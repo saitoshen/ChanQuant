@@ -13,22 +13,36 @@
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 
-# 2. 下载数据
+# 2. 配置 Tushare token（只下美股可跳过）
+cp token.example.txt token.txt      # 然后把 token 填进去；token.txt 不入库
+
+# 3. 下载数据
 .venv\Scripts\python.exe download.py            # 美股（东财，52 只候选）
 .venv\Scripts\python.exe download_futures.py    # 国内期货（Tushare，全品种）
 
-# 3. 批量回测，输出表格 + 图表 + 报告
+# 4. 批量回测，输出表格 + 图表 + 报告
 .venv\Scripts\python.exe backtest_all.py                 # 美股  -> output/
 .venv\Scripts\python.exe backtest_all.py --market cn     # 期货  -> output/futures/
 .venv\Scripts\python.exe backtest_all.py --market cn --adjust none   # 期货不复权，看换月跳空的影响
 
-# 4. 启动图形界面（左侧「品种类别」可切换美股 / 国内期货）
+# 5. 启动图形界面（左侧「品种类别」可切换美股 / 国内期货）
 .venv\Scripts\python.exe gui\app.py
 ```
 
 Windows 下可直接双击 **`启动GUI.bat`**。
 
 补数据：`download.py --missing`、`download_futures.py --missing` 只补缺失或过期标的。
+
+### Tushare token 配置
+
+代码库里**不存 token**，`ttrade/futures.py::read_token()` 按以下优先级查找：
+
+1. 环境变量 `TUSHARE_TOKEN`（CI 或临时会话）
+2. 项目根目录 `token.txt`
+3. 用户配置目录 `token.txt`（Windows `%LOCALAPPDATA%\TrendDesk`，macOS `~/Library/Application Support/TrendDesk`）
+
+三处都没有时抛出的错误里会直接写出这三条路径。仓库里只提交 `token.example.txt`。
+
 
 ---
 
@@ -42,6 +56,8 @@ Claw/
 ├── download_futures.py    # 期货数据下载入口（Tushare）
 ├── backtest_all.py        # 批量回测 + 报告生成（--market us|cn）
 ├── gui/app.py             # PySide6 桌面程序（双市场）
+├── token.example.txt      # token 模板（真正的 token.txt 不入库）
+├── requirements.txt
 ├── packaging/
 │   ├── TrendDesk.spec     # PyInstaller 配置（Windows / macOS 通用）
 │   ├── make_icon.py       # 用 Pillow 生成 .ico / .icns / .png
