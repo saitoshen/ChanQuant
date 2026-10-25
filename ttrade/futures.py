@@ -41,6 +41,23 @@ EXCHANGES = {
 
 PAGE = 2000  # fut_daily 单次上限
 
+# 交易所代码 → Tushare ts_code 后缀。**两者并不相同**，6 个里有 4 个不一样：
+#   SHFE→SHF、CZCE→ZCE、CFFEX→CFX、GFEX→GFE（DCE、INE 同名）
+# 直接用 f"{symbol}.{exchange}" 拼会静默返回空表，看起来像「这个品种没数据」。
+TS_SUFFIX = {
+    "SHFE": "SHF",
+    "DCE": "DCE",
+    "CZCE": "ZCE",
+    "CFFEX": "CFX",
+    "INE": "INE",
+    "GFEX": "GFE",
+}
+
+
+def ts_code_of(symbol: str, exchange: str) -> str:
+    """把「品种代码 + 交易所」拼成 Tushare 的 ts_code（如 CU_SHFE → CU.SHF）。"""
+    return f"{symbol}.{TS_SUFFIX.get(exchange, exchange)}"
+
 _pro = None
 
 
@@ -128,6 +145,8 @@ def get_universe(include_cffex: bool = True) -> list[FutContract]:
             continue
         try:
             df = pro.fut_basic(exchange=ex, fut_type="2", limit=500)
+        except Cancelled:
+            raise
         except Exception:
             continue
         if df is None or df.empty:
@@ -190,6 +209,8 @@ def fetch_daily(
                     limit=PAGE,
                 )
                 break
+            except Cancelled:
+                raise
             except Exception as exc:  # 限频/网络抖动
                 last_err = exc
                 time.sleep(3 * (attempt + 1))
@@ -260,6 +281,8 @@ def fetch_adj_close(
                     limit=PAGE,
                 )
                 break
+            except Cancelled:
+                raise
             except Exception as exc:  # 限频/网络抖动
                 last_err = exc
                 time.sleep(3 * (attempt + 1))

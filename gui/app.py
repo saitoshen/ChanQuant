@@ -42,7 +42,7 @@ from matplotlib.colors import to_rgba
 from matplotlib.figure import Figure
 from matplotlib.ticker import FuncFormatter
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (
     QLayout,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -69,6 +70,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ttrade import updater
 from ttrade.backtest import BacktestConfig, buy_and_hold, drawdown_series, run_backtest
 from ttrade.eastmoney import load_local
 from ttrade.strategies import STRATEGIES, run_strategy
@@ -360,6 +362,51 @@ class MetricCard(QFrame):
         self.value_lbl.setStyleSheet(f"color: {color};")
 
 
+# ------------------------------------------------------------------ 数据更新线程
+class UpdateWorker(QObject):
+    """在后台线程里跑数据更新，避免界面假死。
+
+    下载是纯网络 IO，几十个标的顺序请求，放在主线程会让窗口完全卡住
+    （连「取消」都点不动）。这里用 QThread + 信号把进度送回主线程。
+    """
+
+    progress = Signal(int, int, str)   # done, total, message
+    done = Signal(object)              # UpdateResult
+    failed = Signal(str)
+
+    def __init__(self, market: str, data_dir: str, range_key: str,
+                 source: str = "auto", min_interval: float = 60.0):
+        super().__init__()
+        self.market = market
+        self.data_dir = data_dir
+        self.range_key = range_key
+        self.source = source
+        self.min_interval = min_interval
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        cb = lambda d, t, m: self.progress.emit(d, t, m)  # noqa: E731
+        try:
+            if self.market == "us":
+                res = updater.update_us(
+                    self.data_dir, self.range_key, progress=cb,
+                    cancel=lambda: self._cancel,
+                    source=self.source, min_interval=self.min_interval,
+                )
+            else:
+                res = updater.update_futures(
+                    self.data_dir, self.range_key, progress=cb,
+                    cancel=lambda: self._cancel,
+                )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.done.emit(res)
+
+
 # ------------------------------------------------------------------ 主窗口
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -387,6 +434,8 @@ class MainWindow(QMainWindow):
         self.param_widgets: dict[str, QWidget] = {}
         self.param_scales: dict[str, int] = {}
         self._pending = False
+        self._upd_thread: QThread | None = None
+        self._upd_worker: UpdateWorker | None = None
 
         self._build_ui()
         self._populate_symbols()
@@ -491,6 +540,8 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(card)
 
+        lay.addWidget(self._build_update_card())
+
         # 状态
         self.lbl_status = QLabel("就绪")
         self.lbl_status.setObjectName("Hint")
@@ -519,6 +570,67 @@ class MainWindow(QMainWindow):
         lbl = QLabel(text)
         lbl.setObjectName("SectionTitle")
         return lbl
+
+    def _build_update_card(self) -> QWidget:
+        """数据更新面板：区间 + 数据源 + 限速 + 更新按钮 + 进度条。"""
+        card = QFrame()
+        card.setObjectName("Card")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(7)
+
+        lay.addWidget(self._section("数据更新"))
+
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.cb_upd_range = QComboBox()
+        for key, label, _days in updater.RANGES:
+            self.cb_upd_range.addItem(label, key)
+        self.cb_upd_range.setToolTip(
+            "只补这一段，不重下 20 年。\n"
+            "「全部 20 年」会对每个标的整段重下，耗时较长。"
+        )
+        row.addWidget(self.cb_upd_range, 1)
+
+        self.btn_update = QPushButton("更新")
+        self.btn_update.setObjectName("Ghost")
+        self.btn_update.setFixedWidth(58)
+        self.btn_update.clicked.connect(self._on_update_clicked)
+        row.addWidget(self.btn_update)
+        lay.addLayout(row)
+
+        self.cb_upd_source = QComboBox()
+        for key, label in updater.SOURCE_LABELS.items():
+            self.cb_upd_source.addItem(label, key)
+        self.cb_upd_source.setToolTip(
+            "仅对美股生效。东财给的是后复权价，与本地历史同口径；\n"
+            "Tushare us_daily 是未复权且额度极紧，只作兜底。\n"
+            "国内期货固定走 Tushare。"
+        )
+        lay.addWidget(self.cb_upd_source)
+
+        self.cb_upd_rate = QComboBox()
+        for sec, label in [(60.0, "Tushare 限速：60 秒/次"),
+                           (30.0, "Tushare 限速：30 秒/次"),
+                           (10.0, "Tushare 限速：10 秒/次"),
+                           (0.0, "Tushare 限速：不限")]:
+            self.cb_upd_rate.addItem(label, sec)
+        self.cb_upd_rate.setToolTip("只约束 Tushare 美股接口；东财与期货不受影响")
+        lay.addWidget(self.cb_upd_rate)
+
+        self.prog_update = QProgressBar()
+        self.prog_update.setTextVisible(False)
+        self.prog_update.setFixedHeight(6)
+        self.prog_update.setVisible(False)
+        lay.addWidget(self.prog_update)
+
+        self.lbl_upd = QLabel("")
+        self.lbl_upd.setObjectName("Hint")
+        self.lbl_upd.setWordWrap(True)
+        self.lbl_upd.setVisible(False)
+        lay.addWidget(self.lbl_upd)
+
+        return card
 
     def _build_chart_tab(self) -> QWidget:
         w = QWidget()
@@ -605,6 +717,7 @@ class MainWindow(QMainWindow):
 
         self._fill_symbols()
         self._on_strategy_changed()
+        self._sync_update_controls()
         self._schedule(immediate=True)
 
     def _fill_symbols(self) -> None:
@@ -649,11 +762,113 @@ class MainWindow(QMainWindow):
         )
         self.lbl_sub.setText(info["sub"])
         self.lbl_legend.setText(info["legend"])
+        self._sync_update_controls()
         self._fill_symbols()
         if not self.store.items:
             cmd = "python download.py" if mk == "us" else "python download_futures.py"
             self.lbl_status.setText(f"{info['label']} 本地无数据，请先运行 {cmd}")
             return
+        self._schedule(immediate=True)
+
+    # ---------------------------------------------------------- 数据更新
+    def _sync_update_controls(self) -> None:
+        """数据源与限速只对美股有意义，切到期货时置灰。"""
+        if not hasattr(self, "cb_upd_source"):
+            return
+        is_us = self.market == "us"
+        self.cb_upd_source.setEnabled(is_us)
+        self.cb_upd_rate.setEnabled(is_us)
+
+    def _on_update_clicked(self) -> None:
+        # 正在更新时，这个按钮变成「取消」
+        if self._upd_thread is not None:
+            if self._upd_worker is not None:
+                self._upd_worker.cancel()
+            self.btn_update.setEnabled(False)
+            self.btn_update.setText("取消中")
+            self.lbl_upd.setText("正在取消，等待当前请求结束…")
+            return
+
+        mk = self.market
+        key = self.cb_upd_range.currentData()
+        source = self.cb_upd_source.currentData() if mk == "us" else "tushare"
+        rate = float(self.cb_upd_rate.currentData() or 0.0)
+
+        self._upd_worker = UpdateWorker(mk, MARKETS[mk]["dir"], key, source, rate)
+        self._upd_thread = QThread(self)
+        self._upd_worker.moveToThread(self._upd_thread)
+        self._upd_thread.started.connect(self._upd_worker.run)
+        self._upd_worker.progress.connect(self._on_update_progress)
+        self._upd_worker.done.connect(self._on_update_done)
+        self._upd_worker.failed.connect(self._on_update_failed)
+
+        self.prog_update.setRange(0, 0)      # 先转圈，等第一个进度再定总量
+        self.prog_update.setVisible(True)
+        self.lbl_upd.setVisible(True)
+        self.lbl_upd.setText(f"准备更新{MARKETS[mk]['label']}…")
+        self.btn_update.setText("取消")
+        self.btn_update.setEnabled(True)
+        self._upd_thread.start()
+
+    def _on_update_progress(self, done: int, total: int, msg: str) -> None:
+        if total > 0:
+            self.prog_update.setRange(0, total)
+            self.prog_update.setValue(done)
+        self.lbl_upd.setText(msg)
+
+    def _on_update_done(self, res) -> None:
+        self._finish_update_thread()
+        self.lbl_upd.setVisible(True)
+        self.lbl_upd.setText(res.summary())
+
+        self._reload_store(res.market)
+
+        problems = list(res.errors) + list(res.notes)
+        if problems:
+            more = f"\n… 另有 {len(problems) - 6} 条" if len(problems) > 6 else ""
+            QMessageBox.information(
+                self, "数据更新",
+                res.summary() + "\n\n" + "\n".join(problems[:6]) + more,
+            )
+
+    def _on_update_failed(self, message: str) -> None:
+        self._finish_update_thread()
+        self.lbl_upd.setVisible(True)
+        self.lbl_upd.setText("更新失败")
+        QMessageBox.warning(self, "数据更新失败", message)
+
+    def _finish_update_thread(self) -> None:
+        if self._upd_thread is not None:
+            self._upd_thread.quit()
+            self._upd_thread.wait(5000)
+            self._upd_thread.deleteLater()
+            self._upd_thread = None
+        if self._upd_worker is not None:
+            self._upd_worker.deleteLater()
+            self._upd_worker = None
+        self.btn_update.setText("更新")
+        self.btn_update.setEnabled(True)
+        self.prog_update.setVisible(False)
+
+    def _reload_store(self, market: str) -> None:
+        """重建该市场的 DataStore（清掉 DataFrame 缓存），保留当前选中的标的。"""
+        self.stores[market] = DataStore(market)
+        for i in range(self.cb_market.count()):
+            mk = self.cb_market.itemData(i)
+            if mk == market:
+                self.cb_market.setItemText(
+                    i, f"{MARKETS[mk]['label']}（{len(self.stores[mk].items)} 个标的）"
+                )
+        if market != self.market:
+            return
+        keep = self.cb_symbol.currentData()
+        self.store = self.stores[market]
+        self._fill_symbols()
+        idx = self.cb_symbol.findData(keep)
+        if idx >= 0:
+            self.cb_symbol.blockSignals(True)
+            self.cb_symbol.setCurrentIndex(idx)
+            self.cb_symbol.blockSignals(False)
         self._schedule(immediate=True)
 
     def _on_strategy_changed(self) -> None:
@@ -1127,6 +1342,16 @@ class MainWindow(QMainWindow):
             self.table.setItem(i, 1, it1)
             self.table.setItem(i, 2, it2)
             self.table.setRowHeight(i, 26)
+
+    # ---------------------------------------------------------- 生命周期
+    def closeEvent(self, event) -> None:
+        """关窗前先让更新线程收尾，避免线程还在写 CSV 就被强杀。"""
+        if self._upd_worker is not None:
+            self._upd_worker.cancel()
+        if self._upd_thread is not None:
+            self._upd_thread.quit()
+            self._upd_thread.wait(3000)
+        super().closeEvent(event)
 
 
 def main() -> int:

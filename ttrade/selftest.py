@@ -158,6 +158,13 @@ def _run() -> tuple[bool, list[str]]:
         app.processEvents()
         n = len(win.store.symbols)
         has_res = getattr(win, "res", None) is not None
+        # 数据更新面板：控件都在，且线程未启动
+        has_upd = (
+            hasattr(win, "btn_update")
+            and hasattr(win, "cb_upd_range")
+            and win.cb_upd_range.count() == 5
+            and win._upd_thread is None
+        )
         win.close()
         app.processEvents()
 
@@ -165,7 +172,9 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError("主窗口没有加载到任何标的，数据目录可能没打进包")
         if not has_res:
             raise RuntimeError("主窗口未完成首次回测")
-        return f"{n} 个标的，K 线与绩效页已渲染"
+        if not has_upd:
+            raise RuntimeError("数据更新面板缺失或初始状态异常")
+        return f"{n} 个标的，K 线与绩效页已渲染，更新面板就绪"
 
     check("构建主窗口（端到端）", _window)
 
