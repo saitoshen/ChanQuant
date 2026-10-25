@@ -1,6 +1,21 @@
+# 运行 + 打包所需（版本与本机验证过的一致）
+# 只列源码真正 import 的包，scipy / mplfinance 已确认未使用，不再引入。
+
 matplotlib==3.11.2
-mplfinance==0.12.10b0
 numpy==2.5.4
 pandas==3.1.0
+
+# GUI。PySide6 是元包，会带上 Essentials + Addons
+PySide6==6.12.0
+
+# 图标生成（packaging/make_icon.py）
+Pillow==13.0.0
+
+# 东方财富行情接口
 requests==2.34.2
-shiboken6==6.12.0
+
+# 仅 download_futures.py 需要；GUI 与回测不 import，但保留在依赖里
+# 让「快速开始」能一路跑通
+tushare==1.4.29
+
+# PyInstaller 不写在这里，build.py 会按需自动安装（ensure_pyinstaller）

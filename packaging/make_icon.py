@@ -9,8 +9,17 @@
 from __future__ import annotations
 
 import os
+import sys
 
 from PIL import Image, ImageDraw
+
+# 英文版 Windows 控制台默认 cp1252，print 中文会抛 UnicodeEncodeError
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))

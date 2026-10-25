@@ -14,6 +14,11 @@ jobs:
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    # 英文版 Windows runner 的控制台是 cp1252，脚本里的中文 print 会抛
+    # UnicodeEncodeError（表现为「生成图标」步骤莫名失败）。强制 UTF-8 模式。
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
     strategy:
       fail-fast: false
       matrix:

@@ -135,7 +135,9 @@ if sys.platform == "darwin":
             "CFBundleVersion": VERSION,
             "NSHighResolutionCapable": True,
             "NSRequiresAquaSystemAppearance": False,
-            "LSMinimumSystemVersion": "11.0",
+            # PySide6 6.12 的 macOS 轮子是 macosx_14_0_universal2，
+            # 写 11.0 会让系统误以为能在更老的机器上跑，实际会直接崩
+            "LSMinimumSystemVersion": "14.0",
             "LSApplicationCategoryType": "public.app-category.finance",
             "LSBackgroundOnly": False,
         },

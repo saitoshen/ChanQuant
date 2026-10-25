@@ -30,9 +30,45 @@ APP_NAME = "TrendDesk"
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 
+# 英文版 Windows 控制台默认 cp1252，print 中文会抛 UnicodeEncodeError
+# （GitHub Actions 的 windows-latest 就是这样，日志里表现为打包脚本莫名失败）。
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
+
+
+REQUIRED_MODULES = [
+    ("PySide6.QtWidgets", "PySide6"),
+    ("matplotlib", "matplotlib"),
+    ("numpy", "numpy"),
+    ("pandas", "pandas"),
+]
+
+
+def check_runtime_deps() -> bool:
+    """打包前确认运行期依赖都在。
+
+    这一步不能省：PyInstaller 缺了 PySide6 并不会报错，它会安静地打出一个
+    没有 Qt 的空壳程序，装到用户机器上双击才崩。宁可在打包阶段就失败。
+    """
+    missing: list[str] = []
+    for mod, pkg in REQUIRED_MODULES:
+        try:
+            __import__(mod)
+        except Exception:
+            missing.append(pkg)
+    if missing:
+        log("缺少运行期依赖：" + "、".join(sorted(set(missing))))
+        log("请先执行：pip install -r requirements.txt")
+        return False
+    return True
 
 
 def ensure_pyinstaller(auto_install: bool = True) -> bool:
@@ -132,6 +168,9 @@ def main() -> int:
         if os.path.exists(req):
             log("安装依赖…")
             subprocess.run([sys.executable, "-m", "pip", "install", "-r", req], cwd=ROOT, check=True)
+
+    if not check_runtime_deps():
+        return 1
 
     if not ensure_pyinstaller():
         return 1
