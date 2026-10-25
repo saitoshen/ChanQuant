@@ -22,11 +22,11 @@ jobs:
             label: Windows x64
             artifact: TrendDesk-win64
             archive: dist/TrendDesk-win64.zip
-          - os: macos-14          # Apple Silicon
+          - os: macos-latest     # Apple Silicon（macos-14 起默认 arm64）
             label: macOS arm64
             artifact: TrendDesk-macos-arm64
             archive: dist/TrendDesk-macos-arm64.zip
-          - os: macos-13          # Intel
+          - os: macos-15-intel   # Intel；macos-13 已于 2025-12-04 退役
             label: macOS x64
             artifact: TrendDesk-macos-x64
             archive: dist/TrendDesk-macos-x64.zip
