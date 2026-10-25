@@ -29,12 +29,41 @@ cp token.example.txt token.txt      # 然后把 token 填进去；token.txt 不�
 .venv\Scripts\python.exe backtest_all.py --market cn --adjust none   # 期货不复权，看换月跳空的影响
 
 # 5. 启动图形界面（左侧「品种类别」可切换美股 / 国内期货）
-.venv\Scripts\python.exe gui\app.py
+.venv\Scripts\python.exe launcher.py
 ```
 
-Windows 下可直接双击 **`启动GUI.bat`**。
-
 补数据：`download.py --missing`、`download_futures.py --missing` 只补缺失或过期标的。
+
+### 启动 GUI 的四种方式
+
+按「省事 → 可控」排序，随便挑一种：
+
+| 方式 | 命令 / 操作 | 适用场景 |
+|---|---|---|
+| 双击脚本 | `启动GUI.bat`（或 `start_gui.bat`） | 日常使用，无黑窗口 |
+| 无控制台 | `.venv\Scripts\pythonw.exe launcher.py` | 等价于双击，但能自己控制参数 |
+| 带控制台 | `.venv\Scripts\python.exe launcher.py` | **排查启动问题用这个**，异常直接打在屏幕上 |
+| 已打包程序 | 双击 `dist/TrendDesk/TrendDesk.exe` | 不想装 Python 环境 |
+
+`launcher.py` 是唯一入口，源码运行和打包运行走同一条路径。`--selftest` 可以不开窗口做环境自检：
+
+```bat
+.venv\Scripts\python.exe launcher.py --selftest
+```
+
+**如果双击没反应**：先跑带控制台的那条，错误会直接显示；或者看崩溃日志
+
+```bat
+type "%LOCALAPPDATA%\TrendDesk\logs\error.log"
+```
+
+> **踩过的坑：`.bat` 必须是 CRLF 换行。**
+> 有一次 `启动GUI.bat` 被工具以纯 LF 写出，双击后窗口一闪就没。原因不是 Python 出错——
+> 而是 `cmd.exe` 解析 LF-only 批处理时，`if not exist ... (` 这类块结构会错乱，
+> 条件判断结果**反转**，明明 venv 存在却打印「venv not found」然后 `exit /b 1`。
+> 复现方式：同一份脚本存成 LF 跑一次就能看到。仓库里 `.gitattributes` 已声明
+> `*.bat text eol=crlf`，但 git 只在**检出时**转换，不会回头修工作区里已存在的 LF 文件，
+> 所以遇到这种情况直接重写文件为 CRLF 即可，别指望 `git checkout` 能救。
 
 ### Tushare token 配置
 
@@ -54,6 +83,8 @@ Windows 下可直接双击 **`启动GUI.bat`**。
 ```
 Claw/
 ├── launcher.py            # 桌面程序入口（源码运行 + 打包入口，--selftest 自检）
+├── 启动GUI.bat            # Windows 双击启动（CRLF，见上文「踩过的坑」）
+├── start_gui.bat          # 同上，纯 ASCII 文件名的副本（跨平台 clone 保险）
 ├── build.py               # 一键打包（PyInstaller）
 ├── download.py            # 美股数据下载入口（东财）
 ├── download_futures.py    # 期货数据下载入口（Tushare）
@@ -69,6 +100,8 @@ Claw/
 │   ├── eastmoney.py       # 东财接口封装（secid 解析、K线抓取、本地读取）
 │   ├── quality.py         # 美股行情质量修复（复权跳变 / 脏数据 / 休市占位行）
 │   ├── futures.py         # Tushare 期货封装（合约清单、分页下载、复权因子、板块分类、流动性筛选）
+│   ├── updater.py         # 增量数据更新引擎（区间选择、换源重下、原子写入）
+│   ├── us_tushare.py      # Tushare 美股通道（一分钟一次限速 + 额度熔断）
 │   ├── paths.py           # 路径解析（区分只读资源 / 可写目录，兼容打包）
 │   ├── plotstyle.py       # matplotlib 跨平台中文字体
 │   ├── selftest.py        # 打包后自检（8 项，含端到端建窗口）
