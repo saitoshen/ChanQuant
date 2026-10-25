@@ -1,0 +1,90 @@
+name: build-desktop
+
+# 手动触发，或打 v* 标签时自动构建并发布
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows x64
+            artifact: TrendDesk-win64
+            archive: dist/TrendDesk-win64.zip
+          - os: macos-14          # Apple Silicon
+            label: macOS arm64
+            artifact: TrendDesk-macos-arm64
+            archive: dist/TrendDesk-macos-arm64.zip
+          - os: macos-13          # Intel
+            label: macOS x64
+            artifact: TrendDesk-macos-x64
+            archive: dist/TrendDesk-macos-x64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: 生成图标
+        run: python packaging/make_icon.py
+
+      - name: 打包
+        run: python build.py
+
+      - name: 自检（验证包内资源与 Qt 插件）
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ./dist/TrendDesk/TrendDesk.exe --selftest || { cat "$LOCALAPPDATA/TrendDesk/logs/selftest.log"; exit 1; }
+            cat "$LOCALAPPDATA/TrendDesk/logs/selftest.log"
+          else
+            ./dist/TrendDesk.app/Contents/MacOS/TrendDesk --selftest || {
+              cat "$HOME/Library/Application Support/TrendDesk/logs/selftest.log"; exit 1; }
+            cat "$HOME/Library/Application Support/TrendDesk/logs/selftest.log"
+          fi
+
+      - name: 列出产物
+        shell: bash
+        run: ls -lh dist/ || dir dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: 发布 Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.zip
+          generate_release_notes: true

@@ -1,0 +1,342 @@
+[
+  {
+    "symbol": "AAPL",
+    "name": "苹果",
+    "exchange": "NASDAQ",
+    "secid": "105.AAPL",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "AAPL.csv"
+  },
+  {
+    "symbol": "MSFT",
+    "name": "微软",
+    "exchange": "NASDAQ",
+    "secid": "105.MSFT",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "MSFT.csv"
+  },
+  {
+    "symbol": "GOOGL",
+    "name": "谷歌-A",
+    "exchange": "NASDAQ",
+    "secid": "105.GOOGL",
+    "rows": 4933,
+    "start": "2007-03-19",
+    "end": "2026-10-23",
+    "file": "GOOGL.csv"
+  },
+  {
+    "symbol": "AMZN",
+    "name": "亚马逊",
+    "exchange": "NASDAQ",
+    "secid": "105.AMZN",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "AMZN.csv"
+  },
+  {
+    "symbol": "NVDA",
+    "name": "英伟达",
+    "exchange": "NASDAQ",
+    "secid": "105.NVDA",
+    "rows": 5052,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "NVDA.csv"
+  },
+  {
+    "symbol": "META",
+    "name": "Meta Platforms Inc-A",
+    "exchange": "NASDAQ",
+    "secid": "105.META",
+    "rows": 3628,
+    "start": "2012-05-18",
+    "end": "2026-10-23",
+    "file": "META.csv"
+  },
+  {
+    "symbol": "TSLA",
+    "name": "特斯拉",
+    "exchange": "NASDAQ",
+    "secid": "105.TSLA",
+    "rows": 3932,
+    "start": "2011-01-26",
+    "end": "2026-10-23",
+    "file": "TSLA.csv"
+  },
+  {
+    "symbol": "NFLX",
+    "name": "奈飞",
+    "exchange": "NASDAQ",
+    "secid": "105.NFLX",
+    "rows": 5052,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "NFLX.csv"
+  },
+  {
+    "symbol": "CRM",
+    "name": "赛富时",
+    "exchange": "NYSE",
+    "secid": "106.CRM",
+    "rows": 5052,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "CRM.csv"
+  },
+  {
+    "symbol": "ADBE",
+    "name": "奥多比",
+    "exchange": "NASDAQ",
+    "secid": "105.ADBE",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "ADBE.csv"
+  },
+  {
+    "symbol": "ORCL",
+    "name": "甲骨文",
+    "exchange": "NYSE",
+    "secid": "106.ORCL",
+    "rows": 3341,
+    "start": "2013-07-15",
+    "end": "2026-10-23",
+    "file": "ORCL.csv"
+  },
+  {
+    "symbol": "IBM",
+    "name": "IBM国际商业机器",
+    "exchange": "NYSE",
+    "secid": "106.IBM",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "IBM.csv"
+  },
+  {
+    "symbol": "AMD",
+    "name": "超威半导体",
+    "exchange": "NASDAQ",
+    "secid": "105.AMD",
+    "rows": 2968,
+    "start": "2015-01-05",
+    "end": "2026-10-23",
+    "file": "AMD.csv"
+  },
+  {
+    "symbol": "AVGO",
+    "name": "博通",
+    "exchange": "NASDAQ",
+    "secid": "105.AVGO",
+    "rows": 2699,
+    "start": "2016-02-01",
+    "end": "2026-10-23",
+    "file": "AVGO.csv"
+  },
+  {
+    "symbol": "INTC",
+    "name": "英特尔",
+    "exchange": "NASDAQ",
+    "secid": "105.INTC",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "INTC.csv"
+  },
+  {
+    "symbol": "MU",
+    "name": "美光科技",
+    "exchange": "NASDAQ",
+    "secid": "105.MU",
+    "rows": 4230,
+    "start": "2009-12-30",
+    "end": "2026-10-23",
+    "file": "MU.csv"
+  },
+  {
+    "symbol": "QCOM",
+    "name": "高通",
+    "exchange": "NASDAQ",
+    "secid": "105.QCOM",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "QCOM.csv"
+  },
+  {
+    "symbol": "TSM",
+    "name": "台积电",
+    "exchange": "NYSE",
+    "secid": "106.TSM",
+    "rows": 4933,
+    "start": "2007-03-19",
+    "end": "2026-10-23",
+    "file": "TSM.csv"
+  },
+  {
+    "symbol": "JPM",
+    "name": "摩根大通",
+    "exchange": "NYSE",
+    "secid": "106.JPM",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "JPM.csv"
+  },
+  {
+    "symbol": "BAC",
+    "name": "美国银行",
+    "exchange": "NYSE",
+    "secid": "106.BAC",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "BAC.csv"
+  },
+  {
+    "symbol": "WFC",
+    "name": "富国银行",
+    "exchange": "NYSE",
+    "secid": "106.WFC",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "WFC.csv"
+  },
+  {
+    "symbol": "GS",
+    "name": "高盛",
+    "exchange": "NYSE",
+    "secid": "106.GS",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "GS.csv"
+  },
+  {
+    "symbol": "MS",
+    "name": "摩根士丹利",
+    "exchange": "NYSE",
+    "secid": "106.MS",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "MS.csv"
+  },
+  {
+    "symbol": "V",
+    "name": "维萨",
+    "exchange": "NYSE",
+    "secid": "106.V",
+    "rows": 4681,
+    "start": "2008-03-19",
+    "end": "2026-10-23",
+    "file": "V.csv"
+  },
+  {
+    "symbol": "MA",
+    "name": "万事达",
+    "exchange": "NYSE",
+    "secid": "106.MA",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "MA.csv"
+  },
+  {
+    "symbol": "AXP",
+    "name": "美国运通",
+    "exchange": "NYSE",
+    "secid": "106.AXP",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "AXP.csv"
+  },
+  {
+    "symbol": "KO",
+    "name": "可口可乐",
+    "exchange": "NYSE",
+    "secid": "106.KO",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "KO.csv"
+  },
+  {
+    "symbol": "PEP",
+    "name": "百事",
+    "exchange": "NASDAQ",
+    "secid": "105.PEP",
+    "rows": 4931,
+    "start": "2007-03-19",
+    "end": "2026-10-23",
+    "file": "PEP.csv"
+  },
+  {
+    "symbol": "COST",
+    "name": "开市客",
+    "exchange": "NASDAQ",
+    "secid": "105.COST",
+    "rows": 5052,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "COST.csv"
+  },
+  {
+    "symbol": "MCD",
+    "name": "麦当劳",
+    "exchange": "NYSE",
+    "secid": "106.MCD",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "MCD.csv"
+  },
+  {
+    "symbol": "NKE",
+    "name": "耐克",
+    "exchange": "NYSE",
+    "secid": "106.NKE",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "NKE.csv"
+  },
+  {
+    "symbol": "PG",
+    "name": "宝洁",
+    "exchange": "NYSE",
+    "secid": "106.PG",
+    "rows": 5054,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "PG.csv"
+  },
+  {
+    "symbol": "HD",
+    "name": "家得宝",
+    "exchange": "NYSE",
+    "secid": "106.HD",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "HD.csv"
+  },
+  {
+    "symbol": "JNJ",
+    "name": "强生",
+    "exchange": "NYSE",
+    "secid": "106.JNJ",
+    "rows": 5053,
+    "start": "2006-09-25",
+    "end": "2026-10-23",
+    "file": "JNJ.csv"
+  }
+]

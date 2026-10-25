@@ -1,0 +1,7 @@
+把 Tushare token 填到这里，然后把本文件重命名为 token.txt（同目录）。
+
+    mv token.example.txt token.txt
+
+token 获取地址：https://tushare.pro/user/token
+
+token.txt 已在 .gitignore 中，不会被提交。也可以改用环境变量 TUSHARE_TOKEN。

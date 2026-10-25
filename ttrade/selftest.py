@@ -1,0 +1,200 @@
+"""打包后的自检：不打开窗口，验证资源、数据、回测、绘图、Qt 插件是否都正常。
+
+    TrendDesk.exe --selftest     # Windows
+    TrendDesk.app/Contents/MacOS/TrendDesk --selftest   # macOS
+
+打包成窗口程序后没有控制台，`print` 看不到，所以结果同时写入
+`<用户目录>/logs/selftest.log`，并用退出码表示成败（0 成功 / 1 失败）。
+CI 里跑一遍这个就能确认「打出来的包真的能用」，而不用去点界面。
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import traceback
+
+
+def _run() -> tuple[bool, list[str]]:
+    lines: list[str] = []
+    ok = True
+
+    # 全程离屏，自检不应该在用户屏幕上闪一个窗口
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    def check(name: str, fn) -> None:
+        nonlocal ok
+        try:
+            detail = fn()
+            lines.append(f"[ OK ] {name}" + (f"  {detail}" if detail else ""))
+        except Exception as exc:  # noqa: BLE001 - 自检要吞掉异常继续跑完
+            ok = False
+            lines.append(f"[FAIL] {name}  {type(exc).__name__}: {exc}")
+            lines.append(traceback.format_exc())
+
+    from ttrade.paths import bundle_root, cache_dir, data_dir, is_frozen, log_dir, user_dir
+
+    lines.append(f"frozen={is_frozen()}  python={sys.version.split()[0]}  platform={sys.platform}")
+    lines.append(f"bundle_root = {bundle_root()}")
+    lines.append(f"data(us)    = {data_dir('us')}")
+    lines.append(f"data(cn)    = {data_dir('cn')}")
+    lines.append(f"user_dir    = {user_dir()}")
+    lines.append(f"log_dir     = {log_dir()}")
+    lines.append("")
+
+    def _count(market: str) -> str:
+        d = data_dir(market)
+        if not os.path.isdir(d):
+            raise FileNotFoundError(f"目录不存在：{d}")
+        n = len([f for f in os.listdir(d) if f.endswith(".csv")])
+        if n == 0:
+            raise FileNotFoundError(f"目录里没有 CSV：{d}")
+        return f"{n} 个 CSV"
+
+    check("美股数据目录", lambda: _count("us"))
+    check("期货数据目录", lambda: _count("cn"))
+
+    def _load_us():
+        import pandas as pd
+
+        from ttrade.eastmoney import load_local
+
+        path = os.path.join(data_dir("us"), "AAPL.csv")
+        sym = "AAPL" if os.path.exists(path) else None
+        if sym is None:
+            cands = [f[:-4].replace("_", ".") for f in os.listdir(data_dir("us"))
+                     if f.endswith(".csv") and not f.startswith("_")]
+            if not cands:
+                raise FileNotFoundError("没有可用的美股 CSV")
+            sym = sorted(cands)[0]
+        df = load_local(sym, data_dir("us"))
+        assert isinstance(df, pd.DataFrame) and len(df) > 100
+        return f"{sym} {len(df)} 行 {df.index[0]:%Y-%m-%d}~{df.index[-1]:%Y-%m-%d}"
+
+    check("读取美股行情", _load_us)
+
+    def _load_cn():
+        from ttrade.futures import load_local as load_fut
+
+        for sym, ex in (("RB", "SHFE"), ("CU", "SHFE"), ("M", "DCE")):
+            if os.path.exists(os.path.join(data_dir("cn"), f"{sym}_{ex}.csv")):
+                df = load_fut(sym, ex, data_dir("cn"))
+                assert len(df) > 100
+                return (f"{sym}_{ex} {len(df)} 行，最新 {df['close'].iloc[-1]:.2f}"
+                        f"，复权因子列={'adj_factor' in df.columns}")
+        raise FileNotFoundError("没有可用的期货 CSV")
+
+    check("读取期货行情（含复权）", _load_cn)
+
+    def _backtest():
+        from ttrade.backtest import BacktestConfig, run_backtest
+        from ttrade.eastmoney import load_local
+        from ttrade.strategies import run_strategy
+
+        cands = sorted(f[:-4].replace("_", ".") for f in os.listdir(data_dir("us"))
+                       if f.endswith(".csv") and not f.startswith("_"))
+        df = load_local(cands[0], data_dir("us"))
+        sig = run_strategy(df, "donchian")
+        res = run_backtest(sig, BacktestConfig())
+        m = res.metrics
+        return f"cagr={m['cagr'] * 100:.1f}% sharpe={m['sharpe']:.2f} trades={m['n_trades']}"
+
+    check("策略回测", _backtest)
+
+    def _matplotlib():
+        os.environ.setdefault("MPLCONFIGDIR", cache_dir("mpl"))
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        from ttrade.plotstyle import available_cjk_fonts, check_cjk_render, setup_matplotlib_fonts
+
+        setup_matplotlib_fonts()
+        fonts = available_cjk_fonts()
+        if not fonts:
+            raise RuntimeError("系统中没有任何中文字体，图表中文会显示为方框")
+
+        fig, ax = plt.subplots(figsize=(4, 2))
+        ax.plot(np.arange(10), np.arange(10) ** 2)
+        ax.set_title("自检 · 中文标题")  # 缺字会在这里被 check_cjk_render 抓住
+        out = os.path.join(cache_dir("mpl"), "selftest.png")
+        check_cjk_render(fig, out)
+        plt.close(fig)
+        size = os.path.getsize(out)
+        assert size > 1000, f"图片太小：{size}B"
+        return f"字体 {fonts[0]}，渲染 {size} B"
+
+    check("matplotlib 绘图（含中文字体）", _matplotlib)
+
+    def _qt():
+        from PySide6.QtCore import qVersion
+        from PySide6.QtWidgets import QApplication, QLabel
+
+        app = QApplication.instance() or QApplication([])
+        w = QLabel("自检")
+        w.resize(120, 40)
+        w.show()
+        app.processEvents()
+        w.close()
+        return f"Qt {qVersion()} 离屏渲染正常"
+
+    check("Qt 平台插件", _qt)
+
+    def _window():
+        """真正把主窗口搭起来，验证 UI 代码在打包后也能跑通。"""
+        from PySide6.QtWidgets import QApplication
+
+        from gui.app import STYLE_SHEET, MainWindow, setup_light_palette
+
+        app = QApplication.instance() or QApplication([])
+        setup_light_palette(app)
+        app.setStyleSheet(STYLE_SHEET)
+
+        win = MainWindow()
+        win.resize(1280, 820)
+        win.show()
+        app.processEvents()
+        n = len(win.store.symbols)
+        has_res = getattr(win, "res", None) is not None
+        win.close()
+        app.processEvents()
+
+        if n == 0:
+            raise RuntimeError("主窗口没有加载到任何标的，数据目录可能没打进包")
+        if not has_res:
+            raise RuntimeError("主窗口未完成首次回测")
+        return f"{n} 个标的，K 线与绩效页已渲染"
+
+    check("构建主窗口（端到端）", _window)
+
+    return ok, lines
+
+
+def run() -> int:
+    """执行自检并返回退出码。"""
+    from ttrade.paths import log_dir
+
+    try:
+        ok, lines = _run()
+    except Exception:  # noqa: BLE001 - 连路径都取不到时的兜底
+        ok = False
+        lines = ["自检初始化失败：", traceback.format_exc()]
+
+    text = "\n".join(lines)
+    try:
+        path = os.path.join(log_dir(), "selftest.log")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+        text += f"\n\n结果已写入 {path}"
+    except Exception:
+        pass
+
+    # 打包成窗口程序时 sys.stdout 是 None（print 会静默丢弃），CI/命令行下才看得到
+    if sys.stdout is not None:
+        try:
+            print(text)
+        except Exception:
+            pass
+    return 0 if ok else 1
