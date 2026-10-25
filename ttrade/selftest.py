@@ -165,6 +165,14 @@ def _run() -> tuple[bool, list[str]]:
             and win.cb_upd_range.count() == 5
             and win._upd_thread is None
         )
+        # K 线可视窗口：初始应停在最新一段，且滚动条范围与窗口自洽
+        k_ok = (
+            hasattr(win, "sb_kline")
+            and win._k_total > 0
+            and 0 < win._k_win <= win._k_total
+            and win._k_start == max(0, win._k_total - win._k_win)
+        )
+        k_info = f"窗口 {win._k_win}/{win._k_total} 根"
         win.close()
         app.processEvents()
 
@@ -174,7 +182,11 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError("主窗口未完成首次回测")
         if not has_upd:
             raise RuntimeError("数据更新面板缺失或初始状态异常")
-        return f"{n} 个标的，K 线与绩效页已渲染，更新面板就绪"
+        if not k_ok:
+            raise RuntimeError(
+                f"K 线窗口状态异常：win={win._k_win} start={win._k_start} total={win._k_total}"
+            )
+        return f"{n} 个标的，K 线与绩效页已渲染，{k_info}，更新面板就绪"
 
     check("构建主窗口（端到端）", _window)
 

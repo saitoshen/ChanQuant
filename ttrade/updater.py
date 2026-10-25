@@ -578,7 +578,10 @@ def update_futures(
                     if len(fac) and fac.min() > 0
                     else None
                 ),
-                adjusted=bool(not adj.empty),
+                # 判断依据是「合并后的因子列」，不是「这次有没有拿到复权数据」。
+                # 增量更新时 adj 偶尔为空，新行会沿用旧因子，文件其实仍然是复权的；
+                # 若按 adj.empty 标记，这个品种会从「已复权」被误降级成「未复权」。
+                adjusted=bool(len(fac) and not (fac.round(6) == 1.0).all()),
                 file=t["file"],
             )
             res.ok += 1
