@@ -4,6 +4,9 @@
 （按 `fut_daily_adj` 复权因子消除换月跳空），跑五套经典趋势跟踪策略，与「买入持有」做逐标的、分组、板块、
 组合四个层面的对比，并提供一个可视化 GUI 查看 K 线与买卖信号。
 
+**仓库**：<https://github.com/saitoshen/TrendDesk>
+**下载成品**：<https://github.com/saitoshen/TrendDesk/releases> — Windows x64 / macOS arm64 / macOS x64
+
 ---
 
 ## 快速开始
@@ -300,19 +303,36 @@ dist/TrendDesk.app/Contents/MacOS/TrendDesk --selftest   # macOS
 所以「自检通过」等价于「界面能开、数据能读、图能画」，而不只是「PyInstaller 没报错」。
 CI 里也跑这一步。
 
-### 双平台 CI
+### 三平台 CI
 
-`.github/workflows/build.yml` 已配好三平台矩阵（Windows x64 / macOS arm64 / macOS x64），
-推送 `v*` 标签会自动构建并发布 Release：
+`.github/workflows/build.yml` 配了三平台矩阵：
+
+| runner | 产物 |
+|---|---|
+| `windows-latest` | `TrendDesk-win64.zip` |
+| `macos-latest`（Apple Silicon） | `TrendDesk-macos-arm64.zip` |
+| `macos-15-intel`（Intel） | `TrendDesk-macos-x64.zip` |
+
+触发方式两种：**打 `v*` 标签**（构建 + 发 Release），或到 Actions 页面手动 Run workflow。
+推 `main` 不会触发——数据文件大，不必每次提交都重建。
 
 ```bash
-git init && git add . && git commit -m "init"
-git remote add origin <your-repo>
-git tag v1.0.0 && git push origin main --tags
+git tag -a v1.0.1 -m "说明"
+git push origin v1.0.1
 ```
 
+每个平台打完包都会跑一次 `--selftest`，8 项全过才算成功，自检日志直接打到 CI 输出。
+
 > 注意：`data/` 与 `data_futures/`（约 32MB）需要一并提交，否则打出的包没有行情数据。
-> `.gitignore` 已排除 `.venv/`、`build/`、`dist/`、`output/`。
+> `.gitignore` 已排除 `.venv/`、`build/`、`dist/`、`output/`、`token.txt`。
+
+#### CI 上踩过的三个坑（都已修）
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| Windows 卡在「生成图标」 | 英文版 runner 控制台是 cp1252，脚本 `print` 中文抛 `UnicodeEncodeError` | job 级 `PYTHONUTF8=1`，脚本内也 `reconfigure(encoding="utf-8")` |
+| macOS 打包成功但自检报 `No module named 'PySide6'` | `requirements.txt` 只写了 `shiboken6`，漏了 `PySide6`。**PyInstaller 不会因此报错**，会安静地打出没有 Qt 的空壳 app | 补全依赖；`build.py` 增加 `check_runtime_deps()` 打包前拦截 |
+| Intel Mac 的 job 起不来 | `macos-13` runner 已于 2025-12-04 退役 | 改用 `macos-15-intel` |
 
 ### 产物与首次运行
 
@@ -364,7 +384,8 @@ macOS 的 `.app` 签名后所在卷是**只读**的。之前 `MPLCONFIGDIR` 和 
 
 ### 体积
 
-约 250MB，主要是 PySide6（~150MB）、pandas、numpy、matplotlib。
+CI 实测压缩包大小：Windows 104 MB、macOS arm64 82 MB、macOS x64 88 MB；
+解压后约 250 MB，主要是 PySide6（~150MB）、pandas、numpy、matplotlib。
 spec 里已剔除 `tkinter`、`PyQt5/6`、`PySide2`、`scipy`、`IPython`、`pytest`
 以及 QtWebEngine / QtQuick / Qt3D / QtMultimedia 等未使用的 Qt 子模块。
 再想瘦身只能换 Nuitka 或砍掉 matplotlib 自绘 K 线。
@@ -374,6 +395,7 @@ spec 里已剔除 `tkinter`、`PyQt5/6`、`PySide2`、`scipy`、`IPython`、`pyt
 - 数据随包分发，**更新行情需要重新打包**（GUI 内没有下载入口，下载走命令行脚本）
 - 不含自动更新机制
 - macOS 未做 notarization，需要用户手动放行
+- **macOS 14+**：PySide6 6.12 的轮子是 `macosx_14_0_universal2`，更老的系统装不上
 
 ---
 
