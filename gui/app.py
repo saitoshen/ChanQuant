@@ -604,10 +604,18 @@ class MainWindow(QMainWindow):
             self.cb_upd_source.addItem(label, key)
         self.cb_upd_source.setToolTip(
             "仅对美股生效。东财给的是后复权价，与本地历史同口径；\n"
-            "Tushare us_daily 是未复权且额度极紧，只作兜底。\n"
-            "国内期货固定走 Tushare。"
+            "Tushare us_daily 是未复权且额度极紧，只作兜底。"
         )
         lay.addWidget(self.cb_upd_source)
+
+        # 期货只有一个数据源，用一行静态说明顶替下拉框。
+        # 下拉框里那些「东方财富」「自动」选项对期货毫无意义，
+        # 摆在那里只会让人以为可以选，所以直接不显示。
+        self.lbl_upd_src = QLabel("数据源：Tushare（日线与复权因子同步更新）")
+        self.lbl_upd_src.setObjectName("Hint")
+        self.lbl_upd_src.setWordWrap(True)
+        self.lbl_upd_src.setVisible(False)
+        lay.addWidget(self.lbl_upd_src)
 
         self.cb_upd_rate = QComboBox()
         for sec, label in [(60.0, "Tushare 限速：60 秒/次"),
@@ -772,12 +780,13 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------- 数据更新
     def _sync_update_controls(self) -> None:
-        """数据源与限速只对美股有意义，切到期货时置灰。"""
+        """美股才需要选数据源和限速；期货固定 Tushare、不限速，换成一行说明。"""
         if not hasattr(self, "cb_upd_source"):
             return
         is_us = self.market == "us"
-        self.cb_upd_source.setEnabled(is_us)
-        self.cb_upd_rate.setEnabled(is_us)
+        self.cb_upd_source.setVisible(is_us)
+        self.cb_upd_rate.setVisible(is_us)
+        self.lbl_upd_src.setVisible(not is_us)
 
     def _on_update_clicked(self) -> None:
         # 正在更新时，这个按钮变成「取消」
@@ -791,7 +800,10 @@ class MainWindow(QMainWindow):
 
         mk = self.market
         key = self.cb_upd_range.currentData()
-        source = self.cb_upd_source.currentData() if mk == "us" else "tushare"
+        # 期货没有第二个数据源，直接钉死 Tushare
+        source = (
+            self.cb_upd_source.currentData() if mk == "us" else updater.SOURCE_TUSHARE
+        )
         rate = float(self.cb_upd_rate.currentData() or 0.0)
 
         self._upd_worker = UpdateWorker(mk, MARKETS[mk]["dir"], key, source, rate)

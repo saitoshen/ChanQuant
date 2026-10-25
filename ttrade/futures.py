@@ -41,6 +41,15 @@ EXCHANGES = {
 
 PAGE = 2000  # fut_daily 单次上限
 
+
+class Cancelled(Exception):
+    """下载过程中被用户取消。
+
+    必须在这里定义：`fetch_daily` / `fetch_adj_close` 里有 `except Cancelled: raise`，
+    如果这个名字不存在，真正出错时会先抛 `NameError: name 'Cancelled' is not defined`，
+    把原始错误整个盖掉，排查时看到的全是假线索。
+    """
+
 # 交易所代码 → Tushare ts_code 后缀。**两者并不相同**，6 个里有 4 个不一样：
 #   SHFE→SHF、CZCE→ZCE、CFFEX→CFX、GFEX→GFE（DCE、INE 同名）
 # 直接用 f"{symbol}.{exchange}" 拼会静默返回空表，看起来像「这个品种没数据」。

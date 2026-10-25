@@ -88,6 +88,10 @@ class UpdateResult:
             parts.append(f"新增 {self.added} 根 K 线")
         else:
             parts.append("无新增数据")
+        if self.market == "cn":
+            # 期货的 CSV 存的是「原始价 + 复权因子」，因子和日线是一起下的，
+            # 这里明写一句，免得用户以为只更新了裸价格。
+            parts.append("含复权因子")
         if self.failed:
             parts.append(f"{self.failed} 个失败")
         if self.last_date:
@@ -515,7 +519,17 @@ def update_futures(
             if t["new"] and len(new) < MIN_ROWS_NEW:
                 continue  # 新品种历史太短，视为无效合约
 
-            adj = fut.fetch_adj_close(ts_code, s, e, pro=pro, retries=RETRIES)
+            # 复权因子跟着日线一起下。单独兜底：因子接口抖一下不该让这个标的
+            # 连 K 线都写不进去，否则一次瞬时错误就白跑一个品种。
+            try:
+                adj = fut.fetch_adj_close(ts_code, s, e, pro=pro, retries=RETRIES)
+            except fut.Cancelled:
+                raise
+            except Exception as exc:
+                adj = pd.DataFrame()
+                res.notes.append(
+                    f"{ts_code}: 复权因子未取到，沿用本地因子（{str(exc)[:60]}）"
+                )
             new = fut.attach_adj_factor(new, adj)
             # attach_adj_factor 在复权数据为空时会把因子置 1.0。增量场景下这是错的：
             # 老数据的因子可能已经是 8.0，新行填 1.0 会在拼接处造出一个假跳空。
@@ -569,6 +583,9 @@ def update_futures(
             )
             res.ok += 1
             consec = 0
+        except fut.Cancelled:
+            res.cancelled = True
+            break
         except Exception as exc:
             res.failed += 1
             consec += 1
