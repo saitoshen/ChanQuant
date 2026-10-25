@@ -223,8 +223,9 @@ MARKETS = {
         "slippage": 0.0005,
         "allow_short": False,
         "legend": (
-            "▲ 绿色向上三角＝开多　▼ 绿色向下三角＝平多　"
-            "浅蓝底色＝多头持仓　价格均为后复权（含分红再投资），保证收益率连续"
+            "▲ 紫色向上三角＝开多　▼ 紫色向下三角＝平多　"
+            "浅蓝底色＝多头持仓　红色虚线＝这笔交易盈利　绿色虚线＝亏损　"
+            "价格均为后复权（含分红再投资），保证收益率连续"
         ),
     },
     "cn": {
@@ -236,8 +237,10 @@ MARKETS = {
         "slippage": 0.0002,
         "allow_short": True,
         "legend": (
-            "▲绿＝开多　▼绿＝平多　▼红＝开空　▲红＝平空　"
-            "浅蓝底色＝多头持仓　浅红底色＝空头持仓　价格已按 Tushare 复权因子消除换月跳空"
+            "▲紫＝开多　▼紫＝平多　▼琥珀＝开空　▲琥珀＝平空　"
+            "浅蓝底色＝多头持仓　浅红底色＝空头持仓　"
+            "红色虚线＝这笔交易盈利　绿色虚线＝亏损　"
+            "价格已按 Tushare 复权因子消除换月跳空"
         ),
     },
 }
@@ -1264,13 +1267,18 @@ class MainWindow(QMainWindow):
             ax.scatter(idxs, y, marker=marker, s=72, c=color,
                        edgecolors="white", linewidths=0.9, zorder=6, label=label)
 
-        # 最新价：右上角浮动标签（避免贴边被裁切）
+        # 最新价参考线。只在窗口右端确实是最新一根时才画，而且用中性灰点线：
+        # 原来用红/绿虚线画，跟「持仓盈亏连线」是同一个样式，看着像凭空多出一笔
+        # 还没平的交易。滚到历史位置时这根线也没意义——那是窗口末价，不是最新价。
+        at_latest = start + win >= total
         last_color = C_UP if c[-1] >= o[-1] else C_DOWN
-        ax.axhline(c[-1], color=last_color, lw=0.8, ls=(0, (4, 3)), alpha=0.5, zorder=2)
+        if at_latest:
+            ax.axhline(c[-1], color="#94a3b8", lw=0.8, ls=":", alpha=0.75, zorder=2)
         chg = (c[-1] / c[0] - 1.0) * 100
+        tag = "最新" if at_latest else "末价"
         ax.text(
             0.995, 0.975,
-            f"最新 {c[-1]:,.2f}　区间 {chg:+.1f}%",
+            f"{tag} {c[-1]:,.2f}　区间 {chg:+.1f}%",
             transform=ax.transAxes, ha="right", va="top",
             fontsize=9.5, color="white", fontweight="bold",
             bbox=dict(boxstyle="round,pad=0.34", fc=last_color, ec="none", alpha=0.92),
