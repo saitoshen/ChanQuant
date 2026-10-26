@@ -21,6 +21,8 @@
 import os
 import sys
 
+from PyInstaller.utils.hooks import collect_data_files
+
 # SPECPATH 是 PyInstaller 注入的、本 spec 文件所在目录
 HERE = SPECPATH
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -43,6 +45,12 @@ for sub in ("data", "data_futures"):
     if os.path.isdir(src):
         DATAS.append((src, sub))
 
+# xgboost 的原生库是 ctypes 在**运行时**按路径找的（xgboost/libpath.py 里
+# 第一个候选就是 <包目录>/lib），PyInstaller 的静态分析看不到，也不会自动收集。
+# 少了它打包后 `import xgboost` 直接抛 XGBoostLibraryNotFound，界面上模型下拉
+# 会静默少一项 —— 自检里「机器学习模型依赖」那一项就是专门守这个的。
+DATAS += collect_data_files("xgboost", includes=["lib/*", "VERSION"])
+
 # 动态导入的模块，静态分析扫不到，必须显式声明
 HIDDEN = [
     "matplotlib.backends.backend_qtagg",
@@ -51,6 +59,9 @@ HIDDEN = [
     "ttrade.selftest",
     # 因子策略的机器学习部分：模型按字符串动态 build()，PyInstaller 扫不到。
     # sklearn 的这几处是 GPR 的实际入口，缺了会在运行时报 ImportError。
+    # 注意：别照抄网上抄来的 scipy.special._cdflib —— scipy 1.18 里已经没这个模块，
+    # 写进 hiddenimports 只会得到一行 "Hidden import not found" 警告。
+    # 真正的验收标准是打包后跑 --selftest，里面有一项专门 import 四个模型。
     "lightgbm",
     "xgboost",
     "sklearn.gaussian_process",
@@ -60,8 +71,6 @@ HIDDEN = [
     "sklearn.utils._heap",
     "sklearn.utils._sorting",
     "sklearn.utils._vector_sentinel",
-    "scipy.special._cdflib",
-    "scipy._lib.array_api_compat.numpy.fft",
 ]
 
 # 用不到的重量级依赖，剔掉能省 100MB 以上

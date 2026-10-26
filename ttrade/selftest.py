@@ -328,9 +328,13 @@ def run() -> int:
     except Exception:
         pass
 
-    # 打包成窗口程序时 sys.stdout 是 None（print 会静默丢弃），CI/命令行下才看得到
+    # 打包成窗口程序时 sys.stdout 是 None（print 会静默丢弃），CI/命令行下才看得到。
+    # 英文版 Windows 控制台默认 cp1252/cp936，直接 print 中文会乱码或抛
+    # UnicodeEncodeError，所以先把流切成 utf-8。
     if sys.stdout is not None:
         try:
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
             print(text)
         except Exception:
             pass

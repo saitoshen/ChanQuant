@@ -722,16 +722,34 @@ macOS 的 `.app` 签名后所在卷是**只读**的。之前 `MPLCONFIGDIR` 和 
 
 ### 体积
 
-CI 实测压缩包大小：Windows 104 MB、macOS arm64 82 MB、macOS x64 88 MB；
-解压后约 250 MB，主要是 PySide6（~150MB）、pandas、numpy、matplotlib。
+**v1.1.0（无因子功能）**：Windows 104 MB / macOS arm64 82 MB / macOS x64 88 MB（zip），
+解压后约 241 MB。
+
+**v1.2.0（含因子策略）本地实测**：解压后 **391 MB**，zip **180 MB**。多出来的 150 MB 全是
+机器学习那几件：
+
+| 新增 | 解压后 |
+|---|---|
+| `xgboost/lib/xgboost.dll` | 56.9 MB |
+| `scipy` + `scipy.libs` | 69.1 MB |
+| `sklearn` | 12.4 MB |
+| `lightgbm/bin/lib_lightgbm.dll` | 3.9 MB |
+
+没变的：PySide6 97.9 MB、numpy.libs 21.2 MB、matplotlib 14.4 MB、行情数据 32.2 MB。
+Transformer 故意不用 torch —— 它的 CPU 轮子 1GB 起步，真引进来这份体积会直接失控。
+
 spec 里已剔除 `tkinter`、`PyQt5/6`、`PySide2`、`IPython`、`pytest`
 以及 QtWebEngine / QtQuick / Qt3D / QtMultimedia 等未使用的 Qt 子模块。
-再想瘦身只能换 Nuitka 或砍掉 matplotlib 自绘 K 线。
+**`scipy` 不能剔**：它是 sklearn 和两个 boosting 库的硬依赖，
+早期版本剔掉是省 80MB，现在剔了打出来的包一跑就 ImportError。
+再想瘦身只能换 Nuitka、砍掉 matplotlib 自绘 K 线，或者把 XGBoost 从可选模型里去掉。
 
-**v1.2.0 起体积会明显变大**：因子策略引入 `scikit-learn` + `scipy` + `lightgbm` + `xgboost`。
-其中 `scipy` 以前在 spec 的 `excludes` 里（那时没有因子功能，剔掉省 80MB），
-现在它是 sklearn 和两个 boosting 库的硬依赖，**必须放回来**，否则打出来的包一跑就 ImportError。
-Transformer 故意不用 torch：CPU 轮子 1GB 起步，会让安装包直接涨到 GB 级。
+> **xgboost 的原生库要手动收**。它的 `lib/xgboost.dll` 是 ctypes 在运行时按路径找的，
+> PyInstaller 静态分析看不到，也不会自动收集。漏了它打包后 `import xgboost` 抛
+> `XGBoostLibraryNotFound`，界面上模型下拉会**静默少一项**（4 个变 3 个），
+> 不报错、不崩溃，最容易被忽略。spec 里用
+> `collect_data_files("xgboost", includes=["lib/*", "VERSION"])` 显式收，
+> 自检的「机器学习模型依赖」那一项专门守这个。
 
 ### 已知限制
 
