@@ -18,4 +18,17 @@ requests==2.34.2
 # 让「快速开始」能一路跑通
 tushare==1.4.29
 
+# 因子策略里的机器学习多因子。三件套缺一不可：
+#   scikit-learn 提供高斯过程（GPR），同时 lightgbm / xgboost 的 sklearn
+#   接口也要它；scipy 是 sklearn 的硬依赖（以前在 spec 里被 excludes 掉了，
+#   加因子功能后必须放回来）。
+# Transformer 不走 torch —— ttrade/mlmodels.py 里用 numpy 手写了反向传播，
+# torch 的 CPU 轮子 1GB 起步，会让安装包从 ~99MB 涨到 1GB，不值得。
+scikit-learn==1.9.1
+scipy==1.18.1
+lightgbm==4.7.0
+xgboost==3.4.1
+joblib==1.6.0
+threadpoolctl==3.7.0
+
 # PyInstaller 不写在这里，build.py 会按需自动安装（ensure_pyinstaller）

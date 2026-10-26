@@ -30,7 +30,7 @@ APP_NAME = "TrendDesk"
 BUNDLE_ID = "com.trenddesk.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
@@ -49,6 +49,19 @@ HIDDEN = [
     "matplotlib.backends.backend_agg",
     "ttrade.paths",
     "ttrade.selftest",
+    # 因子策略的机器学习部分：模型按字符串动态 build()，PyInstaller 扫不到。
+    # sklearn 的这几处是 GPR 的实际入口，缺了会在运行时报 ImportError。
+    "lightgbm",
+    "xgboost",
+    "sklearn.gaussian_process",
+    "sklearn.gaussian_process.kernels",
+    "sklearn.metrics.pairwise",
+    "sklearn.utils._typedefs",
+    "sklearn.utils._heap",
+    "sklearn.utils._sorting",
+    "sklearn.utils._vector_sentinel",
+    "scipy.special._cdflib",
+    "scipy._lib.array_api_compat.numpy.fft",
 ]
 
 # 用不到的重量级依赖，剔掉能省 100MB 以上
@@ -57,7 +70,10 @@ EXCLUDES = [
     "tkinter", "_tkinter",
     "PyQt5", "PyQt6", "PySide2", "shiboken2",
     # 科学计算里本项目没用到的
-    "scipy", "sympy", "numba", "mplfinance",
+    # 注意：scipy **不能**剔 —— sklearn（GPR）和 lightgbm/xgboost 都硬依赖它。
+    # 早期版本这里写着 scipy，那时还没有因子功能，剔掉是省了 80MB；
+    # 现在剔了会直接 ImportError，打包后自检会红。
+    "sympy", "numba", "mplfinance",
     # 开发工具
     "IPython", "jupyter", "jupyter_core", "notebook", "nbconvert", "nbformat",
     "pytest", "sphinx", "docutils", "setuptools", "pip",

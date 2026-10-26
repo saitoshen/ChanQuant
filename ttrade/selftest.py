@@ -18,6 +18,7 @@ import traceback
 def _run() -> tuple[bool, list[str]]:
     lines: list[str] = []
     ok = True
+    _cache: dict = {}
 
     # 全程离屏，自检不应该在用户屏幕上闪一个窗口
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -101,6 +102,89 @@ def _run() -> tuple[bool, list[str]]:
 
     check("策略回测", _backtest)
 
+    def _us_df():
+        """自检里反复要用的一份行情，按需加载一次就缓存。"""
+        nonlocal _cache
+        if "us" not in _cache:
+            from ttrade.eastmoney import load_local
+
+            cands = sorted(f[:-4].replace("_", ".") for f in os.listdir(data_dir("us"))
+                           if f.endswith(".csv") and not f.startswith("_"))
+            _cache["us"] = load_local(cands[0], data_dir("us"))
+        return _cache["us"]
+
+    def _factor_lib():
+        from ttrade import factors as F
+
+        df = _us_df()
+        # 美股没有持仓量，oi_change 这类因子本来就不适用，不算失败
+        avail = F.filter_available(df, list(F.FACTORS))
+        bad = [k for k in avail if F.raw(df, k).notna().sum() < 50]
+        if bad:
+            raise RuntimeError(f"这些因子在 {len(df)} 行样本上算不出值：{bad}")
+        missing = [k for k in F.FACTORS if k not in avail]
+        extra = f"（{missing} 该市场无数据）" if missing else ""
+        return f"{len(avail)}/{len(F.FACTORS)} 个因子可算{extra}，样本 {len(df)} 行"
+
+    check("因子库", _factor_lib)
+
+    def _factor_metrics():
+        from ttrade import factor_metrics as M
+        from ttrade import factors as F
+
+        df = _us_df()
+        rep = M.factor_report(df, list(F.FACTORS), horizon=5, window=252)
+        if len(rep) != len(F.FACTORS):
+            raise RuntimeError(f"评估表只有 {len(rep)} 行，应为 {len(F.FACTORS)}")
+        if rep["ic"].isna().all():
+            raise RuntimeError("所有因子的 IC 都是 NaN")
+        return f"{len(rep)} 个因子，|IC| 最大 {rep['ic'].abs().max():.3f}"
+
+    check("因子评估（IC/ICIR/Newey-West）", _factor_metrics)
+
+    def _factor_strategy():
+        from ttrade import factor_strategy as FS
+        from ttrade import factors as F
+
+        df = _us_df()
+        cfg = FS.FactorConfig(window=252, horizon=5)
+        out = FS.run_factor_strategy(df, "single", [F.DEFAULT_SINGLE], cfg)
+        held = int((out.df["signal"] != 0).sum())
+        if held == 0:
+            raise RuntimeError("单因子策略没有产生任何持仓")
+        if "factor_score" not in out.df.columns:
+            raise RuntimeError("策略输出缺少 factor_score 列")
+        return f"单因子 · {F.FACTORS[F.DEFAULT_SINGLE].label}，{held} 根持仓"
+
+    check("因子策略（单因子）", _factor_strategy)
+
+    def _factor_filter():
+        from ttrade import factor_strategy as FS
+        from ttrade import factors as F
+        from ttrade.strategies import run_strategy
+
+        df = _us_df()
+        cfg = FS.FactorConfig(window=252, horizon=5)
+        sig = run_strategy(df, "donchian")["signal"].to_numpy(int)
+        out = FS.run_rule_with_filter(df, sig, "multi", F.DEFAULT_MULTI, cfg)
+        if "rule_signal" not in out.df.columns:
+            raise RuntimeError("过滤结果缺少 rule_signal 列")
+        base = int((sig != 0).sum())
+        kept = int((out.df["signal"] != 0).sum())
+        return f"规则 {base} 根持仓 → 过滤后 {kept} 根"
+
+    check("规则 + 因子过滤", _factor_filter)
+
+    def _ml_deps():
+        from ttrade import mlmodels as ML
+
+        avail = ML.available()
+        if not avail:
+            raise RuntimeError("没有任何可用的机器学习模型，依赖没打进包")
+        return "、".join(ML.MODELS[k]["label"] for k in avail)
+
+    check("机器学习模型依赖", _ml_deps)
+
     def _matplotlib():
         os.environ.setdefault("MPLCONFIGDIR", cache_dir("mpl"))
         import matplotlib
@@ -173,6 +257,31 @@ def _run() -> tuple[bool, list[str]]:
             and win._k_start == max(0, win._k_total - win._k_win)
         )
         k_info = f"窗口 {win._k_win}/{win._k_total} 根"
+
+        # 因子面板：两个策略族、三种因子模式、28 个因子、四类模型都得在
+        fams = {win.cb_family.itemData(i) for i in range(win.cb_family.count())}
+        modes = {win.cb_fmode.itemData(i) for i in range(win.cb_fmode.count())}
+        filters = {win.cb_filter_when.itemData(i) for i in range(win.cb_filter_when.count())}
+        n_factors = win.cb_fsingle.count()
+        n_models = win.cb_fmodel.count()
+        factor_ok = (
+            fams == {"rule", "factor"}
+            and modes == {"single", "multi", "ml"}
+            and filters == {"entry", "delay", "hold"}
+            and n_factors >= 28
+            and n_models >= 4
+            and win.lst_fmulti.count() >= 28
+        )
+        factor_info = f"{len(fams)} 族 / {len(modes)} 模式 / {n_factors} 因子 / {n_models} 模型"
+
+        # 因子分析页：表格应铺满全因子，四格图应建出 4 个轴
+        win.tabs.setCurrentIndex(2)
+        app.processEvents()
+        n_rows = win.tbl_factor.rowCount()
+        n_axes = len(win.canvas_f.fig.axes)
+        win.tabs.setCurrentIndex(0)
+        app.processEvents()
+
         win.close()
         app.processEvents()
 
@@ -186,7 +295,14 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(
                 f"K 线窗口状态异常：win={win._k_win} start={win._k_start} total={win._k_total}"
             )
-        return f"{n} 个标的，K 线与绩效页已渲染，{k_info}，更新面板就绪"
+        if not factor_ok:
+            raise RuntimeError(f"因子面板控件缺失：{factor_info}")
+        if n_rows < 28:
+            raise RuntimeError(f"因子分析页只有 {n_rows} 行，应为 28")
+        if n_axes != 4:
+            raise RuntimeError(f"因子分析页图轴数为 {n_axes}，应为 4")
+        return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
+                f"{factor_info}，更新面板就绪")
 
     check("构建主窗口（端到端）", _window)
 

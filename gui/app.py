@@ -1,9 +1,12 @@
 """美股趋势跟踪研究台 —— PySide6 桌面程序。
 
 功能：
-- 左侧选择标的 / 策略 / 参数 / 显示区间
-- 「K线与信号」页：后复权 K 线、策略指标线、持仓区间底色、买卖信号标记、成交量
+- 左侧选择标的 / 策略族（规则 or 因子）/ 参数 / 显示区间
+- 「K线与信号」页：后复权 K 线、策略指标线、持仓区间底色、买卖信号标记、
+  成交量，因子策略下额外画一行因子分数
 - 「绩效对比」页：策略 vs 买入持有的资金曲线、回撤曲线、指标对比表
+- 「因子分析」页：全因子 IC/ICIR/t 值一览 + IC 时序、衰减、分位收益、
+  模型重要度
 """
 
 from __future__ import annotations
@@ -57,6 +60,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLayout,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -66,6 +71,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -73,7 +79,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ttrade import updater
+from ttrade import factor_metrics, factors, mlmodels, updater
+from ttrade import factor_strategy as fstrat
 from ttrade.backtest import BacktestConfig, buy_and_hold, drawdown_series, run_backtest
 from ttrade.eastmoney import load_local
 from ttrade.strategies import STRATEGIES, run_strategy
@@ -112,6 +119,44 @@ K_WIN_MIN = 40
 K_WIN_MAX = 1500
 K_REDRAW_GAP = 0.15     # 滚动重绘的最小间隔（秒）
 
+# 因子分数面板配色：与 K 线的红绿、信号的紫/琥珀都错开，用青蓝系
+C_FACTOR = "#0891b2"
+C_FACTOR_FILL = "#22d3ee"
+C_IC = "#2563eb"
+C_IC_NEG = "#dc2626"
+
+# ------------------------------------------------------------------ 策略族
+# 两个大类：规则策略（原有 5 个）、因子策略（单/多/机器学习）。
+# 「因子过滤」不是独立大类，而是规则策略的一个可选开关 —— 它只做减法，
+# 拿掉规则本来要开的仓，不自己产生信号。
+FAMILY_RULE = "rule"
+FAMILY_FACTOR = "factor"
+FAMILIES = [
+    (FAMILY_RULE, "规则策略", "经典技术指标，阈值/交叉直接产生信号"),
+    (FAMILY_FACTOR, "因子策略", "因子分数过阈值进出场，可单因子/多因子/机器学习"),
+]
+
+# 因子模式（因子策略与因子过滤共用）
+FACTOR_MODES = [
+    ("single", "单因子", "一个因子的标准化分数过阈值进出场"),
+    ("multi", "多因子等权", "多个因子按 PIT 方向取号后等权平均"),
+    ("ml", "机器学习多因子", "模型学因子权重，walk-forward 滚动训练预测"),
+]
+
+# 因子策略的参数：名字 -> (标签, 最小, 最大, 步长, 默认值)
+FACTOR_PARAMS = {
+    "window": ("标准化窗口", 120, 500, 20, 252),
+    "horizon": ("预测期数", 1, 20, 1, 5),
+    "entry_z": ("进场阈值", 0.3, 3.0, 0.1, 1.0),
+    "exit_z": ("离场阈值", 0.0, 1.5, 0.1, 0.3),
+    "train_window": ("训练窗口", 400, 2500, 100, 1000),
+    "step": ("重训间隔", 60, 400, 20, 180),
+    "long_th": ("多头门槛", -1.5, 1.5, 0.1, 0.0),
+    "short_th": ("空头门槛", -1.5, 1.5, 0.1, 0.0),
+}
+ML_ONLY_PARAMS = ("train_window", "step")
+FILTER_ONLY_PARAMS = ("long_th", "short_th")
+
 from ttrade.plotstyle import setup_matplotlib_fonts
 
 setup_matplotlib_fonts()
@@ -143,6 +188,14 @@ QWidget { font-family: 'Microsoft YaHei', 'Segoe UI'; font-size: 12px; color: #1
 QMainWindow, QWidget#SidePanel { background: #f1f5f9; }
 QScrollArea#SideScroll, QScrollArea#SideScroll > QWidget > QWidget { background: transparent; border: none; }
 QWidget#Card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; }
+QFrame#SubCard { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 7px; }
+QListWidget#FactorList {
+    background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px;
+    font-size: 11px; padding: 2px;
+}
+QListWidget#FactorList::item { padding: 2px 3px; border-radius: 3px; }
+QListWidget#FactorList::item:hover { background: #f1f5f9; }
+QListWidget#FactorList::item:selected { background: #dbeafe; color: #1e40af; }
 QLabel#SectionTitle { font-size: 11px; font-weight: 600; color: #64748b; letter-spacing: 1px; }
 QLabel#AppTitle { font-size: 17px; font-weight: 700; color: #0f172a; }
 QLabel#AppSub { font-size: 11px; color: #64748b; }
@@ -380,13 +433,98 @@ def _extract_trades(sig) -> list[tuple[int, int, int]]:
 
 
 # ------------------------------------------------------------------ 图表基类
+class _CanvasFrozen:
+    """`MplCanvas.frozen()` 的实现体。支持嵌套：只有最外层退出时才补画。"""
+
+    def __init__(self, canvas: "MplCanvas"):
+        self.canvas = canvas
+
+    def __enter__(self):
+        self.canvas._frozen_depth += 1
+        return self.canvas
+
+    def __exit__(self, exc_type, exc, tb):
+        cv = self.canvas
+        cv._frozen_depth = max(0, cv._frozen_depth - 1)
+        if cv._frozen_depth == 0:
+            if exc_type is None:
+                cv._flush_draw()
+            else:
+                # 重建中途出错：别补画半成品，交给下一次完整重建
+                cv._dirty = False
+        return False
+
+
 class MplCanvas(FigureCanvasQTAgg):
+    """matplotlib 画布。
+
+    重建图元时必须用 `frozen()` 包住。原因是 `fig.clear()` 会把 axes 连同
+    它下面的 collection 一起解绑，之后 `collection.get_figure()` 返回 None，
+    而 `_CollectionWithSizes.draw()` 里要读 `get_figure(root=True).dpi`。
+    只要重建期间插进来一次重绘（窗口缩放、切页签、控件显示/隐藏都会触发
+    paintEvent，Qt 完全可以在我们两行代码之间塞一个），就会抛
+
+        AttributeError: 'NoneType' object has no attribute 'dpi'
+
+    所以不能靠「我们只在最后手动 draw() 一次」来保证顺序，得显式把重建期
+    设成不可绘制，退出临界区再同步补画一帧。
+    """
+
     def __init__(self, figsize=(10, 6), dpi=100):
+        # 这两个标志要在 super().__init__ 之前就位：基类构造里可能触发绘制
+        self._frozen_depth = 0
+        self._dirty = False
         self.fig = Figure(figsize=figsize, dpi=dpi, facecolor=C_BG)
         super().__init__(self.fig)
         self.setStyleSheet("background: #ffffff;")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.updateGeometry()
+
+    def frozen(self) -> _CanvasFrozen:
+        return _CanvasFrozen(self)
+
+    def fresh(self) -> Figure:
+        """换一张全新的 Figure 挂到本画布上，并返回它。
+
+        重建图表时不要用 `fig.clear()`：清空之后 matplotlib 有概率留下
+        「还挂在 fig.axes 上、但已经和 figure 解绑」的 collection
+        （`get_figure()` 返回 None）。这种残骸肉眼看不见，要等到下一次绘制
+        才在 `_CollectionWithSizes.draw` 里炸出来：
+
+            AttributeError: 'NoneType' object has no attribute 'dpi'
+
+        因为触发条件跟「清空」和「重绘」的先后顺序有关，偶发、难复现。
+        整张图换掉最干净：新 Figure 里不可能有旧图元，这个失败模式直接消失。
+        代价只是多构造一个 Figure 对象（几十微秒），比 K 线重建本身便宜得多。
+        """
+        old = self.fig
+        fig = Figure(figsize=old.get_size_inches(), dpi=old.dpi, facecolor=C_BG)
+        # matplotlib 3.11 的 Figure.set_canvas() 只写 figure.canvas，不会反过来
+        # 写 canvas.figure，所以两边都要手动指过去。
+        fig._original_dpi = getattr(old, "_original_dpi", old.dpi)
+        fig.set_canvas(self)
+        self.figure = fig
+        self.fig = fig
+        # 把旧 Figure 从画布上摘掉：否则它以后任何 stale 都会回调
+        # canvas.draw_idle()，白白触发一帧重绘。
+        old.canvas = None
+        return fig
+
+    def draw(self):
+        if self._frozen_depth > 0:
+            # 重建中：只记一笔，等 frozen() 退出时统一补画。
+            # 顺手清掉 _draw_pending，否则 draw_idle() 会因为「已有待办」
+            # 一直提前返回，重建完就再也不会重绘了。
+            self._dirty = True
+            self._draw_pending = False
+            return
+        self._dirty = False
+        super().draw()
+
+    def _flush_draw(self):
+        self._dirty = False
+        self._draw_pending = False
+        super().draw()
 
 
 # ------------------------------------------------------------------ 指标卡片
@@ -454,6 +592,53 @@ class UpdateWorker(QObject):
         self.done.emit(res)
 
 
+# ------------------------------------------------------------------ 因子计算线程
+class FactorWorker(QObject):
+    """在后台线程里跑因子策略。
+
+    机器学习模式要跑几十折 walk-forward：LightGBM 约 1s，Transformer 约 18s。
+    放在主线程里窗口会直接假死（连取消都点不动），所以统一走线程。
+    单因子/多因子本身只要几十毫秒，但走同一条路径能少一套分支。
+    """
+
+    progress = Signal(int, int, str)   # done, total, message
+    done = Signal(object)              # FactorOutcome
+    failed = Signal(str)
+
+    def __init__(self, df: pd.DataFrame, mode: str, keys: list[str],
+                 cfg: fstrat.FactorConfig, rule_signal=None):
+        super().__init__()
+        self.df = df
+        self.mode = mode
+        self.keys = keys
+        self.cfg = cfg
+        self.rule_signal = rule_signal
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        cb = lambda d, t, m: self.progress.emit(d, t, m)  # noqa: E731
+        try:
+            if self.rule_signal is None:
+                out = fstrat.run_factor_strategy(
+                    self.df, self.mode, self.keys, self.cfg,
+                    progress=cb, cancel=lambda: self._cancel,
+                )
+            else:
+                out = fstrat.run_rule_with_filter(
+                    self.df, self.rule_signal, self.mode, self.keys, self.cfg,
+                    progress=cb, cancel=lambda: self._cancel,
+                )
+        except fstrat.Cancelled:
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.done.emit(out)
+
+
 # ------------------------------------------------------------------ 主窗口
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -480,9 +665,27 @@ class MainWindow(QMainWindow):
         self.bh = None
         self.param_widgets: dict[str, QWidget] = {}
         self.param_scales: dict[str, int] = {}
+        self.fparam_widgets: dict[str, QWidget] = {}
+        self.fparam_scales: dict[str, int] = {}
         self._pending = False
         self._upd_thread: QThread | None = None
         self._upd_worker: UpdateWorker | None = None
+
+        # 因子相关状态
+        self.family = FAMILY_RULE
+        self.factor_mode = "single"
+        self.factor_keys: list[str] = list(factors.DEFAULT_MULTI)
+        self.factor_outcome = None        # 最近一次 FactorOutcome
+        self._strategy_label = ""         # 当前策略在图上的标题文字
+        self._f_thread: QThread | None = None
+        self._f_worker: FactorWorker | None = None
+        self._f_seq = 0                   # 用于丢弃过期的计算结果
+        self._f_report: pd.DataFrame | None = None
+        self._f_report_key = ""           # 缓存键：标的+市场，避免重复评估
+        # 关窗后仍有排队的信号可能被投递到已销毁的控件上，PySide6 会抛
+        # "Internal C++ object already deleted"。用一个标志把它们挡在门外。
+        self._closing = False
+        self._f_applied = -1              # 已落地的结果序号，防止同一结果重复应用
 
         # K 线可视窗口状态：_k_view 是区间筛选后的全量数据，
         # [_k_start, _k_start+_k_win) 才是当前画出来的那一段。
@@ -517,6 +720,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_chart_tab(), "K线与信号")
         self.tabs.addTab(self._build_perf_tab(), "绩效对比")
+        self.tabs.addTab(self._build_factor_tab(), "因子分析")
         root.addWidget(self.tabs, 1)
 
     def _build_sidebar(self) -> QWidget:
@@ -561,23 +765,168 @@ class MainWindow(QMainWindow):
         self.cb_symbol.setMaxVisibleItems(18)
         cl.addWidget(self.cb_symbol)
 
-        cl.addWidget(self._section("策略"))
+        cl.addWidget(self._section("策略类型"))
+        self.cb_family = QComboBox()
+        for key, label, tip in FAMILIES:
+            self.cb_family.addItem(label, key)
+            self.cb_family.setItemData(
+                self.cb_family.count() - 1, tip, Qt.ToolTipRole
+            )
+        cl.addWidget(self.cb_family)
+
+        # ---------------------------------------------- 规则策略页
+        # 用 show/hide 而不是 QStackedWidget：堆叠容器的高度取所有页的最大值，
+        # 规则模式下会被因子页的因子列表撑出一大块空白。
+        self.box_rule = QWidget()
+        pr = QVBoxLayout(self.box_rule)
+        pr.setContentsMargins(0, 0, 0, 0)
+        pr.setSpacing(8)
+        pr.addWidget(self._section("规则策略"))
         self.cb_strategy = QComboBox()
         for key, spec in STRATEGIES.items():
             self.cb_strategy.addItem(spec.label, key)
-        cl.addWidget(self.cb_strategy)
+        pr.addWidget(self.cb_strategy)
 
         self.lbl_desc = QLabel("")
         self.lbl_desc.setObjectName("Hint")
         self.lbl_desc.setWordWrap(True)
         self.lbl_desc.setMinimumHeight(44)
-        cl.addWidget(self.lbl_desc)
+        pr.addWidget(self.lbl_desc)
 
-        cl.addWidget(self._section("参数"))
+        pr.addWidget(self._section("参数"))
         self.param_box = QVBoxLayout()
         self.param_box.setContentsMargins(0, 0, 0, 0)
         self.param_box.setSpacing(8)
-        cl.addLayout(self.param_box)
+        pr.addLayout(self.param_box)
+        cl.addWidget(self.box_rule)
+
+        # ---------------------------------------------- 因子策略页
+        self.box_factor = QWidget()
+        pf = QVBoxLayout(self.box_factor)
+        pf.setContentsMargins(0, 0, 0, 0)
+        pf.setSpacing(8)
+        pf.addWidget(self._section("因子模式"))
+        self.cb_fmode = QComboBox()
+        for key, label, tip in FACTOR_MODES:
+            self.cb_fmode.addItem(label, key)
+            self.cb_fmode.setItemData(self.cb_fmode.count() - 1, tip, Qt.ToolTipRole)
+        pf.addWidget(self.cb_fmode)
+
+        self.lbl_fmode = QLabel("")
+        self.lbl_fmode.setObjectName("Hint")
+        self.lbl_fmode.setWordWrap(True)
+        pf.addWidget(self.lbl_fmode)
+        cl.addWidget(self.box_factor)
+
+        # ---------------------------------------------- 因子过滤（仅规则模式）
+        self.box_filter = QFrame()
+        self.box_filter.setObjectName("SubCard")
+        fl = QVBoxLayout(self.box_filter)
+        fl.setContentsMargins(10, 9, 10, 9)
+        fl.setSpacing(7)
+
+        self.chk_filter = QCheckBox("用因子过滤规则信号")
+        self.chk_filter.setToolTip(
+            "只做减法：规则说要开仓时，因子不同意就不开。\n"
+            "因子永远不会让规则策略开出它本来不想开的仓。"
+        )
+        fl.addWidget(self.chk_filter)
+
+        self.cb_filter_mode = QComboBox()
+        for key, label, _tip in FACTOR_MODES:
+            self.cb_filter_mode.addItem(label, key)
+        fl.addWidget(self.cb_filter_mode)
+
+        self.cb_filter_when = QComboBox()
+        self.cb_filter_when.addItem("只在开仓时否决", "entry")
+        self.cb_filter_when.addItem("等因子转好再进", "delay")
+        self.cb_filter_when.addItem("转差就离场", "hold")
+        self.cb_filter_when.setToolTip(
+            "只在开仓时否决：规则开仓那一刻因子不同意，整笔跳过，\n"
+            "等规则先平掉再重新开仓才给下一次机会。最严格。\n\n"
+            "等因子转好再进：因子不同意就先等着，转好了再进。\n"
+            "只推迟入场，几乎每笔最终都会进去，对仓位影响很小。\n\n"
+            "转差就离场：持仓期间因子一旦转向立即平仓。\n"
+            "回撤改善最明显，但换手会大幅上升。"
+        )
+        fl.addWidget(self.cb_filter_when)
+        cl.addWidget(self.box_filter)
+
+        # ---------------------------------------------- 因子选择（两处共用）
+        # 因子策略和因子过滤不会同时生效，所以共用一套控件：切换时只换标题，
+        # 选中的因子保留下来，从「策略」改成「过滤」不用重新勾一遍。
+        self.box_fsel = QWidget()
+        sf = QVBoxLayout(self.box_fsel)
+        sf.setContentsMargins(0, 0, 0, 0)
+        sf.setSpacing(8)
+
+        self.lbl_fsel = self._section("因子选择")
+        sf.addWidget(self.lbl_fsel)
+
+        self.cb_fsingle = QComboBox()
+        for cat in factors.CATEGORIES:
+            keys = [k for k, s in factors.FACTORS.items() if s.category == cat]
+            if not keys:
+                continue
+            for i, k in enumerate(keys):
+                spec = factors.FACTORS[k]
+                text = f"{cat} · {spec.label}" if i == 0 else f"　　{spec.label}"
+                self.cb_fsingle.addItem(text, k)
+        idx = self.cb_fsingle.findData(factors.DEFAULT_SINGLE)
+        if idx >= 0:
+            self.cb_fsingle.setCurrentIndex(idx)
+        sf.addWidget(self.cb_fsingle)
+
+        self.lst_fmulti = QListWidget()
+        self.lst_fmulti.setFixedHeight(148)
+        self.lst_fmulti.setObjectName("FactorList")
+        for cat in factors.CATEGORIES:
+            for k, spec in factors.FACTORS.items():
+                if spec.category != cat:
+                    continue
+                item = QListWidgetItem(f"{cat} · {spec.label}")
+                item.setData(Qt.UserRole, k)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(
+                    Qt.Checked if k in factors.DEFAULT_MULTI else Qt.Unchecked
+                )
+                item.setToolTip(spec.desc)
+                self.lst_fmulti.addItem(item)
+        sf.addWidget(self.lst_fmulti)
+
+        sel_row = QWidget()
+        srl = QHBoxLayout(sel_row)
+        srl.setContentsMargins(0, 0, 0, 0)
+        srl.setSpacing(6)
+        self.btn_fall = QPushButton("全选")
+        self.btn_fall.setObjectName("Ghost")
+        self.btn_fall.setFixedHeight(24)
+        self.btn_fnone = QPushButton("清空")
+        self.btn_fnone.setObjectName("Ghost")
+        self.btn_fnone.setFixedHeight(24)
+        srl.addWidget(self.btn_fall)
+        srl.addWidget(self.btn_fnone)
+        srl.addStretch(1)
+        self.box_fbtns = sel_row
+        sf.addWidget(sel_row)
+
+        self.lbl_fmodel = self._section("模型")
+        sf.addWidget(self.lbl_fmodel)
+        self.cb_fmodel = QComboBox()
+        for k in mlmodels.available():
+            self.cb_fmodel.addItem(mlmodels.MODELS[k]["label"], k)
+            self.cb_fmodel.setItemData(
+                self.cb_fmodel.count() - 1, mlmodels.MODELS[k]["desc"], Qt.ToolTipRole
+            )
+        sf.addWidget(self.cb_fmodel)
+
+        self.lbl_fparam = self._section("因子参数")
+        sf.addWidget(self.lbl_fparam)
+        self.fparam_box = QVBoxLayout()
+        self.fparam_box.setContentsMargins(0, 0, 0, 0)
+        self.fparam_box.setSpacing(8)
+        sf.addLayout(self.fparam_box)
+        cl.addWidget(self.box_fsel)
 
         cl.addWidget(self._section("显示区间"))
         self.cb_range = QComboBox()
@@ -786,6 +1135,62 @@ class MainWindow(QMainWindow):
         lay.addWidget(splitter)
         return w
 
+    def _build_factor_tab(self) -> QWidget:
+        """因子分析页：左边全因子 IC/IR 一览，右边四格图。
+
+        表格里列出**所有**因子（不只是选中的），方便横向比较；选中的几行加粗，
+        一眼能看出「我用的这几个因子在池子里算什么水平」。
+        """
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 8, 0)
+        ll.setSpacing(6)
+        cap = QLabel("因子 IC / ICIR 一览")
+        cap.setStyleSheet("font-size: 13px; font-weight: 600; color: #0f172a;")
+        ll.addWidget(cap)
+        self.lbl_frep = QLabel("")
+        self.lbl_frep.setObjectName("Hint")
+        self.lbl_frep.setWordWrap(True)
+        ll.addWidget(self.lbl_frep)
+
+        self.tbl_factor = QTableWidget(0, 7)
+        self.tbl_factor.setHorizontalHeaderLabels(
+            ["因子", "IC", "ICIR", "IC>0", "t(NW)", "单调", "换手"]
+        )
+        self.tbl_factor.verticalHeader().setVisible(False)
+        self.tbl_factor.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl_factor.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tbl_factor.setShowGrid(False)
+        self.tbl_factor.setSortingEnabled(False)
+        hh = self.tbl_factor.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in range(1, 7):
+            hh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        ll.addWidget(self.tbl_factor, 1)
+        splitter.addWidget(left)
+
+        self.canvas_f = MplCanvas(figsize=(8, 7), dpi=100)
+        splitter.addWidget(self.canvas_f)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([430, 760])
+
+        lay.addWidget(splitter)
+
+        self.lbl_fnote = QLabel("")
+        self.lbl_fnote.setObjectName("Hint")
+        self.lbl_fnote.setWordWrap(True)
+        lay.addWidget(self.lbl_fnote)
+        return w
+
     # ---------------------------------------------------------- 数据填充
     def _populate_symbols(self) -> None:
         # 信号只连一次，避免切换市场后重复触发
@@ -796,10 +1201,24 @@ class MainWindow(QMainWindow):
             self.cb_range.currentIndexChanged.connect(self._schedule)
             self.chk_ma.currentIndexChanged.connect(self._schedule)
             self.chk_short.toggled.connect(self._on_short_toggled)
+
+            self.cb_family.currentIndexChanged.connect(self._on_family_changed)
+            self.cb_fmode.currentIndexChanged.connect(self._on_fmode_changed)
+            self.cb_filter_mode.currentIndexChanged.connect(self._on_fmode_changed)
+            self.chk_filter.toggled.connect(self._on_filter_toggled)
+            self.cb_filter_when.currentIndexChanged.connect(
+                lambda *_: self._schedule(immediate=True)
+            )
+            self.cb_fsingle.currentIndexChanged.connect(self._on_factor_selection)
+            self.lst_fmulti.itemChanged.connect(self._on_factor_selection)
+            self.cb_fmodel.currentIndexChanged.connect(self._on_model_changed)
+            self.btn_fall.clicked.connect(lambda: self._check_all_factors(True))
+            self.btn_fnone.clicked.connect(lambda: self._check_all_factors(False))
             self._wired = True
 
         self._fill_symbols()
         self._on_strategy_changed()
+        self._on_family_changed()
         self._sync_update_controls()
         self._schedule(immediate=True)
 
@@ -965,15 +1384,160 @@ class MainWindow(QMainWindow):
         self._rebuild_params(spec)
         self._schedule(immediate=True)
 
-    def _rebuild_params(self, spec) -> None:
-        while self.param_box.count():
-            item = self.param_box.takeAt(0)
+    # ---------------------------------------------------------- 策略族 / 因子面板
+    def _filter_active(self) -> bool:
+        """规则策略是否启用了因子过滤。"""
+        return self.family == FAMILY_RULE and self.chk_filter.isChecked()
+
+    def _factor_mode(self) -> str:
+        """当前生效的因子模式。过滤时取过滤方式，否则取因子策略模式。"""
+        if self._filter_active():
+            return self.cb_filter_mode.currentData() or "single"
+        return self.cb_fmode.currentData() or "single"
+
+    def _on_family_changed(self) -> None:
+        self.family = self.cb_family.currentData() or FAMILY_RULE
+        is_rule = self.family == FAMILY_RULE
+        self.box_rule.setVisible(is_rule)
+        self.box_factor.setVisible(not is_rule)
+        self.box_filter.setVisible(is_rule)
+        self._sync_factor_panel()
+        self._schedule(immediate=True)
+
+    def _on_filter_toggled(self, _checked: bool) -> None:
+        self._sync_factor_panel()
+        self._schedule(immediate=True)
+
+    def _on_fmode_changed(self) -> None:
+        self._sync_factor_panel()
+        self._schedule(immediate=True)
+
+    def _on_model_changed(self) -> None:
+        self._schedule(immediate=True)
+
+    def _sync_factor_panel(self) -> None:
+        """按「在做因子策略」还是「在做因子过滤」切换因子面板的标题与可见性。
+
+        两处共用同一套控件：因子策略和因子过滤不可能同时生效，共用能省一半控件，
+        而且从策略改成过滤时勾好的因子还在，不用重勾一遍。
+        """
+        self.factor_mode = self._factor_mode()
+        show = (self.family == FAMILY_FACTOR) or self._filter_active()
+        self.box_fsel.setVisible(show)
+        if not show:
+            return
+
+        filtering = self._filter_active()
+        self.lbl_fsel.setText("过滤因子" if filtering else "因子选择")
+        single = self.factor_mode == "single"
+        self.cb_fsingle.setVisible(single)
+        self.lst_fmulti.setVisible(not single)
+        self.box_fbtns.setVisible(not single)
+
+        is_ml = self.factor_mode == "ml"
+        self.lbl_fmodel.setVisible(is_ml)
+        self.cb_fmodel.setVisible(is_ml)
+
+        if is_ml and not mlmodels.available():
+            self.lbl_fmode.setText("当前环境没有可用的机器学习库，请先安装依赖。")
+
+        self._rebuild_fparams()
+        self._refresh_fmode_hint()
+
+    def _refresh_fmode_hint(self) -> None:
+        if self.family != FAMILY_FACTOR:
+            self.lbl_fmode.setText("")
+            return
+        for key, _label, tip in FACTOR_MODES:
+            if key == self.factor_mode:
+                self.lbl_fmode.setText(tip)
+                break
+
+    def _check_all_factors(self, on: bool) -> None:
+        self.lst_fmulti.blockSignals(True)
+        state = Qt.Checked if on else Qt.Unchecked
+        for i in range(self.lst_fmulti.count()):
+            self.lst_fmulti.item(i).setCheckState(state)
+        self.lst_fmulti.blockSignals(False)
+        self._on_factor_selection()
+
+    def _on_factor_selection(self, *_args) -> None:
+        keys = self._selected_factor_keys()
+        if self.factor_mode == "ml" and len(keys) < 2:
+            self.lbl_status.setText("机器学习多因子至少需要勾选 2 个因子")
+        self._schedule()
+
+    def _selected_factor_keys(self) -> list[str]:
+        """当前选中的因子。单因子取下拉，多因子/ML 取勾选项（保持库内顺序）。"""
+        if self.factor_mode == "single":
+            k = self.cb_fsingle.currentData()
+            return [k] if k else []
+        picked = set()
+        for i in range(self.lst_fmulti.count()):
+            it = self.lst_fmulti.item(i)
+            if it.checkState() == Qt.Checked:
+                picked.add(it.data(Qt.UserRole))
+        return [k for k in factors.FACTORS if k in picked]
+
+    # ---------------------------------------------------------- 参数滑块
+    def _clear_param_box(self, box, widgets: dict, scales: dict) -> None:
+        while box.count():
+            item = box.takeAt(0)
             wdg = item.widget()
             if wdg:
                 wdg.deleteLater()
-        self.param_widgets.clear()
-        self.param_scales.clear()
+        widgets.clear()
+        scales.clear()
 
+    def _add_param_slider(self, box, widgets: dict, scales: dict,
+                          pname: str, label: str, lo, hi, step, default) -> None:
+        """一个参数一行：标签 + 滑杆 + 数值。整数参数 scale=1，小数参数 scale=10。"""
+        scale = 10 if isinstance(default, float) else 1
+
+        row = QWidget()
+        row.setFixedHeight(28)
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(6)
+
+        lbl = QLabel(label)
+        lbl.setFixedWidth(62)
+        lbl.setFixedHeight(28)
+        lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+
+        sld = QSlider(Qt.Horizontal)
+        sld.setRange(int(round(lo * scale)), int(round(hi * scale)))
+        sld.setSingleStep(max(1, int(round(step * scale))))
+        sld.setPageStep(max(1, int(round(step * scale))) * 2)
+        sld.setValue(int(round(float(default) * scale)))
+        sld.setFixedHeight(24)
+        sld.setCursor(Qt.PointingHandCursor)
+
+        val = QLabel(f"{default:g}")
+        val.setFixedWidth(36)
+        val.setFixedHeight(20)
+        val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        val.setStyleSheet(
+            "color: #1e293b; font-size: 11px; font-weight: 600;"
+            "background: #f1f5f9; border-radius: 4px; padding: 1px 4px;"
+        )
+
+        def on_change(v, _s=scale, _l=val):
+            _l.setText(f"{v / _s:g}")
+
+        sld.valueChanged.connect(on_change)
+        sld.valueChanged.connect(self._schedule)
+
+        rl.addWidget(lbl)
+        rl.addWidget(sld, 1)
+        rl.addWidget(val)
+
+        box.addWidget(row)
+        widgets[pname] = sld
+        scales[pname] = scale
+
+    def _rebuild_params(self, spec) -> None:
+        self._clear_param_box(self.param_box, self.param_widgets, self.param_scales)
         labels = {
             "fast": "快线周期", "slow": "慢线周期", "signal_n": "信号周期",
             "entry": "入场周期", "exit": "离场周期", "n": "通道周期",
@@ -981,50 +1545,28 @@ class MainWindow(QMainWindow):
         }
         for pname, default in spec.params.items():
             lo, hi, step = spec.param_meta.get(pname, (1, 100, 1))
-            is_float = isinstance(default, float)
-            scale = 10 if is_float else 1
-
-            row = QWidget()
-            row.setFixedHeight(28)
-            rl = QHBoxLayout(row)
-            rl.setContentsMargins(0, 0, 0, 0)
-            rl.setSpacing(6)
-
-            lbl = QLabel(labels.get(pname, pname))
-            lbl.setFixedWidth(62)
-            lbl.setFixedHeight(28)
-            lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
-
-            sld = QSlider(Qt.Horizontal)
-            sld.setRange(int(round(lo * scale)), int(round(hi * scale)))
-            sld.setSingleStep(int(round(step * scale)))
-            sld.setPageStep(int(round(step * scale)) * 2)
-            sld.setValue(int(round(float(default) * scale)))
-            sld.setFixedHeight(24)
-            sld.setCursor(Qt.PointingHandCursor)
-
-            val = QLabel(f"{default:g}")
-            val.setFixedWidth(36)
-            val.setFixedHeight(20)
-            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            val.setStyleSheet(
-                "color: #1e293b; font-size: 11px; font-weight: 600;"
-                "background: #f1f5f9; border-radius: 4px; padding: 1px 4px;"
+            self._add_param_slider(
+                self.param_box, self.param_widgets, self.param_scales,
+                pname, labels.get(pname, pname), lo, hi, step, default,
             )
 
-            def on_change(v, _s=scale, _l=val):
-                _l.setText(f"{v / _s:g}")
-
-            sld.valueChanged.connect(on_change)
-            sld.valueChanged.connect(self._schedule)
-
-            rl.addWidget(lbl)
-            rl.addWidget(sld, 1)
-            rl.addWidget(val)
-
-            self.param_box.addWidget(row)
-            self.param_widgets[pname] = sld
-            self.param_scales[pname] = scale
+    def _rebuild_fparams(self) -> None:
+        """因子参数。按模式动态增减：ML 才有训练参数，过滤才有门槛参数。"""
+        self._clear_param_box(self.fparam_box, self.fparam_widgets, self.fparam_scales)
+        filtering = self._filter_active()
+        names = ["window", "horizon"]
+        if filtering:
+            names += ["long_th", "short_th"]
+        else:
+            names += ["entry_z", "exit_z"]
+            if self.factor_mode == "ml":
+                names += ["train_window", "step"]
+        for pname in names:
+            label, lo, hi, step, default = FACTOR_PARAMS[pname]
+            self._add_param_slider(
+                self.fparam_box, self.fparam_widgets, self.fparam_scales,
+                pname, label, lo, hi, step, default,
+            )
 
     def _current_params(self) -> dict:
         out = {}
@@ -1044,7 +1586,12 @@ class MainWindow(QMainWindow):
         if self._pending:
             return
         self._pending = True
-        QTimer.singleShot(220, self._deferred_run)
+        # 机器学习要跑几十折 walk-forward，拖滑杆时 220ms 就重算一次会把线程
+        # 反复打断。给 ML 更长的防抖，让人先拖完再算。
+        delay = 600 if self.factor_mode == "ml" and (
+            self.family == FAMILY_FACTOR or self._filter_active()
+        ) else 220
+        QTimer.singleShot(delay, self._deferred_run)
 
     def _deferred_run(self) -> None:
         self._pending = False
@@ -1058,10 +1605,30 @@ class MainWindow(QMainWindow):
                 return it
         return {"key": key, "symbol": key or "", "name": "", "exchange": ""}
 
+    def _factor_cfg(self) -> fstrat.FactorConfig:
+        """从滑块读出因子配置。缺失的参数（被隐藏的）走默认值。"""
+        def get(name, default):
+            sld = self.fparam_widgets.get(name)
+            if sld is None:
+                return default
+            return sld.value() / self.fparam_scales.get(name, 1)
+
+        return fstrat.FactorConfig(
+            window=int(get("window", 252)),
+            horizon=int(get("horizon", 5)),
+            entry_z=float(get("entry_z", 1.0)),
+            exit_z=float(get("exit_z", 0.3)),
+            model=self.cb_fmodel.currentData() or mlmodels.DEFAULT_MODEL,
+            train_window=int(get("train_window", 1000)),
+            step=int(get("step", 180)),
+            filter_mode=self.cb_filter_when.currentData() or "entry",
+            long_th=float(get("long_th", 0.0)),
+            short_th=float(get("short_th", 0.0)),
+        )
+
     def run_analysis(self) -> None:
         skey = self.cb_symbol.currentData()
-        key = self.cb_strategy.currentData()
-        if not skey or not key:
+        if not skey:
             return
         df = self.store.get(skey)
         if df is None or df.empty:
@@ -1069,21 +1636,148 @@ class MainWindow(QMainWindow):
             return
 
         self.df_raw = df
-        params = self._current_params()
-        try:
-            df_sig = run_strategy(df, key, params)
-        except Exception as exc:
-            self.lbl_status.setText(f"策略计算失败：{exc}")
+        rule_signal = None
+        base_df = df
+
+        if self.family == FAMILY_RULE:
+            rkey = self.cb_strategy.currentData()
+            if not rkey:
+                return
+            try:
+                base_df = run_strategy(df, rkey, self._current_params())
+            except Exception as exc:  # noqa: BLE001
+                self.lbl_status.setText(f"策略计算失败：{exc}")
+                return
+            rule_signal = base_df["signal"].to_numpy(int)
+
+        need_factor = (self.family == FAMILY_FACTOR) or self._filter_active()
+        if not need_factor:
+            self._finish(rule_signal_df=base_df, label=STRATEGIES[self.cb_strategy.currentData()].label)
             return
 
-        self.df_sig = df_sig
-        self.res = run_backtest(df_sig, self.cfg, label=STRATEGIES[key].label)
-        self.bh = buy_and_hold(df, self.cfg)
+        keys = self._selected_factor_keys()
+        if not keys:
+            self.lbl_status.setText("没有选中因子")
+            return
+        if self.factor_mode == "ml" and len(keys) < 2:
+            self.lbl_status.setText("机器学习多因子至少需要勾选 2 个因子")
+            return
 
+        cfg = self._factor_cfg()
+        if self.factor_mode == "ml":
+            self._start_factor_worker(df, keys, cfg, rule_signal)
+            return
+
+        # 单因子 / 多因子只要几十毫秒，同步算完即可，不必起线程
+        try:
+            if rule_signal is None:
+                out = fstrat.run_factor_strategy(df, self.factor_mode, keys, cfg)
+            else:
+                out = fstrat.run_rule_with_filter(
+                    df, rule_signal, self.factor_mode, keys, cfg
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.lbl_status.setText(f"因子计算失败：{exc}")
+            return
+        self._apply_outcome(out, rule_signal)
+
+    def _start_factor_worker(self, df, keys, cfg, rule_signal) -> None:
+        """ML 模式走后台线程。已经在跑的先取消，避免旧结果盖掉新结果。"""
+        self._cancel_factor_worker()
+        self._f_seq += 1
+        seq = self._f_seq
+
+        worker = FactorWorker(df, self.factor_mode, keys, cfg, rule_signal)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_factor_progress)
+        worker.done.connect(lambda out, s=seq: self._on_factor_done(out, s))
+        worker.failed.connect(lambda msg, s=seq: self._on_factor_failed(msg, s))
+        worker.done.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+
+        self._f_worker, self._f_thread = worker, thread
+        self.lbl_status.setText(
+            f"正在训练 {mlmodels.MODELS.get(cfg.model, {}).get('label', cfg.model)}"
+            f"（{len(keys)} 因子，{cfg.train_window} 根训练窗口）…"
+        )
+        thread.start()
+
+    def _cancel_factor_worker(self) -> None:
+        if self._f_worker is not None:
+            self._f_worker.cancel()
+            # 断开信号再退出：否则排队中的 done 会在窗口销毁后才被投递，
+            # PySide6 抛 "Internal C++ object already deleted"。
+            for sig in (self._f_worker.done, self._f_worker.failed,
+                        self._f_worker.progress):
+                try:
+                    sig.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+        thread = self._f_thread
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait(4000)
+            except RuntimeError:
+                # C++ 对象已被 deleteLater 销毁，没什么可等的
+                pass
+        self._f_worker = None
+        self._f_thread = None
+
+    def _on_factor_progress(self, done: int, total: int, msg: str) -> None:
+        self.lbl_status.setText(f"{msg}（共 {total} 折）")
+
+    def _on_factor_done(self, out, seq: int) -> None:
+        self._f_worker = None
+        self._f_thread = None
+        if self._closing or seq != self._f_seq or seq == self._f_applied:
+            return              # 关窗中 / 过期 / 已落地
+        self._f_applied = seq
+        self._apply_outcome(out, None)
+
+    def _on_factor_failed(self, msg: str, seq: int) -> None:
+        self._f_worker = None
+        self._f_thread = None
+        if self._closing or seq != self._f_seq:
+            return
+        self.lbl_status.setText(f"机器学习训练失败：{msg}")
+
+    def _finish(self, rule_signal_df: pd.DataFrame, label: str) -> None:
+        """规则策略（不含因子）的收尾：回测 + 重绘。"""
+        self.factor_outcome = None
+        self.df_sig = rule_signal_df
+        self._strategy_label = label
+        self.res = run_backtest(rule_signal_df, self.cfg, label=label)
+        self.bh = buy_and_hold(self.df_raw, self.cfg)
         self._draw_kline()
         self._draw_perf()
         self._update_metrics()
         self._update_table()
+        self._refresh_factor_tab()
+
+    def _apply_outcome(self, out: fstrat.FactorOutcome, rule_signal) -> None:
+        """因子计算完成后的统一收尾。"""
+        if self._closing:
+            return
+        self.factor_outcome = out
+        self.df_sig = out.df
+        if self.family == FAMILY_FACTOR:
+            label = out.label
+        else:
+            rlabel = STRATEGIES[self.cb_strategy.currentData()].label
+            label = f"{rlabel} + 因子过滤（{out.pack.label}）"
+        self._strategy_label = label
+        self.res = run_backtest(out.df, self.cfg, label=label)
+        self.bh = buy_and_hold(self.df_raw, self.cfg)
+        self._draw_kline()
+        self._draw_perf()
+        self._update_metrics()
+        self._update_table()
+        self._refresh_factor_tab()
 
     # ---------------------------------------------------------- K 线绘制
     def _draw_kline(self) -> None:
@@ -1093,8 +1787,8 @@ class MainWindow(QMainWindow):
         DataFrame、重算策略——那部分在 _render_kline 里按窗口切片完成。
         """
         df = self.df_sig
-        item = self._current_item()
-        key = self.cb_strategy.currentData()
+        if df is None or not len(df):
+            return
 
         years = self.cb_range.currentData()
         if years and len(df):
@@ -1110,15 +1804,25 @@ class MainWindow(QMainWindow):
         # 换标的 / 换策略 / 换区间时回到最新一段，符合看盘习惯
         self._k_win = min(K_WIN_DEFAULT, self._k_total)
         self._k_start = max(0, self._k_total - self._k_win)
-        self._k_spec_label = STRATEGIES[key].label
-        self._k_key = key
+        self._k_spec_label = getattr(self, "_strategy_label", "")
+        self._k_key = self.cb_strategy.currentData() if self.family == FAMILY_RULE else ""
         # 换图是用户主动操作，不受滚动节流限制
         self._k_last_draw = time.monotonic()
         self._k_pending = False
         self._render_kline()
 
     def _render_kline(self) -> None:
-        """按当前窗口 [start, start+win) 重画 K 线，窗口外的数据不进图元。"""
+        """按当前窗口 [start, start+win) 重画 K 线，窗口外的数据不进图元。
+
+        整个重建过程在画布的 frozen() 临界区里跑，避免半成品状态被重绘。
+        """
+        view_all = self._k_view
+        if view_all is None or not len(view_all):
+            return
+        with self.canvas_k.frozen():
+            self._render_kline_impl()
+
+    def _render_kline_impl(self) -> None:
         view_all = self._k_view
         if view_all is None or not len(view_all):
             return
@@ -1150,17 +1854,36 @@ class MainWindow(QMainWindow):
         sig_view = sig_full[start:start + win]
         prev = np.concatenate([[0], sig_full[:-1]])[start:start + win]
 
-        self.canvas_k.fig.clear()
-        gs = self.canvas_k.fig.add_gridspec(
-            2, 1, height_ratios=[4.0, 1.0], hspace=0.06,
-            # left 留够：沪铜、碳酸锂这类五位数报价，0.058 会把最高位切掉
-            left=0.082, right=0.962, top=0.935, bottom=0.085,
+        # 因子模式下多画一行分数曲线：能直接看到「分数在哪里穿过阈值、
+        # 穿过去之后策略怎么走」，比只看三角标记有用得多。
+        has_score = "factor_score" in view_all.columns
+        score_full = (
+            view_all["factor_score"].to_numpy(float) if has_score else None
         )
+
+        self.canvas_k.fresh()
+        if has_score:
+            gs = self.canvas_k.fig.add_gridspec(
+                3, 1, height_ratios=[3.6, 0.85, 1.0], hspace=0.08,
+                left=0.082, right=0.962, top=0.935, bottom=0.085,
+            )
+            axf = self.canvas_k.fig.add_subplot(gs[2], sharex=None)
+        else:
+            gs = self.canvas_k.fig.add_gridspec(
+                2, 1, height_ratios=[4.0, 1.0], hspace=0.06,
+                # left 留够：沪铜、碳酸锂这类五位数报价，0.058 会把最高位切掉
+                left=0.082, right=0.962, top=0.935, bottom=0.085,
+            )
+            axf = None
         ax = self.canvas_k.fig.add_subplot(gs[0])
         axv = self.canvas_k.fig.add_subplot(gs[1], sharex=ax)
+        if axf is not None:
+            axf.sharex(ax)
 
         ax.set_facecolor(C_BG)
         axv.set_facecolor(C_BG)
+        if axf is not None:
+            axf.set_facecolor(C_BG)
 
         # 持仓区间底色：多头蓝、空头红。合并连续区间用 axvspan，
         # 避免逐点 fill_between 产生上千个多边形。
@@ -1306,6 +2029,50 @@ class MainWindow(QMainWindow):
         axv.set_ylabel("量", fontsize=8, color=C_MUTED, rotation=0, labelpad=12)
         axv.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v/1e6:.0f}M" if v >= 1e6 else f"{v/1e3:.0f}K"))
 
+        # ---- 因子分数面板 ----
+        if axf is not None and score_full is not None:
+            sc = score_full[start:start + win]
+            xa = np.arange(len(sc))
+            ok = np.isfinite(sc)
+            if ok.any():
+                axf.plot(xa[ok], sc[ok], color=C_FACTOR, lw=1.1, zorder=4)
+                axf.fill_between(xa, 0.0, np.nan_to_num(sc), where=ok,
+                                 color=C_FACTOR_FILL, alpha=0.16, lw=0, zorder=1)
+            cfg = self._factor_cfg()
+            filtering = self._filter_active()
+            if filtering:
+                lv, sv = cfg.long_th, cfg.short_th
+                axf.axhline(lv, color=C_LONG_SIG, lw=0.9, ls="--", alpha=0.85, zorder=3)
+                # 门槛文字压在分数曲线上，加个半透明白底才读得清
+                box = dict(boxstyle="round,pad=0.15", fc="#ffffff", ec="none", alpha=0.72)
+                if abs(sv - lv) < 1e-9:
+                    # 两个门槛相等（默认都是 0）时只画一条线、一个标签：
+                    # 否则两行文字会精确重叠，糊成一团黑字
+                    axf.text(0.018, lv, f"门槛 {lv:+.1f}",
+                             transform=axf.get_yaxis_transform(),
+                             fontsize=7.5, color=C_LONG_SIG, va="bottom", ha="left",
+                             zorder=6, bbox=box)
+                else:
+                    axf.axhline(sv, color=C_SHORT_SIG, lw=0.9, ls="--", alpha=0.85, zorder=3)
+                    axf.text(0.018, lv, f"多头门槛 {lv:+.1f}",
+                             transform=axf.get_yaxis_transform(),
+                             fontsize=7.5, color=C_LONG_SIG, va="bottom", ha="left",
+                             zorder=6, bbox=box)
+                    axf.text(0.018, sv, f"空头门槛 {sv:+.1f}",
+                             transform=axf.get_yaxis_transform(),
+                             fontsize=7.5, color=C_SHORT_SIG, va="top", ha="left",
+                             zorder=6, bbox=box)
+            else:
+                for lv, col in ((cfg.entry_z, C_LONG_SIG), (-cfg.entry_z, C_SHORT_SIG)):
+                    axf.axhline(lv, color=col, lw=0.9, ls="--", alpha=0.8, zorder=3)
+                for lv in (cfg.exit_z, -cfg.exit_z):
+                    axf.axhline(lv, color=C_MUTED, lw=0.7, ls=":", alpha=0.7, zorder=2)
+            axf.axhline(0.0, color="#cbd5e1", lw=0.7, zorder=2)
+            axf.set_ylabel("因子分", fontsize=8, color=C_MUTED, rotation=0, labelpad=14)
+            axf.grid(True, color=C_GRID, lw=0.5, alpha=0.7)
+            axf.set_axisbelow(True)
+            axf.set_xlim(-1, len(view))
+
         # 坐标轴
         ax.set_xlim(-1, len(view))
         pad = (h.max() - l.min()) * 0.06
@@ -1315,19 +2082,22 @@ class MainWindow(QMainWindow):
         axv.grid(True, color=C_GRID, lw=0.5, alpha=0.7)
         axv.set_axisbelow(True)
 
-        for a in (ax, axv):
+        all_axes = [ax, axv] + ([axf] if axf is not None else [])
+        for a in all_axes:
             for spine in ("top", "right"):
                 a.spines[spine].set_visible(False)
             for spine in ("left", "bottom"):
                 a.spines[spine].set_color("#cbd5e1")
             a.tick_params(colors=C_MUTED, labelsize=9, length=3)
-        ax.tick_params(labelbottom=False)
+        for a in all_axes[:-1]:
+            a.tick_params(labelbottom=False)
 
-        # x 轴日期刻度
+        # x 轴日期刻度放在最下面那根轴上
+        bottom_ax = all_axes[-1]
         n_ticks = min(10, max(4, len(view) // 60))
         tick_pos = np.linspace(0, len(view) - 1, n_ticks).astype(int)
-        axv.set_xticks(tick_pos)
-        axv.set_xticklabels(
+        bottom_ax.set_xticks(tick_pos)
+        bottom_ax.set_xticklabels(
             [view.index[i].strftime("%Y-%m") for i in tick_pos],
             rotation=0, fontsize=9,
         )
@@ -1368,7 +2138,8 @@ class MainWindow(QMainWindow):
         )
 
         self._sync_kline_scrollbar()
-        self.canvas_k.fig.canvas.draw_idle()
+        # 不用再手动 draw()：退出 frozen() 临界区时会同步补画一帧，
+        # 那样能保证「重建完成」和「绘制」之间不会插进别的重绘。
 
     # ---------------------------------------------------------- 窗口滚动 / 缩放
     def _sync_kline_scrollbar(self) -> None:
@@ -1443,9 +2214,13 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------- 绩效图
     def _draw_perf(self) -> None:
+        """绩效页重建，同样走 frozen() 临界区。"""
+        with self.canvas_p.frozen():
+            self._draw_perf_impl()
+
+    def _draw_perf_impl(self) -> None:
         res, bh = self.res, self.bh
-        fig = self.canvas_p.fig
-        fig.clear()
+        fig = self.canvas_p.fresh()
         gs = fig.add_gridspec(
             2, 1, height_ratios=[3.0, 1.0], hspace=0.12,
             left=0.085, right=0.975, top=0.93, bottom=0.085,
@@ -1492,8 +2267,6 @@ class MainWindow(QMainWindow):
                 a.spines[spine].set_color("#cbd5e1")
         for lbl in ax2.get_xticklabels():
             lbl.set_rotation(0)
-
-        fig.canvas.draw_idle()
 
     # ---------------------------------------------------------- 指标
     def _update_metrics(self) -> None:
@@ -1566,9 +2339,222 @@ class MainWindow(QMainWindow):
             self.table.setItem(i, 2, it2)
             self.table.setRowHeight(i, 26)
 
+    # ---------------------------------------------------------- 因子分析页
+    def _ensure_report(self) -> pd.DataFrame:
+        """当前标的的全因子评估表。按「市场+标的」缓存，切参数不用重算。
+
+        28 个因子约 0.3 秒，每次拖滑杆都重算会明显拖慢交互，所以缓存住。
+        """
+        key = f"{self.market}:{self.cb_symbol.currentData()}"
+        if self._f_report is not None and self._f_report_key == key:
+            return self._f_report
+        df = self.df_raw
+        if df is None or df.empty:
+            return pd.DataFrame()
+        cfg = self._factor_cfg()
+        try:
+            rep = factor_metrics.factor_report(
+                df, list(factors.FACTORS), horizon=cfg.horizon,
+                window=cfg.window, method=cfg.method,
+            )
+        except Exception:  # noqa: BLE001
+            rep = pd.DataFrame()
+        self._f_report = rep
+        self._f_report_key = key
+        return rep
+
+    def _refresh_factor_tab(self) -> None:
+        """刷新因子分析页：表格 + 四格图。没有因子在用时也显示全因子一览。"""
+        df = self.df_raw
+        if df is None or df.empty:
+            return
+        cfg = self._factor_cfg()
+        rep = self._ensure_report()
+        if rep.empty:
+            self.lbl_frep.setText("因子评估失败")
+            return
+
+        out = self.factor_outcome
+        selected = list(out.pack.fmat.columns) if out is not None else self._selected_factor_keys()
+        sel_set = set(selected)
+
+        self.tbl_factor.setRowCount(0)
+        for _, r in rep.iterrows():
+            i = self.tbl_factor.rowCount()
+            self.tbl_factor.insertRow(i)
+            on = r["key"] in sel_set
+
+            def cell(text, align_right=True, bold=False, color=None):
+                it = QTableWidgetItem(str(text))
+                if align_right:
+                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if bold:
+                    f = it.font()
+                    f.setBold(True)
+                    it.setFont(f)
+                if color:
+                    it.setForeground(QColor(color))
+                return it
+
+            name = ("● " if on else "　") + str(r["label"])
+            self.tbl_factor.setItem(i, 0, cell(name, False, on, "#1d4ed8" if on else None))
+
+            ic = r.get("ic")
+            ic_color = None
+            if pd.notna(ic):
+                ic_color = "#1d4ed8" if ic > 0 else "#b91c1c"
+            self.tbl_factor.setItem(i, 1, cell("" if pd.isna(ic) else f"{ic:+.4f}", True, on, ic_color))
+
+            for j, col in enumerate(("ir", "ic_pos", "t", "mono", "turnover"), start=2):
+                v = r.get(col)
+                if pd.isna(v) if isinstance(v, float) else v is None:
+                    txt = ""
+                elif col == "ic_pos":
+                    txt = f"{v:.0%}"
+                elif col == "t":
+                    txt = f"{v:+.2f}"
+                else:
+                    txt = f"{v:+.3f}" if col in ("ir", "mono") else f"{v:.3f}"
+                self.tbl_factor.setItem(i, j, cell(txt, True, on))
+            self.tbl_factor.setRowHeight(i, 23)
+
+        n_ok = int(rep["t"].notna().sum()) if "t" in rep else 0
+        n_sig = int((rep["t"].abs() > 2).sum()) if "t" in rep else 0
+        self.lbl_frep.setText(
+            f"{len(rep)} 个因子 · 前向 {cfg.horizon} 日 · 标准化窗口 {cfg.window} 日\n"
+            f"|t|>2 的因子 {n_sig} 个（Newey-West 调整后），有效评估 {n_ok} 个"
+        )
+
+        self._plot_factor_charts(df, cfg, rep, out)
+
+    def _plot_factor_charts(self, df, cfg, rep, out) -> None:
+        """四格图：IC 时序 / IC 衰减 / 分位收益 / 特征重要度（或分数与收益）。"""
+        with self.canvas_f.frozen():
+            self._plot_factor_charts_impl(df, cfg, rep, out)
+
+    def _plot_factor_charts_impl(self, df, cfg, rep, out) -> None:
+        fig = self.canvas_f.fresh()
+        axes = fig.subplots(2, 2)
+        fig.subplots_adjust(left=0.075, right=0.975, top=0.93, bottom=0.09,
+                            hspace=0.34, wspace=0.22)
+        a_ic, a_decay, a_q, a_last = axes.flat
+
+        for a in axes.flat:
+            a.set_facecolor(C_BG)
+            a.grid(True, color=C_GRID, lw=0.5, alpha=0.75)
+            a.set_axisbelow(True)
+            for spine in ("top", "right"):
+                a.spines[spine].set_visible(False)
+            for spine in ("left", "bottom"):
+                a.spines[spine].set_color("#cbd5e1")
+            a.tick_params(colors=C_MUTED, labelsize=8.5, length=3)
+
+        keys = list(out.pack.fmat.columns) if out is not None else self._selected_factor_keys()
+        primary = keys[0] if keys else None
+
+        # ---- 1. IC 时序
+        if primary:
+            f = factors.standardize(factors.raw(df, primary), window=cfg.window, method=cfg.method)
+            fwd = factor_metrics.forward_return(df, cfg.horizon)
+            ser = factor_metrics.ic_series(f, fwd, cfg.window).dropna()
+            if len(ser) > 10:
+                a_ic.plot(ser.index, ser.to_numpy(), color=C_IC, lw=0.9)
+                a_ic.axhline(0, color="#94a3b8", lw=0.8)
+                mu = float(ser.mean())
+                a_ic.axhline(mu, color=C_IC_NEG, lw=0.9, ls="--", alpha=0.85)
+                a_ic.set_title(
+                    f"滚动 IC · {factors.FACTORS[primary].label}"
+                    f"（均值 {mu:+.3f}）",
+                    fontsize=9.5, color=C_TEXT, loc="left",
+                )
+            else:
+                a_ic.set_title("滚动 IC（样本不足）", fontsize=9.5, color=C_TEXT, loc="left")
+        else:
+            a_ic.set_title("滚动 IC（未选因子）", fontsize=9.5, color=C_TEXT, loc="left")
+        a_ic.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.2f}"))
+        # 20 年日频，默认定位器会塞十几个年份标签，在这么小的子图里会连成一片。
+        # 限到 5 个刻度并只留年份，够看趋势又不糊。
+        a_ic.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=5))
+        a_ic.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        a_ic.tick_params(axis="x", labelsize=8)
+
+        # ---- 2. IC 衰减
+        if primary:
+            decay = factor_metrics.ic_decay(df, primary, window=cfg.window, method=cfg.method)
+            xs = np.arange(len(decay))
+            vals = decay.to_numpy(dtype=float)
+            a_decay.bar(xs, vals, color=[C_IC if v >= 0 else C_IC_NEG for v in vals],
+                        width=0.62, alpha=0.85)
+            a_decay.axhline(0, color="#94a3b8", lw=0.8)
+            a_decay.set_xticks(xs)
+            a_decay.set_xticklabels([str(h) for h in decay.index])
+            a_decay.set_xlabel("持有期（交易日）", fontsize=8.5, color=C_MUTED)
+            a_decay.set_title("IC 衰减", fontsize=9.5, color=C_TEXT, loc="left")
+        a_decay.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.2f}"))
+
+        # ---- 3. 分位收益
+        if primary:
+            f = factors.standardize(factors.raw(df, primary), window=cfg.window, method=cfg.method)
+            q = factor_metrics.quantile_returns(
+                f, factor_metrics.forward_return(df, cfg.horizon), 5, cfg.window
+            )
+            if len(q):
+                xs = np.arange(len(q))
+                vals = q.to_numpy(dtype=float) * 100
+                a_q.bar(xs, vals, color=[C_IC if v >= 0 else C_IC_NEG for v in vals],
+                        width=0.6, alpha=0.85)
+                a_q.axhline(0, color="#94a3b8", lw=0.8)
+                a_q.set_xticks(xs)
+                a_q.set_xticklabels([f"Q{i+1}" for i in range(len(q))])
+                mono = factor_metrics.monotonicity(q)
+                ttl = "分位收益" + ("" if pd.isna(mono) else f"（单调性 {mono:+.2f}）")
+                a_q.set_title(ttl, fontsize=9.5, color=C_TEXT, loc="left")
+                a_q.set_ylabel("%", fontsize=8.5, color=C_MUTED)
+        a_q.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.2f}"))
+
+        # ---- 4. 特征重要度 / 综合分数
+        imp = out.pack.importance if out is not None else None
+        if imp is not None and len(imp):
+            top = imp.head(10)[::-1]
+            names = [factors.FACTORS[k].label if k in factors.FACTORS else k for k in top.index]
+            a_last.barh(np.arange(len(top)), top.to_numpy(), color=C_FACTOR, alpha=0.85)
+            a_last.set_yticks(np.arange(len(top)))
+            a_last.set_yticklabels(names, fontsize=8)
+            a_last.set_title(
+                f"因子重要度 · {mlmodels.MODELS.get(cfg.model, {}).get('label', cfg.model)}",
+                fontsize=9.5, color=C_TEXT, loc="left",
+            )
+        elif out is not None:
+            sc = out.pack.score.dropna()
+            if len(sc) > 30:
+                a_last.plot(sc.index, sc.to_numpy(), color=C_FACTOR, lw=0.8)
+                a_last.axhline(0, color="#94a3b8", lw=0.8)
+                for lv, col in ((cfg.entry_z, C_LONG_SIG), (-cfg.entry_z, C_SHORT_SIG)):
+                    a_last.axhline(lv, color=col, lw=0.8, ls="--", alpha=0.75)
+                a_last.set_title("综合因子分数", fontsize=9.5, color=C_TEXT, loc="left")
+                a_last.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=5))
+                a_last.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+                a_last.tick_params(axis="x", labelsize=8)
+        else:
+            a_last.set_title("特征重要度（机器学习模式可用）", fontsize=9.5,
+                             color=C_MUTED, loc="left")
+
+        for a in axes.flat:
+            a.title.set_fontsize(9.5)
+
+        notes = []
+        if out is not None:
+            notes.extend(out.notes)
+        notes.append(
+            "口径：IC 为秩相关；ICIR=滚动IC均值/标准差；t 值经 Newey-West 调整"
+            "（滚动窗口重叠会严重高估显著性）；分位与方向均按 PIT 滚动计算"
+        )
+        self.lbl_fnote.setText(" · ".join(n for n in notes if n))
+
     # ---------------------------------------------------------- 生命周期
     def closeEvent(self, event) -> None:
         """关窗前先让更新线程收尾，避免线程还在写 CSV 就被强杀。"""
+        self._closing = True
         if self._k_redraw_timer.isActive():
             self._k_redraw_timer.stop()
         if self._upd_worker is not None:
@@ -1576,6 +2562,7 @@ class MainWindow(QMainWindow):
         if self._upd_thread is not None:
             self._upd_thread.quit()
             self._upd_thread.wait(3000)
+        self._cancel_factor_worker()
         super().closeEvent(event)
 
 
