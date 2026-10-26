@@ -165,6 +165,26 @@ def _reverse_note(cfg: FactorConfig, keys: list[str]) -> str:
     return f"反转使用：{names}（等效于把该因子取负号）"
 
 
+def _orient_note(ori: pd.DataFrame | None, cfg: FactorConfig) -> str:
+    """自动定向时报出**末期实际生效**的方向。
+
+    这一行是给「为什么 ZN 和 C 上反转结果相反」这类困惑用的：自动定向的符号
+    每个品种不一样、同一品种还会中途翻，光看「反转」两个字完全看不出最后落在
+    哪个绝对方向上。`ori` 里已经是反转之后的值，所以这里报的就是当前真实口径。
+    """
+    if cfg.orient != "auto" or ori is None or ori.empty:
+        return ""
+    tail = ori.dropna(how="all")
+    if tail.empty:
+        return ""
+    last = tail.iloc[-1]
+    up = int((last > 0).sum())
+    down = int((last < 0).sum())
+    if len(last) == 1:
+        return "末期方向：" + ("高分做多（+1）" if up else "高分做空（−1）")
+    return f"末期方向：{up} 个高分做多 / {down} 个高分做空"
+
+
 # ---------------------------------------------------------------- 阈值状态机
 def hysteresis(
     score: np.ndarray, entry: float, exit_: float
@@ -236,6 +256,9 @@ def build_score(
         )
         if cfg.orient == "auto":
             pack.notes.append("方向由扩张窗口 IC 决定（滞后 h 期，无未来信息）")
+            onote = _orient_note(ori, cfg)
+            if onote:
+                pack.notes.append(onote)
         note = _reverse_note(cfg, keys)
         if note:
             pack.notes.append(note)
@@ -252,6 +275,9 @@ def build_score(
         )
         if cfg.orient == "auto":
             pack.notes.append("各因子先按自身 PIT 方向取号，再等权平均")
+            onote = _orient_note(ori, cfg)
+            if onote:
+                pack.notes.append(onote)
         note = _reverse_note(cfg, keys)
         if note:
             pack.notes.append(note)

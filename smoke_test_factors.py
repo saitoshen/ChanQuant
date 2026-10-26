@@ -401,6 +401,60 @@ check("ML 模式说明反转不生效",
       str(p_ml_rev.notes))
 
 
+# ================================================================== 6c. 方向口径
+section("6c. 方向口径（自动 / 固定多 / 固定空）")
+
+p_up = FS.build_score(DF, "single", ["mom_60"],
+                      FS.FactorConfig(window=252, horizon=5, orient="long_high"))
+p_dn = FS.build_score(DF, "single", ["mom_60"],
+                      FS.FactorConfig(window=252, horizon=5, orient="long_low"))
+check("long_high 下分数 = 因子值本身",
+      same_series(p_up.score, p_up.fmat["mom_60"], len(DF)))
+check("long_low 下分数 = 因子值取负",
+      same_series(p_dn.score, -p_dn.fmat["mom_60"], len(DF)))
+check("long_high 的方向矩阵全为 +1",
+      bool((p_up.orient.to_numpy() == 1.0).all()))
+check("long_low 的方向矩阵全为 -1",
+      bool((p_dn.orient.to_numpy() == -1.0).all()))
+
+# 关键：固定方向下「反转」是绝对的，跨品种一致
+p_up_rev = FS.build_score(DF, "single", ["mom_60"], FS.FactorConfig(
+    window=252, horizon=5, orient="long_high", reverse={"mom_60": True}))
+check("固定做多 + 反转 ≡ 固定做空",
+      same_series(p_up_rev.score, p_dn.score, len(DF)))
+
+o_up = FS.run_factor_strategy(DF, "single", ["mom_60"],
+                              FS.FactorConfig(window=252, horizon=5, orient="long_high"))
+o_up_rev = FS.run_factor_strategy(DF, "single", ["mom_60"], FS.FactorConfig(
+    window=252, horizon=5, orient="long_high", reverse={"mom_60": True}))
+o_dn = FS.run_factor_strategy(DF, "single", ["mom_60"],
+                              FS.FactorConfig(window=252, horizon=5, orient="long_low"))
+check("固定方向下反转后的仓位 ≡ 固定反向的仓位",
+      np.array_equal(o_up_rev.df["signal"].to_numpy(), o_dn.df["signal"].to_numpy()))
+check("固定方向下反转后仓位是原仓位的相反数",
+      np.array_equal(o_up_rev.df["signal"].to_numpy(), -o_up.df["signal"].to_numpy()))
+
+# 自动定向：符号是数据决定的，必须报出来，否则用户看不出反转落在哪个绝对方向
+check("自动定向报出末期方向",
+      any("末期方向" in n for n in p_single.notes), str(p_single.notes))
+check("固定方向不报「末期方向」（下拉框已经说明了）",
+      not any("末期方向" in n for n in p_up.notes), str(p_up.notes))
+check("多因子自动定向报出各因子方向分布",
+      any("末期方向" in n for n in p_multi.notes), str(p_multi.notes))
+
+# 自动定向的符号确实会随数据变：这是「同一反转在不同品种上方向相反」的根源
+ori_a = FS.pit_orientation(p_single.fmat["mom_60"],
+                           M.forward_return(DF, 5), 5, 126)
+_shifted = DF.copy()
+_shifted["close"] = _shifted["close"].to_numpy()[::-1].copy()   # 倒序，收益结构变反
+ori_b = FS.pit_orientation(
+    FS.build_score(_shifted, "single", ["mom_60"],
+                   FS.FactorConfig(window=252, horizon=5)).fmat["mom_60"],
+    M.forward_return(_shifted, 5), 5, 126)
+check("自动定向的符号随数据变化（所以「反转」是相对的）",
+      not np.array_equal(ori_a.fillna(0).to_numpy(), ori_b.fillna(0).to_numpy()))
+
+
 # ================================================================== 7. 过滤语义
 section("7. 规则 + 因子过滤")
 rule = FS.hysteresis(DF["close"].pct_change().rolling(20).mean().to_numpy() * 60,

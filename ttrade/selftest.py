@@ -215,6 +215,39 @@ def _run() -> tuple[bool, list[str]]:
 
     check("因子反转（逐因子）", _factor_reverse)
 
+    def _factor_orient():
+        """方向口径三档：固定方向下「反转」必须是绝对的，跨品种可比。"""
+        import numpy as np
+
+        from ttrade import factor_strategy as FS
+        from ttrade import factors as F
+
+        df = _us_df()
+        key = F.DEFAULT_SINGLE
+        up = FS.build_score(df, "single", [key], FS.FactorConfig(window=252, horizon=5,
+                                                                orient="long_high"))
+        dn = FS.build_score(df, "single", [key], FS.FactorConfig(window=252, horizon=5,
+                                                                orient="long_low"))
+        # 固定高分做多 = 直接用因子值；固定高分做空 = 取负
+        if not np.allclose(up.score.fillna(0.0), up.fmat[key].fillna(0.0), atol=1e-12):
+            raise RuntimeError("long_high 下分数应等于因子值")
+        if not np.allclose(dn.score.fillna(0.0), -dn.fmat[key].fillna(0.0), atol=1e-12):
+            raise RuntimeError("long_low 下分数应等于因子值取负")
+
+        # 固定做多 + 反转 ≡ 固定做空（这才是跨品种一致的绝对方向）
+        flip = FS.build_score(df, "single", [key], FS.FactorConfig(
+            window=252, horizon=5, orient="long_high", reverse={key: True}))
+        if not np.allclose(flip.score.fillna(0.0), dn.score.fillna(0.0), atol=1e-12):
+            raise RuntimeError("固定做多 + 反转 应严格等于 固定做空")
+
+        # 自动模式下要能报出末期方向，否则用户看不出反转最后落在哪
+        auto = FS.build_score(df, "single", [key], FS.FactorConfig(window=252, horizon=5))
+        if not any("末期方向" in n for n in auto.notes):
+            raise RuntimeError("自动定向缺少「末期方向」说明")
+        return "固定多/固定空/自动三档正常，末期方向已报出"
+
+    check("因子方向口径", _factor_orient)
+
     def _ml_deps():
         from ttrade import mlmodels as ML
 
@@ -318,6 +351,7 @@ def _run() -> tuple[bool, list[str]]:
         fams = {win.cb_family.itemData(i) for i in range(win.cb_family.count())}
         modes = {win.cb_fmode.itemData(i) for i in range(win.cb_fmode.count())}
         filters = {win.cb_filter_when.itemData(i) for i in range(win.cb_filter_when.count())}
+        orients = {win.cb_forient.itemData(i) for i in range(win.cb_forient.count())}
         n_factors = win.cb_fsingle.count()
         n_models = win.cb_fmodel.count()
         n_rows_f = win.tbl_fmulti.rowCount()
@@ -326,6 +360,8 @@ def _run() -> tuple[bool, list[str]]:
             fams == {"rule", "factor"}
             and modes == {"single", "multi", "ml"}
             and filters == {"entry", "delay", "hold"}
+            # 方向口径三档必须都在，否则「反转」只能相对自动定向，跨品种不可比
+            and orients == {"auto", "long_high", "long_low"}
             and n_factors >= 28
             and n_models >= 4
             # 多因子表要 28 行 × 3 列（因子 / 用 / 反），少了「反」列就没法逐因子反转

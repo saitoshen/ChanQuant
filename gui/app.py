@@ -141,6 +141,22 @@ FACTOR_MODES = [
     ("ml", "机器学习多因子", "模型学因子权重，walk-forward 滚动训练预测"),
 ]
 
+# 因子方向口径。auto 是「让数据说」，另两档是固定方向，跨品种可比。
+FACTOR_ORIENTS = [
+    ("自动（按滚动 IC 定向）", "auto",
+     "方向 = sign(扩张窗口 IC)，滞后预测期数，不含未来信息。\n\n"
+     "注意：这个符号**每个品种不一样，同一品种还会中途翻**。\n"
+     "所以「反转」在自动模式下是相对各品种自己的基线，"
+     "同一个勾选框在不同品种上可能落到相反的绝对方向。\n"
+     "要做跨品种一致的比较，请选下面两档固定方向。"),
+    ("固定：因子高做多", "long_high",
+     "不看 IC，一律「因子分数高就做多、低就做空」。\n"
+     "反转后 = 因子分数高就做空，跨品种完全一致。"),
+    ("固定：因子低做多", "long_low",
+     "不看 IC，一律「因子分数低就做多、高就做空」。\n"
+     "对 rev_5 这类反转因子，这一档就是教科书的短期反转策略。"),
+]
+
 # 因子策略的参数：名字 -> (标签, 最小, 最大, 步长, 默认值)
 FACTOR_PARAMS = {
     "window": ("标准化窗口", 120, 500, 20, 252),
@@ -975,6 +991,17 @@ class MainWindow(QMainWindow):
 
         self.lbl_fparam = self._section("因子参数")
         sf.addWidget(self.lbl_fparam)
+
+        # 方向口径。这一项之前只在 FactorConfig 里存在、界面没暴露，导致「反转」
+        # 是相对「自动定向」的 —— 而自动定向取 sign(扩张 IC)，每个品种不一样、
+        # 同一品种还会中途翻。于是同一个「反转」勾选框在 ZN 上≈高分做空、
+        # 在 C 上≈高分做多，看起来像 bug。选了固定方向，反转就是绝对的、跨品种可比的。
+        self.cb_forient = QComboBox()
+        for label, key, tip in FACTOR_ORIENTS:
+            self.cb_forient.addItem(label, key)
+            self.cb_forient.setItemData(self.cb_forient.count() - 1, tip, Qt.ToolTipRole)
+        sf.addWidget(self.cb_forient)
+
         self.fparam_box = QVBoxLayout()
         self.fparam_box.setContentsMargins(0, 0, 0, 0)
         self.fparam_box.setSpacing(8)
@@ -1264,6 +1291,9 @@ class MainWindow(QMainWindow):
             )
             self.cb_fsingle.currentIndexChanged.connect(self._on_single_factor_changed)
             self.chk_frev.toggled.connect(self._on_frev_toggled)
+            self.cb_forient.currentIndexChanged.connect(
+                lambda *_: self._schedule(immediate=True)
+            )
             self.tbl_fmulti.itemChanged.connect(self._on_factor_selection)
             self.cb_fmodel.currentIndexChanged.connect(self._on_model_changed)
             self.btn_fall.clicked.connect(lambda: self._check_all_factors(True))
@@ -1493,6 +1523,8 @@ class MainWindow(QMainWindow):
         is_ml = self.factor_mode == "ml"
         self.lbl_fmodel.setVisible(is_ml)
         self.cb_fmodel.setVisible(is_ml)
+        # 方向口径对 ML 没意义：模型自己学方向和权重，orient 根本不参与
+        self.cb_forient.setVisible(not is_ml)
 
         if is_ml and not mlmodels.available():
             self.lbl_fmode.setText("当前环境没有可用的机器学习库，请先安装依赖。")
@@ -1740,6 +1772,7 @@ class MainWindow(QMainWindow):
             horizon=int(get("horizon", 5)),
             entry_z=float(get("entry_z", 1.0)),
             exit_z=float(get("exit_z", 0.3)),
+            orient=self.cb_forient.currentData() or "auto",
             reverse={k: True for k in self._reversed_factor_keys()},
             model=self.cb_fmodel.currentData() or mlmodels.DEFAULT_MODEL,
             train_window=int(get("train_window", 1000)),
