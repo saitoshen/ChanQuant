@@ -69,6 +69,10 @@ class UpdateResult:
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)      # 非致命提示（如回退）
     sources: dict[str, int] = field(default_factory=dict)  # 各数据源用了多少个标的
+    # 衍生数据（真实合约 / 期权）的结果。只有界面上勾选了才会跑，所以是
+    # 可选的：`aux=None` 表示「这次没跑」，不是「跑了但没数据」。
+    aux: object | None = None
+    aux_error: str = ""
 
     @property
     def label(self) -> str:
@@ -603,6 +607,56 @@ def update_futures(
     return res
 
 
+# ------------------------------------------------------------------ 衍生数据
+def update_aux(
+    data_root: str | None = None,
+    range_key: str = "1m",
+    want_contracts: bool = True,
+    want_options: bool = True,
+    progress=None,
+    cancel=None,
+    keep_raw_options: bool = False,
+):
+    """更新真实合约 / 期权衍生数据（期限结构、隐含波动率）。
+
+    比主力连续的增量更新慢一个量级：每个交易日都要请求一次全市场横截面，
+    20 年的全量约 40~90 分钟。所以界面上做成可选项，默认不跟着更新。
+
+    只补「行情表里有、衍生数据还没算过」的交易日，所以日常更新只会请求
+    最近几个交易日。返回 `auxbuild.BuildResult`。
+    """
+    from . import auxbuild as AB
+    from . import contracts as C
+
+    root = data_root or os.path.dirname(resolve_data_dir("cn"))
+    days = _days_of(range_key)
+    start = _window_start(days, None).strftime("%Y%m%d")
+
+    all_days = C.trading_days(os.path.join(root, "data_futures"), start=start)
+    if not all_days:
+        raise FileNotFoundError(f"{root}/data_futures 下没有行情数据")
+
+    man = C.load_manifest(os.path.join(root, "data_futures_aux"))
+    done_c = set(man.get("dates") or [])
+    done_o = set(man.get("opt_dates") or [])
+    todo = [
+        d for d in all_days
+        if (want_contracts and d not in done_c) or (want_options and d not in done_o)
+    ]
+    if not todo:
+        res = AB.BuildResult(want_contracts=want_contracts, want_options=want_options)
+        if progress:
+            progress(1, 1, "合约 / 期权数据已是最新")
+        return res
+
+    return AB.build(
+        todo, data_root=root,
+        want_contracts=want_contracts, want_options=want_options,
+        keep_raw_options=keep_raw_options,
+        progress=progress, cancel=cancel,
+    )
+
+
 # ------------------------------------------------------------------ 命令行
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="增量更新行情数据")
@@ -617,6 +671,14 @@ def main(argv: list[str] | None = None) -> int:
         "--interval", type=float, default=us_t.DEFAULT_INTERVAL,
         help=f"Tushare 美股两次调用的最小间隔（秒），默认 {us_t.DEFAULT_INTERVAL:g}",
     )
+    ap.add_argument(
+        "--aux", action="store_true",
+        help="期货更新后接着更新衍生数据（真实合约期限结构 + 期权 IV），很慢",
+    )
+    ap.add_argument(
+        "--aux-what", choices=["both", "contracts", "options"], default="both",
+        help="配合 --aux 用，指定只更新其中一项",
+    )
     args = ap.parse_args(argv)
 
     def on_progress(done: int, total: int, msg: str) -> None:
@@ -630,6 +692,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             res = update_futures(args.data_dir, args.range_key, progress=on_progress)
+            if args.aux:
+                # 衍生数据排在主行情之后：它失败也不影响已经落盘的主力连续。
+                # data_root 是「上一级」，因为 auxbuild 要自己拼 data_futures /
+                # data_contracts / data_futures_aux 三个子目录。
+                aux_root = (os.path.dirname(args.data_dir.rstrip("/\\"))
+                            if args.data_dir else None)
+                aux = update_aux(
+                    aux_root, args.range_key,
+                    want_contracts=args.aux_what in ("both", "contracts"),
+                    want_options=args.aux_what in ("both", "options"),
+                    progress=on_progress,
+                )
+                res.notes.append("衍生数据：" + aux.summary())
+                res.notes.extend(aux.errors[:5])
     except Exception as exc:
         print(f"\n失败：{exc}")
         return 1

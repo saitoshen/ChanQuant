@@ -52,6 +52,140 @@ def _nan_series(df: pd.DataFrame) -> pd.Series:
     return pd.Series(np.nan, index=df.index, dtype=float)
 
 
+def _col(df: pd.DataFrame, name: str) -> pd.Series:
+    """取衍生数据列（期限结构 / 期权），没有就返回全 NaN。
+
+    这些列由 `auxdata.attach()` 在加载时并进来，美股没有、期货里没下过
+    衍生数据的品种也没有。统一返回 NaN 而不是报错，`filter_available()`
+    就会自动把这些因子从该标的的因子列表里剔掉。
+    """
+    if name not in df.columns:
+        return _nan_series(df)
+    return pd.to_numeric(df[name], errors="coerce").astype(float)
+
+
+def _safe_log_ratio(a: pd.Series, b: pd.Series) -> pd.Series:
+    """ln(a/b)，任一侧非正时返回 NaN。"""
+    ok = (a > 0) & (b > 0)
+    return np.log(a.where(ok) / b.where(ok))
+
+
+# ---------------------------------------------------------------- 展期 / 期限结构
+# 展期因子全部来自「同一天、不同到期日」的合约价格，这是主力连续合约给不了的
+# 信息。数据来源见 `ttrade/contracts.py`：c1/c2/c3 是当日最近、次近、第三近
+# 三个有持仓的合约，dte 是距最后交易日的天数。
+def f_roll_yield(df: pd.DataFrame) -> pd.Series:
+    """展期收益率：近月相对次近月的价差率 (P1/P2 - 1)。
+
+    现货溢价（backwardation）时为正——近月比远月贵，多头移仓能赚到价差；
+    期货溢价（contango）时为负，长期持有多头要付出移仓成本。
+    这是商品期货上最经典的一类横截面/时序因子。
+    """
+    return _safe_div(_col(df, "c1_close"), _col(df, "c2_close")) - 1.0
+
+
+def f_roll_annual(df: pd.DataFrame) -> pd.Series:
+    """展期年化收益率：把 P1/P2 的价差按两个合约的到期间隔折算成年化。
+
+    不同品种、不同时点的近远月间隔差异很大（14 天到 160 天都有），
+    不年化就没法横向比较——同样是 1% 的价差，隔 15 天和隔 150 天含义完全不同。
+    """
+    ry = f_roll_yield(df)
+    gap = (_col(df, "c2_dte") - _col(df, "c1_dte")).clip(lower=1.0)
+    return ry * 365.0 / gap
+
+
+def f_roll_curv(df: pd.DataFrame) -> pd.Series:
+    """展期曲率：近端与远端年化斜率之差。
+
+    近端斜率 k1 = ln(P1/P2)/(T2-T1)，远端 k2 = ln(P2/P3)/(T3-T2)，曲率 = k2-k1。
+    用「斜率之差」而不是三点的二阶差分，是因为三个合约的到期间隔通常不等距，
+    直接做二阶差分会被间隔差异污染。曲率为负说明曲线在近端更陡（近月紧张），
+    为正说明远端更陡。
+    """
+    l1 = _safe_log_ratio(_col(df, "c1_close"), _col(df, "c2_close"))
+    l2 = _safe_log_ratio(_col(df, "c2_close"), _col(df, "c3_close"))
+    g1 = (_col(df, "c2_dte") - _col(df, "c1_dte")).clip(lower=1.0)
+    g2 = (_col(df, "c3_dte") - _col(df, "c2_dte")).clip(lower=1.0)
+    return (l2 / g2 - l1 / g1) * 365.0
+
+
+def f_roll_change(df: pd.DataFrame) -> pd.Series:
+    """展期变化：年化展期收益率的 20 日变化。
+
+    用年化值而不是原始价差，是为了减少换月日的跳变——主力合约一换月，
+    c1/c2 直接换成另一对合约，原始价差会出现台阶；年化后台阶小得多。
+    """
+    return f_roll_annual(df).diff(20)
+
+
+def f_near_oi_share(df: pd.DataFrame) -> pd.Series:
+    """近月持仓占比 c1_oi / (c1_oi + c2_oi)。
+
+    接近 1 说明资金都挤在近月，往往对应现货紧张或交割博弈；
+    偏低说明主力已经移到远月，近月价格参考意义下降。
+    """
+    a, b = _col(df, "c1_oi"), _col(df, "c2_oi")
+    return _safe_div(a, a + b)
+
+
+# ---------------------------------------------------------------- 期权 / 波动率曲面
+# 期权因子是唯一「不靠价格历史就能得到」的一类信息：市场对未来波动的定价
+# 直接写在期权价格里。数据来源见 `ttrade/options.py`。
+def f_iv_atm(df: pd.DataFrame) -> pd.Series:
+    """近月平值隐含波动率（ATM IV）。
+
+    由当日近月期权整条微笑做二次拟合后在 K=F 处取值，不是单点插值。
+    IV 高说明市场为未来波动付了高价，常见于恐慌或事件前。
+    """
+    return _col(df, "iv_near")
+
+
+def f_iv_term(df: pd.DataFrame) -> pd.Series:
+    """IV 期限结构斜率：(IV_次月 - IV_近月) / 间隔天数 × 30，即「每月多少 IV 点」。
+
+    正值＝远月更贵（正常，波动率曲线通常上倾）；负值＝近月恐慌，
+    是压力期最典型的信号之一（现货紧张、事件冲击）。
+    """
+    iv1, iv2 = _col(df, "iv_near"), _col(df, "iv_next")
+    gap = (_col(df, "dte_next") - _col(df, "dte_near")).clip(lower=1.0)
+    return (iv2 - iv1) / gap * 30.0
+
+
+def f_iv_skew(df: pd.DataFrame) -> pd.Series:
+    """偏度：IV 微笑在平值处对 ln(K/F) 的一阶导 dIV/dlnK。
+
+    正值＝虚值看涨比虚值看跌贵（市场怕涨）；负值＝虚值看跌更贵（市场怕跌）。
+    商品期权多数时间是负偏，因为下跌往往伴随波动率跳升。
+    """
+    return _col(df, "skew")
+
+
+def f_iv_rv(df: pd.DataFrame) -> pd.Series:
+    """方差风险溢价：近月 ATM IV 减去 20 日已实现波动率。
+
+    期权通常比事后实现的波动更贵（卖方收溢价），所以这个差值长期偏正。
+    差值被压到 0 附近甚至转负，说明期权相对便宜，或市场已进入高波动状态。
+    两个量都是年化的，可以直接相减。
+    """
+    return _col(df, "iv_near") - f_vol_20(df)
+
+
+def f_iv_change(df: pd.DataFrame) -> pd.Series:
+    """IV 的 20 日变化。衡量波动率预期的动量。"""
+    return _col(df, "iv_near").diff(20)
+
+
+def f_pcr(df: pd.DataFrame) -> pd.Series:
+    """看跌/看涨持仓比（Put/Call Ratio），取对数。
+
+    >1 说明看跌期权持仓更多，情绪偏空。取对数是因为这个比值天然是
+    乘性的（0.5 与 2.0 是同一件事的两个方向），取完对数才左右对称。
+    """
+    r = _col(df, "pcr")
+    return np.log(r.where(r > 0))
+
+
 # ---------------------------------------------------------------- 趋势 / 动量
 def f_mom_20(df: pd.DataFrame) -> pd.Series:
     """20 日动量。短期趋势延续。"""
@@ -297,11 +431,41 @@ _reg(FactorSpec("close_pos", "收盘位置", f_close_pos, "形态", "10 日平�
 _reg(FactorSpec("gap", "跳空幅度", f_gap, "形态", "10 日平均跳空幅度。"))
 _reg(FactorSpec("macd_hist", "MACD 柱", f_macd_hist, "形态", "MACD 柱/收盘价，趋势强度的归一化表达。"))
 
+# 展期：需要真实合约（同一天不同到期日），来自 data_futures_aux
+_reg(FactorSpec("roll_yield", "展期收益率", f_roll_yield, "展期",
+                "近月/次近月价差率，现货溢价为正、期货溢价为负。"))
+_reg(FactorSpec("roll_annual", "展期年化", f_roll_annual, "展期",
+                "展期收益率按近远月间隔折算成年化，跨品种可比。"))
+_reg(FactorSpec("roll_curv", "展期曲率", f_roll_curv, "展期",
+                "近端与远端年化斜率之差，刻画期限结构弯曲程度。"))
+_reg(FactorSpec("roll_change", "展期变化", f_roll_change, "展期",
+                "年化展期收益率的 20 日变化，反映曲线陡峭度的动量。"))
+_reg(FactorSpec("near_oi_share", "近月持仓占比", f_near_oi_share, "展期",
+                "近月持仓 / (近月+次近) 持仓，衡量资金是否挤在近月。"))
 
-CATEGORIES: list[str] = ["趋势", "反转", "波动", "量能", "形态"]
+# 期权：需要期权日线反解出的波动率曲面，来自 data_futures_aux
+_reg(FactorSpec("iv_atm", "平值 IV", f_iv_atm, "期权",
+                "近月平值隐含波动率，来自期权微笑的二次拟合。"))
+_reg(FactorSpec("iv_term", "IV 期限结构", f_iv_term, "期权",
+                "次月与近月 IV 的月度斜率，负值代表近月恐慌。"))
+_reg(FactorSpec("iv_skew", "IV 偏度", f_iv_skew, "期权",
+                "IV 对 ln(K/F) 的斜率，负偏＝市场更怕跌。"))
+_reg(FactorSpec("iv_rv", "IV-RV 价差", f_iv_rv, "期权",
+                "平值 IV 减 20 日已实现波动率，即方差风险溢价。"))
+_reg(FactorSpec("iv_change", "IV 变化", f_iv_change, "期权",
+                "平值 IV 的 20 日变化，波动率预期的动量。"))
+_reg(FactorSpec("pcr", "看跌看涨持仓比", f_pcr, "期权",
+                "Put/Call 持仓比取对数，>0 表示情绪偏空。"))
+
+
+CATEGORIES: list[str] = ["趋势", "反转", "波动", "量能", "形态", "展期", "期权"]
 
 DEFAULT_SINGLE = "mom_60"
 DEFAULT_MULTI = ["mom_20", "mom_60", "mom_120", "rev_5", "vol_20", "breakout_pos"]
+
+# 需要额外数据（真实合约 / 期权）才能算的因子。美股没有这些数据，
+# 界面上要把它们和「算不出来」区分开，而不是显示成一堆空行。
+AUX_KEYS = [k for k, s in FACTORS.items() if s.category in ("展期", "期权")]
 
 
 # ---------------------------------------------------------------- 计算

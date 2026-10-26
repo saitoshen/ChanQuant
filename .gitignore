@@ -17,6 +17,11 @@ output/
 data*.bak*/
 data*.bak_*/
 
+# 真实合约与期权原始明细：约 130MB / 1.5GB，用 download_aux.py 重新生成，
+# 不入库也不打进安装包。聚合后的 data_futures_aux/ 很小，需要入库。
+data_contracts/
+data_options_raw/
+
 # 工具内部的工作记忆，不属于项目源码
 .workbuddy-ai/
 

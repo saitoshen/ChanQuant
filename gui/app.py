@@ -272,6 +272,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 
 # ------------------------------------------------------------------ 数据仓库
 FUT_DIR = resolve_data_dir("cn")
+AUX_DIR = resolve_data_dir("aux")
 
 EXCHANGE_CN = {
     "SHFE": "上期所",
@@ -340,7 +341,16 @@ def load_futures_csv(key: str, data_dir: str) -> pd.DataFrame:
         for col in ("open", "high", "low", "close"):
             df[col] = df[col].to_numpy(dtype=float) * f
 
-    return df.set_index("date")
+    df = df.set_index("date")
+    # 并入期限结构 / 期权波动率列（展期因子、期权因子要用）。缺文件时静默跳过。
+    sym, _, ex = key.rpartition("_")
+    try:
+        from ttrade.auxdata import attach as attach_aux
+
+        df = attach_aux(df, sym, ex, AUX_DIR)
+    except Exception:
+        pass
+    return df
 
 
 class DataStore:
@@ -601,13 +611,16 @@ class UpdateWorker(QObject):
     failed = Signal(str)
 
     def __init__(self, market: str, data_dir: str, range_key: str,
-                 source: str = "auto", min_interval: float = 60.0):
+                 source: str = "auto", min_interval: float = 60.0,
+                 aux_contracts: bool = False, aux_options: bool = False):
         super().__init__()
         self.market = market
         self.data_dir = data_dir
         self.range_key = range_key
         self.source = source
         self.min_interval = min_interval
+        self.aux_contracts = aux_contracts
+        self.aux_options = aux_options
         self._cancel = False
 
     def cancel(self) -> None:
@@ -627,6 +640,19 @@ class UpdateWorker(QObject):
                     self.data_dir, self.range_key, progress=cb,
                     cancel=lambda: self._cancel,
                 )
+                if self.aux_contracts or self.aux_options:
+                    # 衍生数据放在主力连续之后跑：即使它失败，主行情也已经落盘了
+                    try:
+                        res.aux = updater.update_aux(
+                            range_key=self.range_key,
+                            want_contracts=self.aux_contracts,
+                            want_options=self.aux_options,
+                            progress=cb,
+                            cancel=lambda: self._cancel,
+                        )
+                    except Exception as exc:
+                        res.aux = None
+                        res.aux_error = str(exc)[:200]
         except Exception as exc:
             self.failed.emit(str(exc))
             return
@@ -942,7 +968,7 @@ class MainWindow(QMainWindow):
         self.tbl_fmulti.setFixedHeight(176)
         self.tbl_fmulti.setHorizontalHeaderLabels(["因子", "用", "反"])
         self.tbl_fmulti.verticalHeader().setVisible(False)
-        # 28 行要尽量多露几行，默认行高太松，176px 只能看到 5 个
+        # 39 行一屏放不下，行高压紧到 21px，176px 能露 8 行，剩下的滚动
         self.tbl_fmulti.verticalHeader().setDefaultSectionSize(21)
         self.tbl_fmulti.setShowGrid(False)
         self.tbl_fmulti.setSelectionMode(QAbstractItemView.NoSelection)
@@ -1142,6 +1168,28 @@ class MainWindow(QMainWindow):
             self.cb_upd_rate.addItem(label, sec)
         self.cb_upd_rate.setToolTip("只约束 Tushare 美股接口；东财与期货不受影响")
         lay.addWidget(self.cb_upd_rate)
+
+        # 合约 / 期权衍生数据。这两项要按「每个交易日一次全市场横截面」取数，
+        # 比主力连续的增量更新慢一个量级，所以做成显式勾选，默认不跟。
+        self.lbl_upd_aux = QLabel("衍生数据（展期 / 期权因子用）")
+        self.lbl_upd_aux.setObjectName("Hint")
+        lay.addWidget(self.lbl_upd_aux)
+
+        self.chk_upd_contracts = QCheckBox("一并更新真实合约（期限结构）")
+        self.chk_upd_contracts.setToolTip(
+            "下载全部真实合约的日线，生成近/次近/第三近合约的期限结构。\n"
+            "展期收益率、展期年化、展期曲率、展期变化依赖它。\n"
+            "每个交易日一次全市场请求，比主力连续慢很多（20 年全量约 40 分钟）。"
+        )
+        lay.addWidget(self.chk_upd_contracts)
+
+        self.chk_upd_options = QCheckBox("一并更新期权（隐含波动率）")
+        self.chk_upd_options.setToolTip(
+            "下载商品期权日线，反解平值 IV、偏度、期限结构与看跌看涨持仓比。\n"
+            "只保留聚合结果（原始期权明细约 1.5GB，默认不落盘）。\n"
+            "商品期权 2017 年才上市，更早的日期会自动跳过。"
+        )
+        lay.addWidget(self.chk_upd_options)
 
         self.prog_update = QProgressBar()
         self.prog_update.setTextVisible(False)
@@ -1382,13 +1430,19 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------- 数据更新
     def _sync_update_controls(self) -> None:
-        """美股才需要选数据源和限速；期货固定 Tushare、不限速，换成一行说明。"""
+        """美股才需要选数据源和限速；期货固定 Tushare、不限速，换成一行说明。
+
+        合约 / 期权的「一并更新」只对期货有意义（美股没有这两个数据集），
+        所以在美股下整块隐藏，避免摆一个点了没反应的开关。
+        """
         if not hasattr(self, "cb_upd_source"):
             return
         is_us = self.market == "us"
         self.cb_upd_source.setVisible(is_us)
         self.cb_upd_rate.setVisible(is_us)
         self.lbl_upd_src.setVisible(not is_us)
+        for w in (self.lbl_upd_aux, self.chk_upd_contracts, self.chk_upd_options):
+            w.setVisible(not is_us)
 
     def _on_update_clicked(self) -> None:
         # 正在更新时，这个按钮变成「取消」
@@ -1407,8 +1461,13 @@ class MainWindow(QMainWindow):
             self.cb_upd_source.currentData() if mk == "us" else updater.SOURCE_TUSHARE
         )
         rate = float(self.cb_upd_rate.currentData() or 0.0)
+        aux_c = bool(mk == "cn" and self.chk_upd_contracts.isChecked())
+        aux_o = bool(mk == "cn" and self.chk_upd_options.isChecked())
 
-        self._upd_worker = UpdateWorker(mk, MARKETS[mk]["dir"], key, source, rate)
+        self._upd_worker = UpdateWorker(
+            mk, MARKETS[mk]["dir"], key, source, rate,
+            aux_contracts=aux_c, aux_options=aux_o,
+        )
         self._upd_thread = QThread(self)
         self._upd_worker.moveToThread(self._upd_thread)
         self._upd_thread.started.connect(self._upd_worker.run)
@@ -1433,16 +1492,23 @@ class MainWindow(QMainWindow):
     def _on_update_done(self, res) -> None:
         self._finish_update_thread()
         self.lbl_upd.setVisible(True)
-        self.lbl_upd.setText(res.summary())
+        text = res.summary()
+        aux = getattr(res, "aux", None)
+        if aux is not None:
+            text += f"\n衍生数据：{aux.summary()}"
+        err = getattr(res, "aux_error", "")
+        if err:
+            text += f"\n衍生数据更新失败：{err}"
+        self.lbl_upd.setText(text)
 
         self._reload_store(res.market)
 
         problems = list(res.errors) + list(res.notes)
-        if problems:
+        if problems or err:
             more = f"\n… 另有 {len(problems) - 6} 条" if len(problems) > 6 else ""
             QMessageBox.information(
                 self, "数据更新",
-                res.summary() + "\n\n" + "\n".join(problems[:6]) + more,
+                text + ("\n\n" + "\n".join(problems[:6]) + more if problems else ""),
             )
 
     def _on_update_failed(self, message: str) -> None:
@@ -1958,6 +2024,16 @@ class MainWindow(QMainWindow):
         self._update_metrics()
         self._update_table()
         self._refresh_factor_tab()
+
+        # 展期/期权因子需要额外的合约与期权数据。美股没有，部分期货品种也可能
+        # 没下过衍生数据 —— 这种情况分数全为 NaN，回测结果是「一笔交易都没有」。
+        # 不解释一句的话，看起来就像策略本身没信号，实际是数据没到。
+        score = getattr(out.pack, "score", None)
+        if score is not None and int(score.notna().sum()) == 0:
+            why = "需要真实合约 / 期权数据" if self.market == "cn" else "美股没有合约与期权数据"
+            self.lbl_status.setText(
+                f"所选因子在当前标的没有任何可用值（{why}），因此不会产生信号"
+            )
 
     # ---------------------------------------------------------- K 线绘制
     def _draw_kline(self) -> None:
@@ -2523,7 +2599,7 @@ class MainWindow(QMainWindow):
     def _ensure_report(self) -> pd.DataFrame:
         """当前标的的全因子评估表。按「市场+标的」缓存，切参数不用重算。
 
-        28 个因子约 0.3 秒，每次拖滑杆都重算会明显拖慢交互，所以缓存住。
+        39 个因子约 0.4 秒，每次拖滑杆都重算会明显拖慢交互，所以缓存住。
         """
         key = f"{self.market}:{self.cb_symbol.currentData()}"
         if self._f_report is not None and self._f_report_key == key:
@@ -2583,7 +2659,15 @@ class MainWindow(QMainWindow):
             ic_color = None
             if pd.notna(ic):
                 ic_color = "#1d4ed8" if ic > 0 else "#b91c1c"
-            self.tbl_factor.setItem(i, 1, cell("" if pd.isna(ic) else f"{ic:+.4f}", True, on, ic_color))
+                self.tbl_factor.setItem(i, 1, cell(f"{ic:+.4f}", True, on, ic_color))
+            elif r.get("key") in factors.AUX_KEYS:
+                # 展期 / 期权因子在美股、以及没下过衍生数据的期货品种上是空的。
+                # 留白会让人以为「算出来是 0」，写清楚是没数据。
+                it = cell("无数据", True, False, "#94a3b8")
+                it.setToolTip("该标的没有真实合约 / 期权数据，这个因子无法计算")
+                self.tbl_factor.setItem(i, 1, it)
+            else:
+                self.tbl_factor.setItem(i, 1, cell("", True, on))
 
             for j, col in enumerate(("ir", "ic_pos", "t", "mono", "turnover"), start=2):
                 v = r.get(col)

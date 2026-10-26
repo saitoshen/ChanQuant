@@ -45,8 +45,23 @@ def bundle_root() -> str:
 
 
 def data_dir(market: str = "us") -> str:
-    """行情数据目录。market: 'us' 美股 / 'cn' 国内期货。"""
-    sub = "data" if market == "us" else "data_futures"
+    """行情数据目录。market: 'us' 美股 / 'cn' 国内期货。
+
+    另有三个「衍生数据」目录，都由 Tushare 明细聚合而来：
+
+    - `contracts`：全部**真实合约**日线（每品种一个文件），体积大（约 130MB），
+      不进 git、不打进包，靠 `python download_contracts.py` 生成；
+    - `aux`：从真实合约/期权聚合出的**期限结构与波动率摘要**，每品种一个文件，
+      体积小（约 30MB），随包分发 —— 展期因子和期权因子只依赖它；
+    - `options_raw`：期权原始日线（可选，`--keep-raw` 才生成，1GB 量级）。
+    """
+    sub = {
+        "us": "data",
+        "cn": "data_futures",
+        "contracts": "data_contracts",
+        "aux": "data_futures_aux",
+        "options_raw": "data_options_raw",
+    }.get(market, market)
     return os.path.join(bundle_root(), sub)
 
 

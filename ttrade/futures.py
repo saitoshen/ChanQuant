@@ -458,6 +458,7 @@ def load_local(
     data_dir: str,
     clean: bool = True,
     adjust: str = "qfq",
+    aux_dir: str | None = None,
 ) -> pd.DataFrame:
     """读取本地期货 CSV，返回与美股一致的 DataFrame。
 
@@ -474,6 +475,9 @@ def load_local(
     三种模式的**收益率完全相同**（只是整体乘一个常数），差异仅在价格绝对水平；
     默认用 qfq 是为了让 GUI 显示的价格与真实盘面一致。
     成交量、成交额、持仓量不参与复权。
+
+    最后会从 `aux_dir`（默认是 data_futures 旁边的 data_futures_aux）并入
+    期限结构与期权波动率列，供展期/期权因子使用。缺文件时静默跳过。
     """
     path = os.path.join(data_dir, f"{symbol}_{exchange}.csv")
     df = pd.read_csv(path)
@@ -493,6 +497,14 @@ def load_local(
             df[col] = df[col].to_numpy(dtype=float) * f
 
     df = df.set_index("date")
+    if aux_dir is None:
+        aux_dir = os.path.join(os.path.dirname(data_dir.rstrip("/\\")), "data_futures_aux")
+    try:
+        from .auxdata import attach as attach_aux
+
+        df = attach_aux(df, symbol, exchange, aux_dir)
+    except Exception:
+        pass
     return df
 
 

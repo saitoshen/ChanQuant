@@ -78,6 +78,42 @@ CUT = 800          # 截断点：前 800 行必须完全一致
 KEYS6 = ["mom_20", "mom_60", "mom_120", "rev_5", "vol_20", "breakout_pos"]
 
 
+def add_aux(df: pd.DataFrame, seed: int = 11) -> pd.DataFrame:
+    """给行情补上期限结构 / 期权摘要列。
+
+    真实环境里这些列由 `auxdata.attach()` 在加载时并进来，冒烟测试不联网，
+    所以手工造一份，好让展期、期权因子也走同一套「算得出、无 inf、无未来」
+    的检查。三档到期日刻意不等距 —— 等距会让「用斜率差而不是二阶差分」
+    这个设计缺陷（如果有）测不出来。
+    """
+    rng = np.random.default_rng(seed)
+    n = len(df)
+    out = df.copy()
+    d1 = rng.integers(15, 40, n).astype(float)
+    d2 = d1 + rng.integers(20, 45, n)
+    d3 = d2 + rng.integers(25, 50, n)
+    px = df["close"].to_numpy(float)
+    out["c1_close"] = px
+    out["c2_close"] = px * (1.0 + rng.normal(0.01, 0.02, n))
+    out["c3_close"] = out["c2_close"].to_numpy() * (1.0 + rng.normal(0.01, 0.02, n))
+    out["c1_dte"], out["c2_dte"], out["c3_dte"] = d1, d2, d3
+    oi = df["volume"].to_numpy(float)
+    out["c1_oi"] = oi * rng.uniform(0.3, 0.8, n)
+    out["c2_oi"] = oi * rng.uniform(0.4, 1.2, n)
+    out["c3_oi"] = oi * rng.uniform(0.2, 0.9, n)
+    out["iv_near"] = 0.20 + rng.normal(0.0, 0.02, n)
+    out["iv_next"] = out["iv_near"].to_numpy() + rng.normal(0.005, 0.01, n)
+    out["dte_near"], out["dte_next"] = d1, d2
+    out["skew"] = rng.normal(0.1, 0.15, n)
+    out["curv"] = rng.normal(0.3, 0.4, n)
+    out["pcr"] = np.exp(rng.normal(0.0, 0.3, n))
+    out["n_opt"] = rng.integers(20, 300, n)
+    return out
+
+
+DF_AUX = add_aux(DF)
+
+
 def same_series(a: pd.Series, b: pd.Series, k: int, tol: float = 1e-9) -> bool:
     x = a.iloc[:k].to_numpy(dtype=float)
     y = b.iloc[:k].to_numpy(dtype=float)
@@ -93,24 +129,29 @@ def same_series(a: pd.Series, b: pd.Series, k: int, tol: float = 1e-9) -> bool:
 
 # ================================================================== 1. 因子库
 section("1. 因子库")
-check("因子数量", len(F.FACTORS) == 28, f"实际 {len(F.FACTORS)}")
-check("分类齐全", set(F.CATEGORIES) == {"趋势", "反转", "波动", "量能", "形态"})
+check("因子数量", len(F.FACTORS) == 39, f"实际 {len(F.FACTORS)}")
+check("分类齐全",
+      set(F.CATEGORIES) == {"趋势", "反转", "波动", "量能", "形态", "展期", "期权"},
+      str(F.CATEGORIES))
+check("展期/期权因子都登记进 AUX_KEYS",
+      set(F.AUX_KEYS) == {k for k, s in F.FACTORS.items() if s.category in ("展期", "期权")},
+      f"实际 {len(F.AUX_KEYS)} 个")
 check("默认单因子存在", F.DEFAULT_SINGLE in F.FACTORS)
 check("默认多因子都存在", all(k in F.FACTORS for k in F.DEFAULT_MULTI))
 
 bad_calc, bad_inf, bad_pit = [], [], []
 for key in F.FACTORS:
-    s = F.raw(DF, key)
-    if len(s) != len(DF) or s.notna().sum() < 100:
+    s = F.raw(DF_AUX, key)
+    if len(s) != len(DF_AUX) or s.notna().sum() < 100:
         bad_calc.append(key)
         continue
     if np.isinf(s.to_numpy(dtype=float)).any():
         bad_inf.append(key)
     # 因子只许用向后看窗口：截断数据后前段必须逐位相同
-    if not same_series(s, F.raw(DF.iloc[:CUT], key), CUT):
+    if not same_series(s, F.raw(DF_AUX.iloc[:CUT], key), CUT):
         bad_pit.append(key)
 
-check("28 个因子都能算出足够样本", not bad_calc, f"异常 {bad_calc}")
+check("39 个因子都能算出足够样本", not bad_calc, f"异常 {bad_calc}")
 check("因子值无 inf", not bad_inf, f"含 inf {bad_inf}")
 check("因子计算不含未来信息（截断重算零差异）", not bad_pit, f"有差异 {bad_pit}")
 
@@ -128,6 +169,148 @@ check("无持仓量时 oi_change 不可用", not F.available(us_like, "oi_change
 check("无持仓量时其它因子仍可用", F.available(us_like, "mom_60"))
 kept = F.filter_available(us_like, ["mom_60", "oi_change", "vol_20"])
 check("filter_available 会剔除不可用因子", kept == ["mom_60", "vol_20"], str(kept))
+
+
+# ========================================================== 1b. 展期 / 期权因子
+section("1b. 展期 / 期权因子")
+
+# 没有衍生列时必须「优雅退化」：因子被剔除，而不是报错或算出 0
+no_aux = F.filter_available(DF, list(F.FACTORS))
+check("无衍生列时展期/期权因子被剔除",
+      all(k not in no_aux for k in F.AUX_KEYS),
+      str([k for k in F.AUX_KEYS if k in no_aux]))
+check("无衍生列时其它因子不受影响",
+      len(no_aux) == len(F.FACTORS) - len(F.AUX_KEYS),
+      f"{len(no_aux)}/{len(F.FACTORS)}")
+check("无衍生列时展期因子返回全 NaN",
+      F.raw(DF, "roll_yield").isna().all())
+
+
+def aux_row(n: int = 60) -> pd.DataFrame:
+    """构造一条精确已知的期限结构：c1=100 / c2=101 / c3=102，间隔 30 / 70 天。"""
+    df = DF.iloc[:n].copy()
+    df["c1_close"], df["c2_close"], df["c3_close"] = 100.0, 101.0, 102.0
+    df["c1_dte"], df["c2_dte"], df["c3_dte"] = 20.0, 50.0, 120.0
+    df["c1_oi"], df["c2_oi"], df["c3_oi"] = 300.0, 700.0, 100.0
+    df["iv_near"], df["iv_next"] = 0.20, 0.23
+    df["dte_near"], df["dte_next"] = 20.0, 50.0
+    df["skew"], df["curv"], df["pcr"] = 0.12, 0.35, 1.2
+    df["n_opt"] = 60
+    return df
+
+
+A = aux_row()
+ry_exp = 100.0 / 101.0 - 1.0
+ry = float(F.raw(A, "roll_yield").iloc[-1])
+check("展期收益率 = P1/P2 - 1", abs(ry - ry_exp) < 1e-12, f"{ry:+.10f} vs {ry_exp:+.10f}")
+
+ann = float(F.raw(A, "roll_annual").iloc[-1])
+ann_exp = ry_exp * 365.0 / 30.0
+check("展期年化 = 收益率 × 365/到期间隔", abs(ann - ann_exp) < 1e-12,
+      f"{ann:+.10f} vs {ann_exp:+.10f}")
+
+# 曲率用「近端年化斜率 - 远端年化斜率」，不是价格二阶差分：
+# 间隔 30/70 天不等距，二阶差分会被间隔差异污染
+import math  # noqa: E402
+
+curv_exp = ((math.log(101.0 / 102.0) / 70.0 - math.log(100.0 / 101.0) / 30.0) * 365.0)
+curv = float(F.raw(A, "roll_curv").iloc[-1])
+check("展期曲率 = 远端斜率 - 近端斜率", abs(curv - curv_exp) < 1e-12,
+      f"{curv:+.10f} vs {curv_exp:+.10f}")
+
+sh = float(F.raw(A, "near_oi_share").iloc[-1])
+check("近月持仓占比 = c1_oi/(c1_oi+c2_oi)", abs(sh - 0.3) < 1e-12, f"{sh:.6f}")
+
+term = float(F.raw(A, "iv_term").iloc[-1])
+check("IV 期限结构 = (IV次月-IV近月)/间隔×30", abs(term - 0.03) < 1e-12, f"{term:+.6f}")
+
+check("平值 IV 直取 iv_near", abs(float(F.raw(A, "iv_atm").iloc[-1]) - 0.20) < 1e-12)
+check("IV 偏度直取 skew", abs(float(F.raw(A, "iv_skew").iloc[-1]) - 0.12) < 1e-12)
+check("PCR 取对数", abs(float(F.raw(A, "pcr").iloc[-1]) - math.log(1.2)) < 1e-12)
+
+# 常数期限结构下，「变化」类因子必须正好为 0，且前 20 根是 NaN（窗口还没凑满）
+rc = F.raw(A, "roll_change")
+check("展期变化在常数结构上为 0", bool((rc.iloc[20:] == 0).all()) and rc.iloc[:20].isna().all())
+ic = F.raw(A, "iv_change")
+check("IV 变化在常数 IV 上为 0", bool((ic.iloc[20:] == 0).all()) and ic.iloc[:20].isna().all())
+
+# IV-RV 价差：必须严格等于 iv_near - vol_20，且 IV 明显高于实际波动时为正
+d = F.raw(A, "iv_rv") - (A["iv_near"] - F.raw(A, "vol_20"))
+check("IV-RV 价差 = 平值 IV - 20 日已实现波动", float(d.abs().max()) < 1e-12)
+
+# 非正 PCR 取对数会变成 -inf，必须挡掉
+neg = aux_row()
+neg["pcr"] = 0.0
+check("PCR ≤ 0 时返回 NaN 而不是 -inf", F.raw(neg, "pcr").isna().all())
+
+# 缺 c3 的品种（只有两个合约）仍能算展期收益率，但曲率应为 NaN
+two = aux_row().drop(columns=["c3_close", "c3_dte", "c3_oi"])
+check("只有两个合约时仍能算展期收益率", F.raw(two, "roll_yield").notna().all())
+check("只有两个合约时展期曲率为 NaN", F.raw(two, "roll_curv").isna().all())
+
+
+# ========================================================== 1c. 期权定价内核
+section("1c. 期权定价与微笑拟合")
+
+from ttrade import contracts as CT  # noqa: E402
+from ttrade import options as OP  # noqa: E402
+
+F0, K0, T0, SIG = 5000.0, 5100.0, 60 / 365.0, 0.22
+call = float(OP.black76(F0, K0, T0, SIG, is_call=True))
+put = float(OP.black76(F0, K0, T0, SIG, is_call=False))
+
+# 期货期权的平价关系不含分红：C − P = e^{−rT}(F − K)。这条不成立说明
+# 贴现因子或 d1/d2 写错了，反解出来的 IV 会整体偏掉。
+parity = call - put - np.exp(-OP.RISK_FREE * T0) * (F0 - K0)
+check("Black-76 满足 put-call 平价", abs(parity) < 1e-9, f"偏差 {parity:.2e}")
+
+check("看涨价格随波动率单调递增",
+      float(OP.black76(F0, K0, T0, 0.30)) > call > float(OP.black76(F0, K0, T0, 0.15)))
+
+# 反解必须回到原值：正向定价 → 反向求 sigma → 误差应到二分法精度
+iv_c = float(OP.implied_vol(np.array([call]), F0, K0, T0, True)[0])
+iv_p = float(OP.implied_vol(np.array([put]), F0, K0, T0, False)[0])
+check("IV 反解回代误差 < 1e-8", abs(iv_c - SIG) < 1e-8 and abs(iv_p - SIG) < 1e-8,
+      f"{iv_c:.10f} / {iv_p:.10f} vs {SIG}")
+
+# 深度实值/虚值也要能反解（二分法在端点附近最容易卡住）
+deep = float(OP.black76(F0, 3000.0, T0, SIG))
+iv_deep = float(OP.implied_vol(np.array([deep]), F0, 3000.0, T0, True)[0])
+check("深度实值仍能反解", abs(iv_deep - SIG) < 1e-6, f"{iv_deep:.8f}")
+
+# 价格低于内在价值时无解，必须返回边界而不是 NaN / 负数
+iv_bad = float(OP.implied_vol(np.array([1.0]), F0, 3000.0, T0, True)[0])
+check("无解时返回下界而不是 NaN", np.isfinite(iv_bad) and iv_bad <= OP.IV_LO + 1e-6,
+      f"{iv_bad:.6f}")
+
+# 微笑拟合：造一条精确的二次曲线，必须把三个系数原样还回来
+m_grid = np.linspace(-0.15, 0.15, 11)
+atm_true, skew_true, curv_true = 0.24, -0.35, 1.8
+iv_true = atm_true + skew_true * m_grid + 0.5 * curv_true * m_grid ** 2
+fit = OP.fit_smile(m_grid, iv_true, np.ones_like(m_grid))
+check("微笑拟合还原平值/偏度/曲率",
+      fit is not None
+      and abs(fit[0] - atm_true) < 1e-10
+      and abs(fit[1] - skew_true) < 1e-10
+      and abs(fit[2] - curv_true) < 1e-10,
+      "None" if fit is None else f"{fit[0]:.6f}/{fit[1]:.6f}/{fit[2]:.6f}")
+
+# 点数不足时不硬拟合（二次要 3 个参数，5 个点才有 2 个自由度）
+check("点数不足时返回 None", OP.fit_smile(m_grid[:3], iv_true[:3], np.ones(3)) is None)
+# 所有点挤在同一个行权价上，等于没信息
+check("行权价全相同也返回 None",
+      OP.fit_smile(np.zeros(8), np.full(8, 0.2), np.ones(8)) is None)
+
+# 结算价优先、缺失时退回收盘价 —— 这是 IV 口径的关键一环
+sdf = pd.DataFrame({
+    "ts_code": ["A1", "A2", "A3"],
+    "settle": [100.0, 0.0, np.nan],
+    "close": [99.0, 88.0, 77.0],
+})
+sm = CT.settle_map(sdf)
+check("settle_map 优先结算价、缺失退回收盘价",
+      sm["A1"] == 100.0 and sm["A2"] == 88.0 and sm["A3"] == 77.0, str(sm))
+check("settle_map 对空表返回空字典", CT.settle_map(pd.DataFrame()) == {})
 
 
 # ================================================================== 2. 标准化
@@ -233,9 +416,11 @@ decay = M.ic_decay(DF, "mom_60", window=252)
 check("IC 衰减长度 = 持有期个数", len(decay) == 7, str(list(decay.index)))
 
 t0 = time.time()
-rep = M.factor_report(DF, list(F.FACTORS), horizon=5, window=252)
+rep = M.factor_report(DF_AUX, list(F.FACTORS), horizon=5, window=252)
 cost = time.time() - t0
-check("全因子评估 28 行", len(rep) == 28, str(len(rep)))
+check("全因子评估 39 行", len(rep) == len(F.FACTORS), str(len(rep)))
+check("全因子 IC 都算得出来", rep["ic"].notna().all(),
+      str(list(rep.loc[rep["ic"].isna(), "key"])))
 check("评估表无 error 列", "error" not in rep.columns or rep["error"].isna().all())
 check("评估表按 |IC| 降序",
       bool((rep["ic"].abs().diff().dropna() <= 1e-12).all()))

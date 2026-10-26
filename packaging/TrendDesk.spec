@@ -32,15 +32,18 @@ APP_NAME = "TrendDesk"
 BUNDLE_ID = "com.trenddesk.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
     ICON = os.path.join(PACK, "icon.png")
 
 # 行情数据随包分发，开箱即用（约 32MB：34 只美股 + 94 个期货品种）
+# data_futures_aux 是从真实合约/期权聚合出的期限结构与波动率摘要（约 40MB），
+# 展期因子和期权因子只依赖它；原始明细 data_contracts（130MB）与
+# data_options_raw（1GB+）不打包 —— 它们能用 download_aux.py 重新生成。
 DATAS = []
-for sub in ("data", "data_futures"):
+for sub in ("data", "data_futures", "data_futures_aux"):
     src = os.path.join(ROOT, sub)
     if os.path.isdir(src):
         DATAS.append((src, sub))

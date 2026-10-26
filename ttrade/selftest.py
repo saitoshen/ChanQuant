@@ -128,6 +128,52 @@ def _run() -> tuple[bool, list[str]]:
 
     check("因子库", _factor_lib)
 
+    def _aux_data():
+        """衍生数据：期限结构 / 期权摘要能否挂到行情上，展期因子算不算得对。"""
+        import pandas as pd
+
+        from ttrade import factors as F
+        from ttrade.auxdata import summary as aux_summary
+        from ttrade.futures import load_local as load_fut
+
+        info = aux_summary(data_dir("aux"))
+        if not info["curve"]:
+            # 衍生数据是可选的：不下载也能用，只是展期/期权因子没有值
+            return "未下载（download_aux.py 可生成），展期/期权因子不可用"
+
+        sym, ex = "CU", "SHFE"
+        if not os.path.exists(os.path.join(data_dir("cn"), f"{sym}_{ex}.csv")):
+            cands = [f[:-4] for f in os.listdir(data_dir("cn"))
+                     if f.endswith(".csv") and not f.startswith("_") and "_" in f]
+            if not cands:
+                raise FileNotFoundError("没有可用的期货 CSV")
+            sym, ex = sorted(cands)[0].rsplit("_", 1)
+
+        df = load_fut(sym, ex, data_dir("cn"))
+        miss = [c for c in ("c1_close", "c2_close", "c2_dte") if c not in df.columns]
+        if miss:
+            raise RuntimeError(f"{sym}_{ex} 没挂上衍生列（缺 {miss}）")
+
+        ry = F.raw(df, "roll_yield")
+        if ry.notna().sum() < 20:
+            raise RuntimeError(f"{sym}_{ex} 的展期收益率只有 {ry.notna().sum()} 个有效值")
+
+        # 年化 = 收益率 × 365 / 两个合约的到期间隔。这条恒等式只要错，说明
+        # 期限结构的列错位了（比如把 c1 当成了 c2），比「有值」更能说明问题。
+        ann = F.raw(df, "roll_annual")
+        gap = (pd.to_numeric(df["c2_dte"], errors="coerce")
+               - pd.to_numeric(df["c1_dte"], errors="coerce")).clip(lower=1.0)
+        err = (ann - ry * 365.0 / gap).abs().max()
+        if pd.notna(err) and err > 1e-9:
+            raise RuntimeError(f"展期年化与收益率不成比例，最大偏差 {err:.2e}")
+
+        opt = f"，期权 {info['opt']} 个品种" if info["opt"] else "，期权尚未下载"
+        return (f"{info['curve']} 个品种{opt}，{info['dates']} 个交易日"
+                f"（{info['first']}~{info['last']}）；{sym}_{ex} 展期 {ry.notna().sum()} 个值"
+                f"，均值 {ry.mean() * 100:+.2f}%")
+
+    check("衍生数据（展期 / 期权因子）", _aux_data)
+
     def _factor_metrics():
         from ttrade import factor_metrics as M
         from ttrade import factors as F
@@ -331,12 +377,20 @@ def _run() -> tuple[bool, list[str]]:
         app.processEvents()
         n = len(win.store.symbols)
         has_res = getattr(win, "res", None) is not None
-        # 数据更新面板：控件都在，且线程未启动
+        # 数据更新面板：控件都在，且线程未启动。
+        # 衍生数据的两个勾选框只在期货市场出现 —— 美股没有真实合约和期权，
+        # 摆在那里只会让人以为「美股也能下期限结构」。
         has_upd = (
             hasattr(win, "btn_update")
             and hasattr(win, "cb_upd_range")
             and win.cb_upd_range.count() == 5
             and win._upd_thread is None
+            and hasattr(win, "chk_upd_contracts")
+            and hasattr(win, "chk_upd_options")
+            and win.chk_upd_contracts.isHidden()
+            and win.chk_upd_options.isHidden()
+            and not win.chk_upd_contracts.isChecked()
+            and not win.chk_upd_options.isChecked()
         )
         # K 线可视窗口：初始应停在最新一段，且滚动条范围与窗口自洽
         k_ok = (
@@ -347,7 +401,7 @@ def _run() -> tuple[bool, list[str]]:
         )
         k_info = f"窗口 {win._k_win}/{win._k_total} 根"
 
-        # 因子面板：两个策略族、三种因子模式、28 个因子、四类模型都得在
+        # 因子面板：两个策略族、三种因子模式、39 个因子、四类模型都得在
         fams = {win.cb_family.itemData(i) for i in range(win.cb_family.count())}
         modes = {win.cb_fmode.itemData(i) for i in range(win.cb_fmode.count())}
         filters = {win.cb_filter_when.itemData(i) for i in range(win.cb_filter_when.count())}
@@ -362,10 +416,10 @@ def _run() -> tuple[bool, list[str]]:
             and filters == {"entry", "delay", "hold"}
             # 方向口径三档必须都在，否则「反转」只能相对自动定向，跨品种不可比
             and orients == {"auto", "long_high", "long_low"}
-            and n_factors >= 28
+            and n_factors >= 39
             and n_models >= 4
-            # 多因子表要 28 行 × 3 列（因子 / 用 / 反），少了「反」列就没法逐因子反转
-            and n_rows_f >= 28
+            # 多因子表要 39 行 × 3 列（因子 / 用 / 反），少了「反」列就没法逐因子反转
+            and n_rows_f >= 39
             and n_cols_f == 3
             and win.chk_frev is not None
         )
