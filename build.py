@@ -149,11 +149,12 @@ def human(n: int) -> str:
 # 所以必须把 libomp.dylib 塞进包内，并把 install name 改成 @loader_path 相对引用。
 
 
-def _find_one(root: str, filename: str) -> str | None:
+def _find_all(root: str, filename: str) -> list[str]:
+    out = []
     for base, _dirs, files in os.walk(root):
         if filename in files:
-            return os.path.join(base, filename)
-    return None
+            out.append(os.path.join(base, filename))
+    return out
 
 
 def _locate_libomp() -> str | None:
@@ -173,43 +174,53 @@ def _locate_libomp() -> str | None:
     return None
 
 
+def _xgb_depends_on_rpath_libomp(xgb: str) -> bool:
+    r = subprocess.run(["otool", "-L", xgb], capture_output=True, text=True)
+    return "@rpath/libomp.dylib" in r.stdout
+
+
 def fix_macos_openmp(target: str) -> bool:
-    """把 libomp.dylib 打进 .app，并改写 libxgboost.dylib 的依赖引用。"""
-    xgb = _find_one(target, "libxgboost.dylib")
-    if xgb is None:
+    """把 libomp.dylib 打进 .app，并改写 libxgboost.dylib 的依赖引用。
+
+    包里出现几份 libxgboost.dylib 就处理几份 —— PyInstaller 在个别情况下会把
+    同一个二进制收集两次（datas 一份、binaries 一份），只改第一份会留隐患。
+    """
+    dylibs = _find_all(target, "libxgboost.dylib")
+    if not dylibs:
         log("  ! 包内没找到 libxgboost.dylib，跳过 OpenMP 处理")
         return False
 
-    lib_dir = os.path.dirname(xgb)
-    dst = os.path.join(lib_dir, "libomp.dylib")
-    if not os.path.exists(dst):
-        src = _locate_libomp()
-        if src is None:
-            log("  ! 构建机上没有 libomp.dylib（brew install libomp），")
-            log("    打出来的包在用户机器上 XGBoost 会不可用")
-            return False
-        shutil.copy2(src, dst)
-        log(f"  已内置 OpenMP 运行时：{src}")
-    else:
-        log("  包内已有 libomp.dylib")
+    src = _locate_libomp()
+    touched: list[str] = []
+    for xgb in dylibs:
+        lib_dir = os.path.dirname(xgb)
+        dst = os.path.join(lib_dir, "libomp.dylib")
+        if not os.path.exists(dst):
+            if src is None:
+                log("  ! 构建机上没有 libomp.dylib（brew install libomp），")
+                log("    打出来的包在用户机器上 XGBoost 会不可用")
+                return False
+            shutil.copy2(src, dst)
+            log(f"  已内置 OpenMP 运行时 → {os.path.relpath(dst, target)}")
 
-    # @loader_path = libxgboost.dylib 自己所在的目录；两个文件同目录，引用天然成立
-    r = subprocess.run(
-        ["install_name_tool", "-change", "@rpath/libomp.dylib",
-         "@loader_path/libomp.dylib", xgb],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        log(f"  ! install_name_tool 失败：{r.stderr.strip()}")
-        return False
-
-    # 改过 Mach-O 之后原签名失效；arm64 上未签名/坏签名的 dylib 会被内核直接拒绝加载
-    for f in (dst, xgb):
-        s = subprocess.run(["codesign", "--force", "--sign", "-", f],
-                           capture_output=True, text=True)
-        if s.returncode != 0:
-            log(f"  ! 重签失败 {os.path.basename(f)}：{s.stderr.strip()}")
+        # @loader_path = libxgboost.dylib 自己所在的目录；两个文件同目录，引用天然成立
+        r = subprocess.run(
+            ["install_name_tool", "-change", "@rpath/libomp.dylib",
+             "@loader_path/libomp.dylib", xgb],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            log(f"  ! install_name_tool 失败：{r.stderr.strip()}")
             return False
+
+        # 改过 Mach-O 之后原签名失效；arm64 上未签名/坏签名的 dylib 会被内核直接拒绝加载
+        for f in (dst, xgb):
+            s = subprocess.run(["codesign", "--force", "--sign", "-", f],
+                               capture_output=True, text=True)
+            if s.returncode != 0:
+                log(f"  ! 重签失败 {os.path.basename(f)}：{s.stderr.strip()}")
+                return False
+        touched.append(xgb)
 
     # 外层 .app 的签名封装了 Frameworks 里每个文件，改了内容必须整包重签
     s = subprocess.run(["codesign", "--force", "--deep", "--sign", "-", target],
@@ -218,9 +229,11 @@ def fix_macos_openmp(target: str) -> bool:
         log(f"  ! 整包重签失败：{s.stderr.strip()}")
         return False
 
-    chk = subprocess.run(["otool", "-L", xgb], capture_output=True, text=True)
-    dep = [ln.strip() for ln in chk.stdout.splitlines() if "libomp" in ln]
-    log("  libxgboost.dylib → " + (dep[0] if dep else "（未列出 libomp）"))
+    left = [p for p in touched if _xgb_depends_on_rpath_libomp(p)]
+    if left:
+        log(f"  ! 还有 {len(left)} 份 libxgboost.dylib 依赖 @rpath/libomp.dylib，改写没生效")
+        return False
+    log(f"  {len(touched)} 份 libxgboost.dylib 已改为 @loader_path/libomp.dylib")
     return True
 
 
