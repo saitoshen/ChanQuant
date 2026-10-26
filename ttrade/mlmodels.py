@@ -591,21 +591,66 @@ def build(key: str, seed: int = 42, **kw) -> BaseModel:
     return spec["cls"](seed=seed, **kw)
 
 
-def available() -> list[str]:
-    """按依赖可用性过滤：没装 lightgbm 就不该在界面上让你选。"""
+_PROBE = {
+    "lightgbm": "lightgbm",
+    "xgboost": "xgboost",
+    "gpr": "sklearn",
+    "transformer": None,  # 纯 numpy，无外部依赖
+}
+
+
+def available(why: dict | None = None) -> list[str]:
+    """按依赖可用性过滤：没装 lightgbm 就不该在界面上让你选。
+
+    传 `why` 进来可以拿到每个不可用模型的失败原因。这一点是必须的：
+    `import xgboost` 在 macOS 上失败时抛的是 `XGBoostError`（ctypes 加载
+    dylib 失败），跟「没装这个包」完全不是一回事，但界面上看起来一样 ——
+    都只是「少了这个选项」。静默吞异常会让打包问题一直藏到用户手里。
+    """
     out = []
-    for k, spec in MODELS.items():
+    for k in MODELS:
+        mod = _PROBE.get(k)
+        if mod is None:
+            out.append(k)
+            continue
         try:
-            if k == "lightgbm":
-                import lightgbm  # noqa: F401
-            elif k == "xgboost":
-                import xgboost  # noqa: F401
-            elif k == "gpr":
-                import sklearn  # noqa: F401
-        except Exception:
+            __import__(mod)
+        except Exception as exc:
+            if why is not None:
+                why[k] = f"{type(exc).__name__}: {exc}"
             continue
         out.append(k)
     return out
+
+
+def diagnose() -> str:
+    """给自检用的一行诊断：可用模型 + 不可用的原因（含原生库路径）。"""
+    why: dict = {}
+    avail = available(why=why)
+    parts = ["、".join(MODELS[k]["label"] for k in avail) or "无"]
+    for k, msg in why.items():
+        detail = msg
+        if k == "xgboost":
+            detail += f"（{_xgboost_lib_hint()}）"
+        parts.append(f"{MODELS[k]['label']} 不可用 —— {detail}")
+    return "；".join(parts)
+
+
+def _xgboost_lib_hint() -> str:
+    """xgboost 的原生库是运行时按路径找的，打没打进包只能这么查。"""
+    try:
+        import os
+
+        import xgboost
+
+        root = os.path.dirname(os.path.abspath(xgboost.__file__))
+        lib = os.path.join(root, "lib")
+        if not os.path.isdir(lib):
+            return f"{lib} 不存在"
+        names = sorted(os.listdir(lib))
+        return f"lib 目录 {lib} → {names or '空'}"
+    except Exception as exc:  # noqa: BLE001
+        return f"连 xgboost 包目录都定位不到（{type(exc).__name__}: {exc}）"
 
 
 def permutation_importance(

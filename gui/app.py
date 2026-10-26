@@ -913,10 +913,20 @@ class MainWindow(QMainWindow):
         self.lbl_fmodel = self._section("模型")
         sf.addWidget(self.lbl_fmodel)
         self.cb_fmodel = QComboBox()
-        for k in mlmodels.available():
+        # 缺依赖的模型不列出来，但要在下拉框上留一句提示 ——
+        # 否则「XGBoost 不见了」和「本来就没有 XGBoost」在界面上长得一模一样。
+        _why: dict = {}
+        for k in mlmodels.available(why=_why):
             self.cb_fmodel.addItem(mlmodels.MODELS[k]["label"], k)
             self.cb_fmodel.setItemData(
                 self.cb_fmodel.count() - 1, mlmodels.MODELS[k]["desc"], Qt.ToolTipRole
+            )
+        if _why:
+            self.cb_fmodel.setToolTip(
+                "以下模型在本机不可用（依赖缺失）：\n"
+                + "\n".join(
+                    f"· {mlmodels.MODELS[k]['label']}：{msg}" for k, msg in _why.items()
+                )
             )
         sf.addWidget(self.cb_fmodel)
 

@@ -134,6 +134,96 @@ def human(n: int) -> str:
     return f"{n:.1f} GB"
 
 
+# --------------------------------------------------------------- macOS OpenMP
+# PyPI 上 xgboost 的两个 macOS wheel（x86_64 / arm64）都**不带** OpenMP 运行时，
+# libxgboost.dylib 里写死的是：
+#     LC_LOAD_DYLIB  @rpath/libomp.dylib
+#     LC_RPATH       /usr/local/opt/libomp/lib      （x86_64）
+#                    /opt/homebrew/opt/libomp/lib   （arm64）
+# 也就是说它指望构建机上有 brew 装的 libomp。CI 的 macos-latest 镜像恰好预装了
+# /opt/homebrew/opt/libomp，所以 arm64 能过；macos-15-intel 镜像的 /usr/local/opt
+# 下没有，x64 就 import 失败。
+#
+# 更麻烦的是：即便 CI 装了 libomp，打出来的包在**用户机器**上照样跑不起来 ——
+# 普通用户不会去 brew install libomp，@rpath 解析不到，XGBoost 直接消失。
+# 所以必须把 libomp.dylib 塞进包内，并把 install name 改成 @loader_path 相对引用。
+
+
+def _find_one(root: str, filename: str) -> str | None:
+    for base, _dirs, files in os.walk(root):
+        if filename in files:
+            return os.path.join(base, filename)
+    return None
+
+
+def _locate_libomp() -> str | None:
+    """找构建机上的 libomp.dylib。优先问 brew，再退回两个已知前缀。"""
+    cands: list[str] = []
+    try:
+        r = subprocess.run(["brew", "--prefix", "libomp"], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            cands.append(os.path.join(r.stdout.strip(), "lib", "libomp.dylib"))
+    except OSError:
+        pass
+    for arch_prefix in ("/opt/homebrew/opt/libomp", "/usr/local/opt/libomp"):
+        cands.append(os.path.join(arch_prefix, "lib", "libomp.dylib"))
+    for c in cands:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def fix_macos_openmp(target: str) -> bool:
+    """把 libomp.dylib 打进 .app，并改写 libxgboost.dylib 的依赖引用。"""
+    xgb = _find_one(target, "libxgboost.dylib")
+    if xgb is None:
+        log("  ! 包内没找到 libxgboost.dylib，跳过 OpenMP 处理")
+        return False
+
+    lib_dir = os.path.dirname(xgb)
+    dst = os.path.join(lib_dir, "libomp.dylib")
+    if not os.path.exists(dst):
+        src = _locate_libomp()
+        if src is None:
+            log("  ! 构建机上没有 libomp.dylib（brew install libomp），")
+            log("    打出来的包在用户机器上 XGBoost 会不可用")
+            return False
+        shutil.copy2(src, dst)
+        log(f"  已内置 OpenMP 运行时：{src}")
+    else:
+        log("  包内已有 libomp.dylib")
+
+    # @loader_path = libxgboost.dylib 自己所在的目录；两个文件同目录，引用天然成立
+    r = subprocess.run(
+        ["install_name_tool", "-change", "@rpath/libomp.dylib",
+         "@loader_path/libomp.dylib", xgb],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        log(f"  ! install_name_tool 失败：{r.stderr.strip()}")
+        return False
+
+    # 改过 Mach-O 之后原签名失效；arm64 上未签名/坏签名的 dylib 会被内核直接拒绝加载
+    for f in (dst, xgb):
+        s = subprocess.run(["codesign", "--force", "--sign", "-", f],
+                           capture_output=True, text=True)
+        if s.returncode != 0:
+            log(f"  ! 重签失败 {os.path.basename(f)}：{s.stderr.strip()}")
+            return False
+
+    # 外层 .app 的签名封装了 Frameworks 里每个文件，改了内容必须整包重签
+    s = subprocess.run(["codesign", "--force", "--deep", "--sign", "-", target],
+                       capture_output=True, text=True)
+    if s.returncode != 0:
+        log(f"  ! 整包重签失败：{s.stderr.strip()}")
+        return False
+
+    chk = subprocess.run(["otool", "-L", xgb], capture_output=True, text=True)
+    dep = [ln.strip() for ln in chk.stdout.splitlines() if "libomp" in ln]
+    log("  libxgboost.dylib → " + (dep[0] if dep else "（未列出 libomp）"))
+    return True
+
+
 def package(target: str, base_name: str) -> str | None:
     """把产物打成压缩包。macOS 用 ditto 以保留 .app 内的符号链接与资源分叉。"""
     out_dir = os.path.join(ROOT, "dist")
@@ -196,6 +286,13 @@ def main() -> int:
     if not os.path.exists(target):
         log(f"未找到产物：{target}")
         return 1
+
+    if IS_MAC:
+        log("处理 macOS OpenMP 依赖…")
+        if not fix_macos_openmp(target):
+            # 不算致命错误：包里其它功能都正常，只是机器学习少了 XGBoost。
+            # 但要吼一声，否则又会变成「CI 绿了、用户那边模型少一个」。
+            log("  ! XGBoost 在 macOS 上可能不可用，详见上面的提示")
 
     size = dir_size(target)
     log("")

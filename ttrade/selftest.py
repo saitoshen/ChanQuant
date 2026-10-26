@@ -178,9 +178,25 @@ def _run() -> tuple[bool, list[str]]:
     def _ml_deps():
         from ttrade import mlmodels as ML
 
-        avail = ML.available()
-        if not avail:
-            raise RuntimeError("没有任何可用的机器学习模型，依赖没打进包")
+        why: dict = {}
+        avail = ML.available(why=why)
+        missing = [k for k in ML.MODELS if k not in avail]
+        # 四个模型都在 requirements.txt 里，少一个就是打包漏了，不能算通过。
+        # 之前这里只判「至少有一个」，于是 macOS x64 少了 XGBoost 也照样打勾，
+        # 真正的失败点被推迟到下面的窗口检查才暴露，日志里看不出原因。
+        if missing:
+            raise RuntimeError(
+                "缺少 "
+                + "、".join(ML.MODELS[k]["label"] for k in missing)
+                + " —— "
+                + "；".join(f"{ML.MODELS[k]['label']}: {why.get(k, '?')}" for k in missing)
+                + (
+                    "｜"
+                    + ML._xgboost_lib_hint()
+                    if "xgboost" in missing
+                    else ""
+                )
+            )
         return "、".join(ML.MODELS[k]["label"] for k in avail)
 
     check("机器学习模型依赖", _ml_deps)

@@ -50,6 +50,26 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      # xgboost 的 macOS wheel 不打包 OpenMP 运行时，libxgboost.dylib 里写的是
+      # @rpath/libomp.dylib + LC_RPATH=/usr/local/opt/libomp/lib（x64）或
+      # /opt/homebrew/opt/libomp/lib（arm64）。macos-latest 镜像预装了 arm64 那份，
+      # macos-15-intel 没有 x64 那份 —— 这就是 macOS x64 上 XGBoost 静默消失的原因。
+      # 构建期必须有它（否则 import 就失败），运行期由 build.py 打进包内。
+      - name: 安装 libomp（macOS 上 xgboost 的原生依赖）
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install libomp || brew upgrade libomp
+          ls -l "$(brew --prefix libomp)/lib" || true
+
+      # 打包前的探针。xgboost 的原生库是 ctypes 在运行时按路径加载的，
+      # 「源码环境能 import」和「打包后能 import」是两件独立的事，分开查才定位得快。
+      - name: 检查机器学习依赖（源码环境）
+        run: |
+          python -c "import platform,sys; print('平台:', platform.machine(), '| Python:', sys.version.split()[0])"
+          python -c "from ttrade import mlmodels as ML; print('可用:', ML.diagnose())"
+          python -c "import importlib.metadata as m; print('xgboost', m.version('xgboost'))"
+
       - name: 生成图标
         run: python packaging/make_icon.py
 
