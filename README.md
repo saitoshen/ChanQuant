@@ -599,11 +599,15 @@ macOS 的 `.app` 本身就是目录结构。
 
 ```bash
 .venv\Scripts\python.exe build.py          # Windows -> dist/TrendDesk/TrendDesk.exe
-python build.py                            # macOS   -> dist/TrendDesk.app
+brew install libomp && python build.py     # macOS   -> dist/TrendDesk.app
 ```
 
 脚本会自动：装 PyInstaller → 生成图标 → 打包 → 报体积 → 打成 zip。
 其他参数：`--clean` 先清 `build/` 和 `dist/`，`--no-zip` 不打包，`--install-deps` 顺带装依赖。
+
+macOS 上 `brew install libomp` 不是可选项：xgboost 的 wheel 不自带 OpenMP，
+构建期 `import xgboost` 就会失败（详见下面的「macOS 的 OpenMP 依赖」）。
+从源码直接跑 GUI 也一样需要它。
 
 ### 打包后自检
 
@@ -659,18 +663,56 @@ git tag -a v1.0.1 -m "说明"
 git push origin v1.0.1
 ```
 
-每个平台打完包都会跑一次 `--selftest`，8 项全过才算成功，自检日志直接打到 CI 输出。
+每个平台打完包都会跑一次 `--selftest`，13 项全过才算成功，自检日志直接打到 CI 输出。
 
 > 注意：`data/` 与 `data_futures/`（约 32MB）需要一并提交，否则打出的包没有行情数据。
 > `.gitignore` 已排除 `.venv/`、`build/`、`dist/`、`output/`、`token.txt`。
 
-#### CI 上踩过的三个坑（都已修）
+#### CI 上踩过的四个坑（都已修）
 
 | 现象 | 原因 | 修法 |
 |---|---|---|
 | Windows 卡在「生成图标」 | 英文版 runner 控制台是 cp1252，脚本 `print` 中文抛 `UnicodeEncodeError` | job 级 `PYTHONUTF8=1`，脚本内也 `reconfigure(encoding="utf-8")` |
 | macOS 打包成功但自检报 `No module named 'PySide6'` | `requirements.txt` 只写了 `shiboken6`，漏了 `PySide6`。**PyInstaller 不会因此报错**，会安静地打出没有 Qt 的空壳 app | 补全依赖；`build.py` 增加 `check_runtime_deps()` 打包前拦截 |
 | Intel Mac 的 job 起不来 | `macos-13` runner 已于 2025-12-04 退役 | 改用 `macos-15-intel` |
+| macOS x64 上 XGBoost 静默消失（4 个模型只剩 3 个） | 见下节 | 包内内置 `libomp.dylib` + 改 install name |
+
+#### macOS 的 OpenMP 依赖（一个会漏到用户手里的坑）
+
+PyPI 上 xgboost 的**两个** macOS wheel 都不带 OpenMP 运行时，`libxgboost.dylib`
+里写死的是对构建机 Homebrew 的绝对引用：
+
+```
+LC_LOAD_DYLIB  @rpath/libomp.dylib
+LC_RPATH       /usr/local/opt/libomp/lib      # x86_64
+               /opt/homebrew/opt/libomp/lib   # arm64
+```
+
+后果有两层：
+
+1. **构建期**：`macos-latest`（arm64）镜像恰好预装了 `/opt/homebrew/opt/libomp`，
+   所以能过；`macos-15-intel` 镜像的 `/usr/local/opt` 下没有，`import xgboost`
+   直接抛 `XGBoostError`，模型下拉框里少一项。
+2. **运行期（更严重）**：普通用户不会去 `brew install libomp`，`@rpath` 解析不到。
+   arm64 那个「通过」只是借了 CI 的环境，**打出来的包在用户机器上一样是坏的**。
+
+修法（`build.py` 的 `fix_macos_openmp()`，在 PyInstaller 之后、打 zip 之前跑）：
+
+```python
+shutil.copy2(libomp_src, os.path.join(lib_dir, "libomp.dylib"))
+install_name_tool -change @rpath/libomp.dylib @loader_path/libomp.dylib libxgboost.dylib
+codesign --force --sign - <两个 dylib>     # 改过 Mach-O，原签名失效
+codesign --force --deep --sign - TrendDesk.app   # 外层签名封装了 Frameworks，要整包重签
+```
+
+`@loader_path` 就是 `libxgboost.dylib` 自己所在的目录，两个文件同目录，引用天然成立，
+用户机器上不需要任何额外安装。CI 里仍然要 `brew install libomp`——那是**构建期**需要的。
+
+> 顺带把两处「静默」堵上了：`mlmodels.available()` 以前 `except: continue` 吞掉所有异常，
+> 「没装这个包」和「dylib 加载失败」在界面上长得一模一样；自检的「机器学习模型依赖」
+> 以前只判「至少有一个可用」，3 个模型也打勾。现在少一个就红，并打出真实异常与
+> `xgboost/lib` 目录清单。
+
 
 ### 产物与首次运行
 
