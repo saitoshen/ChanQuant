@@ -379,6 +379,29 @@ def _run() -> tuple[bool, list[str]]:
         win.tabs.setCurrentIndex(0)
         app.processEvents()
 
+        # K 线滚轮缩放：走真实的事件派发路径，不直接调 _on_kline_wheel。
+        # 必须验这一条，因为 matplotlib 的回调注册表挂在 Figure 上
+        # （canvas.callbacks 是 figure._canvas_callbacks 的代理），MplCanvas.fresh()
+        # 换 Figure 就会让之前 mpl_connect 的连接全部静默失效 —— 滚轮缩放
+        # 正是这么失灵过一次的，而且界面不会报任何错。
+        from matplotlib.backend_bases import MouseEvent
+
+        def _wheel(step: int) -> tuple[int, int]:
+            ax = win.canvas_k.fig.axes[0]
+            bb = ax.get_window_extent()
+            before = win._k_win
+            MouseEvent(
+                "scroll_event", win.canvas_k,
+                (bb.x0 + bb.x1) / 2, (bb.y0 + bb.y1) / 2, step=step,
+            )._process()
+            app.processEvents()
+            return before, win._k_win
+
+        w0, w1 = _wheel(+1)   # 向上滚 = 放大 = 窗口变窄
+        w2, w3 = _wheel(-1)   # 向下滚 = 缩小 = 窗口变宽
+        wheel_ok = w1 < w0 and w3 > w2
+        wheel_info = f"{w0}→{w1}→{w3} 根"
+
         win.close()
         app.processEvents()
 
@@ -388,6 +411,11 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError("主窗口未完成首次回测")
         if not has_upd:
             raise RuntimeError("数据更新面板缺失或初始状态异常")
+        if not wheel_ok:
+            raise RuntimeError(
+                f"K 线滚轮缩放失效（窗口 {wheel_info}）：scroll_event 回调没生效，"
+                "多半是 MplCanvas.fresh() 换 Figure 之后没重挂事件连接"
+            )
         if not k_ok:
             raise RuntimeError(
                 f"K 线窗口状态异常：win={win._k_win} start={win._k_start} total={win._k_total}"
@@ -399,7 +427,7 @@ def _run() -> tuple[bool, list[str]]:
         if n_axes != 4:
             raise RuntimeError(f"因子分析页图轴数为 {n_axes}，应为 4")
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
-                f"{factor_info}，更新面板就绪")
+                f"{factor_info}，滚轮缩放 {wheel_info}，更新面板就绪")
 
     check("构建主窗口（端到端）", _window)
 

@@ -491,6 +491,12 @@ class MplCanvas(FigureCanvasQTAgg):
         # 这两个标志要在 super().__init__ 之前就位：基类构造里可能触发绘制
         self._frozen_depth = 0
         self._dirty = False
+        # 自己记一份事件连接清单。matplotlib 的 canvas.callbacks 并不是画布自己的
+        # 注册表，而是 figure._canvas_callbacks 的属性代理：
+        #     callbacks = property(lambda self: self.figure._canvas_callbacks)
+        # 所以 fresh() 换掉 Figure 就等于换掉注册表，之前 mpl_connect 的连接会
+        # 全部静默失效（滚轮缩放就这么消失过一次）。记下来，换完再挂一遍。
+        self._conns: list[list] = []
         self.fig = Figure(figsize=figsize, dpi=dpi, facecolor=C_BG)
         super().__init__(self.fig)
         self.setStyleSheet("background: #ffffff;")
@@ -499,6 +505,21 @@ class MplCanvas(FigureCanvasQTAgg):
 
     def frozen(self) -> _CanvasFrozen:
         return _CanvasFrozen(self)
+
+    def mpl_connect(self, s: str, func):
+        cid = super().mpl_connect(s, func)
+        self._conns.append([cid, s, func])
+        return cid
+
+    def mpl_disconnect(self, cid):
+        super().mpl_disconnect(cid)
+        self._conns = [c for c in self._conns if c[0] != cid]
+
+    def _replay_conns(self) -> None:
+        """把记下来的连接重新挂到当前 Figure 上，并刷新 cid。"""
+        conns, self._conns = self._conns, []
+        for _cid, s, func in conns:
+            self.mpl_connect(s, func)
 
     def fresh(self) -> Figure:
         """换一张全新的 Figure 挂到本画布上，并返回它。
@@ -525,6 +546,9 @@ class MplCanvas(FigureCanvasQTAgg):
         # 把旧 Figure 从画布上摘掉：否则它以后任何 stale 都会回调
         # canvas.draw_idle()，白白触发一帧重绘。
         old.canvas = None
+        # 事件回调是挂在 Figure 上的（见 __init__ 里的说明），换完必须重挂，
+        # 否则滚轮缩放、点击等交互会在第一次重建之后全部失灵。
+        self._replay_conns()
         return fig
 
     def draw(self):
