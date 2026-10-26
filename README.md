@@ -44,6 +44,7 @@ cp token.example.txt token.txt      # 然后把 token 填进去；token.txt 不�
 .venv\Scripts\python.exe smoke_test_updater.py   # 增量更新：38 项
 .venv\Scripts\python.exe smoke_test_factors.py   # 因子链路：104 项（含未来函数探针）
 .venv\Scripts\python.exe smoke_test_factors.py --fast   # 跳过 Transformer，快 1.5 秒
+.venv\Scripts\python.exe smoke_test_mutation.py  # 变异检验：6 项，证明探针不是摆设
 ```
 
 ### 启动 GUI 的四种方式
@@ -102,6 +103,7 @@ Claw/
 ├── download_futures.py    # 期货数据下载入口（Tushare）
 ├── backtest_all.py        # 批量回测 + 报告生成（--market us|cn）
 ├── smoke_test_factors.py  # 因子/因子策略离线自测（104 项，含未来函数探针）
+├── smoke_test_mutation.py # 变异检验：证明上面那些探针真能抓到未来函数
 ├── smoke_test_updater.py  # 增量更新引擎离线自测（38 项，全部打桩）
 ├── gui/app.py             # PySide6 桌面程序（双市场）
 ├── token.example.txt      # token 模板（真正的 token.txt 不入库）
@@ -276,8 +278,12 @@ a                                b                    c
 | **口径钉住** | `sign(扩张 IC 滞后 h 期)` 直接和手算公式比对 | 「忘了 `shift(h)`」——`sign()` 对单个样本扰动极不敏感，截断法测不出来，只能把公式钉死 |
 | **标签探针** | 把第一折训练窗口尾部 h 个标签改成极端值，**第一折的预测**必须一字不变 | `tr_end = b - horizon` 被改成 `b`。截断法对它无效：折的训练窗口只取决于 `(a, b)`，与预测终点 `c` 无关，所以砍数据长度不会改变任何一折的训练集 |
 
-这三类探针都用**变异检验**验证过真的有效：把源码对应那一行改掉（去掉 `shift(h)`、
-`tr_end` 改成 `b`、滚动均值换成全样本均值），三个探针各自变红。
+这三类探针都用**变异检验**验证过真的有效：`smoke_test_mutation.py` 会把源码对应那一行
+改掉（去掉 `shift(h)`、`tr_end` 改成 `b`、滚动均值换成全样本均值），三个探针必须各自变红：
+
+```bash
+.venv\Scripts\python.exe smoke_test_mutation.py    # 6 项：3 个基线 + 3 个变异
+```
 
 > 这一步不做的话，测试很容易变成「跑通即通过」——写了 100 项断言，却一项都抓不到
 > 真正的未来函数。第一版就是那样：截断法对「定向不滞后」和「训练集越界」完全无感，
