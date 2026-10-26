@@ -8,6 +8,9 @@ v1.2.0 起加入**因子策略**：28 个 PIT 因子、单/多因子与机器学
 打分、Walk-forward 滚动训练，以及「规则策略 + 因子过滤」的三种叠加语义。全部按 Point-In-Time 构造，
 并有一套能真正抓出未来函数的离线自测（见下文「因子策略 → 怎么证明没有未来函数」）。
 
+v1.2.1 是因子策略的补丁版：**逐因子反转**、**方向口径可选**（自动 / 固定高分做多 / 固定高分做空），
+并修掉 K 线滚轮缩放失灵（`fresh()` 换 Figure 后 matplotlib 的事件连接没重挂）。
+
 **仓库**：<https://github.com/saitoshen/TrendDesk>
 **下载成品**：<https://github.com/saitoshen/TrendDesk/releases> — Windows x64 / macOS arm64 / macOS x64
 

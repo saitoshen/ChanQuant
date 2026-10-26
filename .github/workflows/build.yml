@@ -44,6 +44,27 @@ jobs:
           python-version: "3.13"
           cache: pip
 
+      # 发版最容易忘的就是同步版本号：v1.0.1 那次打出来的包里还写着 1.0.0，
+      # 装完在「关于」里看到的是错版本，而且要等用户反馈才知道。
+      # tag 构建时先对一遍，不一致直接失败，比事后发补丁包便宜得多。
+      - name: 校验版本号与 tag 一致
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          spec=$(grep -E '^VERSION = ' packaging/TrendDesk.spec | head -1 | sed -E 's/.*"(.*)".*/\1/')
+          pkg=$(grep -E '^__version__ = ' ttrade/__init__.py | head -1 | sed -E 's/.*"(.*)".*/\1/')
+          tag="${GITHUB_REF_NAME#v}"
+          echo "tag=$tag  spec=$spec  ttrade=$pkg"
+          if [ "$spec" != "$tag" ]; then
+            echo "::error::packaging/TrendDesk.spec 里 VERSION=$spec，与 tag v$tag 不一致"
+            exit 1
+          fi
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::ttrade/__init__.py 里 __version__=$pkg，与 tag v$tag 不一致"
+            exit 1
+          fi
+          echo "版本号一致：$tag"
+
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
