@@ -54,6 +54,11 @@ class FactorConfig:
     exit_z: float = 0.3
     orient: str = "auto"         # auto（PIT 滚动 IC 定向）/ long_high / long_low
 
+    # 因子反转：{因子键: True} 表示这个因子按反方向使用（等效于把该因子取负号）。
+    # 多因子组合里常有「有的因子要反、有的不用反」，所以是逐因子开关而不是全局开关。
+    # 只作用于单因子 / 多因子；机器学习自己学方向，不看这个。
+    reverse: dict = field(default_factory=dict)
+
     # 机器学习
     model: str = ML.DEFAULT_MODEL
     train_window: int = 1000     # 滚动训练窗口
@@ -65,8 +70,14 @@ class FactorConfig:
     long_th: float = 0.0
     short_th: float = 0.0
 
+    def reversed_keys(self) -> set[str]:
+        """真正打开反转的因子。顺手把非真值过滤掉，调用方不用自己判。"""
+        return {k for k, v in dict(self.reverse or {}).items() if v}
+
     def normalized(self) -> "FactorConfig":
         c = FactorConfig(**{k: getattr(self, k) for k in self.__dataclass_fields__})
+        # dict 是可变对象，复制一份，免得调用方事后改原配置影响已经算好的结果
+        c.reverse = {k: True for k in c.reversed_keys()}
         c.window = int(max(60, c.window))
         c.horizon = int(max(1, c.horizon))
         c.entry_z = float(max(0.0, c.entry_z))
@@ -120,18 +131,38 @@ def pit_orientation(
 def _orientation_frame(
     fmat: pd.DataFrame, fwd: pd.Series, cfg: FactorConfig
 ) -> pd.DataFrame:
-    """每个因子在每个时点的方向。`orient` 配置可覆盖为固定方向。"""
+    """每个因子在每个时点的方向。`orient` 配置可覆盖为固定方向。
+
+    反转在这里生效，而不是在最后对综合分数取负号：多因子等权时，只反一个因子
+    必须只把那一列取反；整体取负会把其它因子也一起反掉。
+    """
     if cfg.orient == "long_high":
-        return pd.DataFrame(1.0, index=fmat.index, columns=fmat.columns)
-    if cfg.orient == "long_low":
-        return pd.DataFrame(-1.0, index=fmat.index, columns=fmat.columns)
-    return pd.DataFrame(
-        {
-            c: pit_orientation(fmat[c], fwd, cfg.horizon, max(120, cfg.window // 2))
-            for c in fmat.columns
-        },
-        index=fmat.index,
-    )
+        ori = pd.DataFrame(1.0, index=fmat.index, columns=fmat.columns)
+    elif cfg.orient == "long_low":
+        ori = pd.DataFrame(-1.0, index=fmat.index, columns=fmat.columns)
+    else:
+        ori = pd.DataFrame(
+            {
+                c: pit_orientation(fmat[c], fwd, cfg.horizon, max(120, cfg.window // 2))
+                for c in fmat.columns
+            },
+            index=fmat.index,
+        )
+    rev = cfg.reversed_keys() & set(ori.columns)
+    if rev:
+        ori = ori.copy()
+        for c in rev:
+            ori[c] = -ori[c]
+    return ori
+
+
+def _reverse_note(cfg: FactorConfig, keys: list[str]) -> str:
+    """反转说明。写成「反转使用：A、B」，界面上直接看得出哪几个因子被反着用。"""
+    rev = [k for k in keys if k in cfg.reversed_keys()]
+    if not rev:
+        return ""
+    names = "、".join(F.FACTORS[k].label if k in F.FACTORS else k for k in rev)
+    return f"反转使用：{names}（等效于把该因子取负号）"
 
 
 # ---------------------------------------------------------------- 阈值状态机
@@ -198,20 +229,32 @@ def build_score(
         k = keys[0]
         ori = _orientation_frame(fmat[[k]], fwd, cfg)
         score = (fmat[k] * ori[k]).rename("score")
-        pack = ScorePack(score=score, fmat=fmat, raw=rawf, orient=ori,
-                         label=f"单因子 · {F.FACTORS[k].label}")
+        rev = k in cfg.reversed_keys()
+        pack = ScorePack(
+            score=score, fmat=fmat, raw=rawf, orient=ori,
+            label=f"单因子 · {F.FACTORS[k].label}" + ("（反转）" if rev else ""),
+        )
         if cfg.orient == "auto":
             pack.notes.append("方向由扩张窗口 IC 决定（滞后 h 期，无未来信息）")
+        note = _reverse_note(cfg, keys)
+        if note:
+            pack.notes.append(note)
         return pack
 
     if mode == "multi":
         ori = _orientation_frame(fmat, fwd, cfg)
         signed = fmat * ori
         score = signed.mean(axis=1, skipna=True).rename("score")
-        pack = ScorePack(score=score, fmat=fmat, raw=rawf, orient=ori,
-                         label=f"多因子等权 · {len(keys)} 个")
+        n_rev = len(cfg.reversed_keys() & set(keys))
+        pack = ScorePack(
+            score=score, fmat=fmat, raw=rawf, orient=ori,
+            label=f"多因子等权 · {len(keys)} 个" + (f"（{n_rev} 个反转）" if n_rev else ""),
+        )
         if cfg.orient == "auto":
             pack.notes.append("各因子先按自身 PIT 方向取号，再等权平均")
+        note = _reverse_note(cfg, keys)
+        if note:
+            pack.notes.append(note)
         return pack
 
     if mode == "ml":
@@ -228,6 +271,10 @@ def build_score(
         )
         if covered < len(df) * 0.5:
             notes.append("前段样本不足以训练，该区间不持仓（walk-forward 的正常代价）")
+        # 反转开关在 ML 模式下不生效：模型自己从数据里学方向和权重，
+        # 人工指定方向反而会和它打架。这里只提醒一句，不静默忽略。
+        if cfg.reversed_keys() & set(keys):
+            notes.append("机器学习自行学习方向，反转开关在 ML 模式下不生效")
         return ScorePack(
             score=score, fmat=fmat, raw=rawf, pred=pred, importance=imp,
             label=f"机器学习多因子 · {ML.MODELS.get(cfg.model, {}).get('label', cfg.model)}",

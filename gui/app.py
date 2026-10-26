@@ -60,8 +60,6 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLayout,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -189,13 +187,16 @@ QMainWindow, QWidget#SidePanel { background: #f1f5f9; }
 QScrollArea#SideScroll, QScrollArea#SideScroll > QWidget > QWidget { background: transparent; border: none; }
 QWidget#Card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; }
 QFrame#SubCard { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 7px; }
-QListWidget#FactorList {
+QTableWidget#FactorTable {
     background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px;
-    font-size: 11px; padding: 2px;
+    font-size: 11px; gridline-color: transparent;
 }
-QListWidget#FactorList::item { padding: 2px 3px; border-radius: 3px; }
-QListWidget#FactorList::item:hover { background: #f1f5f9; }
-QListWidget#FactorList::item:selected { background: #dbeafe; color: #1e40af; }
+QTableWidget#FactorTable::item { padding: 1px 3px; }
+QTableWidget#FactorTable::item:hover { background: #f1f5f9; }
+QTableWidget#FactorTable QHeaderView::section {
+    background: #f8fafc; color: #64748b; border: none;
+    border-bottom: 1px solid #e2e8f0; font-size: 10px; padding: 2px 4px;
+}
 QLabel#SectionTitle { font-size: 11px; font-weight: 600; color: #64748b; letter-spacing: 1px; }
 QLabel#AppTitle { font-size: 17px; font-weight: 700; color: #0f172a; }
 QLabel#AppSub { font-size: 11px; color: #64748b; }
@@ -875,24 +876,66 @@ class MainWindow(QMainWindow):
         idx = self.cb_fsingle.findData(factors.DEFAULT_SINGLE)
         if idx >= 0:
             self.cb_fsingle.setCurrentIndex(idx)
-        sf.addWidget(self.cb_fsingle)
 
-        self.lst_fmulti = QListWidget()
-        self.lst_fmulti.setFixedHeight(148)
-        self.lst_fmulti.setObjectName("FactorList")
+        # 单因子模式：下拉框 + 反转勾选框同一行。
+        # 反转状态不在这个勾选框里单独存，而是回写到下面表格的「反」列 ——
+        # 这样单因子和多因子共用一份反转状态，切模式时勾过的不会丢，也不会打架。
+        self.box_fsingle = QWidget()
+        bfl = QHBoxLayout(self.box_fsingle)
+        bfl.setContentsMargins(0, 0, 0, 0)
+        bfl.setSpacing(6)
+        bfl.addWidget(self.cb_fsingle, 1)
+        self.chk_frev = QCheckBox("反转")
+        self.chk_frev.setToolTip(
+            "勾上 = 这个因子反向使用（等效于把因子取负号）。\n"
+            "本来分数高做多的，改成分数高做空；分数低做空的，改成分数低做多。\n\n"
+            "与多因子表格里的「反」列是同一份状态。"
+        )
+        bfl.addWidget(self.chk_frev)
+        sf.addWidget(self.box_fsingle)
+
+        # 多因子选择：三列表 —— 因子 / 用 / 反。
+        # 用 QTableWidget 而不是 QListWidget：每个因子需要两个独立开关
+        # （参与合成、反向使用），QListWidget 只有一列勾选框，塞不下第二个。
+        self.tbl_fmulti = QTableWidget(0, 3)
+        self.tbl_fmulti.setObjectName("FactorTable")
+        self.tbl_fmulti.setFixedHeight(176)
+        self.tbl_fmulti.setHorizontalHeaderLabels(["因子", "用", "反"])
+        self.tbl_fmulti.verticalHeader().setVisible(False)
+        # 28 行要尽量多露几行，默认行高太松，176px 只能看到 5 个
+        self.tbl_fmulti.verticalHeader().setDefaultSectionSize(21)
+        self.tbl_fmulti.setShowGrid(False)
+        self.tbl_fmulti.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tbl_fmulti.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl_fmulti.setFocusPolicy(Qt.NoFocus)
+        hh = self.tbl_fmulti.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.Fixed)
+        hh.setSectionResizeMode(2, QHeaderView.Fixed)
+        hh.setFixedHeight(22)
+        self.tbl_fmulti.setColumnWidth(1, 34)
+        self.tbl_fmulti.setColumnWidth(2, 34)
         for cat in factors.CATEGORIES:
             for k, spec in factors.FACTORS.items():
                 if spec.category != cat:
                     continue
-                item = QListWidgetItem(f"{cat} · {spec.label}")
-                item.setData(Qt.UserRole, k)
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(
-                    Qt.Checked if k in factors.DEFAULT_MULTI else Qt.Unchecked
-                )
-                item.setToolTip(spec.desc)
-                self.lst_fmulti.addItem(item)
-        sf.addWidget(self.lst_fmulti)
+                r = self.tbl_fmulti.rowCount()
+                self.tbl_fmulti.insertRow(r)
+                name = QTableWidgetItem(f"{cat} · {spec.label}")
+                name.setData(Qt.UserRole, k)
+                name.setToolTip(spec.desc)
+                self.tbl_fmulti.setItem(r, 0, name)
+                for col, tip, default in (
+                    (1, "勾上表示参与合成", k in factors.DEFAULT_MULTI),
+                    (2, "勾上表示这个因子反向使用（取负号）", False),
+                ):
+                    cell = QTableWidgetItem("")
+                    cell.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                    cell.setCheckState(Qt.Checked if default else Qt.Unchecked)
+                    cell.setTextAlignment(Qt.AlignCenter)
+                    cell.setToolTip(tip)
+                    self.tbl_fmulti.setItem(r, col, cell)
+        sf.addWidget(self.tbl_fmulti)
 
         sel_row = QWidget()
         srl = QHBoxLayout(sel_row)
@@ -1219,8 +1262,9 @@ class MainWindow(QMainWindow):
             self.cb_filter_when.currentIndexChanged.connect(
                 lambda *_: self._schedule(immediate=True)
             )
-            self.cb_fsingle.currentIndexChanged.connect(self._on_factor_selection)
-            self.lst_fmulti.itemChanged.connect(self._on_factor_selection)
+            self.cb_fsingle.currentIndexChanged.connect(self._on_single_factor_changed)
+            self.chk_frev.toggled.connect(self._on_frev_toggled)
+            self.tbl_fmulti.itemChanged.connect(self._on_factor_selection)
             self.cb_fmodel.currentIndexChanged.connect(self._on_model_changed)
             self.btn_fall.clicked.connect(lambda: self._check_all_factors(True))
             self.btn_fnone.clicked.connect(lambda: self._check_all_factors(False))
@@ -1440,9 +1484,11 @@ class MainWindow(QMainWindow):
         filtering = self._filter_active()
         self.lbl_fsel.setText("过滤因子" if filtering else "因子选择")
         single = self.factor_mode == "single"
-        self.cb_fsingle.setVisible(single)
-        self.lst_fmulti.setVisible(not single)
+        self.box_fsingle.setVisible(single)
+        self.tbl_fmulti.setVisible(not single)
         self.box_fbtns.setVisible(not single)
+        if single:
+            self._sync_single_rev()
 
         is_ml = self.factor_mode == "ml"
         self.lbl_fmodel.setVisible(is_ml)
@@ -1464,12 +1510,77 @@ class MainWindow(QMainWindow):
                 break
 
     def _check_all_factors(self, on: bool) -> None:
-        self.lst_fmulti.blockSignals(True)
+        self.tbl_fmulti.blockSignals(True)
         state = Qt.Checked if on else Qt.Unchecked
-        for i in range(self.lst_fmulti.count()):
-            self.lst_fmulti.item(i).setCheckState(state)
-        self.lst_fmulti.blockSignals(False)
+        for r in range(self.tbl_fmulti.rowCount()):
+            cell = self.tbl_fmulti.item(r, 1)
+            if cell is not None:
+                cell.setCheckState(state)
+        self.tbl_fmulti.blockSignals(False)
         self._on_factor_selection()
+
+    # ---------------------------------------------------------- 因子反转
+    # 反转状态只有一份，存在多因子表格的「反」列里；单因子模式那个勾选框
+    # 只是它的一个镜像。两份状态各存一份的话，切模式就会出现「这里勾了那里没勾」。
+    def _row_of_factor(self, key: str) -> int:
+        for r in range(self.tbl_fmulti.rowCount()):
+            it = self.tbl_fmulti.item(r, 0)
+            if it is not None and it.data(Qt.UserRole) == key:
+                return r
+        return -1
+
+    def _rev_state(self, key: str) -> bool:
+        r = self._row_of_factor(key)
+        if r < 0:
+            return False
+        cell = self.tbl_fmulti.item(r, 2)
+        return bool(cell is not None and cell.checkState() == Qt.Checked)
+
+    def _set_rev_state(self, key: str, on: bool) -> None:
+        r = self._row_of_factor(key)
+        if r < 0:
+            return
+        cell = self.tbl_fmulti.item(r, 2)
+        if cell is None:
+            return
+        self.tbl_fmulti.blockSignals(True)
+        cell.setCheckState(Qt.Checked if on else Qt.Unchecked)
+        self.tbl_fmulti.blockSignals(False)
+
+    def _sync_single_rev(self) -> None:
+        """把当前单因子的反转状态刷到勾选框上（不触发重算）。"""
+        k = self.cb_fsingle.currentData()
+        self.chk_frev.blockSignals(True)
+        self.chk_frev.setChecked(bool(k) and self._rev_state(k))
+        self.chk_frev.blockSignals(False)
+
+    def _on_single_factor_changed(self, *_args) -> None:
+        self._sync_single_rev()
+        self._on_factor_selection()
+
+    def _on_frev_toggled(self, on: bool) -> None:
+        k = self.cb_fsingle.currentData()
+        if k:
+            self._set_rev_state(k, bool(on))
+        self._schedule(immediate=True)
+
+    def _reversed_factor_keys(self) -> set[str]:
+        """勾了「反」的因子。
+
+        这里**不**看「用」列：单因子模式下因子一定是参与计算的（取下拉框那一个），
+        但它在多因子表里的「用」可能是没勾的。若这里也要求「用」勾上，
+        单因子就会「勾了反转却不生效」。未参与合成的因子由 build_score 里的
+        列交集自然忽略，不需要在这一层挡。
+        """
+        out = set()
+        for r in range(self.tbl_fmulti.rowCount()):
+            name = self.tbl_fmulti.item(r, 0)
+            rev = self.tbl_fmulti.item(r, 2)
+            if name is None or rev is None:
+                continue
+            if rev.checkState() == Qt.Checked:
+                out.add(name.data(Qt.UserRole))
+        return out
 
     def _on_factor_selection(self, *_args) -> None:
         keys = self._selected_factor_keys()
@@ -1483,10 +1594,11 @@ class MainWindow(QMainWindow):
             k = self.cb_fsingle.currentData()
             return [k] if k else []
         picked = set()
-        for i in range(self.lst_fmulti.count()):
-            it = self.lst_fmulti.item(i)
-            if it.checkState() == Qt.Checked:
-                picked.add(it.data(Qt.UserRole))
+        for r in range(self.tbl_fmulti.rowCount()):
+            name = self.tbl_fmulti.item(r, 0)
+            use = self.tbl_fmulti.item(r, 1)
+            if name is not None and use is not None and use.checkState() == Qt.Checked:
+                picked.add(name.data(Qt.UserRole))
         return [k for k in factors.FACTORS if k in picked]
 
     # ---------------------------------------------------------- 参数滑块
@@ -1628,6 +1740,7 @@ class MainWindow(QMainWindow):
             horizon=int(get("horizon", 5)),
             entry_z=float(get("entry_z", 1.0)),
             exit_z=float(get("exit_z", 0.3)),
+            reverse={k: True for k in self._reversed_factor_keys()},
             model=self.cb_fmodel.currentData() or mlmodels.DEFAULT_MODEL,
             train_window=int(get("train_window", 1000)),
             step=int(get("step", 180)),

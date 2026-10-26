@@ -328,6 +328,79 @@ check("多因子策略信号截断重算零差异",
                   cut_multi.df["signal"].astype(float), CUT))
 
 
+# ================================================================== 6b. 因子反转
+section("6b. 逐因子反转")
+
+cfg_rev = FS.FactorConfig(window=252, horizon=5, entry_z=1.0, exit_z=0.3,
+                          reverse={"mom_60": True})
+p_single_rev = FS.build_score(DF, "single", ["mom_60"], cfg_rev)
+check("单因子反转 = 分数取负",
+      same_series(p_single_rev.score, -p_single.score, len(DF)))
+check("单因子反转标签带标记", "反转" in p_single_rev.label, p_single_rev.label)
+check("单因子反转写进说明",
+      any("反转使用" in n for n in p_single_rev.notes), str(p_single_rev.notes))
+
+out_rev = FS.run_factor_strategy(DF, "single", ["mom_60"], cfg_rev)
+# 阈值状态机左右对称（多头 > entry_z、空头 < -entry_z），所以仓位必须严格对调
+check("单因子反转 = 仓位严格对调",
+      np.array_equal(out_rev.df["signal"].to_numpy(),
+                     -out_single.df["signal"].to_numpy()))
+check("反转后多空根数互换",
+      int((out_rev.df["signal"] > 0).sum()) == int((out_single.df["signal"] < 0).sum())
+      and int((out_rev.df["signal"] < 0).sum()) == int((out_single.df["signal"] > 0).sum()))
+
+# 多因子：只反一个，必须只影响那一列
+cfg_one = FS.FactorConfig(window=252, horizon=5, reverse={"rev_5": True})
+p_one = FS.build_score(DF, "multi", KEYS6, cfg_one)
+_signed = (p_multi.fmat * p_multi.orient).copy()
+_signed["rev_5"] = -_signed["rev_5"]
+check("多因子只反一个 = 只把该列取负后等权",
+      same_series(p_one.score, _signed.mean(axis=1, skipna=True), len(DF)))
+check("反转不改因子矩阵本身",
+      same_series(p_one.fmat["rev_5"], p_multi.fmat["rev_5"], len(DF)))
+check("反转只改该因子的方向列",
+      same_series(p_one.orient["rev_5"], -p_multi.orient["rev_5"], len(DF)))
+check("其它因子的方向不受影响",
+      all(same_series(p_one.orient[c], p_multi.orient[c], len(DF))
+          for c in KEYS6 if c != "rev_5"))
+
+cfg_all = FS.FactorConfig(window=252, horizon=5, reverse={k: True for k in KEYS6})
+check("多因子全反 = 整体取负",
+      same_series(FS.build_score(DF, "multi", KEYS6, cfg_all).score,
+                  -p_multi.score, len(DF)))
+
+# 勾了反转但没参与合成的因子不该有任何影响
+cfg_stray = FS.FactorConfig(window=252, horizon=5, reverse={"mom_250": True})
+check("未参与合成的因子的反转被忽略",
+      same_series(FS.build_score(DF, "multi", KEYS6, cfg_stray).score,
+                  p_multi.score, len(DF)))
+
+# reverse 是 dict，normalized 必须复制，否则调用方事后改动会串味
+_src = {"mom_60": True}
+_c0 = FS.FactorConfig(reverse=_src)
+_c1 = _c0.normalized()
+_src["vol_20"] = True
+check("normalized 复制了 reverse（外部改动不串味）",
+      _c1.reverse == {"mom_60": True}, str(_c1.reverse))
+check("非真值的脏值被过滤",
+      FS.FactorConfig(reverse={"mom_60": 0, "vol_20": True}).normalized().reverse
+      == {"vol_20": True})
+
+# 反转不影响 PIT：反转后的分数截断重算仍须零差异
+check("反转后分数截断重算零差异",
+      same_series(p_single_rev.score,
+                  FS.build_score(DF.iloc[:CUT], "single", ["mom_60"], cfg_rev).score,
+                  CUT))
+
+# ML 模式自己学方向，反转不生效 —— 但要说明，不能静默忽略
+cfg_ml_rev = FS.FactorConfig(window=252, horizon=5, train_window=600, step=300,
+                             min_train=400, reverse={"mom_60": True})
+p_ml_rev = FS.build_score(DF, "ml", KEYS6, cfg_ml_rev)
+check("ML 模式说明反转不生效",
+      any("反转开关在 ML 模式下不生效" in n for n in p_ml_rev.notes),
+      str(p_ml_rev.notes))
+
+
 # ================================================================== 7. 过滤语义
 section("7. 规则 + 因子过滤")
 rule = FS.hysteresis(DF["close"].pct_change().rolling(20).mean().to_numpy() * 60,

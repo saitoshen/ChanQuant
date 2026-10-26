@@ -175,6 +175,46 @@ def _run() -> tuple[bool, list[str]]:
 
     check("规则 + 因子过滤", _factor_filter)
 
+    def _factor_reverse():
+        """逐因子反转：分数严格取负，仓位严格对调。"""
+        import numpy as np
+
+        from ttrade import factor_strategy as FS
+        from ttrade import factors as F
+
+        df = _us_df()
+        key = F.DEFAULT_SINGLE
+        cfg = FS.FactorConfig(window=252, horizon=5)
+        rev = FS.FactorConfig(window=252, horizon=5, reverse={key: True})
+
+        a = FS.run_factor_strategy(df, "single", [key], cfg)
+        b = FS.run_factor_strategy(df, "single", [key], rev)
+        # 阈值状态机左右对称，所以分数取负后仓位必须**严格**是相反数
+        if not np.allclose(b.pack.score.fillna(0.0), -a.pack.score.fillna(0.0),
+                           atol=1e-12):
+            raise RuntimeError("反转后分数不是原分数的相反数")
+        if not np.array_equal(b.df["signal"].to_numpy(), -a.df["signal"].to_numpy()):
+            raise RuntimeError("反转后仓位不是原仓位的相反数")
+
+        # 多因子只反一个：必须只影响那一列，其它因子照旧
+        keys = list(F.DEFAULT_MULTI)
+        m0 = FS.build_score(df, "multi", keys, cfg)
+        one = keys[-1]
+        m1 = FS.build_score(
+            df, "multi", keys, FS.FactorConfig(window=252, horizon=5, reverse={one: True})
+        )
+        signed = (m0.fmat * m0.orient).copy()
+        signed[one] = -signed[one]
+        manual = signed.mean(axis=1, skipna=True)
+        if not np.allclose(m1.score.fillna(0.0), manual.fillna(0.0), atol=1e-9):
+            raise RuntimeError("多因子只反一个因子时，结果与手算不一致")
+
+        n_long = int((a.df["signal"] > 0).sum())
+        n_short = int((a.df["signal"] < 0).sum())
+        return f"{F.FACTORS[key].label} 反转后多空对调（{n_long}/{n_short} 根）"
+
+    check("因子反转（逐因子）", _factor_reverse)
+
     def _ml_deps():
         from ttrade import mlmodels as ML
 
@@ -280,13 +320,18 @@ def _run() -> tuple[bool, list[str]]:
         filters = {win.cb_filter_when.itemData(i) for i in range(win.cb_filter_when.count())}
         n_factors = win.cb_fsingle.count()
         n_models = win.cb_fmodel.count()
+        n_rows_f = win.tbl_fmulti.rowCount()
+        n_cols_f = win.tbl_fmulti.columnCount()
         factor_ok = (
             fams == {"rule", "factor"}
             and modes == {"single", "multi", "ml"}
             and filters == {"entry", "delay", "hold"}
             and n_factors >= 28
             and n_models >= 4
-            and win.lst_fmulti.count() >= 28
+            # 多因子表要 28 行 × 3 列（因子 / 用 / 反），少了「反」列就没法逐因子反转
+            and n_rows_f >= 28
+            and n_cols_f == 3
+            and win.chk_frev is not None
         )
         factor_info = f"{len(fams)} 族 / {len(modes)} 模式 / {n_factors} 因子 / {n_models} 模型"
 
