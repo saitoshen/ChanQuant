@@ -767,8 +767,15 @@ macOS 的 `.app` 签名后所在卷是**只读**的。之前 `MPLCONFIGDIR` 和 
 **v1.1.0（无因子功能）**：Windows 104 MB / macOS arm64 82 MB / macOS x64 88 MB（zip），
 解压后约 241 MB。
 
-**v1.2.0（含因子策略）本地实测**：解压后 **391 MB**，zip **180 MB**。多出来的 150 MB 全是
-机器学习那几件：
+**v1.2.0（含因子策略）三平台 CI 实测**：
+
+| 平台 | 解压 | zip |
+|---|---|---|
+| Windows x64 | 382.4 MB | 182.9 MB |
+| macOS arm64 | 271.5 MB | 104.3 MB |
+| macOS x64 | 284.4 MB | 114.2 MB |
+
+Windows 比 v1.1.0 多出来的 ~150 MB 全是机器学习那几件：
 
 | 新增 | 解压后 |
 |---|---|
@@ -776,6 +783,9 @@ macOS 的 `.app` 签名后所在卷是**只读**的。之前 `MPLCONFIGDIR` 和 
 | `scipy` + `scipy.libs` | 69.1 MB |
 | `sklearn` | 12.4 MB |
 | `lightgbm/bin/lib_lightgbm.dll` | 3.9 MB |
+
+macOS 的体积小一截，因为 xgboost 的 macOS dylib 是动态链接 OpenMP 的（8.7 MB，
+Windows 的 dll 是静态链接的 56.9 MB），另外 `libomp.dylib` 只有 0.7 MB。
 
 没变的：PySide6 97.9 MB、numpy.libs 21.2 MB、matplotlib 14.4 MB、行情数据 32.2 MB。
 Transformer 故意不用 torch —— 它的 CPU 轮子 1GB 起步，真引进来这份体积会直接失控。
