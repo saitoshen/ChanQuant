@@ -426,6 +426,92 @@ def check_contract_incremental() -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def check_factor_refresh() -> None:
+    """复权因子是派生数据：换月点要跟序列对齐，因子要按切换表重算。
+
+    钉住三件在真实数据上踩过的事：
+
+    1. **首条换月之前的 bar 不能是 1.0** —— 那一段的因子应该是全部比率的连乘。
+       漏了它 CJ 的复权价在首条换月日一根 bar 涨 280%。
+    2. **切换日要挪到序列真正跳空的那天** —— 天勤的每日主力映射和主连 K 线偶尔
+       差一个交易日。顺带覆盖 `UPDATE` 后必须消费结果，否则下一条 execute 报
+       `unfinished result`（下载跑到第一个品种就崩）。
+    3. **挪完要收敛** —— 再跑一遍不能继续往前挪。
+    """
+    import tempfile
+
+    try:
+        from ttrade import tqfetch as D
+    except Exception as exc:  # noqa: BLE001
+        skip("复权因子重算", f"无法导入 tqfetch：{exc}")
+        return
+
+    old_env = os.environ.get("TRENDDESK_TQ_DB")
+    tmpdir = tempfile.mkdtemp(prefix="tqtest_")
+    os.environ["TRENDDESK_TQ_DB"] = os.path.join(tmpdir, "t.duckdb")
+    try:
+        days = pd.bdate_range("2026-01-05", periods=5)
+        closes = [100.0, 101.0, 102.0, 204.0, 205.0]   # 第 4 天翻倍
+        bars = pd.DataFrame({
+            "dt": days + pd.Timedelta(hours=9),
+            "trading_day": days,
+            "open": closes, "high": closes, "low": closes, "close": closes,
+            "volume": 1, "open_oi": 1, "close_oi": 1,
+        })
+        # 切换日故意填早一天：序列是第 4 天才跳的
+        rec = pd.DataFrame([{
+            "switch_date": days[2], "old_tq": "SHFE.rb2601", "new_tq": "SHFE.rb2605",
+            "old_ts": "RB2601.SHFE", "new_ts": "RB2605.SHFE", "ratio": 2.0,
+        }])
+        with S.connect() as con:
+            S.upsert_bars(con, "RB", "SHFE", "1h", bars)
+            S.upsert_switch(con, "RB", "SHFE", rec)
+            n = D.realign_switch(con, "RB", "SHFE")
+            check("切换日按序列跳空校正", n == 1, f"挪了 {n} 条")
+            # 只能在同一个连接上查：DuckDB 的文件锁是排他的，再开只读连接会撞上
+            got = con.execute(
+                "SELECT switch_date FROM switch WHERE symbol='RB' AND exchange='SHFE'"
+            ).fetchall()
+            check("校正后的切换日", pd.Timestamp(got[0][0]) == days[3], str(got[0][0]))
+
+            D.refresh_factors(con, "RB", "SHFE", "1h")
+            df = con.execute(
+                "SELECT close, adj_factor FROM bars WHERE symbol='RB' AND exchange='SHFE'"
+                " AND period='1h' ORDER BY dt"
+            ).df()
+            f = df["adj_factor"].to_numpy(float)
+            check("首条换月之前的因子是全部比率连乘", abs(f[0] - 2.0) < 1e-9, f"{f[0]}")
+            check("换月之后的因子为 1", abs(f[-1] - 1.0) < 1e-9, f"{f[-1]}")
+            adj = df["close"].to_numpy(float) * f
+            check("复权后序列连续",
+                  bool(np.allclose(adj[1:] / adj[:-1], [1.01, 1.009901, 1.0, 1.004902],
+                                   atol=2e-3)),
+                  f"{adj[-1] / adj[0]:.4f}")
+
+            check("重复校正收敛", D.realign_switch(con, "RB", "SHFE") == 0)
+
+            # 同一个连接上接着处理下一个品种。set_adj_factor 曾经用 fetchone 读计数，
+            # 结果集没关掉，连接一直处于「有未完成结果」，下一个品种一 register 就报
+            # ResourceInUseException —— 下载跑到第二个品种必崩，而单品种测试看不出来。
+            try:
+                S.upsert_bars(con, "HC", "SHFE", "1h", bars)
+                D.refresh_factors(con, "HC", "SHFE", "1h")
+                reused = True
+            except Exception:  # noqa: BLE001
+                reused = False
+            check("重算因子后连接仍可复用", reused)
+    except Exception as exc:  # noqa: BLE001
+        check("复权因子重算", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        if old_env is None:
+            os.environ.pop("TRENDDESK_TQ_DB", None)
+        else:
+            os.environ["TRENDDESK_TQ_DB"] = old_env
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -438,6 +524,7 @@ def main() -> int:
     check_contract_incremental()
     check_live_helpers()
     check_cli_entry()
+    check_factor_refresh()
     for k in ks:
         try:
             check_one(k)

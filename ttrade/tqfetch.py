@@ -427,10 +427,13 @@ def realign_switch(con, symbol: str, exchange: str) -> int:
         nxt = abs(float(np.log(vals[k + 1] / vals[k] / ratio)))
         target = days[k + 1]
         if here > 0.02 and nxt < 0.01 and nxt < here / 3 and target not in used:
+            # `.fetchall()` 不能省：DuckDB 的 execute 是惰性的，UPDATE 的结果不消费
+            # 就会一直挂在连接上，下一条 execute 直接报
+            # `ResourceInUseException: connection has an unfinished result`。
             con.execute(
                 "UPDATE switch SET switch_date=? WHERE symbol=? AND exchange=? AND switch_date=?",
                 [target.date(), symbol, exchange, d.date()],
-            )
+            ).fetchall()
             used.discard(d)
             used.add(target)
             moved += 1

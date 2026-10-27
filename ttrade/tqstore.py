@@ -270,19 +270,24 @@ def set_adj_factor(con, symbol: str, exchange: str, period: str,
     d = d.drop_duplicates("trading_day")
     con.register("_tmp_adj", d)
     try:
+        # `.fetchall()` 是必须的：DuckDB 的 execute 惰性求值，UPDATE 的结果不消费
+        # 就会挂在连接上，下一条 execute 报 unfinished result。
         con.execute(
             "UPDATE bars SET adj_factor = _tmp_adj.adj_factor FROM _tmp_adj"
             " WHERE bars.symbol=? AND bars.exchange=? AND bars.period=?"
             " AND bars.trading_day = _tmp_adj.trading_day",
             [symbol, exchange, period],
-        )
+        ).fetchall()
     finally:
         con.unregister("_tmp_adj")
+    # 必须 fetchall 而不是 fetchone：只取一行不会把结果集关掉，连接仍处于
+    # 「有未完成结果」的状态，调用方下一条 execute/register 直接报
+    # `ResourceInUseException`（下载跑到第二个品种就崩，报的是 upsert 里那行 register）。
     r = con.execute(
         "SELECT count(*) FROM bars WHERE symbol=? AND exchange=? AND period=?",
         [symbol, exchange, period],
-    ).fetchone()
-    return int(r[0]) if r else 0
+    ).fetchall()
+    return int(r[0][0]) if r else 0
 
 
 # ------------------------------------------------------------------ 切换表
