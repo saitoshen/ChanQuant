@@ -77,8 +77,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ttrade import factor_metrics, factors, mlmodels, tqdata, updater
+from ttrade import factor_metrics, factors, mlmodels, tqdata, tqlive, updater
 from ttrade import factor_strategy as fstrat
+from gui.live import LiveController
+from gui.trade_page import TradePage
 from ttrade.backtest import (
     BacktestConfig,
     bars_per_year,
@@ -264,6 +266,16 @@ QTabBar::tab {
 }
 QTabBar::tab:selected { color: #2563eb; border-bottom: 2px solid #2563eb; }
 QTabBar::tab:hover { color: #1f2937; }
+
+/* 顶层两个大页面的切换按钮。刻意做成「下划线标签」而不是页签方块：
+   内层已经有一套 QTabWidget，外层再用方块页签会变成两层页签，分不清层级。 */
+QPushButton#PageTab {
+    background: transparent; color: #64748b; border: none;
+    border-bottom: 2px solid transparent; border-radius: 0;
+    padding: 6px 16px; font-size: 13px; font-weight: 600;
+}
+QPushButton#PageTab:hover { color: #1f2937; background: #f8fafc; }
+QPushButton#PageTab:checked { color: #2563eb; border-bottom: 2px solid #2563eb; }
 QTableWidget { background: #ffffff; border: none; gridline-color: #eef2f7; }
 QTableWidget::item { padding: 4px 6px; }
 QHeaderView::section {
@@ -463,6 +475,14 @@ class DataStore:
             self._cache.pop(next(iter(self._cache)))
         self._cache[ck] = df
         return df
+
+    def invalidate(self, key: str, period: str | None = None) -> None:
+        """作废缓存。补齐历史后必须调，否则实时段会接在旧尾巴上。"""
+        for ck in [c for c in self._cache
+                   if c[0] == key and (period is None or c[1] == period)]:
+            self._cache.pop(ck, None)
+        if period is None:
+            self._periods.pop(key, None)
 
     def has_period(self, key: str, period: str) -> bool:
         """这个标的有没有该周期的数据。按品种缓存，切换品种时只查一次库。"""
@@ -810,6 +830,16 @@ class MainWindow(QMainWindow):
         self._k_redraw_timer.setSingleShot(True)
         self._k_redraw_timer.timeout.connect(self._flush_kline_redraw)
 
+        # 实时与交易
+        self._live_base: pd.DataFrame | None = None   # 订阅时的本地历史，实时段接在它后面
+        self._live_state = None                        # 最近一次 LiveState
+        self._live_key = ""
+        self._live_period = ""
+        self._live_last = None                         # 上一根 bar 的时间，用来判断「新 bar」
+        self._trading = False                          # 绿灯：新信号直接下单
+        self._last_target = 0                          # 上次下发的目标仓位，防重复下单
+        self._live_seq = 0                             # 每次起停自增，丢掉过期的推送
+
         self._build_ui()
         self._populate_symbols()
 
@@ -817,8 +847,58 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
-        root = QHBoxLayout(central)
-        root.setContentsMargins(14, 12, 14, 12)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(14, 10, 14, 12)
+        outer.setSpacing(8)
+
+        outer.addWidget(self._build_page_bar())
+
+        # 两个平行的大页面：策略研究 / 账户透视和交易。
+        # 用 QStackedWidget 而不是外层 QTabWidget：页签放在顶部一条自绘的按钮条上，
+        # 视觉上和侧边栏的卡片、内层的三个页签区分得开，不会变成「两层页签」。
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._build_study_page())
+        self.live = LiveController(self)
+        self.trade_page = TradePage(self.live)
+        self.pages.addWidget(self.trade_page)
+        outer.addWidget(self.pages, 1)
+
+        self.trade_page.connect_requested.connect(self._on_trade_connect)
+        self.trade_page.disconnect_requested.connect(self._on_live_stop)
+        self._wire_live()
+
+    def _build_page_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("Card")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(4)
+
+        self.btn_page_study = QPushButton("策略研究")
+        self.btn_page_trade = QPushButton("账户透视和交易")
+        for i, b in enumerate((self.btn_page_study, self.btn_page_trade)):
+            b.setObjectName("PageTab")
+            b.setCheckable(True)
+            b.setMinimumWidth(132)
+            b.clicked.connect(lambda _c=False, k=i: self._switch_page(k))
+            lay.addWidget(b)
+        self.btn_page_study.setChecked(True)
+        lay.addStretch(1)
+
+        self.lbl_live = QLabel("实时未启动")
+        self.lbl_live.setObjectName("Hint")
+        lay.addWidget(self.lbl_live)
+        return bar
+
+    def _switch_page(self, idx: int) -> None:
+        self.btn_page_study.setChecked(idx == 0)
+        self.btn_page_trade.setChecked(idx == 1)
+        self.pages.setCurrentIndex(idx)
+
+    def _build_study_page(self) -> QWidget:
+        page = QWidget()
+        root = QHBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
 
         root.addWidget(self._build_sidebar())
@@ -828,6 +908,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_perf_tab(), "绩效对比")
         self.tabs.addTab(self._build_factor_tab(), "因子分析")
         root.addWidget(self.tabs, 1)
+        return page
 
     def _build_sidebar(self) -> QWidget:
         content = QWidget()
@@ -1270,6 +1351,41 @@ class MainWindow(QMainWindow):
             "font-size: 13px; font-weight: 600; color: #0f172a; padding-left: 4px;"
         )
         lay.addWidget(self.lbl_chart_title)
+
+        # 实时 / 交易开关。放在 K 线页里是因为它们的作用域就是「当前这张图」：
+        # 换了品种或周期，实时订阅要跟着换，交易信号也只在当前图上触发。
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self.btn_live = QPushButton("启动实时")
+        self.btn_live.setCheckable(True)
+        self.btn_live.setObjectName("Ghost")
+        self.btn_live.setMinimumWidth(92)
+        self.btn_live.toggled.connect(self._on_live_toggled)
+        bar.addWidget(self.btn_live)
+
+        self.btn_trade = QPushButton("启动交易")
+        self.btn_trade.setCheckable(True)
+        self.btn_trade.setObjectName("Ghost")
+        self.btn_trade.setMinimumWidth(92)
+        self.btn_trade.setToolTip(
+            "开启后，当前图上的新信号会直接下到所选天勤账户。\n"
+            "需要先「启动实时」并连上账户。"
+        )
+        self.btn_trade.toggled.connect(self._on_trade_toggled)
+        bar.addWidget(self.btn_trade)
+
+        self.lbl_trade_icon = QLabel("☹")
+        self.lbl_trade_icon.setStyleSheet(f"font-size: 17px; color: {C_DOWN};")
+        bar.addWidget(self.lbl_trade_icon)
+        self.lbl_trade_state = QLabel("未交易")
+        self.lbl_trade_state.setStyleSheet(f"font-size: 11px; color: {C_MUTED};")
+        bar.addWidget(self.lbl_trade_state)
+
+        bar.addStretch(1)
+        self.lbl_live_msg = QLabel("")
+        self.lbl_live_msg.setObjectName("Hint")
+        bar.addWidget(self.lbl_live_msg)
+        lay.addLayout(bar)
 
         # 指标卡片条（横向，放在图表上方）
         cards = QHBoxLayout()
@@ -1984,12 +2100,14 @@ class MainWindow(QMainWindow):
             short_th=float(get("short_th", 0.0)),
         )
 
-    def run_analysis(self) -> None:
+    def run_analysis(self, df_override: pd.DataFrame | None = None) -> None:
         skey = self.cb_symbol.currentData()
         if not skey:
             return
         period = self._period()
-        df = self.store.get(skey, period)
+        # 实时推送时由调用方把「本地历史 + 实时段」拼好的表递进来，
+        # 否则从本地仓库读。
+        df = df_override if df_override is not None else self.store.get(skey, period)
         if df is None or df.empty:
             if period == PERIOD_1D:
                 self._clear_chart(f"{skey} 数据缺失")
@@ -2185,6 +2303,212 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText(
                 f"所选因子在当前标的没有任何可用值（{why}），因此不会产生信号"
             )
+
+    # ---------------------------------------------------------- 实时行情
+    def _wire_live(self) -> None:
+        self.live.started.connect(self._on_live_started)
+        self.live.stopped.connect(self._on_live_stopped)
+        self.live.bars.connect(self._on_live_bars)
+        self.live.state.connect(self._on_live_state)
+        self.live.failed.connect(self._on_live_failed)
+        self.live.log.connect(self._on_live_log)
+
+    def _current_pair(self) -> tuple[str, str] | None:
+        item = self._current_item()
+        if not item:
+            return None
+        key = item["key"]
+        sym, _, ex = key.rpartition("_")
+        if not sym or not ex:
+            return None
+        return sym, ex
+
+    def _on_live_toggled(self, on: bool) -> None:
+        if not on:
+            self._on_live_stop()
+            return
+        if self.market != "cn":
+            self._revert_live("实时行情只接了国内期货")
+            return
+        period = self._period()
+        if period == PERIOD_1D:
+            self._revert_live("实时行情需要分钟周期，先选 5 分钟或 1 小时")
+            return
+        pair = self._current_pair()
+        if pair is None:
+            self._revert_live("先选一个品种")
+            return
+        spec = self.trade_page._current_spec()
+        if spec is None:
+            self._revert_live("先在「账户透视和交易」页添加一个天勤账户")
+            return
+        self.live.start(spec, pair[0], pair[1], period, need_history=True)
+        self.btn_live.setText("停止实时")
+        self.lbl_live_msg.setText("正在连接…")
+
+    def _revert_live(self, msg: str) -> None:
+        self.btn_live.blockSignals(True)
+        self.btn_live.setChecked(False)
+        self.btn_live.blockSignals(False)
+        self.btn_live.setText("启动实时")
+        self.lbl_live_msg.setText(msg)
+
+    def _on_trade_connect(self, spec) -> None:
+        """从交易页点「连接」：沿用当前选中的品种与周期。"""
+        if self.market != "cn":
+            self.trade_page.on_failed("交易只接了国内期货")
+            return
+        pair = self._current_pair()
+        period = self._period() if self._period() != PERIOD_1D else "5m"
+        if pair is None:
+            self.trade_page.on_failed("先在「策略研究」页选一个品种")
+            return
+        self.live.start(spec, pair[0], pair[1], period, need_history=True)
+        self.lbl_live_msg.setText("正在连接…")
+        self.btn_live.blockSignals(True)
+        self.btn_live.setChecked(True)
+        self.btn_live.blockSignals(False)
+        self.btn_live.setText("停止实时")
+
+    def _on_live_stop(self) -> None:
+        self.live.stop(wait=False)
+        self.btn_live.blockSignals(True)
+        self.btn_live.setChecked(False)
+        self.btn_live.blockSignals(False)
+        self.btn_live.setText("启动实时")
+        self.lbl_live_msg.setText("实时已停止")
+        if self._trading:
+            self.btn_trade.setChecked(False)
+
+    def _on_live_started(self, key: str) -> None:
+        sym, _, ex = key.rpartition("_")
+        self._live_key = key
+        self._live_period = self._period()
+        self._live_seq += 1
+        self._live_last = None
+        self._last_target = 0
+        # 工作线程刚把缺口补进库，缓存里的旧数据要作废，否则实时段会接在旧尾巴上
+        self.store.invalidate(key, self._live_period)
+        self._live_base = self.store.get(key, self._live_period)
+        self.lbl_live_msg.setText(
+            f"实时中 · {sym} {PERIOD_LABEL.get(self._live_period, '')}"
+            f"（{0 if self._live_base is None else len(self._live_base):,} 根历史）"
+        )
+        self.lbl_live.setText("● 实时")
+        self.lbl_live.setStyleSheet(f"color: {C_UP}; font-size: 11px; font-weight: 600;")
+
+    def _on_live_stopped(self) -> None:
+        self.lbl_live.setText("实时未启动")
+        self.lbl_live.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+        self.btn_live.blockSignals(True)
+        self.btn_live.setChecked(False)
+        self.btn_live.blockSignals(False)
+        self.btn_live.setText("启动实时")
+
+    def _on_live_log(self, msg: str) -> None:
+        self.lbl_live_msg.setText(msg)
+        self.trade_page.on_log(msg)
+
+    def _on_live_failed(self, msg: str) -> None:
+        self.lbl_live_msg.setText(msg)
+        self.trade_page.on_failed(msg)
+
+    def _on_live_state(self, st) -> None:
+        self._live_state = st
+        q = st.quote or {}
+        if q and self._live_base is not None:
+            und = q.get("underlying") or ""
+            self.lbl_live_msg.setText(
+                f"{q.get('name', '')} {und} {q.get('last', 0):.2f}"
+                f" · 买 {q.get('bid', 0):.2f} 卖 {q.get('ask', 0):.2f}"
+            )
+
+    def _on_live_bars(self, live_df) -> None:
+        """实时 K 线到了：新 bar 就整体重算，同一根内只刷价格。"""
+        if self._closing or self._live_base is None or live_df is None or live_df.empty:
+            return
+        pair = self._current_pair()
+        if pair is None or self._live_key != f"{pair[0]}_{pair[1]}":
+            return          # 推送还是上一个品种的，丢掉
+        merged = tqlive.merge_live(self._live_base, live_df)
+        if merged.empty:
+            return
+        ts = merged.index[-1]
+        new_bar = self._live_last is not None and ts != self._live_last
+        first = self._live_last is None
+        self._live_last = ts
+        if first or new_bar:
+            # 新 bar 走完整重算：信号只认走完的 bar，避免一根没走完的 K 线反复开平
+            self.run_analysis(df_override=merged)
+            self._maybe_auto_trade()
+        else:
+            self._patch_live_bar(merged)
+
+    def _patch_live_bar(self, merged: pd.DataFrame) -> None:
+        """把还没走完的那根 bar 的最新价刷到图上，不重算策略。
+
+        只有用户正停在最新一段时才动 —— 滚到历史位置时 `_k_view` 的最后一根
+        是历史 bar，改它等于篡改历史。
+        """
+        if self.df_sig is None or self._k_view is None or not len(self._k_view):
+            return
+        ts = merged.index[-1]
+        if self._k_view.index[-1] != ts:
+            return
+        cols = [c for c in ("open", "high", "low", "close", "volume") if c in merged.columns]
+        for c in cols:
+            if c in self.df_sig.columns:
+                self.df_sig.loc[ts, c] = merged.loc[ts, c]
+            self._k_view.loc[ts, c] = merged.loc[ts, c]
+        self._render_kline()
+
+    # ---------------------------------------------------------- 交易开关
+    def _on_trade_toggled(self, on: bool) -> None:
+        if on and not self.live.running:
+            self.btn_trade.blockSignals(True)
+            self.btn_trade.setChecked(False)
+            self.btn_trade.blockSignals(False)
+            self.lbl_live_msg.setText("先「启动实时」并连上账户，才能启动交易")
+            return
+        self._trading = bool(on)
+        self._last_target = 0
+        if on:
+            self.btn_trade.setText("停止交易")
+            self.lbl_trade_icon.setText("☺")
+            self.lbl_trade_icon.setStyleSheet(f"font-size: 17px; color: {C_DOWN};")
+            self.lbl_trade_state.setText("交易中")
+            self.lbl_trade_state.setStyleSheet(
+                f"font-size: 11px; color: {C_DOWN}; font-weight: 600;"
+            )
+        else:
+            self.btn_trade.setText("启动交易")
+            self.lbl_trade_icon.setText("☹")
+            self.lbl_trade_icon.setStyleSheet(f"font-size: 17px; color: {C_UP};")
+            self.lbl_trade_state.setText("未交易")
+            self.lbl_trade_state.setStyleSheet(f"font-size: 11px; color: {C_MUTED};")
+
+    def _maybe_auto_trade(self) -> None:
+        """绿灯时按最新信号把仓位调到目标方向（1 手）。
+
+        用 `TargetPosTask` 而不是自己 `insert_order`：反手要「先平后开」，
+        上期所还要求区分平今/平仓，这些规则各交易所不一样，手写必然踩坑。
+        TargetPosTask 按目标净仓自己拆单、自己追价。
+        """
+        if not self._trading or self.df_sig is None or not len(self.df_sig):
+            return
+        st = self._live_state
+        if st is None or not st.underlying:
+            return
+        sig = int(self.df_sig["signal"].iloc[-1])
+        target = sig * 1
+        if target == self._last_target:
+            return
+        self._last_target = target
+        self.live.set_target(st.underlying, target)
+        self.lbl_trade_state.setText(
+            f"交易中 · 目标 {target:+d} 手" if target else "交易中 · 空仓"
+        )
+
 
     # ---------------------------------------------------------- K 线绘制
     def _draw_kline(self) -> None:
