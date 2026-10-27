@@ -1085,10 +1085,18 @@ macOS 的 `.app` 签名后所在卷是**只读**的。之前 `MPLCONFIGDIR` 和 
 | macOS arm64 | 271.5 MB | 104.3 MB |
 | macOS x64 | 284.4 MB | 114.2 MB |
 
-**v1.3.0 本地实测（Windows x64）**：解压 **396.4 MB** / zip **186.5 MB**。
-比 v1.2.1 多 14 MB，全部来自衍生数据 —— `data_futures_aux/` 有 24 MB CSV，
-但 CSV 压缩率高，进 zip 只多了 3.6 MB。原始合约明细 `data_contracts/`（175 MB）
-**没有**打进包，它只是回查用，能用 `download_aux.py` 重新生成。
+**v1.3.0（含衍生数据）三平台 CI 实测**：
+
+| 平台 | zip | 比 v1.2.0 |
+|---|---|---|
+| Windows x64 | 189.3 MB | +6.4 MB |
+| macOS arm64 | 110.7 MB | +6.4 MB |
+| macOS x64 | 120.6 MB | +6.4 MB |
+
+Windows 解压后 396.4 MB（v1.2.0 是 382.4 MB）。**三个平台都只多了 6.4 MB**，
+来源就是 `data_futures_aux/` 那 24 MB CSV —— 文本压缩率高，压完只剩零头。
+原始合约明细 `data_contracts/`（175 MB）**没有**打进包，它只是回查用，
+能用 `download_aux.py` 重新生成。
 
 Windows 比 v1.1.0 多出来的 ~150 MB 全是机器学习那几件：
 
