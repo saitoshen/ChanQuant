@@ -43,16 +43,34 @@ SLEEP = 0.05            # 每两次请求之间的自然间隔，实测接口约
 MIN_DTE = 5             # 距最后交易日不足 5 天的合约不参与（临近交割价格失真）
 MIN_OI = 1.0            # 持仓量为 0 的合约不参与（挂而不交易的僵尸合约）
 
+# 除了「按到期日取最近三个」，再额外产出两套「先按持仓量筛活跃、再按到期日取最近三个」。
+# 起因是主力合约月份是跳跃的：螺纹/热卷/铁矿是 1/5/10，豆粕/棕榈是 1/5/9，所以
+# 「最近三个到期」经常全落在冷门月上（螺纹有七成的日子主力根本不在 c1/c2/c3 里，
+# c1 的持仓量只占全品种的 0.1%）。筛活跃能把这种情况滤掉。
+#
+# 为什么是 3 和 6 两档：OI 前 3 太紧（近月合约可能被整体排除，丢掉「近端紧张」
+# 这个核心信号），前 8 太松（冷门合约又混回来，退化到不筛）。实测 12 个品种上
+# 前 6 的均值 IC 最高。但全 81 品种上前 6 只改善 43% 的品种、且方向一致性下降，
+# 所以**不做全局替换**，三套并列，让用户在因子分析页自己比。
+N_ACTIVE = (3, 6)
+
 # ts_code 后缀 → 交易所代码
 SUFFIX_EX = {"SHF": "SHFE", "DCE": "DCE", "ZCE": "CZCE", "CFX": "CFFEX",
              "INE": "INE", "GFE": "GFEX"}
 
 RAW_COLS = ["date", "ts_code", "open", "high", "low", "close", "settle",
             "volume", "amount", "open_interest"]
+
+# 三套期限结构的列。前缀约定：`c` = 按到期日（原口径），`o3_` / `o6_` = 先筛
+# 持仓量前 3 / 前 6 再按到期日。下游因子层统一拼成 `{pre}1_close` 这种形式，
+# 所以 `c` + `1_close` = `c1_close`，`o3_` + `1_close` = `o3_1_close`。
 CURVE_COLS = ["date",
               "c1_code", "c1_close", "c1_dte", "c1_oi",
               "c2_code", "c2_close", "c2_dte", "c2_oi",
               "c3_code", "c3_close", "c3_dte", "c3_oi"]
+for _n in N_ACTIVE:
+    for _i in (1, 2, 3):
+        CURVE_COLS += [f"o{_n}_{_i}_close", f"o{_n}_{_i}_dte", f"o{_n}_{_i}_oi"]
 
 
 class Cancelled(Exception):
@@ -193,11 +211,18 @@ def settle_map(df: pd.DataFrame) -> dict[str, float]:
 
 
 def build_curve(day_df: pd.DataFrame, basic: pd.DataFrame) -> pd.DataFrame:
-    """把一天的横截面压成「每品种一条期限结构」。
+    """把一天的横截面压成「每品种一条期限结构」，同时产出三套口径。
 
     选合约的规则：按剩余到期天数排序，取最近的三个**有持仓、未临近交割**的合约。
     不用「成交量最大的三个」——展期收益衡量的是滚动持有成本，对应的就是
     即将到期的那几个合约，用最活跃的反而会跳过真正要滚掉的那一腿。
+
+    另有两套「先按持仓量筛活跃、再按到期日取三腿」的口径（`o3_` / `o6_`），
+    动机见 `N_ACTIVE` 上方的注释。
+
+    入参可以是**单日**（在线更新时的正常用法），也可以是**多日**（离线重算）：
+    分组键里带了 `date`，两种输入的结果逐位一致。多日一次算完比按天循环快得多 ——
+    后者光 pandas 的固定开销就要 8ms/天，4800 个交易日就是 40 秒一个品种。
     """
     if day_df.empty:
         return pd.DataFrame(columns=CURVE_COLS)
@@ -211,21 +236,65 @@ def build_curve(day_df: pd.DataFrame, basic: pd.DataFrame) -> pd.DataFrame:
     if m.empty:
         return pd.DataFrame(columns=CURVE_COLS)
 
-    rows: list[dict] = []
-    for (fc, ex), g in m.groupby(["fut_code", "exchange"], sort=False):
-        g = g.sort_values(["dte", "close"], kind="mergesort")
-        if len(g) < 2:
-            # 只有一个合约时也能算展期（用主力连续兜底没意义），直接跳过
-            continue
-        rec = {"date": g["date"].iloc[0], "symbol": fc, "exchange": ex}
-        for i, (_, r) in enumerate(g.head(3).iterrows(), 1):
-            rec[f"c{i}_code"] = r["ts_code"]
+    def _fill(rec: dict, pre: str, sub: pd.DataFrame, with_code: bool) -> None:
+        # 用数组遍历而不是 iterrows()：离线重算一个品种要写三万多行，
+        # iterrows 每次都要现造一个 Series，光这一项就能占到总耗时的一大半。
+        n = len(sub)
+        codes = sub["ts_code"].to_numpy() if with_code else None
+        close = sub["close"].to_numpy(dtype=float)
+        dte = sub["dte"].to_numpy(dtype=float)
+        oi = sub["oi"].to_numpy(dtype=float)
+        for i in range(n):
+            j = i + 1
+            if with_code:
+                rec[f"{pre}{j}_code"] = codes[i]
             # 价格保留 2 位、持仓量取整：aux 文件要随包分发，
             # 全精度浮点会让 CSV 体积翻一倍而信息量几乎不变
-            rec[f"c{i}_close"] = round(float(r["close"]), 2)
-            rec[f"c{i}_dte"] = int(r["dte"])
-            rec[f"c{i}_oi"] = int(round(float(r["oi"])))
-        rows.append(rec)
+            rec[f"{pre}{j}_close"] = round(float(close[i]), 2)
+            rec[f"{pre}{j}_dte"] = int(dte[i])
+            rec[f"{pre}{j}_oi"] = int(round(float(oi[i])))
+
+    keys = ["date", "fut_code", "exchange"]
+
+    def _top(cols: list[str], asc: list[bool], n: int) -> pd.DataFrame:
+        """每个（日期, 品种）取前 n 行，最后一律按到期日升序排好。
+
+        为什么不逐组 `sort_values`：一个品种 4800 个交易日就是 4800 次组内排序，
+        每组 2ms，累计十几秒。改成「先整体稳定排序、再按组取前 n 行」结果完全
+        一样（稳定排序保证同键行的相对顺序不变），快两个数量级。
+        """
+        d = m.sort_values(keys + cols, ascending=[True] * 3 + asc, kind="mergesort")
+        d = d.groupby(keys, sort=False).head(n)
+        # 筛活跃口径是「先按持仓量挑候选、再回到按到期日排」，所以要再排一次；
+        # 原口径本来就按 dte 排好，这一步是空操作。
+        d = d.sort_values(keys + ["dte"], kind="mergesort")
+        return d.groupby(keys, sort=False).head(3)
+
+    # 只有一个合约的组算不出价差，直接跳过
+    counts = m.groupby(keys, sort=False).size()
+    keep = set(counts[counts >= 2].index)
+
+    recs: dict[tuple, dict] = {}
+
+    def _put(pre: str, d: pd.DataFrame, with_code: bool) -> None:
+        for (day, fc, ex), g in d.groupby(keys, sort=False):
+            key = (day, fc, ex)
+            if key not in keep:
+                continue
+            rec = recs.get(key)
+            if rec is None:
+                rec = recs[key] = {"date": day, "symbol": fc, "exchange": ex}
+            _fill(rec, pre, g, with_code)
+
+    # 原口径：纯按到期日。c*_code 留着 —— 排查「选进来的是哪张合约」时要用。
+    _put("c", _top(["dte", "close"], [True, True], 3), True)
+    # 筛活跃口径：先按持仓量降序取前 N（同量时近月优先），再按到期日排。
+    # 这里不写 code 列：两组各三腿，省下 6 列能让随包分发的 aux 小一圈，
+    # 真要查是哪张合约，用日期去 data_contracts 明细里对即可。
+    for n in N_ACTIVE:
+        _put(f"o{n}_", _top(["oi", "dte"], [False, True], n), False)
+
+    rows = list(recs.values())
     if not rows:
         return pd.DataFrame(columns=CURVE_COLS)
     out = pd.DataFrame(rows)

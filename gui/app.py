@@ -968,7 +968,7 @@ class MainWindow(QMainWindow):
         self.tbl_fmulti.setFixedHeight(176)
         self.tbl_fmulti.setHorizontalHeaderLabels(["因子", "用", "反"])
         self.tbl_fmulti.verticalHeader().setVisible(False)
-        # 39 行一屏放不下，行高压紧到 21px，176px 能露 8 行，剩下的滚动
+        # 47 行一屏放不下，行高压紧到 21px，176px 能露 8 行，剩下的滚动
         self.tbl_fmulti.verticalHeader().setDefaultSectionSize(21)
         self.tbl_fmulti.setShowGrid(False)
         self.tbl_fmulti.setSelectionMode(QAbstractItemView.NoSelection)
@@ -2599,7 +2599,7 @@ class MainWindow(QMainWindow):
     def _ensure_report(self) -> pd.DataFrame:
         """当前标的的全因子评估表。按「市场+标的」缓存，切参数不用重算。
 
-        39 个因子约 0.4 秒，每次拖滑杆都重算会明显拖慢交互，所以缓存住。
+        47 个因子约 0.5 秒，每次拖滑杆都重算会明显拖慢交互，所以缓存住。
         """
         key = f"{self.market}:{self.cb_symbol.currentData()}"
         if self._f_report is not None and self._f_report_key == key:

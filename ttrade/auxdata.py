@@ -30,12 +30,18 @@ import os
 
 import pandas as pd
 
-# 期限结构列：近月 c1 / 次近 c2 / 第三近 c3
+# 期限结构列，三套口径并列：
+#   c*  = 纯按到期日（原口径）
+#   o3_* / o6_* = 先按持仓量筛出前 3 / 前 6 个活跃合约，再按到期日取最近三腿
+# 三套共用同一批列名后缀（`{pre}1_close`），因子层用同一个函数就能算三遍。
 CURVE_COLS = [
     "c1_close", "c1_dte", "c1_oi",
     "c2_close", "c2_dte", "c2_oi",
     "c3_close", "c3_dte", "c3_oi",
 ]
+for _n in (3, 6):
+    for _i in (1, 2, 3):
+        CURVE_COLS += [f"o{_n}_{_i}_close", f"o{_n}_{_i}_dte", f"o{_n}_{_i}_oi"]
 # 期权列
 OPT_COLS = ["iv_near", "iv_next", "dte_near", "dte_next", "skew", "curv", "pcr", "n_opt"]
 
@@ -120,17 +126,33 @@ def clear_cache() -> None:
 
 
 def summary(aux_dir: str) -> dict:
-    """统计衍生数据覆盖情况，给界面和自检用。"""
+    """统计衍生数据覆盖情况，给界面和自检用。
+
+    `stale` 是「列结构落后于当前代码」的曲线文件数。v1.4.0 给期限结构加了两套
+    持仓量口径（o3_ / o6_），旧 aux 文件里没有这些列，对应的 8 个因子会静默变成
+    全 NaN —— 与其让人对着一堆「算不出来」猜，不如在这里数出来，自检和界面
+    可以提示重建（`rebuild_aux.py`）。
+    """
     import json
 
-    out = {"curve": 0, "opt": 0, "dates": 0, "first": "", "last": ""}
+    out = {"curve": 0, "opt": 0, "dates": 0, "first": "", "last": "", "stale": 0}
     if not os.path.isdir(aux_dir):
         return out
+    need = [c for c in CURVE_COLS if c != "date"]
     for fn in os.listdir(aux_dir):
         if fn.startswith("opt_") and fn.endswith(".csv"):
             out["opt"] += 1
         elif fn.endswith(".csv") and not fn.startswith("_"):
             out["curve"] += 1
+            try:
+                # 只读表头一行，不用把整份 CSV 载进来
+                with open(os.path.join(aux_dir, fn), encoding="utf-8-sig") as fh:
+                    head = fh.readline()
+            except Exception:
+                out["stale"] += 1
+                continue
+            if any(c not in head for c in need):
+                out["stale"] += 1
     man = os.path.join(aux_dir, "_manifest.json")
     if os.path.exists(man):
         try:

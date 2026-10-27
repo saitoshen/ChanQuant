@@ -72,8 +72,40 @@ def _safe_log_ratio(a: pd.Series, b: pd.Series) -> pd.Series:
 
 # ---------------------------------------------------------------- 展期 / 期限结构
 # 展期因子全部来自「同一天、不同到期日」的合约价格，这是主力连续合约给不了的
-# 信息。数据来源见 `ttrade/contracts.py`：c1/c2/c3 是当日最近、次近、第三近
-# 三个有持仓的合约，dte 是距最后交易日的天数。
+# 信息。数据来源见 `ttrade/contracts.py`。
+#
+# 期限结构有**三套口径**，共用下面这套 `pre` 前缀实现：
+#   "c"   → c1/c2/c3：当日最近、次近、第三近的三个合约（原口径）
+#   "o3_" → o3_1..3：先从持仓量前 3 里挑，再按到期日取最近三腿
+#   "o6_" → o6_1..3：先从持仓量前 6 里挑，再按到期日取最近三腿
+#
+# 为什么要多两套：主力合约月份是跳跃的（螺纹/热卷是 1/5/10，豆粕/棕榈是 1/5/9），
+# 纯按到期日选会让 c1 常常落在冷门月上 —— 螺纹有七成的日子主力根本不在 c1/c2/c3
+# 里，c1 的持仓量只占全品种的 0.1%，棕榈有 27.7% 的日子 c1 成交量为 0。筛活跃能
+# 把这种空壳合约滤掉。但实测这不是全局更优（全 81 品种上只改善 43% 的品种、
+# 方向一致性还下降），所以三套并列而不是替换，让用户在因子分析页按品种自己比。
+def _roll_yield(df: pd.DataFrame, pre: str = "c") -> pd.Series:
+    return _safe_div(_col(df, f"{pre}1_close"), _col(df, f"{pre}2_close")) - 1.0
+
+
+def _roll_annual(df: pd.DataFrame, pre: str = "c") -> pd.Series:
+    ry = _roll_yield(df, pre)
+    gap = (_col(df, f"{pre}2_dte") - _col(df, f"{pre}1_dte")).clip(lower=1.0)
+    return ry * 365.0 / gap
+
+
+def _roll_curv(df: pd.DataFrame, pre: str = "c") -> pd.Series:
+    l1 = _safe_log_ratio(_col(df, f"{pre}1_close"), _col(df, f"{pre}2_close"))
+    l2 = _safe_log_ratio(_col(df, f"{pre}2_close"), _col(df, f"{pre}3_close"))
+    g1 = (_col(df, f"{pre}2_dte") - _col(df, f"{pre}1_dte")).clip(lower=1.0)
+    g2 = (_col(df, f"{pre}3_dte") - _col(df, f"{pre}2_dte")).clip(lower=1.0)
+    return (l2 / g2 - l1 / g1) * 365.0
+
+
+def _roll_change(df: pd.DataFrame, pre: str = "c") -> pd.Series:
+    return _roll_annual(df, pre).diff(20)
+
+
 def f_roll_yield(df: pd.DataFrame) -> pd.Series:
     """展期收益率：近月相对次近月的价差率 (P1/P2 - 1)。
 
@@ -81,7 +113,7 @@ def f_roll_yield(df: pd.DataFrame) -> pd.Series:
     期货溢价（contango）时为负，长期持有多头要付出移仓成本。
     这是商品期货上最经典的一类横截面/时序因子。
     """
-    return _safe_div(_col(df, "c1_close"), _col(df, "c2_close")) - 1.0
+    return _roll_yield(df, "c")
 
 
 def f_roll_annual(df: pd.DataFrame) -> pd.Series:
@@ -90,9 +122,7 @@ def f_roll_annual(df: pd.DataFrame) -> pd.Series:
     不同品种、不同时点的近远月间隔差异很大（14 天到 160 天都有），
     不年化就没法横向比较——同样是 1% 的价差，隔 15 天和隔 150 天含义完全不同。
     """
-    ry = f_roll_yield(df)
-    gap = (_col(df, "c2_dte") - _col(df, "c1_dte")).clip(lower=1.0)
-    return ry * 365.0 / gap
+    return _roll_annual(df, "c")
 
 
 def f_roll_curv(df: pd.DataFrame) -> pd.Series:
@@ -103,11 +133,7 @@ def f_roll_curv(df: pd.DataFrame) -> pd.Series:
     直接做二阶差分会被间隔差异污染。曲率为负说明曲线在近端更陡（近月紧张），
     为正说明远端更陡。
     """
-    l1 = _safe_log_ratio(_col(df, "c1_close"), _col(df, "c2_close"))
-    l2 = _safe_log_ratio(_col(df, "c2_close"), _col(df, "c3_close"))
-    g1 = (_col(df, "c2_dte") - _col(df, "c1_dte")).clip(lower=1.0)
-    g2 = (_col(df, "c3_dte") - _col(df, "c2_dte")).clip(lower=1.0)
-    return (l2 / g2 - l1 / g1) * 365.0
+    return _roll_curv(df, "c")
 
 
 def f_roll_change(df: pd.DataFrame) -> pd.Series:
@@ -116,7 +142,7 @@ def f_roll_change(df: pd.DataFrame) -> pd.Series:
     用年化值而不是原始价差，是为了减少换月日的跳变——主力合约一换月，
     c1/c2 直接换成另一对合约，原始价差会出现台阶；年化后台阶小得多。
     """
-    return f_roll_annual(df).diff(20)
+    return _roll_change(df, "c")
 
 
 def f_near_oi_share(df: pd.DataFrame) -> pd.Series:
@@ -124,9 +150,58 @@ def f_near_oi_share(df: pd.DataFrame) -> pd.Series:
 
     接近 1 说明资金都挤在近月，往往对应现货紧张或交割博弈；
     偏低说明主力已经移到远月，近月价格参考意义下降。
+
+    只在原口径上提供 —— o3_ 那套的三腿本来就是「持仓量前 3」，再算占比等于
+    「最大的占前两个的比例」，恒在 0.5~0.7 之间，没有信息量。
     """
     a, b = _col(df, "c1_oi"), _col(df, "c2_oi")
     return _safe_div(a, a + b)
+
+
+# ---- 筛活跃口径：同一套逻辑，换个列前缀 ----
+def f_roll_yield_o3(df: pd.DataFrame) -> pd.Series:
+    """展期收益率（持仓量前 3 口径）：只从当日持仓最大的 3 个合约里取最近两腿。"""
+    return _roll_yield(df, "o3_")
+
+
+def f_roll_annual_o3(df: pd.DataFrame) -> pd.Series:
+    """展期年化（持仓量前 3 口径）。"""
+    return _roll_annual(df, "o3_")
+
+
+def f_roll_curv_o3(df: pd.DataFrame) -> pd.Series:
+    """展期曲率（持仓量前 3 口径）。三腿都落在活跃月上，报价噪声比原口径小。"""
+    return _roll_curv(df, "o3_")
+
+
+def f_roll_change_o3(df: pd.DataFrame) -> pd.Series:
+    """展期变化（持仓量前 3 口径）。"""
+    return _roll_change(df, "o3_")
+
+
+def f_roll_yield_o6(df: pd.DataFrame) -> pd.Series:
+    """展期收益率（持仓量前 6 口径）。
+
+    候选池比 OI3 宽，第三腿更可能落在真正活跃的远月上；代价是换腿更频繁
+    （实测日均 7% vs 原口径 5%）。在流动性前 40 的品种池上这一档全面优于原口径，
+    但全品种看方向一致性不如原口径 —— 所以是并列提供，不做替换。
+    """
+    return _roll_yield(df, "o6_")
+
+
+def f_roll_annual_o6(df: pd.DataFrame) -> pd.Series:
+    """展期年化（持仓量前 6 口径）。"""
+    return _roll_annual(df, "o6_")
+
+
+def f_roll_curv_o6(df: pd.DataFrame) -> pd.Series:
+    """展期曲率（持仓量前 6 口径）。"""
+    return _roll_curv(df, "o6_")
+
+
+def f_roll_change_o6(df: pd.DataFrame) -> pd.Series:
+    """展期变化（持仓量前 6 口径）。"""
+    return _roll_change(df, "o6_")
 
 
 # ---------------------------------------------------------------- 期权 / 波动率曲面
@@ -443,6 +518,29 @@ _reg(FactorSpec("roll_change", "展期变化", f_roll_change, "展期",
 _reg(FactorSpec("near_oi_share", "近月持仓占比", f_near_oi_share, "展期",
                 "近月持仓 / (近月+次近) 持仓，衡量资金是否挤在近月。"))
 
+# 展期·OI3 / OI6：同样四个公式，但换一套选合约的口径。
+# 上面的「展期」是按到期日取最近三腿；这两类是先按持仓量取前 3 / 前 6 个活跃合约，
+# 再在其中按到期日排三腿。原因是中国商品期货的主力月份是跳跃的（螺纹/热卷/铁矿
+# 只做 1/5/10，豆粕/棕榈/豆油只做 1/5/9），纯按到期日常常整条曲线都落在冷门月上。
+# 三套并列而不是替换：全 81 个品种上原口径的方向一致性最好（IC>0 占 79%），
+# OI 口径在流动性前 40 的品种上更强，谁合适取决于做什么品种，让用户自己比。
+_reg(FactorSpec("roll_yield_o3", "展期收益率·OI3", f_roll_yield_o3, "展期 OI3",
+                "持仓量前 3 合约中的近月/次近月价差率。"))
+_reg(FactorSpec("roll_annual_o3", "展期年化·OI3", f_roll_annual_o3, "展期 OI3",
+                "OI3 口径的展期收益率按近远月间隔年化。"))
+_reg(FactorSpec("roll_curv_o3", "展期曲率·OI3", f_roll_curv_o3, "展期 OI3",
+                "OI3 口径近端与远端年化斜率之差。"))
+_reg(FactorSpec("roll_change_o3", "展期变化·OI3", f_roll_change_o3, "展期 OI3",
+                "OI3 口径年化展期收益率的 20 日变化。"))
+_reg(FactorSpec("roll_yield_o6", "展期收益率·OI6", f_roll_yield_o6, "展期 OI6",
+                "持仓量前 6 合约中的近月/次近月价差率。"))
+_reg(FactorSpec("roll_annual_o6", "展期年化·OI6", f_roll_annual_o6, "展期 OI6",
+                "OI6 口径的展期收益率按近远月间隔年化。"))
+_reg(FactorSpec("roll_curv_o6", "展期曲率·OI6", f_roll_curv_o6, "展期 OI6",
+                "OI6 口径近端与远端年化斜率之差。"))
+_reg(FactorSpec("roll_change_o6", "展期变化·OI6", f_roll_change_o6, "展期 OI6",
+                "OI6 口径年化展期收益率的 20 日变化。"))
+
 # 期权：需要期权日线反解出的波动率曲面，来自 data_futures_aux
 _reg(FactorSpec("iv_atm", "平值 IV", f_iv_atm, "期权",
                 "近月平值隐含波动率，来自期权微笑的二次拟合。"))
@@ -458,14 +556,20 @@ _reg(FactorSpec("pcr", "看跌看涨持仓比", f_pcr, "期权",
                 "Put/Call 持仓比取对数，>0 表示情绪偏空。"))
 
 
-CATEGORIES: list[str] = ["趋势", "反转", "波动", "量能", "形态", "展期", "期权"]
+CATEGORIES: list[str] = [
+    "趋势", "反转", "波动", "量能", "形态",
+    "展期", "展期 OI3", "展期 OI6", "期权",
+]
 
 DEFAULT_SINGLE = "mom_60"
 DEFAULT_MULTI = ["mom_20", "mom_60", "mom_120", "rev_5", "vol_20", "breakout_pos"]
 
 # 需要额外数据（真实合约 / 期权）才能算的因子。美股没有这些数据，
 # 界面上要把它们和「算不出来」区分开，而不是显示成一堆空行。
-AUX_KEYS = [k for k, s in FACTORS.items() if s.category in ("展期", "期权")]
+# 展期三个类别（原口径 / OI3 / OI6）都读同一批 aux 列，用前缀匹配一并收进来，
+# 免得以后再加一档（比如 OI9）时忘了同步这里。
+AUX_KEYS = [k for k, s in FACTORS.items()
+            if s.category.startswith("展期") or s.category == "期权"]
 
 
 # ---------------------------------------------------------------- 计算

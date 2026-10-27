@@ -167,10 +167,38 @@ def _run() -> tuple[bool, list[str]]:
         if pd.notna(err) and err > 1e-9:
             raise RuntimeError(f"展期年化与收益率不成比例，最大偏差 {err:.2e}")
 
+        # 三套口径的结构性检查。这里查的不是「有没有值」，而是口径本身对不对：
+        # 同一套曲线里三腿的到期日必须递增，且筛过持仓量的近腿不可能比 c1 更近
+        # （c1 是全品种最近的那个合约，筛活跃只会在候选里挑更远的）。
+        stale = info.get("stale", 0)
+        n_o3 = F.raw(df, "roll_yield_o3").notna().sum()
+        if not n_o3:
+            raise RuntimeError(
+                f"{sym}_{ex} 没有 OI 口径的期限结构（{stale} 个 aux 文件是旧版本），"
+                "跑 rebuild_aux.py 或重新 download_aux.py"
+            )
+        for pre in ("c", "o3_", "o6_"):
+            d = [pd.to_numeric(df[f"{pre}{i}_dte"], errors="coerce") for i in (1, 2, 3)]
+            for i in range(2):
+                bad = (d[i] > d[i + 1]).sum()
+                if bad:
+                    raise RuntimeError(f"{pre} 曲线的到期日没有递增，{bad} 行异常")
+        # 筛活跃只会把近腿推远，所以 o6_1 一定不比 c1 更近，o3_1 也不比 o6_1 更近
+        c1d = pd.to_numeric(df["c1_dte"], errors="coerce")
+        o3d = pd.to_numeric(df["o3_1_dte"], errors="coerce")
+        o6d = pd.to_numeric(df["o6_1_dte"], errors="coerce")
+        if (o3d < c1d).any() or (o6d < c1d).any():
+            raise RuntimeError("OI 口径的近腿比 c1 还近，选合约的逻辑有问题")
+        if (o3d < o6d).any():
+            raise RuntimeError("OI3 的近腿比 OI6 还近：候选集越小只会更远")
+
         opt = f"，期权 {info['opt']} 个品种" if info["opt"] else "，期权尚未下载"
+        stale_note = f"，{stale} 个 aux 文件待重建" if stale else ""
         return (f"{info['curve']} 个品种{opt}，{info['dates']} 个交易日"
                 f"（{info['first']}~{info['last']}）；{sym}_{ex} 展期 {ry.notna().sum()} 个值"
-                f"，均值 {ry.mean() * 100:+.2f}%")
+                f"，均值 {ry.mean() * 100:+.2f}%；三套口径 "
+                f"{ry.notna().sum()}/{n_o3}/{F.raw(df, 'roll_yield_o6').notna().sum()}"
+                f"{stale_note}")
 
     check("衍生数据（展期 / 期权因子）", _aux_data)
 
@@ -401,7 +429,7 @@ def _run() -> tuple[bool, list[str]]:
         )
         k_info = f"窗口 {win._k_win}/{win._k_total} 根"
 
-        # 因子面板：两个策略族、三种因子模式、39 个因子、四类模型都得在
+        # 因子面板：两个策略族、三种因子模式、47 个因子、四类模型都得在
         fams = {win.cb_family.itemData(i) for i in range(win.cb_family.count())}
         modes = {win.cb_fmode.itemData(i) for i in range(win.cb_fmode.count())}
         filters = {win.cb_filter_when.itemData(i) for i in range(win.cb_filter_when.count())}
@@ -416,10 +444,10 @@ def _run() -> tuple[bool, list[str]]:
             and filters == {"entry", "delay", "hold"}
             # 方向口径三档必须都在，否则「反转」只能相对自动定向，跨品种不可比
             and orients == {"auto", "long_high", "long_low"}
-            and n_factors >= 39
+            and n_factors >= 47
             and n_models >= 4
-            # 多因子表要 39 行 × 3 列（因子 / 用 / 反），少了「反」列就没法逐因子反转
-            and n_rows_f >= 39
+            # 多因子表要 47 行 × 3 列（因子 / 用 / 反），少了「反」列就没法逐因子反转
+            and n_rows_f >= 47
             and n_cols_f == 3
             and win.chk_frev is not None
         )

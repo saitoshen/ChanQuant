@@ -101,6 +101,24 @@ def add_aux(df: pd.DataFrame, seed: int = 11) -> pd.DataFrame:
     out["c1_oi"] = oi * rng.uniform(0.3, 0.8, n)
     out["c2_oi"] = oi * rng.uniform(0.4, 1.2, n)
     out["c3_oi"] = oi * rng.uniform(0.2, 0.9, n)
+    # 两套「先筛持仓量再按到期日」的口径。造数据时不能随便乱填：选合约的规则
+    # 决定了近腿只会被推远，所以必须满足 dte 递增、o6_1 ≥ c1、o3_1 ≥ o6_1
+    # （候选集越小，最近的那个只会更远）。这里按「o6 = c2 起、o3 = c3 起」错开
+    # 一档，既满足约束又能让两套值明显不同于原口径 —— 否则测不出前缀接错。
+    d4 = d3 + rng.integers(20, 45, n)
+    d5 = d4 + rng.integers(20, 45, n)
+    p4 = out["c3_close"].to_numpy(float) * (1.0 + rng.normal(0.01, 0.02, n))
+    p5 = p4 * (1.0 + rng.normal(0.01, 0.02, n))
+    ladder = {
+        "o6_": ([d2, d3, d4], [out["c2_close"].to_numpy(float),
+                               out["c3_close"].to_numpy(float), p4]),
+        "o3_": ([d3, d4, d5], [out["c3_close"].to_numpy(float), p4, p5]),
+    }
+    for pre, (dtes, px3) in ladder.items():
+        for i in (1, 2, 3):
+            out[f"{pre}{i}_dte"] = dtes[i - 1]
+            out[f"{pre}{i}_close"] = px3[i - 1]
+            out[f"{pre}{i}_oi"] = oi * rng.uniform(0.3, 1.2, n)
     out["iv_near"] = 0.20 + rng.normal(0.0, 0.02, n)
     out["iv_next"] = out["iv_near"].to_numpy() + rng.normal(0.005, 0.01, n)
     out["dte_near"], out["dte_next"] = d1, d2
@@ -129,12 +147,14 @@ def same_series(a: pd.Series, b: pd.Series, k: int, tol: float = 1e-9) -> bool:
 
 # ================================================================== 1. 因子库
 section("1. 因子库")
-check("因子数量", len(F.FACTORS) == 39, f"实际 {len(F.FACTORS)}")
+check("因子数量", len(F.FACTORS) == 47, f"实际 {len(F.FACTORS)}")
 check("分类齐全",
-      set(F.CATEGORIES) == {"趋势", "反转", "波动", "量能", "形态", "展期", "期权"},
+      set(F.CATEGORIES) == {"趋势", "反转", "波动", "量能", "形态",
+                            "展期", "展期 OI3", "展期 OI6", "期权"},
       str(F.CATEGORIES))
 check("展期/期权因子都登记进 AUX_KEYS",
-      set(F.AUX_KEYS) == {k for k, s in F.FACTORS.items() if s.category in ("展期", "期权")},
+      set(F.AUX_KEYS) == {k for k, s in F.FACTORS.items()
+                          if s.category.startswith("展期") or s.category == "期权"},
       f"实际 {len(F.AUX_KEYS)} 个")
 check("默认单因子存在", F.DEFAULT_SINGLE in F.FACTORS)
 check("默认多因子都存在", all(k in F.FACTORS for k in F.DEFAULT_MULTI))
@@ -151,7 +171,7 @@ for key in F.FACTORS:
     if not same_series(s, F.raw(DF_AUX.iloc[:CUT], key), CUT):
         bad_pit.append(key)
 
-check("39 个因子都能算出足够样本", not bad_calc, f"异常 {bad_calc}")
+check("47 个因子都能算出足够样本", not bad_calc, f"异常 {bad_calc}")
 check("因子值无 inf", not bad_inf, f"含 inf {bad_inf}")
 check("因子计算不含未来信息（截断重算零差异）", not bad_pit, f"有差异 {bad_pit}")
 
@@ -187,11 +207,22 @@ check("无衍生列时展期因子返回全 NaN",
 
 
 def aux_row(n: int = 60) -> pd.DataFrame:
-    """构造一条精确已知的期限结构：c1=100 / c2=101 / c3=102，间隔 30 / 70 天。"""
+    """构造一条精确已知的期限结构：c1=100 / c2=101 / c3=102，间隔 30 / 70 天。
+
+    OI 两套口径按「o6 从 c2 起、o3 从 c3 起」各错开一档，间隔 70 / 40 / 50 天，
+    这样每套的分子分母、到期间隔都是不同的数，前缀接错时一定对不上。
+    """
     df = DF.iloc[:n].copy()
     df["c1_close"], df["c2_close"], df["c3_close"] = 100.0, 101.0, 102.0
     df["c1_dte"], df["c2_dte"], df["c3_dte"] = 20.0, 50.0, 120.0
     df["c1_oi"], df["c2_oi"], df["c3_oi"] = 300.0, 700.0, 100.0
+    df["o6_1_close"], df["o6_2_close"], df["o6_3_close"] = 101.0, 102.0, 103.0
+    df["o6_1_dte"], df["o6_2_dte"], df["o6_3_dte"] = 50.0, 120.0, 160.0
+    df["o3_1_close"], df["o3_2_close"], df["o3_3_close"] = 102.0, 103.0, 104.0
+    df["o3_1_dte"], df["o3_2_dte"], df["o3_3_dte"] = 120.0, 160.0, 210.0
+    for pre in ("o3_", "o6_"):
+        for i in (1, 2, 3):
+            df[f"{pre}{i}_oi"] = 500.0
     df["iv_near"], df["iv_next"] = 0.20, 0.23
     df["dte_near"], df["dte_next"] = 20.0, 50.0
     df["skew"], df["curv"], df["pcr"] = 0.12, 0.35, 1.2
@@ -233,6 +264,43 @@ rc = F.raw(A, "roll_change")
 check("展期变化在常数结构上为 0", bool((rc.iloc[20:] == 0).all()) and rc.iloc[:20].isna().all())
 ic = F.raw(A, "iv_change")
 check("IV 变化在常数 IV 上为 0", bool((ic.iloc[20:] == 0).all()) and ic.iloc[:20].isna().all())
+
+# ---- OI 两套口径：四个公式各自换前缀，逐项对精确值
+for pre, p1, p2, p3, g12, g23 in (
+    ("o3_", 102.0, 103.0, 104.0, 40.0, 50.0),
+    ("o6_", 101.0, 102.0, 103.0, 70.0, 40.0),
+):
+    tag = pre.strip("_").upper()
+    ry_x = p1 / p2 - 1.0
+    got = float(F.raw(A, f"roll_yield_{pre.strip('_')}").iloc[-1])
+    check(f"{tag} 展期收益率 = P1/P2 - 1", abs(got - ry_x) < 1e-12,
+          f"{got:+.10f} vs {ry_x:+.10f}")
+
+    got = float(F.raw(A, f"roll_annual_{pre.strip('_')}").iloc[-1])
+    exp = ry_x * 365.0 / g12
+    check(f"{tag} 展期年化 = 收益率 × 365/{g12:.0f}", abs(got - exp) < 1e-12,
+          f"{got:+.10f} vs {exp:+.10f}")
+
+    got = float(F.raw(A, f"roll_curv_{pre.strip('_')}").iloc[-1])
+    exp = (math.log(p2 / p3) / g23 - math.log(p1 / p2) / g12) * 365.0
+    check(f"{tag} 展期曲率 = 远端斜率 - 近端斜率", abs(got - exp) < 1e-12,
+          f"{got:+.10f} vs {exp:+.10f}")
+
+    rc_x = F.raw(A, f"roll_change_{pre.strip('_')}")
+    check(f"{tag} 展期变化在常数结构上为 0",
+          bool((rc_x.iloc[20:] == 0).all()) and rc_x.iloc[:20].isna().all())
+
+# 把 c* 的列原样冒充成 o3_/o6_，两套因子必须逐位相同 —— 这条专门抓前缀拼错，
+# 上面那些精确值检查抓不到「o3 和 o6 都接对了但互相抄错」这种情形
+fake = A.copy()
+for pre in ("o3_", "o6_"):
+    for i in (1, 2, 3):
+        for suf in ("close", "dte", "oi"):
+            fake[f"{pre}{i}_{suf}"] = A[f"c{i}_{suf}"]
+for stem in ("roll_yield", "roll_annual", "roll_curv", "roll_change"):
+    for suf in ("o3", "o6"):
+        check(f"{stem}_{suf} 与 c 口径等价（同列时应完全一致）",
+              same_series(F.raw(fake, f"{stem}_{suf}"), F.raw(fake, stem), len(fake)))
 
 # IV-RV 价差：必须严格等于 iv_near - vol_20，且 IV 明显高于实际波动时为正
 d = F.raw(A, "iv_rv") - (A["iv_near"] - F.raw(A, "vol_20"))
@@ -418,7 +486,7 @@ check("IC 衰减长度 = 持有期个数", len(decay) == 7, str(list(decay.index
 t0 = time.time()
 rep = M.factor_report(DF_AUX, list(F.FACTORS), horizon=5, window=252)
 cost = time.time() - t0
-check("全因子评估 39 行", len(rep) == len(F.FACTORS), str(len(rep)))
+check("全因子评估 47 行", len(rep) == len(F.FACTORS), str(len(rep)))
 check("全因子 IC 都算得出来", rep["ic"].notna().all(),
       str(list(rep.loc[rep["ic"].isna(), "key"])))
 check("评估表无 error 列", "error" not in rep.columns or rep["error"].isna().all())
