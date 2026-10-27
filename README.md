@@ -55,6 +55,38 @@ cp token.example.txt token.txt      # 然后把 token 填进去；token.txt 不�
 .venv\Scripts\python.exe smoke_test_mutation.py  # 变异检验：6 项，证明探针不是摆设
 ```
 
+### 换目录 / 换机器之后（只在 `.venv` 是直接复制过来时需要）
+
+项目连同 `.venv` 一起拷到别的路径（比如从 C 盘挪到 D 盘）之后，venv 里有两类
+东西还指着旧目录，症状都不明显：
+
+| 症状 | 原因 |
+|---|---|
+| `pip.exe` / `pyinstaller.exe` 静默失败：退出码 1、**没有任何输出** | console script 是「launcher + 一行 shebang + zip」，shebang 里写死了旧路径的 `python.exe` |
+| 激活 venv 之后 `python` 仍然跑到旧环境 | `activate` 里的 `VIRTUAL_ENV` 是绝对路径 |
+
+跑一次就好：
+
+```bash
+.venv\Scripts\python.exe packaging\relocate_venv.py           # 修
+.venv\Scripts\python.exe packaging\relocate_venv.py --check   # 只看不动
+```
+
+它会改 `activate*` 里的 `VIRTUAL_ENV`、按各 `dist-info/entry_points.txt`
+重新生成 `Scripts\*.exe`，最后扫一遍确认没有残留。
+
+> **shebang 为什么只能重建、不能改**：那行 shebang 夹在 launcher 可执行文件和
+> zip 归档之间，而 zip 的中央目录记录着每个条目的字节偏移 —— 长度一变，偏移全错，
+> 整个 zip 就失效了。补 NUL 或补空格凑回原长度也不行：distlib 的 launcher 会把
+> 整段交给 `CreateProcess`，两种填充实测都是退出码 1、无输出。所以走
+> `distlib.ScriptMaker` 重新生成，结构完整、shebang 是新的。
+>
+> `pyvenv.cfg` 里的 `home` **不要动** —— 它指向创建 venv 时用的那个 Python 安装，
+> 不在项目里，改了就真起不来。脚本只改 `command` 那一行（纯历史记录）。
+>
+> `__pycache__` 里的 `.pyc` 同样记着旧源路径，但那只影响 traceback 的显示，
+> 不影响运行，不用管。
+
 ### 启动 GUI 的四种方式
 
 按「省事 → 可控」排序，随便挑一种：
@@ -120,6 +152,7 @@ Claw/
 ├── packaging/
 │   ├── TrendDesk.spec     # PyInstaller 配置（Windows / macOS 通用）
 │   ├── make_icon.py       # 用 Pillow 生成 .ico / .icns / .png
+│   ├── relocate_venv.py   # 项目换目录后修 .venv 里写死的绝对路径
 │   └── icon.*             # 生成好的图标
 ├── ttrade/
 │   ├── eastmoney.py       # 东财接口封装（secid 解析、K线抓取、本地读取）
