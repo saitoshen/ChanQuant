@@ -38,3 +38,9 @@ desktop.ini
 # 编辑器
 .vscode/
 .idea/
+
+# 天勤账户（两行：用户名、密码），与 Tushare token 同级别保护
+tq_account.txt
+
+# 天勤行情仓库（DuckDB，5m 全品种十年约 1GB，由 download_tq.py 生成）
+data_tq/

@@ -3,7 +3,7 @@
 
 matplotlib==3.11.2
 numpy==2.5.4
-pandas==3.1.0
+pandas==3.0.6
 
 # GUI。PySide6 是元包，会带上 Essentials + Addons
 PySide6==6.12.0
@@ -13,6 +13,13 @@ Pillow==13.0.0
 
 # 东方财富行情接口
 requests==2.34.2
+
+# 天勤行情（5m/1h 下载、实时行情、交易）。**它把 pandas 钉在 <3.1**，
+# 所以上面的 pandas 是 3.0.6 而不是 3.1.0 —— 升到 3.1 会让 pip 解析失败。
+tqsdk==3.10.4
+
+# 分钟级行情仓库（单文件列存，见 ttrade/tqstore.py）
+duckdb==2.0.0
 
 # 仅 download_futures.py 需要；GUI 与回测不 import，但保留在依赖里
 # 让「快速开始」能一路跑通
