@@ -77,9 +77,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ttrade import factor_metrics, factors, mlmodels, updater
+from ttrade import factor_metrics, factors, mlmodels, tqdata, updater
 from ttrade import factor_strategy as fstrat
-from ttrade.backtest import BacktestConfig, buy_and_hold, drawdown_series, run_backtest
+from ttrade.backtest import (
+    BacktestConfig,
+    bars_per_year,
+    buy_and_hold,
+    drawdown_series,
+    run_backtest,
+)
 from ttrade.eastmoney import load_local
 from ttrade.strategies import STRATEGIES, run_strategy
 from ttrade.universe import BENCHMARK, UNIVERSE, cn_name, sector_of
@@ -116,6 +122,13 @@ K_WIN_DEFAULT = 180
 K_WIN_MIN = 40
 K_WIN_MAX = 1500
 K_REDRAW_GAP = 0.15     # 滚动重绘的最小间隔（秒）
+
+# 周期。日线走原来的 Tushare CSV（20 年），分钟级走天勤 DuckDB（10 年）。
+# 两者主力换月口径不同（天勤按自己的规则，Tushare 按自己的），所以跨周期的
+# 绝对价位会有细微差异 —— 这是数据源差异，不是 bug。
+PERIOD_1D = "1d"
+GUI_PERIODS = [PERIOD_1D] + tqdata.PERIOD_ORDER   # 下拉框顺序：日线在前，越往后越短
+PERIOD_LABEL = dict(tqdata.PERIOD_LABEL, **{PERIOD_1D: "日线"})
 
 # 因子分数面板配色：与 K 线的红绿、信号的紫/琥珀都错开，用青蓝系
 C_FACTOR = "#0891b2"
@@ -302,7 +315,7 @@ MARKETS = {
     "cn": {
         "label": "国内期货",
         "dir": FUT_DIR,
-        "sub": "国内期货 · 20年日线 · 主力连续 · 前复权 · Tushare",
+        "sub": "国内期货 · 日线 20 年（Tushare）/ 5 分钟·1 小时 10 年（天勤）· 主力连续 · 前复权",
         "price_note": "价格（前复权·主力连续）",
         "fee": 0.0001,
         "slippage": 0.0002,
@@ -311,7 +324,7 @@ MARKETS = {
             "▲紫＝开多　▼紫＝平多　▼琥珀＝开空　▲琥珀＝平空　"
             "浅蓝底色＝多头持仓　浅红底色＝空头持仓　"
             "红色虚线＝这笔交易盈利　绿色虚线＝亏损　"
-            "价格已按 Tushare 复权因子消除换月跳空"
+            "分钟级按天勤自己的主力切换口径复权，与日线的 Tushare 口径不同"
         ),
     },
 }
@@ -354,12 +367,20 @@ def load_futures_csv(key: str, data_dir: str) -> pd.DataFrame:
 
 
 class DataStore:
-    """本地 CSV 缓存，按需读取。支持美股 / 国内期货两个市场。"""
+    """本地缓存，按需读取。支持美股 / 国内期货两个市场、多个周期。
+
+    期货的日线走 Tushare CSV（20 年），分钟级走天勤 DuckDB（10 年）。缓存按
+    (标的, 周期) 存，并限制条目数 —— 一个品种的 5 分钟十年是十几万行、约 10 MB，
+    全市场都缓存下来会吃掉几个 G。
+    """
+
+    CACHE_MAX = 6
 
     def __init__(self, market: str = "us"):
         self.market = market
         self.data_dir = MARKETS[market]["dir"]
-        self._cache: dict[str, pd.DataFrame] = {}
+        self._cache: dict[tuple[str, str], pd.DataFrame] = {}
+        self._periods: dict[str, set[str]] = {}
         self.items: list[dict] = []
         self._scan()
 
@@ -424,18 +445,36 @@ class DataStore:
                  "name": r.get("name", ""), "exchange": ex}
             )
 
-    def get(self, key: str) -> pd.DataFrame | None:
-        if key in self._cache:
-            return self._cache[key]
+    def get(self, key: str, period: str = PERIOD_1D) -> pd.DataFrame | None:
+        ck = (key, period)
+        if ck in self._cache:
+            return self._cache[ck]
         try:
-            if self.market == "us":
-                df = load_local(key, self.data_dir)
+            if self.market == "us" or period in (None, "", PERIOD_1D):
+                df = load_local(key, self.data_dir) if self.market == "us" \
+                    else load_futures_csv(key, self.data_dir)
             else:
-                df = load_futures_csv(key, self.data_dir)
+                sym, _, ex = key.rpartition("_")
+                # qfq：最后一根等于真实盘面价，和日线的口径一致
+                df = tqdata.load_main(sym, ex, period, adjust="qfq")
         except Exception:
             return None
-        self._cache[key] = df
+        while len(self._cache) >= self.CACHE_MAX:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[ck] = df
         return df
+
+    def has_period(self, key: str, period: str) -> bool:
+        """这个标的有没有该周期的数据。按品种缓存，切换品种时只查一次库。"""
+        if self.market == "us" or period in (None, "", PERIOD_1D):
+            return True
+        if key not in self._periods:
+            sym, _, ex = key.rpartition("_")
+            try:
+                self._periods[key] = set(tqdata.available_periods(sym, ex))
+            except Exception:
+                self._periods[key] = set()
+        return period in self._periods[key]
 
 
 # ------------------------------------------------------------------ 交易切分
@@ -831,6 +870,21 @@ class MainWindow(QMainWindow):
         self.cb_symbol = QComboBox()
         self.cb_symbol.setMaxVisibleItems(18)
         cl.addWidget(self.cb_symbol)
+
+        cl.addWidget(self._section("周期"))
+        self.cb_period = QComboBox()
+        for p in GUI_PERIODS:
+            self.cb_period.addItem(PERIOD_LABEL.get(p, p), p)
+        self.cb_period.setToolTip(
+            "日线来自 Tushare（20 年）；5 分钟 / 1 小时来自天勤（10 年），\n"
+            "15/30 分钟由 5 分钟合并、2/4 小时由 1 小时合并。\n"
+            "两个数据源的主力换月口径不同，跨周期的绝对价位会有细微差异。"
+        )
+        cl.addWidget(self.cb_period)
+        self.lbl_period = QLabel("")
+        self.lbl_period.setObjectName("Hint")
+        self.lbl_period.setWordWrap(True)
+        cl.addWidget(self.lbl_period)
 
         cl.addWidget(self._section("策略类型"))
         self.cb_family = QComboBox()
@@ -1348,7 +1402,8 @@ class MainWindow(QMainWindow):
         # 信号只连一次，避免切换市场后重复触发
         if not getattr(self, "_wired", False):
             self.cb_market.currentIndexChanged.connect(self._on_market_changed)
-            self.cb_symbol.currentIndexChanged.connect(self._schedule)
+            self.cb_symbol.currentIndexChanged.connect(self._on_symbol_changed)
+            self.cb_period.currentIndexChanged.connect(self._on_period_changed)
             self.cb_strategy.currentIndexChanged.connect(self._on_strategy_changed)
             self.cb_range.currentIndexChanged.connect(self._schedule)
             self.chk_ma.currentIndexChanged.connect(self._schedule)
@@ -1373,6 +1428,7 @@ class MainWindow(QMainWindow):
             self._wired = True
 
         self._fill_symbols()
+        self._sync_period_controls()
         self._on_strategy_changed()
         self._on_family_changed()
         self._sync_update_controls()
@@ -1388,6 +1444,7 @@ class MainWindow(QMainWindow):
             idx = self.cb_symbol.findData(default)
             self.cb_symbol.setCurrentIndex(idx if idx >= 0 else 0)
         self.cb_symbol.blockSignals(False)
+        self._sync_period_hint()
 
     def _short_enabled(self) -> bool:
         """当前是否允许做空。美股默认不允许，期货默认允许。"""
@@ -1422,11 +1479,66 @@ class MainWindow(QMainWindow):
         self.lbl_legend.setText(info["legend"])
         self._sync_update_controls()
         self._fill_symbols()
+        self._sync_period_controls()
         if not self.store.items:
             cmd = "python download.py" if mk == "us" else "python download_futures.py"
             self.lbl_status.setText(f"{info['label']} 本地无数据，请先运行 {cmd}")
             return
         self._schedule(immediate=True)
+
+    # ---------------------------------------------------------- 周期
+    def _period(self) -> str:
+        if not hasattr(self, "cb_period"):
+            return PERIOD_1D
+        return self.cb_period.currentData() or PERIOD_1D
+
+    def _sync_period_controls(self) -> None:
+        """美股没有分钟数据，周期锁在日线；期货按品种实际下载情况标注。"""
+        if not hasattr(self, "cb_period"):
+            return
+        if self.market == "us":
+            self.cb_period.blockSignals(True)
+            idx = self.cb_period.findData(PERIOD_1D)
+            self.cb_period.setCurrentIndex(max(idx, 0))
+            self.cb_period.setEnabled(False)
+            self.cb_period.blockSignals(False)
+            self.lbl_period.setText("美股只有日线")
+            return
+        self.cb_period.setEnabled(True)
+        self._sync_period_hint()
+
+    def _sync_period_hint(self) -> None:
+        """在当前下拉项上标出「已下载 / 未下载」，避免选到空周期一脸问号。"""
+        if self.market == "us" or not hasattr(self, "cb_period"):
+            return
+        key = self.cb_symbol.currentData() if hasattr(self, "cb_symbol") else None
+        miss = []
+        for i in range(self.cb_period.count()):
+            p = self.cb_period.itemData(i)
+            base = PERIOD_LABEL.get(p, p)
+            ok = True if (key is None or p == PERIOD_1D) else self.store.has_period(key, p)
+            self.cb_period.setItemText(i, base if ok else f"{base}（未下载）")
+            if not ok:
+                miss.append(p)
+        cur = self._period()
+        if cur != PERIOD_1D and not (key and self.store.has_period(key, cur)):
+            self.lbl_period.setText(
+                f"{PERIOD_LABEL.get(cur, cur)} 数据还没下载：\n"
+                f"python download_tq.py --main {cur} --symbols ..."
+            )
+        elif miss:
+            self.lbl_period.setText(f"天勤分钟数据已覆盖 {len(GUI_PERIODS) - 1 - len(miss)} 个周期")
+        else:
+            self.lbl_period.setText("")
+
+    def _on_period_changed(self) -> None:
+        self._sync_period_hint()
+        self._schedule(immediate=True)
+
+    def _on_symbol_changed(self) -> None:
+        # 每个品种下载到的周期不一样，换品种必须重标一次下拉项
+        self._sync_period_hint()
+        self._schedule()
 
     # ---------------------------------------------------------- 数据更新
     def _sync_update_controls(self) -> None:
@@ -1876,10 +1988,21 @@ class MainWindow(QMainWindow):
         skey = self.cb_symbol.currentData()
         if not skey:
             return
-        df = self.store.get(skey)
+        period = self._period()
+        df = self.store.get(skey, period)
         if df is None or df.empty:
-            self.lbl_status.setText(f"{skey} 数据缺失")
+            if period == PERIOD_1D:
+                self._clear_chart(f"{skey} 数据缺失")
+            else:
+                self._clear_chart(
+                    f"{skey} 没有 {PERIOD_LABEL.get(period, period)} 数据\n"
+                    f"先跑：python download_tq.py --main {period} --all"
+                )
             return
+
+        # 年化口径必须跟着周期走：5 分钟一年约 1.2 万根，按 252 算会把波动
+        # 低估一个数量级、夏普虚高一个数量级。
+        self.cfg.bars_per_year = bars_per_year(df.index)
 
         self.df_raw = df
         rule_signal = None
@@ -1991,6 +2114,34 @@ class MainWindow(QMainWindow):
         if self._closing or seq != self._f_seq:
             return
         self.lbl_status.setText(f"机器学习训练失败：{msg}")
+
+    def _clear_chart(self, msg: str) -> None:
+        """没有数据时把图清空并写一句话。
+
+        不清的话会留着上一个品种/上一个周期的图，配上一句「数据缺失」，
+        看起来像是这个品种算出来了但结论为空 —— 比直接空白更误导。
+        """
+        self.df_raw = None
+        self.df_sig = None
+        self.res = None
+        self.bh = None
+        self.factor_outcome = None
+        self.lbl_status.setText(msg)
+        for card in ("card_cagr", "card_dd", "card_sharpe", "card_excess"):
+            w = getattr(self, card, None)
+            if w is not None:
+                w.set_value("—", C_MUTED)
+        if hasattr(self, "tbl_factor"):
+            self.tbl_factor.setRowCount(0)
+        try:
+            fig = self.canvas_k.fresh()
+            ax = fig.add_subplot(111)
+            ax.axis("off")
+            ax.text(0.5, 0.5, msg, ha="center", va="center",
+                    color=C_MUTED, fontsize=12, wrap=True)
+            self.canvas_k.draw()
+        except Exception:
+            pass
 
     def _finish(self, rule_signal_df: pd.DataFrame, label: str) -> None:
         """规则策略（不含因子）的收尾：回测 + 重绘。"""
@@ -2348,13 +2499,21 @@ class MainWindow(QMainWindow):
         for a in all_axes[:-1]:
             a.tick_params(labelbottom=False)
 
-        # x 轴日期刻度放在最下面那根轴上
+        # x 轴日期刻度放在最下面那根轴上。格式跟着可视跨度走：180 根 5 分钟
+        # 只有两天半，一律写「年-月」会变成十个一模一样的标签。
         bottom_ax = all_axes[-1]
         n_ticks = min(10, max(4, len(view) // 60))
         tick_pos = np.linspace(0, len(view) - 1, n_ticks).astype(int)
+        span = (view.index[-1] - view.index[0]).total_seconds()
+        if span <= 2 * 86400:
+            fmt = "%m-%d %H:%M"
+        elif span <= 150 * 86400:
+            fmt = "%m-%d"
+        else:
+            fmt = "%Y-%m"
         bottom_ax.set_xticks(tick_pos)
         bottom_ax.set_xticklabels(
-            [view.index[i].strftime("%Y-%m") for i in tick_pos],
+            [view.index[i].strftime(fmt) for i in tick_pos],
             rotation=0, fontsize=9,
         )
 
@@ -2374,16 +2533,22 @@ class MainWindow(QMainWindow):
         # 「当前状态」永远指最新一根，不是窗口最后一根——否则滚到历史位置时
         # 标题会跟着变，看着像当前真的空仓了。
         state = {1: "多头持仓", -1: "空头持仓"}.get(int(sig_full[-1]), "空仓")
+        period = self._period()
+        plabel = "" if period == PERIOD_1D else f" · {PERIOD_LABEL.get(period, period)}"
         ax.set_title(
-            f"{head}   ·   {spec_label}   ·   "
-            f"{view.index[0]:%Y-%m-%d} ~ {view.index[-1]:%Y-%m-%d}   ·   当前状态：{state}",
+            f"{head}{plabel}   ·   {spec_label}   ·   "
+            f"{view.index[0]:%Y-%m-%d %H:%M} ~ {view.index[-1]:%Y-%m-%d %H:%M}"
+            f"   ·   当前状态：{state}",
             fontsize=11.5, color=C_TEXT, loc="left", pad=10,
         )
-        source = (
-            "东方财富后复权"
-            if self.market == "us"
-            else "Tushare 换月复权"
-        )
+        if self.market == "us":
+            source = "东方财富后复权"
+        elif period == PERIOD_1D:
+            source = "Tushare 换月复权"
+        else:
+            src = tqdata.PERIODS.get(period, (period, 1))
+            merged = f"（由 {src[0]} × {src[1]} 合并）" if src[1] > 1 else ""
+            source = f"天勤换月复权{merged}"
         shown = f"{start + 1:,}–{start + win:,}"
         self.lbl_chart_title.setText(
             f"全历史 {len(self.df_sig):,} 根 · 当前显示第 {shown} 根"
@@ -2545,8 +2710,20 @@ class MainWindow(QMainWindow):
                 dir_txt += f" · 爆仓 {m['n_blowup']} 次"
         self.lbl_status.setText(
             f"{m['n_trades']} 笔交易 · 胜率 {m['win_rate']*100:.0f}% · "
-            f"仓位时间 {m['exposure']*100:.0f}% · 平均持仓 {m['avg_bars']:.0f} 天{dir_txt}"
+            f"仓位时间 {m['exposure']*100:.0f}% · 平均持仓 {self._hold_text(m['avg_bars'])}{dir_txt}"
         )
+
+    def _hold_text(self, bars: float) -> str:
+        """平均持仓长度的可读写法。
+
+        `avg_bars` 的单位是「根」，日线一根就是一天，分钟级一根只有几十分钟。
+        统一写「天」会把 1 小时的 160 根说成 160 天（实际约 32 个交易日）。
+        """
+        if self._period() == PERIOD_1D:
+            return f"{bars:.0f} 天"
+        bpy = float(self.cfg.bars_per_year or 252)
+        days = bars / bpy * 365.25 if bpy > 0 else 0.0
+        return f"{bars:.0f} 根（约 {days:.0f} 天）"
 
     def _update_table(self) -> None:
         m, b = self.res.metrics, self.bh.metrics
@@ -2569,7 +2746,7 @@ class MainWindow(QMainWindow):
             ("胜率", pct(m["win_rate"]), "—", None),
             ("盈亏比", f"{m['profit_factor']:.2f}", "—", None),
             ("平均每笔收益", pct(m["avg_trade"]), "—", None),
-            ("平均持仓天数", f"{m['avg_bars']:.0f}", "—", None),
+            ("平均持仓", self._hold_text(m["avg_bars"]), "—", None),
             ("最佳单笔", pct(m["best_trade"]), "—", None),
             ("最差单笔", pct(m["worst_trade"]), "—", None),
             ("期末资金", f"${m['final_equity']:,.0f}", f"${b['final_equity']:,.0f}",

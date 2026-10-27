@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import contextmanager
 
@@ -99,6 +100,11 @@ DDL = [
 
 
 def db_path() -> str:
+    """仓库路径。`TRENDDESK_TQ_DB` 可以指向别处 —— 测试用临时库、或者把仓库放到
+    空间更大的盘上，都不需要改代码。"""
+    env = os.environ.get("TRENDDESK_TQ_DB")
+    if env:
+        return env
     return os.path.join(os.path.dirname(data_dir("cn").rstrip("/\\")), "data_tq", "tq.duckdb")
 
 
@@ -296,6 +302,61 @@ def upsert_contracts(con, symbol: str, exchange: str, period: str, df: pd.DataFr
     con.execute("INSERT OR REPLACE INTO contract_bars SELECT * FROM _tmp_cb")
     con.unregister("_tmp_cb")
     return len(d)
+
+
+def periods_of(symbol: str, exchange: str) -> set[str]:
+    """这个品种在库里已经落了哪些源周期。
+
+    界面每换一个品种要判断 6 个周期有没有数据，逐个调 `bar_count()` 就是 6 次
+    开库查询；这里一次查完。注意返回的是**源周期**（5m / 1h），15m/2h 这些
+    是本地合并出来的，由 `tqdata` 负责映射。
+    """
+    if not exists():
+        return set()
+    with connect(read_only=True) as con:
+        rows = con.execute(
+            "SELECT DISTINCT period FROM bars WHERE symbol=? AND exchange=?",
+            [symbol, exchange],
+        ).fetchall()
+    return {r[0] for r in rows}
+
+
+def contract_last_dt(symbol: str, exchange: str, period: str) -> dict[str, pd.Timestamp]:
+    """每个真实合约在库里已有的最后一根时间，用于增量跳过。
+
+    没有这个，每次重跑都要把几百个合约从头下一遍 —— 真实合约十年是几千个
+    合约、上亿行，重下要几小时。
+    """
+    if not exists():
+        return {}
+    with connect(read_only=True) as con:
+        rows = con.execute(
+            "SELECT contract, max(dt) FROM contract_bars"
+            " WHERE symbol=? AND exchange=? AND period=? GROUP BY contract",
+            [symbol, exchange, period],
+        ).fetchall()
+    return {r[0]: pd.Timestamp(r[1]) for r in rows if r[1] is not None}
+
+
+def meta_get(k: str, default=None):
+    """读 meta 里的一个键。JSON 能解析就返回对象，否则返回原字符串。"""
+    if not exists():
+        return default
+    with connect(read_only=True) as con:
+        r = con.execute("SELECT v FROM meta WHERE k=?", [k]).fetchone()
+    if r is None or r[0] is None:
+        return default
+    try:
+        return json.loads(r[0])
+    except (ValueError, TypeError):
+        return r[0]
+
+
+def meta_set(k: str, v) -> None:
+    """写 meta。dict / list 自动转 JSON，省得调用方到处 dumps。"""
+    val = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+    with connect() as con:
+        con.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", [k, val])
 
 
 def load_contracts(symbol: str, exchange: str, period: str,

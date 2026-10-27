@@ -19,12 +19,31 @@ import pandas as pd
 TRADING_DAYS = 252
 
 
+def bars_per_year(index: pd.DatetimeIndex) -> float:
+    """按数据本身推断「一年有多少根 bar」，用于年化波动和夏普。
+
+    不能写死 252：日线一年 244 根，1 小时一年约 1.4 千根，5 分钟一年约 1.2 万根。
+    用 252 去年化 5 分钟数据，年化波动会被低估约 7 倍（√(11700/252)），夏普虚高
+    同样倍数 —— 而且这个错误不会报错，只是数字看起来「特别好」。
+
+    用整段数据的根数除以日历跨度，比按周期查表更稳：不同品种夜盘时长不同
+    （有的到 23:00，有的到 01:00 或 02:30），查表必然对不齐。
+    """
+    if index is None or len(index) < 2:
+        return float(TRADING_DAYS)
+    days = (pd.Timestamp(index[-1]) - pd.Timestamp(index[0])).days
+    if days <= 0:
+        return float(TRADING_DAYS)
+    return float(len(index) / (days / 365.25))
+
+
 @dataclass
 class BacktestConfig:
     initial_cash: float = 100_000.0
     fee_rate: float = 0.0005      # 单边手续费 5bp
     slippage: float = 0.0005      # 单边滑点 5bp
     long_only: bool = False       # True 时把 -1 裁成 0（股票市场默认）
+    bars_per_year: float = float(TRADING_DAYS)   # 日线默认；分钟级由调用方按数据推断
 
     @property
     def label(self) -> str:
@@ -62,7 +81,8 @@ _METRIC_KEYS = (
 )
 
 
-def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade]) -> dict:
+def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
+             bars_per_year: float = float(TRADING_DAYS)) -> dict:
     equity = equity.dropna()
     if len(equity) < 2:
         return {k: 0.0 for k in _METRIC_KEYS}
@@ -74,8 +94,9 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade]) -> dic
     years = days / 365.25
     cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1 / years) - 1 if years > 0 else 0.0
 
-    vol = ret.std(ddof=1) * np.sqrt(TRADING_DAYS) if ret.std(ddof=1) > 0 else 0.0
-    sharpe = (ret.mean() * TRADING_DAYS) / vol if vol > 0 else 0.0
+    bpy = float(bars_per_year or TRADING_DAYS)
+    vol = ret.std(ddof=1) * np.sqrt(bpy) if ret.std(ddof=1) > 0 else 0.0
+    sharpe = (ret.mean() * bpy) / vol if vol > 0 else 0.0
 
     dd_series = equity / equity.cummax() - 1.0
     max_dd = float(dd_series.min())
@@ -244,7 +265,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
 
     eq = pd.Series(equity, index=idx, name="equity")
     ps = pd.Series(pos_state, index=idx, name="position")
-    m = _metrics(eq, ps, trades)
+    m = _metrics(eq, ps, trades, cfg.bars_per_year)
     m["final_equity"] = float(eq.iloc[-1])
     return Result(equity=eq, position=ps, trades=trades, metrics=m, label=label)
 
@@ -273,7 +294,7 @@ def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None) -> Result:
         direction=1,
         open_position=True,
     )
-    m = _metrics(eq, ps, [trade])
+    m = _metrics(eq, ps, [trade], cfg.bars_per_year)
     m["final_equity"] = float(eq.iloc[-1])
     return Result(equity=eq, position=ps, trades=[trade], metrics=m, label="买入持有")
 

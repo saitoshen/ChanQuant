@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -60,7 +61,7 @@ from ttrade.tqsdk_symbols import (  # noqa: E402
 PERIOD_SEC = {"5m": 300, "1h": 3600, "1d": 86400}
 
 MAIN_YEARS = 10        # 主连默认回溯年数（天勤 5m 最早约 2016 年）
-CONTRACT_YEARS = 3     # 真实合约默认回溯年数（体积大一个量级，见 README）
+CONTRACT_YEARS = 10    # 真实合约默认回溯年数（与主连一致）
 
 BATCH = 30             # query_his_cont_quotes 单次最多查多少个品种
 
@@ -73,23 +74,6 @@ def tq_root() -> str:
     return os.path.join(os.path.dirname(paths.data_dir("cn").rstrip("/\\")), "data_tq")
 
 
-def main_dir(period: str) -> str:
-    return os.path.join(tq_root(), "main", period)
-
-
-def switch_dir() -> str:
-    return os.path.join(tq_root(), "switch")
-
-
-def contract_dir(period: str) -> str:
-    return os.path.join(tq_root(), "contracts", period)
-
-
-def ensure_dirs(*ds: str) -> None:
-    for d in ds:
-        os.makedirs(d, exist_ok=True)
-
-
 # ----------------------------------------------------------------- 天勤连接
 
 
@@ -98,6 +82,52 @@ def make_api():
 
     user, pwd = read_account()
     return TqApi(auth=TqAuth(user, pwd))
+
+
+def in_maintenance(now: datetime | None = None) -> bool:
+    """天勤每天 19:00-19:30（北京时间）是运维窗口，这段时间连不上。"""
+    now = now or datetime.now()
+    return now.hour == 19 and now.minute < 31
+
+
+def wait_maintenance() -> None:
+    """撞上运维窗口就等到 19:31，别用重试硬刷 —— 刷再快也连不上。"""
+    if not in_maintenance():
+        return
+    now = datetime.now()
+    target = now.replace(hour=19, minute=31, second=30, microsecond=0)
+    secs = max(5, (target - now).total_seconds())
+    print(f"  [天勤运维窗口 19:00-19:30] 等待 {secs / 60:.0f} 分钟后继续", flush=True)
+    time.sleep(secs)
+
+
+class Session:
+    """持有 TqApi，断线能重建。
+
+    长任务（真实合约十年要跑几个小时）必然撞上运维窗口或偶发断连。天勤的 api
+    一旦抛异常就不可再用，必须关掉重建；而重跑的成本靠库里的增量控制 ——
+    所以这里的策略是「断开就重建，然后从这一条继续」，不是重试同一条请求。
+    """
+
+    def __init__(self) -> None:
+        self.api = None
+
+    def get(self):
+        if self.api is None:
+            wait_maintenance()
+            self.api = make_api()
+        return self.api
+
+    def reset(self) -> None:
+        try:
+            if self.api is not None:
+                self.api.close()
+        except Exception:
+            pass
+        self.api = None
+
+    def close(self) -> None:
+        self.reset()
 
 
 # ----------------------------------------------------------------- 主力切换表
@@ -344,73 +374,178 @@ def factor_at(series: pd.Series, ts) -> "np.ndarray":
 # ----------------------------------------------------------------- 行情下载
 
 
-def download_bars(api, tq_symbol: str, period: str, start: date, end: date,
-                  tmp_csv: str) -> pd.DataFrame:
-    """用 DataDownloader 下载单合约单周期，返回 DataFrame（dt = 北京时间）。
+_dl_seq = 0
 
-    DataDownloader 只认文件路径，所以先落一个临时 CSV 再读进来，读完就删。
-    增量由调用方决定 `start`（从库里最后一根往前推几天），这里不做合并。
+
+def download_many(api, jobs: list[tuple[str, date, date]], period: str,
+                  out_dir: str, tag: str, max_parallel: int = 8) -> dict[str, pd.DataFrame]:
+    """并发下载多个合约，返回 {天勤合约: DataFrame}。
+
+    `DataDownloader` 是「建任务 + 靠 api.wait_update() 推进」的模式，多个任务可以
+    同时挂在一个 api 上 —— 这才是真实合约下载的正确姿势。逐个 `while not
+    task.is_finished()` 等于把网络往返完全串行化，实测一个品种十年要 11 分钟，
+    78 个品种就是十几个小时。
+
+    并发度取 8：再高对服务端不友好，收益也趋平（瓶颈从网络变成解析 CSV）。
+
+    临时文件名用自增序号而不是 `hash(sym)`：`hash()` 在同进程内对同一字符串稳定，
+    但不同合约理论上可能撞同一个桶，撞上就是两个任务往同一个 CSV 里写、数据串掉，
+    而且这种错误不会报错。序号零成本且绝对唯一。
     """
     from tqsdk.tools import DataDownloader
 
-    if os.path.exists(tmp_csv):
-        os.remove(tmp_csv)
-    task = DataDownloader(
-        api,
-        symbol_list=tq_symbol,
-        dur_sec=PERIOD_SEC[period],
-        start_dt=start,
-        end_dt=end,
-        csv_file_name=tmp_csv,
-    )
-    while not task.is_finished():
-        api.wait_update()
+    global _dl_seq
+    out: dict[str, pd.DataFrame] = {}
+    queue = list(jobs)
+    running: list[tuple[str, object, str]] = []
+    paths: list[str] = []
+    try:
+        while queue or running:
+            while queue and len(running) < max_parallel:
+                sym, start, end = queue.pop(0)
+                _dl_seq += 1
+                path = os.path.join(out_dir, f"_dl_{tag}_{_dl_seq}.csv")
+                paths.append(path)
+                task = DataDownloader(
+                    api,
+                    symbol_list=sym,
+                    dur_sec=PERIOD_SEC[period],
+                    start_dt=start,
+                    end_dt=end,
+                    csv_file_name=path,
+                )
+                running.append((sym, task, path))
+            api.wait_update()
+            still = []
+            for sym, task, path in running:
+                if task.is_finished():
+                    df = _read_downloaded(path, sym)
+                    if not df.empty:
+                        out[sym] = df
+                else:
+                    still.append((sym, task, path))
+            running = still
+    finally:
+        # 断线时 wait_update 会抛异常，此时还在跑的任务文件留在磁盘上。
+        # 不清就会在 data_tq 里堆一堆几百 KB 的 _dl_*.csv，越跑越多。
+        for p in paths:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+    return out
 
-    if not os.path.exists(tmp_csv):
+
+def _read_downloaded(path: str, tq_symbol: str) -> pd.DataFrame:
+    """读 DataDownloader 写出的 CSV，去掉合约前缀列名，返回 dt 为北京时间的表。"""
+    if not os.path.exists(path):
         return pd.DataFrame()
-    raw = pd.read_csv(tmp_csv)
-    os.remove(tmp_csv)
+    try:
+        raw = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
     if raw.empty:
         return pd.DataFrame()
-
-    # 列名带合约前缀（`KQ.m@SHFE.cu.open`），统一去掉
     ren = {c: c[len(tq_symbol) + 1:] for c in raw.columns if c.startswith(tq_symbol + ".")}
     raw = raw.rename(columns=ren)
     keep = [c for c in ("datetime", "open", "high", "low", "close",
                         "volume", "open_oi", "close_oi") if c in raw.columns]
+    if "datetime" not in keep:
+        return pd.DataFrame()
     out = raw[keep].copy()
     out["dt"] = pd.to_datetime(out["datetime"])
     out = out.drop(columns=["datetime"]).dropna(subset=["close"])
     return out.sort_values("dt").drop_duplicates("dt", keep="last").reset_index(drop=True)
 
 
-def write_main(api, sym: str, ex: str, period: str, years: int,
-               factors: pd.Series) -> dict:
-    """下载一个品种的主连并写入仓库（原始价 + adj_factor，复权在读取时做）。"""
-    key = f"{sym}_{ex}"
+def write_main_all(sess, pairs: list[tuple[str, str]], period: str, years: int,
+                   with_retry) -> None:
+    """批量下载主连并写库（原始价 + adj_factor，复权在读取时做）。
+
+    一个品种十年 5m 串行要几分钟，78 个品种两个周期就是几小时。这里和真实合约
+    一样走 8 路并发，批次大小正好取一波 —— 断线最多丢一波，而且已经落库的品种
+    靠 `S.last_dt()` 的增量跳过不会重下。
+    """
     end = date.today()
-    start = end - timedelta(days=365 * years)
-    have = S.last_dt(sym, ex, period)
-    if have is not None:
-        # 往前推 3 天重叠，覆盖「上次下到一半」和节假日边界；主键冲突会覆盖
-        start = max(start, (have - timedelta(days=3)).date())
+    hard_start = end - timedelta(days=365 * years)
 
-    tmp = os.path.join(tq_root(), "_tmp_dl.csv")
-    df = download_bars(api, main_symbol(sym, ex), period, start, end, tmp)
-    if df.empty:
-        return {"key": key, "period": period, "rows": S.bar_count(sym, ex, period),
-                "status": "无新数据"}
+    jobs: list[tuple[str, date, date, str, str]] = []
+    factors: dict[tuple[str, str], pd.Series] = {}
+    for sym, ex in pairs:
+        rec = S.load_switch(sym, ex)
+        factors[(sym, ex)] = adj_factor_series(rec) if len(rec) else pd.Series(dtype=float)
+        start = hard_start
+        have = S.last_dt(sym, ex, period)
+        if have is not None:
+            # 往前推 3 天重叠，覆盖「上次下到一半」和节假日边界；主键冲突会覆盖
+            start = max(start, (have - timedelta(days=3)).date())
+        jobs.append((main_symbol(sym, ex), start, end, sym, ex))
 
-    df["adj_factor"] = factor_at(factors, trading_days(df["dt"]))
-    with S.connect() as con:
-        S.upsert_bars(con, sym, ex, period, df)
-    total = S.bar_count(sym, ex, period)
-    return {"key": key, "period": period, "rows": total, "status": "ok",
-            "added": len(df), "first": str(df["dt"].iloc[0]), "last": str(df["dt"].iloc[-1])}
+    total = len(jobs)
+    done = 0
+    CHUNK = 8
+    for i in range(0, total, CHUNK):
+        batch = jobs[i : i + CHUNK]
+
+        def job(api, batch=batch):
+            nonlocal done
+            frames = download_many(
+                api, [(t, s, e) for t, s, e, _, _ in batch], period, tq_root(),
+                f"MAIN_{period}", max_parallel=8,
+            )
+            with S.connect() as con:
+                for tq_sym, _s, _e, sym, ex in batch:
+                    done += 1
+                    df = frames.get(tq_sym)
+                    if df is None or df.empty:
+                        print(f"  [{period} {done}/{total}] {sym}_{ex}: 无新数据", flush=True)
+                        continue
+                    df["adj_factor"] = factor_at(factors[(sym, ex)], trading_days(df["dt"]))
+                    n = S.upsert_bars(con, sym, ex, period, df)
+                    print(f"  [{period} {done}/{total}] {sym}_{ex}: +{n} 行"
+                          f"（{df['dt'].iloc[0]:%Y-%m-%d} 起）", flush=True)
+            return True
+
+        with_retry(f"主连 {period} 第 {i // CHUNK + 1} 批", job)
+
+
+def _contract_ym(ts_code: str) -> tuple[int, int] | None:
+    """从 Tushare 合约名取出 (年, 月)。`CU2601.SHF` → (2026, 1)。
+
+    郑商所的 3 位月份在 `to_ts()` 里已经补成 4 位，所以这里统一按 4 位解析。
+    """
+    m = re.search(r"(\d{4})\.", str(ts_code))
+    if not m:
+        return None
+    yymm = int(m.group(1))
+    return 2000 + yymm // 100, yymm % 100
+
+
+def _expired(ts_code: str, today: date) -> bool:
+    """合约月份早于当前月，就当它已经到期。
+
+    到期日可能是月份中旬（商品）或第三个周五（股指），这里不做精确判断 ——
+    只用来决定「要不要跳过重下」，差几天无所谓：没到期的会被重下（便宜），
+    真到期了再下一次也只是一次空请求。
+    """
+    ym = _contract_ym(ts_code)
+    return bool(ym and ym < (today.year, today.month))
 
 
 def write_contracts(api, sym: str, ex: str, period: str, years: int) -> dict:
-    """下载一个品种的全部真实合约（不复权，单个合约本身没有换月跳空）。"""
+    """下载一个品种的全部真实合约（不复权，单个合约本身没有换月跳空）。
+
+    十年全品种是几千个合约、上亿行的量级，所以三件事必须做对：
+
+    1. **按合约增量**：已到期的合约有数据就整段跳过，没到期的从最后一根往前推
+       3 天续下。没有这层跳过，重跑一次等于重下全部。
+    2. **并发下载**：见 `download_many()`。串行下一个品种十年要 11 分钟。
+    3. **区间外与空合约也记账**：`query_quotes(expired=True)` 会把品种上市以来
+       所有合约都返回，十年前就摘牌的那些整段都不需要；另外有些远月合约从挂牌
+       到摘牌一笔没成交，每次跑都会白请求一次。前者按到期月份直接过滤，后者写进
+       meta，下次跳过。
+    """
     key = f"{sym}_{ex}"
     end = date.today()
     start = end - timedelta(days=365 * years)
@@ -422,23 +557,55 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int) -> dict:
     except Exception as exc:
         return {"key": key, "period": period, "rows": 0, "status": f"查合约失败 {exc}"}
 
-    total = 0
-    n_con = 0
-    tmp = os.path.join(tq_root(), "_tmp_cb.csv")
+    have = S.contract_last_dt(sym, ex, period)
+    empty = set(S.meta_get(f"empty::{key}::{period}", []) or [])
+    todo: list[tuple[str, str, date]] = []   # (天勤合约, Tushare 合约, 起始日)
+    skipped = old = blank = 0
     for c in conts:
-        df = download_bars(api, c, period, start, end, tmp)
-        if df.empty:
-            continue
         try:
             ts_code = to_ts(c, end)
         except Exception:
             ts_code = c  # 解析不了就保留天勤原名，至少不丢数据
-        df["contract"] = ts_code
+        ym = _contract_ym(ts_code)
+        if ym is not None and ym < (start.year, start.month):
+            old += 1                      # 到期月份早于回溯区间，整段都不需要
+            continue
+        last = have.get(ts_code)
+        if last is not None and (_expired(ts_code, end) or last.date() >= end - timedelta(days=5)):
+            skipped += 1
+            continue
+        if last is None and ts_code in empty and _expired(ts_code, end):
+            blank += 1                    # 摘牌时就没数据，不会再有
+            continue
+        cstart = start if last is None else max(start, (last - timedelta(days=3)).date())
+        todo.append((c, ts_code, cstart))
+
+    added = n_con = 0
+    new_empty: list[str] = []
+    CHUNK = 24  # 每批 24 个合约、8 并发，跑 3 轮；批次太大内存里堆的 DataFrame 会多
+    for i in range(0, len(todo), CHUNK):
+        batch = todo[i : i + CHUNK]
+        frames = download_many(
+            api, [(c, s, end) for c, _, s in batch], period, tq_root(), key, max_parallel=8
+        )
+        # 整批共用一个写连接：一个合约一次 connect 的话，十年全品种要开关几千次，
+        # 每次都要跑一遍 DDL，纯属浪费。
         with S.connect() as con:
-            total += S.upsert_contracts(con, sym, ex, period, df)
-        n_con += 1
-    return {"key": key, "period": period, "rows": total,
-            "status": "ok" if total else "无数据", "contracts": n_con}
+            for c, ts_code, _ in batch:
+                df = frames.get(c)
+                if df is None or df.empty:
+                    if _expired(ts_code, end):
+                        new_empty.append(ts_code)
+                    continue
+                df["contract"] = ts_code
+                added += S.upsert_contracts(con, sym, ex, period, df)
+                n_con += 1
+    if new_empty:
+        S.meta_set(f"empty::{key}::{period}", sorted(empty | set(new_empty)))
+
+    return {"key": key, "period": period, "rows": added, "contracts": n_con,
+            "skipped": skipped, "old": old, "blank": blank + len(new_empty),
+            "status": "ok" if (added or skipped or old or blank) else "无数据"}
 
 
 def _tq_product_of(sym: str, ex: str) -> str:
@@ -468,98 +635,154 @@ def pick_pairs(symbols: str | None, all_: bool) -> list[tuple[str, str]]:
     return pairs
 
 
+def _switch_stamp(sym: str, ex: str) -> str:
+    return f"switch_at::{sym}_{ex}"
+
+
+def _fresh_switch(sym: str, ex: str, days: int = 1) -> bool:
+    """切换表是不是最近算过。
+
+    重算一个品种要请求几十次合约日线（约 20 秒），78 个品种就是半小时，所以
+    断线重跑时必须能跳过。这里用「上次计算时间」而不是「最后一次换月日期」：
+    低流动性品种可能两个月才换一次月，按后者判断会把它们每次重跑都重算一遍
+    —— 实测 78 个品种里有 28 个会中招。
+
+    默认窗口 1 天：同一天内重跑一律跳过，跨天重算一次。想立刻刷新用
+    `--force-switch`。
+    """
+    ts = S.meta_get(_switch_stamp(sym, ex))
+    if ts:
+        try:
+            return (pd.Timestamp.today().normalize() - pd.Timestamp(str(ts))).days < days
+        except (ValueError, TypeError):
+            pass
+    if len(S.load_switch(sym, ex)) == 0:
+        return False
+    # 老数据没有时间戳（加这一列之前算的），补一个今天的，之后就走上面的日期判断
+    S.meta_set(_switch_stamp(sym, ex), str(date.today()))
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="从天勤下载 5m/1h 行情到 DuckDB")
     ap.add_argument("--check", action="store_true", help="只检查账户与权限")
     ap.add_argument("--switch", action="store_true", help="更新主力切换表")
     ap.add_argument("--main", default="", help="下载主连，周期逗号分隔：5m,1h")
     ap.add_argument("--contracts", default="", help="下载真实合约，周期逗号分隔")
-    ap.add_argument("--years", type=int, default=0, help="回溯年数（默认主连 10、真实合约 3）")
+    ap.add_argument("--years", type=int, default=0, help="回溯年数（默认主连 10、真实合约 10）")
     ap.add_argument("--symbols", default="", help="品种代码，逗号分隔")
     ap.add_argument("--all", action="store_true", help="全部品种")
     ap.add_argument("--precise-ratio", action="store_true",
                     help="用 5m 切换 bar 同刻价算复权比率（更准，但每品种多几十次大请求）")
+    ap.add_argument("--force-switch", action="store_true", help="即使切换表较新也重算")
     ap.add_argument("--stats", action="store_true", help="只看仓库统计")
     args = ap.parse_args()
 
     if args.stats:
-        st = S.stats()
-        print(json.dumps(st, ensure_ascii=False, indent=1))
+        print(json.dumps(S.stats(), ensure_ascii=False, indent=1))
         return 0
 
-    ensure_dirs(tq_root())
+    os.makedirs(tq_root(), exist_ok=True)
     t0 = time.time()
 
+    sess = Session()
     if args.check:
-        api = make_api()
         try:
-            q = api.query_quotes(ins_class="FUTURE", expired=False)
+            q = sess.get().query_quotes(ins_class="FUTURE", expired=False)
             print(f"连接正常，未到期期货合约 {len(q)} 个")
         finally:
-            api.close()
+            sess.close()
         return 0
 
     pairs = pick_pairs(args.symbols, args.all)
     print(f"品种 {len(pairs)} 个，仓库 {S.db_path()}")
 
-    api = make_api()
     ratio_cache: dict = {}
+
+    def with_retry(label: str, fn):
+        """跑一个品种，断线就重建会话再试一次。失败两次就记下来跳过，不中断全局。"""
+        for attempt in (1, 2):
+            try:
+                return fn(sess.get())
+            except Exception as exc:
+                msg = str(exc)
+                if "连接失败" in msg or "运维" in msg or "Connection" in msg or "closed" in msg:
+                    print(f"    {label} 连接中断（{msg[:40]}），重建会话后重试", flush=True)
+                    sess.reset()
+                    time.sleep(5)
+                    continue
+                print(f"    {label} 失败：{type(exc).__name__}: {msg[:100]}", flush=True)
+                return None
+        print(f"    {label} 重试后仍失败，跳过", flush=True)
+        return None
+
     try:
         # ---- 切换表 ----
         if args.switch or args.main:
-            print("\n[1/2] 主力切换表")
-            maps = fetch_switch(api, pairs)
-            for i, (sym, ex) in enumerate(pairs, 1):
+            print("\n[1/3] 主力切换表")
+            todo = [(s_, e_) for s_, e_ in pairs
+                    if args.force_switch or not _fresh_switch(s_, e_)]
+            print(f"  需要更新 {len(todo)} 个品种（{len(pairs) - len(todo)} 个较新，跳过）", flush=True)
+            maps = fetch_switch(sess.get(), todo) if todo else {}
+            for i, (sym, ex) in enumerate(todo, 1):
                 key = f"{sym}_{ex}"
                 df = maps.get(key)
                 if df is None or len(df) < 2:
-                    print(f"  [{i}/{len(pairs)}] {key}: 无历史主力数据")
+                    print(f"  [{i}/{len(todo)}] {key}: 无历史主力数据")
                     continue
-                rec = switch_records(df, sym, ex)
-                # 默认走日线：一次请求几 KB，全品种十几分钟跑完。
-                # --precise-ratio 改用 5m 切换 bar 同刻价，换月残差能从 1.02% 压到 0.85%，
-                # 但每个品种要多几十次 10000 根的大请求，全量要几个小时。
-                rec = fill_ratio(api, rec, ratio_cache,
-                                 "5m" if args.precise_ratio else "1d")
-                with S.connect() as con:
-                    S.upsert_switch(con, sym, ex, rec)
-                n_bar = int((rec.get("price_src") == "bar").sum()) if len(rec) else 0
-                src = "5m 同刻价" if args.precise_ratio else "日线收盘"
-                print(f"  [{i}/{len(pairs)}] {key}: {len(rec)} 次换月"
-                      f"（{n_bar} 条取到 {src}，{len(rec) - n_bar} 条回退）"
-                      f"，{rec['switch_date'].min().date() if len(rec) else '-'} 起",
-                      flush=True)
+
+                def job(api, sym=sym, ex=ex, df=df, key=key, i=i):
+                    rec = switch_records(df, sym, ex)
+                    rec = fill_ratio(api, rec, ratio_cache,
+                                     "5m" if args.precise_ratio else "1d")
+                    with S.connect() as con:
+                        S.upsert_switch(con, sym, ex, rec)
+                    S.meta_set(_switch_stamp(sym, ex), str(date.today()))
+                    src = "5m 同刻价" if args.precise_ratio else "日线收盘"
+                    n_bar = int((rec.get("price_src") == "bar").sum()) if len(rec) else 0
+                    print(f"  [{i}/{len(todo)}] {key}: {len(rec)} 次换月"
+                          f"（{n_bar} 条取到{src}，{len(rec) - n_bar} 条回退）"
+                          f"，{rec['switch_date'].min().date() if len(rec) else '-'} 起",
+                          flush=True)
+                    return rec
+
+                with_retry(key, job)
 
         # ---- 主连 ----
         if args.main:
-            print("\n[2/2] 主连")
+            print("\n[2/3] 主连")
             years = args.years or MAIN_YEARS
             for period in [p.strip() for p in args.main.split(",") if p.strip()]:
                 if period not in PERIOD_SEC:
                     print(f"  [!] 不支持的周期 {period}")
                     continue
-                for i, (sym, ex) in enumerate(pairs, 1):
-                    rec = S.load_switch(sym, ex)
-                    factors = adj_factor_series(rec) if len(rec) else pd.Series(dtype=float)
-                    r = write_main(api, sym, ex, period, years, factors)
-                    print(f"  [{period} {i}/{len(pairs)}] {r['key']}: {r['rows']} 行"
-                          f"（+{r.get('added', 0)}）{r['status']}", flush=True)
+                write_main_all(sess, pairs, period, years, with_retry)
 
         # ---- 真实合约 ----
         if args.contracts:
             print("\n[3/3] 真实合约")
             years = args.years or CONTRACT_YEARS
             for period in [p.strip() for p in args.contracts.split(",") if p.strip()]:
+                if period not in PERIOD_SEC:
+                    print(f"  [!] 不支持的周期 {period}")
+                    continue
                 for i, (sym, ex) in enumerate(pairs, 1):
-                    r = write_contracts(api, sym, ex, period, years)
-                    print(f"  [{period} {i}/{len(pairs)}] {r['key']}: {r['rows']} 行"
-                          f" / {r.get('contracts', 0)} 个合约 {r['status']}", flush=True)
-    finally:
-        api.close()
 
-    st = S.stats()
+                    def job(api, sym=sym, ex=ex, period=period, years=years, i=i):
+                        r = write_contracts(api, sym, ex, period, years)
+                        print(f"  [{period} {i}/{len(pairs)}] {r['key']}: +{r['rows']} 行"
+                              f" / 新下 {r.get('contracts', 0)} 个合约"
+                              f" / 跳过 {r.get('skipped', 0)} 个"
+                              f" / 区间外 {r.get('old', 0)} 个"
+                              f" / 空合约 {r.get('blank', 0)} 个 {r['status']}", flush=True)
+                        return r
+
+                    with_retry(f"{sym}_{ex} {period}", job)
+    finally:
+        sess.close()
+
     print(f"\n完成，耗时 {time.time() - t0:.0f}s")
-    print(json.dumps(st, ensure_ascii=False, indent=1))
+    print(json.dumps(S.stats(), ensure_ascii=False, indent=1))
     return 0
 
 

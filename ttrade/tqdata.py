@@ -72,7 +72,18 @@ def has_period(symbol: str, exchange: str, period: str) -> bool:
 
 
 def available_periods(symbol: str, exchange: str) -> list[str]:
-    return [p for p in PERIOD_ORDER if has_period(symbol, exchange, p)]
+    """这个品种已经能读出来的周期（按 PERIOD_ORDER 排序）。
+
+    先一次性查出源周期，再映射到合并周期 —— 有 5m 就同时有 15m/30m，
+    不必每个周期都去查一次库。
+    """
+    src = tqstore.periods_of(symbol, exchange) if tqstore.exists() else set()
+    out = []
+    for p in PERIOD_ORDER:
+        need = PERIODS.get(p, (p, 1))[0]
+        if need in src or os.path.exists(main_path(symbol, exchange, p)):
+            out.append(p)
+    return out
 
 
 def trading_days(ts: pd.Series | pd.DatetimeIndex) -> pd.Series:
