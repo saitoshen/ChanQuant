@@ -168,9 +168,9 @@ def check_contract_incremental() -> None:
     import tempfile
 
     try:
-        import download_tq as D
-    except Exception as exc:  # 打包环境可能没带下载脚本
-        skip("真实合约增量", f"无法导入 download_tq：{exc}")
+        from ttrade import tqfetch as D
+    except Exception as exc:
+        skip("真实合约增量", f"无法导入 tqfetch：{exc}")
         return
 
     old_env = os.environ.get("TRENDDESK_TQ_DB")
