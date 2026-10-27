@@ -87,6 +87,57 @@ def _run() -> tuple[bool, list[str]]:
 
     check("读取期货行情（含复权）", _load_cn)
 
+    def _tq_data():
+        """天勤分钟级仓库：能读、复权因子与切换表一致。
+
+        因子是**派生数据**，只在写 bar 那一刻算一次会过期（切换表补全、每来一次新
+        换月都会让它变）。所以这里现场拿切换表重算一遍逐根比对 —— 这是唯一能发现
+        「库里因子过期」的检查，而那种错误不会报错，只会让复权序列在换月处出现假跳空。
+        """
+        from ttrade import tqdata as T
+        from ttrade import tqstore as S
+        from ttrade.tqfetch import adj_factor_series, factor_at
+
+        import pandas as pd
+
+        if not S.exists():
+            return "未下载（可选：download_tq.py --main 1h --all）"
+        try:
+            st = S.stats()
+        except Exception as exc:  # noqa: BLE001
+            # 下载脚本正持着 DuckDB 的排他锁。这是预期状态，不该算自检失败。
+            return f"行情库读不了（可能正在下载）：{type(exc).__name__}"
+        per = st.get("periods") or {}
+        if not per:
+            return "仓库为空（可选）"
+        cover = "，".join(f"{p} {v['symbols']} 品种 / {v['rows']} 行" for p, v in per.items())
+
+        picked = None
+        for sym, ex in S.switch_symbols():
+            for period in ("1h", "5m"):
+                if period in per and S.bar_count(sym, ex, period) > 100:
+                    picked = (sym, ex, period)
+                    break
+            if picked:
+                break
+        if picked is None:
+            return f"{cover}（没有可校验的品种）"
+
+        sym, ex, period = picked
+        df = T.load_main(sym, ex, period, adjust="none")
+        sw = S.load_switch(sym, ex)
+        got = df["adj_factor"].to_numpy(float)
+        want = factor_at(adj_factor_series(sw), pd.Series(df["trading_day"]))
+        bad = int((abs(got - want) > 1e-12).sum())
+        if bad:
+            raise RuntimeError(
+                f"{sym}_{ex} {period} 有 {bad} 根 bar 的复权因子与切换表不一致"
+                f"（最大偏差 {float(abs(got - want).max()):.3g}），跑 --refresh-factors 重算"
+            )
+        return f"{cover}；{sym}_{ex} {period} 因子与切换表逐根一致"
+
+    check("天勤分钟级行情", _tq_data)
+
     def _backtest():
         from ttrade.backtest import BacktestConfig, run_backtest
         from ttrade.eastmoney import load_local
