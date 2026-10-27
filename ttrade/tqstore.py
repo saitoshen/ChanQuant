@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from contextlib import contextmanager
 
 import pandas as pd
@@ -114,17 +115,34 @@ def exists() -> bool:
 
 @contextmanager
 def connect(read_only: bool = False):
-    """打开仓库。只读模式允许多个进程同时读（GUI 与下载脚本并存）。
+    """打开仓库。
 
-    写入时 DuckDB 是**单写多读**：同一时刻只允许一个写连接。所以下载脚本要写、
-    GUI 只读，两边不冲突；如果两个下载脚本同时跑，后一个会拿到
-    「Conflicting lock」错误 —— 这是预期行为，不要用重试掩盖。
+    **DuckDB 的文件锁是排他的**：一个进程以读写方式打开后，别的进程连只读都打不开
+    （报 `Cannot open file ... 另一个程序正在使用此文件`）。所以下载脚本在跑的时候，
+    界面读不了库 —— 这不是配置问题，是单文件数据库的固有行为。
+
+    因此只读打开会先重试几次（下载器是「一批一个写连接」，批次之间有空隙），
+    实在拿不到就把错误往上抛，由界面提示「正在下载」，而不是假装没数据。
+    写入仍然是单写多读：同一时刻只允许一个写连接，第二个写会拿到 Conflicting lock，
+    这是预期行为，不要用重试掩盖。
     """
     import duckdb
 
     p = db_path()
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    con = duckdb.connect(p, read_only=read_only)
+    last = None
+    for attempt in range(3 if read_only else 1):
+        try:
+            con = duckdb.connect(p, read_only=read_only)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if attempt == 0:
+                time.sleep(0.4)
+            else:
+                raise
+    else:  # pragma: no cover - 循环必然 break 或 raise
+        raise last
     try:
         if not read_only:
             for ddl in DDL:
@@ -226,6 +244,47 @@ def bar_count(symbol: str, exchange: str, period: str) -> int:
     return int(r[0]) if r else 0
 
 
+def set_adj_factor(con, symbol: str, exchange: str, period: str,
+                   trading_day, factor) -> int:
+    """按**交易日**整段重写 `adj_factor`，返回该品种该周期覆盖的 bar 数。
+
+    为什么需要这个：`adj_factor` 是**派生数据**，完全由切换表决定，而切换表会变
+    —— 补算、重算、每来一次新换月都会变。只在写 K 线那一刻算一次是不够的：后补的
+    切换记录不会回头修已经落库的历史 bar。
+
+    实测踩到过：78 个品种里 CJ、LH 两个整段因子停在 1.0（写库时它们的切换表还是
+    空的），复权后换月处留着 3% 的假跳空，比不复权还难看；而 `write_main_many` 的
+    增量只重写最近 3 天，历史段永远不会被修。
+
+    传的是「交易日 → 因子」的映射而不是逐行 bar：同一个交易日内的所有 bar 因子相同
+    （换月发生在夜盘 21:00，按交易日对齐才不会切在半天里），5m 十年也才两千多个
+    交易日，UPDATE 的 join 表很小。
+    """
+    d = pd.DataFrame({
+        "trading_day": pd.to_datetime(pd.Series(trading_day)).dt.date,
+        "adj_factor": pd.to_numeric(pd.Series(factor), errors="coerce").astype(float),
+    }).dropna()
+    if d.empty:
+        return 0
+    # 同一交易日只留一行：UPDATE ... FROM 遇到重复匹配行时结果不确定
+    d = d.drop_duplicates("trading_day")
+    con.register("_tmp_adj", d)
+    try:
+        con.execute(
+            "UPDATE bars SET adj_factor = _tmp_adj.adj_factor FROM _tmp_adj"
+            " WHERE bars.symbol=? AND bars.exchange=? AND bars.period=?"
+            " AND bars.trading_day = _tmp_adj.trading_day",
+            [symbol, exchange, period],
+        )
+    finally:
+        con.unregister("_tmp_adj")
+    r = con.execute(
+        "SELECT count(*) FROM bars WHERE symbol=? AND exchange=? AND period=?",
+        [symbol, exchange, period],
+    ).fetchone()
+    return int(r[0]) if r else 0
+
+
 # ------------------------------------------------------------------ 切换表
 
 
@@ -304,20 +363,34 @@ def upsert_contracts(con, symbol: str, exchange: str, period: str, df: pd.DataFr
     return len(d)
 
 
-def periods_of(symbol: str, exchange: str) -> set[str]:
+def periods_of(symbol: str, exchange: str, con=None) -> set[str]:
     """这个品种在库里已经落了哪些源周期。
 
     界面每换一个品种要判断 6 个周期有没有数据，逐个调 `bar_count()` 就是 6 次
     开库查询；这里一次查完。注意返回的是**源周期**（5m / 1h），15m/2h 这些
     是本地合并出来的，由 `tqdata` 负责映射。
+
+    传入 `con` 就在这个连接上查 —— 批量重算因子的循环自己持着写连接，这时候
+    再开一个只读连接会撞上 DuckDB 的排他锁。
     """
-    if not exists():
-        return set()
-    with connect(read_only=True) as con:
+    if con is not None:
         rows = con.execute(
             "SELECT DISTINCT period FROM bars WHERE symbol=? AND exchange=?",
             [symbol, exchange],
         ).fetchall()
+        return {r[0] for r in rows}
+    if not exists():
+        return set()
+    try:
+        with connect(read_only=True) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT period FROM bars WHERE symbol=? AND exchange=?",
+                [symbol, exchange],
+            ).fetchall()
+    except Exception:  # noqa: BLE001
+        # 下载脚本正持锁时拿不到。界面据此标「未下载」会短暂误报，但比抛异常好 ——
+        # 下一次刷新就恢复了，而异常会让整张图消失。
+        return set()
     return {r[0] for r in rows}
 
 

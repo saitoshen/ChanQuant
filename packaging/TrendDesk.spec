@@ -74,6 +74,25 @@ HIDDEN = [
     "sklearn.utils._heap",
     "sklearn.utils._sorting",
     "sklearn.utils._vector_sentinel",
+    # 天勤行情与交易。tqsdk 里有一堆按字符串动态 import 的模块（行情解压、
+    # 账户类型、下单任务），静态扫描扫不全，所以把用到的子包整体带上。
+    "tqsdk",
+    "tqsdk.tools",
+    "tqsdk.tools.downloader",
+    "tqsdk.tradeable",
+    "tqsdk.lib",
+    "tqsdk.algorithm",
+    "duckdb",
+    # 天勤行情走 websocket，用 asyncio + aiohttp；缺了会在运行时才炸
+    "aiohttp",
+    "websockets",
+    "ttrade.tqfetch",
+    "ttrade.tqdata",
+    "ttrade.tqstore",
+    "ttrade.tqsdk_symbols",
+    "ttrade.tqlive",
+    "gui.live",
+    "gui.trade_page",
 ]
 
 # 用不到的重量级依赖，剔掉能省 100MB 以上

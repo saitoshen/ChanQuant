@@ -393,6 +393,7 @@ class DataStore:
         self.data_dir = MARKETS[market]["dir"]
         self._cache: dict[tuple[str, str], pd.DataFrame] = {}
         self._periods: dict[str, set[str]] = {}
+        self.last_error = ""
         self.items: list[dict] = []
         self._scan()
 
@@ -469,8 +470,12 @@ class DataStore:
                 sym, _, ex = key.rpartition("_")
                 # qfq：最后一根等于真实盘面价，和日线的口径一致
                 df = tqdata.load_main(sym, ex, period, adjust="qfq")
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            # 最常见的是下载脚本正持有 DuckDB 的排他锁。把原因记下来，
+            # 上层据此提示「正在下载」，而不是含糊的「数据缺失」。
+            self.last_error = str(exc)
             return None
+        self.last_error = ""
         while len(self._cache) >= self.CACHE_MAX:
             self._cache.pop(next(iter(self._cache)))
         self._cache[ck] = df
@@ -492,8 +497,8 @@ class DataStore:
             sym, _, ex = key.rpartition("_")
             try:
                 self._periods[key] = set(tqdata.available_periods(sym, ex))
-            except Exception:
-                self._periods[key] = set()
+            except Exception:  # noqa: BLE001
+                return False      # 拿不到就返回 False，但不要把失败结果缓存住
         return period in self._periods[key]
 
 
@@ -2109,7 +2114,13 @@ class MainWindow(QMainWindow):
         # 否则从本地仓库读。
         df = df_override if df_override is not None else self.store.get(skey, period)
         if df is None or df.empty:
-            if period == PERIOD_1D:
+            why = getattr(self.store, "last_error", "")
+            if "另一个程序正在使用" in why or "Cannot open file" in why:
+                self._clear_chart(
+                    "行情库正被下载脚本占用（DuckDB 单文件排他锁）\n"
+                    "等下载跑完，或先停掉 download_tq.py 再看图"
+                )
+            elif period == PERIOD_1D:
                 self._clear_chart(f"{skey} 数据缺失")
             else:
                 self._clear_chart(

@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ttrade import tqstore as S  # noqa: E402
 from ttrade.futures import list_local  # noqa: E402
+from ttrade.paths import data_dir  # noqa: E402
 from ttrade.tqfetch import (  # noqa: E402
     CONTRACT_YEARS,
     MAIN_YEARS,
@@ -53,6 +54,8 @@ from ttrade.tqfetch import (  # noqa: E402
     adj_factor_series,
     fetch_switch,
     fill_ratio,
+    realign_switch,
+    refresh_factors,
     switch_records,
     tq_root,
     write_contracts,
@@ -62,13 +65,13 @@ from ttrade.tqfetch import (  # noqa: E402
 
 def pick_pairs(symbols: str | None, all_: bool) -> list[tuple[str, str]]:
     if all_:
-        items = list_local(paths.data_dir("cn"))
+        items = list_local(data_dir("cn"))
         pairs = [(it["symbol"], it["exchange"]) for it in items]
     else:
         want = [s.strip().upper() for s in (symbols or "").split(",") if s.strip()]
         if not want:
             raise SystemExit("请用 --symbols RB,HC 指定品种，或用 --all")
-        items = {it["symbol"]: it for it in list_local(paths.data_dir("cn"))}
+        items = {it["symbol"]: it for it in list_local(data_dir("cn"))}
         pairs = []
         for w in want:
             if w not in items:
@@ -106,6 +109,33 @@ def _fresh_switch(sym: str, ex: str, days: int = 1) -> bool:
     return True
 
 
+def refresh_all(pairs: list[tuple[str, str]]) -> None:
+    """对齐换月点 + 按当前切换表重刷所有品种、所有已落库周期的复权因子。
+
+    两步都必须做：
+
+    1. **对齐**：天勤的每日主力映射和主连 K 线偶尔差一个交易日（LH 27 次换月里
+       20 次如此），切换日要挪到序列真正跳空的那天；
+    2. **重刷**：新 ratio 要乘到**全部历史**上，而 K 线表里的 `adj_factor` 只是
+       上次写库时的快照。不刷的话切换表补全了历史价格却没动 —— CJ、LH 曾整段
+       停在 1.0。纯本地计算，78 个品种秒级完成。
+    """
+    moved = touched = 0
+    with S.connect() as con:
+        for sym, ex in pairs:
+            periods = sorted(S.periods_of(sym, ex, con=con))
+            if not periods:
+                continue
+            k = realign_switch(con, sym, ex)
+            if k:
+                moved += k
+                print(f"  {sym}_{ex}: 校正 {k} 个换月日", flush=True)
+            for period in periods:
+                if refresh_factors(con, sym, ex, period):
+                    touched += 1
+    print(f"  换月日校正 {moved} 处，复权因子刷新 {touched} 个品种周期", flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="从天勤下载 5m/1h 行情到 DuckDB")
     ap.add_argument("--check", action="store_true", help="只检查账户与权限")
@@ -118,11 +148,19 @@ def main() -> int:
     ap.add_argument("--precise-ratio", action="store_true",
                     help="用 5m 切换 bar 同刻价算复权比率（更准，但每品种多几十次大请求）")
     ap.add_argument("--force-switch", action="store_true", help="即使切换表较新也重算")
+    ap.add_argument("--refresh-factors", action="store_true",
+                    help="只按当前切换表重算复权因子，不联网、不下载")
     ap.add_argument("--stats", action="store_true", help="只看仓库统计")
     args = ap.parse_args()
 
     if args.stats:
         print(json.dumps(S.stats(), ensure_ascii=False, indent=1))
+        return 0
+
+    if args.refresh_factors:
+        pairs = pick_pairs(args.symbols, args.all)
+        print(f"品种 {len(pairs)} 个，重算复权因子")
+        refresh_all(pairs)
         return 0
 
     os.makedirs(tq_root(), exist_ok=True)
@@ -190,6 +228,11 @@ def main() -> int:
                     return rec
 
                 with_retry(key, job)
+
+            if todo:
+                # 切换表刚变过：新 ratio 要乘到全部历史上，已落库的 adj_factor 过期了
+                print("  切换表有变化，重算历史复权因子", flush=True)
+                refresh_all(pairs)
 
         # ---- 主连 ----
         if args.main:

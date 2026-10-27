@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from datetime import date
 
 import numpy as np  # noqa: F401  （保留给后续数值校验用）
@@ -20,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ttrade import tqdata as T  # noqa: E402
 from ttrade import tqstore as S  # noqa: E402
+from ttrade.tqfetch import adj_factor_series, factor_at  # noqa: E402
 
 _ok = _fail = _skip = 0
 _msgs: list[str] = []
@@ -79,12 +81,35 @@ def check_one(key: str) -> None:
 
         # 后复权因子 = 之后所有换月比率的连乘，所以它的单调性取决于换月方向：
         # 商品多为 contango（远月更贵，ratio>1），因子随时间递减；股指远月贴水
-        # （ratio<1），因子随时间递增。两种都对，能保证的只有「最新段为 1」和
-        # 「量级合理」—— 连续性由下面的跳空检查负责。
+        # （ratio<1），因子随时间递增。两种都对，唯一能要求的是「量级不失控」——
+        # 十年三十多次换月的连乘本来就可以到 0.19（铁矿石实测），连续性由下面的
+        # 跳空检查负责。这里只拦 NaN / 0 / 爆炸这种明显的错。
         f = df["adj_factor"].to_numpy(float)
-        check(f"{key} {period} 复权因子量级合理", bool(((f > 0.2) & (f < 5.0)).all()),
+        check(f"{key} {period} 复权因子有限且为正",
+              bool(np.isfinite(f).all() and (f > 0).all()),
+              f"min={f.min():.4g} max={f.max():.4g}")
+        check(f"{key} {period} 复权因子量级合理", bool(((f > 0.01) & (f < 100.0)).all()),
               f"min={f.min():.4f} max={f.max():.4f}")
-        check(f"{key} {period} 最新段因子为 1", abs(f[-1] - 1.0) < 1e-9, f"{f[-1]}")
+
+        # 真正该钉死的不变式：**库里存的因子必须等于按当前切换表现算的因子**。
+        # 「最新段恒为 1」是个假不变式 —— 它只在没有待换月时成立，而且抓不到最
+        # 要命的那类 bug：切换表补全后历史 bar 的因子没跟着改（CJ、LH 曾整段停在
+        # 1.0，复权后换月处留 3% 假跳空，比不复权还难看）。
+        want = factor_at(adj_factor_series(sw), pd.Series(df["trading_day"]))
+        check(f"{key} {period} 库中因子与切换表一致",
+              bool(np.allclose(f, want, rtol=0, atol=1e-12)),
+              f"最大偏差 {float(np.abs(f - want).max()):.3g}")
+
+        # 待换月（切换日 > 最后一根 bar 的交易日）时，最新一段的因子就等于那次换月
+        # 的比率 —— 这是对的：今晚 21:00 主连就换了，提前乘上去序列才不会在夜盘
+        # 开盘跳一下。没有待换月时，最新段因子必须正好是 1。
+        last_td = pd.Timestamp(df["trading_day"].iloc[-1])
+        sw_dates = pd.to_datetime(sw["switch_date"])
+        if sw_dates.max() > last_td:
+            check(f"{key} {period} 待换月时因子等于最后比率",
+                  abs(f[-1] - float(sw["ratio"].iloc[-1])) < 1e-9, f"{f[-1]}")
+        else:
+            check(f"{key} {period} 最新段因子为 1", abs(f[-1] - 1.0) < 1e-9, f"{f[-1]}")
 
         # 复权后，换月 bar 的跳空不应显著大于平常 bar
         adj = df["close"] * df["adj_factor"]
@@ -116,6 +141,113 @@ def check_resample(key: str) -> None:
         check(f"{key} {period} 行数约为 5m 的 1/{n}",
               abs(len(dn) - len(d5) / n) <= len(d5) * 0.02,
               f"{len(dn)} vs {len(d5) / n:.0f}")
+
+
+def check_live_helpers() -> None:
+    """实时行情的纯逻辑：占位行、时区、与本地历史的拼接。
+
+    这三件事都不需要联网，但每一件写错都很难在界面上看出来 ——
+    占位行会让图上多一根塌到 0 的 K 线，时区错 8 小时会让实时段和本地历史
+    错开一大截，拼接时覆盖本地最后一根会把复权因子换成 1.0。
+    """
+    try:
+        from ttrade import tqlive as L
+    except Exception as exc:
+        skip("实时行情纯逻辑", f"无法导入 tqlive：{exc}")
+        return
+
+    ns = lambda s: int(pd.Timestamp(s).value)  # noqa: E731  UTC 纳秒
+    raw = pd.DataFrame({
+        "datetime": [0, 0, ns("2026-10-27 09:00"), ns("2026-10-27 10:00")],
+        "open": [np.nan, np.nan, 100.0, 102.0],
+        "high": [np.nan, np.nan, 103.0, 104.0],
+        "low": [np.nan, np.nan, 99.0, 101.0],
+        "close": [np.nan, np.nan, 102.0, 103.0],
+        "volume": [0, 0, 10, 20],
+        "open_oi": [0, 0, 5, 6],
+        "close_oi": [0, 0, 5, 7],
+    })
+    bars = L.bars_from_serial(raw, "1h")
+    check("实时①启动占位行被剔除", len(bars) == 2, f"{len(bars)} 行")
+    check("实时①占位行不参与计算", bool(bars["close"].notna().all()))
+    check("实时①UTC 纳秒转北京时间",
+          bars.index[0] == pd.Timestamp("2026-10-27 17:00"),
+          f"{bars.index[0]}")
+    check("实时①索引无重复", bool(bars.index.is_unique))
+
+    # 与本地历史拼接：本地最后一根 17:00，实时有 17:00 和 18:00 两根
+    local = pd.DataFrame(
+        {
+            "open": [100.0], "high": [103.0], "low": [99.0], "close": [102.0],
+            "volume": [10.0], "open_oi": [5.0], "close_oi": [5.0],
+            "adj_factor": [0.97], "trading_day": [pd.Timestamp("2026-10-27").date()],
+        },
+        index=pd.DatetimeIndex(["2026-10-27 17:00"], name="datetime"),
+    )
+    merged = L.merge_live(local, bars)
+    check("实时②只接严格晚于本地的 bar", len(merged) == 2, f"{len(merged)} 行")
+    check("实时②不覆盖本地最后一根",
+          float(merged.loc["2026-10-27 17:00", "adj_factor"]) == 0.97,
+          f"{merged.loc['2026-10-27 17:00', 'adj_factor']}")
+    check("实时②新 bar 因子为 1",
+          float(merged.loc["2026-10-27 18:00", "adj_factor"]) == 1.0)
+    check("实时②新 bar 有交易日", "trading_day" in merged.columns
+          and pd.notna(merged.loc["2026-10-27 18:00", "trading_day"]))
+    check("实时②拼接后索引递增", bool(merged.index.is_monotonic_increasing))
+
+    empty = L.merge_live(pd.DataFrame(), bars)
+    check("实时③没有本地历史时整段当实时",
+          len(empty) == 2 and bool((empty["adj_factor"] == 1.0).all()))
+
+    # 账户配置：实盘缺参数必须报错，不能静默退化成模拟
+    bad = L.AccountSpec(name="x", kind="account", user="u", password="p")
+    try:
+        bad.build()
+        check("实时④实盘缺参数报错", False, "没有抛异常")
+    except ValueError as exc:
+        check("实时④实盘缺参数报错", "缺少参数" in str(exc), str(exc))
+
+    old = os.environ.get("LOCALAPPDATA")
+    tmpdir = tempfile.mkdtemp(prefix="tqacct_")
+    os.environ["LOCALAPPDATA"] = tmpdir
+    try:
+        specs = [L.AccountSpec(name="模拟", kind="kq", user="u1", password="p1"),
+                 L.AccountSpec(name="实盘", kind="account", user="u2", password="p2",
+                               broker_id="B", account_id="A", account_password="C")]
+        L.save_accounts(specs)
+        back = L.load_accounts()
+        check("实时⑤账户列表存取一致",
+              [s.name for s in back] == ["模拟", "实盘"] and back[1].broker_id == "B",
+              f"{[s.name for s in back]}")
+    finally:
+        if old is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = old
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def check_cli_entry() -> None:
+    """命令行入口能真正跑到「列出品种」这一步。
+
+    `--stats` 和 `--help` 都在 argparse 阶段就返回了，不会走 `pick_pairs()` ——
+    重构时漏掉一个 import，这两个命令照样绿，但一开跑就 NameError。
+    """
+    try:
+        import download_tq as D
+    except Exception as exc:  # noqa: BLE001
+        skip("命令行入口", f"无法导入 download_tq：{exc}")
+        return
+    try:
+        pairs = D.pick_pairs(None, True)
+    except Exception as exc:  # noqa: BLE001
+        check("命令行入口能列出品种", False, f"{type(exc).__name__}: {exc}")
+        return
+    check("命令行入口能列出品种", len(pairs) > 0, f"{len(pairs)} 个品种")
+    check("命令行入口品种格式正确",
+          all(isinstance(a, str) and isinstance(b, str) for a, b in pairs))
 
 
 def check_trading_day() -> None:
@@ -157,6 +289,22 @@ class _FakeApi:
         self.calls += 1
         if self.calls > 200:
             raise RuntimeError("测试里不该跑这么久")
+
+
+def _leftover(tmpdir: str) -> str:
+    """残留的临时文件里还有内容的那些。槽位文件本身会留下，但必须是 0 字节。"""
+    bad = []
+    for fn in sorted(os.listdir(tmpdir)):
+        if not fn.startswith("_dl_"):
+            continue
+        p = os.path.join(tmpdir, fn)
+        if os.path.getsize(p) > 0:
+            bad.append(f"{fn}({os.path.getsize(p)}B)")
+    return "、".join(bad) or "无"
+
+
+def _no_leftover(tmpdir: str) -> bool:
+    return _leftover(tmpdir) == "无"
 
 
 def check_contract_incremental() -> None:
@@ -216,7 +364,7 @@ def check_contract_incremental() -> None:
               (r3["rows"], r3["contracts"]) == (r2["rows"], r2["contracts"]),
               f"{r3}")
 
-        # ---- 临时文件：正常结束与异常中断都不能留下 _dl_*.csv ----
+        # ---- 临时文件：正常结束与异常中断都不能留下数据 ----
         import sys as _sys
         import types
 
@@ -242,8 +390,7 @@ def check_contract_incremental() -> None:
             jobs = [("SHFE.rb2601", date(2025, 1, 1), date(2026, 1, 1)),
                     ("SHFE.rb2605", date(2025, 1, 1), date(2026, 1, 1))]
             got = D.download_many(_FakeApi([]), jobs, "5m", tmpdir, "T", max_parallel=2)
-            left = [f for f in os.listdir(tmpdir) if f.startswith("_dl_")]
-            check("临时文件：正常结束全部删除", not left, f"残留 {left}")
+            check("临时文件：正常结束不留数据", _no_leftover(tmpdir), _leftover(tmpdir))
             check("临时文件：读回的列已去掉合约前缀",
                   len(got) == 2 and "close" in next(iter(got.values())).columns,
                   f"{list(got)}")
@@ -261,8 +408,7 @@ def check_contract_incremental() -> None:
                 D.download_many(_HangApi([]), jobs, "5m", tmpdir, "T", max_parallel=2)
             except RuntimeError:
                 pass
-            left = [f for f in os.listdir(tmpdir) if f.startswith("_dl_")]
-            check("临时文件：断线中断也要清干净", not left, f"残留 {left}")
+            check("临时文件：断线中断也要清干净", _no_leftover(tmpdir), _leftover(tmpdir))
         finally:
             for k, v in saved.items():
                 if v is None:
@@ -290,6 +436,8 @@ def main() -> int:
 
     check_trading_day()
     check_contract_incremental()
+    check_live_helpers()
+    check_cli_entry()
     for k in ks:
         try:
             check_one(k)
