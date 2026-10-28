@@ -334,7 +334,7 @@ def check_contract_incremental() -> None:
                  "SHFE.rb2611"]                  # 区间内、未到期
         seen: list[list[str]] = []
 
-        def fake_dl(api, jobs, period, out_dir, tag, max_parallel=8):
+        def fake_dl(api, jobs, period, out_dir, tag, max_parallel=8, errors=None):
             seen.append([s for s, _, _ in jobs])
             out = {}
             for sym, _s, _e in jobs:
@@ -364,7 +364,44 @@ def check_contract_incremental() -> None:
               (r3["rows"], r3["contracts"]) == (r2["rows"], r2["contracts"]),
               f"{r3}")
 
+        # ---- 失败不能被当成「没数据」----
+        # 上一轮真实下载里 54 个品种的合约全被静默吞掉，日志只写「新下 0 个合约」，
+        # 看着像正常跳过。现在：失败一轮就重试，两轮都失败要计入 failed 并写进 status。
+        rounds = {"n": 0}
+
+        def flaky_dl(api, jobs, period, out_dir, tag, max_parallel=8, errors=None):
+            rounds["n"] += 1
+            out = {}
+            for sym, _s, _e in jobs:
+                if rounds["n"] == 1:
+                    if errors is not None:
+                        errors[sym] = "UnboundLocalError: cannot access local variable 'writer'"
+                    continue
+                out[sym] = _fake_frame(today - pd.Timedelta(hours=1))
+            return out
+
+        D.download_many = flaky_dl
+        r4 = D.write_contracts(_FakeApi(["SHFE.ag2609", "SHFE.ag2612"]), "AG", "SHFE", "5m", 1)
+        check("下载失败：重试一轮后成功", r4["failed"] == 0 and r4["contracts"] == 2,
+              f"failed={r4['failed']} contracts={r4['contracts']} rounds={rounds['n']}")
+
+        def always_fail(api, jobs, period, out_dir, tag, max_parallel=8, errors=None):
+            if errors is not None:
+                for sym, _s, _e in jobs:
+                    errors[sym] = "ConnectionError: boom"
+            return {}
+
+        D.download_many = always_fail
+        r5 = D.write_contracts(_FakeApi(["SHFE.au2609", "SHFE.au2612"]), "AU", "SHFE", "5m", 1)
+        check("下载失败：两轮都失败要报出来",
+              r5["failed"] == 2 and "失败" in r5["status"],
+              f"failed={r5['failed']} status={r5['status']}")
+        check("下载失败：失败合约不能被记成空合约",
+              r5["blank"] == 0, f"blank={r5['blank']}")
+
         # ---- 临时文件：正常结束与异常中断都不能留下数据 ----
+        # 下面的用例要测真实的 download_many，先把前面替换掉的假下载器还回去。
+        D.download_many = real_dl
         import sys as _sys
         import types
 
@@ -372,7 +409,11 @@ def check_contract_incremental() -> None:
             def __init__(self, api, symbol_list, dur_sec, start_dt, end_dt, csv_file_name):
                 self.sym = symbol_list
                 self.path = csv_file_name
-                df = _fake_frame(pd.Timestamp("2026-01-05 15:00"))
+                # DataDownloader 写出的表头是 `合约.datetime`，不是 `dt` —— 这里必须
+                # 照真实格式造，否则 _read_downloaded 认不出时间列，测试会假通过。
+                df = _fake_frame(pd.Timestamp("2026-01-05 15:00")).rename(
+                    columns={"dt": "datetime"}
+                )
                 df = df.rename(columns={c: f"{self.sym}.{c}" for c in df.columns})
                 df.to_csv(self.path, index=False)
 

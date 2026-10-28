@@ -443,21 +443,46 @@ def realign_switch(con, symbol: str, exchange: str) -> int:
 # ----------------------------------------------------------------- 行情下载
 
 
-def _dl_path(out_dir: str, period: str, slot: int) -> str:
-    """下载用的临时文件路径。**固定 8 个槽位循环复用，不删除。**
+def _dl_path(out_dir: str, period: str, seq: int) -> str:
+    """下载用的临时文件路径。**一批任务内每个任务独占一个，不删除。**
 
     `DataDownloader` 内部是 `open(csv_file_name, write_mode)`，`write_mode` 默认
     `"w"` —— 复用同一路径会自动截断，所以没必要每下完一个就删一次文件。
+    这不只是省事：运行环境对「单次批量删除」有阈值保护，删到第 50 个就被拦下来
+    把整轮下载打断（踩过两次）。清空是写操作，不受限制。
 
-    这不只是省事：一轮 78 个品种要删 78 个临时文件，而运行环境对「单次批量删除」
-    有阈值保护，删到第 50 个就被拦下来，整轮下载直接中断（踩过两次）。
-    槽位复用把删除次数从 78 降到 0。
+    **不能再按「8 个槽位循环复用」**：`is_finished()` 只反映协程退出，文件句柄
+    的关闭发生在 `_run()` 的 `finally` 里，两者之间有一个窗口。槽位一还回去就
+    立刻被下一个任务 `open(..., "w")`，撞上还没关的句柄时 open 直接失败，而
+    tqsdk 的 `finally` 又用未定义的 `writer` 去 close，把真正的异常盖成
+    `UnboundLocalError: cannot access local variable 'writer'`。实测就是这样
+    静默丢掉 54 个品种的合约数据。
+
+    现在按任务序号命名，一个任务一个文件，批内零复用。批数 × 每批合约数最多
+    几百个小文件，跑完都是 0 字节，代价可以忽略。
     """
-    return os.path.join(out_dir, f"_dl_{period}_{slot}.csv")
+    return os.path.join(out_dir, f"_dl_{period}_{seq}.csv")
+
+
+def _task_error(task) -> str:
+    """取 `DataDownloader` 内部协程的异常。
+
+    `is_finished()` 只是 `task.done()`，协程抛的异常被存在 Task 对象里、没人
+    await 就永远不会浮出来。不主动去取，失败和「这个合约本来就没数据」在调用方
+    看来完全一样。
+    """
+    inner = getattr(task, "_task", None)
+    if inner is None or not inner.done():
+        return ""
+    if inner.cancelled():
+        return "cancelled"
+    exc = inner.exception()
+    return "" if exc is None else f"{type(exc).__name__}: {exc}"
 
 
 def download_many(api, jobs: list[tuple[str, date, date]], period: str,
-                  out_dir: str, tag: str = "", max_parallel: int = 8) -> dict[str, pd.DataFrame]:
+                  out_dir: str, tag: str = "", max_parallel: int = 8,
+                  errors: dict[str, str] | None = None) -> dict[str, pd.DataFrame]:
     """并发下载多个合约，返回 {天勤合约: DataFrame}。
 
     `DataDownloader` 是「建任务 + 靠 api.wait_update() 推进」的模式，多个任务可以
@@ -467,22 +492,35 @@ def download_many(api, jobs: list[tuple[str, date, date]], period: str,
 
     并发度取 8：再高对服务端不友好，收益也趋平（瓶颈从网络变成解析 CSV）。
 
-    临时文件按「槽位」复用而不是「一任务一个文件」：同时最多 8 个任务在跑，
-    8 个路径就够了，下完一个槽位马上给下一个用。见 `_dl_path()`。
+    完成的任务**不立刻读**，先放进 `ready` 等下一轮 `wait_update()` 之后再读：
+    `is_finished()` 只代表协程退出，文件句柄要到 `_run()` 的 `finally` 才关闭。
+    中间那一拍足够 asyncio 把清理跑完，读到的才是完整文件。
+
+    失败的合约写进 `errors`（合约 → 异常文本），不再静默当成「没数据」。
     """
     from tqsdk.tools import DataDownloader
 
     out: dict[str, pd.DataFrame] = {}
-    queue = list(jobs)
-    running: list[tuple[str, object, str, int]] = []
-    free = list(range(max(1, int(max_parallel))))
+    queue = list(enumerate(jobs))            # (任务序号, (合约, 起, 止))
+    running: list[tuple[int, str, object, str]] = []
+    ready: list[tuple[int, str, str]] = []   # 已结束、等下一拍再读
+    inflight = 0
+    limit = max(1, int(max_parallel))
     used: list[str] = []
     try:
-        while queue or running:
-            while queue and free:
-                sym, start, end = queue.pop(0)
-                slot = free.pop(0)
-                path = _dl_path(out_dir, period, slot)
+        while queue or running or ready:
+            # 1) 消化上一拍结束的任务：此刻协程的 finally 已经跑完，文件已关闭
+            for seq, sym, path in ready:
+                df = _read_downloaded(path, sym)
+                if not df.empty:
+                    out[sym] = df
+                inflight -= 1
+            ready = []
+
+            # 2) 补满并发
+            while queue and inflight < limit:
+                seq, (sym, start, end) = queue.pop(0)
+                path = _dl_path(out_dir, period, seq)
                 if path not in used:
                     used.append(path)
                 task = DataDownloader(
@@ -493,20 +531,26 @@ def download_many(api, jobs: list[tuple[str, date, date]], period: str,
                     end_dt=end,
                     csv_file_name=path,
                 )
-                running.append((sym, task, path, slot))
+                running.append((seq, sym, task, path))
+                inflight += 1
+
+            if not (running or queue):
+                break
             api.wait_update()
+
+            # 3) 挑出这一拍结束的，下一轮再读
             still = []
-            for sym, task, path, slot in running:
+            for seq, sym, task, path in running:
                 if task.is_finished():
-                    df = _read_downloaded(path, sym)
-                    if not df.empty:
-                        out[sym] = df
-                    free.append(slot)      # 槽位还给下一个任务
+                    err = _task_error(task)
+                    if err and errors is not None:
+                        errors[sym] = err
+                    ready.append((seq, sym, path))
                 else:
-                    still.append((sym, task, path, slot))
+                    still.append((seq, sym, task, path))
             running = still
     finally:
-        # 只把内容清空（0 字节），不删文件 —— 槽位下次还会复用同一批路径
+        # 只把内容清空（0 字节），不删文件 —— 下一批还会复用同一批路径
         for p in used:
             _truncate(p)
     return out
@@ -623,30 +667,54 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int) -> dict:
 
     added = n_con = 0
     new_empty: list[str] = []
+    failed: dict[str, str] = {}
     CHUNK = 24  # 每批 24 个合约、8 并发，跑 3 轮；批次太大内存里堆的 DataFrame 会多
-    for i in range(0, len(todo), CHUNK):
-        batch = todo[i : i + CHUNK]
-        frames = download_many(
-            api, [(c, s, end) for c, _, s in batch], period, tq_root(), key, max_parallel=8
-        )
-        # 整批共用一个写连接：一个合约一次 connect 的话，十年全品种要开关几千次，
-        # 每次都要跑一遍 DDL，纯属浪费。
-        with S.connect() as con:
-            for c, ts_code, _ in batch:
-                df = frames.get(c)
-                if df is None or df.empty:
-                    if _expired(ts_code, end):
+    batches = [todo[i : i + CHUNK] for i in range(0, len(todo), CHUNK)]
+
+    # 失败重试一轮：合约级失败基本是下载器偶发（连接抖动、文件句柄），换个批次
+    # 再来一次大多能成。**不能静默当成「没数据」** —— 上一轮就是 54 个品种的
+    # 合约全被吞掉，日志只写「新下 0 个合约」，看着像正常跳过。
+    for attempt in (1, 2):
+        retry: list[tuple[str, str, date]] = []
+        for batch in batches:
+            errs: dict[str, str] = {}
+            frames = download_many(
+                api, [(c, s, end) for c, _, s in batch], period, tq_root(), key,
+                max_parallel=8, errors=errs,
+            )
+            # 整批共用一个写连接：一个合约一次 connect 的话，十年全品种要开关几千次，
+            # 每次都要跑一遍 DDL，纯属浪费。
+            with S.connect() as con:
+                for c, ts_code, cstart in batch:
+                    df = frames.get(c)
+                    if df is not None and not df.empty:
+                        df["contract"] = ts_code
+                        added += S.upsert_contracts(con, sym, ex, period, df)
+                        n_con += 1
+                        failed.pop(c, None)
+                        continue
+                    if c in errs:
+                        failed[c] = errs[c]
+                        retry.append((c, ts_code, cstart))
+                    elif _expired(ts_code, end):
                         new_empty.append(ts_code)
-                    continue
-                df["contract"] = ts_code
-                added += S.upsert_contracts(con, sym, ex, period, df)
-                n_con += 1
+        if attempt == 2 or not retry:
+            break
+        print(f"    {key} {period}: {len(retry)} 个合约失败，重试一轮", flush=True)
+        batches = [retry[i : i + CHUNK] for i in range(0, len(retry), CHUNK)]
+
     if new_empty:
         S.meta_set(f"empty::{key}::{period}", sorted(empty | set(new_empty)))
 
+    if failed:
+        status = f"{len(failed)} 个合约失败：{next(iter(failed.values()))[:70]}"
+    elif added or skipped or old or blank:
+        status = "ok"
+    else:
+        status = "无数据"
     return {"key": key, "period": period, "rows": added, "contracts": n_con,
             "skipped": skipped, "old": old, "blank": blank + len(new_empty),
-            "status": "ok" if (added or skipped or old or blank) else "无数据"}
+            "failed": len(failed), "status": status}
 
 
 def _tq_product_of(sym: str, ex: str) -> str:
