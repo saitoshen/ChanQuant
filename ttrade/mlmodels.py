@@ -573,12 +573,203 @@ class TransformerModel(BaseModel):
         return np.linalg.norm(self._Win.d, axis=1)
 
 
+# ================================================================== 线性
+class LinearModel(BaseModel):
+    """岭回归。
+
+    它存在的意义不是「更准」，而是**当基准**：树模型和神经网络的分数如果打不过
+    一条岭回归，说明那点复杂度全用在拟合噪声上了。系数直接就是因子权重，
+    可解释性也最好 —— 用户能一眼看出「这条策略到底在赌哪几个因子」。
+
+    用 numpy 闭式解而不是 sklearn：一个 (k+1)×(k+1) 的正规方程，k 只有几十，
+    `np.linalg.solve` 就是精确解，没有迭代、没有随机种子、没有版本差异。
+    """
+
+    name = "linear"
+
+    def __init__(self, alpha: float = 1.0, seed: int = 42):
+        self.alpha = float(alpha)
+        self.seed = int(seed)
+        self._w: np.ndarray | None = None
+        self._b = 0.0
+        self._mu: np.ndarray | None = None
+        self._sd: np.ndarray | None = None
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        keep = np.isfinite(y) & np.isfinite(X).all(axis=1)
+        X, y = X[keep], y[keep]
+        if len(y) < X.shape[1] + 2:
+            raise ValueError("样本太少，无法训练线性模型")
+
+        self._mu = X.mean(axis=0)
+        sd = X.std(axis=0)
+        sd[sd < 1e-12] = 1.0          # 常数列不能除零
+        self._sd = sd
+        Z = (X - self._mu) / sd
+        Z1 = np.hstack([np.ones((len(Z), 1)), Z])
+
+        # 截距不惩罚，否则目标整体偏移会被往 0 拉
+        pen = np.eye(Z1.shape[1]) * self.alpha
+        pen[0, 0] = 0.0
+        coef = np.linalg.solve(Z1.T @ Z1 + pen, Z1.T @ y)
+        self._b = float(coef[0])
+        self._w = coef[1:]
+        return self
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        out = np.full(len(X), np.nan)
+        if self._w is None or self._mu is None:
+            return out
+        keep = np.isfinite(X).all(axis=1)
+        if not keep.any():
+            return out
+        Z = (X[keep] - self._mu) / self._sd
+        out[keep] = Z @ self._w + self._b
+        return out
+
+    def importance(self):
+        return None if self._w is None else np.abs(self._w)
+
+
+# ================================================================== 图神经网络
+class GNNModel(BaseModel):
+    """因子图神经网络：把每个因子当成一个节点，让节点之间互相传消息。
+
+    一层图卷积：
+
+        A  = softmax_rows(A_param)        # k×k，学出来的邻接矩阵
+        H  = relu(X · Aᵀ · W1 + b1)       # 一行一个样本，按 A 做邻居聚合
+        y  = H · w2 + b2
+
+    `A[i][j]` 表示「因子 i 的消息有多少流向因子 j」。用行 softmax 而不是
+    对称归一化（D^-1/2 A D^-1/2）：行 softmax 本身就是归一化的，不必再算度矩阵，
+    而度矩阵的梯度会多出一串容易写错的项。
+
+    ## 为什么是「因子图」而不是「品种图」
+
+    平台的机器学习是**单品种时序**训练 —— 一次只有一条品种的样本，没有横截面，
+    建不出品种之间的图。把因子当节点就没有这个问题，而且学出来的 A 本身就是
+    一张「因子关联图」，正好回答「哪几个因子在互相解释」。
+
+    ## 为什么不用 torch
+
+    和 Transformer 一样：torch 的 CPU 轮子 1GB 起步，安装包会从 ~99MB 涨到 1GB。
+    这里复用模块里的 `Var` 自动微分，几十行就够。
+    """
+
+    name = "gnn"
+
+    def __init__(
+        self,
+        hidden: int = 8,
+        epochs: int = 60,
+        lr: float = 5e-3,
+        seed: int = 42,
+        batch_size: int = 256,
+    ):
+        self.hidden = int(hidden)
+        self.epochs = int(epochs)
+        self.lr = float(lr)
+        self.seed = int(seed)
+        self.batch_size = int(batch_size)
+        self._params: list[Var] = []
+        self._A: Var | None = None
+        self._W1: Var | None = None
+        self._b1: Var | None = None
+        self._w2: Var | None = None
+        self._b2: Var | None = None
+        self._ymu = 0.0
+        self._ysd = 1.0
+
+    def _init(self, k: int) -> None:
+        rng = np.random.default_rng(self.seed)
+        h = self.hidden
+        self._A = Var(rng.normal(0.0, 0.1, size=(k, k)))
+        self._W1 = Var(rng.normal(0.0, np.sqrt(2.0 / max(k, 1)), size=(k, h)))
+        self._b1 = Var(np.zeros(h))
+        self._w2 = Var(rng.normal(0.0, np.sqrt(2.0 / max(h, 1)), size=(h, 1)))
+        self._b2 = Var(np.zeros(1))
+        self._params = [self._A, self._W1, self._b1, self._w2, self._b2]
+
+    def _forward(self, X: np.ndarray) -> Var:
+        # 样本是行向量，所以聚合写成 X·Aᵀ 而不是 A·X：
+        # 第 j 列的新特征 = Σ_i A[j,i]·X[:,i]，即「j 收下所有邻居 i 的消息」。
+        adj_t = transpose(softmax_last(self._A), (1, 0))
+        h = matmul(matmul(Var(X), adj_t), self._W1)
+        h = relu(add(h, self._b1))
+        return add(matmul(h, self._w2), self._b2)
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        keep = np.isfinite(y) & np.isfinite(X).all(axis=1)
+        X, y = X[keep], y[keep]
+        if len(y) <= X.shape[1] + 10:
+            raise ValueError("样本太少，无法训练 GNN")
+
+        self._init(X.shape[1])
+        self._ymu = float(y.mean())
+        self._ysd = float(y.std()) or 1.0
+        ys = (y - self._ymu) / self._ysd
+
+        opt = Adam(self._params, lr=self.lr)
+        rng = np.random.default_rng(self.seed + 1)
+        n = len(ys)
+        bs = min(self.batch_size, max(32, n // 2))
+        for _ in range(self.epochs):
+            order = rng.permutation(n)
+            for s in range(0, n, bs):
+                idx = order[s : s + bs]
+                pred = self._forward(X[idx])
+                loss = mse(pred, ys[idx].reshape(-1, 1))
+                for p in self._params:
+                    p.g = None
+                backward(loss)
+                opt.step()
+        return self
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        out = np.full(len(X), np.nan)
+        if self._A is None:
+            return out
+        keep = np.isfinite(X).all(axis=1)
+        if not keep.any():
+            return out
+        pred = self._forward(X[keep])
+        out[keep] = pred.d.reshape(-1) * self._ysd + self._ymu
+        return out
+
+    def importance(self):
+        """输入层权重的列范数，作为各因子的「进入强度」粗代理。
+
+        和 Transformer 同一个口径，方便两种模型横向比。真正的因子关联要看
+        `adjacency()`。
+        """
+        if self._W1 is None:
+            return None
+        return np.linalg.norm(self._W1.d, axis=1)
+
+    def adjacency(self) -> np.ndarray | None:
+        """学出来的因子邻接矩阵（行归一化）。第 i 行是「因子 i 把消息分给了谁」。"""
+        if self._A is None:
+            return None
+        x = self._A.d - self._A.d.max(axis=1, keepdims=True)
+        e = np.exp(x)
+        return e / e.sum(axis=1, keepdims=True)
+
+
 # ================================================================== 注册表
 MODELS: dict[str, dict] = {
     "lightgbm": {"label": "LightGBM", "cls": LGBMModel, "desc": "梯度提升树，对非线性与因子交互最敏感，速度最快。"},
     "xgboost": {"label": "XGBoost", "cls": XGBModel, "desc": "二阶梯度提升树，正则更强，与 LightGBM 互为对照。"},
     "gpr": {"label": "高斯过程 GPR", "cls": GPRModel, "desc": "核方法，小样本稳健、天然带不确定性；训练量受 O(n³) 限制。"},
     "transformer": {"label": "Transformer", "cls": TransformerModel, "desc": "单层多头自注意力，从因子序列里学时序交互（numpy 实现）。"},
+    "linear": {"label": "线性回归 Ridge", "cls": LinearModel, "desc": "因子线性加权。当基准用：复杂模型打不过它，说明复杂度都用在拟合噪声上了。"},
+    "gnn": {"label": "图神经网络 GNN", "cls": GNNModel, "desc": "把因子当节点学一张关联图，消息传递后再回归（numpy 实现）。"},
 }
 
 DEFAULT_MODEL = "lightgbm"
@@ -596,6 +787,8 @@ _PROBE = {
     "xgboost": "xgboost",
     "gpr": "sklearn",
     "transformer": None,  # 纯 numpy，无外部依赖
+    "linear": None,
+    "gnn": None,
 }
 
 

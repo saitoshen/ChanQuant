@@ -4,7 +4,7 @@
 （按 `fut_daily_adj` 复权因子消除换月跳空），跑五套经典趋势跟踪策略，与「买入持有」做逐标的、分组、板块、
 组合四个层面的对比，并提供一个可视化 GUI 查看 K 线与买卖信号。
 
-v1.2.0 起加入**因子策略**：PIT 因子、单/多因子与机器学习（LightGBM / XGBoost / GPR / Transformer）
+v1.2.0 起加入**因子策略**：PIT 因子、单/多因子与机器学习（LightGBM / XGBoost / GPR / Transformer / 线性 / GNN）
 打分、Walk-forward 滚动训练，以及「规则策略 + 因子过滤」的三种叠加语义。全部按 Point-In-Time 构造，
 并有一套能真正抓出未来函数的离线自测（见下文「因子策略 → 怎么证明没有未来函数」）。
 
@@ -178,7 +178,7 @@ Claw/
 │   ├── factors.py         # 47 个 PIT 因子 / 9 类 + 滚动标准化
 │   ├── factor_metrics.py  # IC / ICIR / Newey-West t / IC 衰减 / 分位收益
 │   ├── factor_strategy.py # 单因子·多因子·ML 打分、walk-forward、三种过滤语义
-│   ├── mlmodels.py        # LightGBM / XGBoost / GPR / Transformer（numpy 手写反向传播）
+│   ├── mlmodels.py        # LightGBM / XGBoost / GPR / Transformer / Ridge / GNN
 │   ├── backtest.py        # 逐日回测引擎 + 绩效指标
 │   └── universe.py        # 美股股票池（52 只，按行业分组）
 ├── .github/workflows/
@@ -586,7 +586,7 @@ a                                b                    c
 `i > b-h` 的行在 `b` 时刻还是「未知标签」，混进训练集就是未来函数。
 这个边界比看起来重要：训练窗口只差 5 行，回测年化能差 1 个百分点以上。
 
-四个模型的实现取向：
+六个模型的实现取向：
 
 | 模型 | 实现 | 为什么这么选 |
 |---|---|---|
@@ -594,6 +594,8 @@ a                                b                    c
 | XGBoost | `xgboost` 原生 | 交叉验证 LightGBM 的结论 |
 | 高斯过程 GPR | `sklearn`，**核超参冻结** | 让 sklearn 优化 ARD 长度尺度，单折从 10ms 涨到 1s+，30 折直接卡死；因子已 z-score 过（方差为 1），长度尺度 3.0 是合理先验 |
 | Transformer | **numpy 手写自动微分 + 单层多头自注意力** | torch 的 CPU 轮子 1GB 起步，会把安装包从 ~99MB 撑到 1GB；这里只需要一个 8×8 的小编码器，手写 620 行够用 |
+| 线性 Ridge | numpy 闭式解（正规方程） | **当基准用**：复杂模型打不过一条岭回归，说明那点复杂度全用在拟合噪声上了。k 只有几十，(k+1)×(k+1) 的正规方程用 `np.linalg.solve` 就是精确解，没有迭代、没有随机种子、没有版本差异 |
+| 图神经网络 GNN | **numpy 手写，一层图卷积** | 把每个因子当成一个节点，学一个 k×k 的邻接矩阵 A（行 softmax），`H = relu(X·Aᵀ·W1 + b1)`。样本是行向量，所以聚合写成 `X·Aᵀ` 而不是 `A·X`。**为什么是因子图不是品种图**：平台的机器学习是单品种时序训练，一次只有一条品种的样本，没有横截面就建不出品种图；因子图没有这个问题，学出来的 A 本身就是一张因子关联图 |
 
 #### 实测（沪铜 CU_SHFE，2006-09 ~ 2026-10，4873 根）
 
@@ -614,8 +616,10 @@ a                                b                    c
 
 - 单因子在这一个品种上是负收益，**这很正常**。单因子择时的价值本来就不在「每个品种都赚」，
   而在于「在一批品种上是否稳定为正」，所以要看 IC/ICIR，不能只看一条资金曲线。
-- 四个模型的信号一致性只有 56%~81%（lightgbm vs xgboost 81%，vs gpr / transformer 各 56%）。
+- 各模型的信号一致性只有 56%~81%（lightgbm vs xgboost 81%，vs gpr / transformer 各 56%）。
   模型确实在学不同的东西，不是换个壳子跑同一个信号。
+- 线性与 GNN 是后加的，上表还没跑它们的数 —— 换模型重跑一遍 `smoke_test_factors.py`
+  或直接在「因子分析」页选模型就能看到。线性模型的训练耗时是 0ms 级别，适合先看基准。
 - 机器学习模式**前 500 根不持仓**：样本不够训练。这是 walk-forward 的正常代价，
   不是 bug，界面上会写「有效预测 xxx/xxx 根」。
 
@@ -1469,7 +1473,7 @@ dist/TrendDesk.app/Contents/MacOS/TrendDesk --selftest   # macOS
 [ OK ] 规则 + 因子过滤  规则 3396 根持仓 → 过滤后 3125 根
 [ OK ] 因子反转（逐因子）  动量 60 日 反转后多空对调（1430/1478 根）
 [ OK ] 因子方向口径  固定多/固定空/自动三档正常，末期方向已报出
-[ OK ] 机器学习模型依赖  LightGBM、XGBoost、高斯过程 GPR、Transformer
+[ OK ] 机器学习模型依赖  LightGBM、XGBoost、高斯过程 GPR、Transformer、线性 Ridge、GNN
 [ OK ] matplotlib 绘图（含中文字体）  字体 Microsoft YaHei，渲染 11212 B
 [ OK ] Qt 平台插件  Qt 6.12.0 离屏渲染正常
 [ OK ] 构建主窗口（端到端）  34 个标的，K 线/绩效/因子页已渲染，窗口 180/754 根，

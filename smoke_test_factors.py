@@ -818,7 +818,9 @@ check("自动微分数值梯度一致", worst < 1e-5, f"最大相对误差 {wors
 
 avail = ML.available()
 check("可用模型至少含 LightGBM", "lightgbm" in avail, str(avail))
-check("模型清单齐全", set(ML.MODELS) == {"lightgbm", "xgboost", "gpr", "transformer"})
+check("模型清单齐全",
+      set(ML.MODELS) == {"lightgbm", "xgboost", "gpr", "transformer", "linear", "gnn"},
+      str(sorted(ML.MODELS)))
 
 
 # ================================================================== 9. 四模型
@@ -829,7 +831,8 @@ ok_rows = np.isfinite(Y) & np.all(np.isfinite(X), axis=1)
 Xf, Yf = X[ok_rows], Y[ok_rows]
 check("训练样本足够", len(Xf) > 300, f"{len(Xf)} 行")
 
-models = [m for m in ("lightgbm", "xgboost", "gpr", "transformer") if m in avail]
+models = [m for m in ("lightgbm", "xgboost", "gpr", "transformer", "linear", "gnn")
+          if m in avail]
 if FAST:
     models = [m for m in models if m != "transformer"]
 
