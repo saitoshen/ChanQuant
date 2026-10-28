@@ -1420,6 +1420,9 @@ def check_strategy_runner() -> None:
                                sizing="fixed", volume=2,
                                rule_params={"fast": 5, "slow": 20})
         st5 = r.add(c5)
+        # 这一段测的是「K 线 → 信号」的纯逻辑，用人工序列；置空 qfq 缓存让
+        # `_signal_frame` 退回实时价，否则会去读真库把人工序列覆盖掉
+        r._qfq_base[r._skey(c5)] = pd.DataFrame()
         r._klines[r._skey(c5)] = bars
         r._quotes[c5.key()] = None
         st5.running = True
@@ -1463,6 +1466,35 @@ def check_strategy_runner() -> None:
         check("触发：同一根 bar 内推价不重算信号",
               (st5.signal, st5.target, st5.last_bar) == before,
               f"{before} → {(st5.signal, st5.target, st5.last_bar)}")
+
+        # 实盘算信号必须用「前复权历史 + 实时 bar」，和回测同一口径 —— 否则换月
+        # 那一下的复权差会把信号推到阈值另一侧（回测空仓、实盘反向持仓）。这里
+        # 不碰真库：手动给一份 qfq 底，验证只接更晚的实时 bar、重叠保留本地那份
+        rq = PortfolioRunner(AccountSpec(name="口径测试", kind="sim"), St.ChaseConfig())
+        cq = St.StrategyConfig(sid="sq", symbol="ZZ", exchange="SHFE", period="5m",
+                               rule_key="ma_cross", sizing="fixed", volume=1)
+        stq = rq.add(cq)
+        bi = pd.date_range("2026-01-05 09:00", periods=40, freq="5min")
+        baseq = pd.DataFrame({
+            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+            "volume": 1.0, "open_oi": 1.0, "close_oi": 1.0, "adj_factor": 1.1,
+        }, index=bi)
+        baseq.index.name = "datetime"
+        rq._qfq_base[rq._skey(cq)] = baseq
+        lv = pd.DataFrame({
+            "datetime": [(bi[0] + pd.Timedelta(minutes=5 * (30 + k)))
+                         .tz_localize("Asia/Shanghai").tz_convert("UTC")
+                         .as_unit("ns").value for k in range(15)],
+            "open": 200.0, "high": 200.0, "low": 200.0, "close": 200.0,
+            "volume": 1.0, "open_oi": 1.0, "close_oi": 1.0,
+        })
+        fr = rq._signal_frame(stq, lv)
+        check("实盘口径：前复权底 + 只接更晚的实时 bar",
+              len(fr) == 45
+              and abs(float(fr["close"].iloc[39]) - 100.0) < 1e-9
+              and abs(float(fr["close"].iloc[-1]) - 200.0) < 1e-9,
+              f"len={len(fr)} c39={float(fr['close'].iloc[39]):.2f} "
+              f"last={float(fr['close'].iloc[-1]):.2f}")
 
         # 周期不认识时必须在 enable 就拒掉，而不是等订阅时抛 KeyError 把策略打死
         bad = St.StrategyConfig(sid="s9", symbol="RB", exchange="SHFE",

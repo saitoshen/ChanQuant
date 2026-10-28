@@ -48,11 +48,11 @@ import pandas as pd
 
 from ttrade import factor_strategy as fstrat
 from ttrade import replay
-from ttrade import daylimit, orderbook, topup
+from ttrade import daylimit, orderbook, topup, tqdata
 from ttrade import strategy_store as SStore
 from ttrade.strategies import run_strategy
 from ttrade.tqfetch import PERIOD_SEC
-from ttrade.tqlive import AccountSpec, bars_from_serial
+from ttrade.tqlive import AccountSpec, bars_from_serial, merge_live
 from ttrade.tqsdk_symbols import main_symbol
 
 KLINE_LEN = 3000          # 每个策略回看多少根。日线 3000 根够跑 MA200，5m 够跑一周多
@@ -211,6 +211,9 @@ class PortfolioRunner:
         self._top_try: dict[tuple[str, str, str], float] = {}
         # 上次失败的原因。同样的原因只打一条日志，不然每 2 秒刷一行
         self._top_err: dict[tuple[str, str, str], str] = {}
+        # 算信号用的前复权基准，(品种_交易所@周期) -> qfq 历史。实盘必须和回测
+        # 同一份复权口径（见 `_signal_frame`）。主连换月时失效重载。
+        self._qfq_base: dict[str, pd.DataFrame] = {}
 
     # ---- 生命周期 ----
 
@@ -507,6 +510,8 @@ class PortfolioRunner:
                 st.retired.append(st.underlying)
                 self._log(f"{st.title()}：换月 {st.underlying} → {und}，老合约待清仓")
             st.underlying = und
+            # 换月带来新的换月跳空，前复权基准要按新数据重算
+            self._qfq_base.pop(key, None)
         # 必须 `.iloc[-1]`：天勤的 kline 是 DataFrame，`kl["datetime"]` 是带
         # RangeIndex 的 Series，`series[-1]` 走的是**按标签**取值，直接抛
         # `KeyError: -1`。这一行曾经让每条策略在第一个 tick 就停机。
@@ -515,7 +520,7 @@ class PortfolioRunner:
             return                       # 同一根 bar 里不重算
         st.last_bar = last
 
-        df = bars_from_serial(kl, st.cfg.period)
+        df = self._signal_frame(st, kl)
         # 最后一根是正在走的活 bar，信号只用已收盘的算（见模块文档）。此刻正是
         # 新 bar 刚开盘，用上一根收盘的信号下单 = 回测里的 T+1 开盘成交。
         if len(df) > 1:
@@ -527,6 +532,51 @@ class PortfolioRunner:
             st.signal = max(0, st.signal)     # 不允许做空时把空头信号裁掉
         st.lots = self._lots(st, self._mark_price(st, df), atr(df, st.cfg.stop_atr_n))
         st.target = st.signal * st.lots
+
+    def _signal_frame(self, st: SlotState, kl) -> pd.DataFrame:
+        """算信号用的行情：**本地前复权历史 + 实时 bar**。
+
+        回测（详情页）走 `tqdata.load_main(adjust="qfq")`，实盘必须同一份口径 ——
+        直接拿天勤原始价算，换月那一下的复权差会把 60 根动量推到 `entry_z` 两侧：
+        回测空仓、实盘反向持仓，两边永远对不上。
+
+        `merge_live` 只接**严格晚于**本地最后一根的实时 bar，重叠的保留本地那份
+        （本地带正确复权因子，实时段因子是 1.0）。换月时调用方会清掉缓存，让新的
+        换月跳空也按前复权抹平。
+        """
+        live = bars_from_serial(kl, st.cfg.period)
+        if live.empty:
+            return live
+        key = self._skey(st.cfg)
+        base = self._qfq_base.get(key)
+        if base is None:
+            try:
+                base = tqdata.load_main(
+                    st.cfg.symbol, st.cfg.exchange, st.cfg.period, adjust="qfq"
+                )
+            except Exception as exc:  # noqa: BLE001
+                # 读不到前复权历史也别把策略打死：退回实时原始价，至少还出得了信号
+                self._log(
+                    f"{st.title()}：读前复权历史失败，暂用实时原始价"
+                    f"（{type(exc).__name__}: {exc}）"
+                )
+                base = pd.DataFrame()
+            self._qfq_base[key] = base
+        if base is None or base.empty:
+            return live
+        if live.index[0] > base.index[-1]:
+            # 本地历史太旧，和实时段接不上（中间断了一截）。硬拼会在断口造一次
+            # 假跳空，比用原始价更糟 —— 退回实时原始价，并记一条日志
+            self._log(f"{st.title()}：本地历史与实时段接不上，暂用实时原始价")
+            return live
+        # **和回测同源同长**：`replay.run` 先按 `range_years` 切一刀（还多留
+        # `WARMUP_BARS` 根预热），这里切同一刀。详情页画多少根、从哪根开始算，
+        # 实盘就用同样那些根 —— 所见即所得，不再截 KLINE_LEN。
+        merged = merge_live(base, live)
+        merged = replay.window(merged, getattr(st.cfg, "range_years", 0) or 0)
+        if merged is None or len(merged) < 2:
+            return live
+        return merged
 
     def _signal(self, st: SlotState, df: pd.DataFrame) -> int:
         """按当前配置算出最后一根 bar 上的目标仓位（-1 / 0 / 1）。

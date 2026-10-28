@@ -1145,7 +1145,25 @@ class PortfolioPage(QWidget):
                     f"\n当前价下满仓 {lots} 手" if lots > 0 else
                     "引擎还没算出实际手数（需要行情）"
                 )
-            self._set_cell(t, i, 5, str(theo), C_TEXT)
+            # 「理论」只对**正在运行**的策略显示。停机（报单到顶 / 出错）不会清零
+            # target，继续显示 -11 会让人以为它还在管这 -11 手；而监控器按 running
+            # 汇总，那边是 0 /「未托管」—— 同一页两处就打架了。停机时显示「—」，
+            # 把残值放进 tooltip。
+            if slot.get("running"):
+                self._set_cell(t, i, 5, str(theo), C_TEXT)
+                it5 = t.item(i, 5)
+                if it5 is not None:
+                    it5.setToolTip(f"策略当前目标净仓 {theo:+d} 手")
+            else:
+                self._set_cell(t, i, 5, "—", C_MUTED)
+                it5 = t.item(i, 5)
+                if it5 is not None:
+                    it5.setToolTip(
+                        (f"策略未运行。停机前最后目标 {theo:+d} 手，不再参与托管；"
+                         "实际持仓在右下监控器里记为「未托管」。")
+                        if slot else "还没启动"
+                    )
+
             # 运行中且仓位对不上才标红。停掉的策略留着仓位往往是用户故意的，
             # 那是「未托管」的事，监控器里会单独列出来。
             off = bool(slot.get("running")) and real != theo
