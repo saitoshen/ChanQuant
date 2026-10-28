@@ -2691,7 +2691,14 @@ class MainWindow(QMainWindow):
         self.lbl_live_msg.setText(msg)
 
     def _on_trade_connect(self, spec) -> None:
-        """从交易页点「连接」：沿用当前选中的品种与周期。"""
+        """从交易页点「连接」：沿用当前选中的品种与周期。
+
+        **不补本地历史**。这个动作的语义是「登录账户」，用户要看的是持仓/资金/
+        委托，而 `hub.start()` 之后这些东西就有了。补历史一个品种十年 5m 要几十
+        秒到几分钟，撞上天勤运维窗口（19:00-19:30）还会一直等到 19:31 —— 为了
+        画 K 线把「登录」卡住几分钟是不划算的。需要长历史的场景是研究页的实时
+        K 线，那里走 `_on_live_toggled`，它照样补。
+        """
         if self.market != "cn":
             self.trade_page.on_failed("交易只接了国内期货")
             return
@@ -2700,7 +2707,7 @@ class MainWindow(QMainWindow):
         if pair is None:
             self.trade_page.on_failed("先在「策略研究」页选一个品种")
             return
-        self.live.start(spec, pair[0], pair[1], period, need_history=True)
+        self.live.start(spec, pair[0], pair[1], period, need_history=False)
         self.lbl_live_msg.setText("正在连接…")
         self.btn_live.blockSignals(True)
         self.btn_live.setChecked(True)
@@ -2727,9 +2734,12 @@ class MainWindow(QMainWindow):
         # 工作线程刚把缺口补进库，缓存里的旧数据要作废，否则实时段会接在旧尾巴上
         self.store.invalidate(key, self._live_period)
         self._live_base = self.store.get(key, self._live_period)
+        # 从交易页连的账户不补历史（见 `_on_trade_connect`），这时本地一根都没有。
+        # 写「0 根历史」看着像出错，直接说清楚是没补。
+        n_base = 0 if self._live_base is None else len(self._live_base)
+        tail = f"{n_base:,} 根历史" if n_base else "未补本地历史"
         self.lbl_live_msg.setText(
-            f"实时中 · {sym} {PERIOD_LABEL.get(self._live_period, '')}"
-            f"（{0 if self._live_base is None else len(self._live_base):,} 根历史）"
+            f"实时中 · {sym} {PERIOD_LABEL.get(self._live_period, '')}（{tail}）"
         )
         self.lbl_live.setText("● 实时")
         self.lbl_live.setStyleSheet(f"color: {C_UP}; font-size: 11px; font-weight: 600;")

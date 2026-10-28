@@ -459,6 +459,10 @@ def _run() -> tuple[bool, list[str]]:
         # 数据更新面板：控件都在，且线程未启动。
         # 衍生数据的两个勾选框只在期货市场出现 —— 美股没有真实合约和期权，
         # 摆在那里只会让人以为「美股也能下期限结构」。
+        # **按当前市场判断，不能写死 hidden**：窗口启动时会恢复上次的配置
+        # （`last_config.json`，可能是期货），写死的话用户上次用期货、这次跑
+        # 自检就必红 —— 而那不是代码坏了，是自检假设了初始状态。
+        is_us = win.market == "us"
         has_upd = (
             hasattr(win, "btn_update")
             and hasattr(win, "cb_upd_range")
@@ -466,8 +470,8 @@ def _run() -> tuple[bool, list[str]]:
             and win._upd_thread is None
             and hasattr(win, "chk_upd_contracts")
             and hasattr(win, "chk_upd_options")
-            and win.chk_upd_contracts.isHidden()
-            and win.chk_upd_options.isHidden()
+            and win.chk_upd_contracts.isHidden() == is_us
+            and win.chk_upd_options.isHidden() == is_us
             and not win.chk_upd_contracts.isChecked()
             and not win.chk_upd_options.isChecked()
         )
@@ -555,8 +559,10 @@ def _run() -> tuple[bool, list[str]]:
             )
         if not factor_ok:
             raise RuntimeError(f"因子面板控件缺失：{factor_info}")
-        if n_rows < 28:
-            raise RuntimeError(f"因子分析页只有 {n_rows} 行，应为 28")
+        # 因子分析页列出**全部**因子（算不出的显示「无数据」），所以行数应等于
+        # 因子库大小。用 `n_factors` 而不是写死数字：加因子时这里不用改。
+        if n_rows < n_factors:
+            raise RuntimeError(f"因子分析页只有 {n_rows} 行，应为 {n_factors}")
         if n_axes != 4:
             raise RuntimeError(f"因子分析页图轴数为 {n_axes}，应为 4")
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"

@@ -275,6 +275,105 @@ def check_live_helpers() -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def check_live_worker() -> None:
+    """登录账户不能被补历史卡住。
+
+    交易页点「连接」的语义是登录账户，用户要看持仓/资金/委托 —— 这些在
+    `hub.start()` 之后就有了。补历史一个品种十年 5m 要几十秒到几分钟，撞上
+    天勤运维窗口（19:00-19:30）还会一直等到 19:31。所以：
+
+    ① `need_history=False` 时完全不碰 `update_main`
+    ② `need_history=True` 但补历史抛异常时，仍然把账户连上
+    """
+    try:
+        from gui import live as LV
+        import ttrade.tqfetch as TF
+    except Exception as exc:  # noqa: BLE001
+        skip("实时 worker", f"无法导入 gui.live：{exc}")
+        return
+
+    state = {"update": 0, "start": 0, "subscribe": 0, "closed": 0}
+    holder: dict = {}
+
+    class FakeHub:
+        """只记调用，不连天勤。`wait()` 里让 worker 停，循环跑一轮就退出。"""
+
+        def __init__(self, spec):
+            self.spec = spec
+            self.underlying = ""
+
+        def start(self):
+            state["start"] += 1
+
+        def subscribe(self, symbol, exchange, period):
+            state["subscribe"] += 1
+
+        def wait(self, timeout=0.8):
+            holder["w"].stop()
+            return False
+
+        def bars(self):
+            return pd.DataFrame()
+
+        def state(self):
+            return None
+
+        def close(self):
+            state["closed"] += 1
+
+    def run_once(need, update_impl):
+        for k in state:
+            state[k] = 0
+        LV.LiveHub = FakeHub
+        TF.update_main = update_impl
+        w = LV.LiveWorker(None, "RB", "SHFE", "5m", need_history=need)
+        holder["w"] = w
+        logs: list[str] = []
+        fails: list[str] = []
+        w.log.connect(logs.append)
+        w.failed.connect(fails.append)
+        w.run()
+        return logs, fails
+
+    old_hub, old_upd = LV.LiveHub, TF.update_main
+    try:
+        # ① 交易页连接：不补历史
+        logs, fails = run_once(
+            False, lambda *a, **k: state.__setitem__("update", state["update"] + 1) or 0
+        )
+        check("实时⑧登录账户不补历史（不调 update_main）", state["update"] == 0,
+              f"调用 {state['update']} 次")
+        check("实时⑧登录账户仍然连上并订阅",
+              state["start"] == 1 and state["subscribe"] == 1,
+              f"start={state['start']} subscribe={state['subscribe']}")
+        check("实时⑧登录过程没有报错", not fails, repr(fails))
+        check("实时⑧日志里不提补历史",
+              not any("补历史" in s or "补齐" in s for s in logs), repr(logs))
+
+        # ② 研究页：要补历史，但补失败不能拖累连接
+        def boom(*a, **k):
+            state["update"] += 1
+            raise RuntimeError("天勤运维窗口")
+
+        logs, fails = run_once(True, boom)
+        check("实时⑨补历史失败仍然连上",
+              state["start"] == 1 and state["subscribe"] == 1,
+              f"start={state['start']} subscribe={state['subscribe']}")
+        check("实时⑨补历史失败不算连接失败", not fails, repr(fails))
+        check("实时⑨日志说明补历史失败并继续",
+              any("补历史失败" in s and "继续连接" in s for s in logs), repr(logs))
+
+        # ③ 研究页正常补历史
+        logs, _ = run_once(
+            True, lambda *a, **k: state.__setitem__("update", state["update"] + 1) or 123
+        )
+        check("实时⑩补历史成功会写日志",
+              any("本地历史已补齐" in s and "123" in s for s in logs), repr(logs))
+    finally:
+        LV.LiveHub = old_hub
+        TF.update_main = old_upd
+
+
 def check_cli_entry() -> None:
     """命令行入口能真正跑到「列出品种」这一步。
 
@@ -1122,6 +1221,7 @@ def main() -> int:
     check_trading_day()
     check_contract_incremental()
     check_live_helpers()
+    check_live_worker()
     check_cli_entry()
     check_factor_refresh()
     check_main_backfill()

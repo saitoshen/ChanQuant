@@ -25,7 +25,12 @@ from ttrade.tqlive import LiveHub, LiveState
 
 
 class LiveWorker(QObject):
-    """跑在天勤线程里：补历史 → 订阅 → 循环推进。"""
+    """跑在天勤线程里：（可选）补历史 → 订阅 → 循环推进。
+
+    `need_history` 只在要画 K 线时才需要（研究页要把实时推送拼到本地历史上）。
+    纯看账户的页面传 False —— 补历史一个品种十年 5m 要几十秒到几分钟，而账户
+    信息在 `hub.start()` 之后就有了，没必要让用户干等。
+    """
 
     ready = Signal(str)          # 订阅就绪，参数是「品种_交易所」
     bars = Signal(object)        # 实时 K 线 DataFrame（含未走完的最后一根）
@@ -60,12 +65,18 @@ class LiveWorker(QObject):
         hub = LiveHub(self.spec)
         try:
             if self.need_history:
-                # 补历史走 DataDownloader，可能要几十秒；放在线程里，界面不冻
-                from ttrade.tqfetch import update_main
+                # 补历史走 DataDownloader，可能要几十秒；放在线程里，界面不冻。
+                # 失败**不能**拖累连接：账户能登上去比历史补齐重要得多，而且
+                # 天勤运维窗口（19:00-19:30）里 update_main 会一直等到 19:31，
+                # 那种情况下抛出来连账户都看不到。
+                try:
+                    from ttrade.tqfetch import update_main
 
-                self.log.emit("正在补齐本地历史…")
-                n = update_main(self.symbol, self.exchange, self.period)
-                self.log.emit(f"本地历史已补齐（本次写入 {n:,} 行）")
+                    self.log.emit("正在补齐本地历史…")
+                    n = update_main(self.symbol, self.exchange, self.period)
+                    self.log.emit(f"本地历史已补齐（本次写入 {n:,} 行）")
+                except Exception as exc:  # noqa: BLE001
+                    self.log.emit(f"补历史失败（{type(exc).__name__}: {exc}），继续连接")
             self.log.emit("正在连接天勤…")
             hub.start()
             hub.subscribe(self.symbol, self.exchange, self.period)
