@@ -456,24 +456,51 @@ def _run() -> tuple[bool, list[str]]:
         app.processEvents()
         n = len(win.store.symbols)
         has_res = getattr(win, "res", None) is not None
-        # 数据更新面板：控件都在，且线程未启动。
+        # 数据管理页：五个页面按钮一一对应，补数据的控件在数据页里。
         # 衍生数据的两个勾选框只在期货市场出现 —— 美股没有真实合约和期权，
         # 摆在那里只会让人以为「美股也能下期限结构」。
         # **按当前市场判断，不能写死 hidden**：窗口启动时会恢复上次的配置
         # （`last_config.json`，可能是期货），写死的话用户上次用期货、这次跑
         # 自检就必红 —— 而那不是代码坏了，是自检假设了初始状态。
         is_us = win.market == "us"
+        dp = getattr(win, "data_page", None)
         has_upd = (
-            hasattr(win, "btn_update")
-            and hasattr(win, "cb_upd_range")
-            and win.cb_upd_range.count() == 5
-            and win._upd_thread is None
-            and hasattr(win, "chk_upd_contracts")
-            and hasattr(win, "chk_upd_options")
-            and win.chk_upd_contracts.isHidden() == is_us
-            and win.chk_upd_options.isHidden() == is_us
-            and not win.chk_upd_contracts.isChecked()
-            and not win.chk_upd_options.isChecked()
+            dp is not None
+            and win.pages.count() == 5
+            and len(win._page_btns) == 5
+            and win.pages.widget(4) is dp
+            and dp.market == win.market
+            and not dp.busy()
+            and dp.cb_upd_range.count() == 5
+            and dp.cb_source.count() == 2
+            # 周期是入口，期货下始终能选；美股没有分钟线才藏起来
+            and dp.cb_period.isHidden() == is_us
+            and dp.chk_upd_contracts.isHidden() == is_us
+            and dp.chk_upd_options.isHidden() == is_us
+            and not dp.chk_upd_contracts.isChecked()
+            and not dp.chk_upd_options.isChecked()
+        )
+        # 交易Agent 页：删除按钮在没选中东西时必须是灰的，权限开关默认关。
+        # 升级权限的文件模块是**函数里 import** 的，打包漏了只会在用户勾上开关
+        # 之后才炸 —— 所以在这里 import 一次，把它变成打包期就能发现的问题。
+        ap = getattr(win, "agent_page", None)
+        fs_ok = True
+        fs_err = ""
+        try:
+            from ttrade import agent_fs  # noqa: F401
+
+            root = agent_fs.root()
+            fs_ok = bool(root) and os.path.isdir(root)
+        except Exception as exc:  # noqa: BLE001
+            fs_ok, fs_err = False, f"{type(exc).__name__}: {exc}"
+        agent_ok = (
+            ap is not None
+            and hasattr(ap, "btn_del_factor")
+            and hasattr(ap, "btn_del_strat")
+            and not ap.btn_del_factor.isEnabled()
+            and not ap.btn_del_strat.isEnabled()
+            and ap.cfg.allow_fs is False
+            and fs_ok
         )
         # K 线可视窗口：初始应停在最新一段，且滚动条范围与窗口自洽
         k_ok = (
@@ -547,7 +574,12 @@ def _run() -> tuple[bool, list[str]]:
         if not has_res:
             raise RuntimeError("主窗口未完成首次回测")
         if not has_upd:
-            raise RuntimeError("数据更新面板缺失或初始状态异常")
+            raise RuntimeError("数据管理页缺失或初始状态异常")
+        if not agent_ok:
+            raise RuntimeError(
+                "交易Agent 页异常：删除按钮初始状态不对，或升级权限的文件模块取不到"
+                + (f"（{fs_err}）" if fs_err else "")
+            )
         if not wheel_ok:
             raise RuntimeError(
                 f"K 线滚轮缩放失效（窗口 {wheel_info}）：scroll_event 回调没生效，"
@@ -566,7 +598,7 @@ def _run() -> tuple[bool, list[str]]:
         if n_axes != 4:
             raise RuntimeError(f"因子分析页图轴数为 {n_axes}，应为 4")
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
-                f"{factor_info}，滚轮缩放 {wheel_info}，更新面板就绪")
+                f"{factor_info}，滚轮缩放 {wheel_info}，数据管理页就绪")
 
     check("构建主窗口（端到端）", _window)
 

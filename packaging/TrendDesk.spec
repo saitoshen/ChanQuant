@@ -93,6 +93,10 @@ HIDDEN = [
     "ttrade.tqlive",
     "gui.live",
     "gui.trade_page",
+    # Agent 的升级权限：`agent_fs` 只在函数里 import（默认权限下根本用不到），
+    # 打包时要是漏了，用户勾上那个开关之后每一次文件动作都会 ImportError
+    "ttrade.agent_fs",
+    "gui.data_page",
 ]
 
 # 用不到的重量级依赖，剔掉能省 100MB 以上

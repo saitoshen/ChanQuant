@@ -118,6 +118,9 @@ class AgentConfig:
     # 下单前弹确认框。用户可以勾「下次不提醒」把它关掉 —— 关掉之后模型给的动作
     # 会直接执行，所以设置页里必须能重新打开。
     confirm_trade: bool = True
+    # 升级权限：允许 Agent 读写 TrendDesk 目录下的文件（`fs` 动作）。
+    # 默认关。打开等于把整个平台的代码交给模型，设置页里必须写清楚这一点。
+    allow_fs: bool = False
 
     def endpoint(self, path: str) -> str:
         return self.base_url.rstrip("/") + path
@@ -461,13 +464,61 @@ SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务�
 """
 
 
-def build_messages(history: list[dict], user_text: str, memory: str = "") -> list[dict]:
+# 只在「升级权限」打开时追加。默认权限下模型根本不知道有这回事，
+# 也就不会写出一个必然被拒的动作块。
+FS_PROMPT = """
+
+## 升级权限：读写平台文件
+
+用户已打开「升级权限」，你可以读写 TrendDesk 根目录（`{root}`）下的文件。
+改代码之前先 `read` 看清楚现状，改完告诉用户改了什么、要重启哪一部分才生效。
+
+```json
+{"action": "fs", "op": "read", "path": "ttrade/factors.py"}
+```
+
+```json
+{"action": "fs", "op": "list", "path": "ttrade"}
+```
+
+```json
+{"action": "fs", "op": "write", "path": "notes/螺纹.txt", "content": "第一行\\n第二行"}
+```
+
+- `path` 只能是**相对根目录**的路径，不能出现 `..`，不能是绝对路径
+- `write` 是**整文件覆盖**，不是打补丁：先 `read` 拿全文，改完把全文写回去。
+  只写你真正要改的那几行，别顺手重排格式 —— 用户看不懂 diff 就没法复核
+- 写之前平台会弹确认框给人看内容，所以一次只写一个文件
+- 改 `gui/` 或 `ttrade/` 下的代码都要重启程序才生效；配置文件一般也是重启读一次
+- 不确定要改哪个文件时，先 `list` 再看，别猜路径
+"""
+
+
+def _system_prompt(allow_fs: bool) -> str:
+    """基础提示词 + 升级权限那段。根目录在每次拼的时候现取 ——
+    源码运行和打包运行不是同一个目录，写死进提示词会让模型照着错的路径去改。"""
+    if not allow_fs:
+        return SYSTEM_PROMPT
+    try:
+        from ttrade import agent_fs as FS
+
+        root = FS.root().replace("\\", "/")
+    except Exception:  # noqa: BLE001 - 取不到路径也不该让整轮对话发不出去
+        root = "（取不到，用相对路径即可）"
+    return SYSTEM_PROMPT + FS_PROMPT.replace("{root}", root)
+
+
+def build_messages(history: list[dict], user_text: str, memory: str = "",
+                   allow_fs: bool = False) -> list[dict]:
     """拼一份完整消息列表：系统提示 + 长期记忆 + 历史 + 本轮。
 
     记忆单独占一条 system 消息，不拼进 `SYSTEM_PROMPT`：一是基础提示词不变，
     各家服务端的上下文缓存还能命中；二是调试时一眼能看出「这句是记忆喂进去的」。
+
+    `allow_fs` 为真时追加「读写平台文件」那段。**这是能力开关，不是提示语**：
+    关着的时候提示词里不提这件事，模型就不会写出必然被拒的动作块。
     """
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    msgs = [{"role": "system", "content": _system_prompt(allow_fs)}]
     if memory.strip():
         msgs.append({
             "role": "system",
@@ -521,7 +572,7 @@ _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
 
 @dataclass
 class Action:
-    kind: str                 # trade / backtest / factor / strategy / 空串表示没有动作
+    kind: str                 # trade / backtest / factor / strategy / fs / 空串表示没有动作
     payload: dict = field(default_factory=dict)
     error: str = ""
 
@@ -549,6 +600,15 @@ class Action:
         if self.kind == "strategy":
             n = len(p.get("params") or {})
             return f"注册策略「{p.get('label', '')}」（{n} 个参数）"
+        if self.kind == "fs":
+            op = p.get("op", "")
+            path = p.get("path", "")
+            if op == "read":
+                return f"读取 {path}"
+            if op == "list":
+                return f"列出目录 {path or '.'}"
+            n = len(p.get("content") or "")
+            return f"写入 {path}（{n} 字符）"
         return self.kind
 
 
@@ -621,6 +681,28 @@ def _parse_strategy(obj: dict) -> Action:
     return Action("strategy", obj)
 
 
+def _parse_fs(obj: dict) -> Action:
+    """读写平台文件的动作块。真正的路径校验在 `agent_fs.resolve()` 里 ——
+    这里只挡住一眼就能看出来的错，让模型能立刻改对。"""
+    op = str(obj.get("op") or "").strip().lower()
+    if op not in ("read", "list", "write"):
+        return Action("fs", obj, "op 只能是 read / list / write")
+    path = str(obj.get("path") or "").strip().replace("\\", "/")
+    if not path and op != "list":
+        return Action("fs", obj, "缺少 path")
+    if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
+        return Action("fs", obj, "path 只能是相对 TrendDesk 根目录的路径")
+    if ".." in path.split("/"):
+        return Action("fs", obj, "path 里不能出现 ..")
+    if op == "write" and "content" not in obj:
+        return Action("fs", obj, "写入要带 content（整文件覆盖）")
+
+    obj["op"] = op
+    obj["path"] = path or "."
+    obj["content"] = str(obj.get("content") or "")
+    return Action("fs", obj)
+
+
 def parse_action(text: str) -> Action:
     """从回答里挖出动作块。没有就返回 kind 为空串的 Action。
 
@@ -638,7 +720,7 @@ def parse_action(text: str) -> Action:
         return Action("", {}, "动作块不是对象")
 
     kind = str(obj.get("action") or "").strip().lower()
-    if kind not in ("trade", "backtest", "factor", "strategy"):
+    if kind not in ("trade", "backtest", "factor", "strategy", "fs"):
         return Action("")
     if kind == "factor":
         # 注册因子不需要品种 —— 因子是横截面的，对哪个标的算由用户决定
@@ -646,6 +728,9 @@ def parse_action(text: str) -> Action:
     if kind == "strategy":
         # 注册的是策略**定义**，也不带品种：同一套逻辑要跑哪个品种是另一件事
         return _parse_strategy(obj)
+    if kind == "fs":
+        # 也不带品种：改哪个文件是 path 说了算
+        return _parse_fs(obj)
     if not obj.get("symbol"):
         return Action(kind, obj, "缺少品种")
 

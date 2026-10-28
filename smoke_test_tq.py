@@ -1616,6 +1616,103 @@ def check_agent_memory() -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def check_agent_fs() -> None:
+    """升级权限的文件读写：路径不能跑出根目录、写是原子的、换行跟着原文件走。"""
+    from ttrade import agent as A
+    from ttrade import agent_fs as FS
+
+    tmpdir = tempfile.mkdtemp(prefix="td_fs_")
+    old_root = FS.root
+    FS.root = lambda: tmpdir
+    try:
+        check("文件权限：根目录可取", os.path.isdir(FS.root()), FS.root())
+
+        # 路径闸门。这层挡不住蓄意破坏，但必须挡住 `../` 和绝对路径 ——
+        # 否则「只能改 TrendDesk 目录」这句话就是假的
+        ok_path, err = FS.resolve("ttrade/factors.py")
+        check("文件权限：正常相对路径能落", bool(ok_path) and not err, err)
+        for bad in ("../outside.txt", "a/../../b.txt", "/etc/passwd", "C:/Windows/win.ini"):
+            _p, e = FS.resolve(bad)
+            check(f"文件权限：拒绝 {bad}", bool(e), e)
+
+        # 写 → 读
+        ok, msg = FS.write_text("notes/a.txt", "第一行\n第二行")
+        check("文件权限：写入成功", ok, msg)
+        check("文件权限：目录自动建出来",
+              os.path.isfile(os.path.join(tmpdir, "notes", "a.txt")), "")
+        text, err = FS.read_text("notes/a.txt")
+        check("文件权限：读回一致", text == "第一行\n第二行" and not err, err)
+        check("文件权限：覆盖已有文件不报错", FS.write_text("notes/a.txt", "改了")[0], "")
+
+        # 换行跟着原文件走：仓库是 CRLF 的，模型只给 \n，直接写会让整个文件变红
+        with open(os.path.join(tmpdir, "crlf.py"), "wb") as fh:
+            fh.write(b"a = 1\r\nb = 2\r\n")
+        FS.write_text("crlf.py", "a = 9\nb = 2\n")
+        with open(os.path.join(tmpdir, "crlf.py"), "rb") as fh:
+            raw = fh.read()
+        check("文件权限：保留原文件的 CRLF", raw == b"a = 9\r\nb = 2\r\n", repr(raw))
+
+        # 二进制不读：parquet/图片塞进上下文只会烧 token
+        with open(os.path.join(tmpdir, "x.bin"), "wb") as fh:
+            fh.write(b"\x00\x01\x02")
+        _t, e = FS.read_text("x.bin")
+        check("文件权限：二进制拒绝读取", bool(e) and "二进制" in e, e)
+
+        # 目录列表：跳过 .git 这类，且标明是不是目录
+        os.makedirs(os.path.join(tmpdir, ".git"), exist_ok=True)
+        os.makedirs(os.path.join(tmpdir, "sub"), exist_ok=True)
+        listing, e = FS.list_dir(".")
+        check("文件权限：列目录跳过 .git",
+              not e and "sub/" in listing and ".git" not in listing, e or listing[:60])
+
+        # 大小上限
+        big = "x" * (FS.MAX_WRITE + 1)
+        ok, msg = FS.write_text("big.txt", big)
+        check("文件权限：超长写入被拒", not ok and "太长" in msg, msg)
+
+        # 动作解析
+        r = A.parse_action('```json\n{"action":"fs","op":"read","path":"ttrade/agent.py"}\n```')
+        check("动作：读文件能解析", r.ok and r.describe() == "读取 ttrade/agent.py", r.error)
+        w = A.parse_action('```json\n{"action":"fs","op":"write","path":"a.txt",'
+                           '"content":"hi"}\n```')
+        check("动作：写文件能解析", w.ok and "写入 a.txt" in w.describe(), w.describe())
+        check("动作：写入缺 content 要报错",
+              not A.parse_action('```json\n{"action":"fs","op":"write","path":"a.txt"}\n```').ok, "")
+        check("动作：op 不认识要报错",
+              not A.parse_action('```json\n{"action":"fs","op":"rm","path":"a.txt"}\n```').ok, "")
+        check("动作：path 带 .. 要报错",
+              not A.parse_action('```json\n{"action":"fs","op":"read","path":"../a"}\n```').ok, "")
+        check("动作：绝对路径要报错",
+              not A.parse_action('```json\n{"action":"fs","op":"read","path":"C:/a"}\n```').ok, "")
+
+        # 提示词：不开权限时不提这件事，开了才追加那段
+        off = A.build_messages([], "问")[0]["content"]
+        on = A.build_messages([], "问", allow_fs=True)[0]["content"]
+        check("提示词：默认不提文件动作", '"action": "fs"' not in off, "")
+        check("提示词：开权限后追加文件段",
+              '"action": "fs"' in on and "升级权限" in on and len(on) > len(off), "")
+        check("提示词：文件段里写了真实根目录",
+              FS.root().replace("\\", "/") in on, FS.root())
+        import json as _json
+        import re as _re
+
+        blocks = _re.findall(r"```json\s*(\{.*?\})\s*```", on, _re.S)
+        broken = []
+        for blk in blocks:
+            try:
+                _json.loads(blk)
+            except ValueError:
+                broken.append(blk[:30])
+        check("提示词：文件段示例是合法 JSON", bool(blocks) and not broken, str(broken))
+    except Exception as exc:  # noqa: BLE001
+        check("文件读写权限", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        FS.root = old_root
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -1640,6 +1737,7 @@ def main() -> int:
     check_user_factors()
     check_user_strategies()
     check_agent_memory()
+    check_agent_fs()
     for k in ks:
         try:
             check_one(k)

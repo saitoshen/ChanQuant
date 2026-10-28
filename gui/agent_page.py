@@ -30,7 +30,7 @@ from __future__ import annotations
 import os
 import time
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (
 
 from ttrade import agent as A
 from ttrade import agent_memory as Mem
+from ttrade import factors as F
 from ttrade import library_docs as L
 from ttrade import strategy_store as SStore
 from ttrade.strategies import STRATEGIES
@@ -251,6 +252,54 @@ class ConfirmDialog(QDialog):
             lay.addWidget(box)
             return
 
+        if action.kind == "fs":
+            # 写入是整文件覆盖，看不见内容就是盲签。这里连「原来有没有这个文件」
+            # 都要标出来 —— 覆盖已有文件和新建一个文件，风险差着一个量级。
+            from ttrade import agent_fs as FS
+
+            path = p.get("path", "")
+            try:
+                old = FS.exists(path)
+            except Exception:  # noqa: BLE001
+                old = False
+            rows = [
+                ("路径", path),
+                ("动作", "覆盖已有文件" if old else "新建文件"),
+                ("大小", f"{len(p.get('content') or '')} 字符"),
+            ]
+            form = QFormLayout()
+            form.setContentsMargins(0, 6, 0, 6)
+            for k, v in rows:
+                lab = QLabel(str(v))
+                lab.setWordWrap(True)
+                form.addRow(QLabel(k), lab)
+            lay.addLayout(form)
+
+            lay.addWidget(QLabel("写入内容（整文件覆盖）"))
+            body = QPlainTextEdit(p.get("content") or "")
+            body.setReadOnly(True)
+            body.setMinimumHeight(280)
+            body.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
+            lay.addWidget(body)
+
+            warn = QLabel(
+                "确认后整个文件被替换，没有撤销。改的是程序自己的代码时，"
+                "重启之后平台可能起不来。"
+            )
+            warn.setWordWrap(True)
+            warn.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
+            lay.addWidget(warn)
+
+            self.chk_silent = QCheckBox()
+            self.chk_silent.hide()
+            box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            box.button(QDialogButtonBox.Ok).setText("写入")
+            box.button(QDialogButtonBox.Cancel).setText("取消")
+            box.accepted.connect(self.accept)
+            box.rejected.connect(self.reject)
+            lay.addWidget(box)
+            return
+
         rows = []
         if p.get("reason"):
             rows.append(("理由", str(p["reason"])))
@@ -339,6 +388,17 @@ class SettingsDialog(QDialog):
         self.chk_confirm.setChecked(cfg.confirm_trade)
         form.addRow("", self.chk_confirm)
 
+        # 权限分级。默认那档能做的事都写在提示词里（下单 / 回测 / 注册因子和策略），
+        # 这一档是额外放开磁盘 —— 等于把平台自己的代码交给模型，所以要拦一道警告。
+        self.chk_fs = QCheckBox("允许 Agent 读写 TrendDesk 目录（升级权限）")
+        self.chk_fs.setChecked(cfg.allow_fs)
+        self.chk_fs.setToolTip(
+            "关着：Agent 只能下单、回测、注册因子和策略。\n"
+            "打开：多一个文件动作，可读写 TrendDesk 根目录下的任意文件。"
+        )
+        self.chk_fs.toggled.connect(self._on_fs_toggled)
+        form.addRow("", self.chk_fs)
+
         self.lbl_mem = QLabel(f"{Mem.count()} 条")
         self.lbl_mem.setObjectName("Hint")
         btn_mem = QPushButton("清空记忆")
@@ -398,7 +458,28 @@ class SettingsDialog(QDialog):
             max_tokens=self.sp_tokens.value(),
             timeout=self.cfg.timeout,
             confirm_trade=self.chk_confirm.isChecked(),
+            allow_fs=self.chk_fs.isChecked(),
         )
+
+    def _on_fs_toggled(self, on: bool) -> None:
+        """打开升级权限前必须警告一次。关掉不拦 —— 降权永远安全。"""
+        if not on:
+            return
+        ok = QMessageBox.warning(
+            self, "升级权限",
+            "打开之后，Agent 可以读写 TrendDesk 目录下的任何文件 —— 包括程序"
+            "自己的代码、配置和历史数据。\n\n"
+            "模型改错了代码，平台可能起不来；写错了数据文件，已经补好的行情"
+            "可能被覆盖。每次写入仍会弹一次确认框，读文件不会。\n\n"
+            "确定要打开吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if ok != QMessageBox.Yes:
+            # 拒绝了就把勾去掉。`blockSignals` 防递归：`setChecked(False)` 会再
+            # 发一次 toggled，虽然那里直接 return，少绕一圈更不容易看错
+            self.chk_fs.blockSignals(True)
+            self.chk_fs.setChecked(False)
+            self.chk_fs.blockSignals(False)
 
     def _clear_memory(self) -> None:
         """清空长期记忆。对话记录不动 —— 那是两回事。"""
@@ -448,6 +529,8 @@ class AgentPage(QWidget):
     portfolio_requested = Signal(object)  # SStore.StrategyConfig
     factor_added = Signal(str)            # 新注册的因子 key，主窗口据此刷新下拉
     strategy_added = Signal(str)          # 新注册的策略 key，同上
+    factor_removed = Signal(str)          # 删掉的因子 key，主窗口重建下拉
+    strategy_removed = Signal(str)        # 删掉的策略 key，同上
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -461,6 +544,7 @@ class AgentPage(QWidget):
         self._memo_worker: MemoWorker | None = None
         self._memo_thread: QThread | None = None
         self._memo_warned = False     # 压缩失败只提示一次，别每轮都刷
+        self._fs_turns = 0            # 本轮提问已经连续自动跑了几次文件动作
         self._build()
         self._refresh_status()
         self._fill_factors()
@@ -522,6 +606,15 @@ class AgentPage(QWidget):
         btn.setObjectName("Ghost")
         btn.clicked.connect(self._ask_new_factor)
         lay.addWidget(btn)
+
+        # 删除只对自定义因子开放：内置因子写在 `factors.py` 里，不在 JSON 里，
+        # 「删掉」下次启动又会回来，让人白删一次比不让删更糟。
+        self.btn_del_factor = QPushButton("删除选中因子")
+        self.btn_del_factor.setObjectName("Ghost")
+        self.btn_del_factor.setEnabled(False)
+        self.btn_del_factor.setToolTip("只能删自定义因子；内置因子改代码才会消失。")
+        self.btn_del_factor.clicked.connect(self._delete_factor)
+        lay.addWidget(self.btn_del_factor)
         return w
 
     def _build_strategy_tab(self) -> QWidget:
@@ -549,6 +642,14 @@ class AgentPage(QWidget):
         btn_new.setObjectName("Ghost")
         btn_new.clicked.connect(self._ask_new_strategy)
         lay.addWidget(btn_new)
+
+        # 同理，内置规则策略删不掉；「我的」那些是策略库模板，也允许删
+        self.btn_del_strat = QPushButton("删除选中策略")
+        self.btn_del_strat.setObjectName("Ghost")
+        self.btn_del_strat.setEnabled(False)
+        self.btn_del_strat.setToolTip("删自定义策略或策略库模板；内置策略改代码才会消失。")
+        self.btn_del_strat.clicked.connect(self._delete_strategy)
+        lay.addWidget(self.btn_del_strat)
         return w
 
     def _build_report_tab(self) -> QWidget:
@@ -680,8 +781,12 @@ class AgentPage(QWidget):
         ok, why = self.cfg.ready()
         p = A.provider(self.cfg.provider)
         if ok:
-            self.lbl_model.setText(f"{p.label} · {self.cfg.model}")
-            self.lbl_model.setStyleSheet(f"color: {C_OK}; font-size: 11px;")
+            # 升级权限是个危险开关，状态要一直看得见，不能只在设置里藏着
+            extra = "｜升级权限" if self.cfg.allow_fs else ""
+            self.lbl_model.setText(f"{p.label} · {self.cfg.model}{extra}")
+            self.lbl_model.setStyleSheet(
+                f"color: {C_BAD if self.cfg.allow_fs else C_OK}; font-size: 11px;"
+            )
         else:
             self.lbl_model.setText(f"未配置：{why}")
             self.lbl_model.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
@@ -697,6 +802,10 @@ class AgentPage(QWidget):
             self._show_report(self.lst_report.currentItem(), None)
 
     def _show_factor(self, cur, _prev) -> None:
+        # 列表重建时 cur 会变成 None，按钮得跟着灰掉，否则会出现「空选中也能点删除」
+        self.btn_del_factor.setEnabled(
+            cur is not None and _is_user_factor(str(cur.data(Qt.UserRole)))
+        )
         if cur is None:
             return
         d = L.factor_doc(str(cur.data(Qt.UserRole)))
@@ -719,9 +828,13 @@ class AgentPage(QWidget):
         self.detail.setHtml("".join(html))
 
     def _show_strategy(self, cur, _prev) -> None:
+        kind, key = cur.data(Qt.UserRole) if cur is not None else ("", "")
+        # 内置规则策略删不掉；自定义策略和「我的」模板都可以删
+        self.btn_del_strat.setEnabled(
+            cur is not None and (kind == "cfg" or (kind == "rule" and _is_user_strategy(key)))
+        )
         if cur is None:
             return
-        kind, key = cur.data(Qt.UserRole)
         if kind == "rule":
             d = L.strategy_doc(key)
             if d is None:
@@ -833,8 +946,10 @@ class AgentPage(QWidget):
         self._append(f"<p style='margin:12px 0 2px 0'><b>助手</b></p>")
 
         self._history.append({"role": "user", "content": text})
+        self._fs_turns = 0
         msgs = A.build_messages(
-            A.trim_history(self._history[:-1]), text, memory=Mem.brief()
+            A.trim_history(self._history[:-1]), text, memory=Mem.brief(),
+            allow_fs=self.cfg.allow_fs,
         )
         self._stream_buf = ""
         self._start_worker(msgs)
@@ -894,6 +1009,10 @@ class AgentPage(QWidget):
         self._pending_report = ""
 
     def _on_thread_done(self) -> None:
+        # 旧线程收尾时不能动状态：文件动作会连着起好几轮，上一轮的 `finished`
+        # 可能比新一轮晚到，一律清空的话新线程就没人管了（按钮提前变灰）。
+        if self.sender() is not None and self.sender() is not self._thread:
+            return
         self._worker = None
         self._thread = None
         self._set_busy(False)
@@ -923,6 +1042,10 @@ class AgentPage(QWidget):
         用户下一句可能立刻就来。
         """
         if self._memo_thread is not None or not self.cfg.ready():
+            return
+        # 文件动作还在自动续跑：这段历史下一秒就要用，压掉再删会让模型丢掉
+        # 刚读到的文件内容。等这轮结束、用户下一句再压
+        if self._fs_turns:
             return
         n = len(self._history) - self.MEMO_KEEP
         if n < self.MEMO_AT - self.MEMO_KEEP:
@@ -999,6 +1122,11 @@ class AgentPage(QWidget):
     # ---------------------------------------------------------- 动作
 
     def _handle_action(self, action: A.Action) -> None:
+        # 文件动作自己管确认框（读直接做、写必须弹），所以先走掉
+        if action.kind == "fs":
+            self._run_fs_action(action)
+            return
+
         # 只有「会改本机状态」的动作才拦：下单、注册因子。回测是只读操作，为它
         # 弹一个「确认后立即执行」的框只会训练用户无脑点确认。
         #
@@ -1032,6 +1160,99 @@ class AgentPage(QWidget):
         )
         self.trade_requested.emit(action)
 
+    # ---------------------------------------------------------- 文件动作
+
+    # 一次提问里最多连续自动跑几轮文件动作。模型拿到读取结果后可能再读、再写，
+    # 不封顶的话它俩能来回刷到把 token 烧光。
+    MAX_FS_TURNS = 4
+
+    def _run_fs_action(self, action: A.Action) -> None:
+        """执行 `fs` 动作：读和列目录直接做，写必须弹确认框。"""
+        from ttrade import agent_fs as FS
+
+        p = action.payload
+        op = p.get("op", "")
+        path = p.get("path", "")
+
+        # 解析层不管权限 —— `parse_action` 不该知道界面状态。在这里拦，
+        # 并且说清楚为什么，否则用户只看到一句「已取消」，不知道是权限没开。
+        if not self.cfg.allow_fs:
+            self._append(
+                f"<p style='color:{C_BAD}'>模型想{_esc(action.describe())}，"
+                "但升级权限没打开。到左下角「设置」里勾上「允许 Agent 读写 "
+                "TrendDesk 目录」才能用。</p>"
+            )
+            self._set_state("升级权限未开启", C_BAD)
+            return
+
+        if op == "list":
+            text, err = FS.list_dir(path)
+            if err:
+                self._after_fs(f"列出 {path} 失败：{err}")
+                return
+            self._append(
+                f"<p style='color:{C_MUTED};font-size:11px'>已列出 {_esc(path)}</p>"
+                f"<pre style='font-size:11px'>{_esc(text)}</pre>"
+            )
+            self._after_fs(f"目录 {path} 的内容：\n{text}")
+            return
+
+        if op == "read":
+            text, err = FS.read_text(path)
+            if err:
+                self._after_fs(f"读取 {path} 失败：{err}")
+                return
+            # 日志里只贴前 4000 字符：整篇贴进去 QTextBrowser 会卡，而用户
+            # 真要核对时看文件本身更快。喂给模型的仍是全文。
+            shown = text if len(text) <= 4000 else text[:4000] + "\n……（对话里只显示前 4000 字符）"
+            self._append(
+                f"<p style='color:{C_MUTED};font-size:11px'>已读取 {_esc(path)}"
+                f"（{len(text)} 字符）</p>"
+                f"<pre style='white-space:pre-wrap;font-family:Consolas,monospace;"
+                f"font-size:11px'>{_esc(shown)}</pre>"
+            )
+            self._after_fs(f"文件 {path} 的全文：\n```\n{text}\n```")
+            return
+
+        # 写：内容摊开给人看。读可以不问，写不行 —— 一次覆盖就是几十行没了。
+        content = p.get("content", "")
+        dlg = ConfirmDialog(action, self)
+        if dlg.exec() != QDialog.Accepted:
+            self._append(f"<p style='color:{C_MUTED};font-size:11px'>已取消写入。</p>")
+            self._after_fs(f"用户拒绝写入 {path}，不要重试同一个改动，先问清楚要改什么。")
+            return
+        ok, msg = FS.write_text(path, content)
+        color = C_OK if ok else C_BAD
+        self._append(f"<p style='color:{color}'>{_esc(msg)}</p>")
+        self._set_state(msg[:80], color)
+        self._after_fs(("写入成功：" if ok else "写入失败：") + msg)
+
+    def _after_fs(self, result: str) -> None:
+        """把执行结果喂回模型，让它接着干。
+
+        标成 `user` 角色是协议限制：OpenAI 兼容端点里没有 `tool` 角色，塞进
+        `assistant` 又会让模型以为那是自己说过的话。
+        """
+        note = "【平台执行结果】\n" + result + "\n\n需要继续就再给一个动作块，不需要就用人话总结。"
+        self._history.append({"role": "user", "content": note})
+        if self._fs_turns >= self.MAX_FS_TURNS:
+            self._append(
+                f"<p style='color:{C_MUTED};font-size:11px'>文件动作已连续执行 "
+                f"{self._fs_turns} 轮，先停在这里。要继续就再发一句。</p>"
+            )
+            return
+        self._fs_turns += 1
+        msgs = A.build_messages(
+            A.trim_history(self._history[:-1]), note,
+            memory=Mem.brief(), allow_fs=True,
+        )
+        self._append("<p style='margin:12px 0 2px 0'><b>助手</b></p>")
+        self._stream_buf = ""
+        # 延到下一个事件循环再起线程：这里还在 `_on_done` 里，旧线程的
+        # `finished` 可能比新线程先到，直接起会让 `_on_thread_done` 把新线程
+        # 的状态抹掉（发送按钮变灰、停止键失灵）
+        QTimer.singleShot(0, lambda m=msgs: self._start_worker(m))
+
     def _register_factor(self, p: dict) -> None:
         """把模型写的因子落地：试算 → 写盘 → 注册进 FACTORS → 刷新左边的库。"""
         from ttrade import userfactors as UF
@@ -1053,8 +1274,7 @@ class AgentPage(QWidget):
             f"{_esc(msg)}</p>"
             f"<p style='color:{C_MUTED};font-size:11px'>"
             "在「策略研究」页的因子列表里能选到它。定义存在 "
-            f"<code>{_esc(UF.path())}</code>，不想留就把那一条删掉（删整个文件"
-            "就是清空全部自定义因子）。</p>"
+            f"<code>{_esc(UF.path())}</code>，不想要就在左边选中它、点「删除选中因子」。</p>"
         )
         self._set_state(f"已注册因子 {f.key}", C_OK)
         self.reload()
@@ -1082,11 +1302,102 @@ class AgentPage(QWidget):
             f"{_esc(msg)}</p>"
             f"<p style='color:{C_MUTED};font-size:11px'>"
             "在「策略研究」页的规则策略下拉里能选到它，参数可以拖滑杆调。定义存在 "
-            f"<code>{_esc(US.path())}</code>，不想留就把那一条删掉。</p>"
+            f"<code>{_esc(US.path())}</code>，不想要就在左边选中它、点「删除选中策略」。</p>"
         )
         self._set_state(f"已注册策略 {s.key}", C_OK)
         self.reload()
         self.strategy_added.emit(s.key)
+
+    # ---------------------------------------------------------- 删除自定义
+
+    def _delete_factor(self) -> None:
+        """删掉选中的自定义因子。"""
+        from ttrade import userfactors as UF
+
+        cur = self.lst_factor.currentItem()
+        if cur is None:
+            return
+        key = str(cur.data(Qt.UserRole))
+        spec = F.FACTORS.get(key)
+        if spec is None or not _is_user_factor(key):
+            return
+        n = _refs_of_factor(key)
+        warn = (
+            f"\n\n有 {n} 份配置（策略库 / 交易组合）在用这个因子，删掉之后它们"
+            "算不出来，得重新选因子。"
+            if n else ""
+        )
+        ok = QMessageBox.question(
+            self, "删除因子",
+            f"删掉自定义因子「{spec.label}」（{key}）？{warn}",
+        )
+        if ok != QMessageBox.Yes:
+            return
+        if not UF.remove(key):
+            self._append(f"<p style='color:{C_BAD}'>没删掉「{_esc(key)}」，库里找不到这一条。</p>")
+            return
+
+        self._append(
+            f"<p style='color:{C_OK}'>已删除因子「{_esc(spec.label)}」。</p>"
+            f"<p style='color:{C_MUTED};font-size:11px'>"
+            "内置因子不受影响。已经存进策略库的配置不会自动改，重新跑之前记得换因子。</p>"
+        )
+        self._set_state(f"已删除因子 {key}", C_OK)
+        self.reload()
+        self.factor_removed.emit(key)
+
+    def _delete_strategy(self) -> None:
+        """删掉选中的自定义策略，或者策略库里「我的」那条模板。"""
+        from ttrade import userstrategies as US
+
+        cur = self.lst_strat.currentItem()
+        if cur is None:
+            return
+        kind, key = cur.data(Qt.UserRole)
+        if kind == "cfg":
+            self._delete_library_item(str(key))
+            return
+        spec = STRATEGIES.get(key)
+        if spec is None or not _is_user_strategy(key):
+            return
+        n = _refs_of_strategy(key)
+        warn = (
+            f"\n\n有 {n} 份配置（策略库 / 交易组合）在用这个策略，删掉之后它们"
+            "跑不起来，得重新选策略。"
+            if n else ""
+        )
+        ok = QMessageBox.question(
+            self, "删除策略",
+            f"删掉自定义策略「{spec.label}」（{key}）？{warn}",
+        )
+        if ok != QMessageBox.Yes:
+            return
+        if not US.remove(key):
+            self._append(f"<p style='color:{C_BAD}'>没删掉「{_esc(key)}」，库里找不到这一条。</p>")
+            return
+        self._append(f"<p style='color:{C_OK}'>已删除策略「{_esc(spec.label)}」。</p>")
+        self._set_state(f"已删除策略 {key}", C_OK)
+        self.reload()
+        self.strategy_removed.emit(key)
+
+    def _delete_library_item(self, sid: str) -> None:
+        """删策略库里的模板。**组合里跑着的实例不动** —— 那是两份独立的数据。"""
+        cfg = next((c for c in SStore.load_library() if c.sid == sid), None)
+        if cfg is None:
+            return
+        ok = QMessageBox.question(
+            self, "删除策略模板",
+            f"从策略库里删掉「{cfg.title()}」？\n\n"
+            "「策略交易和组合」里已经加进去的实例不受影响，删的只是这个模板。",
+        )
+        if ok != QMessageBox.Yes:
+            return
+        if not SStore.remove_from_library(sid):
+            self._append(f"<p style='color:{C_BAD}'>没删掉，库里找不到这条。</p>")
+            return
+        self._append(f"<p style='color:{C_OK}'>已从策略库删掉「{_esc(cfg.title())}」。</p>")
+        self._set_state("已删除策略模板", C_OK)
+        self.reload()
 
     # ---------------------------------------------------------- 策略 / 研报动作
 
@@ -1239,6 +1550,29 @@ def _is_user_strategy(key: str) -> bool:
     """
     spec = STRATEGIES.get(key)
     return bool(spec and spec.code)
+
+
+def _is_user_factor(key: str) -> bool:
+    """同 `_is_user_strategy`：自定义因子的源码挂在 `FactorSpec.code` 上。"""
+    spec = F.FACTORS.get(key)
+    return bool(spec and spec.code)
+
+
+def _refs_of_factor(key: str) -> int:
+    """有多少份配置在用这个因子。删之前得让用户知道会牵动什么。"""
+    n = 0
+    for cfg in SStore.load_portfolio() + SStore.load_library():
+        if cfg.family == "factor" and key in (cfg.factor_keys or []):
+            n += 1
+    return n
+
+
+def _refs_of_strategy(key: str) -> int:
+    n = 0
+    for cfg in SStore.load_portfolio() + SStore.load_library():
+        if cfg.family == "rule" and cfg.rule_key == key:
+            n += 1
+    return n
 
 
 def _block(title: str, body: str, raw: bool = False) -> str:

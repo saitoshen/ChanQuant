@@ -54,8 +54,7 @@ from ttrade.tqfetch import (  # noqa: E402
     adj_factor_series,
     fetch_switch,
     fill_ratio,
-    realign_switch,
-    refresh_factors,
+    refresh_all,
     switch_records,
     tq_root,
     write_contracts,
@@ -107,33 +106,6 @@ def _fresh_switch(sym: str, ex: str, days: int = 1) -> bool:
     # 老数据没有时间戳（加这一列之前算的），补一个今天的，之后就走上面的日期判断
     S.meta_set(_switch_stamp(sym, ex), str(date.today()))
     return True
-
-
-def refresh_all(pairs: list[tuple[str, str]]) -> None:
-    """对齐换月点 + 按当前切换表重刷所有品种、所有已落库周期的复权因子。
-
-    两步都必须做：
-
-    1. **对齐**：天勤的每日主力映射和主连 K 线偶尔差一个交易日（LH 27 次换月里
-       20 次如此），切换日要挪到序列真正跳空的那天；
-    2. **重刷**：新 ratio 要乘到**全部历史**上，而 K 线表里的 `adj_factor` 只是
-       上次写库时的快照。不刷的话切换表补全了历史价格却没动 —— CJ、LH 曾整段
-       停在 1.0。纯本地计算，78 个品种秒级完成。
-    """
-    moved = touched = 0
-    with S.connect() as con:
-        for sym, ex in pairs:
-            periods = sorted(S.periods_of(sym, ex, con=con))
-            if not periods:
-                continue
-            k = realign_switch(con, sym, ex)
-            if k:
-                moved += k
-                print(f"  {sym}_{ex}: 校正 {k} 个换月日", flush=True)
-            for period in periods:
-                if refresh_factors(con, sym, ex, period):
-                    touched += 1
-    print(f"  换月日校正 {moved} 处，复权因子刷新 {touched} 个品种周期", flush=True)
 
 
 def main() -> int:
@@ -232,7 +204,8 @@ def main() -> int:
             if todo:
                 # 切换表刚变过：新 ratio 要乘到全部历史上，已落库的 adj_factor 过期了
                 print("  切换表有变化，重算历史复权因子", flush=True)
-                refresh_all(pairs)
+                moved, touched = refresh_all(pairs, on_msg=lambda m: print(f"  {m}", flush=True))
+                print(f"  换月日校正 {moved} 处，复权因子刷新 {touched} 个品种周期", flush=True)
 
         # ---- 主连 ----
         if args.main:

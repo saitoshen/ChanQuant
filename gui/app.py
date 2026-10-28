@@ -82,6 +82,7 @@ from ttrade import factor_metrics, factors, mlmodels, tqdata, tqlive, updater
 from ttrade import factor_strategy as fstrat
 from ttrade import strategy_store as SStore
 from gui.agent_page import AgentPage
+from gui.data_page import DataPage
 from gui.live import LiveController
 from gui.portfolio_page import PortfolioPage
 from gui.trade_page import TradePage
@@ -666,67 +667,6 @@ class MetricCard(QFrame):
         self.value_lbl.setStyleSheet(f"color: {color};")
 
 
-# ------------------------------------------------------------------ 数据更新线程
-class UpdateWorker(QObject):
-    """在后台线程里跑数据更新，避免界面假死。
-
-    下载是纯网络 IO，几十个标的顺序请求，放在主线程会让窗口完全卡住
-    （连「取消」都点不动）。这里用 QThread + 信号把进度送回主线程。
-    """
-
-    progress = Signal(int, int, str)   # done, total, message
-    done = Signal(object)              # UpdateResult
-    failed = Signal(str)
-
-    def __init__(self, market: str, data_dir: str, range_key: str,
-                 source: str = "auto", min_interval: float = 60.0,
-                 aux_contracts: bool = False, aux_options: bool = False):
-        super().__init__()
-        self.market = market
-        self.data_dir = data_dir
-        self.range_key = range_key
-        self.source = source
-        self.min_interval = min_interval
-        self.aux_contracts = aux_contracts
-        self.aux_options = aux_options
-        self._cancel = False
-
-    def cancel(self) -> None:
-        self._cancel = True
-
-    def run(self) -> None:
-        cb = lambda d, t, m: self.progress.emit(d, t, m)  # noqa: E731
-        try:
-            if self.market == "us":
-                res = updater.update_us(
-                    self.data_dir, self.range_key, progress=cb,
-                    cancel=lambda: self._cancel,
-                    source=self.source, min_interval=self.min_interval,
-                )
-            else:
-                res = updater.update_futures(
-                    self.data_dir, self.range_key, progress=cb,
-                    cancel=lambda: self._cancel,
-                )
-                if self.aux_contracts or self.aux_options:
-                    # 衍生数据放在主力连续之后跑：即使它失败，主行情也已经落盘了
-                    try:
-                        res.aux = updater.update_aux(
-                            range_key=self.range_key,
-                            want_contracts=self.aux_contracts,
-                            want_options=self.aux_options,
-                            progress=cb,
-                            cancel=lambda: self._cancel,
-                        )
-                    except Exception as exc:
-                        res.aux = None
-                        res.aux_error = str(exc)[:200]
-        except Exception as exc:
-            self.failed.emit(str(exc))
-            return
-        self.done.emit(res)
-
-
 # ------------------------------------------------------------------ 因子计算线程
 class FactorWorker(QObject):
     """在后台线程里跑因子策略。
@@ -803,8 +743,6 @@ class MainWindow(QMainWindow):
         self.fparam_widgets: dict[str, QWidget] = {}
         self.fparam_scales: dict[str, int] = {}
         self._pending = False
-        self._upd_thread: QThread | None = None
-        self._upd_worker: UpdateWorker | None = None
 
         # 因子相关状态
         self.family = FAMILY_RULE
@@ -877,7 +815,12 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.portfolio_page)
         self.agent_page = AgentPage()
         self.pages.addWidget(self.agent_page)
+        self.data_page = DataPage()
+        self.pages.addWidget(self.data_page)
         outer.addWidget(self.pages, 1)
+
+        # 数据补完之后标的池可能变了（新上市品种、刚补的分钟线），主窗口要重读
+        self.data_page.data_changed.connect(self._on_data_changed)
 
         self.agent_page.study_requested.connect(self._on_agent_study)
         self.agent_page.trade_requested.connect(self._on_agent_trade)
@@ -885,6 +828,9 @@ class MainWindow(QMainWindow):
         # Agent 注册了新因子/新策略之后，对应下拉要重建，否则库里有了却选不到
         self.agent_page.factor_added.connect(self._on_factor_added)
         self.agent_page.strategy_added.connect(self._on_strategy_added)
+        # 删掉同理：不重建的话下拉里还留着一条，选中就报「因子不存在」
+        self.agent_page.factor_removed.connect(self._on_factor_removed)
+        self.agent_page.strategy_removed.connect(self._on_strategy_removed)
 
         self.trade_page.connect_requested.connect(self._on_trade_connect)
         self.trade_page.disconnect_requested.connect(self._on_live_stop)
@@ -901,9 +847,10 @@ class MainWindow(QMainWindow):
         self.btn_page_trade = QPushButton("账户透视和交易")
         self.btn_page_port = QPushButton("策略交易和组合")
         self.btn_page_agent = QPushButton("交易Agent")
+        self.btn_page_data = QPushButton("数据管理")
         self._page_btns = (
             self.btn_page_study, self.btn_page_trade,
-            self.btn_page_port, self.btn_page_agent,
+            self.btn_page_port, self.btn_page_agent, self.btn_page_data,
         )
         for i, b in enumerate(self._page_btns):
             b.setObjectName("PageTab")
@@ -928,6 +875,23 @@ class MainWindow(QMainWindow):
             self.portfolio_page.reload()
         elif idx == 3:
             self.agent_page.reload()
+        elif idx == 4:
+            self._sync_data_page()
+
+    def _sync_data_page(self) -> None:
+        """把当前市场告诉数据页：Tushare 按市场走，天勤只有期货。
+
+        `_populate_symbols()` 在数据页创建**之前**就会调到这里（页面栈按顺序建），
+        所以必须能容忍 `data_page` 还不存在。
+        """
+        if not hasattr(self, "data_page"):
+            return
+        info = MARKETS[self.market]
+        self.data_page.set_market(self.market, info["label"], info["dir"])
+
+    def _on_data_changed(self, market: str) -> None:
+        """补完数据：标的池、分钟线覆盖都可能变了，重读一遍。"""
+        self._reload_store(market)
 
     # ---------------------------------------------------------- 交易Agent
 
@@ -1353,8 +1317,6 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(card)
 
-        lay.addWidget(self._build_update_card())
-
         # 状态
         self.lbl_status = QLabel("就绪")
         self.lbl_status.setObjectName("Hint")
@@ -1383,97 +1345,6 @@ class MainWindow(QMainWindow):
         lbl = QLabel(text)
         lbl.setObjectName("SectionTitle")
         return lbl
-
-    def _build_update_card(self) -> QWidget:
-        """数据更新面板：区间 + 数据源 + 限速 + 更新按钮 + 进度条。"""
-        card = QFrame()
-        card.setObjectName("Card")
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(12, 10, 12, 10)
-        lay.setSpacing(7)
-
-        lay.addWidget(self._section("数据更新"))
-
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        self.cb_upd_range = QComboBox()
-        for key, label, _days in updater.RANGES:
-            self.cb_upd_range.addItem(label, key)
-        self.cb_upd_range.setToolTip(
-            "只补这一段，不重下 20 年。\n"
-            "「全部 20 年」会对每个标的整段重下，耗时较长。"
-        )
-        row.addWidget(self.cb_upd_range, 1)
-
-        self.btn_update = QPushButton("更新")
-        self.btn_update.setObjectName("Ghost")
-        self.btn_update.setFixedWidth(58)
-        self.btn_update.clicked.connect(self._on_update_clicked)
-        row.addWidget(self.btn_update)
-        lay.addLayout(row)
-
-        self.cb_upd_source = QComboBox()
-        for key, label in updater.SOURCE_LABELS.items():
-            self.cb_upd_source.addItem(label, key)
-        self.cb_upd_source.setToolTip(
-            "仅对美股生效。东财给的是后复权价，与本地历史同口径；\n"
-            "Tushare us_daily 是未复权且额度极紧，只作兜底。"
-        )
-        lay.addWidget(self.cb_upd_source)
-
-        # 期货只有一个数据源，用一行静态说明顶替下拉框。
-        # 下拉框里那些「东方财富」「自动」选项对期货毫无意义，
-        # 摆在那里只会让人以为可以选，所以直接不显示。
-        self.lbl_upd_src = QLabel("数据源：Tushare（日线与复权因子同步更新）")
-        self.lbl_upd_src.setObjectName("Hint")
-        self.lbl_upd_src.setWordWrap(True)
-        self.lbl_upd_src.setVisible(False)
-        lay.addWidget(self.lbl_upd_src)
-
-        self.cb_upd_rate = QComboBox()
-        for sec, label in [(60.0, "Tushare 限速：60 秒/次"),
-                           (30.0, "Tushare 限速：30 秒/次"),
-                           (10.0, "Tushare 限速：10 秒/次"),
-                           (0.0, "Tushare 限速：不限")]:
-            self.cb_upd_rate.addItem(label, sec)
-        self.cb_upd_rate.setToolTip("只约束 Tushare 美股接口；东财与期货不受影响")
-        lay.addWidget(self.cb_upd_rate)
-
-        # 合约 / 期权衍生数据。这两项要按「每个交易日一次全市场横截面」取数，
-        # 比主力连续的增量更新慢一个量级，所以做成显式勾选，默认不跟。
-        self.lbl_upd_aux = QLabel("衍生数据（展期 / 期权因子用）")
-        self.lbl_upd_aux.setObjectName("Hint")
-        lay.addWidget(self.lbl_upd_aux)
-
-        self.chk_upd_contracts = QCheckBox("一并更新真实合约（期限结构）")
-        self.chk_upd_contracts.setToolTip(
-            "下载全部真实合约的日线，生成近/次近/第三近合约的期限结构。\n"
-            "展期收益率、展期年化、展期曲率、展期变化依赖它。\n"
-            "每个交易日一次全市场请求，比主力连续慢很多（20 年全量约 40 分钟）。"
-        )
-        lay.addWidget(self.chk_upd_contracts)
-
-        self.chk_upd_options = QCheckBox("一并更新期权（隐含波动率）")
-        self.chk_upd_options.setToolTip(
-            "下载商品期权日线，反解平值 IV、偏度、期限结构与看跌看涨持仓比。\n"
-            "只保留聚合结果（原始期权明细约 1.5GB，默认不落盘）。\n"
-            "商品期权 2017 年才上市，更早的日期会自动跳过。"
-        )
-        lay.addWidget(self.chk_upd_options)
-
-        self.prog_update = QProgressBar()
-        self.prog_update.setTextVisible(False)
-        self.prog_update.setFixedHeight(6)
-        self.prog_update.setVisible(False)
-        lay.addWidget(self.prog_update)
-
-        self.lbl_upd = QLabel("")
-        self.lbl_upd.setObjectName("Hint")
-        self.lbl_upd.setWordWrap(True)
-        self.lbl_upd.setVisible(False)
-        lay.addWidget(self.lbl_upd)
-
-        return card
 
     def _build_chart_tab(self) -> QWidget:
         w = QWidget()
@@ -1684,7 +1555,7 @@ class MainWindow(QMainWindow):
         self._sync_period_controls()
         self._on_strategy_changed()
         self._on_family_changed()
-        self._sync_update_controls()
+        self._sync_data_page()
         self._schedule(immediate=True)
 
     def _fill_single_combo(self) -> None:
@@ -1732,6 +1603,18 @@ class MainWindow(QMainWindow):
             f = self.cb_family.findData("rule")
             if f >= 0:
                 self.cb_family.setCurrentIndex(f)
+
+    def _on_factor_removed(self, _key: str) -> None:
+        """删掉自定义因子：两个因子控件都要重建。
+
+        不选中任何东西 —— 删完再跳到别的因子上，会让人以为「删的是那个」。
+        当前选中的正好是被删的那个时，重建后自然落到第一项。
+        """
+        self._fill_single_combo()
+        self._fill_multi_table()
+
+    def _on_strategy_removed(self, _key: str) -> None:
+        self._fill_strategy_combo()
 
     def _multi_state(self) -> dict:
         """当前多因子表格里每个因子的 (参与合成, 反转)。重建时用它保住勾选。"""
@@ -1831,7 +1714,7 @@ class MainWindow(QMainWindow):
         )
         self.lbl_sub.setText(info["sub"])
         self.lbl_legend.setText(info["legend"])
-        self._sync_update_controls()
+        self._sync_data_page()
         self._fill_symbols()
         self._sync_period_controls()
         if not self.store.items:
@@ -1893,108 +1776,6 @@ class MainWindow(QMainWindow):
         # 每个品种下载到的周期不一样，换品种必须重标一次下拉项
         self._sync_period_hint()
         self._schedule()
-
-    # ---------------------------------------------------------- 数据更新
-    def _sync_update_controls(self) -> None:
-        """美股才需要选数据源和限速；期货固定 Tushare、不限速，换成一行说明。
-
-        合约 / 期权的「一并更新」只对期货有意义（美股没有这两个数据集），
-        所以在美股下整块隐藏，避免摆一个点了没反应的开关。
-        """
-        if not hasattr(self, "cb_upd_source"):
-            return
-        is_us = self.market == "us"
-        self.cb_upd_source.setVisible(is_us)
-        self.cb_upd_rate.setVisible(is_us)
-        self.lbl_upd_src.setVisible(not is_us)
-        for w in (self.lbl_upd_aux, self.chk_upd_contracts, self.chk_upd_options):
-            w.setVisible(not is_us)
-
-    def _on_update_clicked(self) -> None:
-        # 正在更新时，这个按钮变成「取消」
-        if self._upd_thread is not None:
-            if self._upd_worker is not None:
-                self._upd_worker.cancel()
-            self.btn_update.setEnabled(False)
-            self.btn_update.setText("取消中")
-            self.lbl_upd.setText("正在取消，等待当前请求结束…")
-            return
-
-        mk = self.market
-        key = self.cb_upd_range.currentData()
-        # 期货没有第二个数据源，直接钉死 Tushare
-        source = (
-            self.cb_upd_source.currentData() if mk == "us" else updater.SOURCE_TUSHARE
-        )
-        rate = float(self.cb_upd_rate.currentData() or 0.0)
-        aux_c = bool(mk == "cn" and self.chk_upd_contracts.isChecked())
-        aux_o = bool(mk == "cn" and self.chk_upd_options.isChecked())
-
-        self._upd_worker = UpdateWorker(
-            mk, MARKETS[mk]["dir"], key, source, rate,
-            aux_contracts=aux_c, aux_options=aux_o,
-        )
-        self._upd_thread = QThread(self)
-        self._upd_worker.moveToThread(self._upd_thread)
-        self._upd_thread.started.connect(self._upd_worker.run)
-        self._upd_worker.progress.connect(self._on_update_progress)
-        self._upd_worker.done.connect(self._on_update_done)
-        self._upd_worker.failed.connect(self._on_update_failed)
-
-        self.prog_update.setRange(0, 0)      # 先转圈，等第一个进度再定总量
-        self.prog_update.setVisible(True)
-        self.lbl_upd.setVisible(True)
-        self.lbl_upd.setText(f"准备更新{MARKETS[mk]['label']}…")
-        self.btn_update.setText("取消")
-        self.btn_update.setEnabled(True)
-        self._upd_thread.start()
-
-    def _on_update_progress(self, done: int, total: int, msg: str) -> None:
-        if total > 0:
-            self.prog_update.setRange(0, total)
-            self.prog_update.setValue(done)
-        self.lbl_upd.setText(msg)
-
-    def _on_update_done(self, res) -> None:
-        self._finish_update_thread()
-        self.lbl_upd.setVisible(True)
-        text = res.summary()
-        aux = getattr(res, "aux", None)
-        if aux is not None:
-            text += f"\n衍生数据：{aux.summary()}"
-        err = getattr(res, "aux_error", "")
-        if err:
-            text += f"\n衍生数据更新失败：{err}"
-        self.lbl_upd.setText(text)
-
-        self._reload_store(res.market)
-
-        problems = list(res.errors) + list(res.notes)
-        if problems or err:
-            more = f"\n… 另有 {len(problems) - 6} 条" if len(problems) > 6 else ""
-            QMessageBox.information(
-                self, "数据更新",
-                text + ("\n\n" + "\n".join(problems[:6]) + more if problems else ""),
-            )
-
-    def _on_update_failed(self, message: str) -> None:
-        self._finish_update_thread()
-        self.lbl_upd.setVisible(True)
-        self.lbl_upd.setText("更新失败")
-        QMessageBox.warning(self, "数据更新失败", message)
-
-    def _finish_update_thread(self) -> None:
-        if self._upd_thread is not None:
-            self._upd_thread.quit()
-            self._upd_thread.wait(5000)
-            self._upd_thread.deleteLater()
-            self._upd_thread = None
-        if self._upd_worker is not None:
-            self._upd_worker.deleteLater()
-            self._upd_worker = None
-        self.btn_update.setText("更新")
-        self.btn_update.setEnabled(True)
-        self.prog_update.setVisible(False)
 
     def _reload_store(self, market: str) -> None:
         """重建该市场的 DataStore（清掉 DataFrame 缓存），保留当前选中的标的。"""
@@ -3743,11 +3524,7 @@ class MainWindow(QMainWindow):
         self._closing = True
         if self._k_redraw_timer.isActive():
             self._k_redraw_timer.stop()
-        if self._upd_worker is not None:
-            self._upd_worker.cancel()
-        if self._upd_thread is not None:
-            self._upd_thread.quit()
-            self._upd_thread.wait(3000)
+        self.data_page.shutdown()
         self._cancel_factor_worker()
         # 组合页每条账户连接一个 QThread，窗口关掉时线程还在跑 wait_update
         # 会让解释器退出时崩在 TqApi 上。这里等它们真的停下来再放行。

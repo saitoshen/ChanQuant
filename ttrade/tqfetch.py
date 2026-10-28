@@ -727,7 +727,8 @@ def _tq_product_of(sym: str, ex: str) -> str:
 
 
 def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
-                    on_row=None, max_parallel: int = 8) -> dict[str, int]:
+                    on_row=None, max_parallel: int = 8,
+                    cancel=None) -> dict[str, int]:
     """批量下载主连并写库（原始价 + adj_factor，复权在读取时做）。
 
     一个品种十年 5m 串行要几分钟，78 个品种两个周期就是几小时。这里走 8 路并发，
@@ -797,10 +798,77 @@ def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
     # 头段先跑：补历史缺口。这一段不回调 —— 同一个品种稍后还会跑尾段，
     # 回调两次会让调用方的「第几个品种」计数翻倍。
     for i in range(0, len(head), chunk):
+        if cancel is not None and cancel():
+            return out
         run(head[i : i + chunk], f"MAIN_{period}_head", report=False)
     for i in range(0, len(tail), chunk):
+        # 只在批次之间检查：一批 8 个品种正在飞，掐断它们只会留下一堆半截文件
+        if cancel is not None and cancel():
+            break
         run(tail[i : i + chunk], f"MAIN_{period}", report=True)
     return out
+
+
+def switch_stamp(sym: str, ex: str) -> str:
+    """切换表「上次算过」的元数据键。"""
+    return f"switch_at::{sym}_{ex}"
+
+
+def ensure_switch(api, pairs: list[tuple[str, str]], on_row=None) -> int:
+    """给**还没有切换表**的品种补一张。返回补了几个。
+
+    界面第一次补分钟线时必须先走这一步：`write_main_many` 用切换表算复权因子，
+    表是空的，`adj_factor` 就会全是 1.0，价格看起来正常、复权全错。
+    已有的不重算 —— 重算一个品种要请求几十次合约日线，78 个品种半小时。
+    """
+    todo = [(s_, e_) for s_, e_ in pairs if len(S.load_switch(s_, e_)) == 0]
+    if not todo:
+        return 0
+    maps = fetch_switch(api, todo)
+    n = 0
+    for sym, ex in todo:
+        key = f"{sym}_{ex}"
+        df = maps.get(key)
+        if df is None or len(df) < 2:
+            continue
+        rec = fill_ratio(api, switch_records(df, sym, ex), {}, "1d")
+        with S.connect() as con:
+            S.upsert_switch(con, sym, ex, rec)
+        S.meta_set(switch_stamp(sym, ex), str(date.today()))
+        n += 1
+        if on_row is not None:
+            on_row(key, len(rec))
+    return n
+
+
+def refresh_all(pairs: list[tuple[str, str]], on_msg=None) -> tuple[int, int]:
+    """对齐换月点 + 按当前切换表重刷所有品种、所有已落库周期的复权因子。
+
+    两步都必须做：
+
+    1. **对齐**：天勤的每日主力映射和主连 K 线偶尔差一个交易日（LH 27 次换月里
+       20 次如此），切换日要挪到序列真正跳空的那天；
+    2. **重刷**：新 ratio 要乘到**全部历史**上，而 K 线表里的 `adj_factor` 只是
+       上次写库时的快照。不刷的话切换表补全了历史价格却没动 —— CJ、LH 曾整段
+       停在 1.0。
+
+    纯本地计算，78 个品种秒级完成。返回 (校正的换月日数, 刷新的品种周期数)。
+    """
+    moved = touched = 0
+    with S.connect() as con:
+        for sym, ex in pairs:
+            periods = sorted(S.periods_of(sym, ex, con=con))
+            if not periods:
+                continue
+            k = realign_switch(con, sym, ex)
+            if k:
+                moved += k
+                if on_msg is not None:
+                    on_msg(f"{sym}_{ex}: 校正 {k} 个换月日")
+            for period in periods:
+                if refresh_factors(con, sym, ex, period):
+                    touched += 1
+    return moved, touched
 
 
 def update_main(symbol: str, exchange: str, period: str = "5m",
