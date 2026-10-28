@@ -89,20 +89,36 @@ class ChatWorker(QObject):
         self.cfg = cfg
         self.messages = messages
         self._stop = False
+        self._client: A.LLMClient | None = None
+        # 自己攒一份：被中途掐断时 `chat()` 会抛异常、拿不到返回值，但已经吐出来
+        # 的那部分得留住，否则「停止」会把答到一半的内容整段丢掉
+        self._buf: list[str] = []
 
     def stop(self) -> None:
         self._stop = True
+        # 只置标志不够：`chat()` 每两行才检查一次，模型思考时可能几十秒不推字节，
+        # 线程就卡在 socket 读上。关掉 response 让读立刻抛错。
+        if self._client is not None:
+            self._client.abort()
+
+    def _on_piece(self, piece: str) -> None:
+        self._buf.append(piece)
+        self.delta.emit(piece)
 
     def run(self) -> None:
-        client = A.LLMClient(self.cfg)
+        self._client = A.LLMClient(self.cfg)
         try:
-            text = client.chat(
+            text = self._client.chat(
                 self.messages,
-                on_delta=self.delta.emit,
+                on_delta=self._on_piece,
                 should_stop=lambda: self._stop,
             )
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
+            if self._stop:
+                # 主动停止时中断读必然抛异常，这不是错误 —— 把已收到的半截当结果
+                self.done.emit("".join(self._buf))
+            else:
+                self.failed.emit(str(exc))
             return
         self.done.emit(text)
 
@@ -677,6 +693,11 @@ class AgentPage(QWidget):
         worker.delta.connect(self._on_delta)
         worker.done.connect(self._on_done)
         worker.failed.connect(self._on_failed)
+        # **必须显式 quit**。`started` 连的是一个普通函数，它返回后线程的事件循环
+        # 还在跑，`finished` 永远不会发 —— 表现就是「发送按钮点一次就灰掉，停止也
+        # 停不下来」，因为 `_on_thread_done` 从来没被调用过。
+        worker.done.connect(thread.quit)
+        worker.failed.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._on_thread_done)
@@ -719,14 +740,16 @@ class AgentPage(QWidget):
         self._worker = None
         self._thread = None
         self._set_busy(False)
-        # 只在「正在生成」时改状态：出错和已提交的回执不能在这里被覆盖掉
-        if self.lbl_state.text() == "正在生成…":
+        # 只在「进行中」的状态上改：出错和「已提交」的回执不能在这里被覆盖掉。
+        # 「正在停止…」也要收尾 —— 漏了它，点过停止的状态栏就永远停在那句话上。
+        if self.lbl_state.text() in ("正在生成…", "正在停止…"):
             self._set_state("就绪", C_MUTED)
 
     def _stop(self) -> None:
-        if self._worker is not None:
-            self._worker.stop()
-            self._set_state("正在停止…", C_MUTED)
+        if self._worker is None:
+            return
+        self._worker.stop()
+        self._set_state("正在停止…", C_MUTED)
 
     def _set_busy(self, on: bool) -> None:
         self._busy = on

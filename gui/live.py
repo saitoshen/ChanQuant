@@ -160,6 +160,10 @@ class LiveController(QObject):
         worker.log.connect(self.log)
         worker.failed.connect(self.failed)
         worker.order_sent.connect(self.order_sent)
+        # `run()` 有两种提前返回：连接失败、行情中断。两种都不会回到 while 循环，
+        # 而线程的事件循环还开着 —— 不显式 quit 的话 `finished` 永不发，
+        # `stopped` 也就永远不发，界面会一直以为还连着。
+        worker.failed.connect(thread.quit)
         # worker 循环结束就退线程，再让 Qt 回收
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)

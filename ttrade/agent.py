@@ -191,6 +191,24 @@ class LLMClient:
     def __init__(self, cfg: AgentConfig) -> None:
         self.cfg = cfg
         self.last_error = ""
+        self._resp = None
+
+    def abort(self) -> None:
+        """从**另一个线程**掐断正在进行的流式读。
+
+        只靠 `should_stop` 不够：那个标志在 `iter_lines()` 每两行之间才检查一次，
+        而模型思考时可能几十秒不推任何字节，此时线程阻塞在 socket 读上，标志形同
+        虚设。关掉 response 会让读立刻抛异常，线程才能退出。
+
+        `close()` 是幂等的，和 `with r:` 的退出顺序无关；异常一律吞掉 —— 这里是
+        收尾路径，抛出去只会让「停止」变成一个错误弹窗。
+        """
+        r, self._resp = self._resp, None
+        if r is not None:
+            try:
+                r.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---- 请求头 ----
 
@@ -254,40 +272,47 @@ class LLMClient:
         except requests.RequestException as exc:
             raise AgentError(f"连不上 {url}：{exc}") from exc
 
-        with r:
-            if r.status_code >= 400:
-                raise AgentError(self._http_error(r))
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            if "event-stream" not in ctype:
-                # 有的网关会忽略 stream=true，直接回一个完整 JSON
-                return self._read_plain(r)
+        # 记下来，好让 `abort()` 能从界面线程掐断阻塞中的读
+        self._resp = r
+        try:
+            with r:
+                if r.status_code >= 400:
+                    raise AgentError(self._http_error(r))
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                if "event-stream" not in ctype:
+                    # 有的网关会忽略 stream=true，直接回一个完整 JSON
+                    return self._read_plain(r)
 
-            parts: list[str] = []
-            for raw in r.iter_lines(decode_unicode=False):
-                if should_stop is not None and should_stop():
-                    break
-                if not raw:
-                    continue
-                line = raw.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data)
-                except ValueError:
-                    continue
-                if "error" in obj:
-                    raise AgentError(str(obj["error"])[:300])
-                for ch in obj.get("choices") or []:
-                    delta = ch.get("delta") or {}
-                    piece = delta.get("content") or ""
-                    if piece:
-                        parts.append(piece)
-                        if on_delta is not None:
-                            on_delta(piece)
-            return "".join(parts)
+                parts: list[str] = []
+                for raw in r.iter_lines(decode_unicode=False):
+                    if should_stop is not None and should_stop():
+                        break
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except ValueError:
+                        continue
+                    if "error" in obj:
+                        raise AgentError(str(obj["error"])[:300])
+                    for ch in obj.get("choices") or []:
+                        delta = ch.get("delta") or {}
+                        piece = delta.get("content") or ""
+                        if piece:
+                            parts.append(piece)
+                            if on_delta is not None:
+                                on_delta(piece)
+                return "".join(parts)
+        finally:
+            # 正常结束、出错、被 abort 掐断，三种情况都要清掉，否则下一次 chat()
+            # 的 abort() 会去关一个已经死掉的 response
+            self._resp = None
 
     def _read_plain(self, r: requests.Response) -> str:
         try:

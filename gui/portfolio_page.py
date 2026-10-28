@@ -184,6 +184,10 @@ class PortfolioController(QObject):
         worker.snapshot.connect(self.snapshot)
         worker.log.connect(self.log)
         worker.failed.connect(self.failed)
+        # 连接失败时 `run()` 直接 return，不会再进 while 循环。线程的事件循环还
+        # 开着，不显式 quit 就永远不发 `finished` —— `_workers` 里会残留一条
+        # 「正在跑」的记录，「启动全部」按钮的逻辑就跟着错。
+        worker.failed.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(lambda k=key: self._on_done(k))

@@ -1124,6 +1124,7 @@ def check_agent_stream() -> None:
     """
     import json as _json
     import threading
+    import time
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
     from ttrade import agent as A
@@ -1154,6 +1155,25 @@ def check_agent_stream() -> None:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+
+            if mode["v"] == "slow":
+                # 推一段就长时间不出声：模拟模型思考时 socket 上没有字节，
+                # `should_stop` 检查不到，只有 abort() 关掉 response 才停得下来
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                chunk = {"choices": [{"delta": {"content": "半"}}]}
+                self.wfile.write(
+                    f"data: {_json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+                )
+                self.wfile.flush()
+                time.sleep(3.0)
+                try:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionAbortedError):
+                    pass
                 return
 
             self.send_response(200)
@@ -1204,10 +1224,108 @@ def check_agent_stream() -> None:
             return seen["n"] > 1
 
         check("流式：能中途停止", client.chat(msgs, should_stop=stop) == "螺纹", "停不下来")
+
+        # abort() 是另一条路：模型思考时 socket 上几十秒没有字节，`should_stop`
+        # 根本没机会被检查，线程就卡在 iter_lines 的阻塞读上。关掉 response 才能
+        # 让它立刻抛出来 —— 否则界面上的「停止」要等 HTTP 超时（默认 120 秒）。
+        mode["v"] = "slow"
+        box: dict = {}
+
+        def run_chat() -> None:
+            try:
+                box["text"] = client.chat(msgs)
+            except Exception as exc:  # noqa: BLE001
+                box["err"] = exc
+
+        th = threading.Thread(target=run_chat, daemon=True)
+        th.start()
+        time.sleep(0.4)          # 等它进到阻塞读
+        client.abort()
+        th.join(1.5)             # 服务器要 3 秒后才推 DONE：1.5 秒内退出就说明是 abort 生效
+        check("流式：abort 能掐断阻塞中的读", not th.is_alive(),
+              f"1.5 秒后还卡着（服务器 3 秒后才收尾）")
+        # 掐断后可能抛异常，也可能读到空行后正常返回已收到的部分 —— 两种都算对，
+        # 关键是不能把「半截」变成「整段」
+        check("流式：abort 后保留已收到的部分",
+              box.get("text") == "半" or "err" in box, repr(box))
+        check("流式：abort 之后 response 已清空", client._resp is None,
+              repr(client._resp))
     except Exception as exc:  # noqa: BLE001
         check("流式解析", False, f"{type(exc).__name__}: {exc}")
     finally:
         srv.shutdown()
+
+
+def check_agent_thread() -> None:
+    """Agent 页的线程必须能退出，否则「发送按钮点一次就灰掉」。
+
+    `thread.started` 连的是普通函数（`worker.run`），它返回后线程的事件循环还在
+    跑 —— 不显式 `quit()` 就永远不发 `finished`，`_on_thread_done` 也就永远不跑，
+    `_busy` 卡在 True。用户看到的是：第一轮答完，输入框里还能打字，但发送按钮
+    一直灰着；点「停止」也没用，因为停止同样靠 `_on_thread_done` 收尾。
+    """
+    import time
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from PySide6.QtWidgets import QApplication
+
+        from ttrade import agent as A
+        from gui import agent_page as G
+    except Exception as exc:  # noqa: BLE001
+        skip("Agent 线程", f"无法导入：{exc}")
+        return
+
+    app = QApplication.instance() or QApplication([])
+    calls: list[int] = []
+
+    def fake_chat(self, messages, on_delta=None, should_stop=None):
+        calls.append(1)
+        if on_delta is not None:
+            on_delta("答")
+        return "答"
+
+    old = A.LLMClient.chat
+    A.LLMClient.chat = fake_chat
+    pg = None
+    try:
+        pg = G.AgentPage()
+        pg.cfg.api_key = "k"
+        pg.cfg.provider = "deepseek"
+        pg.cfg.base_url = "https://api.deepseek.com/v1"
+        pg.cfg.model = "deepseek-chat"
+        pg.cfg.confirm_trade = False
+
+        def pump(n: int = 80) -> None:
+            for _ in range(n):
+                app.processEvents()
+                time.sleep(0.01)
+
+        pg.ed_input.setPlainText("一")
+        pg._send()
+        pump()
+        check("Agent 线程：第一轮结束后发送按钮恢复",
+              not pg._busy and pg.btn_send.isEnabled(),
+              f"busy={pg._busy} enabled={pg.btn_send.isEnabled()}")
+        check("Agent 线程：第一轮结束状态回到就绪",
+              pg.lbl_state.text() == "就绪", repr(pg.lbl_state.text()))
+
+        pg.ed_input.setPlainText("二")
+        pg._send()
+        pump()
+        check("Agent 线程：能连发第二轮", len(calls) == 2, f"{len(calls)} 次")
+        check("Agent 线程：第二轮后仍然就绪",
+              not pg._busy and pg.lbl_state.text() == "就绪",
+              f"busy={pg._busy} state={pg.lbl_state.text()!r}")
+    except Exception as exc:  # noqa: BLE001
+        check("Agent 线程", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        A.LLMClient.chat = old
+        if pg is not None:
+            try:
+                pg.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def main() -> int:
@@ -1230,6 +1348,7 @@ def main() -> int:
     check_library_docs()
     check_agent()
     check_agent_stream()
+    check_agent_thread()
     for k in ks:
         try:
             check_one(k)
