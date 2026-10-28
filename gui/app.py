@@ -882,6 +882,8 @@ class MainWindow(QMainWindow):
         self.agent_page.study_requested.connect(self._on_agent_study)
         self.agent_page.trade_requested.connect(self._on_agent_trade)
         self.agent_page.portfolio_requested.connect(self._on_agent_portfolio)
+        # Agent 注册了新因子之后，因子下拉要重建，否则库里有了却选不到
+        self.agent_page.factor_added.connect(self._on_factor_added)
 
         self.trade_page.connect_requested.connect(self._on_trade_connect)
         self.trade_page.disconnect_requested.connect(self._on_live_stop)
@@ -1193,17 +1195,7 @@ class MainWindow(QMainWindow):
         sf.addWidget(self.lbl_fsel)
 
         self.cb_fsingle = QComboBox()
-        for cat in factors.CATEGORIES:
-            keys = [k for k, s in factors.FACTORS.items() if s.category == cat]
-            if not keys:
-                continue
-            for i, k in enumerate(keys):
-                spec = factors.FACTORS[k]
-                text = f"{cat} · {spec.label}" if i == 0 else f"　　{spec.label}"
-                self.cb_fsingle.addItem(text, k)
-        idx = self.cb_fsingle.findData(factors.DEFAULT_SINGLE)
-        if idx >= 0:
-            self.cb_fsingle.setCurrentIndex(idx)
+        self._fill_single_combo()
 
         # 单因子模式：下拉框 + 反转勾选框同一行。
         # 反转状态不在这个勾选框里单独存，而是回写到下面表格的「反」列 ——
@@ -1243,26 +1235,7 @@ class MainWindow(QMainWindow):
         hh.setFixedHeight(22)
         self.tbl_fmulti.setColumnWidth(1, 34)
         self.tbl_fmulti.setColumnWidth(2, 34)
-        for cat in factors.CATEGORIES:
-            for k, spec in factors.FACTORS.items():
-                if spec.category != cat:
-                    continue
-                r = self.tbl_fmulti.rowCount()
-                self.tbl_fmulti.insertRow(r)
-                name = QTableWidgetItem(f"{cat} · {spec.label}")
-                name.setData(Qt.UserRole, k)
-                name.setToolTip(spec.desc)
-                self.tbl_fmulti.setItem(r, 0, name)
-                for col, tip, default in (
-                    (1, "勾上表示参与合成", k in factors.DEFAULT_MULTI),
-                    (2, "勾上表示这个因子反向使用（取负号）", False),
-                ):
-                    cell = QTableWidgetItem("")
-                    cell.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
-                    cell.setCheckState(Qt.Checked if default else Qt.Unchecked)
-                    cell.setTextAlignment(Qt.AlignCenter)
-                    cell.setToolTip(tip)
-                    self.tbl_fmulti.setItem(r, col, cell)
+        self._fill_multi_table()
         sf.addWidget(self.tbl_fmulti)
 
         sel_row = QWidget()
@@ -1713,6 +1686,80 @@ class MainWindow(QMainWindow):
         self._on_family_changed()
         self._sync_update_controls()
         self._schedule(immediate=True)
+
+    def _fill_single_combo(self) -> None:
+        """重建单因子下拉。注册了新因子之后要重来一遍，否则选不到它。"""
+        keep = self.cb_fsingle.currentData()
+        self.cb_fsingle.blockSignals(True)
+        self.cb_fsingle.clear()
+        for cat in factors.CATEGORIES:
+            keys = [k for k, s in factors.FACTORS.items() if s.category == cat]
+            if not keys:
+                continue
+            for i, k in enumerate(keys):
+                spec = factors.FACTORS[k]
+                text = f"{cat} · {spec.label}" if i == 0 else f"　　{spec.label}"
+                self.cb_fsingle.addItem(text, k)
+        target = keep if self.cb_fsingle.findData(keep) >= 0 else factors.DEFAULT_SINGLE
+        idx = self.cb_fsingle.findData(target)
+        if idx >= 0:
+            self.cb_fsingle.setCurrentIndex(idx)
+        self.cb_fsingle.blockSignals(False)
+
+    def _multi_state(self) -> dict:
+        """当前多因子表格里每个因子的 (参与合成, 反转)。重建时用它保住勾选。"""
+        out: dict[str, tuple[bool, bool]] = {}
+        for r in range(self.tbl_fmulti.rowCount()):
+            item = self.tbl_fmulti.item(r, 0)
+            if item is None:
+                continue
+            k = item.data(Qt.UserRole)
+            use = self.tbl_fmulti.item(r, 1)
+            rev = self.tbl_fmulti.item(r, 2)
+            out[k] = (
+                bool(use is not None and use.checkState() == Qt.Checked),
+                bool(rev is not None and rev.checkState() == Qt.Checked),
+            )
+        return out
+
+    def _fill_multi_table(self) -> None:
+        """重建多因子表格。保留用户已勾的「用 / 反」—— 加一个因子不该把之前
+        的勾选全清掉。"""
+        picked = self._multi_state() if self.tbl_fmulti.rowCount() else {}
+        self.tbl_fmulti.setRowCount(0)
+        for cat in factors.CATEGORIES:
+            for k, spec in factors.FACTORS.items():
+                if spec.category != cat:
+                    continue
+                r = self.tbl_fmulti.rowCount()
+                self.tbl_fmulti.insertRow(r)
+                name = QTableWidgetItem(f"{cat} · {spec.label}")
+                name.setData(Qt.UserRole, k)
+                name.setToolTip(spec.desc)
+                self.tbl_fmulti.setItem(r, 0, name)
+                use_on, rev_on = picked.get(k, (k in factors.DEFAULT_MULTI, False))
+                for col, tip, default in (
+                    (1, "勾上表示参与合成", use_on),
+                    (2, "勾上表示这个因子反向使用（取负号）", rev_on),
+                ):
+                    cell = QTableWidgetItem("")
+                    cell.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                    cell.setCheckState(Qt.Checked if default else Qt.Unchecked)
+                    cell.setTextAlignment(Qt.AlignCenter)
+                    cell.setToolTip(tip)
+                    self.tbl_fmulti.setItem(r, col, cell)
+
+    def _on_factor_added(self, key: str) -> None:
+        """Agent 注册了新因子：两个因子控件都得重建，然后选中它。"""
+        self._fill_single_combo()
+        self._fill_multi_table()
+        idx = self.cb_fsingle.findData(key)
+        if idx >= 0:
+            self.cb_fsingle.setCurrentIndex(idx)
+            self.cb_family.setCurrentIndex(self.cb_family.findData("factor"))
+            self.cb_fmode.setCurrentIndex(self.cb_fmode.findData("single"))
+        # 不再往对话流里补一句「已加入因子库」：`_register_factor` 刚说过一遍，
+        # 同一个动作回两行只会让人以为注册了两次。
 
     def _fill_symbols(self) -> None:
         self.cb_symbol.blockSignals(True)

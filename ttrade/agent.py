@@ -360,7 +360,8 @@ SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务�
 ## 平台里有什么
 
 - 数据：国内商品期货 78 个品种（日线 20 年，5 分钟/1 小时 10 年，天勤主连 + 真实合约），美股 34 只（东财后复权）
-- 47 个因子：趋势/反转/波动/量能/形态/展期/期权七类，每个都有数学公式与实现代码
+- 47 个内置因子：趋势/反转/波动/量能/形态/展期/期权七类，每个都有数学公式与实现代码；
+  用户注册的自定义因子会追加进同一个库
 - 5 套规则策略：双均线、唐奇安突破、ATR 通道、MACD、海龟（突破 + ATR 止损）
 - 因子策略三种模式：单因子、多因子等权、机器学习多因子（含线性模型与图神经网络）
 - 回测：次日开盘成交、双边成本、逐笔保证金、爆仓保护；方向由滚动 IC 决定，不用未来信息
@@ -369,7 +370,8 @@ SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务�
 ## 你要做的
 
 1. 用户问数据/策略/因子时，先给结论，再给依据（数字、区间、样本数）
-2. 用户描述一个想法时，把它翻译成**平台已有的因子或策略**；平台没有的，说清楚缺什么
+2. 用户描述一个想法时，先看**平台已有的因子或策略**能不能表达；确实没有的，
+   按下面「注册新因子」写成 factor 动作块，不要让用户自己去填表
 3. 用户要下单时，先把「买什么、多少手、什么价、为什么」列清楚，再给动作块
 4. 不确定的地方直接说不确定，不要编造回测数字 —— 你没跑过回测
 
@@ -387,6 +389,37 @@ SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务�
 - 主观买卖：`"mode": "manual"`，带 `"side": "BUY"|"SELL"`、`"offset": "OPEN"|"CLOSE"|"CLOSETODAY"`
 - 只想回测不交易：`{"action": "backtest", ...}`，字段同上但不带 mode
 - 不需要执行任何操作时，**不要输出 json 块**
+
+## 注册新因子
+
+平台**支持运行时注册因子**，不用让用户手动去因子管理页填表。用户描述一个平台
+没有的想法时，把它写成动作块，用户确认后就会进因子库：
+
+```json
+{"action": "factor", "key": "roll_yield_main", "label": "展期收益率·主力",
+ "category": "展期", "hint_dir": 1,
+ "formula": "ln(P近/P次近) / (T次近 - T近) × 365",
+ "desc": "一句话说明这个因子在测什么",
+ "func": "f_roll_yield_main",
+ "code": "def f_roll_yield_main(df):\n    near = _col(df, 'c1_close')\n    nxt = _col(df, 'c2_close')\n    d1 = _col(df, 'c1_dte')\n    d2 = _col(df, 'c2_dte')\n    return _safe_div(np.log(_safe_div(near, nxt)), d2 - d1) * 365"}
+```
+
+写代码的硬约束，违反任何一条都会注册失败：
+
+1. **签名固定** `def f_xxx(df) -> pd.Series`，`df` 的索引是 datetime，含
+   `open/high/low/close/volume/open_oi/close_oi`
+2. **不要写 import**。`np`、`pd` 已经注入；`_col(df, 列名)` 取衍生列（没有该列
+   时返回全 NaN，不要自己判空）、`_ret(c, n)`、`_safe_div(a, b)` 也可用
+3. **返回等长 Series，索引和 df 完全一致**。不要 `dropna()`、不要 `reset_index()`
+   —— 预热期的 NaN 要留着，下游统一处理
+4. **必须 PIT**：只用 `rolling` / `ewm` / `shift(正数)`，**绝不出现 `shift(-n)`**。
+   用未来数据的因子在回测里会好得离谱、实盘一分钱赚不到
+5. 因子只算**原始值**，标准化（滚动 z-score）平台统一做，不要自己减均值除标准差
+6. `key` 用英文小写加下划线，`label` 用中文；`hint_dir` 是历史倾向（+1 高分偏涨、
+   -1 偏跌、0 无明显方向），**只是展示提示**，回测里方向仍由滚动 IC 决定
+
+如果这个想法用现有因子组合就能表达（比如「动量除以波动」），优先建议用多因子模式，
+不要为此新增因子 —— 库里多一个几乎重复的因子，比少一个更难维护。
 """
 
 
@@ -407,7 +440,7 @@ _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
 
 @dataclass
 class Action:
-    kind: str                 # trade / backtest / 空串表示没有动作
+    kind: str                 # trade / backtest / factor / 空串表示没有动作
     payload: dict = field(default_factory=dict)
     error: str = ""
 
@@ -430,7 +463,40 @@ class Action:
                     f"{p.get('strategy', '')}｜{p.get('volume', 1)} 手")
         if self.kind == "backtest":
             return f"回测 {sym} {p.get('period', '')}｜{p.get('strategy', '')}"
+        if self.kind == "factor":
+            return f"注册因子「{p.get('label', '')}」（{p.get('category', '')}）"
         return self.kind
+
+
+def _parse_factor(obj: dict) -> Action:
+    """注册因子的动作块。字段校验只做「能不能落地」，不评判因子好坏。"""
+    key = str(obj.get("key") or "").strip().lower()
+    label = str(obj.get("label") or "").strip()
+    code = str(obj.get("code") or "")
+    if not key:
+        return Action("factor", obj, "缺少因子代号 key")
+    if not label:
+        return Action("factor", obj, "缺少显示名 label")
+    if not code.strip():
+        return Action("factor", obj, "缺少实现代码 code")
+
+    func = str(obj.get("func") or f"f_{key}").strip()
+    if f"def {func}" not in code:
+        return Action("factor", obj, f"code 里要定义 def {func}(df)")
+
+    obj["key"] = key
+    obj["label"] = label
+    obj["func"] = func
+    obj["code"] = code
+    obj["category"] = str(obj.get("category") or "自定义").strip()
+    obj["desc"] = str(obj.get("desc") or "").strip()
+    obj["formula"] = str(obj.get("formula") or "").strip()
+    try:
+        hint = int(obj.get("hint_dir", 1))
+    except (TypeError, ValueError):
+        hint = 1
+    obj["hint_dir"] = hint if hint in (-1, 0, 1) else 1
+    return Action("factor", obj)
 
 
 def parse_action(text: str) -> Action:
@@ -450,8 +516,11 @@ def parse_action(text: str) -> Action:
         return Action("", {}, "动作块不是对象")
 
     kind = str(obj.get("action") or "").strip().lower()
-    if kind not in ("trade", "backtest"):
+    if kind not in ("trade", "backtest", "factor"):
         return Action("")
+    if kind == "factor":
+        # 注册因子不需要品种 —— 因子是横截面的，对哪个标的算由用户决定
+        return _parse_factor(obj)
     if not obj.get("symbol"):
         return Action(kind, obj, "缺少品种")
 

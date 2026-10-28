@@ -464,6 +464,10 @@ class FactorSpec:
     # 仅作展示提示：历史上这类因子高分倾向涨(+1)还是跌(-1)。
     # **回测里绝不直接用**，方向一律由滚动 IC 决定，否则就是用未来信息。
     hint_dir: int = 1
+    # 用户自定义因子（Agent 生成）自带公式与源码：它们不在 FACTOR_DOCS 里，
+    # `inspect.getsource()` 也取不到 —— `exec` 出来的函数没有对应文件。
+    formula: str = ""
+    code: str = ""
 
 
 FACTORS: dict[str, FactorSpec] = {}
@@ -668,3 +672,31 @@ def available(df: pd.DataFrame, key: str, min_obs: int = 60) -> bool:
 
 def filter_available(df: pd.DataFrame, keys: list[str], min_obs: int = 60) -> list[str]:
     return [k for k in keys if k in FACTORS and available(df, k, min_obs)]
+
+
+# ---------------------------------------------------------------- 用户自定义因子
+def _load_user_factors() -> int:
+    """把用户目录里的自定义因子挂进来。
+
+    放在文件**末尾**：`userfactors` 要 `from ttrade.factors import FactorSpec`，
+    这时本模块已经执行到最底下，`FactorSpec` / `_col` 这些都在了。放在开头会
+    变成循环导入。
+
+    失败一律吞掉 —— 用户手改 JSON 改坏了，不该让整个程序起不来。
+    """
+    try:
+        from ttrade import userfactors as UF
+
+        return UF.register_all_into(FACTORS)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+USER_FACTOR_COUNT = _load_user_factors()
+
+# 用户因子可能带来新类别（默认叫「自定义」）。`CATEGORIES` 是界面上分组用的
+# 静态列表，不补进去的话新因子在「策略研究」页的因子下拉里根本不出现 ——
+# 注册成功了却选不到，比注册失败还难排查。
+for _spec in FACTORS.values():
+    if _spec.category not in CATEGORIES:
+        CATEGORIES.append(_spec.category)

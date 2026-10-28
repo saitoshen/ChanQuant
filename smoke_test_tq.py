@@ -1018,7 +1018,9 @@ def check_library_docs() -> None:
     from ttrade.strategies import STRATEGIES
 
     try:
-        missing = [k for k in FACTORS if k not in L.FACTOR_DOCS]
+        # 用户注册的因子不进 `FACTOR_DOCS`（公式和源码存在 `FactorSpec` 上），
+        # 所以「缺文档」只对内置因子成立：内置因子没有 spec.formula 兜底
+        missing = [k for k in FACTORS if k not in L.FACTOR_DOCS and not FACTORS[k].formula]
         extra = [k for k in L.FACTOR_DOCS if k not in FACTORS]
         check("因子文档：覆盖全部注册因子", not missing, f"缺 {missing}")
         check("因子文档：没有多余条目", not extra, f"多 {extra}")
@@ -1328,6 +1330,109 @@ def check_agent_thread() -> None:
                 pass
 
 
+def check_user_factors() -> None:
+    """Agent 注册的自定义因子：执行沙箱、试算校验、落盘往返、删除。
+
+    这条链最容易出的问题是「注册成功了但选不到」：因子进了 `FACTORS`，却不在
+    `CATEGORIES` 里，而下拉是按 `CATEGORIES` 分组的 —— 库里有、界面上没有。
+    """
+    from ttrade import factors as F
+    from ttrade import library_docs as L
+    from ttrade import userfactors as UF
+
+    tmpdir = tempfile.mkdtemp(prefix="td_uf_")
+    old_path = UF.path
+    UF.path = lambda: os.path.join(tmpdir, "user_factors.json")
+    key = "zz_smoke_test"
+    try:
+        # 1) `import os` 必须失败。白名单 builtins 里没有 `__import__`，
+        #    这一条挡的是模型「顺手读个文件」，不是蓄意攻击
+        ok, msg = UF.register(UF.UserFactor(
+            key=key, label="试", func="f_x",
+            code="import os\ndef f_x(df):\n    return df['close']"))
+        check("用户因子：白名单挡住 import", not ok and "跑不起来" in msg, msg)
+
+        # 2) 返回值不是 Series
+        ok, msg = UF.register(UF.UserFactor(
+            key=key, label="试", func="f_x",
+            code="def f_x(df):\n    return np.zeros(len(df))"))
+        check("用户因子：返回 ndarray 被拒", not ok and "Series" in msg, msg)
+
+        # 3) 长度不对
+        ok, msg = UF.register(UF.UserFactor(
+            key=key, label="试", func="f_x",
+            code="def f_x(df):\n    return _col(df, 'close').iloc[:-5]"))
+        check("用户因子：长度不一致被拒", not ok and "长度" in msg, msg)
+
+        # 4) 索引不对：dropna + reset_index 是模型最常犯的错
+        ok, msg = UF.register(UF.UserFactor(
+            key=key, label="试", func="f_x",
+            code="def f_x(df):\n    return _col(df, 'close').reset_index(drop=True)"))
+        check("用户因子：索引不对齐被拒", not ok and "索引" in msg, msg)
+
+        # 5) 全 NaN 只警告不拦：缺衍生列的因子在别的标的上是能用的
+        ok, msg = UF.register(UF.UserFactor(
+            key=key, label="试", func="f_x",
+            code="def f_x(df):\n    return _nan_series(df)"))
+        check("用户因子：全 NaN 只给警告", ok and "NaN" in msg, msg)
+        UF.remove(key)
+
+        # 6) 正常因子
+        good = UF.UserFactor(
+            key=key, label="冒烟测试因子", category="冒烟",
+            desc="5 日均值比 20 日均值", formula="MA(close,5)/MA(close,20)",
+            hint_dir=1, func="f_zz",
+            code=("def f_zz(df):\n"
+                  "    c = _col(df, 'close')\n"
+                  "    return _safe_div(c.rolling(5).mean(), c.rolling(20).mean())"))
+        ok, msg = UF.register(good)
+        check("用户因子：正常因子注册成功", ok, msg)
+        check("用户因子：进了 FACTORS", key in F.FACTORS, key)
+        check("用户因子：新类别补进 CATEGORIES", "冒烟" in F.CATEGORIES,
+              str(F.CATEGORIES[-3:]))
+
+        doc = L.factor_doc(key)
+        check("用户因子：文档带公式与源码",
+              doc is not None and doc.formula == good.formula
+              and "def f_zz" in doc.code,
+              "" if doc is None else f"formula={doc.formula!r}")
+
+        # 7) 重名要拒绝，不能悄悄覆盖内置因子
+        ok2, msg2 = UF.register(good)
+        check("用户因子：重名被拒", not ok2 and "已经有一个" in msg2, msg2)
+        ok3, msg3 = UF.register(UF.UserFactor(
+            key="mom_60", label="撞名", func="f_y",
+            code="def f_y(df):\n    return _col(df, 'close')"))
+        check("用户因子：不能覆盖内置因子", not ok3, msg3)
+
+        # 8) 代号格式
+        ok4, msg4 = UF.register(UF.UserFactor(
+            key="Zz-Bad", label="坏代号", func="f_z",
+            code="def f_z(df):\n    return _col(df, 'close')"))
+        check("用户因子：代号格式校验", not ok4 and "代号" in msg4, msg4)
+
+        # 9) 重启后能挂回来
+        box: dict = {}
+        n = UF.register_all_into(box)
+        check("用户因子：重启后从盘里挂回来", n == 1 and key in box, f"n={n}")
+        check("用户因子：挂回来的函数能跑",
+              key in box and len(box[key].func(UF.sample_df())) == len(UF.sample_df()),
+              "")
+
+        # 10) 删除
+        check("用户因子：删除后 FACTORS 里没了", UF.remove(key) and key not in F.FACTORS, "")
+        check("用户因子：删完盘里也没了", UF.register_all_into({}) == 0, "")
+        check("用户因子：内置因子删不掉", not UF.remove("mom_60"), "")
+    except Exception as exc:  # noqa: BLE001
+        check("用户自定义因子", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        UF.path = old_path
+        F.FACTORS.pop(key, None)
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -1349,6 +1454,7 @@ def main() -> int:
     check_agent()
     check_agent_stream()
     check_agent_thread()
+    check_user_factors()
     for k in ks:
         try:
             check_one(k)

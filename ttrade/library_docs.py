@@ -394,14 +394,16 @@ def factor_doc(key: str) -> FactorDoc | None:
     if spec is None:
         return None
     doc = FACTOR_DOCS.get(key, {})
+    # 用户自定义因子把公式和源码存在 `FactorSpec` 上：它们不在 FACTOR_DOCS 里，
+    # `inspect.getsource()` 也取不到（exec 出来的函数没有对应文件）。
     return FactorDoc(
         key=key,
         label=spec.label,
         category=spec.category,
         desc=spec.desc,
-        formula=doc.get("formula", "（未收录公式）"),
-        explain=doc.get("explain", spec.desc),
-        code=_source(spec.func),
+        formula=doc.get("formula") or spec.formula or "（未收录公式）",
+        explain=doc.get("explain") or spec.desc,
+        code=spec.code or _source(spec.func),
         hint_dir=spec.hint_dir,
     )
 

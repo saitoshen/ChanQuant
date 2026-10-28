@@ -140,6 +140,48 @@ class ConfirmDialog(QDialog):
         lay.addWidget(head)
 
         p = action.payload
+        if action.kind == "factor":
+            # 注册因子要给人看代码。只写「注册一个因子」等于让人盲签 —— 这段代码
+            # 会在本机执行，用户至少该有机会扫一眼。
+            rows = [
+                ("代号", p.get("key", "")),
+                ("类别", p.get("category", "")),
+                ("公式", p.get("formula", "") or "（模型没给公式）"),
+                ("说明", p.get("desc", "")),
+            ]
+            form = QFormLayout()
+            form.setContentsMargins(0, 6, 0, 6)
+            for k, v in rows:
+                if not v:
+                    continue
+                lab = QLabel(str(v))
+                lab.setWordWrap(True)
+                form.addRow(QLabel(k), lab)
+            lay.addLayout(form)
+
+            lay.addWidget(QLabel("实现代码"))
+            code = QPlainTextEdit(p.get("code", ""))
+            code.setReadOnly(True)
+            code.setMinimumHeight(240)
+            code.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
+            lay.addWidget(code)
+
+            warn = QLabel("确认后写入因子库并立刻可用；代码有问题会注册失败并给出原因。")
+            warn.setWordWrap(True)
+            warn.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
+            lay.addWidget(warn)
+
+            # 注册因子没有「下次不提醒」：每次的代码都不一样，盲签没有意义
+            self.chk_silent = QCheckBox()
+            self.chk_silent.hide()
+            box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            box.button(QDialogButtonBox.Ok).setText("注册")
+            box.button(QDialogButtonBox.Cancel).setText("取消")
+            box.accepted.connect(self.accept)
+            box.rejected.connect(self.reject)
+            lay.addWidget(box)
+            return
+
         rows = []
         if p.get("reason"):
             rows.append(("理由", str(p["reason"])))
@@ -311,6 +353,7 @@ class AgentPage(QWidget):
     study_requested = Signal(object)      # SStore.StrategyConfig
     trade_requested = Signal(object)      # A.Action
     portfolio_requested = Signal(object)  # SStore.StrategyConfig
+    factor_added = Signal(str)            # 新注册的因子 key，主窗口据此刷新下拉
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -765,24 +808,63 @@ class AgentPage(QWidget):
     # ---------------------------------------------------------- 动作
 
     def _handle_action(self, action: A.Action) -> None:
-        # 只有真下单才拦。回测是只读操作，为它弹一个「确认后立即执行」的框
-        # 只会训练用户无脑点确认。
-        if self.cfg.confirm_trade and action.kind == "trade":
+        # 只有「会改本机状态」的动作才拦：下单、注册因子。回测是只读操作，为它
+        # 弹一个「确认后立即执行」的框只会训练用户无脑点确认。
+        #
+        # 注册因子**不受** `confirm_trade` 开关控制 —— 那个开关管的是下单，而这里
+        # 要执行的是模型写的 Python 代码，每次都不一样，盲签没有意义。
+        need_confirm = action.kind == "factor" or (
+            self.cfg.confirm_trade and action.kind == "trade"
+        )
+        if need_confirm:
             dlg = ConfirmDialog(action, self)
             if dlg.exec() != QDialog.Accepted:
                 self._append(f"<p style='color:{C_MUTED};font-size:11px'>已取消。</p>")
                 return
-            if dlg.silent():
+            if action.kind == "trade" and dlg.silent():
                 self.cfg.confirm_trade = False
                 A.save_config(self.cfg)
                 self._append(
                     f"<p style='color:{C_MUTED};font-size:11px'>"
                     "以后不再询问，可在设置里重新打开。</p>"
                 )
+
+        if action.kind == "factor":
+            self._register_factor(action.payload)
+            return
+
         self._append(
             f"<p style='color:{C_OK};font-size:11px'>已提交：{_esc(action.describe())}</p>"
         )
         self.trade_requested.emit(action)
+
+    def _register_factor(self, p: dict) -> None:
+        """把模型写的因子落地：试算 → 写盘 → 注册进 FACTORS → 刷新左边的库。"""
+        from ttrade import userfactors as UF
+
+        f = UF.UserFactor(
+            key=p.get("key", ""), label=p.get("label", ""),
+            category=p.get("category", "自定义"), desc=p.get("desc", ""),
+            formula=p.get("formula", ""), hint_dir=int(p.get("hint_dir", 1)),
+            func=p.get("func", ""), code=p.get("code", ""),
+        )
+        ok, msg = UF.register(f)
+        if not ok:
+            self._append(f"<p style='color:{C_BAD}'>注册失败：{_esc(msg)}</p>")
+            self._set_state("因子注册失败", C_BAD)
+            return
+
+        self._append(
+            f"<p style='color:{C_OK}'>已注册因子「{_esc(f.label)}」（{_esc(f.key)}）。"
+            f"{_esc(msg)}</p>"
+            f"<p style='color:{C_MUTED};font-size:11px'>"
+            "在「策略研究」页的因子列表里能选到它。定义存在 "
+            f"<code>{_esc(UF.path())}</code>，不想留就把那一条删掉（删整个文件"
+            "就是清空全部自定义因子）。</p>"
+        )
+        self._set_state(f"已注册因子 {f.key}", C_OK)
+        self.reload()
+        self.factor_added.emit(f.key)
 
     # ---------------------------------------------------------- 策略 / 研报动作
 
@@ -881,7 +963,8 @@ class AgentPage(QWidget):
     # ---------------------------------------------------------- 外部通知
 
     def reload(self) -> None:
-        """重读策略库与研报目录。切回本页时调，能看到刚存进库的策略。"""
+        """重读因子库、策略库与研报目录。切回本页时调，能看到刚进库的东西。"""
+        self._fill_factors()
         self._fill_strategies()
         self._fill_reports()
 
