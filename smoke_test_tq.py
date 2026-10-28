@@ -226,6 +226,33 @@ def check_live_helpers() -> None:
     check("实时⑥quote 快照与 underlying 同源",
           st.quote.get("underlying") == "SHFE.rb2701", repr(st.quote.get("underlying")))
 
+    # 持仓快照的合约名：`Position` 上没有 `symbol` 属性，合约代码是 get_position()
+    # 返回的 dict 的 key（或 instrument_id）。取错属性会让持仓表的「合约」列整列空白，
+    # 而委托/成交用的是 instrument_id 所以看着正常。
+    from types import SimpleNamespace
+
+    def _pos(**kw):
+        base = dict(pos=-1, pos_long=0, pos_short=1, pos_long_today=0, pos_short_today=1,
+                    open_price_long=float("nan"), open_price_short=109360.0,
+                    float_profit=950.0, position_profit=0.0, margin=59752.0,
+                    last_price=108860.0)
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    hub._positions = {"SHFE.cu2612": _pos(instrument_id="cu2612")}
+    rows = hub._positions_snapshot()
+    check("实时⑦持仓合约名取 instrument_id", rows and rows[0]["symbol"] == "cu2612",
+          repr(rows[0]["symbol"]) if rows else "空")
+    hub._positions = {"SHFE.cu2612": _pos()}
+    rows = hub._positions_snapshot()
+    check("实时⑦没有 instrument_id 时回退到 dict 的 key",
+          rows and rows[0]["symbol"] == "SHFE.cu2612",
+          repr(rows[0]["symbol"]) if rows else "空")
+    check("实时⑦空头持仓的 open_price_long 是 NaN（界面要按方向取）",
+          rows and rows[0]["open_price_long"] != rows[0]["open_price_long"]
+          and rows[0]["open_price_short"] == 109360.0,
+          f"{rows[0]['open_price_long']}")
+
     old = os.environ.get("LOCALAPPDATA")
     tmpdir = tempfile.mkdtemp(prefix="tqacct_")
     os.environ["LOCALAPPDATA"] = tmpdir

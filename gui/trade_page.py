@@ -60,18 +60,41 @@ OFFSETS = [("开仓", "OPEN"), ("平今", "CLOSETODAY"), ("平仓", "CLOSE")]
 DIRECTIONS = [("买入", "BUY"), ("卖出", "SELL")]
 
 
-def _money(v) -> str:
+def _num(v, default=None):
+    """把天勤的数值字段转成 float，NaN / None / 非数字都归到 default。
+
+    tqsdk 用 NaN 表示「这一侧没有持仓」—— 比如只有空头时 `open_price_long`
+    就是 NaN。NaN 是 truthy，所以 `a or b` 取不到 b，`f"{nan:.2f}"` 会直接把
+    "nan" 打到表里（持仓表原来就这么显示的）。
+    """
     try:
-        return f"{float(v):,.2f}"
+        f = float(v)
     except (TypeError, ValueError):
-        return "—"
+        return default
+    return default if f != f else f
+
+
+def _money(v) -> str:
+    f = _num(v)
+    return "—" if f is None else f"{f:,.2f}"
 
 
 def _pnl(v) -> str:
-    try:
-        return f"{float(v):+,.2f}"
-    except (TypeError, ValueError):
-        return "—"
+    f = _num(v)
+    return "—" if f is None else f"{f:+,.2f}"
+
+
+def _avg_price(r: dict) -> str:
+    """开仓均价。锁仓时两边都有，按净头寸取；只有一边就取那一边。"""
+    pl = _num(r.get("open_price_long"))
+    ps = _num(r.get("open_price_short"))
+    if r["pos_long"] and r["pos_short"]:
+        v = pl if r["pos"] >= 0 else ps
+    elif r["pos_long"]:
+        v = pl
+    else:
+        v = ps
+    return "—" if v is None else f"{v:.2f}"
 
 
 def _color(v) -> str:
@@ -480,7 +503,7 @@ class TradePage(QWidget):
             vals = [
                 r["symbol"], str(r["pos"]), str(r["pos_long"]), str(r["pos_short"]),
                 str(r["pos_long_today"]), str(r["pos_short_today"]),
-                f"{r['open_price_long'] or r['open_price_short']:.2f}",
+                _avg_price(r),
                 _pnl(r["float_profit"]),
                 _money(r["margin"]),
             ]

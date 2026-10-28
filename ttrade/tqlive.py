@@ -385,7 +385,10 @@ class LiveHub:
             if pos == 0 and not self._num(p, "pos_long") and not self._num(p, "pos_short"):
                 continue
             out.append({
-                "symbol": getattr(p, "symbol", ""),
+                # `Position` 上没有 `symbol` 属性 —— 合约代码是 `get_position()`
+                # 返回的 dict 的 key。早先取 `p.symbol` 拿到空串，持仓表的「合约」
+                # 列整列空白，而委托/成交用的是 `instrument_id` 所以正常。
+                "symbol": getattr(p, "instrument_id", "") or _sym,
                 "pos": pos,
                 "pos_long": int(self._num(p, "pos_long")),
                 "pos_short": int(self._num(p, "pos_short")),
