@@ -101,9 +101,7 @@ def attach(
     万一衍生文件里有行情表没有的日期，`how="left"` 会直接丢掉，不会多出行。
     """
     if aux_dir is None:
-        aux_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "..", "data_futures_aux"
-        )
+        aux_dir = _default_dir()
     if not os.path.isdir(aux_dir) or df.empty:
         return df
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -119,6 +117,65 @@ def attach(
             continue
         out = out.join(part[cols], how="left")
     return out
+
+
+def attach_intraday(
+    df: pd.DataFrame,
+    symbol: str,
+    exchange: str,
+    aux_dir: str | None = None,
+) -> pd.DataFrame:
+    """把衍生列挂到**分钟级**行情上：每根 bar 用「上一个交易日」的快照。
+
+    日线可以直接 `attach()`：那根 K 线的收盘价和期限结构是同一天同一时刻算出来
+    的，谁都不领先谁。分钟线不行 —— 同一天 09:05 那根 bar 不可能知道当天 15:00
+    收盘之后才有的近远月价差，按日期硬 join 等于把当天收盘的结果提前灌进上午的
+    bar，展期因子的 IC 会被这条未来信息吹起来，实盘一上就露馅。
+
+    所以先 `ffill` 把衍生表铺成「每个交易日一行」，再整体 `shift(1)`：第 D 个
+    交易日的所有 bar 都用 D-1 收盘时的快照，正好是实盘那一刻能拿到的信息。
+    代价是窗口最前面一天没有值，`_col()` 会返回 NaN，因子自然空着。
+
+    为什么不像日线那样 join：分钟表的索引是「时间戳」不是「日期」，直接 join
+    只会命中 00:00 那一行（分钟 bar 根本没有这个点），整列还是 NaN —— 这正是
+    1h / 5m 的展期因子长期没数值的原因。
+    """
+    if aux_dir is None:
+        aux_dir = _default_dir()
+    if not os.path.isdir(aux_dir) or df.empty:
+        return df
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return df
+
+    day = df.index.normalize()
+    parts = [load_curve(aux_dir, symbol, exchange), load_opt(aux_dir, symbol, exchange)]
+    out = df
+    for part in parts:
+        if part.empty:
+            continue
+        # 分钟表动辄十几万行，合约代码（c1_code 之类）是字符串列，因子用不到，
+        # 铺到每根 bar 上只是白占几十 MB
+        cols = [c for c in part.columns
+                if c not in out.columns and pd.api.types.is_numeric_dtype(part[c])]
+        if not cols:
+            continue
+        # union 会把「行情有、衍生没有」的交易日补进来（比如衍生只更到上周），
+        # ffill 之后再 shift，取到的就是「这根 bar 之前最近一个有快照的交易日」
+        grid = part.index.union(day.unique()).sort_values()
+        snap = part[cols].reindex(grid).ffill().shift(1).reindex(day.unique())
+        out = out.join(pd.DataFrame(
+            snap.to_numpy()[pd.Index(day.unique()).get_indexer(day)],
+            index=out.index, columns=cols,
+        ))
+    return out
+
+
+def _default_dir() -> str:
+    """衍生数据目录。走 `paths.data_dir("aux")` 而不是相对 `__file__` —— 打包后
+    代码在 PYZ 里，`../data_futures_aux` 指到的是解包临时目录以外的地方。"""
+    from .paths import data_dir
+
+    return data_dir("aux")
 
 
 def clear_cache() -> None:

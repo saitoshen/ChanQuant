@@ -84,6 +84,26 @@ def _safe_log_ratio(a: pd.Series, b: pd.Series) -> pd.Series:
     return np.log(a.where(ok) / b.where(ok))
 
 
+def _day_diff(s: pd.Series, n: int = 20) -> pd.Series:
+    """按**交易日**取 n 天变化。
+
+    日线上 `diff(n)` 本来就是 n 天。分钟线上不是：5m 的 `diff(20)` 只是 100
+    分钟，而衍生数据（期限结构 / 期权 IV）本身是「一天一个快照」，由
+    `auxdata.attach_intraday` 铺到当天每根 bar 上 —— 直接 diff 得到的是一串 0，
+    每天开盘那几根再跳一下，看着像信号其实是采样伪影。
+
+    这里先压成日频、diff 完再映射回每根 bar，两个周期口径就一致了。
+    """
+    idx = s.index
+    if not isinstance(idx, pd.DatetimeIndex) or len(idx) < 2:
+        return s.diff(n)
+    day = idx.normalize()
+    if len(day) == len(day.unique()):        # 一天一根，本来就是日线
+        return s.diff(n)
+    daily = s.groupby(day).last()
+    return pd.Series(np.asarray(day.map(daily.diff(n)), dtype=float), index=idx)
+
+
 # ---------------------------------------------------------------- 展期 / 期限结构
 # 展期因子全部来自「同一天、不同到期日」的合约价格，这是主力连续合约给不了的
 # 信息。数据来源见 `ttrade/contracts.py`。
@@ -117,7 +137,7 @@ def _roll_curv(df: pd.DataFrame, pre: str = "c") -> pd.Series:
 
 
 def _roll_change(df: pd.DataFrame, pre: str = "c") -> pd.Series:
-    return _roll_annual(df, pre).diff(20)
+    return _day_diff(_roll_annual(df, pre), 20)
 
 
 def f_roll_yield(df: pd.DataFrame) -> pd.Series:
@@ -262,7 +282,7 @@ def f_iv_rv(df: pd.DataFrame) -> pd.Series:
 
 def f_iv_change(df: pd.DataFrame) -> pd.Series:
     """IV 的 20 日变化。衡量波动率预期的动量。"""
-    return _col(df, "iv_near").diff(20)
+    return _day_diff(_col(df, "iv_near"), 20)
 
 
 def f_pcr(df: pd.DataFrame) -> pd.Series:

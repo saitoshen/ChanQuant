@@ -1,8 +1,23 @@
 """多策略自动交易引擎。
 
-一个 `TqApi` 管一组策略：每个策略订阅自己的主连 K 线，新 bar 到了就重算信号，
-目标净仓变了就下单。和 `gui/app.py` 里那个「单策略 + 手动绿灯」是两套东西 ——
-那边是研究用，这边是组合运行。
+一个 `TqApi` 管一组策略：每个策略订阅自己的主连 K 线，新 bar 一到就用**刚收盘
+的那根**重算信号，目标净仓变了就按新 bar 的开盘价下单。和 `gui/app.py` 里那个
+「单策略 + 手动绿灯」是两套东西 —— 那边是研究用，这边是组合运行。
+
+## 成交时点：T 根收盘出信号，T+1 根开盘进场
+
+回测引擎里是 `target = np.roll(sig, 1)`，即第 T 根收盘的信号在第 T+1 根开盘
+成交。实时这边必须同口径，否则「回测赚钱、实盘亏钱」永远说不清是谁的问题。
+
+天勤的 K 线序列最后一根是**正在走的活 bar**，它的 `datetime` 在新 bar 出现时
+就变了，但 OHLC 要到收盘才定。拿它算信号有两个毛病：
+
+- 开盘那一瞬 `close == open`，突破 / 偏离类条件会在开盘就成立、收盘又消失，
+  实盘比回测早一根进场，进的还是「开盘时的假信号」；
+- ATR 这类用 `high - low` 的量在开盘等于 0，止损线被算得极窄。
+
+所以 `_refresh_signal` 只喂**已收盘**的 bar（`df.iloc[:-1]`）：此刻正是新 bar
+刚开盘，用上一根收盘的信号在这一刻下单，就是回测里的 T+1 开盘成交。
 
 ## 为什么按账户分组，而不是一个 Runner 管所有
 
@@ -278,6 +293,10 @@ class PortfolioRunner:
         st.last_bar = last
 
         df = bars_from_serial(kl, st.cfg.period)
+        # 最后一根是正在走的活 bar，信号只用已收盘的算（见模块文档）。此刻正是
+        # 新 bar 刚开盘，用上一根收盘的信号下单 = 回测里的 T+1 开盘成交。
+        if len(df) > 1:
+            df = df.iloc[:-1]
         if len(df) < MIN_BARS:
             return
         st.signal = self._signal(st, df)
@@ -299,6 +318,7 @@ class PortfolioRunner:
         if st.cfg.family == "factor":
             if len(df) < FACTOR_MIN_BARS:
                 return 0                 # 历史不够，分数全是 NaN，先空仓等数据
+            df = self._with_aux(st, df)
             out = fstrat.run_factor_strategy(
                 df, st.cfg.factor_mode or "single", list(st.cfg.factor_keys or []),
                 replay.factor_config(st.cfg.factor_cfg or {}),
@@ -309,6 +329,21 @@ class PortfolioRunner:
         out = run_strategy(df, st.cfg.rule_key, st.cfg.rule_params)
         sig = out["signal"].iloc[-1]
         return 0 if pd.isna(sig) else int(sig)
+
+    @staticmethod
+    def _with_aux(st: SlotState, df: pd.DataFrame) -> pd.DataFrame:
+        """给实时序列挂上期限结构 / 期权列。
+
+        天勤的 K 线只有 OHLC 和持仓量，展期、期权那十几个因子读的 `c1_close`、
+        `iv_near` 之类全在衍生表里。研究页是 `DataStore` 加载时挂的，实时这条
+        链路自己拼 df，不挂就是整列 NaN —— 因子分数算不出来，策略永远空仓。
+        """
+        try:
+            from ttrade.auxdata import attach_intraday
+
+            return attach_intraday(df, st.cfg.symbol, st.cfg.exchange)
+        except Exception:  # noqa: BLE001
+            return df
 
     # ---- 调仓 ----
 

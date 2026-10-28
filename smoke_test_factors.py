@@ -147,15 +147,20 @@ def same_series(a: pd.Series, b: pd.Series, k: int, tol: float = 1e-9) -> bool:
 
 # ================================================================== 1. 因子库
 section("1. 因子库")
-check("因子数量", len(F.FACTORS) == 47, f"实际 {len(F.FACTORS)}")
+# 只量内置因子。用户目录里的自定义因子（Agent 生成）也会注册进 FACTORS，
+# 按 47 这个硬数字量的话，用户存一条因子这条就红 —— 和策略文档那条同一个毛病
+BUILTIN = [k for k, s_ in F.FACTORS.items() if not s_.code]
+AUXISH = {k for k, s_ in F.FACTORS.items()
+          if s_.category.startswith("展期") or s_.category == "期权"}
+check("因子数量", len(BUILTIN) == 47,
+      f"内置 {len(BUILTIN)}，用户 {len(F.FACTORS) - len(BUILTIN)}")
 check("分类齐全",
       set(F.CATEGORIES) == {"趋势", "反转", "波动", "量能", "形态",
                             "展期", "展期 OI3", "展期 OI6", "期权"},
       str(F.CATEGORIES))
 check("展期/期权因子都登记进 AUX_KEYS",
-      set(F.AUX_KEYS) == {k for k, s in F.FACTORS.items()
-                          if s.category.startswith("展期") or s.category == "期权"},
-      f"实际 {len(F.AUX_KEYS)} 个")
+      set(F.AUX_KEYS) == {k for k in AUXISH if not F.FACTORS[k].code},
+      f"实际 {len(F.AUX_KEYS)} 个，应登记 {len([k for k in AUXISH if not F.FACTORS[k].code])} 个")
 check("默认单因子存在", F.DEFAULT_SINGLE in F.FACTORS)
 check("默认多因子都存在", all(k in F.FACTORS for k in F.DEFAULT_MULTI))
 
@@ -200,8 +205,8 @@ check("无衍生列时展期/期权因子被剔除",
       all(k not in no_aux for k in F.AUX_KEYS),
       str([k for k in F.AUX_KEYS if k in no_aux]))
 check("无衍生列时其它因子不受影响",
-      len(no_aux) == len(F.FACTORS) - len(F.AUX_KEYS),
-      f"{len(no_aux)}/{len(F.FACTORS)}")
+      len(no_aux) == len(F.FACTORS) - len(AUXISH),
+      f"{len(no_aux)}/{len(F.FACTORS)}，应保留 {len(F.FACTORS) - len(AUXISH)}")
 check("无衍生列时展期因子返回全 NaN",
       F.raw(DF, "roll_yield").isna().all())
 

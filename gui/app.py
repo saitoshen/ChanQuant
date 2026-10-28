@@ -283,7 +283,8 @@ MARKETS = {
         "legend": (
             "▲ 紫色向上三角＝开多　▼ 紫色向下三角＝平多　"
             "浅蓝底色＝多头持仓　红色虚线＝这笔交易盈利　绿色虚线＝亏损　"
-            "价格均为后复权（含分红再投资），保证收益率连续"
+            "价格均为后复权（含分红再投资），保证收益率连续　"
+            "信号在下一根开盘成交"
         ),
     },
     "cn": {
@@ -296,7 +297,8 @@ MARKETS = {
             "▲紫＝开多　▼紫＝平多　▼琥珀＝开空　▲琥珀＝平空　"
             "浅蓝底色＝多头持仓　浅红底色＝空头持仓　"
             "红色虚线＝这笔交易盈利　绿色虚线＝亏损　"
-            "分钟级按天勤自己的主力切换口径复权，与日线的 Tushare 口径不同"
+            "分钟级按天勤自己的主力切换口径复权，与日线的 Tushare 口径不同　"
+            "信号在下一根开盘成交"
         ),
     },
 }
@@ -430,6 +432,17 @@ class DataStore:
                 sym, _, ex = key.rpartition("_")
                 # qfq：最后一根等于真实盘面价，和日线的口径一致
                 df = tqdata.load_main(sym, ex, period, adjust="qfq")
+                # 分钟级同样要挂衍生列（期限结构 / 期权 IV），否则展期、期权那
+                # 十几个因子在 1h / 5m 上整列 NaN。日线分支在 load_futures_csv()
+                # 里做过，这里一直漏着 —— 「下载了真实合约却算不出展期因子」就是
+                # 这个原因。分钟 bar 比衍生表密得多，用 attach_intraday 按上一个
+                # 交易日对齐，避免把当天收盘才有的价差灌进上午的 bar。
+                try:
+                    from ttrade.auxdata import attach_intraday as attach_intra
+
+                    df = attach_intra(df, sym, ex, AUX_DIR)
+                except Exception:
+                    pass
         except Exception as exc:  # noqa: BLE001
             # 最常见的是下载脚本正持有 DuckDB 的排他锁。把原因记下来，
             # 上层据此提示「正在下载」，而不是含糊的「数据缺失」。

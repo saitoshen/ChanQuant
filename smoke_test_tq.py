@@ -143,6 +143,81 @@ def check_resample(key: str) -> None:
               f"{len(dn)} vs {len(d5) / n:.0f}")
 
 
+def check_intraday_aux() -> None:
+    """分钟级的衍生列：展期 / 期权因子在 1h、5m 上必须有数值。
+
+    这些列只存在于 `data_futures_aux/`（由真实合约聚合而来），日线分支一直在
+    加载时挂上去，分钟分支漏了 —— 结果是「下了全品种 5m/1h 真实合约，展期因子
+    却整列空着」。这里同时盯住两件事：列挂上了，且用的是**上一交易日**的快照
+    （当天 15:00 收盘才算得出来的价差不能灌进上午的 bar）。
+    """
+    import os
+
+    from ttrade import auxdata as A
+    from ttrade import factors as F
+    from ttrade import tqdata as T
+
+    try:
+        check("周期：15m/30m 归到 5m",
+              [T.source_period(p) for p in ("15m", "30m")] == ["5m", "5m"])
+        check("周期：2h/4h 归到 1h",
+              [T.source_period(p) for p in ("2h", "4h")] == ["1h", "1h"])
+        check("周期：5m/1h/1d 原样",
+              [T.source_period(p) for p in ("5m", "1h", "1d")] == ["5m", "1h", "1d"])
+
+        aux_dir = A._default_dir()
+        key = ""
+        for k in keys():
+            sym, ex = k.rsplit("_", 1)
+            if os.path.exists(A.curve_path(aux_dir, sym, ex)) and T.has_period(sym, ex, "1h"):
+                key = k
+                break
+        if not key:
+            skip("分钟级衍生列", "没有同时具备 1h 行情和衍生数据的品种")
+            return
+        sym, ex = key.rsplit("_", 1)
+
+        df = T.load_main(sym, ex, "1h", adjust="qfq").tail(2000)
+        out = A.attach_intraday(df, sym, ex)
+        check(f"{key} 1h：挂上了期限结构列", "c1_close" in out.columns and "c2_close" in out.columns)
+        check(f"{key} 1h：期限结构没有空洞",
+              float(out["c1_close"].notna().mean()) > 0.99,
+              f"{out['c1_close'].notna().mean():.1%}")
+        check(f"{key} 1h：行数不变", len(out) == len(df), f"{len(out)} vs {len(df)}")
+
+        # 第一根 bar 用的是「它所在交易日之前」最近一个快照
+        curve = A.load_curve(aux_dir, sym, ex)
+        day = pd.Timestamp(out.index[0]).normalize()
+        prev = curve.loc[curve.index < day]
+        if len(prev):
+            check(f"{key} 1h：用上一交易日的快照（不提前用当天收盘）",
+                  abs(float(out["c1_close"].iloc[0]) - float(prev["c1_close"].iloc[-1])) < 1e-9,
+                  f"{out['c1_close'].iloc[0]} vs {prev['c1_close'].iloc[-1]}")
+
+        ry = F.f_roll_yield(out)
+        check(f"{key} 1h：展期收益率算得出", float(ry.notna().mean()) > 0.99,
+              f"{ry.notna().mean():.1%}")
+        # 衍生列一天一个快照，同一天里所有 bar 的「20 日变化」必须一模一样。
+        # 直接 `.diff(20)` 的话，5m 上算的是 100 分钟前的差，一天内根根不同
+        ch = F.f_roll_change(out).dropna()
+        grp = ch.groupby(ch.index.normalize())
+        sizes = grp.size()
+        full = [d for d in sizes.index if sizes[d] >= 3]
+        same_day = grp.get_group(full[-1]) if full else ch.iloc[:0]
+        check(f"{key} 1h：展期变化按交易日算（同一天内取值一致）",
+              len(same_day) >= 3 and same_day.nunique() == 1,
+              f"{len(same_day)} 根，{same_day.nunique()} 个不同值")
+
+        # 日线分支不能被改坏：还是按同一天 join
+        plain = pd.DataFrame({"close": [1.0] * 5}, index=curve.index[:5])
+        d1 = A.attach(plain, sym, ex, aux_dir)
+        check(f"{key} 日线：attach 按日期并入且不改行数",
+              len(d1) == 5 and "c1_close" in d1.columns
+              and float(d1["c1_close"].iloc[0]) == float(curve["c1_close"].iloc[0]))
+    except Exception as exc:  # noqa: BLE001
+        check("分钟级衍生列", False, f"{type(exc).__name__}: {exc}")
+
+
 def check_live_helpers() -> None:
     """实时行情的纯逻辑：占位行、时区、与本地历史的拼接。
 
@@ -1085,6 +1160,24 @@ def check_strategy_runner() -> None:
         st5.signal = 0
         r._refresh_signal(st5)
         check("信号：同一根 bar 不重算", st5.signal == 0, str(st5.signal))
+
+        # 最后一根是正在走的活 bar。拿它算，开盘那一瞬 close==open，突破类条件
+        # 会在开盘成立、收盘又消失 —— 实盘比回测早一根进场。这里追加一根「开盘
+        # 就砸到 1000」的活 bar：算进去的话快线会掉到慢线下方（信号变 0），
+        # 只喂已收盘的 bar 则应当维持上一根的多头信号
+        live = pd.concat([bars, pd.DataFrame({
+            "datetime": [base + n * 300 * 10**9],
+            "open": [1000.0], "high": [1000.0], "low": [1000.0],
+            "close": [1000.0], "volume": [100.0],
+            "open_oi": [1000.0], "close_oi": [1000.0],
+        })]).reset_index(drop=True)
+        r._klines[c5.key()] = live
+        r._refresh_signal(st5)
+        check("信号：新 bar 到了会用刚收盘的那根重算",
+              st5.last_bar == int(live["datetime"].iloc[-1]), str(st5.last_bar))
+        check("信号：正在走的活 bar 不参与计算（开盘假信号）",
+              st5.signal == 1 and st5.target == 2,
+              f"signal={st5.signal} target={st5.target}")
 
         # 周期不认识时必须在 enable 就拒掉，而不是等订阅时抛 KeyError 把策略打死
         bad = St.StrategyConfig(sid="s9", symbol="RB", exchange="SHFE",
@@ -2427,6 +2520,26 @@ def check_result_view() -> None:
               str(many.tbl_trades.columnCount()))
         check("视图：单策略交易表不带策略列", one.tbl_trades.columnCount() == 9,
               str(one.tbl_trades.columnCount()))
+
+        # 交易表不能截断。组合报告里三条策略的起点差七年，890 笔里最早的 390 笔
+        # 曾经被「只显示最近 500 笔」砍掉，表格第一行落在 2023 年，而资金曲线是
+        # 从 2016 年开始的 —— 看起来就像早年的交易丢了
+        from ttrade.backtest import Trade as _T
+
+        many.trades = [
+            ("策略", _T(
+                entry_date=pd.Timestamp("2016-01-04") + pd.Timedelta(days=i),
+                exit_date=pd.Timestamp("2016-01-05") + pd.Timedelta(days=i),
+                entry_price=100.0, exit_price=101.0, ret=0.01, bars=1,
+            ))
+            for i in reversed(range(620))
+        ]
+        many._refresh_trades()
+        check("视图：交易表全部列出（不截断到 500 笔）",
+              many.tbl_trades.rowCount() == 620, str(many.tbl_trades.rowCount()))
+        check("视图：交易表按开仓时间重排",
+              many.tbl_trades.item(0, 3).text() < many.tbl_trades.item(619, 3).text(),
+              f"{many.tbl_trades.item(0, 3).text()} → {many.tbl_trades.item(619, 3).text()}")
         many.clear("清空")
         check("视图：清空后没有残留结果", many.res is None)
         app.processEvents()
@@ -2451,6 +2564,7 @@ def main() -> int:
     check_main_backfill()
     check_strategy_store()
     check_strategy_runner()
+    check_intraday_aux()
     check_library_docs()
     check_agent()
     check_agent_stream()

@@ -21,7 +21,7 @@ import pandas as pd
 
 from . import tqstore as S
 from .paths import data_dir
-from .tqdata import trading_days
+from .tqdata import source_period, trading_days
 from .tqsdk_symbols import main_symbol, read_account, to_ts
 
 
@@ -632,6 +632,9 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int) -> dict:
        meta，下次跳过。
     """
     key = f"{sym}_{ex}"
+    # 15m/30m 归到 5m、2h/4h 归到 1h：合约明细只有 5m/1h 两种，其余周期在读取时
+    # 合并。不归一的话 `PERIOD_SEC[period]` 直接 KeyError
+    period = source_period(period)
     end = date.today()
     start = end - timedelta(days=365 * years)
 
@@ -737,7 +740,12 @@ def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
 
     `on_row(key, rows, first_dt)` 是进度回调：命令行用它打日志，界面用它刷状态。
     返回 `{品种_交易所: 本次写入行数}`。
+
+    **`period` 会先归一成源周期**（`tqdata.source_period`）：天勤只下 5m 和 1h，
+    15m/30m 是 5m 合并、2h/4h 是 1h 合并。传 15m 进来也只会去补 5m —— 这才和
+    读取端对得上，也顺带避开 `PERIOD_SEC` 里没有 15m 的 KeyError。
     """
+    period = source_period(period)
     end = date.today()
     hard_start = end - timedelta(days=365 * years)
 
@@ -877,6 +885,9 @@ def update_main(symbol: str, exchange: str, period: str = "5m",
 
     界面在「选中品种 + 周期」之后调它把本地缺口补上，再交给实时推送。
     断线时抛异常由调用方决定要不要重试 —— 这里不吞。
+
+    `period` 传目标周期即可（15m / 2h 都行），下载时按源周期补：1h 以下（不含
+    1h）补 5m，1h 到日线之间补 1h，再由 `tqdata.load_main` 合并成目标周期。
     """
     sess = Session()
     try:

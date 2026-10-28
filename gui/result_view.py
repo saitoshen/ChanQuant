@@ -1261,11 +1261,20 @@ class ResultView(QObject):
     # ---------------------------------------------------------- 交易记录
 
     def _refresh_trades(self) -> None:
-        """逐笔交易表。只显示最近 500 笔 —— 再多人也不会一页页翻。"""
+        """逐笔交易表。**全部列出**，不截断。
+
+        曾经只显示最近 500 笔，理由是「再多人也不会一页页翻」。但组合报告里三条
+        策略的起点差七年，890 笔里最早的 390 笔被砍掉之后，表格第一行落在 2023
+        年，而资金曲线是从 2016 年开始的 —— 看起来像「早年的交易丢了」。逐笔明细
+        本来就是要能对着曲线查的，少一段就等于不能查，宁可让人滚鼠标。
+        """
         tbl = getattr(self, "tbl_trades", None)
         if tbl is None:
             return
-        rows = list(self.trades)
+        # 按开仓时间排。单策略的 `res.trades` 是「平仓顺序」（平一笔追加一笔），
+        # 组合的是 `combine_trades` 混排过的 —— 两边的行号对不上同一条时间轴，
+        # 对着资金曲线查的时候很容易看串行。这里统一按开仓时间排。
+        rows = sorted(self.trades, key=lambda nt: (nt[1].entry_date, nt[1].exit_date))
         with_name = self.kind == "portfolio"
         n_closed = sum(1 for _n, t in rows if not t.open_position)
         n_open = len(rows) - n_closed
@@ -1285,7 +1294,7 @@ class ResultView(QObject):
             + ("　（组合：按策略分别平仓，不合并对冲）" if with_name else "")
         )
 
-        shown = rows[-500:] if len(rows) > 500 else rows
+        shown = rows
         tbl.setRowCount(len(shown))
         for i, (name, t) in enumerate(shown):
             d = "多" if t.direction > 0 else "空"

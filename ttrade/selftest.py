@@ -138,6 +138,43 @@ def _run() -> tuple[bool, list[str]]:
 
     check("天勤分钟级行情", _tq_data)
 
+    def _tq_aux():
+        """分钟级也要算得出展期因子。
+
+        `data_futures_aux/` 是日频的，分钟 bar 的时间戳里根本没有 00:00 这个点，
+        按日期 join 一根都命中不上 —— 1h / 5m 的展期、期权因子曾长期整列 NaN，
+        而界面上只表现为「算不出来」，不会报错。这里直接量「加载之后有值」。
+        """
+        import os
+
+        from ttrade import auxdata as A
+        from ttrade import factors as F
+        from ttrade import tqdata as T
+        from ttrade import tqstore as S
+
+        if not S.exists():
+            return "未下载（可选）"
+        aux_dir = A._default_dir()
+        for sym, ex in S.switch_symbols():
+            if not os.path.exists(A.curve_path(aux_dir, sym, ex)):
+                continue
+            for period in ("1h", "5m"):
+                if not T.has_period(sym, ex, period):
+                    continue
+                df = T.load_main(sym, ex, period).tail(500)
+                out = A.attach_intraday(df, sym, ex)
+                if "c1_close" not in out.columns:
+                    raise RuntimeError(f"{sym}_{ex} {period} 没挂上期限结构列")
+                ry = F.f_roll_yield(out)
+                if float(ry.notna().mean()) < 0.99:
+                    raise RuntimeError(
+                        f"{sym}_{ex} {period} 展期收益率只有 {ry.notna().mean():.0%} 有值"
+                    )
+                return f"{sym}_{ex} {period} 展期收益率 {ry.notna().mean():.0%} 有值"
+        return "没有同时具备分钟行情和衍生数据的品种（可选）"
+
+    check("分钟级衍生列", _tq_aux)
+
     def _backtest():
         from ttrade.backtest import BacktestConfig, run_backtest
         from ttrade.eastmoney import load_local

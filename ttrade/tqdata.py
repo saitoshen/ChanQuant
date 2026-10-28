@@ -51,6 +51,17 @@ PERIOD_LABEL = {
 }
 
 
+def source_period(period: str) -> str:
+    """目标周期 → 真正要下载的那个周期。
+
+    天勤只给 5m 和 1h 两种原生 bar，其余周期都是本地合并出来的（见上面的
+    `PERIODS`）。所以补历史必须**按源周期**下：直接下 15m 存成 15m，既违背
+    「周期是合并出来的」这套约定，读的时候也只会去找 5m —— 白下一场，界面上
+    还是「没有数据」。1d 没有合并关系，原样返回。
+    """
+    return PERIODS.get(period, (period, 1))[0]
+
+
 def tq_root() -> str:
     return os.path.join(os.path.dirname(data_dir("cn").rstrip("/\\")), "data_tq")
 

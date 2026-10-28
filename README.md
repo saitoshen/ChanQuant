@@ -70,6 +70,12 @@ cp token.example.txt token.txt      # 然后把 token 填进去；token.txt 不�
 .venv\Scripts\python.exe launcher.py
 ```
 
+天勤只给 **5m 和 1h** 两种原生 bar，其余周期在本地合并：`15m = 5m × 3`、
+`30m = 5m × 6`、`2h = 1h × 2`、`4h = 1h × 4`。所以「补历史」永远只补源周期 ——
+界面上选 15m 去补，实际下的是 5m；选 2h 去补，实际下的是 1h。反过来（直接下
+15m 存成 15m）会两头落空：读的时候 `load_main("15m")` 只去找 5m，白下一场，
+界面上还是「没有数据」。
+
 补数据：`download.py --missing`、`download_futures.py --missing` 只补缺失或过期标的。
 
 离线自测（不联网，验证逻辑而不只是「能跑」）：
@@ -78,7 +84,7 @@ cp token.example.txt token.txt      # 然后把 token 填进去；token.txt 不�
 .venv\Scripts\python.exe smoke_test_updater.py   # 增量更新：38 项
 .venv\Scripts\python.exe smoke_test_factors.py   # 因子链路：179 项（含未来函数探针）
 .venv\Scripts\python.exe smoke_test_factors.py --fast   # 跳过 Transformer，快 1.5 秒
-.venv\Scripts\python.exe smoke_test_tq.py        # 天勤链路：2294 项（平今/追单/换月/SSE）
+.venv\Scripts\python.exe smoke_test_tq.py        # 天勤链路：2516 项（平今/追单/换月/SSE/衍生列）
 .venv\Scripts\python.exe smoke_test_mutation.py  # 变异检验：6 项，证明探针不是摆设
 .venv\Scripts\python.exe scan_ic.py              # 全样本因子 IC（README 里那两张表的来源）
 ```
@@ -175,7 +181,7 @@ Claw/
 ├── backtest_all.py        # 批量回测 + 报告生成（--market us|cn）
 ├── scan_ic.py             # 全样本因子 IC 扫描（逐品种时序 IC 再跨品种平均）
 ├── smoke_test_factors.py  # 因子/因子策略离线自测（179 项，含未来函数探针）
-├── smoke_test_tq.py       # 天勤链路自测（2465 项，含平今/追单/换月/SSE 解析/结果视图）
+├── smoke_test_tq.py       # 天勤链路自测（2516 项，含平今/追单/换月/SSE 解析/结果视图）
 ├── smoke_test_gui.py      # 界面冒烟（离屏建窗口、切页、渲染）
 ├── smoke_test_mutation.py # 变异检验：证明上面那些探针真能抓到未来函数
 ├── smoke_test_updater.py  # 增量更新引擎离线自测（38 项，全部打桩）
@@ -221,7 +227,7 @@ Claw/
 │   ├── us_tushare.py      # Tushare 美股通道（一分钟一次限速 + 额度熔断）
 │   ├── paths.py           # 路径解析（区分只读资源 / 可写目录，兼容打包）
 │   ├── plotstyle.py       # matplotlib 跨平台中文字体
-│   ├── selftest.py        # 打包后自检（17 项，含端到端建窗口与因子链路）
+│   ├── selftest.py        # 打包后自检（20 项，含端到端建窗口与因子链路）
 │   ├── strategies.py      # 5 套规则策略
 │   ├── factors.py         # 47 个 PIT 因子 / 9 类 + 滚动标准化
 │   ├── factor_metrics.py  # IC / ICIR / Newey-West t / IC 衰减 / 分位收益
@@ -296,6 +302,16 @@ Tushare fut_daily(trade_date=D)  ──┐
                                    ├─► 按日聚合 ─► data_futures_aux/ ─► 加载时 join 进 df ─► 因子
 Tushare opt_daily(trade_date=D)  ──┘
 ```
+
+**日线和分钟线挂法不一样**，这是两套口径，别混：
+
+| 行情 | 怎么挂 | 为什么 |
+|---|---|---|
+| 日线 | `auxdata.attach()`：按日期 `join` | 那根 K 线的收盘价和期限结构是同一天同一时刻算出来的，谁都不领先谁 |
+| 1h / 5m | `auxdata.attach_intraday()`：先 `ffill` 铺成「一天一行」，再 `shift(1)`，然后按交易日映射到每根 bar | 上午 09:05 的 bar 不可能知道当天 15:00 收盘后才有的近远月价差；按日期硬 join 还会一根都命中不上（分钟 bar 没有 00:00 这个点），整列 NaN |
+
+顺带一条：`展期变化` 和 `期权 IV 的 20 日变化` 在分钟级上按**交易日**取 20 天
+（先压日频、diff 完再铺回去），不是「20 根 bar」—— 5m 的 20 根只有 100 分钟。
 
 **为什么要真实合约**：主力连续是把不同月份的合约拼成一条曲线，回答不了期限结构。
 `fut_basic(fut_type="1")` 给出全部真实合约（6 个交易所共 11135 个），
@@ -1368,7 +1384,13 @@ K 线与信号 / 绩效对比 / 因子分析 / 交易记录 / 阶段分析。按
 
 **交易记录按开仓时间混排**（`combine_trades`）。按策略分组拼接的话，表格是「A 从 2023
 一路做到 2026，然后 B 又从 2023 开始」，读起来像先后跑了两遍，而不是两条策略在同一段
-时间里并行。
+时间里并行。单策略视图也按开仓时间重排 —— `Result.trades` 本来是「平仓顺序」，两个
+视图的行号对不上同一条时间轴，对着曲线查容易看串行。
+
+**全部列出，不截断**。曾经只显示最近 500 笔，理由是「再多人也不会一页页翻」。但三条
+策略的起点差七年时，890 笔里最早的 390 笔被砍掉，表格第一行落在 2023 年，而资金曲线
+是从 2016 年开始的 —— 看起来就像早年的交易丢了。逐笔明细本来就是要能对着曲线查的，
+少一段等于不能查。
 
 **交易 Agent 发起的 backtest 也落在这一页**，不进「策略研究」：那边是用户手上正在调的
 那套参数，模型问一句就把它冲掉说不过去。结果同样推一份到 Agent 页右下角的「运行输出」，
@@ -1378,6 +1400,20 @@ K 线与信号 / 绩效对比 / 因子分析 / 交易记录 / 阶段分析。按
 一个账户，同账号再开第二个连接还会把第一个踢下线。所以「策略 A 跑在账户甲、策略 B
 跑在账户乙」只能靠多条连接，一条连接一个 `PortfolioRunner`。`cfg.account` 为空的策略
 跟随顶部那个默认账户。
+
+**成交时点：T 根收盘出信号，T+1 根开盘成交**。回测引擎里是 `target = np.roll(sig, 1)`，
+实时链路必须同口径，否则「回测赚钱、实盘亏钱」永远说不清是谁的问题。天勤的 K 线序列
+最后一根是**正在走的活 bar**，它的 `datetime` 在新 bar 出现时就变了，但 OHLC 要到收盘
+才定。拿它算信号有两个毛病：开盘那一瞬 `close == open`，突破 / 偏离类条件会在开盘就
+成立、收盘又消失，实盘比回测早一根进场，进的还是「开盘时的假信号」；ATR 这类用
+`high - low` 的量在开盘等于 0，止损线被算得极窄。所以 `_refresh_signal` 只喂已收盘的
+bar（`df.iloc[:-1]`）：此刻正是新 bar 刚开盘，用上一根收盘的信号在这一刻下单，就是
+回测里的 T+1 开盘成交。
+
+因子策略在实时段还要自己挂衍生列（`auxdata.attach_intraday`）。天勤的 K 线只有 OHLC
+和持仓量，展期 / 期权那十几个因子读的 `c1_close`、`iv_near` 全在衍生表里；研究页是
+`DataStore` 加载时挂的，实时这条链路自己拼 df，不挂就是整列 NaN —— 分数算不出来，
+策略永远空仓。
 
 **追单状态机必须经过 `cancelling`**：撤单和重报之间要等旧委托真的死掉。撤完立刻重报，
 会在旧单还有效的窗口里重复成交，一次信号变两倍仓位。所以是 `live → cancelling → 重报`，
@@ -1831,7 +1867,7 @@ git tag -a v1.0.1 -m "说明"
 git push origin v1.0.1
 ```
 
-每个平台打完包都会跑一次 `--selftest`，15 项全过才算成功，自检日志直接打到 CI 输出。
+每个平台打完包都会跑一次 `--selftest`，20 项全过才算成功，自检日志直接打到 CI 输出。
 
 > 注意：`data/` 与 `data_futures/`（约 32MB）需要一并提交，否则打出的包没有行情数据。
 > `.gitignore` 已排除 `.venv/`、`build/`、`dist/`、`output/`、`token.txt`。
