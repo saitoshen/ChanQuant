@@ -1452,6 +1452,18 @@ def check_strategy_runner() -> None:
               st5.signal == 1 and st5.target == 2,
               f"signal={st5.signal} target={st5.target}")
 
+        # **触发是按 bar 的，不是按 tick 的**。同一根 bar 里价格怎么跳都不该
+        # 重算信号 —— 重算就会在盘中反复翻仓，和回测「T 收盘出信号、T+1 开盘
+        # 成交」的口径彻底分叉。这里把活 bar 的收盘价从 1000 推到 9000，
+        # 信号和 last_bar 都必须一动不动
+        before = (st5.signal, st5.target, st5.last_bar)
+        for i in range(5):
+            live.iloc[-1, live.columns.get_loc("close")] = 1000.0 + i * 2000
+            r._refresh_signal(st5)
+        check("触发：同一根 bar 内推价不重算信号",
+              (st5.signal, st5.target, st5.last_bar) == before,
+              f"{before} → {(st5.signal, st5.target, st5.last_bar)}")
+
         # 周期不认识时必须在 enable 就拒掉，而不是等订阅时抛 KeyError 把策略打死
         bad = St.StrategyConfig(sid="s9", symbol="RB", exchange="SHFE",
                                 period="7m", rule_key="ma_cross", volume=1)
