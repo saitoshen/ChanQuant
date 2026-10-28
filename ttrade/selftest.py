@@ -175,6 +175,64 @@ def _run() -> tuple[bool, list[str]]:
 
     check("分钟级衍生列", _tq_aux)
 
+    def _qfq_tail():
+        """前复权之后，最后一根必须等于真实盘面价。
+
+        后复权会让最新价停在「按历史换月累计放大」的水平上（螺纹 3424 vs 盘面
+        3047），图上看着没事，但实盘按价格算保证金、算手数时就是另一套数 ——
+        回测 161 手、实盘 145 手，差在这里。所以这里逐品种比一次「前复权末值
+        vs 不复权末值」，两者不等就说明复权基准没归一到最新一根。
+        """
+        import os
+
+        from ttrade import futures
+        from ttrade import tqdata as T
+        from ttrade import tqstore as S
+
+        picked, bad = 0, []
+        if S.exists():
+            for sym, ex in S.switch_symbols():
+                for period in ("1h", "5m"):
+                    if not T.has_period(sym, ex, period):
+                        continue
+                    q = T.load_main(sym, ex, period, adjust="qfq")
+                    r = T.load_main(sym, ex, period, adjust="none")
+                    if not len(q) or not len(r):
+                        continue
+                    if q.index[-1] != r.index[-1]:
+                        continue
+                    picked += 1
+                    a, b = float(q["close"].iloc[-1]), float(r["close"].iloc[-1])
+                    if abs(a - b) > max(1e-6, abs(b) * 1e-9):
+                        bad.append(f"{sym}_{ex} {period} {a:.2f}≠{b:.2f}")
+                    break
+                if picked >= 3:
+                    break
+        for f in sorted(os.listdir(data_dir("cn"))):
+            if not f.endswith(".csv") or f.startswith("_"):
+                continue
+            key = f[:-4]
+            sym, _, ex = key.rpartition("_")
+            if not sym or not ex:
+                continue
+            try:
+                q = futures.load_local(sym, ex, data_dir("cn"), adjust="qfq")
+                r = futures.load_local(sym, ex, data_dir("cn"), adjust="none")
+            except Exception:  # noqa: BLE001
+                continue
+            picked += 1
+            a, b = float(q["close"].iloc[-1]), float(r["close"].iloc[-1])
+            if abs(a - b) > max(1e-6, abs(b) * 1e-9):
+                bad.append(f"{key} 日线 {a:.2f}≠{b:.2f}")
+            break
+        if bad:
+            raise RuntimeError("前复权末值不等于盘面价：" + "；".join(bad[:4]))
+        if not picked:
+            return "未下载（可选）"
+        return f"{picked} 个品种的前复权末值都等于真实盘面价"
+
+    check("前复权末值=盘面价", _qfq_tail)
+
     def _backtest():
         from ttrade.backtest import BacktestConfig, run_backtest
         from ttrade.eastmoney import load_local

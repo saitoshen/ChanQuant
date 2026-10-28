@@ -65,6 +65,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
@@ -342,10 +343,61 @@ class EditDialog(QDialog):
         self.ed_name.setPlaceholderText(cfg.title())
         form.addRow("名称", self.ed_name)
 
+        # ---- 仓位分配 ----
+        # 默认不再是「1 手」：1 手螺纹和 1 手铜差 40 倍名义价值，同一条策略在两个
+        # 品种上跑出来的风险完全不是一回事。默认按「分配资金 ÷ 每手保证金」铺满。
+        self.cb_size = QComboBox()
+        for text, val in (("按资金分配", "capital"),
+                          ("按止损金额", "risk"),
+                          ("固定手数", "fixed")):
+            self.cb_size.addItem(text, val)
+        i = self.cb_size.findData(cfg.sizing or "capital")
+        self.cb_size.setCurrentIndex(max(i, 0))
+        self.cb_size.setToolTip(
+            "按资金：手数 = 分配资金 ÷ 每手保证金。\n"
+            "杠杆由品种自己的保证金比例决定（商品、股指约 10 倍，国债 30~50 倍）。\n"
+            "按止损金额：手数 = 止损金额 ÷（止损倍数 × ATR × 合约乘数）。\n"
+            "固定手数：老的「几手」口径。"
+        )
+        form.addRow("仓位分配", self.cb_size)
+
+        self.sp_capital = QDoubleSpinBox()
+        self.sp_capital.setRange(1000, 100_000_000)
+        self.sp_capital.setDecimals(0)
+        self.sp_capital.setSingleStep(50000)
+        self.sp_capital.setSuffix(" 元")
+        self.sp_capital.setValue(float(cfg.capital or 500_000))
+        self.sp_capital.setToolTip("分给这条策略的钱。手数按每手保证金折算，不按「几手」拍。")
+        form.addRow("分配资金", self.sp_capital)
+
         self.sp_vol = QSpinBox()
         self.sp_vol.setRange(1, 9999)
         self.sp_vol.setValue(max(1, _int(cfg.volume) or 1))
-        form.addRow("手数", self.sp_vol)
+        form.addRow("固定手数", self.sp_vol)
+
+        self.sp_risk = QDoubleSpinBox()
+        self.sp_risk.setRange(1000, 100_000_000)
+        self.sp_risk.setDecimals(0)
+        self.sp_risk.setSingleStep(5000)
+        self.sp_risk.setSuffix(" 元")
+        self.sp_risk.setValue(float(cfg.risk_amount or 20_000))
+        self.sp_risk.setToolTip("打止损时最多亏这么多钱，手数由止损距离反推。")
+        form.addRow("止损金额", self.sp_risk)
+
+        self.sp_atr = QSpinBox()
+        self.sp_atr.setRange(2, 200)
+        self.sp_atr.setValue(max(2, _int(cfg.stop_atr_n) or 14))
+        form.addRow("止损 ATR 周期", self.sp_atr)
+
+        self.sp_stop = QDoubleSpinBox()
+        self.sp_stop.setRange(0.1, 50.0)
+        self.sp_stop.setSingleStep(0.5)
+        self.sp_stop.setDecimals(1)
+        self.sp_stop.setValue(float(cfg.stop_mult or 5.0))
+        form.addRow("止损 ATR 倍数", self.sp_stop)
+
+        self.cb_size.currentIndexChanged.connect(self._sync_size)
+        self._sync_size()
 
         self.chk_short = QCheckBox("允许做空")
         self.chk_short.setChecked(cfg.note == "short")
@@ -402,8 +454,29 @@ class EditDialog(QDialog):
         box.rejected.connect(self.reject)
         form.addRow(box)
 
+    def _sync_size(self) -> None:
+        """只显示当前口径用得上的字段，免得一堆数字看不出哪个生效。"""
+        mode = self.cb_size.currentData()
+        form = self.layout()
+        if form is None:
+            return
+        for w, on in ((self.sp_capital, mode == "capital"),
+                      (self.sp_vol, mode == "fixed"),
+                      (self.sp_risk, mode == "risk"),
+                      (self.sp_atr, mode == "risk"),
+                      (self.sp_stop, mode == "risk")):
+            try:
+                form.setRowVisible(w, on)
+            except (TypeError, AttributeError):   # 老 Qt 没有这个重载
+                pass
+
     def apply_to(self, cfg) -> None:
         cfg.name = self.ed_name.text().strip()
+        cfg.sizing = self.cb_size.currentData() or "capital"
+        cfg.capital = float(self.sp_capital.value())
+        cfg.risk_amount = float(self.sp_risk.value())
+        cfg.stop_atr_n = int(self.sp_atr.value())
+        cfg.stop_mult = float(self.sp_stop.value())
         cfg.volume = self.sp_vol.value()
         cfg.note = "short" if self.chk_short.isChecked() else ""
         cfg.account = self.cb_acct.currentData() or ""
@@ -604,7 +677,8 @@ class PortfolioPage(QWidget):
 
         btn_edit = QPushButton("设置参数")
         btn_edit.setObjectName("Ghost")
-        btn_edit.setToolTip("改手数、账户、策略参数（快线慢线…）和回测区间")
+        btn_edit.setToolTip("改仓位分配（资金 / 止损金额 / 固定手数）、账户、"
+                            "策略参数（快线慢线…）和回测区间")
         btn_edit.clicked.connect(self._edit_selected)
         head.addWidget(btn_edit)
 
@@ -619,7 +693,7 @@ class PortfolioPage(QWidget):
         head.addWidget(btn_del)
 
         self.tbl_strat = self._table(
-            ["名称", "标的", "策略", "手数", "账户", "理论", "实际", "状态"]
+            ["名称", "标的", "策略", "仓位", "账户", "理论", "实际", "状态"]
         )
         # 多选是为了组合报告。双击原来是「启动 / 停止」，但那个动作有同名按钮，
         # 而「看一眼这条策略的历史表现」没有别的入口 —— 双击给后者更值。
@@ -763,7 +837,7 @@ class PortfolioPage(QWidget):
                     cfg.name.strip() or cfg.title(),
                     f"{cfg.key()} {cfg.period}",
                     cfg.strategy_label(),
-                    str(cfg.volume),
+                    cfg.size_text(),
                     cfg.account or "默认",
                 ]
                 for j, v in enumerate(vals):
@@ -962,6 +1036,18 @@ class PortfolioPage(QWidget):
                 break
             theo = _int(slot.get("target"))
             real = _int(slot.get("actual"))
+            # 仓位列写「口径 → 实际算出来的手数」。手数依赖价格和每手保证金，
+            # 存盘时算不出来，只有引擎跑起来才知道 —— 所以两段拼在一起显示。
+            lots = _int(slot.get("lots"))
+            size = cfg.size_text() + (f" → {lots} 手" if lots > 0 else "")
+            self._set_cell(t, i, 3, size, C_TEXT)
+            it3 = t.item(i, 3)
+            if it3 is not None:
+                it3.setToolTip(
+                    f"每手保证金按品种自己的比例算（商品/股指约 10 倍，国债 30~50 倍）。"
+                    f"\n当前价下满仓 {lots} 手" if lots > 0 else
+                    "引擎还没算出实际手数（需要行情）"
+                )
             self._set_cell(t, i, 5, str(theo), C_TEXT)
             # 运行中且仓位对不上才标红。停掉的策略留着仓位往往是用户故意的，
             # 那是「未托管」的事，监控器里会单独列出来。
@@ -1164,7 +1250,7 @@ class PortfolioPage(QWidget):
             if self.ctl.running:
                 # 手数改了要让引擎立刻知道，否则得等下一根 bar 才按新手数调仓
                 self.ctl.update_cfg(self._account_of(cfg), cfg)
-            self._on_log(f"{cfg.title()}：{cfg.volume} 手")
+            self._on_log(f"{cfg.title()}：{cfg.size_text()}")
 
     def accept(self, cfg) -> str:
         """从「交易Agent」页送来的策略：加进组合，正在跑就直接挂上去。

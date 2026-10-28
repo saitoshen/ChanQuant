@@ -954,6 +954,8 @@ def check_strategy_runner() -> None:
         ask_price1 = 3050.0
         bid_price1 = 3049.0
         last_price = 3049.5
+        margin = 4000.0          # 每手保证金，定仓用
+        volume_multiple = 10     # 合约乘数，按止损金额定仓用
 
     class Order(dict):
         """tqsdk 3.x 的 `insert_order()` 返回的是这个：dict 子类，不可哈希。
@@ -982,13 +984,34 @@ def check_strategy_runner() -> None:
     try:
         r = PortfolioRunner(AccountSpec(name="t", kind="sim"), St.ChaseConfig())
 
+        # 平仓必须按实际今昨仓拆开。整笔当 CLOSE 发出去，超过昨仓的部分会被
+        # 交易所整单打回（截图上「平昨手数超过持仓仓量」刷屏就是这个）
         r._pos = {"SHFE.rb2701": Pos(long=3, long_today=2)}
-        check("平今：今仓够就平今", r._offset_for("SHFE.rb2701", "SELL", 2) == "CLOSETODAY")
-        check("平今：今仓不够就平昨", r._offset_for("SHFE.rb2701", "SELL", 3) == "CLOSE")
-        check("平今：空仓时开仓", r._offset_for("SHFE.cu2612", "BUY", 1) == "OPEN")
+        check("平仓：先平昨、再平今",
+              r._legs("SHFE.rb2701", -3) == [("CLOSE", 1), ("CLOSETODAY", 2)],
+              str(r._legs("SHFE.rb2701", -3)))
+        check("平仓：只平一部分时昨仓优先",
+              r._legs("SHFE.rb2701", -2) == [("CLOSE", 1), ("CLOSETODAY", 1)],
+              str(r._legs("SHFE.rb2701", -2)))
+        check("平仓：空仓时直接开仓",
+              r._legs("SHFE.cu2612", 1) == [("OPEN", 1)],
+              str(r._legs("SHFE.cu2612", 1)))
+        # 反手：+3 手多 → -2 手空，delta = -5，3 手平完还剩 2 手要开
+        check("平仓：反手先平后开",
+              r._legs("SHFE.rb2701", -5) == [("CLOSE", 1), ("CLOSETODAY", 2), ("OPEN", 2)],
+              str(r._legs("SHFE.rb2701", -5)))
         r._pos = {"CFFEX.IF2612": Pos(long=2, long_today=2)}
-        check("平今：中金所不分平今",
-              r._offset_for("CFFEX.IF2612", "SELL", 2) == "CLOSE")
+        check("平仓：中金所不分平今",
+              r._legs("CFFEX.IF2612", -2) == [("CLOSE", 2)],
+              str(r._legs("CFFEX.IF2612", -2)))
+
+        # 实盘 CTP 只填 volume_* 那一套，pos_* 全是 0。只读 pos_* 会把今仓当昨仓
+        p_ctp = Pos()
+        p_ctp.volume_short_today = 4
+        r._pos = {"SHFE.ag2612": p_ctp}
+        check("平仓：实盘只填 volume_* 也能认出今仓",
+              r._legs("SHFE.ag2612", 4) == [("CLOSETODAY", 4)],
+              str(r._legs("SHFE.ag2612", 4)))
 
         cfg = St.StrategyConfig(sid="s1", symbol="RB", exchange="SHFE",
                                 period="1d", rule_key="ma_cross", volume=2)
@@ -1091,8 +1114,11 @@ def check_strategy_runner() -> None:
         st.pending.clear()
         r._orders = None
 
-        # 改手数要让目标仓位立刻跟上，否则得等下一根 bar
+        # 改手数要让目标仓位立刻跟上，否则得等下一根 bar。
+        # 按资金/止损金额定仓时手数依赖价格，只能等下一根 bar 重算 —— 这里测的是
+        # 固定手数模式：手数就写在配置里，必须立刻生效
         cfg2 = cfg.clone(volume=5)
+        cfg2.sizing = "fixed"
         cfg2.sid = cfg.sid
         r.update(cfg2)
         check("改手数：目标仓位立刻重算", st.target == 5, str(st.target))
@@ -1122,6 +1148,56 @@ def check_strategy_runner() -> None:
         st.retired = []
         check("理论持仓：只算运行中的策略", r.theoretical() == {}, str(r.theoretical()))
 
+        # ---- 仓位分配：不再固定 1 手 ----
+        r.api = Api()
+        r._pos = {}
+        cap = St.StrategyConfig(sid="s-cap", symbol="RB", exchange="SHFE",
+                                period="1d", rule_key="ma_cross",
+                                sizing="capital", capital=500_000.0)
+        st_cap = r.add(cap)
+        st_cap.underlying = "SHFE.rb2701"
+        check("仓位：50 万 ÷ 每手保证金 4000 = 125 手",
+              r._lots(st_cap, 3049.5, 0.0) == 125, str(r._lots(st_cap, 3049.5, 0.0)))
+
+        rk = St.StrategyConfig(sid="s-risk", symbol="RB", exchange="SHFE",
+                               period="1d", rule_key="sbbox_mini",
+                               sizing="risk", risk_amount=20_000.0,
+                               stop_mult=5.0, stop_atr_n=14)
+        st_rk = r.add(rk)
+        st_rk.underlying = "SHFE.rb2701"
+        # 止损距离 5×20 = 100 点，乘数 10 → 每手亏 1000，2 万 ÷ 1000 = 20 手
+        check("仓位：按止损金额反推（2 万 / 5×ATR×乘数）",
+              r._lots(st_rk, 3049.5, 20.0) == 20, str(r._lots(st_rk, 3049.5, 20.0)))
+
+        fx = St.StrategyConfig(sid="s-fix", symbol="RB", exchange="SHFE",
+                               period="1d", rule_key="ma_cross",
+                               sizing="fixed", volume=7)
+        st_fx = r.add(fx)
+        st_fx.underlying = "SHFE.rb2701"
+        check("仓位：固定手数仍然可用", r._lots(st_fx, 3049.5, 20.0) == 7)
+
+        # 老配置没有 sizing 字段：按止损金额定仓的策略要自动走 risk
+        old_risk = St.StrategyConfig.from_dict(
+            {"sid": "s-old", "symbol": "RB", "exchange": "SHFE",
+             "rule_key": "sbbox_mini", "rule_params": {"stop_mult": 5.0}}
+        )
+        check("仓位：老配置里 sbbox_mini 自动按止损金额",
+              old_risk.sizing == "risk", old_risk.sizing)
+        old_cap = St.StrategyConfig.from_dict(
+            {"sid": "s-old2", "symbol": "RB", "exchange": "SHFE", "rule_key": "ma_cross"}
+        )
+        check("仓位：老配置默认按资金 50 万",
+              old_cap.sizing == "capital" and old_cap.capital == 500_000.0,
+              f"{old_cap.sizing} {old_cap.capital}")
+
+        # 保证金拿不到时按品种兜底：国债 3%（约 33 倍）、股指 12%（约 8 倍）
+        check("仓位：国债保证金率 3%", abs(R.default_margin_rate("T") - 0.03) < 1e-9)
+        check("仓位：股指保证金率 12%", abs(R.default_margin_rate("IF") - 0.12) < 1e-9)
+        check("仓位：商品保证金率 10%", abs(R.default_margin_rate("RB") - 0.10) < 1e-9)
+
+        for sid in ("s-cap", "s-risk", "s-fix"):
+            r.remove(sid)
+
         check("实时周期：覆盖分钟级与小时级",
               all(k in R.RT_SEC for k in ("5m", "15m", "30m", "1h", "2h", "4h", "1d")),
               str(sorted(R.RT_SEC)))
@@ -1143,8 +1219,11 @@ def check_strategy_runner() -> None:
             "open_oi": [1000.0] * n,
             "close_oi": [1000.0] * n,
         })
+        # 固定 2 手：这一段测的是「K 线 → 信号 → 目标仓位」，手数怎么来的
+        # 由上面「仓位分配」那几条单独覆盖
         c5 = St.StrategyConfig(sid="s5", symbol="RB", exchange="SHFE",
-                               period="5m", rule_key="ma_cross", volume=2,
+                               period="5m", rule_key="ma_cross",
+                               sizing="fixed", volume=2,
                                rule_params={"fast": 5, "slow": 20})
         st5 = r.add(c5)
         r._klines[c5.key()] = bars
@@ -1188,6 +1267,60 @@ def check_strategy_runner() -> None:
               not st_bad.running and "周期" in st_bad.error, st_bad.error)
     except Exception as exc:  # noqa: BLE001
         check("多策略引擎", False, f"{type(exc).__name__}: {exc}")
+
+
+def check_sizing() -> None:
+    """回测的仓位口径。三条规则最容易悄悄改坏：
+
+    - 按资金分配是**单利**：赚了不加大仓、亏了不缩仓
+    - 期货一手是「价格 × 合约乘数」，忘了乘数就是 10 倍杠杆
+    - 「名义敞口 = 权益」不能把本金全押成保证金
+    """
+    from ttrade.backtest import BacktestConfig, buy_and_hold, run_backtest, size_lots
+
+    base = dict(multiplier=10.0, margin_rate=0.10, capital=500_000.0)
+    cap = BacktestConfig(sizing="capital", **base)
+    # 价格 3000、乘数 10、保证金 10% → 每手 3000，50 万正好 166 手
+    check("仓位：50 万 ÷ (3000×10×10%) = 166 手",
+          size_lots(cap, 3000.0, 500_000.0) == 166,
+          str(size_lots(cap, 3000.0, 500_000.0)))
+    # 单利：权益翻倍 / 腰斩都不影响手数
+    check("仓位：按资金分配是单利（赚了不加仓）",
+          size_lots(cap, 3000.0, 1_000_000.0) == 166,
+          str(size_lots(cap, 3000.0, 1_000_000.0)))
+    check("仓位：按资金分配是单利（亏了不减仓）",
+          size_lots(cap, 3000.0, 200_000.0) == 166,
+          str(size_lots(cap, 3000.0, 200_000.0)))
+
+    risk = BacktestConfig(sizing="risk", **base)
+    # 2 万 ÷ (5 × ATR 20 × 乘数 10) = 20 手
+    check("仓位：止损 2 万 ÷ (5×20×10) = 20 手",
+          size_lots(risk, 3000.0, 500_000.0, 20.0) == 20,
+          str(size_lots(risk, 3000.0, 500_000.0, 20.0)))
+
+    unit = BacktestConfig(sizing="unit", **base)
+    # 名义敞口 = 权益：50 万 ÷ (3000×10) = 16.7 手，不是 166 手
+    check("仓位：本金全额口径不乘杠杆",
+          abs(size_lots(unit, 3000.0, 500_000.0) - 16.6667) < 0.01,
+          str(size_lots(unit, 3000.0, 500_000.0)))
+
+    # 真跑一遍。手数会跟着开仓价变（价高就少开几手），但**名义敞口**必须
+    # 一直钉在「分配资金 × 杠杆」上 —— 那才是单利；跟着权益走就是复利
+    n = 400
+    idx = pd.date_range("2020-01-01", periods=n, freq="D")
+    px = pd.Series(3000.0 + np.sin(np.arange(n) / 9.0) * 10.0, index=idx)
+    df = pd.DataFrame({"open": px, "high": px * 1.001, "low": px * 0.999,
+                       "close": px, "signal": (np.arange(n) // 40) % 2})
+    res = run_backtest(df, BacktestConfig(sizing="capital", **base))
+    notional = [t.lots * 10.0 * t.entry_price for t in res.trades]
+    check("仓位：单利下名义敞口固定在 500 万",
+          bool(notional) and max(abs(x - 5_000_000) for x in notional) < 32_000,
+          f"{min(notional or [0]):,.0f}~{max(notional or [0]):,.0f}")
+
+    # 基准必须和策略同口径，否则「策略 vs 买入持有」是在比杠杆
+    bh = buy_and_hold(df, BacktestConfig(sizing="capital", **base))
+    check("仓位：买入持有与策略同口径",
+          abs(bh.trades[0].lots - 166) < 0.01, str(bh.trades[0].lots))
 
 
 def check_library_docs() -> None:
@@ -2516,10 +2649,39 @@ def check_result_view() -> None:
         # 画不出来就是一片空白，而界面上不会报错
         many.show_result(None, None, combo, None, many.ctx)
         check("视图：组合无基准也能渲染", many.res is not None and len(many.res.equity) > 0)
-        check("视图：组合交易表带策略列", many.tbl_trades.columnCount() == 10,
+        check("视图：组合交易表带策略列", many.tbl_trades.columnCount() == 11,
               str(many.tbl_trades.columnCount()))
-        check("视图：单策略交易表不带策略列", one.tbl_trades.columnCount() == 9,
+        check("视图：单策略交易表不带策略列", one.tbl_trades.columnCount() == 10,
               str(one.tbl_trades.columnCount()))
+
+        # K 线页：信号必须画在「下一根开盘」上。回测是 T 收盘出信号、T+1 开盘
+        # 成交，画在信号那根的收盘价上会让人以为按收盘价成交，和回测对不上
+        from gui.result_view import ViewCtx
+
+        one.show_result(r1.df, r1.df, r1.res, r1.bh,
+                        ViewCtx(symbol="TEST", period="1d", market="cn", label="MA"))
+        sig = r1.df["signal"].to_numpy(int)
+        t0 = r1.res.trades[0]
+        pos = list(r1.df.index).index(t0.entry_date)
+        check("K线：开仓落在信号后的那一根",
+              sig[pos - 1] == 1 and sig[pos - 2] != 1,
+              f"第 {pos} 根，前一根 signal={sig[pos - 1]}")
+        check("K线：成交价是那一根的开盘价",
+              abs(t0.entry_price / float(r1.df["open"].iloc[pos]) - 1) < 0.01,
+              f"{t0.entry_price:.2f} vs {float(r1.df['open'].iloc[pos]):.2f}")
+
+        # 十字光标：双击开启后，信息框要给出时间 + 开高低收，遇到信号根还要
+        # 带上开平方向、成交价、手数
+        one._k_cross = True
+        one._show_cross(0)
+        tip = one._bar_text(0)
+        check("K线：十字光标给出开高低收",
+              all(k in tip for k in ("开 ", "高 ", "低 ", "收 ")), tip.replace("\n", " / "))
+        check("K线：十字光标可见", one._k_tip.get_visible())
+        note = one._k_notes.get(t0.entry_date) or []
+        check("K线：信号根带开平信息", bool(note) and "手" in note[0], str(note))
+        one._hide_cross()
+        check("K线：十字光标可关闭", not one._k_tip.get_visible())
 
         # 交易表不能截断。组合报告里三条策略的起点差七年，890 笔里最早的 390 笔
         # 曾经被「只显示最近 500 笔」砍掉，表格第一行落在 2023 年，而资金曲线是
@@ -2531,6 +2693,7 @@ def check_result_view() -> None:
                 entry_date=pd.Timestamp("2016-01-04") + pd.Timedelta(days=i),
                 exit_date=pd.Timestamp("2016-01-05") + pd.Timedelta(days=i),
                 entry_price=100.0, exit_price=101.0, ret=0.01, bars=1,
+                lots=3,
             ))
             for i in reversed(range(620))
         ]
@@ -2540,6 +2703,11 @@ def check_result_view() -> None:
         check("视图：交易表按开仓时间重排",
               many.tbl_trades.item(0, 3).text() < many.tbl_trades.item(619, 3).text(),
               f"{many.tbl_trades.item(0, 3).text()} → {many.tbl_trades.item(619, 3).text()}")
+        # 手数列：回测按手数下单之后，逐笔明细要能对着看「这笔下了几手」
+        check("视图：交易表有手数列", many.tbl_trades.horizontalHeaderItem(7).text() == "手数",
+              many.tbl_trades.horizontalHeaderItem(7).text())
+        check("视图：手数按笔显示", many.tbl_trades.item(0, 7).text() == "3",
+              many.tbl_trades.item(0, 7).text())
         many.clear("清空")
         check("视图：清空后没有残留结果", many.res is None)
         app.processEvents()
@@ -2564,6 +2732,7 @@ def main() -> int:
     check_main_backfill()
     check_strategy_store()
     check_strategy_runner()
+    check_sizing()
     check_intraday_aux()
     check_library_docs()
     check_agent()

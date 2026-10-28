@@ -40,6 +40,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 
@@ -62,6 +63,37 @@ FACTOR_MIN_BARS = 300
 # 天勤的 `get_kline_serial` 本身支持 15m / 30m / 2h / 4h，实时段不用像本地历史
 # 那样由 5m/1h 合并出来。
 RT_SEC = {**PERIOD_SEC, "15m": 900, "30m": 1800, "2h": 7200, "4h": 14400}
+
+
+def default_margin_rate(symbol: str) -> float:
+    """品种的默认保证金率。杠杆 = 1 / 保证金率。
+
+    只在拿不到交易所实时保证金时兜底（`quote.margin` 一般都有）。商品、股指
+    约 10 倍，国债 30~50 倍 —— 国债波动小、保证金低，同样的钱能铺更多手，
+    这正是不该用「固定几手」的理由。
+    """
+    s = (symbol or "").upper()
+    if s in ("T", "TF", "TS", "TL"):
+        return 0.03            # 国债期货：约 33 倍
+    if s in ("IF", "IH", "IC", "IM"):
+        return 0.12            # 股指期货：约 8 倍
+    return 0.10                # 商品期货：约 10 倍
+
+
+def atr(df: pd.DataFrame, n: int = 14) -> float:
+    """真实波幅均值（最后一根）。给「按止损金额定仓」反推手数用。
+
+    和 `sbbox_mini` 里的算法一致：`max(h-l, |h-c[-1]|, |l-c[-1]|)` 的 N 根均值。
+    """
+    n = max(1, int(n or 14))
+    if df is None or len(df) < 2:
+        return 0.0
+    h, l, c = df["high"], df["low"], df["close"]
+    prev = c.shift(1)
+    tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    v = tr.rolling(n, min_periods=n).mean()
+    val = float(v.iloc[-1]) if len(v) else 0.0
+    return val if math.isfinite(val) and val > 0 else 0.0
 
 
 # ------------------------------------------------------------------ 状态
@@ -89,6 +121,7 @@ class SlotState:
     cfg: SStore.StrategyConfig
     running: bool = False
     signal: int = 0
+    lots: int = 1              # 一次满仓对应几手（按资金 / 止损金额算出来）
     target: int = 0            # 策略理论净仓（手）
     actual: int = 0            # 账户在该合约上的实际净仓
     underlying: str = ""       # 当前真实主力合约
@@ -199,7 +232,12 @@ class PortfolioRunner:
         # 手数变了目标仓位跟着变，立刻重算 —— 不然要等下一根 bar 才调整。
         # 停着的时候也算：`_rebalance` 只对 running 的槽位生效，重新启动时
         # 若刚好没出新 bar（`_refresh_signal` 会早退），靠的就是这个值。
-        st.target = st.signal * max(1, int(cfg.volume or 1))
+        # `lots` 是上一根 bar 按价格算出来的手数；改分配资金后要等下一次
+        # `_refresh_signal` 才会重算，所以下面还要清 last_bar。
+        # 固定手数模式例外：手数就写在配置里，立刻生效，不用等行情。
+        if (cfg.sizing or "capital").lower() == "fixed":
+            st.lots = max(1, int(cfg.volume or 1))
+        st.target = st.signal * max(1, st.lots)
         # 策略参数（快线 / 慢线）也可能一起改了。不清掉 last_bar 的话，
         # `_refresh_signal` 认为「这根 bar 算过了」直接早退，新参数要等下一根
         # K 线才生效 —— 用户会以为改了没用。
@@ -302,7 +340,8 @@ class PortfolioRunner:
         st.signal = self._signal(st, df)
         if st.cfg.note != "short":
             st.signal = max(0, st.signal)     # 不允许做空时把空头信号裁掉
-        st.target = st.signal * max(1, int(st.cfg.volume))
+        st.lots = self._lots(st, self._mark_price(st, df), atr(df, st.cfg.stop_atr_n))
+        st.target = st.signal * st.lots
 
     def _signal(self, st: SlotState, df: pd.DataFrame) -> int:
         """按当前配置算出最后一根 bar 上的目标仓位（-1 / 0 / 1）。
@@ -345,6 +384,71 @@ class PortfolioRunner:
         except Exception:  # noqa: BLE001
             return df
 
+    # ---- 手数 ----
+
+    def _contract_quote(self, symbol: str):
+        """真实合约的行情对象。拿不到就返回 None —— 定仓失败不该让策略停机。"""
+        if self.api is None or not symbol:
+            return None
+        try:
+            return self.api.get_quote(symbol)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _mark_price(self, st: SlotState, df: pd.DataFrame) -> float:
+        """算手数用的价格。优先真实合约的最新价，没有就用最后一根收盘。"""
+        q = self._contract_quote(st.underlying)
+        p = float(getattr(q, "last_price", 0) or 0) if q is not None else 0.0
+        if p > 0 and math.isfinite(p):
+            return p
+        try:
+            return float(df["close"].iloc[-1])
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    @staticmethod
+    def _margin_per_lot(q, price: float, mult: float, symbol: str) -> float:
+        """每手保证金。优先用交易所给的 `quote.margin`，没有才按乘数 × 保证金率估。"""
+        m = float(getattr(q, "margin", 0) or 0) if q is not None else 0.0
+        if m > 0 and math.isfinite(m):
+            return m
+        if mult <= 0 or price <= 0:
+            return 0.0
+        return price * mult * default_margin_rate(symbol)
+
+    def _lots(self, st: SlotState, price: float, atr_value: float) -> int:
+        """这条策略满仓该下几手。
+
+        - `capital`：手数 = 分配资金 / 每手保证金。50 万铺 10 倍杠杆的品种就是
+          500 万名义价值；1 手 10 万的合约正好 50 手。国债保证金低（3% 左右），
+          同样的钱自然铺出更多手 —— 这就是「杠杆按品种自己的保证金比例」的意思。
+        - `risk`：手数 = 止损金额 / (止损距离 × 合约乘数)。止损距离 = 倍数 × ATR，
+          和策略自己的止损口径一致，所以「打止损就亏 2 万」是真的 2 万。
+        - `fixed`：老行为，固定手数。
+        """
+        cfg = st.cfg
+        mode = (cfg.sizing or "capital").lower()
+        if mode == "fixed":
+            return max(1, int(cfg.volume or 1))
+
+        q = self._contract_quote(st.underlying)
+        try:
+            mult = float(getattr(q, "volume_multiple", 0) or 0) if q is not None else 0.0
+        except (TypeError, ValueError):
+            mult = 0.0
+
+        if mode == "risk":
+            stop_px = max(0.0, float(cfg.stop_mult or 0)) * float(atr_value or 0)
+            if stop_px <= 0 or mult <= 0:
+                return 1                     # 拿不到 ATR / 乘数：先 1 手，别裸奔
+            per_lot = stop_px * mult
+            return max(1, int(float(cfg.risk_amount or 0) / per_lot))
+
+        per_margin = self._margin_per_lot(q, price, mult, cfg.symbol)
+        if per_margin <= 0:
+            return 1
+        return max(1, int(float(cfg.capital or 0) / per_margin))
+
     # ---- 调仓 ----
 
     def _net_pos(self, symbol: str) -> int:
@@ -380,29 +484,65 @@ class PortfolioRunner:
             return
         self._send(st, st.underlying, delta)
 
-    def _offset_for(self, symbol: str, direction: str, volume: int) -> str:
-        """开仓 / 平今 / 平仓。
+    def _split_pos(self, symbol: str, side: str) -> tuple[int, int]:
+        """(昨仓, 今仓)。`side` 是 long / short。
 
-        上期所、大商所、郑商所区分平今；中金所不区分（一律 CLOSE）。
-        判断依据是「要平的那一侧有多少今仓」：今仓够就 CLOSETODAY，否则 CLOSE。
+        天勤有**两套**字段描述同一件事：模拟盘填 `pos_long_his` / `pos_long_today`，
+        实盘 CTP 填 `volume_long_his` / `volume_long_today`。只读一套的话，另一套
+        环境里今仓恒为 0 —— 明明全是今天开的仓，也会被判成「昨仓足够」而发 CLOSE，
+        交易所直接打回「平昨手数超过持仓仓量」，追单再把这笔注定失败的单重报几次。
         """
-        if self._pos is None:
-            return "OPEN"
-        p = self._pos.get(symbol)
+        p = self._pos.get(symbol) if self._pos is not None else None
         if p is None:
-            return "OPEN"
-        # 卖出平多头，买入平空头
-        if direction == "SELL":
-            total = int(getattr(p, "pos_long", 0) or 0)
-            today = int(getattr(p, "pos_long_today", 0) or 0)
-        else:
-            total = int(getattr(p, "pos_short", 0) or 0)
-            today = int(getattr(p, "pos_short_today", 0) or 0)
-        if total <= 0:
-            return "OPEN"
-        if symbol.startswith("CFFEX"):
-            return "CLOSE"
-        return "CLOSETODAY" if today >= volume else "CLOSE"
+            return 0, 0
+
+        def _i(name: str) -> int:
+            try:
+                return int(getattr(p, name, 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        his = max(_i(f"pos_{side}_his"), _i(f"volume_{side}_his"))
+        today = max(_i(f"pos_{side}_today"), _i(f"volume_{side}_today"))
+        total = max(_i(f"pos_{side}"), _i(f"volume_{side}"))
+        if his + today < total:
+            # 今昨明细缺失（或只填了总数）：多出来的按昨仓算 —— 平昨先发出去，
+            # 今仓那部分下一笔再补 CLOSETODAY，不会一上来就把整单打回
+            his = total - today
+        return his, today
+
+    def _legs(self, symbol: str, delta: int) -> list[tuple[str, int]]:
+        """把一次调仓拆成「平昨 → 平今 → 开仓」几笔。
+
+        交易所对 CLOSE / CLOSETODAY 的手数**分别**校验：CLOSE 超过昨仓会被整单
+        打回。反手时最明显 —— 持 5 手多、目标 -3 手空，delta = -8，整笔当 CLOSE
+        发出去就是「平 8 手多」，而实际只有 5 手，于是被拒、重报、再被拒。
+
+        所以先按实际今昨仓把能平的平掉，剩下的才是开仓。上期所、大商所、郑商所
+        区分平今；中金所不区分，一律 CLOSE。
+        """
+        vol = abs(int(delta))
+        if vol <= 0:
+            return []
+        direction = "BUY" if delta > 0 else "SELL"
+        side = "long" if direction == "SELL" else "short"
+        his, today = self._split_pos(symbol, side)
+        have = his + today
+        out: list[tuple[str, int]] = []
+        if have > 0:
+            closing = min(vol, have)
+            if symbol.startswith("CFFEX"):
+                out.append(("CLOSE", closing))
+            else:
+                n_his = min(closing, his)
+                if n_his > 0:
+                    out.append(("CLOSE", n_his))
+                if closing > n_his:
+                    out.append(("CLOSETODAY", closing - n_his))
+        rest = vol - min(vol, have)
+        if rest > 0:
+            out.append(("OPEN", rest))
+        return out
 
     def _price_at(self, symbol: str, direction: str, ticks: int = 0) -> float:
         """按**合约**取对手价，往成交方向让 `ticks` 跳。盘口还没来就返回 NaN。
@@ -437,22 +577,28 @@ class PortfolioRunner:
         return str(oid or "")
 
     def _send(self, st: SlotState, symbol: str, delta: int) -> None:
+        legs = self._legs(symbol, delta)
+        if not legs:
+            return
         direction = "BUY" if delta > 0 else "SELL"
-        vol = abs(int(delta))
-        offset = self._offset_for(symbol, direction, vol)
         price = self._price_at(symbol, direction)
         if not price or price != price:      # NaN / 0 都说明盘口还没来
             st.last_action = "等盘口"
             return
-        oid = self._order_id(self.api.insert_order(
-            symbol=symbol, direction=direction, offset=offset,
-            volume=vol, limit_price=price,
-        ))
-        st.pending.append(
-            PendingOrder(order_id=oid, symbol=symbol, direction=direction,
-                         offset=offset, volume=vol, price=price, ts=time.time())
+        parts = []
+        for offset, vol in legs:
+            oid = self._order_id(self.api.insert_order(
+                symbol=symbol, direction=direction, offset=offset,
+                volume=vol, limit_price=price,
+            ))
+            st.pending.append(
+                PendingOrder(order_id=oid, symbol=symbol, direction=direction,
+                             offset=offset, volume=vol, price=price, ts=time.time())
+            )
+            parts.append(f"{offset} {vol}")
+        st.last_action = (
+            f"{'买' if direction == 'BUY' else '卖'} {' + '.join(parts)} 手 @ {price:.2f}"
         )
-        st.last_action = f"{'买' if direction == 'BUY' else '卖'}{offset} {vol} 手 @ {price:.2f}"
         self._log(f"{st.title()}：{st.last_action}")
 
     def _cancel_all(self, st: SlotState) -> None:
@@ -613,17 +759,17 @@ class PortfolioRunner:
             if delta == 0:
                 continue
             direction = "BUY" if delta > 0 else "SELL"
-            vol = abs(delta)
-            offset = self._offset_for(sym, direction, vol)
+            legs = self._legs(sym, delta)
             price = self._price_at(sym, direction)
             if not price or price != price:
                 continue
-            self.api.insert_order(
-                symbol=sym, direction=direction, offset=offset,
-                volume=vol, limit_price=price,
-            )
-            n += 1
-            self._log(f"对齐 {sym}：{direction} {offset} {vol} 手 @ {price:.2f}")
+            for offset, vol in legs:
+                self.api.insert_order(
+                    symbol=sym, direction=direction, offset=offset,
+                    volume=vol, limit_price=price,
+                )
+                n += 1
+                self._log(f"对齐 {sym}：{direction} {offset} {vol} 手 @ {price:.2f}")
         return n
 
     # ---- 快照 ----
@@ -641,6 +787,9 @@ class PortfolioRunner:
                     "period": st.cfg.period,
                     "strategy": st.cfg.strategy_label(),
                     "volume": st.cfg.volume,
+                    "sizing": st.cfg.sizing,
+                    "size_text": st.cfg.size_text(),
+                    "lots": st.lots,
                     "running": st.running,
                     "signal": st.signal,
                     "target": st.target,

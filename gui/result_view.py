@@ -112,6 +112,17 @@ def _extract_trades(sig) -> list[tuple[int, int, int]]:
     return out
 
 
+def _lots_text(v: float) -> str:
+    """手数的可读写法。
+
+    `unit` 口径（股票 / 指数 / 旧结果）是份额，会出现 33.2323 这种小数；
+    期货手数是整数。两种都要能读，所以按「是不是整数」分开写。
+    """
+    if v <= 0:
+        return "—"
+    return f"{v:,.0f}" if abs(v - round(v)) < 1e-6 else f"{v:,.2f}"
+
+
 # ------------------------------------------------------------------ 图表基类
 
 
@@ -338,6 +349,15 @@ class ResultView(QObject):
         self._k_start = 0
         self._k_last_draw = 0.0
         self._k_pending = False
+        # 十字光标：双击开/关，鼠标扫到哪根读哪根
+        self._k_cross = False
+        self._k_hover = -1
+        self._k_axes: list = []
+        self._k_cross_v: list = []
+        self._k_cross_h = None
+        self._k_tip = None
+        self._k_bars = None
+        self._k_notes: dict = {}
         self._k_redraw_timer = QTimer(self)
         self._k_redraw_timer.setSingleShot(True)
         self._k_redraw_timer.timeout.connect(self._flush_kline_redraw)
@@ -408,6 +428,11 @@ class ResultView(QObject):
 
         # 滚轮缩放：以鼠标位置为锚点增减窗口根数，和滚动条配合使用
         self.canvas_k.mpl_connect("scroll_event", self._on_kline_wheel)
+        # 双击开十字光标，移动时跟着走。看盘软件里这是最顺手的查价方式：
+        # 不用点住、不用选中，鼠标扫到哪根就读哪根
+        self.canvas_k.mpl_connect("button_press_event", self._on_kline_click)
+        self.canvas_k.mpl_connect("motion_notify_event", self._on_kline_move)
+        self.canvas_k.mpl_connect("axes_leave_event", self._on_kline_leave)
         return w
 
     # ---- 绩效
@@ -525,7 +550,7 @@ class ResultView(QObject):
         self.lbl_trades.setWordWrap(True)
         lay.addWidget(self.lbl_trades)
 
-        cols = ["#", "策略", "方向", "开仓", "开仓价", "平仓", "平仓价", "收益", "持仓", "备注"]
+        cols = ["#", "策略", "方向", "开仓", "开仓价", "平仓", "平仓价", "手数", "收益", "持仓", "备注"]
         if self.kind == "portfolio":
             cols[1] = "策略"
         else:
@@ -539,8 +564,8 @@ class ResultView(QObject):
         h = self.tbl_trades.horizontalHeader()
         for i in range(len(cols)):
             h.setSectionResizeMode(i, QHeaderView.ResizeToContents)
-        # 最后一列（备注）多数行是空的。让它撑满剩余宽度的话，一张 9 列的表
-        # 右边会多出一条 600px 的空白栏，看起来像「备注」全丢了
+        # 最后一列（备注）多数行是空的。让它撑满剩余宽度的话，表格右边会多出
+        # 一条 600px 的空白栏，看起来像「备注」全丢了
         h.setStretchLastSection(False)
         lay.addWidget(self.tbl_trades, 1)
         return w
@@ -716,12 +741,16 @@ class ResultView(QObject):
         vol = view["volume"].to_numpy(float)
         up = c >= o
 
-        # 全量的信号与收盘价：窗口第一根到底是不是「开仓」，得看它的前一根，
+        # 全量的信号：窗口第一根到底是不是「开仓」，得看它的前一根，
         # 只拿窗口内的数据判断会把每根都误认成开仓点。
-        sig_full = view_all["signal"].to_numpy(int)
+        raw_sig = view_all["signal"].to_numpy(int)
         if self.long_only:
-            sig_full = np.maximum(sig_full, 0)
-        close_full = view_all["close"].to_numpy(float)
+            raw_sig = np.maximum(raw_sig, 0)
+        # **执行口径**：回测是「T 收盘出信号、T+1 开盘成交」，所以第 i 根上的
+        # 持仓和开平动作来自第 i-1 根收盘的信号。图上必须按执行口径画 ——
+        # 画在信号那根的收盘价上，看起来像「收盘价成交」，和回测、实盘都对不上
+        sig_full = np.concatenate([[0], raw_sig[:-1]])
+        open_full = view_all["open"].to_numpy(float)
         sig_view = sig_full[start:start + win]
         prev = np.concatenate([[0], sig_full[:-1]])[start:start + win]
 
@@ -731,6 +760,8 @@ class ResultView(QObject):
         score_full = (
             view_all["factor_score"].to_numpy(float) if has_score else None
         )
+
+        self._k_notes = self._signal_notes()
 
         self.canvas_k.fresh()
         if has_score:
@@ -834,9 +865,10 @@ class ResultView(QObject):
             b = min(x_i, start + win - 1)
             if b <= e_i:
                 continue
-            gain = (close_full[x_i] - close_full[e_i]) * d
+            # 连线两头都是**成交价**（T+1 开盘），不是收盘价
+            gain = (open_full[x_i] - open_full[e_i]) * d
             ax.plot(
-                [e_i - start, b - start], [close_full[e_i], close_full[b]],
+                [e_i - start, b - start], [open_full[e_i], open_full[b]],
                 color=C_PROFIT if gain >= 0 else C_LOSSLINE,
                 ls=(0, (4, 3)), lw=1.15, alpha=0.88, zorder=5,
             )
@@ -987,6 +1019,29 @@ class ResultView(QObject):
                       handletextpad=0.4, columnspacing=1.1)
         ax.set_ylabel(self.ctx.price_note, fontsize=9, color=C_MUTED)
 
+        # ---- 十字光标 ----
+        # 图元建好就常驻（初始不可见），鼠标移动只改坐标不重建 —— 重建一次
+        # 5000 根 K 线的图元要几百毫秒，跟着鼠标走会卡成幻灯片。
+        self._k_axes = all_axes
+        self._k_bars = view
+        self._k_cross_v = [
+            a.axvline(0, color="#64748b", lw=0.7, alpha=0.7, zorder=9, visible=False)
+            for a in all_axes
+        ]
+        self._k_cross_h = ax.axhline(
+            float(c[0]), color="#64748b", lw=0.7, alpha=0.7, zorder=9, visible=False
+        )
+        # 压在「最新价」那个色块下面一行：两者都在右上角，贴太近会互相盖住
+        self._k_tip = ax.text(
+            0.995, 0.875, "", transform=ax.transAxes, ha="right", va="top",
+            fontsize=8.5, color="#e2e8f0", linespacing=1.5, zorder=10,
+            bbox=dict(boxstyle="round,pad=0.42", fc="#0f172a", ec="#475569", alpha=0.78),
+        )
+        self._k_tip.set_visible(False)
+        self._k_hover = -1
+        if self._k_cross:
+            self._show_cross(len(view) - 1, draw=False)
+
         # 标题信息
         name = item["name"]
         exch = item["exchange"]
@@ -995,6 +1050,11 @@ class ResultView(QObject):
         # 「当前状态」永远指最新一根，不是窗口最后一根——否则滚到历史位置时
         # 标题会跟着变，看着像当前真的空仓了。
         state = {1: "多头持仓", -1: "空头持仓"}.get(int(sig_full[-1]), "空仓")
+        # 最后一根收盘又出了新信号时，仓位还没变（要等下一根开盘），
+        # 但人看着图会问「那现在到底算什么」，所以把待执行的动作写出来
+        pend = int(raw_sig[-1]) if len(raw_sig) else 0
+        if pend != int(sig_full[-1]):
+            state += "（下一根开盘" + {1: "开多", -1: "开空"}.get(pend, "平仓") + "）"
         period = self.period
         plabel = "" if period == PERIOD_1D else f" · {PERIOD_LABEL.get(period, period)}"
         ax.set_title(
@@ -1006,11 +1066,11 @@ class ResultView(QObject):
         if self.market == "us":
             source = "东方财富后复权"
         elif period == PERIOD_1D:
-            source = "Tushare 换月复权"
+            source = "Tushare 换月前复权"
         else:
             src = tqdata.PERIODS.get(period, (period, 1))
             merged = f"（由 {src[0]} × {src[1]} 合并）" if src[1] > 1 else ""
-            source = f"天勤换月复权{merged}"
+            source = f"天勤换月前复权{merged}"
         shown = f"{start + 1:,}–{start + win:,}"
         self.lbl_chart_title.setText(
             f"全历史 {len(self.df):,} 根 · 当前显示第 {shown} 根"
@@ -1020,6 +1080,96 @@ class ResultView(QObject):
         self._sync_kline_scrollbar()
         # 不用再手动 draw()：退出 frozen() 临界区时会同步补画一帧，
         # 那样能保证「重建完成」和「绘制」之间不会插进别的重绘。
+
+    # ---------------------------------------------------------- 十字光标
+
+    def _signal_notes(self) -> dict:
+        """每根 bar 上发生的开平动作，给十字光标的信息框用。
+
+        直接读 `self.trades` 而不是重新从 signal 推：手数、成交价只有成交记录里
+        才有，从 signal 只能推出方向，还得再猜一次手数。
+        """
+        notes: dict = {}
+        with_name = self.kind == "portfolio"
+        for name, t in self.trades or []:
+            who = f"{name} " if with_name else ""
+            side = "多" if t.direction > 0 else "空"
+            lots = f" {_lots_text(t.lots)} 手" if t.lots > 0 else ""
+            notes.setdefault(t.entry_date, []).append(
+                f"{who}开{side} @{t.entry_price:,.2f}{lots}"
+            )
+            if not t.open_position:
+                notes.setdefault(t.exit_date, []).append(
+                    f"{who}平{side} @{t.exit_price:,.2f}{lots}"
+                )
+        return notes
+
+    def _on_kline_click(self, ev) -> None:
+        """双击开/关十字光标。"""
+        if not getattr(ev, "dblclick", False) or ev.inaxes not in self._k_axes:
+            return
+        self._k_cross = not self._k_cross
+        if self._k_cross and ev.xdata is not None:
+            self._show_cross(int(round(ev.xdata)))
+        else:
+            self._hide_cross()
+
+    def _on_kline_move(self, ev) -> None:
+        if not self._k_cross or ev.inaxes not in self._k_axes or ev.xdata is None:
+            return
+        self._show_cross(int(round(ev.xdata)))
+
+    def _on_kline_leave(self, _ev) -> None:
+        if self._k_cross:
+            self._hide_cross()
+
+    def _show_cross(self, i: int, draw: bool = True) -> None:
+        view = self._k_bars
+        if view is None or not len(view):
+            return
+        i = max(0, min(len(view) - 1, int(i)))
+        if draw and i == self._k_hover:
+            return              # 同一根不重画：鼠标横扫时会连着触发几十次
+        self._k_hover = i
+        for ln in self._k_cross_v:
+            ln.set_xdata([i, i])
+            ln.set_visible(True)
+        if self._k_cross_h is not None:
+            self._k_cross_h.set_ydata([float(view["close"].iloc[i])] * 2)
+            self._k_cross_h.set_visible(True)
+        if self._k_tip is not None:
+            self._k_tip.set_text(self._bar_text(i))
+            self._k_tip.set_visible(True)
+        if draw:
+            self.canvas_k.draw_idle()
+
+    def _hide_cross(self) -> None:
+        self._k_hover = -1
+        for ln in self._k_cross_v:
+            ln.set_visible(False)
+        if self._k_cross_h is not None:
+            self._k_cross_h.set_visible(False)
+        if self._k_tip is not None:
+            self._k_tip.set_visible(False)
+        self.canvas_k.draw_idle()
+
+    def _bar_text(self, i: int) -> str:
+        """一根 K 线的读数：时间、开高低收、涨跌幅、量，外加这一根上的信号。"""
+        view = self._k_bars
+        row = view.iloc[i]
+        ts = view.index[i]
+        fmt = "%Y-%m-%d" if self.period == PERIOD_1D else "%Y-%m-%d %H:%M"
+        o, h, l, c = (float(row[k]) for k in ("open", "high", "low", "close"))
+        pct = (c / o - 1.0) * 100.0 if o else 0.0
+        lines = [ts.strftime(fmt)]
+        lines.append(f"开 {o:,.2f}　高 {h:,.2f}")
+        lines.append(f"低 {l:,.2f}　收 {c:,.2f}　{pct:+.2f}%")
+        vol = float(row.get("volume", 0) or 0)
+        if vol > 0:
+            lines.append(f"量 {vol / 1e4:,.1f} 万")
+        for note in self._k_notes.get(ts, []) or []:
+            lines.append(note)
+        return "\n".join(lines)
 
     # ---------------------------------------------------------- 窗口滚动 / 缩放
 
@@ -1314,6 +1464,7 @@ class ResultView(QObject):
                 f"{t.exit_date:%Y-%m-%d %H:%M}" if self.period != PERIOD_1D
                 else f"{t.exit_date:%Y-%m-%d}",
                 f"{t.exit_price:,.2f}",
+                _lots_text(t.lots),
                 f"{t.ret*100:+.2f}%",
                 f"{t.bars}",
                 "、".join(note),
@@ -1322,7 +1473,7 @@ class ResultView(QObject):
                 it = QTableWidgetItem(v)
                 if j >= 3 and j != len(vals) - 1:
                     it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if j == len(vals) - 3:      # 收益列
+                if j == len(vals) - 3:      # 收益列（手数插在它前面，倒数第三个不变）
                     it.setForeground(QColor(C_UP if t.ret >= 0 else C_DOWN))
                 if t.open_position:
                     it.setForeground(QColor(C_MUTED))

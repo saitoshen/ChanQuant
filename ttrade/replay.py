@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from ttrade import factor_strategy as fstrat
+from ttrade import specs
 from ttrade.backtest import BacktestConfig, bars_per_year, buy_and_hold, run_backtest
 from ttrade.strategies import STRATEGIES, run_strategy
 
@@ -44,14 +45,41 @@ def market_of(cfg) -> str:
     return "cn" if getattr(cfg, "exchange", "") else "us"
 
 
-def make_bt(market: str, allow_short: bool = False) -> BacktestConfig:
-    """按市场成本建一份回测配置。`allow_short` 来自配置里的 `note == "short"`。"""
+def make_bt(market: str, allow_short: bool = False,
+            cfg=None) -> BacktestConfig:
+    """按市场成本建一份回测配置。`allow_short` 来自配置里的 `note == "short"`。
+
+    传了 `cfg`（`StrategyConfig`）就把仓位口径一起带过来：不传的话这里默认
+    `sizing="unit"`，也就是「名义敞口 = 本金」，而研究页和实盘都是「资金 ÷
+    每手保证金」—— 同一条策略在三个地方给出三个收益曲线，用户只会认为程序算错。
+    """
     c = MARKET_COST.get(market) or MARKET_COST["us"]
-    return BacktestConfig(
+    bt = BacktestConfig(
         fee_rate=c["fee"],
         slippage=c["slippage"],
         long_only=not (c["allow_short"] and allow_short),
     )
+    if cfg is None:
+        return bt
+    bt.sizing = getattr(cfg, "sizing", "") or "capital"
+    bt.capital = float(getattr(cfg, "capital", 0) or 0)
+    bt.risk_amount = float(getattr(cfg, "risk_amount", 0) or 20_000)
+    bt.stop_atr_n = int(getattr(cfg, "stop_atr_n", 0) or 14)
+    bt.stop_mult = float(getattr(cfg, "stop_mult", 0) or 5.0)
+    bt.volume = int(getattr(cfg, "volume", 0) or 1)
+    if market == "cn":
+        # 合约乘数和保证金比例：回测里没有天勤 Quote，只能从本地行情反推
+        bt.multiplier = specs.multiplier(getattr(cfg, "symbol", "") or "",
+                                         getattr(cfg, "exchange", "") or "")
+        bt.margin_rate = specs.margin_rate(getattr(cfg, "symbol", "") or "")
+    else:
+        # 美股没有保证金这一说，全额买入。漏了这行就是拿 10% 保证金率
+        # 给股票上 10 倍杠杆，收益曲线会离谱到一眼看出不对
+        bt.multiplier, bt.margin_rate = 1.0, 1.0
+    if bt.capital > 0:
+        # 曲线也从这笔钱起步，否则「不超过现有权益」那条上限会把 50 万压回 10 万
+        bt.initial_cash = bt.capital
+    return bt
 
 
 def factor_config(d: dict) -> fstrat.FactorConfig:
@@ -196,7 +224,7 @@ def run(cfg, df: pd.DataFrame | None, market: str = "",
         return Replay(error=f"{cfg.key()} 在所选区间里没有足够的行情")
 
     period = getattr(cfg, "period", "") or "1d"
-    bt = make_bt(mk, getattr(cfg, "note", "") == "short")
+    bt = make_bt(mk, getattr(cfg, "note", "") == "short", cfg)
     # 年化口径跟着周期走：5 分钟一年一万多根，按 252 算夏普会虚高一个数量级
     bt.bars_per_year = bars_per_year(df.index)
     bpy = bt.bars_per_year

@@ -24,6 +24,10 @@ from dataclasses import asdict, dataclass, field
 
 from ttrade.paths import user_dir
 
+# 按「止损金额」定仓的策略。它们把止损距离写在策略参数里（stop_mult × ATR），
+# 固定手数等于把风险敞口交给运气 —— 老配置没有 sizing 字段时按这条兜底。
+RISK_SIZED = {"sbbox_mini"}
+
 LIB_FILE = "strategy_lib.json"
 PORT_FILE = "portfolio.json"
 LAST_FILE = "last_config.json"
@@ -60,8 +64,22 @@ class StrategyConfig:
     factor_reverse: dict = field(default_factory=dict)
     factor_cfg: dict = field(default_factory=dict)
 
-    # 执行
-    volume: int = 1
+    # 执行 —— 仓位怎么定
+    #
+    # 默认**不再固定 1 手**：1 手螺纹和 1 手铜差 40 倍名义价值，同一条策略在两
+    # 个品种上跑出来的风险完全不是一回事。默认按「分配资金 ÷ 每手保证金」算手数，
+    # 也就是把钱按品种自己的杠杆铺满，而不是按「几手」拍脑袋。
+    #
+    #   capital：分 `capital` 元给这条策略，手数 = capital / 每手保证金
+    #   fixed  ：固定 `volume` 手（老行为，想精确控制敞口时用）
+    #   risk   ：按止损金额反推手数 = risk_amount / (stop_mult × ATR × 合约乘数)
+    sizing: str = "capital"
+    capital: float = 500_000.0      # 分配资金（元）
+    risk_amount: float = 20_000.0   # 单笔止损金额（元）
+    stop_atr_n: int = 14            # 止损用的 ATR 周期
+    stop_mult: float = 5.0          # 止损 = stop_mult × ATR
+    volume: int = 1                 # 仅 sizing="fixed" 时生效
+
     account: str = ""          # 账户名（AccountSpec.name），空表示用当前连接
     enabled: bool = False
     note: str = ""
@@ -108,11 +126,22 @@ class StrategyConfig:
             bits.append(f"模型={cfg.get('model', '')}")
         return " ".join(bits)
 
+    def size_text(self) -> str:
+        """仓位口径的可读描述。实际手数要等拿到价格和保证金才知道。"""
+        mode = (self.sizing or "capital").lower()
+        if mode == "fixed":
+            return f"固定 {int(self.volume or 1)} 手"
+        if mode == "risk":
+            return f"止损 {self.risk_amount / 10000:g} 万"
+        if mode == "unit":
+            return "本金全额"
+        return f"{self.capital / 10000:g} 万"
+
     def describe(self) -> str:
         """一句话说明，给确认框和日志用。"""
         return (
             f"{self.title()}｜{self.key()} {self.period}｜{self.strategy_label()}"
-            f"｜{self.volume} 手" + (f"｜账户 {self.account}" if self.account else "")
+            f"｜{self.size_text()}" + (f"｜账户 {self.account}" if self.account else "")
         )
 
     # ---- 序列化 ----
@@ -139,6 +168,24 @@ class StrategyConfig:
             cfg.range_years = max(0.0, float(cfg.range_years or 0))
         except (TypeError, ValueError):
             cfg.range_years = 0.0
+        if cfg.sizing not in ("capital", "fixed", "risk"):
+            cfg.sizing = "capital"
+        # 老配置里没有 sizing 字段。按止损金额定仓的策略（止损距离写在策略参数里）
+        # 默认就该走 risk —— 用固定手数等于把风险敞口交给运气，和它自己的设计相反
+        if "sizing" not in d and cfg.rule_key in RISK_SIZED:
+            cfg.sizing = "risk"
+        for attr, lo, dflt in (("capital", 0.0, 500_000.0),
+                               ("risk_amount", 0.0, 20_000.0),
+                               ("stop_mult", 0.1, 5.0)):
+            try:
+                v = float(getattr(cfg, attr) or 0)
+                setattr(cfg, attr, v if v >= lo and v == v else dflt)
+            except (TypeError, ValueError):
+                setattr(cfg, attr, dflt)
+        try:
+            cfg.stop_atr_n = max(1, int(cfg.stop_atr_n or 14))
+        except (TypeError, ValueError):
+            cfg.stop_atr_n = 14
         if not isinstance(cfg.rule_params, dict):
             cfg.rule_params = {}
         if not isinstance(cfg.factor_cfg, dict):

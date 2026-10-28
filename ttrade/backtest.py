@@ -4,9 +4,18 @@
 1. 策略在第 T 日收盘后给出目标仓位 signal[T] ∈ {-1, 0, 1}；
 2. 实际成交发生在第 T+1 日开盘价（杜绝未来函数）；
 3. 买卖均计手续费与滑点；
-4. 名义敞口 = 账户权益（不加杠杆），多头买入全额、空头卖出等额名义；
+4. **仓位按手数下**（见 `BacktestConfig.sizing`）：期货是「分配资金 ÷ 每手保证金」，
+   杠杆由品种自己的保证金比例决定；美股没有杠杆概念，走 `unit` 口径（名义敞口 =
+   权益）；
 5. 空头遇到价格暴涨导致权益归零时强制平仓（爆仓），后续不再交易；
 6. 空仓时资金闲置（不计利息）。
+
+## 为什么权益是「现金 + 浮动盈亏」而不是「市值」
+
+期货开仓只是把保证金冻住，钱还是你的，权益不会因为开仓而缩水。所以持仓期间
+`equity = cash + 手数 × (现价 − 开仓价) × 乘数 × 方向`，平仓时这笔盈亏才落进
+`cash`。按市值算（`手数 × 现价`）在期货上会得到一条完全错误的曲线：开仓瞬间
+权益看起来就翻了几倍。
 """
 
 from __future__ import annotations
@@ -45,9 +54,30 @@ class BacktestConfig:
     long_only: bool = False       # True 时把 -1 裁成 0（股票市场默认）
     bars_per_year: float = float(TRADING_DAYS)   # 日线默认；分钟级由调用方按数据推断
 
+    # ---- 仓位怎么定 ----
+    #   unit   ：名义敞口 = 权益，不加杠杆、不看乘数（美股、批量脚本）
+    #   capital：手数 = 分配资金 ÷ 每手保证金（期货默认）
+    #   risk   ：手数 = 止损金额 ÷（止损倍数 × ATR × 乘数）
+    #   fixed  ：固定 `volume` 手
+    sizing: str = "unit"
+    capital: float = 0.0          # 分配资金（0 = 用 initial_cash）
+    risk_amount: float = 20_000.0
+    stop_atr_n: int = 14
+    stop_mult: float = 5.0
+    volume: int = 1
+    multiplier: float = 1.0       # 合约乘数（每手多少单位）
+    # 保证金率。默认 1.0 = 全额，也就是「不认识的品种先按不加杠杆算」。
+    # 写成 0.1 的话，任何忘了填乘数/保证金率的地方都会悄悄变成 10 倍杠杆
+    margin_rate: float = 1.0
+
     @property
     def label(self) -> str:
         return "只做多" if self.long_only else "多空双向"
+
+    @property
+    def budget(self) -> float:
+        """这条策略能动用的名义资金。"""
+        return float(self.capital or self.initial_cash)
 
 
 @dataclass
@@ -61,6 +91,7 @@ class Trade:
     direction: int = 1            # 1=多头，-1=空头
     open_position: bool = False
     blowup: bool = False          # 是否因爆仓强平
+    lots: float = 0.0             # 这笔实际下了多少手（unit 口径是份额，小数）
 
 
 @dataclass
@@ -149,6 +180,49 @@ def _trade_ret(direction: int, entry: float, exit_: float) -> float:
     return float(exit_ / entry - 1.0) if direction == 1 else float(1.0 - exit_ / entry)
 
 
+def _atr_array(close: np.ndarray, high: np.ndarray, low: np.ndarray, n: int) -> np.ndarray:
+    """真实波幅均值的整段序列，给「按止损金额定仓」用。"""
+    n = max(1, int(n or 14))
+    prev = np.concatenate(([np.nan], close[:-1]))
+    tr = np.maximum(np.maximum(high - low, np.abs(high - prev)), np.abs(low - prev))
+    return pd.Series(tr).rolling(n, min_periods=n).mean().to_numpy(dtype=float)
+
+
+def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float = 0.0) -> float:
+    """这一笔该下多少手。
+
+    `unit` 口径返回的是**手数**（可以是小数，名义敞口 = 权益），其余口径返回整数手。
+    手数为 0 表示这笔不做（钱不够一手保证金）。
+
+    `capital` 和 `risk` 都是**单利**：手数只看「分配的资金 / 止损金额」，不看
+    账户当前权益。赚了不加大仓位，亏了也不缩 —— 这样回测出来的是「这套规则在
+    固定规模下能赚多少」，而不是「复利滚了二十年之后的奇迹」。要看复利，把
+    资金口径换成 `unit`。
+    """
+    if price <= 0:
+        return 0.0
+    mode = (cfg.sizing or "unit").lower()
+    mult = float(cfg.multiplier or 1.0)
+    if mode == "fixed":
+        return float(max(1, int(cfg.volume or 1)))
+    if mode == "risk":
+        per = float(cfg.stop_mult or 0) * float(atr_value or 0) * mult
+        if per <= 0:
+            return 1.0                      # ATR 还没暖起来：先 1 手，别裸奔
+        return float(max(1, int(float(cfg.risk_amount or 0) / per)))
+    if mode == "capital":
+        per = price * mult * float(cfg.margin_rate or 0)
+        if per <= 0:
+            return 1.0
+        # 分配资金 ÷ 每手保证金，**固定用分配的那笔钱**，不随盈亏变。
+        # 按当前权益收口就变成复利了：50 万赚到 80 万会自己加到 80 万的仓，
+        # 亏到 30 万又自动减到 30 万 —— 那是另一套策略，不是用户要的「单利」
+        return float(max(int(cfg.budget / per), 0))
+    # 名义敞口 = 权益。期货一手是 price × 乘数，不除乘数的话
+    # 「不加杠杆」会变成 10 倍杠杆（RB 乘数 10）
+    return float(max(equity, 0.0) / (price * mult))
+
+
 def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str = "") -> Result:
     """按 signal 列执行回测。df 需含 open/close 与 signal（取值 -1/0/1）。"""
     cfg = cfg or BacktestConfig()
@@ -166,13 +240,23 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     idx = data.index
     n = len(data)
     fee, slip = cfg.fee_rate, cfg.slippage
+    mult = float(cfg.multiplier or 1.0)
+    mode = (cfg.sizing or "unit").lower()
+
+    atr_arr = None
+    if mode == "risk":
+        atr_arr = _atr_array(close, data["high"].to_numpy(dtype=float)
+                             if "high" in data else close,
+                             data["low"].to_numpy(dtype=float)
+                             if "low" in data else close,
+                             cfg.stop_atr_n)
 
     # 目标仓位：T 日收盘的信号，T+1 开盘执行
     target = np.roll(sig, 1)
     target[0] = 0
 
-    cash = cfg.initial_cash
-    shares = 0.0
+    cash = float(cfg.initial_cash)
+    lots = 0.0                   # 正=多，负=空，0=空仓（unit 口径是份额）
     pos = 0                      # 1=多，-1=空，0=平
     dead = False                 # 爆仓后停止交易
     pos_state = np.zeros(n, dtype=int)
@@ -182,8 +266,8 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     entry_bar = 0
     entry_dir = 1
 
-    def close_position(i: int, price: float, blowup: bool = False) -> None:
-        nonlocal cash, shares, entry_price, entry_date
+    def close_position(i: int, price: float, held: float, blowup: bool = False) -> None:
+        nonlocal entry_price, entry_date
         if entry_price is None:
             return
         trades.append(
@@ -196,6 +280,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
                 bars=i - entry_bar,
                 direction=entry_dir,
                 blowup=blowup,
+                lots=abs(float(held)),
             )
         )
         entry_price = entry_date = None
@@ -208,39 +293,33 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
         want = target[i]
         if want != pos:
             # ---- 先平掉现有仓位 ----
-            if pos == 1:
-                price = open_[i] * (1 - slip)
-                cash += shares * price * (1 - fee)
-                close_position(i, price)
-                shares = 0.0
-            elif pos == -1:
-                price = open_[i] * (1 + slip)      # 买回，滑点不利
-                cash -= (-shares) * price * (1 + fee)
-                close_position(i, price)
-                shares = 0.0
-            pos = 0
+            if pos != 0:
+                price = open_[i] * (1 - slip) if pos == 1 else open_[i] * (1 + slip)
+                # 平仓：浮动盈亏落地，再扣平仓手续费（按成交名义额）
+                cash += lots * mult * (price - entry_price)
+                cash -= abs(lots) * mult * price * fee
+                close_position(i, price, lots)
+                lots = 0.0
+                pos = 0
 
-            # ---- 再按需开新仓（名义敞口 = 全部权益，不加杠杆）----
-            if want == 1 and cash > 0:
-                price = open_[i] * (1 + slip)
-                qty = cash / (price * (1 + fee))
-                shares, cash = qty, 0.0
-                entry_price, entry_date, entry_bar, entry_dir = price, idx[i], i, 1
-                pos = 1
-            elif want == -1 and cash > 0:
-                price = open_[i] * (1 - slip)
-                qty = cash / price
-                cash += qty * price * (1 - fee)     # 卖出所得 + 原有现金
-                shares = -qty
-                entry_price, entry_date, entry_bar, entry_dir = price, idx[i], i, -1
-                pos = -1
+            # ---- 再按需开新仓 ----
+            if want != 0:
+                price = open_[i] * (1 + slip) if want > 0 else open_[i] * (1 - slip)
+                a = float(atr_arr[i]) if atr_arr is not None else 0.0
+                q = size_lots(cfg, price, cash, a if a == a else 0.0)
+                if q > 0:
+                    cash -= q * mult * price * fee        # 开仓手续费
+                    lots = q if want > 0 else -q
+                    entry_price, entry_date, entry_bar, entry_dir = price, idx[i], i, want
+                    pos = want
 
-        eq = cash + shares * close[i]
+        eq = cash + (lots * mult * (close[i] - entry_price) if pos != 0 else 0.0)
 
         # ---- 爆仓：权益归零则强平 ----
         if eq <= 0 and pos != 0:
-            close_position(i, close[i], blowup=True)
-            cash, shares, pos = 0.0, 0.0, 0
+            cash += lots * mult * (close[i] - entry_price)
+            close_position(i, close[i], lots, blowup=True)
+            cash, lots, pos = 0.0, 0.0, 0
             dead = True
             eq = 0.0
 
@@ -248,7 +327,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
         equity[i] = eq
 
     # 未平仓的最后一笔
-    if shares != 0 and entry_price is not None:
+    if pos != 0 and entry_price is not None:
         last = close[-1]
         trades.append(
             Trade(
@@ -260,6 +339,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
                 bars=n - 1 - entry_bar,
                 direction=entry_dir,
                 open_position=True,
+                lots=abs(float(lots)),
             )
         )
 
@@ -280,8 +360,12 @@ def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None) -> Result:
     open_ = d["open"].to_numpy(dtype=float)
     close = d["close"].to_numpy(dtype=float)
     price = open_[0] * (1 + cfg.slippage)
-    shares = (cfg.initial_cash * (1 - cfg.fee_rate)) / price
-    equity = shares * close
+    mult = float(cfg.multiplier or 1.0)
+    # 基准要和策略用同一套仓位口径，否则「策略 vs 买入持有」是在比杠杆，
+    # 不是在比策略。期货上尤其明显：策略 10 倍杠杆、基准全额，比出来毫无意义
+    q = size_lots(cfg, price, cfg.initial_cash, 0.0)
+    cash = cfg.initial_cash - q * mult * price * cfg.fee_rate
+    equity = cash + q * mult * (close - price)
     eq = pd.Series(equity, index=d.index, name="equity")
     ps = pd.Series(1, index=d.index, name="position")
     trade = Trade(
@@ -293,6 +377,7 @@ def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None) -> Result:
         bars=len(d) - 1,
         direction=1,
         open_position=True,
+        lots=float(q),
     )
     m = _metrics(eq, ps, [trade], cfg.bars_per_year)
     m["final_equity"] = float(eq.iloc[-1])

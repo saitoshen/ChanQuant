@@ -1,9 +1,10 @@
-"""美股趋势跟踪研究台 —— PySide6 桌面程序。
+"""趋势跟踪研究台 —— PySide6 桌面程序。
 
 功能：
-- 左侧选择标的 / 策略族（规则 or 因子）/ 参数 / 显示区间
-- 「K线与信号」页：后复权 K 线、策略指标线、持仓区间底色、买卖信号标记、
-  成交量，因子策略下额外画一行因子分数
+- 左侧选择标的 / 策略族（规则 or 因子）/ 参数 / 显示区间 / 仓位口径
+- 「K线与信号」页：**前复权** K 线（最新一根等于真实盘面价，实盘按它算手数）、
+  策略指标线、持仓区间底色、买卖信号标记（画在信号后的下一根开盘）、成交量，
+  因子策略下额外画一行因子分数；双击出十字光标读单根行情
 - 「绩效对比」页：策略 vs 买入持有的资金曲线、回撤曲线、指标对比表
 - 「因子分析」页：全因子 IC/ICIR/t 值一览 + IC 时序、衰减、分位收益、
   模型重要度
@@ -46,6 +47,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -57,6 +59,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSpinBox,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -65,7 +68,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ttrade import factors, mlmodels, tqdata, tqlive
+from ttrade import factors, mlmodels, specs, tqdata, tqlive
 from ttrade import factor_strategy as fstrat
 from ttrade import replay
 from ttrade import strategy_store as SStore
@@ -129,6 +132,23 @@ FACTOR_ORIENTS = [
     ("固定：因子低做多", "long_low",
      "不看 IC，一律「因子分数低就做多、高就做空」。\n"
      "对 rev_5 这类反转因子，这一档就是教科书的短期反转策略。"),
+]
+
+# 仓位口径。研究页、组合页回放、实盘三处必须用同一个口径 —— 同一条策略在
+# 三个地方算出三个收益曲线的话，用户只会认为程序算错了。
+SIZE_MODES = [
+    ("按资金分配", "capital",
+     "分配一笔资金（默认 50 万），按每手保证金算能开几手：\n"
+     "手数 = 资金 ÷ (价格 × 合约乘数 × 保证金比例)。\n"
+     "杠杆就是保证金比例给的：商品 / 股指约 10 倍，国债 30~50 倍。"),
+    ("按止损金额", "risk",
+     "每笔最多亏「止损金额」（默认 2 万）：\n"
+     "手数 = 止损金额 ÷ (止损倍数 × ATR × 合约乘数)。\n"
+     "波动大的品种自动少开，和价格高低无关。"),
+    ("固定手数", "fixed", "每笔固定下 N 手，不看价格和资金。"),
+    ("按本金全额", "unit",
+     "名义敞口 = 全部本金（股票口径）。\n"
+     "期货上等于不加杠杆，只用来和旧结果对照。"),
 ]
 
 # 因子策略的参数：名字 -> (标签, 最小, 最大, 步长, 默认值)
@@ -284,7 +304,7 @@ MARKETS = {
             "▲ 紫色向上三角＝开多　▼ 紫色向下三角＝平多　"
             "浅蓝底色＝多头持仓　红色虚线＝这笔交易盈利　绿色虚线＝亏损　"
             "价格均为后复权（含分红再投资），保证收益率连续　"
-            "信号在下一根开盘成交"
+            "信号在下一根开盘成交　双击 K 线出十字光标"
         ),
     },
     "cn": {
@@ -298,7 +318,7 @@ MARKETS = {
             "浅蓝底色＝多头持仓　浅红底色＝空头持仓　"
             "红色虚线＝这笔交易盈利　绿色虚线＝亏损　"
             "分钟级按天勤自己的主力切换口径复权，与日线的 Tushare 口径不同　"
-            "信号在下一根开盘成交"
+            "前复权：最新一根＝真实盘面价　信号在下一根开盘成交　双击 K 线出十字光标"
         ),
     },
 }
@@ -545,10 +565,7 @@ class MainWindow(QMainWindow):
         # 字典顺序是 us 在前，所以这里必须显式指定，不能靠 items() 的第一项
         self.market = DEFAULT_MARKET
         self.store = self.stores[self.market]
-        self.cfg = BacktestConfig(
-            fee_rate=MARKETS[self.market]["fee"], slippage=MARKETS[self.market]["slippage"],
-            long_only=not MARKETS[self.market]["allow_short"],
-        )
+        self.cfg = self._new_cfg(MARKETS[self.market])
         self.df_raw: pd.DataFrame | None = None
         self.df_sig: pd.DataFrame | None = None
         self.res = None
@@ -586,8 +603,6 @@ class MainWindow(QMainWindow):
         self._live_key = ""
         self._live_period = ""
         self._live_last = None                         # 上一根 bar 的时间，用来判断「新 bar」
-        self._trading = False                          # 绿灯：新信号直接下单
-        self._last_target = 0                          # 上次下发的目标仓位，防重复下单
         self._live_seq = 0                             # 每次起停自增，丢掉过期的推送
 
         self._build_ui()
@@ -595,6 +610,9 @@ class MainWindow(QMainWindow):
         # 延后一拍：等界面完全建好、第一次分析排上队之后再灌配置，
         # 否则 apply_config 里的 _schedule(immediate=True) 会和首帧抢数据加载。
         QTimer.singleShot(0, self._restore_last_config)
+        # 再晚一拍接实时：配置恢复会顺带跑一遍分析，实时要接的是「恢复之后」
+        # 那个品种和周期，早于它会先连一次错的再重连
+        QTimer.singleShot(250, self._auto_live)
 
     # ---------------------------------------------------------- UI 构建
     def _build_ui(self) -> None:
@@ -760,6 +778,8 @@ class MainWindow(QMainWindow):
                 period=p.get("period", "1d"),
                 rule_key=p.get("strategy", ""),
                 rule_params=dict(p.get("params") or {}),
+                # Agent 明说了几手就按固定手数，没说就走「分配资金」口径
+                sizing="fixed" if p.get("volume") else "capital",
                 volume=int(p.get("volume", 1)),
             )
             # 结果落在「策略交易和组合」，**不**切到「策略研究」：那边是用户手上
@@ -786,6 +806,7 @@ class MainWindow(QMainWindow):
             period=p.get("period", "1d"),
             rule_key=key,
             rule_params=dict(p.get("params") or {}),
+            sizing="fixed" if p.get("volume") else "capital",
             volume=int(p.get("volume", 1)),
             note="short",
         )
@@ -1107,6 +1128,65 @@ class MainWindow(QMainWindow):
         )
         cl.addWidget(self.cb_range)
 
+        # 仓位口径。和「策略交易和组合」页编辑框里的那一组是同一套字段，
+        # 存进同一份 StrategyConfig —— 研究页调出来的手数，保存之后实盘和
+        # 组合回放必须照着走，否则「研究页赚 30%、实盘亏 5%」会反复上演。
+        cl.addWidget(self._section("仓位"))
+        self.cb_size = QComboBox()
+        for label, key, tip in SIZE_MODES:
+            self.cb_size.addItem(label, key)
+            self.cb_size.setItemData(self.cb_size.count() - 1, tip, Qt.ToolTipRole)
+        cl.addWidget(self.cb_size)
+
+        self.sp_capital = QDoubleSpinBox()
+        self.sp_capital.setRange(10_000, 100_000_000)
+        self.sp_capital.setSingleStep(100_000)
+        self.sp_capital.setDecimals(0)
+        self.sp_capital.setPrefix("资金 ")
+        self.sp_capital.setSuffix(" 元")
+        self.sp_capital.setValue(500_000)
+        self.sp_capital.setToolTip(
+            "这条策略能动用的钱。手数 = 资金 ÷ 每手保证金。\n"
+            "资金曲线也从这笔钱起步，否则下单量会被默认本金卡住。"
+        )
+        cl.addWidget(self.sp_capital)
+
+        self.sp_risk = QDoubleSpinBox()
+        self.sp_risk.setRange(1_000, 10_000_000)
+        self.sp_risk.setSingleStep(5_000)
+        self.sp_risk.setDecimals(0)
+        self.sp_risk.setPrefix("止损 ")
+        self.sp_risk.setSuffix(" 元")
+        self.sp_risk.setValue(20_000)
+        self.sp_risk.setToolTip("一笔最多亏多少钱。sbbox-mini 这类按波动定仓的策略用它。")
+        cl.addWidget(self.sp_risk)
+
+        self.sp_atr = QSpinBox()
+        self.sp_atr.setRange(2, 200)
+        self.sp_atr.setPrefix("ATR ")
+        self.sp_atr.setSuffix(" 根")
+        self.sp_atr.setValue(14)
+        cl.addWidget(self.sp_atr)
+
+        self.sp_stop = QDoubleSpinBox()
+        self.sp_stop.setRange(0.5, 50.0)
+        self.sp_stop.setSingleStep(0.5)
+        self.sp_stop.setDecimals(1)
+        self.sp_stop.setPrefix("× ")
+        self.sp_stop.setSuffix(" 倍")
+        self.sp_stop.setValue(5.0)
+        self.sp_stop.setToolTip("止损距离 = 倍数 × ATR。手数按「止损金额 ÷ 每手止损金额」反推。")
+        cl.addWidget(self.sp_stop)
+
+        self.sp_vol = QSpinBox()
+        self.sp_vol.setRange(1, 1000)
+        self.sp_vol.setPrefix("固定 ")
+        self.sp_vol.setSuffix(" 手")
+        self.sp_vol.setValue(1)
+        cl.addWidget(self.sp_vol)
+        self._sync_size()
+        self._apply_sizing(self.cfg)      # 控件建好了，把默认口径灌进配置
+
         self.chk_ma = QComboBox()
         cl.addWidget(self._section("K线叠加"))
         self.chk_ma.addItem("显示策略指标线", True)
@@ -1204,6 +1284,10 @@ class MainWindow(QMainWindow):
             self.cb_period.currentIndexChanged.connect(self._on_period_changed)
             self.cb_strategy.currentIndexChanged.connect(self._on_strategy_changed)
             self.cb_range.currentIndexChanged.connect(self._schedule)
+            self.cb_size.currentIndexChanged.connect(self._on_size_changed)
+            for w in (self.sp_capital, self.sp_risk, self.sp_atr,
+                      self.sp_stop, self.sp_vol):
+                w.valueChanged.connect(lambda *_: self._schedule())
             self.chk_ma.currentIndexChanged.connect(self._schedule)
             self.chk_short.toggled.connect(self._on_short_toggled)
 
@@ -1366,12 +1450,52 @@ class MainWindow(QMainWindow):
             return bool(MARKETS.get(self.market, {}).get("allow_short", False))
         return self.chk_short.isChecked()
 
-    def _on_short_toggled(self, _checked: bool) -> None:
-        info = MARKETS[self.market]
-        self.cfg = BacktestConfig(
+    def _new_cfg(self, info: dict) -> BacktestConfig:
+        """按当前界面重建回测配置。
+
+        `self.cfg` 在切市场、切方向时都会整体重建 —— 仓位口径必须一起带过去，
+        否则用户调好的「50 万」会在勾一下「允许做空」之后悄悄变回 1 手。
+        """
+        cfg = BacktestConfig(
             fee_rate=info["fee"], slippage=info["slippage"],
-            long_only=not self._short_enabled(),
+            long_only=not (info["allow_short"] and self._short_enabled()),
         )
+        self._apply_sizing(cfg)
+        return cfg
+
+    def _apply_sizing(self, cfg: BacktestConfig) -> None:
+        """把「仓位」那一组控件灌进配置。控件还没建好时什么都不做。"""
+        if not hasattr(self, "cb_size"):
+            return
+        cfg.sizing = self.cb_size.currentData() or "capital"
+        cfg.capital = float(self.sp_capital.value())
+        cfg.risk_amount = float(self.sp_risk.value())
+        cfg.stop_atr_n = int(self.sp_atr.value())
+        cfg.stop_mult = float(self.sp_stop.value())
+        cfg.volume = int(self.sp_vol.value())
+        if cfg.capital > 0:
+            # 资金曲线也从这笔钱起步。只改手数不改本金的话，界面上写「50 万」、
+            # 图上的净值还是从 10 万开始，收益百分比看着对、金额全对不上；
+            # 按止损金额定仓时更糟 —— 2 万止损压在 10 万本金上就是每笔赌 20%
+            cfg.initial_cash = cfg.capital
+
+    def _sync_size(self) -> None:
+        """只显示当前口径用得到的输入框。"""
+        mode = self.cb_size.currentData()
+        for w, on in ((self.sp_capital, mode == "capital"),
+                      (self.sp_risk, mode == "risk"),
+                      (self.sp_atr, mode == "risk"),
+                      (self.sp_stop, mode == "risk"),
+                      (self.sp_vol, mode == "fixed")):
+            w.setVisible(on)
+
+    def _on_size_changed(self, *_a) -> None:
+        self._sync_size()
+        self._apply_sizing(self.cfg)
+        self._schedule()
+
+    def _on_short_toggled(self, _checked: bool) -> None:
+        self.cfg = self._new_cfg(MARKETS[self.market])
         self._schedule(immediate=True)
 
     def _on_market_changed(self) -> None:
@@ -1385,11 +1509,9 @@ class MainWindow(QMainWindow):
             self.chk_short.blockSignals(True)
             self.chk_short.setChecked(bool(info["allow_short"]))
             self.chk_short.blockSignals(False)
-        self.cfg = BacktestConfig(
-            fee_rate=info["fee"], slippage=info["slippage"],
-            long_only=not (info["allow_short"] and self._short_enabled()),
-        )
+        self.cfg = self._new_cfg(info)
         self.lbl_sub.setText(info["sub"])
+        self._auto_live()          # 美股没有实时，这条会顺手把旧会话停掉
         self._sync_data_page()
         self._fill_symbols()
         self._sync_period_controls()
@@ -1447,11 +1569,13 @@ class MainWindow(QMainWindow):
     def _on_period_changed(self) -> None:
         self._sync_period_hint()
         self._schedule(immediate=True)
+        self._auto_live()
 
     def _on_symbol_changed(self) -> None:
         # 每个品种下载到的周期不一样，换品种必须重标一次下拉项
         self._sync_period_hint()
         self._schedule()
+        self._auto_live()
 
     def _reload_store(self, market: str) -> None:
         """重建该市场的 DataStore（清掉 DataFrame 缓存），保留当前选中的标的。"""
@@ -1766,7 +1890,12 @@ class MainWindow(QMainWindow):
             factor_keys=self._selected_factor_keys() if is_factor else [],
             factor_reverse={k: True for k in self._reversed_factor_keys()},
             factor_cfg=dict(vars(fc)) if fc is not None else {},
-            volume=1,
+            sizing=self.cb_size.currentData() or "capital",
+            capital=float(self.sp_capital.value()),
+            risk_amount=float(self.sp_risk.value()),
+            stop_atr_n=int(self.sp_atr.value()),
+            stop_mult=float(self.sp_stop.value()),
+            volume=int(self.sp_vol.value()),
             note="short" if self.chk_short.isChecked() else "",
             range_years=float(self.cb_range.currentData() or 0),
         )
@@ -1811,6 +1940,15 @@ class MainWindow(QMainWindow):
             self._apply_factor_cfg(cfg.factor_cfg)
 
         self.chk_short.setChecked(cfg.note == "short")
+        i = self.cb_size.findData(getattr(cfg, "sizing", "capital") or "capital")
+        if i >= 0:
+            self.cb_size.setCurrentIndex(i)
+        self.sp_capital.setValue(float(getattr(cfg, "capital", 0) or 500_000))
+        self.sp_risk.setValue(float(getattr(cfg, "risk_amount", 0) or 20_000))
+        self.sp_atr.setValue(int(getattr(cfg, "stop_atr_n", 0) or 14))
+        self.sp_stop.setValue(float(getattr(cfg, "stop_mult", 0) or 5.0))
+        self.sp_vol.setValue(int(getattr(cfg, "volume", 0) or 1))
+        self._sync_size()
         self.ed_cfg_name.setText(cfg.name)
         r = self.cb_range.findData(float(getattr(cfg, "range_years", 0) or 0))
         if r >= 0:
@@ -2021,6 +2159,15 @@ class MainWindow(QMainWindow):
         # 年化口径必须跟着周期走：5 分钟一年约 1.2 万根，按 252 算会把波动
         # 低估一个数量级、夏普虚高一个数量级。
         self.cfg.bars_per_year = bars_per_year(df.index)
+        # 仓位口径每次重算都从界面读一遍：控件改了不一定重建 cfg，但这里一定跑
+        self._apply_sizing(self.cfg)
+        item = self._current_item()
+        if self.market == "cn":
+            self.cfg.multiplier = specs.multiplier(item.get("symbol", ""),
+                                                   item.get("exchange", ""))
+            self.cfg.margin_rate = specs.margin_rate(item.get("symbol", ""))
+        else:
+            self.cfg.multiplier, self.cfg.margin_rate = 1.0, 1.0
 
         self.df_raw = df
         rule_signal = None
@@ -2237,35 +2384,33 @@ class MainWindow(QMainWindow):
             return None
         return sym, ex
 
-    def _on_live_toggled(self, on: bool) -> None:
-        if not on:
-            self._on_live_stop()
-            return
+    def _auto_live(self) -> None:
+        """自动接上实时行情。
+
+        K 线与信号页并进公共视图之后，「启动实时」按钮没了 —— 这是对的：
+        看盘不该先点一下开关。所以改成条件满足就自己接：国内期货 + 分钟周期 +
+        已经配好天勤账户。缺哪一样就写一句原因，但不弹窗、不拦人。
+        """
         if self.market != "cn":
-            self._revert_live("实时行情只接了国内期货")
+            if self.live.running:
+                self.live.stop(wait=False)
             return
         period = self._period()
         if period == PERIOD_1D:
-            self._revert_live("实时行情需要分钟周期，先选 5 分钟或 1 小时")
+            self.lbl_live_msg.setText("日线不需要实时（切到 5 分钟或 1 小时会自动接上）")
             return
         pair = self._current_pair()
         if pair is None:
-            self._revert_live("先选一个品种")
             return
+        key = f"{pair[0]}_{pair[1]}"
+        if self.live.running and self._live_key == key and self._live_period == period:
+            return                      # 已经在接这个品种这个周期，别反复重连
         spec = self.trade_page._current_spec()
         if spec is None:
-            self._revert_live("先在「账户透视和交易」页添加一个天勤账户")
+            self.lbl_live_msg.setText("实时行情需要一个天勤账户（在「账户透视和交易」页添加）")
             return
         self.live.start(spec, pair[0], pair[1], period, need_history=True)
-        self.btn_live.setText("停止实时")
         self.lbl_live_msg.setText("正在连接…")
-
-    def _revert_live(self, msg: str) -> None:
-        self.btn_live.blockSignals(True)
-        self.btn_live.setChecked(False)
-        self.btn_live.blockSignals(False)
-        self.btn_live.setText("启动实时")
-        self.lbl_live_msg.setText(msg)
 
     def _on_trade_connect(self, spec) -> None:
         """从交易页点「连接」：沿用当前选中的品种与周期。
@@ -2286,20 +2431,10 @@ class MainWindow(QMainWindow):
             return
         self.live.start(spec, pair[0], pair[1], period, need_history=False)
         self.lbl_live_msg.setText("正在连接…")
-        self.btn_live.blockSignals(True)
-        self.btn_live.setChecked(True)
-        self.btn_live.blockSignals(False)
-        self.btn_live.setText("停止实时")
 
     def _on_live_stop(self) -> None:
         self.live.stop(wait=False)
-        self.btn_live.blockSignals(True)
-        self.btn_live.setChecked(False)
-        self.btn_live.blockSignals(False)
-        self.btn_live.setText("启动实时")
         self.lbl_live_msg.setText("实时已停止")
-        if self._trading:
-            self.btn_trade.setChecked(False)
 
     def _on_live_started(self, key: str) -> None:
         sym, _, ex = key.rpartition("_")
@@ -2307,7 +2442,6 @@ class MainWindow(QMainWindow):
         self._live_period = self._period()
         self._live_seq += 1
         self._live_last = None
-        self._last_target = 0
         # 工作线程刚把缺口补进库，缓存里的旧数据要作废，否则实时段会接在旧尾巴上
         self.store.invalidate(key, self._live_period)
         self._live_base = self.store.get(key, self._live_period)
@@ -2322,12 +2456,10 @@ class MainWindow(QMainWindow):
         self.lbl_live.setStyleSheet(f"color: {C_UP}; font-size: 11px; font-weight: 600;")
 
     def _on_live_stopped(self) -> None:
+        if self.live.running:
+            return      # 换品种时旧线程收尾，新的已经在跑了，别把标签刷回去
         self.lbl_live.setText("实时未启动")
         self.lbl_live.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
-        self.btn_live.blockSignals(True)
-        self.btn_live.setChecked(False)
-        self.btn_live.blockSignals(False)
-        self.btn_live.setText("启动实时")
 
     def _on_live_log(self, msg: str) -> None:
         self.lbl_live_msg.setText(msg)
@@ -2364,7 +2496,6 @@ class MainWindow(QMainWindow):
         if first or new_bar:
             # 新 bar 走完整重算：信号只认走完的 bar，避免一根没走完的 K 线反复开平
             self.run_analysis(df_override=merged)
-            self._maybe_auto_trade()
         else:
             self._patch_live_bar(merged)
 
@@ -2376,52 +2507,9 @@ class MainWindow(QMainWindow):
         """
         self.view.patch_last_bar(merged)
 
-    # ---------------------------------------------------------- 交易开关
-    def _on_trade_toggled(self, on: bool) -> None:
-        if on and not self.live.running:
-            self.btn_trade.blockSignals(True)
-            self.btn_trade.setChecked(False)
-            self.btn_trade.blockSignals(False)
-            self.lbl_live_msg.setText("先「启动实时」并连上账户，才能启动交易")
-            return
-        self._trading = bool(on)
-        self._last_target = 0
-        if on:
-            self.btn_trade.setText("停止交易")
-            self.lbl_trade_icon.setText("☺")
-            self.lbl_trade_icon.setStyleSheet(f"font-size: 17px; color: {C_DOWN};")
-            self.lbl_trade_state.setText("交易中")
-            self.lbl_trade_state.setStyleSheet(
-                f"font-size: 11px; color: {C_DOWN}; font-weight: 600;"
-            )
-        else:
-            self.btn_trade.setText("启动交易")
-            self.lbl_trade_icon.setText("☹")
-            self.lbl_trade_icon.setStyleSheet(f"font-size: 17px; color: {C_UP};")
-            self.lbl_trade_state.setText("未交易")
-            self.lbl_trade_state.setStyleSheet(f"font-size: 11px; color: {C_MUTED};")
-
-    def _maybe_auto_trade(self) -> None:
-        """绿灯时按最新信号把仓位调到目标方向（1 手）。
-
-        用 `TargetPosTask` 而不是自己 `insert_order`：反手要「先平后开」，
-        上期所还要求区分平今/平仓，这些规则各交易所不一样，手写必然踩坑。
-        TargetPosTask 按目标净仓自己拆单、自己追价。
-        """
-        if not self._trading or self.df_sig is None or not len(self.df_sig):
-            return
-        st = self._live_state
-        if st is None or not st.underlying:
-            return
-        sig = int(self.df_sig["signal"].iloc[-1])
-        target = sig * 1
-        if target == self._last_target:
-            return
-        self._last_target = target
-        self.live.set_target(st.underlying, target)
-        self.lbl_trade_state.setText(
-            f"交易中 · 目标 {target:+d} 手" if target else "交易中 · 空仓"
-        )
+    # 下单不在这里：「启动交易」那套开关已经下线，实盘下单统一走
+    # 「账户透视和交易」页的 `strategy_runner`（按配置、按手数、拆平今平昨）。
+    # 研究页只负责看行情和调参数。
 
     # ---------------------------------------------------------- 结果文本
 
