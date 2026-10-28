@@ -322,10 +322,18 @@ def combine(results: list[Result], label: str = "组合",
     把它落到交易日这个共同刻度上 —— 混合周期（30 分钟 + 1 小时 + 日线）的组合
     也只有这样才说得清「今天一共赚了多少」。
 
-    对齐用 `ffill(limit_area="inside")`：净值在两根 bar 之间是常数，往前填是
-    精确的；但只填「自己区间内部」的空档，策略还没上线、或者数据已经结束的
-    日子保持空 —— 往后一直填的话，一条 2020 年就停掉的策略会以最后那点净值
-    一直参与组合，把后面的曲线压平。
+    **成分的起止不能让它从均值里消失**。这一点很要紧：两条曲线覆盖的日期往往
+    差一天（一个 30 分钟策略的最后一根在 14:55，一个 1 小时的在次日 11:00，
+    或者本地数据更新进度不同）。如果那条先结束的直接不参与当天的均值，组合
+    净值会从「两条的平均」掉成「另一条自己」—— 看起来是末端凭空跳水 15%，
+    而交易记录上那天还是赚的。
+
+    - 还没上线的日子按 **1.0（现金）** 计：钱已经分给它了，只是还没开始交易
+    - 数据结束之后沿用**最后一个净值**：停手了，钱还在，只是不再赚亏
+
+    两头都不跳，组合净值也始终等于「各策略净值之和 ÷ 条数」，和「每个策略
+    10 万、加起来除以二」的直觉一致。`ffill()` 之后 `fillna(1.0)` 正好是这两件事：
+    ffill 只往前带（头部没值填不了），剩下的空只可能是头部。
 
     **先各自归一化到 1 再平均**，不是直接平均净值：一个品种 3000 点、另一个
     80 块，初始资金也可能不同，直接平均出来的数字没有任何含义。
@@ -335,8 +343,8 @@ def combine(results: list[Result], label: str = "组合",
     算（把每天的收益取均值再连乘），调仓成本没计进去，收益会略好看一点 ——
     两种口径都能自圆其说，这里选更保守的那种，并在标题里写明「等权」。
 
-    某条策略还没上线的日子**不参与**当天的均值 —— 用 1.0 去填等于凭空多出
-    一份现金，会把组合净值稀释成「一半空仓」，看起来像策略失效。
+    某条策略还没上线的日子按 1.0 计（见上），不是不参与 —— 用 skipna 跳过的话
+    均值会在它上线那天从「一条」变成「两条」，一样是假跳变。
 
     交易记录用 `combine_trades()` 合并，别直接拼接：拼接出来是「A 的全部交易，
     然后 B 的全部交易」，看不出两条策略其实在同一段时间里并行。
@@ -357,11 +365,13 @@ def combine(results: list[Result], label: str = "组合",
         return Result(equity=blank, position=blank, trades=[], metrics={}, label=label)
 
     grid = pd.DatetimeIndex(sorted(set().union(*[c.index for c in curves])))
-    mat = pd.concat([c.reindex(grid).ffill(limit_area="inside") for c in curves], axis=1)
-    eq = mat.mean(axis=1, skipna=True).dropna() * float(initial_cash)
+    # ffill 把「数据结束」往后带，fillna(1.0) 补的是头部「还没上线」——
+    # 两种都是钱还在、只是不动，绝不能让成分从均值里掉出去
+    mat = pd.concat([c.reindex(grid).ffill().fillna(1.0) for c in curves], axis=1)
+    eq = mat.mean(axis=1) * float(initial_cash)
 
-    pmat = pd.concat([p.reindex(grid).ffill(limit_area="inside") for p in poss], axis=1)
-    pos = pmat.mean(axis=1, skipna=True).reindex(eq.index).fillna(0.0)
+    pmat = pd.concat([p.reindex(grid).ffill().fillna(0.0) for p in poss], axis=1)
+    pos = pmat.mean(axis=1)
 
     # 年化口径按组合自己的日频算。沿用某一条成分的 bars_per_year 会错得离谱：
     # 一条 30 分钟策略一年几千根，拿它去年化日频曲线，夏普会虚高一个量级

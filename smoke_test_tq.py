@@ -2167,6 +2167,20 @@ def check_result_view() -> None:
                                       | set(r3.res.equity.index.normalize())),
               f"{len(mixed.equity)} 点")
 
+        # 一条策略先没数据（r3 只到第 160 天）：它那一份钱还在，只是不动了。
+        # 从均值里摘掉的话，组合从「两条平均」掉成「另一条自己」—— 末端凭空
+        # 跳水一大截，而交易记录上那天还在赚
+        end_day = r3.res.equity.dropna().index[-1].normalize()
+        after = mixed.equity.index[mixed.equity.index > end_day]
+        jump = abs(float(mixed.equity.loc[after[0]]
+                         / mixed.equity.shift(1).loc[after[0]] - 1.0))
+        check("混合：成分结束时曲线不跳", jump < 0.05, f"{jump:.1%}")
+        a_end = float(r1.res.equity.iloc[-1] / r1.res.equity.iloc[0])
+        b_end = float(daily.iloc[-1] / daily.iloc[0])
+        check("混合：末值等于两条归一净值的平均",
+              abs(float(mixed.equity.iloc[-1]) - (a_end + b_end) / 2 * 100_000) < 1e-6,
+              f"{mixed.equity.iloc[-1]:.0f}")
+
         # 交易记录按开仓时间混排。分组拼接的话，表格是「A 从 2021 一路做到
         # 2023，然后 B 又从 2021 开始」—— 读起来像先后跑了两遍
         pairs = combine_trades([("日线", r1.res), ("30 分钟", r3.res)])
