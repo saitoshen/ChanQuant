@@ -533,14 +533,18 @@ def _run() -> tuple[bool, list[str]]:
             and manual_ok
             and out_ok
         )
-        # K 线可视窗口：初始应停在最新一段，且滚动条范围与窗口自洽
+        # K 线可视窗口：初始应停在最新一段，且滚动条范围与窗口自洽。
+        # 这些状态现在归 `ResultView` 管（研究页和组合页共用一份实现），
+        # 所以要从 `win.view` 上读，而不是主窗口自己。
+        rv = getattr(win, "view", None)
         k_ok = (
-            hasattr(win, "sb_kline")
-            and win._k_total > 0
-            and 0 < win._k_win <= win._k_total
-            and win._k_start == max(0, win._k_total - win._k_win)
+            rv is not None
+            and hasattr(rv, "sb_kline")
+            and rv._k_total > 0
+            and 0 < rv._k_win <= rv._k_total
+            and rv._k_start == max(0, rv._k_total - rv._k_win)
         )
-        k_info = f"窗口 {win._k_win}/{win._k_total} 根"
+        k_info = f"窗口 {rv._k_win}/{rv._k_total} 根" if rv is not None else "无结果视图"
 
         # 因子面板：两个策略族、三种因子模式、47 个因子、四类模型都得在
         fams = {win.cb_family.itemData(i) for i in range(win.cb_family.count())}
@@ -569,8 +573,8 @@ def _run() -> tuple[bool, list[str]]:
         # 因子分析页：表格应铺满全因子，四格图应建出 4 个轴
         win.tabs.setCurrentIndex(2)
         app.processEvents()
-        n_rows = win.tbl_factor.rowCount()
-        n_axes = len(win.canvas_f.fig.axes)
+        n_rows = rv.tbl_factor.rowCount()
+        n_axes = len(rv.canvas_f.fig.axes)
         win.tabs.setCurrentIndex(0)
         app.processEvents()
 
@@ -582,20 +586,57 @@ def _run() -> tuple[bool, list[str]]:
         from matplotlib.backend_bases import MouseEvent
 
         def _wheel(step: int) -> tuple[int, int]:
-            ax = win.canvas_k.fig.axes[0]
+            ax = rv.canvas_k.fig.axes[0]
             bb = ax.get_window_extent()
-            before = win._k_win
+            before = rv._k_win
             MouseEvent(
-                "scroll_event", win.canvas_k,
+                "scroll_event", rv.canvas_k,
                 (bb.x0 + bb.x1) / 2, (bb.y0 + bb.y1) / 2, step=step,
             )._process()
             app.processEvents()
-            return before, win._k_win
+            return before, rv._k_win
 
         w0, w1 = _wheel(+1)   # 向上滚 = 放大 = 窗口变窄
         w2, w3 = _wheel(-1)   # 向下滚 = 缩小 = 窗口变宽
         wheel_ok = w1 < w0 and w3 > w2
         wheel_info = f"{w0}→{w1}→{w3} 根"
+
+        # 组合报告：两条策略等权。一次验三件事 —— 组合页能不能复用同一套
+        # 结果视图（不能就是一片空白）、组合有没有三页（绩效/交易/阶段）、
+        # 绩效表是不是只有两列（多出「买入持有」那列说明还在按单策略画）
+        combo_ok = False
+        combo_info = ""
+        try:
+            from ttrade import strategy_store as SStore
+            from ttrade.strategies import STRATEGIES
+
+            key = win.cb_symbol.currentData() or ""
+            if win.market == "cn":
+                sym, _, ex = key.rpartition("_")
+            else:
+                sym, ex = key, ""
+            note = "short" if win._short_enabled() else ""
+            cfgs = [
+                SStore.StrategyConfig(
+                    symbol=sym, exchange=ex, period=win._period(), rule_key=k,
+                    rule_params=dict(STRATEGIES[k].params), note=note,
+                )
+                for k in ("ma_cross", "donchian")
+            ]
+            text = win.portfolio_page.show_combo(cfgs)
+            tabs, pv = win.portfolio_page._views.get("portfolio", (None, None))
+            combo_ok = (
+                tabs is not None
+                and pv is not None
+                and tabs.count() == 3
+                and pv.table.columnCount() == 2
+                and pv.res is not None
+                and "组合（2 条策略）" in text
+            )
+            combo_info = (f"{tabs.count()} 页 / {pv.table.columnCount()} 列"
+                          if tabs is not None else "未建出视图")
+        except Exception as exc:  # noqa: BLE001
+            combo_info = f"{type(exc).__name__}: {exc}"
 
         win.close()
         app.processEvents()
@@ -621,8 +662,10 @@ def _run() -> tuple[bool, list[str]]:
             )
         if not k_ok:
             raise RuntimeError(
-                f"K 线窗口状态异常：win={win._k_win} start={win._k_start} total={win._k_total}"
+                f"K 线窗口状态异常：win={rv._k_win} start={rv._k_start} total={rv._k_total}"
             )
+        if not combo_ok:
+            raise RuntimeError(f"组合报告异常：{combo_info}")
         if not factor_ok:
             raise RuntimeError(f"因子面板控件缺失：{factor_info}")
         # 因子分析页列出**全部**因子（算不出的显示「无数据」），所以行数应等于
@@ -632,8 +675,8 @@ def _run() -> tuple[bool, list[str]]:
         if n_axes != 4:
             raise RuntimeError(f"因子分析页图轴数为 {n_axes}，应为 4")
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
-                f"{factor_info}，滚轮缩放 {wheel_info}，数据管理页就绪，"
-                f"手册 {manual_info}，输出 {out_info}")
+                f"{factor_info}，滚轮缩放 {wheel_info}，组合 {combo_info}，"
+                f"数据管理页就绪，手册 {manual_info}，输出 {out_info}")
 
     check("构建主窗口（端到端）", _window)
 

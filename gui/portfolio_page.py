@@ -6,9 +6,24 @@
 页面结构：
 
     顶部  默认账户 / 启动全部 / 停止全部 / 状态灯
-    左侧  策略列表：增删、单独启停、从策略库添加、绑定交易账户
+    左侧  策略列表：增删、单独启停、从策略库添加、绑定交易账户、查看回测
     右侧  监控器：逐合约列出「策略理论 / 账户实际 / 差额」，一键对齐
     底部  交易助手：等几秒撤单重报、追几次、每次追几跳
+
+## 为什么这里也有一套 K 线 / 绩效 / 因子
+
+「策略研究」页里那三页是**调参时**看的：改一个滑杆，图跟着变。但策略存进组合
+之后，用户想知道的是「我存下的这一条，历史表现到底怎么样」—— 那不该让他跑回
+研究页把参数一格一格调回来。所以双击列表里的一行，就地打开同一套结果视图。
+
+结果视图是 `gui/result_view.ResultView`，和研究页**同一份实现**：一处改动两处
+生效，不会出现「这边修好了那边还是老图」。
+
+## 组合报告为什么只有一页绩效
+
+单选一条策略：K 线、绩效对比（对买入持有）、因子分析、交易记录、阶段分析。
+多选：只给绩效、交易记录、阶段分析 —— 组合是跨品种、跨周期加权，没有单一
+对照物，硬拉一个「等权买入持有」只会误导。
 
 ## 为什么按账户分多个 Runner
 
@@ -42,6 +57,7 @@ from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -57,15 +73,21 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from gui.result_view import PERIOD_LABEL, ResultView, ViewCtx
+from ttrade import replay
 from ttrade import strategy_store as SStore
 from ttrade import tqlive
+from ttrade.backtest import bars_per_year, combine
 from ttrade.strategy_runner import PortfolioRunner
+from ttrade.universe import cn_name
 
 # 与 trade_page.py / app.py 同一套配色。不 import 那两处：app 会 import 本模块。
 C_TEXT = "#1f2937"
@@ -331,13 +353,17 @@ class EditDialog(QDialog):
 class PortfolioPage(QWidget):
     """策略交易和组合。"""
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, loader=None, parent=None) -> None:
         super().__init__(parent)
+        # loader(market, key, period) -> DataFrame | None。主窗口把它的 DataStore
+        # 递进来 —— 这一页自己不该再扫一遍数据目录（那是几秒钟的事）。
+        self._loader = loader
         self._items = SStore.load_portfolio()
         self._accounts = tqlive.load_accounts()
         self._chase = SStore.load_chase()
         self._snaps: dict[str, dict] = {}
         self._slot_view: dict[str, dict] = {}     # sid -> 快照里的 slot
+        self._views: dict[str, tuple[QTabWidget, ResultView]] = {}
         self.ctl = PortfolioController(self)
         self._build()
         self._load_chase_widgets()
@@ -354,6 +380,19 @@ class PortfolioPage(QWidget):
     def _build(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # 两页：管理界面 / 结果视图。用 QStackedWidget 而不是弹窗 —— 弹窗里塞
+        # 五个带 matplotlib 的页签，窗口一小图表就糊成一片，还得再调一次尺寸。
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_manage())
+        self.stack.addWidget(self._build_view_page())
+        root.addWidget(self.stack, 1)
+
+    def _build_manage(self) -> QWidget:
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(10)
         root.addWidget(self._build_top())
 
@@ -364,6 +403,54 @@ class PortfolioPage(QWidget):
         root.addWidget(split, 1)
 
         root.addWidget(self._build_chase_card())
+        return page
+
+    def _build_view_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        bar = QWidget()
+        bar.setObjectName("Card")
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(12, 6, 12, 6)
+        bl.setSpacing(10)
+        self.btn_back = QPushButton("← 返回策略列表")
+        self.btn_back.setObjectName("Ghost")
+        self.btn_back.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        bl.addWidget(self.btn_back)
+
+        self.lbl_view = QLabel("")
+        self.lbl_view.setStyleSheet("font-size: 13px; font-weight: 600; color: #0f172a;")
+        bl.addWidget(self.lbl_view, 1)
+        lay.addWidget(bar)
+
+        # 单策略视图和组合视图各建一次、常驻不销毁：销毁要停 QTimer、要防
+        # 已排队的重绘打到已删的画布上，切回来还得重建五个页签。留着更省事，
+        # 代价只是多几 MB 的 Figure。
+        self._view_stack = QStackedWidget()
+        lay.addWidget(self._view_stack, 1)
+        return page
+
+    def _ensure_view(self, kind: str) -> tuple[QTabWidget, ResultView]:
+        hit = self._views.get(kind)
+        if hit is not None:
+            return hit
+        tabs = QTabWidget()
+        view = ResultView(kind, self)
+        for title, w in view.pages():
+            tabs.addTab(w, title)
+        view.status.connect(self.lbl_view.setText)
+        self._view_stack.addWidget(tabs)
+        self._views[kind] = (tabs, view)
+        return tabs, view
+
+    def _show_view(self, kind: str, title: str) -> None:
+        tabs, _view = self._ensure_view(kind)
+        self._view_stack.setCurrentWidget(tabs)
+        self.lbl_view.setText(title)
+        self.stack.setCurrentIndex(1)
 
     def _build_top(self) -> QWidget:
         card = QWidget()
@@ -433,6 +520,18 @@ class PortfolioPage(QWidget):
     def _build_strategy_card(self) -> QWidget:
         card, lay, head = self._card("策略列表")
 
+        self.btn_view = QPushButton("查看回测")
+        self.btn_view.setToolTip("打开这一条策略的 K 线与信号 / 绩效 / 因子分析 / 交易记录 / 阶段分析")
+        self.btn_view.clicked.connect(self._open_single)
+        head.addWidget(self.btn_view)
+
+        self.btn_combo = QPushButton("组合报告")
+        self.btn_combo.setObjectName("Ghost")
+        self.btn_combo.setToolTip("按住 Ctrl 选中多条策略，看它们等权组合起来的资金曲线")
+        self.btn_combo.setEnabled(False)
+        self.btn_combo.clicked.connect(self._open_combo)
+        head.addWidget(self.btn_combo)
+
         btn_lib = QPushButton("从策略库添加")
         btn_lib.setObjectName("Ghost")
         btn_lib.clicked.connect(self._add_from_library)
@@ -456,15 +555,28 @@ class PortfolioPage(QWidget):
         self.tbl_strat = self._table(
             ["名称", "标的", "策略", "手数", "账户", "理论", "实际", "状态"]
         )
-        self.tbl_strat.doubleClicked.connect(lambda _i: self._toggle_selected())
+        # 多选是为了组合报告。双击原来是「启动 / 停止」，但那个动作有同名按钮，
+        # 而「看一眼这条策略的历史表现」没有别的入口 —— 双击给后者更值。
+        self.tbl_strat.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tbl_strat.doubleClicked.connect(lambda _i: self._open_single())
+        self.tbl_strat.itemSelectionChanged.connect(self._sync_buttons)
         lay.addWidget(self.tbl_strat, 1)
 
         hint = QLabel(
-            "双击一行 = 启动 / 停止这一条。策略来源是「策略研究」里保存的配置。"
+            "双击一行 = 打开它的 K 线与绩效。按住 Ctrl 多选后点「组合报告」，"
+            "看这几条策略等权组合的资金曲线。启停请用上面的按钮。"
         )
         hint.setObjectName("Hint")
+        hint.setWordWrap(True)
         lay.addWidget(hint)
         return card
+
+    def _sync_buttons(self) -> None:
+        """选中几条就改一次按钮：只有一条时「组合报告」没有意义。"""
+        n = len(self._selected_cfgs())
+        self.btn_combo.setEnabled(n >= 2)
+        self.btn_combo.setText(f"组合报告（{n}）" if n >= 2 else "组合报告")
+        self.btn_view.setEnabled(n >= 1)
 
     def _build_monitor_card(self) -> QWidget:
         card, lay, head = self._card("监控器")
@@ -574,45 +686,194 @@ class PortfolioPage(QWidget):
 
     def _fill_strategies(self) -> None:
         """重建策略表。选中行按 sid 找回，不然每次刷新都会跳回第一行。"""
-        sel = self._selected_sid()
+        keep = set(self._selected_sids())
         t = self.tbl_strat
-        t.setRowCount(len(self._items))
-        for i, cfg in enumerate(self._items):
-            vals = [
-                cfg.name.strip() or cfg.title(),
-                f"{cfg.key()} {cfg.period}",
-                cfg.strategy_label(),
-                str(cfg.volume),
-                cfg.account or "默认",
-            ]
-            for j, v in enumerate(vals):
-                item = QTableWidgetItem(v)
-                item.setData(Qt.UserRole, cfg.sid)
-                if j == 3:
-                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                t.setItem(i, j, item)
-            for j in (5, 6, 7):
-                t.setItem(i, j, QTableWidgetItem("—"))
-        if sel:
-            for i in range(t.rowCount()):
-                it = t.item(i, 0)
-                if it is not None and it.data(Qt.UserRole) == sel:
-                    t.selectRow(i)
+        t.blockSignals(True)
+        try:
+            t.setRowCount(len(self._items))
+            for i, cfg in enumerate(self._items):
+                vals = [
+                    cfg.name.strip() or cfg.title(),
+                    f"{cfg.key()} {cfg.period}",
+                    cfg.strategy_label(),
+                    str(cfg.volume),
+                    cfg.account or "默认",
+                ]
+                for j, v in enumerate(vals):
+                    item = QTableWidgetItem(v)
+                    item.setData(Qt.UserRole, cfg.sid)
+                    if j == 3:
+                        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    t.setItem(i, j, item)
+                for j in (5, 6, 7):
+                    t.setItem(i, j, QTableWidgetItem("—"))
+            if keep:
+                for i in range(t.rowCount()):
+                    it = t.item(i, 0)
+                    if it is not None and it.data(Qt.UserRole) in keep:
+                        t.selectRow(i)
+        finally:
+            t.blockSignals(False)
+        self._sync_buttons()
+
+    def _selected_sids(self) -> list[str]:
+        model = self.tbl_strat.selectionModel()
+        if model is None:
+            return []
+        out = []
+        for i in sorted({i.row() for i in model.selectedRows()}):
+            it = self.tbl_strat.item(i, 0)
+            sid = "" if it is None else str(it.data(Qt.UserRole) or "")
+            if sid:
+                out.append(sid)
+        return out
+
+    def _selected_cfgs(self) -> list:
+        """当前选中的所有配置，按表格顺序。组合报告要这个。"""
+        sids = self._selected_sids()
+        out = []
+        for sid in sids:
+            for cfg in self._items:
+                if cfg.sid == sid:
+                    out.append(cfg)
                     break
+        return out
 
-    def _selected_sid(self) -> str:
-        row = self.tbl_strat.currentRow()
-        if row < 0:
-            return ""
-        it = self.tbl_strat.item(row, 0)
-        return "" if it is None else str(it.data(Qt.UserRole) or "")
+    # ---------------------------------------------------------- 结果视图
 
-    def _selected_cfg(self):
-        sid = self._selected_sid()
-        for cfg in self._items:
-            if cfg.sid == sid:
-                return cfg
-        return None
+    def _load(self, cfg):
+        """取这个配置的行情。返回 (df, 出错原因)。"""
+        if self._loader is None:
+            return None, "没有接上行情数据源"
+        mk = replay.market_of(cfg)
+        key = cfg.key()
+        try:
+            df = self._loader(mk, key, cfg.period or "1d")
+        except Exception as exc:  # noqa: BLE001
+            return None, f"{key} 读取失败：{exc}"
+        if df is None or df.empty:
+            return None, f"{key} 没有 {cfg.period} 的行情数据"
+        return df, ""
+
+    def _ctx(self, cfg, rp, period: str = "") -> ViewCtx:
+        return ViewCtx(
+            symbol=cfg.symbol,
+            name=cn_name(cfg.symbol) or "",
+            exchange=cfg.exchange,
+            period=period or cfg.period,
+            market=replay.market_of(cfg),
+            label=rp.label,
+            legend=("▲紫＝开多　▼紫＝平多" if rp.long_only
+                    else "▲紫＝开多　▼紫＝平多　▼琥珀＝开空　▲琥珀＝平空"),
+            price_note="价格（后复权）" if not cfg.exchange else "价格（前复权·主力连续）",
+            range_years=None,      # 存下来的策略看全历史，不然「绩效」是可挑选的
+            rule_key=cfg.rule_key,
+            overlay=True,
+            long_only=rp.long_only,
+            bars_per_year=rp.bars_per_year,
+            factor_cfg=rp.factor_cfg,
+            filter_active=rp.filter_active,
+            selected_keys=rp.keys,
+            outcome=rp.outcome,
+        )
+
+    def _open_single(self) -> None:
+        cfgs = self._selected_cfgs()
+        if not cfgs:
+            self._on_failed("先选中一条策略")
+            return
+        if len(cfgs) > 1:
+            self._on_log(f"选中了 {len(cfgs)} 条，先显示第一条；要看整体请点「组合报告」")
+        self.show_config(cfgs[0])
+
+    def _open_combo(self) -> None:
+        cfgs = self._selected_cfgs()
+        if len(cfgs) < 2:
+            self._on_failed("按住 Ctrl 至少选两条策略，才谈得上组合")
+            return
+        self.show_combo(cfgs)
+
+    def show_config(self, cfg, note: str = "") -> str:
+        """回放一份配置并展示。返回一段纯文本结论（失败时是原因）。
+
+        「交易 Agent」发起的 backtest 走这里：跑完把文本推回 Agent 页的输出框，
+        模型才知道算出来是什么。所以失败也要返回原因，不能只弹个红字。
+        """
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            df, why = self._load(cfg)
+            if df is None:
+                return f"回测失败：{why}"
+            rp = replay.run(cfg, df)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not rp.ok:
+            return f"回测失败：{rp.error}"
+
+        _tabs, view = self._ensure_view("single")
+        view.show_result(rp.df, rp.raw, rp.res, rp.bh, self._ctx(cfg, rp))
+        period = PERIOD_LABEL.get(cfg.period, cfg.period)
+        # cfg.title() 已经含「品种 · 策略」，别再拼一遍 key 和策略名
+        self._show_view("single", f"{cfg.title()}｜{period}"
+                                 + (f"｜{note}" if note else ""))
+        return replay.summary(rp, cfg.key(), period)
+
+    def show_combo(self, cfgs: list) -> str:
+        """多策略等权组合报告。返回结论文本（失败时是原因）。"""
+        reps: list = []
+        missing: list[str] = []
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for cfg in cfgs:
+                df, why = self._load(cfg)
+                if df is None:
+                    missing.append(why)
+                    continue
+                rp = replay.run(cfg, df, with_bh=False)
+                if not rp.ok:
+                    missing.append(f"{cfg.title()}：{rp.error}")
+                    continue
+                reps.append((cfg, rp))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if not reps:
+            return "组合报告失败：" + "；".join(missing or ["没有可用的策略"])
+        if len(reps) < 2:
+            # 一条都算不出来时「组合」没有意义，直接说清楚少了谁
+            return ("组合报告需要至少 2 条能算出结果的策略。"
+                    + ("　" + "；".join(missing) if missing else ""))
+
+        # 周期一致就照抄，混着就留空：留空时交易记录会带上时分（分钟级策略
+        # 的交易时间差几十分钟是有意义的），持仓长度也改用「根（约 N 天）」
+        periods = {c.period for c, _r in reps}
+        period = periods.pop() if len(periods) == 1 else ""
+        bpy = bars_per_year(reps[0][1].res.equity.index)
+        res = combine([rp.res for _c, rp in reps], label="组合", bars_per_year=bpy)
+        # 交易记录要带策略名：组合不合并对冲，得能分清哪一笔是谁做的
+        trades = [(c.title(), t) for c, rp in reps for t in rp.res.trades]
+        ctx = ViewCtx(
+            symbol="", name="", exchange="", period=period,
+            market=replay.market_of(reps[0][0]), label="组合",
+            price_note="净值", long_only=False, bars_per_year=bpy,
+            selected_keys=[], overlay=False,
+        )
+        tabs, view = self._ensure_view("portfolio")
+        view.show_result(None, None, res, None, ctx, trades=trades)
+        names = "、".join(c.title() for c, _r in reps)
+        self._show_view("portfolio", f"组合报告｜{len(reps)} 条策略等权｜{names}")
+
+        head = f"组合（{len(reps)} 条策略）"
+        rp = replay.Replay(res=res, bh=None, period=period,
+                           bars_per_year=bpy)
+        text = replay.summary(rp, head, "等权")
+        if not period:
+            # 混了日线和分钟线时「平均持仓 40 根」没法换算成天数：一根 30 分钟
+            # 和一根日线不是同一个单位。与其给个错的天数，不如直说
+            text += "\n注意：组合里混了不同周期，平均持仓的根数不可比"
+        if missing:
+            text += "\n未能加入组合：" + "；".join(missing)
+        return text
 
     def _on_snapshot(self, key: str, snap: dict) -> None:
         self._snaps[key] = snap
@@ -761,10 +1022,20 @@ class PortfolioPage(QWidget):
         self._snaps.clear()
         self._render()
 
-    def _toggle_selected(self) -> None:
-        cfg = self._selected_cfg()
-        if cfg is None:
+    def _single_or_warn(self) -> object | None:
+        """这几个动作一次只能作用在一条策略上。多选时先劝一句，别闷头改第一条。"""
+        cfgs = self._selected_cfgs()
+        if not cfgs:
             self._on_failed("先选中一条策略")
+            return None
+        if len(cfgs) > 1:
+            self._on_failed(f"选中了 {len(cfgs)} 条。这个动作一次只作用于一条，先只选一条")
+            return None
+        return cfgs[0]
+
+    def _toggle_selected(self) -> None:
+        cfg = self._single_or_warn()
+        if cfg is None:
             return
         on = not cfg.enabled
         cfg.enabled = on
@@ -799,9 +1070,8 @@ class PortfolioPage(QWidget):
         self._on_log(f"已加入组合：{item.title()}")
 
     def _edit_selected(self) -> None:
-        cfg = self._selected_cfg()
+        cfg = self._single_or_warn()
         if cfg is None:
-            self._on_failed("先选中一条策略")
             return
         dlg = EditDialog(cfg, [s.name for s in self._accounts], self)
         if dlg.exec() != QDialog.Accepted:
@@ -842,9 +1112,8 @@ class PortfolioPage(QWidget):
         return msg
 
     def _del_selected(self) -> None:
-        cfg = self._selected_cfg()
+        cfg = self._single_or_warn()
         if cfg is None:
-            self._on_failed("先选中一条策略")
             return
         msg = f"从组合里删除「{cfg.title()}」？\n策略库里的模板不受影响。"
         if QMessageBox.question(self, "删除策略", msg) != QMessageBox.Yes:

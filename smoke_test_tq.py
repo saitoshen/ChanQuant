@@ -2024,6 +2024,142 @@ def check_agent_attachments() -> None:
         check("附件 / 输出框", False, f"{type(exc).__name__}: {exc}")
 
 
+def check_result_view() -> None:
+    """结果视图：阶段分析的口径、组合合成、离线回放。
+
+    这些数字会同时出现在页面上（年度柱状 + 月度矩阵 + 绩效页），对不上就是
+    用户眼里的 bug —— 尤其「12 个月连乘 ≠ 全年」，一眼就能看出来。
+    """
+    from ttrade import replay
+    from ttrade import strategy_store as SStore
+    from ttrade.backtest import combine, month_matrix, stage_table
+
+    try:
+        rng = np.random.default_rng(7)
+        idx = pd.bdate_range("2021-01-04", periods=700)
+        # 造一段有涨有跌的行情：单调上涨的话月度矩阵全是正数，测不出符号错误
+        drift = np.sin(np.arange(len(idx)) / 60.0) * 0.004 + 0.0004
+        close = 100 * np.exp(np.cumsum(drift + rng.normal(0, 0.008, len(idx))))
+        df = pd.DataFrame(
+            {
+                "open": close * (1 + rng.normal(0, 0.001, len(idx))),
+                "high": close * 1.01,
+                "low": close * 0.99,
+                "close": close,
+                "volume": 1000.0,
+            },
+            index=idx,
+        )
+
+        eq = pd.Series(close, index=idx)
+        st = stage_table(eq, "YE")
+        total = float(eq.iloc[-1] / eq.iloc[0] - 1.0)
+        prod = float((1 + st["ret"]).prod() - 1.0)
+        check("阶段：年度收益连乘等于总收益", abs(prod - total) < 1e-9,
+              f"{prod:.6f} vs {total:.6f}")
+
+        mm = month_matrix(eq)
+        check("阶段：月度矩阵按年成行",
+              list(mm.index) == sorted({d.year for d in idx}), str(list(mm.index)))
+        # 每一年的 12 个月连乘必须等于那一年的收益。段收益取「上段末→本段末」
+        # 就是为了这条 —— 用段内第一根当基准会把月初的跳空吞掉
+        ok_year = True
+        for year in mm.index:
+            row = mm.loc[year].dropna()
+            got = float((1 + row).prod() - 1.0)
+            want = float(st.loc[st["period"].dt.year == year, "ret"].iloc[0])
+            if abs(got - want) > 1e-9:
+                ok_year = False
+                break
+        check("阶段：每年 12 个月连乘等于年度收益", ok_year)
+
+        # 回放：规则策略能出结果，且带基准；不带基准时 bh 必须是 None
+        c1 = SStore.StrategyConfig(symbol="TEST", period="1d", rule_key="ma_cross",
+                                   rule_params={"fast": 5, "slow": 20})
+        c2 = SStore.StrategyConfig(symbol="TEST", period="1d", rule_key="donchian",
+                                   rule_params={"entry": 20, "exit": 10})
+        r1 = replay.run(c1, df)
+        r2 = replay.run(c2, df)
+        check("回放：规则策略出结果", r1.ok and r1.res is not None, r1.error)
+        check("回放：带买入持有基准", r1.bh is not None)
+        check("回放：含 signal 列", r1.df is not None and "signal" in r1.df.columns)
+        check("回放：可以不要基准",
+              replay.run(c1, df, with_bh=False).bh is None)
+
+        # 出错要落在 error 里，不能抛 —— 调用方是「双击一行看个图」
+        bad = replay.run(SStore.StrategyConfig(symbol="TEST", rule_key="不存在的策略"), df)
+        check("回放：未知策略不抛异常", (not bad.ok) and "没有这个策略" in bad.error, bad.error)
+        check("回放：没数据也不抛", replay.run(c1, None).ok is False)
+
+        # 配置里留着旧版本删掉的字段时不能 TypeError
+        fcfg = replay.factor_config({"window": 120, "已经删掉的字段": 1})
+        check("回放：旧配置的多余字段被忽略", fcfg.window == 120, str(fcfg.window))
+
+        # 组合：等权 = 归一化后逐日取均值，交易记录直接拼接
+        combo = combine([r1.res, r2.res], label="组合")
+        norm = pd.concat([r1.res.equity / r1.res.equity.iloc[0],
+                          r2.res.equity / r2.res.equity.iloc[0]], axis=1).mean(axis=1)
+        check("组合：曲线是归一化后的均值",
+              bool(np.allclose(combo.equity.values, (norm * 100_000).values)))
+        check("组合：首日净值等于初始资金",
+              abs(float(combo.equity.iloc[0]) - 100_000) < 1e-6,
+              f"{combo.equity.iloc[0]:.2f}")
+        check("组合：交易记录是两条之和",
+              len(combo.trades) == len(r1.res.trades) + len(r2.res.trades),
+              f"{len(combo.trades)} 笔")
+        check("组合：指标齐全", "cagr" in combo.metrics and "max_dd" in combo.metrics)
+
+        # 结论文本：组合没有基准，不能写出「基准 / 超额」两行
+        text_one = replay.summary(r1, "TEST", "日线")
+        text_combo = replay.summary(
+            replay.Replay(res=combo, bh=None, period="1d"), "组合（2 条策略）", "等权")
+        check("结论：单策略写基准", "基准" in text_one and "超额" in text_one)
+        check("结论：组合不写基准", "基准" not in text_combo and "超额" not in text_combo,
+              text_combo[:40])
+        check("结论：组合带条数", "组合（2 条策略）" in text_combo)
+        check("结论：日线持仓写「天」", "天" in text_one and "根（约" not in text_one)
+    except Exception as exc:  # noqa: BLE001
+        check("阶段 / 组合 / 回放", False, f"{type(exc).__name__}: {exc}")
+        return
+
+    # 页数由 kind 决定：单策略五页，组合三页（没有 K 线和因子 —— 跨品种加权
+    # 没有单一对照物，也没有「这个组合的因子」这种说法）
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from PySide6.QtWidgets import QApplication
+
+        from gui.result_view import ResultView
+        from ttrade.plotstyle import setup_matplotlib_fonts
+
+        # 不设字体的话标题里的中文全是方块，而且只在 warning 里出现一次，
+        # 页面上看起来就是「图里没字」——主程序启动时做过同样的事
+        setup_matplotlib_fonts()
+        app = QApplication.instance() or QApplication([])
+        one = ResultView("single")
+        many = ResultView("portfolio")
+        titles_one = [t for t, _ in one.pages()]
+        titles_many = [t for t, _ in many.pages()]
+        check("视图：单策略五页", len(titles_one) == 5, str(titles_one))
+        check("视图：组合三页", titles_many == ["绩效", "交易记录", "阶段分析"],
+              str(titles_many))
+        check("视图：组合绩效表只有两列", many.table.columnCount() == 2,
+              str(many.table.columnCount()))
+
+        # 无基准路径必须真的能画出来：组合页的整条链都走这里，
+        # 画不出来就是一片空白，而界面上不会报错
+        many.show_result(None, None, combo, None, many.ctx)
+        check("视图：组合无基准也能渲染", many.res is not None and len(many.res.equity) > 0)
+        check("视图：组合交易表带策略列", many.tbl_trades.columnCount() == 10,
+              str(many.tbl_trades.columnCount()))
+        check("视图：单策略交易表不带策略列", one.tbl_trades.columnCount() == 9,
+              str(one.tbl_trades.columnCount()))
+        many.clear("清空")
+        check("视图：清空后没有残留结果", many.res is None)
+        app.processEvents()
+    except Exception as exc:  # noqa: BLE001
+        check("结果视图", False, f"{type(exc).__name__}: {exc}")
+
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -2051,6 +2187,7 @@ def main() -> int:
     check_agent_fs()
     check_factor_manual()
     check_agent_attachments()
+    check_result_view()
     for k in ks:
         try:
             check_one(k)

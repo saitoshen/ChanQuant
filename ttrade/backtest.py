@@ -299,6 +299,55 @@ def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None) -> Result:
     return Result(equity=eq, position=ps, trades=[trade], metrics=m, label="买入持有")
 
 
+def combine(results: list[Result], label: str = "组合",
+            bars_per_year: float = float(TRADING_DAYS),
+            initial_cash: float = 100_000.0) -> Result:
+    """把多条资金曲线合成一条等权组合曲线。
+
+    **先各自归一化到 1 再平均**，不是直接平均净值：一个品种 3000 点、另一个
+    80 块，初始资金也可能不同，直接平均出来的数字没有任何含义。
+
+    平均的是**净值水平**，所以这是「初始等权、之后不再平衡」的组合：表现好的
+    那条占的份额会慢慢变大，和持有一篮子标的的感觉一致。若按「每日再平衡」
+    算（把每天的收益取均值再连乘），调仓成本没计进去，收益会略好看一点 ——
+    两种口径都能自圆其说，这里选更保守的那种，并在标题里写明「等权」。
+
+    某条策略还没上线（或者已经没数据）的日期**不参与**当天的均值 —— 用 1.0
+    去填等于凭空多出一份现金，会把组合净值稀释成「一半空仓」，看起来像策略
+    失效。所以用 skipna 的均值，让曲线在成分变化处保持连续。
+
+    交易记录直接拼接：组合不合并对冲，各策略各自开平，看的时候要能分清是
+    谁做的这一笔。
+    """
+    curves: list[pd.Series] = []
+    poss: list[pd.Series] = []
+    trades: list[Trade] = []
+    for r in results:
+        eq = r.equity.dropna()
+        if len(eq) < 2:
+            continue
+        curves.append(eq / float(eq.iloc[0]))
+        poss.append(r.position.reindex(eq.index).fillna(0))
+        trades += list(r.trades)
+
+    if not curves:
+        blank = pd.Series(dtype=float)
+        return Result(equity=blank, position=blank, trades=[], metrics={}, label=label)
+
+    mat = pd.concat(curves, axis=1).sort_index()
+    eq = mat.mean(axis=1, skipna=True).dropna()
+    pos = (
+        pd.concat(poss, axis=1).sort_index()
+        .mean(axis=1, skipna=True)
+        .reindex(eq.index)
+        .fillna(0.0)
+    )
+    eq = eq * float(initial_cash)
+    m = _metrics(eq, pos, trades, bars_per_year)
+    m["final_equity"] = float(eq.iloc[-1])
+    return Result(equity=eq, position=pos, trades=trades, metrics=m, label=label)
+
+
 def drawdown_series(equity: pd.Series) -> pd.Series:
     return equity / equity.cummax() - 1.0
 
@@ -309,3 +358,49 @@ def yearly_returns(equity: pd.Series) -> pd.Series:
     prev = yr.shift(1)
     prev.iloc[0] = equity.iloc[0]
     return (yr / prev - 1.0).rename("return")
+
+
+def stage_table(equity: pd.Series, freq: str = "YE") -> pd.DataFrame:
+    """按自然周期切段：段收益、段内最大回撤、段内波动、根数。
+
+    **段收益用「上段末 → 本段末」算**，不是「段内第一根 → 段末」。第一根只是
+    这个月的第一天，拿它当基准会把「上月末到本月初」那段跳空吞掉，十二个月的
+    收益连乘起来对不上全年 —— 而这两个数字都会摆在页面上，对不上就是 bug。
+
+    段内最大回撤的峰值在段首重置：它回答的是「这个月里最多回撤了多少」，
+    不是「从历史最高点回撤了多少」。后者叫全局回撤，看资金曲线就够了。
+    """
+    eq = pd.to_numeric(equity, errors="coerce").dropna()
+    if len(eq) < 2:
+        return pd.DataFrame(columns=["period", "ret", "max_dd", "vol", "bars"])
+
+    base = float(eq.iloc[0])
+    rows = []
+    for key, seg in eq.groupby(pd.Grouper(freq=freq)):
+        seg = seg.dropna()
+        if seg.empty:
+            continue
+        last = float(seg.iloc[-1])
+        ret = last / base - 1.0 if base else 0.0
+        dd = float((seg / seg.cummax() - 1.0).min())
+        # 段内波动按根数年化，和 `_metrics` 的口径一致（否则月表里的数字
+        # 和绩效页的「年化波动」对不上，看的人会以为有一处算错了）
+        r = seg.pct_change().dropna()
+        vol = float(r.std(ddof=1) * np.sqrt(252)) if len(r) > 1 else 0.0
+        rows.append({"period": key, "ret": ret, "max_dd": dd, "vol": vol, "bars": len(seg)})
+        base = last
+    return pd.DataFrame(rows)
+
+
+def month_matrix(equity: pd.Series) -> pd.DataFrame:
+    """月度收益矩阵：行=年，列=1..12，值=当月收益（缺失为 NaN）。
+
+    年度和月度分开算（都走 `stage_table`），不用「十二个月连乘」倒推年度 ——
+    首尾不满整年的那两段会让连乘结果和真实年度收益差出几个点。
+    """
+    st = stage_table(equity, "ME")
+    if st.empty:
+        return pd.DataFrame()
+    df = st.assign(year=st["period"].dt.year, month=st["period"].dt.month)
+    return df.pivot_table(index="year", columns="month", values="ret", aggfunc="last")
+

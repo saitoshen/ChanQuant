@@ -101,6 +101,11 @@ HIDDEN = [
     # 附件：也是点「附件」按钮时才 import，漏了就是「加图片没反应」
     "ttrade.attachments",
     "gui.data_page",
+    # 结果视图与离线回放：组合页双击一条策略、Agent 发起 backtest 都走这两个。
+    # 静态分析本来扫得到，但它们是最近才拆出来的模块，列在这里免得以后挪成
+    # 函数内 import 时忘了补 —— 那时表现是「双击策略没反应」
+    "gui.result_view",
+    "ttrade.replay",
 ]
 
 # 用不到的重量级依赖，剔掉能省 100MB 以上

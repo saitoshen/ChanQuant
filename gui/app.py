@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 
@@ -35,27 +34,18 @@ os.environ.setdefault("MPLCONFIGDIR", cache_dir("mpl"))
 import matplotlib
 
 matplotlib.use("QtAgg")
-import time
 
-import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.collections import LineCollection, PolyCollection
-from matplotlib.colors import to_rgba
-from matplotlib.figure import Figure
-from matplotlib.ticker import FuncFormatter
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QPalette
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -63,13 +53,9 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QScrollArea,
-    QScrollBar,
-    QSizePolicy,
     QSlider,
-    QSplitter,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -78,57 +64,30 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ttrade import factor_metrics, factors, mlmodels, tqdata, tqlive
+from ttrade import factors, mlmodels, tqdata, tqlive
 from ttrade import factor_strategy as fstrat
+from ttrade import replay
 from ttrade import strategy_store as SStore
 from gui.agent_page import AgentPage
 from gui.data_page import DataPage
 from gui.live import LiveController
 from gui.portfolio_page import PortfolioPage
+from gui.result_view import ResultView, ViewCtx
 from gui.trade_page import TradePage
-from ttrade.backtest import (
-    BacktestConfig,
-    bars_per_year,
-    buy_and_hold,
-    drawdown_series,
-    run_backtest,
-)
+from ttrade.backtest import BacktestConfig, bars_per_year, buy_and_hold, run_backtest
 from ttrade.eastmoney import load_local
 from ttrade.strategies import STRATEGIES, run_strategy
-from ttrade.universe import BENCHMARK, UNIVERSE, cn_name, sector_of
+from ttrade.universe import UNIVERSE, cn_name, sector_of
 
 DATA_DIR = resolve_data_dir("us")
 
 # ------------------------------------------------------------------ 样式常量
-C_BG = "#ffffff"
-C_PANEL = "#f8fafc"
-C_GRID = "#e5e7eb"
+# 图表的配色和 K 线窗口常量都在 `gui/result_view.py` 里 —— 这一页只剩侧边栏和
+# 状态灯，用到颜色的地方只有下面四个。
 C_TEXT = "#1f2937"
 C_MUTED = "#6b7280"
 C_UP = "#d92b2b"      # 红涨
 C_DOWN = "#0f9d58"    # 绿跌
-C_STRAT = "#2563eb"
-C_BH = "#94a3b8"
-C_ENTRY = "#059669"
-C_EXIT = "#dc2626"
-C_HOLD_BG = "#3b82f6"
-C_SHORT_BG = "#ef4444"
-
-# 开平仓标记刻意避开 K 线的红绿：原来多头用绿、空头用红，三角混在蜡烛里
-# 根本找不出来（尤其连板行情）。改成紫 / 琥珀，和红(#d92b2b)、绿(#0f9d58)、
-# 多头背景蓝、空头背景红都拉得开。
-C_LONG_SIG = "#7c3aed"    # 多头信号：紫
-C_SHORT_SIG = "#f59e0b"   # 空头信号：琥珀
-
-# 持仓连线：盈利红、亏损绿（A 股习惯）。和信号标记是两套色，不会互相干扰。
-C_PROFIT = "#d92b2b"
-C_LOSSLINE = "#0f9d58"
-
-# K 线可视窗口（根）。窗口小看得清，窗口大看趋势；滚动条在不缩放的前提下平移。
-K_WIN_DEFAULT = 180
-K_WIN_MIN = 40
-K_WIN_MAX = 1500
-K_REDRAW_GAP = 0.15     # 滚动重绘的最小间隔（秒）
 
 # 周期。日线走原来的 Tushare CSV（20 年），分钟级走天勤 DuckDB（10 年）。
 # 两者主力换月口径不同（天勤按自己的规则，Tushare 按自己的），所以跨周期的
@@ -136,12 +95,6 @@ K_REDRAW_GAP = 0.15     # 滚动重绘的最小间隔（秒）
 PERIOD_1D = "1d"
 GUI_PERIODS = [PERIOD_1D] + tqdata.PERIOD_ORDER   # 下拉框顺序：日线在前，越往后越短
 PERIOD_LABEL = dict(tqdata.PERIOD_LABEL, **{PERIOD_1D: "日线"})
-
-# 因子分数面板配色：与 K 线的红绿、信号的紫/琥珀都错开，用青蓝系
-C_FACTOR = "#0891b2"
-C_FACTOR_FILL = "#22d3ee"
-C_IC = "#2563eb"
-C_IC_NEG = "#dc2626"
 
 # ------------------------------------------------------------------ 策略族
 # 两个大类：规则策略（原有 5 个）、因子策略（单/多/机器学习）。
@@ -313,16 +266,16 @@ EXCHANGE_CN = {
     "GFEX": "广期所",
 }
 
-# 市场元信息：目录、副标题、价格说明、回测成本假设
+# 市场元信息：目录、副标题、价格说明、回测成本假设。
+# 成本三项来自 `ttrade.replay.MARKET_COST`：组合页的离线回放用同一份数字，
+# 否则同一条策略在两个页面会算出不同的收益。
 MARKETS = {
     "us": {
         "label": "美股",
         "dir": DATA_DIR,
         "sub": "美股 · 20年日线 · 后复权 · 东方财富",
         "price_note": "价格（后复权）",
-        "fee": 0.0005,
-        "slippage": 0.0005,
-        "allow_short": False,
+        **replay.MARKET_COST["us"],
         "legend": (
             "▲ 紫色向上三角＝开多　▼ 紫色向下三角＝平多　"
             "浅蓝底色＝多头持仓　红色虚线＝这笔交易盈利　绿色虚线＝亏损　"
@@ -334,9 +287,7 @@ MARKETS = {
         "dir": FUT_DIR,
         "sub": "国内期货 · 日线 20 年（Tushare）/ 5 分钟·1 小时 10 年（天勤）· 主力连续 · 前复权",
         "price_note": "价格（前复权·主力连续）",
-        "fee": 0.0001,
-        "slippage": 0.0002,
-        "allow_short": True,
+        **replay.MARKET_COST["cn"],
         "legend": (
             "▲紫＝开多　▼紫＝平多　▼琥珀＝开空　▲琥珀＝平空　"
             "浅蓝底色＝多头持仓　浅红底色＝空头持仓　"
@@ -507,166 +458,6 @@ class DataStore:
         return period in self._periods[key]
 
 
-# ------------------------------------------------------------------ 交易切分
-def _extract_trades(sig) -> list[tuple[int, int, int]]:
-    """把 signal 序列拆成一笔笔持仓：返回 [(开仓下标, 平仓下标, 方向)]。
-
-    方向 1 为多、-1 为空。最后一笔还没平仓时，平仓下标取最后一根——
-    这样它也能画出连线，只是线段末端贴着右边缘，一眼能看出「还开着」。
-    """
-    out: list[tuple[int, int, int]] = []
-    cur, entry = 0, 0
-    for i, s in enumerate(sig):
-        s = int(s)
-        if s == cur:
-            continue
-        if cur != 0:
-            out.append((entry, i, cur))
-        cur, entry = s, i
-    if cur != 0 and len(sig):
-        out.append((entry, len(sig) - 1, cur))
-    return out
-
-
-# ------------------------------------------------------------------ 图表基类
-class _CanvasFrozen:
-    """`MplCanvas.frozen()` 的实现体。支持嵌套：只有最外层退出时才补画。"""
-
-    def __init__(self, canvas: "MplCanvas"):
-        self.canvas = canvas
-
-    def __enter__(self):
-        self.canvas._frozen_depth += 1
-        return self.canvas
-
-    def __exit__(self, exc_type, exc, tb):
-        cv = self.canvas
-        cv._frozen_depth = max(0, cv._frozen_depth - 1)
-        if cv._frozen_depth == 0:
-            if exc_type is None:
-                cv._flush_draw()
-            else:
-                # 重建中途出错：别补画半成品，交给下一次完整重建
-                cv._dirty = False
-        return False
-
-
-class MplCanvas(FigureCanvasQTAgg):
-    """matplotlib 画布。
-
-    重建图元时必须用 `frozen()` 包住。原因是 `fig.clear()` 会把 axes 连同
-    它下面的 collection 一起解绑，之后 `collection.get_figure()` 返回 None，
-    而 `_CollectionWithSizes.draw()` 里要读 `get_figure(root=True).dpi`。
-    只要重建期间插进来一次重绘（窗口缩放、切页签、控件显示/隐藏都会触发
-    paintEvent，Qt 完全可以在我们两行代码之间塞一个），就会抛
-
-        AttributeError: 'NoneType' object has no attribute 'dpi'
-
-    所以不能靠「我们只在最后手动 draw() 一次」来保证顺序，得显式把重建期
-    设成不可绘制，退出临界区再同步补画一帧。
-    """
-
-    def __init__(self, figsize=(10, 6), dpi=100):
-        # 这两个标志要在 super().__init__ 之前就位：基类构造里可能触发绘制
-        self._frozen_depth = 0
-        self._dirty = False
-        # 自己记一份事件连接清单。matplotlib 的 canvas.callbacks 并不是画布自己的
-        # 注册表，而是 figure._canvas_callbacks 的属性代理：
-        #     callbacks = property(lambda self: self.figure._canvas_callbacks)
-        # 所以 fresh() 换掉 Figure 就等于换掉注册表，之前 mpl_connect 的连接会
-        # 全部静默失效（滚轮缩放就这么消失过一次）。记下来，换完再挂一遍。
-        self._conns: list[list] = []
-        self.fig = Figure(figsize=figsize, dpi=dpi, facecolor=C_BG)
-        super().__init__(self.fig)
-        self.setStyleSheet("background: #ffffff;")
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.updateGeometry()
-
-    def frozen(self) -> _CanvasFrozen:
-        return _CanvasFrozen(self)
-
-    def mpl_connect(self, s: str, func):
-        cid = super().mpl_connect(s, func)
-        self._conns.append([cid, s, func])
-        return cid
-
-    def mpl_disconnect(self, cid):
-        super().mpl_disconnect(cid)
-        self._conns = [c for c in self._conns if c[0] != cid]
-
-    def _replay_conns(self) -> None:
-        """把记下来的连接重新挂到当前 Figure 上，并刷新 cid。"""
-        conns, self._conns = self._conns, []
-        for _cid, s, func in conns:
-            self.mpl_connect(s, func)
-
-    def fresh(self) -> Figure:
-        """换一张全新的 Figure 挂到本画布上，并返回它。
-
-        重建图表时不要用 `fig.clear()`：清空之后 matplotlib 有概率留下
-        「还挂在 fig.axes 上、但已经和 figure 解绑」的 collection
-        （`get_figure()` 返回 None）。这种残骸肉眼看不见，要等到下一次绘制
-        才在 `_CollectionWithSizes.draw` 里炸出来：
-
-            AttributeError: 'NoneType' object has no attribute 'dpi'
-
-        因为触发条件跟「清空」和「重绘」的先后顺序有关，偶发、难复现。
-        整张图换掉最干净：新 Figure 里不可能有旧图元，这个失败模式直接消失。
-        代价只是多构造一个 Figure 对象（几十微秒），比 K 线重建本身便宜得多。
-        """
-        old = self.fig
-        fig = Figure(figsize=old.get_size_inches(), dpi=old.dpi, facecolor=C_BG)
-        # matplotlib 3.11 的 Figure.set_canvas() 只写 figure.canvas，不会反过来
-        # 写 canvas.figure，所以两边都要手动指过去。
-        fig._original_dpi = getattr(old, "_original_dpi", old.dpi)
-        fig.set_canvas(self)
-        self.figure = fig
-        self.fig = fig
-        # 把旧 Figure 从画布上摘掉：否则它以后任何 stale 都会回调
-        # canvas.draw_idle()，白白触发一帧重绘。
-        old.canvas = None
-        # 事件回调是挂在 Figure 上的（见 __init__ 里的说明），换完必须重挂，
-        # 否则滚轮缩放、点击等交互会在第一次重建之后全部失灵。
-        self._replay_conns()
-        return fig
-
-    def draw(self):
-        if self._frozen_depth > 0:
-            # 重建中：只记一笔，等 frozen() 退出时统一补画。
-            # 顺手清掉 _draw_pending，否则 draw_idle() 会因为「已有待办」
-            # 一直提前返回，重建完就再也不会重绘了。
-            self._dirty = True
-            self._draw_pending = False
-            return
-        self._dirty = False
-        super().draw()
-
-    def _flush_draw(self):
-        self._dirty = False
-        self._draw_pending = False
-        super().draw()
-
-
-# ------------------------------------------------------------------ 指标卡片
-class MetricCard(QFrame):
-    def __init__(self, label: str, parent=None):
-        super().__init__(parent)
-        self.setObjectName("Card")
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 7, 12, 7)
-        lay.setSpacing(1)
-        self.value_lbl = QLabel("—")
-        self.value_lbl.setObjectName("MetricValue")
-        self.name_lbl = QLabel(label)
-        self.name_lbl.setObjectName("MetricLabel")
-        lay.addWidget(self.value_lbl)
-        lay.addWidget(self.name_lbl)
-
-    def set_value(self, text: str, color: str = C_TEXT) -> None:
-        self.value_lbl.setText(text)
-        self.value_lbl.setStyleSheet(f"color: {color};")
-
-
 # ------------------------------------------------------------------ 因子计算线程
 class FactorWorker(QObject):
     """在后台线程里跑因子策略。
@@ -770,23 +561,6 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._f_applied = -1              # 已落地的结果序号，防止同一结果重复应用
 
-        # K 线可视窗口状态：_k_view 是区间筛选后的全量数据，
-        # [_k_start, _k_start+_k_win) 才是当前画出来的那一段。
-        self._k_view: pd.DataFrame | None = None
-        self._k_total = 0
-        self._k_win = K_WIN_DEFAULT
-        self._k_start = 0
-        self._k_spec_label = ""
-        self._k_key = ""
-        # 滚动重绘一次约 180ms（重建图元 54ms + Agg 出图 125ms）。
-        # 拖动时 valueChanged 每秒能来几十次，不节流会直接把事件队列堆死，
-        # 表现就是「拖一下卡三秒」。这里限制最小间隔，并保证松手后一定补最后一帧。
-        self._k_last_draw = 0.0
-        self._k_pending = False
-        self._k_redraw_timer = QTimer(self)
-        self._k_redraw_timer.setSingleShot(True)
-        self._k_redraw_timer.timeout.connect(self._flush_kline_redraw)
-
         # 实时与交易
         self._live_base: pd.DataFrame | None = None   # 订阅时的本地历史，实时段接在它后面
         self._live_state = None                        # 最近一次 LiveState
@@ -821,7 +595,7 @@ class MainWindow(QMainWindow):
         self.live = LiveController(self)
         self.trade_page = TradePage(self.live)
         self.pages.addWidget(self.trade_page)
-        self.portfolio_page = PortfolioPage()
+        self.portfolio_page = PortfolioPage(loader=self._load_bars)
         self.pages.addWidget(self.portfolio_page)
         self.agent_page = AgentPage()
         self.pages.addWidget(self.agent_page)
@@ -947,6 +721,13 @@ class MainWindow(QMainWindow):
         self._switch_page(2)
         self.portfolio_page.accept(cfg)
 
+    def _load_bars(self, market: str, key: str, period: str):
+        """给「策略交易和组合」取行情。走主窗口的 DataStore，共用同一份缓存。"""
+        store = self.stores.get(market)
+        if store is None:
+            return None
+        return store.get(key, period or PERIOD_1D)
+
     def _on_agent_trade(self, action) -> None:
         """Agent 给了交易动作。动作**已经在界面上确认过**才走到这里。"""
         p = action.payload
@@ -954,14 +735,19 @@ class MainWindow(QMainWindow):
             # 先告诉 Agent 页「这次结果要喂回模型」。用户自己点回测不该触发一轮
             # 对话，只有模型问出来的结果才值得它接着往下说
             self.agent_page.begin_backtest_feedback()
-            self._on_agent_study(SStore.StrategyConfig(
+            cfg = SStore.StrategyConfig(
                 symbol=p.get("symbol", ""),
                 exchange=p.get("exchange", ""),
                 period=p.get("period", "1d"),
                 rule_key=p.get("strategy", ""),
                 rule_params=dict(p.get("params") or {}),
                 volume=int(p.get("volume", 1)),
-            ))
+            )
+            # 结果落在「策略交易和组合」，**不**切到「策略研究」：那边是用户手上
+            # 正在调的那套参数，模型问一句就把它冲掉说不过去。五个结果页
+            # （K线 / 绩效 / 因子 / 交易记录 / 阶段分析）组合页都挂得上。
+            self._switch_page(2)
+            self._publish(self.portfolio_page.show_config(cfg, note="Agent 回测"), False)
             return
 
         if action.kind != "trade":
@@ -1022,10 +808,14 @@ class MainWindow(QMainWindow):
 
         root.addWidget(self._build_sidebar())
 
+        # 五页结果由 `ResultView` 统一提供。「策略交易和组合」里双击一条策略
+        # 打开的是同一个类 —— 一处实现两处挂载，不会出现「这边改好了那边还是
+        # 老图」的情况。
+        self.view = ResultView("single", self)
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_chart_tab(), "K线与信号")
-        self.tabs.addTab(self._build_perf_tab(), "绩效对比")
-        self.tabs.addTab(self._build_factor_tab(), "因子分析")
+        for title, w in self.view.pages():
+            self.tabs.addTab(w, title)
+        self.view.status.connect(self.lbl_status.setText)
         root.addWidget(self.tabs, 1)
         return page
 
@@ -1371,179 +1161,6 @@ class MainWindow(QMainWindow):
         lbl.setObjectName("SectionTitle")
         return lbl
 
-    def _build_chart_tab(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
-
-        self.lbl_chart_title = QLabel("")
-        self.lbl_chart_title.setStyleSheet(
-            "font-size: 13px; font-weight: 600; color: #0f172a; padding-left: 4px;"
-        )
-        lay.addWidget(self.lbl_chart_title)
-
-        # 实时 / 交易开关。放在 K 线页里是因为它们的作用域就是「当前这张图」：
-        # 换了品种或周期，实时订阅要跟着换，交易信号也只在当前图上触发。
-        bar = QHBoxLayout()
-        bar.setSpacing(8)
-        self.btn_live = QPushButton("启动实时")
-        self.btn_live.setCheckable(True)
-        self.btn_live.setObjectName("Ghost")
-        self.btn_live.setMinimumWidth(92)
-        self.btn_live.toggled.connect(self._on_live_toggled)
-        bar.addWidget(self.btn_live)
-
-        self.btn_trade = QPushButton("启动交易")
-        self.btn_trade.setCheckable(True)
-        self.btn_trade.setObjectName("Ghost")
-        self.btn_trade.setMinimumWidth(92)
-        self.btn_trade.setToolTip(
-            "开启后，当前图上的新信号会直接下到所选天勤账户。\n"
-            "需要先「启动实时」并连上账户。"
-        )
-        self.btn_trade.toggled.connect(self._on_trade_toggled)
-        bar.addWidget(self.btn_trade)
-
-        self.lbl_trade_icon = QLabel("☹")
-        self.lbl_trade_icon.setStyleSheet(f"font-size: 17px; color: {C_DOWN};")
-        bar.addWidget(self.lbl_trade_icon)
-        self.lbl_trade_state = QLabel("未交易")
-        self.lbl_trade_state.setStyleSheet(f"font-size: 11px; color: {C_MUTED};")
-        bar.addWidget(self.lbl_trade_state)
-
-        bar.addStretch(1)
-        self.lbl_live_msg = QLabel("")
-        self.lbl_live_msg.setObjectName("Hint")
-        bar.addWidget(self.lbl_live_msg)
-        lay.addLayout(bar)
-
-        # 指标卡片条（横向，放在图表上方）
-        cards = QHBoxLayout()
-        cards.setSpacing(8)
-        self.card_cagr = MetricCard("策略年化")
-        self.card_dd = MetricCard("最大回撤")
-        self.card_sharpe = MetricCard("夏普比率")
-        self.card_excess = MetricCard("vs 持有超额")
-        for c in (self.card_cagr, self.card_dd, self.card_sharpe, self.card_excess):
-            cards.addWidget(c)
-        lay.addLayout(cards)
-
-        self.canvas_k = MplCanvas(figsize=(10, 7), dpi=100)
-        lay.addWidget(self.canvas_k, 1)
-
-        # 横向滚动条：在**不缩放**的前提下平移可视窗口。区间选「全部 20 年」时
-        # 5000 根挤在一屏根本没法看，有了它就能保持当前根数左右拖着看历史。
-        self.sb_kline = QScrollBar(Qt.Horizontal)
-        self.sb_kline.setFixedHeight(15)
-        self.sb_kline.setVisible(False)
-        self.sb_kline.valueChanged.connect(self._on_kline_scroll)
-        lay.addWidget(self.sb_kline)
-
-        # 滚轮缩放：以鼠标位置为锚点增减窗口根数，和滚动条配合使用
-        self.canvas_k.mpl_connect("scroll_event", self._on_kline_wheel)
-
-        self.lbl_legend = QLabel(MARKETS[self.market]["legend"])
-        self.lbl_legend.setObjectName("Hint")
-        self.lbl_legend.setStyleSheet("padding-left: 4px;")
-        self.lbl_legend.setWordWrap(True)
-        lay.addWidget(self.lbl_legend)
-        return w
-
-    def _build_perf_tab(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(8, 8, 8, 8)
-
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
-
-        self.canvas_p = MplCanvas(figsize=(7, 6), dpi=100)
-        splitter.addWidget(self.canvas_p)
-
-        right = QWidget()
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(8, 0, 0, 0)
-        rl.setSpacing(6)
-        cap = QLabel("绩效指标对比")
-        cap.setStyleSheet("font-size: 13px; font-weight: 600; color: #0f172a;")
-        rl.addWidget(cap)
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["指标", "趋势策略", "买入持有"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setSelectionMode(QAbstractItemView.NoSelection)
-        self.table.setShowGrid(False)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        rl.addWidget(self.table, 1)
-        right.setMinimumWidth(360)
-        right.setMaximumWidth(470)
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-        splitter.setSizes([700, 400])
-
-        lay.addWidget(splitter)
-        return w
-
-    def _build_factor_tab(self) -> QWidget:
-        """因子分析页：左边全因子 IC/IR 一览，右边四格图。
-
-        表格里列出**所有**因子（不只是选中的），方便横向比较；选中的几行加粗，
-        一眼能看出「我用的这几个因子在池子里算什么水平」。
-        """
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
-
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
-
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(0, 0, 8, 0)
-        ll.setSpacing(6)
-        cap = QLabel("因子 IC / ICIR 一览")
-        cap.setStyleSheet("font-size: 13px; font-weight: 600; color: #0f172a;")
-        ll.addWidget(cap)
-        self.lbl_frep = QLabel("")
-        self.lbl_frep.setObjectName("Hint")
-        self.lbl_frep.setWordWrap(True)
-        ll.addWidget(self.lbl_frep)
-
-        self.tbl_factor = QTableWidget(0, 7)
-        self.tbl_factor.setHorizontalHeaderLabels(
-            ["因子", "IC", "ICIR", "IC>0", "t(NW)", "单调", "换手"]
-        )
-        self.tbl_factor.verticalHeader().setVisible(False)
-        self.tbl_factor.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.tbl_factor.setSelectionMode(QAbstractItemView.NoSelection)
-        self.tbl_factor.setShowGrid(False)
-        self.tbl_factor.setSortingEnabled(False)
-        hh = self.tbl_factor.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        for i in range(1, 7):
-            hh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
-        ll.addWidget(self.tbl_factor, 1)
-        splitter.addWidget(left)
-
-        self.canvas_f = MplCanvas(figsize=(8, 7), dpi=100)
-        splitter.addWidget(self.canvas_f)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([430, 760])
-
-        lay.addWidget(splitter)
-
-        self.lbl_fnote = QLabel("")
-        self.lbl_fnote.setObjectName("Hint")
-        self.lbl_fnote.setWordWrap(True)
-        lay.addWidget(self.lbl_fnote)
-        return w
-
     # ---------------------------------------------------------- 数据填充
     def _populate_symbols(self) -> None:
         # 信号只连一次，避免切换市场后重复触发
@@ -1738,7 +1355,6 @@ class MainWindow(QMainWindow):
             long_only=not (info["allow_short"] and self._short_enabled()),
         )
         self.lbl_sub.setText(info["sub"])
-        self.lbl_legend.setText(info["legend"])
         self._sync_data_page()
         self._fill_symbols()
         self._sync_period_controls()
@@ -2453,6 +2069,33 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText(f"机器学习训练失败：{msg}")
         self._publish(f"机器学习训练失败：{msg}", True)
 
+    def _view_ctx(self, label: str) -> ViewCtx:
+        """把左边那排控件当前的选择收成画图需要的上下文。
+
+        `ResultView` 不知道自己被谁挂着，所以要什么就一次给全 —— 它不该反过来
+        读 `self.cb_symbol`，那样就没法在组合页复用了。
+        """
+        item = self._current_item()
+        return ViewCtx(
+            symbol=item.get("symbol") or "",
+            name=item.get("name") or "",
+            exchange=item.get("exchange") or "",
+            period=self._period(),
+            market=self.market,
+            label=label,
+            legend=MARKETS[self.market]["legend"],
+            price_note=MARKETS[self.market]["price_note"],
+            range_years=self.cb_range.currentData() or None,
+            rule_key=self.cb_strategy.currentData() or "",
+            overlay=bool(self.chk_ma.currentData()),
+            long_only=self.cfg.long_only,
+            bars_per_year=self.cfg.bars_per_year,
+            factor_cfg=self._factor_cfg(),
+            filter_active=self._filter_active(),
+            selected_keys=self._selected_factor_keys(),
+            outcome=self.factor_outcome,
+        )
+
     def _clear_chart(self, msg: str) -> None:
         """没有数据时把图清空并写一句话。
 
@@ -2464,25 +2107,10 @@ class MainWindow(QMainWindow):
         self.res = None
         self.bh = None
         self.factor_outcome = None
-        self.lbl_status.setText(msg)
-        for card in ("card_cagr", "card_dd", "card_sharpe", "card_excess"):
-            w = getattr(self, card, None)
-            if w is not None:
-                w.set_value("—", C_MUTED)
-        if hasattr(self, "tbl_factor"):
-            self.tbl_factor.setRowCount(0)
+        self.view.clear(msg)
         # 算不出来也得让 Agent 那边看见原因。「没有结果」和「结果是 0」在界面上
         # 长得一模一样，模型分不清就只能反过来问用户
         self._publish(f"没有结果：{msg}", True)
-        try:
-            fig = self.canvas_k.fresh()
-            ax = fig.add_subplot(111)
-            ax.axis("off")
-            ax.text(0.5, 0.5, msg, ha="center", va="center",
-                    color=C_MUTED, fontsize=12, wrap=True)
-            self.canvas_k.draw()
-        except Exception:
-            pass
 
     def _finish(self, rule_signal_df: pd.DataFrame, label: str) -> None:
         """规则策略（不含因子）的收尾：回测 + 重绘。"""
@@ -2491,11 +2119,8 @@ class MainWindow(QMainWindow):
         self._strategy_label = label
         self.res = run_backtest(rule_signal_df, self.cfg, label=label)
         self.bh = buy_and_hold(self.df_raw, self.cfg)
-        self._draw_kline()
-        self._draw_perf()
-        self._update_metrics()
-        self._update_table()
-        self._refresh_factor_tab()
+        self.view.show_result(self.df_sig, self.df_raw, self.res, self.bh,
+                              self._view_ctx(label))
         self._publish_result()
 
     def _apply_outcome(self, out: fstrat.FactorOutcome, rule_signal) -> None:
@@ -2512,11 +2137,8 @@ class MainWindow(QMainWindow):
         self._strategy_label = label
         self.res = run_backtest(out.df, self.cfg, label=label)
         self.bh = buy_and_hold(self.df_raw, self.cfg)
-        self._draw_kline()
-        self._draw_perf()
-        self._update_metrics()
-        self._update_table()
-        self._refresh_factor_tab()
+        self.view.show_result(self.df_sig, self.df_raw, self.res, self.bh,
+                              self._view_ctx(label))
 
         # 展期/期权因子需要额外的合约与期权数据。美股没有，部分期货品种也可能
         # 没下过衍生数据 —— 这种情况分数全为 NaN，回测结果是「一笔交易都没有」。
@@ -2682,20 +2304,10 @@ class MainWindow(QMainWindow):
     def _patch_live_bar(self, merged: pd.DataFrame) -> None:
         """把还没走完的那根 bar 的最新价刷到图上，不重算策略。
 
-        只有用户正停在最新一段时才动 —— 滚到历史位置时 `_k_view` 的最后一根
-        是历史 bar，改它等于篡改历史。
+        视图里的 `df` 就是 `self.df_sig` 的同一个对象，所以这里只需要改一次；
+        滚到历史位置时窗口最后一根是历史 bar，视图会自己拒掉（改它等于篡改历史）。
         """
-        if self.df_sig is None or self._k_view is None or not len(self._k_view):
-            return
-        ts = merged.index[-1]
-        if self._k_view.index[-1] != ts:
-            return
-        cols = [c for c in ("open", "high", "low", "close", "volume") if c in merged.columns]
-        for c in cols:
-            if c in self.df_sig.columns:
-                self.df_sig.loc[ts, c] = merged.loc[ts, c]
-            self._k_view.loc[ts, c] = merged.loc[ts, c]
-        self._render_kline()
+        self.view.patch_last_bar(merged)
 
     # ---------------------------------------------------------- 交易开关
     def _on_trade_toggled(self, on: bool) -> None:
@@ -2744,533 +2356,7 @@ class MainWindow(QMainWindow):
             f"交易中 · 目标 {target:+d} 手" if target else "交易中 · 空仓"
         )
 
-
-    # ---------------------------------------------------------- K 线绘制
-    def _draw_kline(self) -> None:
-        """切好数据、把可视窗口重置到最新一段，再交给 _render_kline 画。
-
-        拆成两步是为了滚动/缩放：滚动时数据不变，只挪窗口，没必要重新切
-        DataFrame、重算策略——那部分在 _render_kline 里按窗口切片完成。
-        """
-        df = self.df_sig
-        if df is None or not len(df):
-            return
-
-        years = self.cb_range.currentData()
-        if years and len(df):
-            cutoff = df.index[-1] - pd.DateOffset(years=years)
-            view = df[df.index >= cutoff]
-        else:
-            view = df
-        if len(view) < 20:
-            view = df.tail(120)
-
-        self._k_view = view
-        self._k_total = len(view)
-        # 换标的 / 换策略 / 换区间时回到最新一段，符合看盘习惯
-        self._k_win = min(K_WIN_DEFAULT, self._k_total)
-        self._k_start = max(0, self._k_total - self._k_win)
-        self._k_spec_label = getattr(self, "_strategy_label", "")
-        self._k_key = self.cb_strategy.currentData() if self.family == FAMILY_RULE else ""
-        # 换图是用户主动操作，不受滚动节流限制
-        self._k_last_draw = time.monotonic()
-        self._k_pending = False
-        self._render_kline()
-
-    def _render_kline(self) -> None:
-        """按当前窗口 [start, start+win) 重画 K 线，窗口外的数据不进图元。
-
-        整个重建过程在画布的 frozen() 临界区里跑，避免半成品状态被重绘。
-        """
-        view_all = self._k_view
-        if view_all is None or not len(view_all):
-            return
-        with self.canvas_k.frozen():
-            self._render_kline_impl()
-
-    def _render_kline_impl(self) -> None:
-        view_all = self._k_view
-        if view_all is None or not len(view_all):
-            return
-
-        total = self._k_total
-        win = max(K_WIN_MIN, min(int(self._k_win), total))
-        start = max(0, min(total - win, int(self._k_start)))
-        self._k_win, self._k_start = win, start
-
-        view = view_all.iloc[start:start + win]
-        spec_label = self._k_spec_label
-        item = self._current_item()
-        sym = item["symbol"]
-
-        x = np.arange(len(view))
-        o = view["open"].to_numpy(float)
-        h = view["high"].to_numpy(float)
-        l = view["low"].to_numpy(float)
-        c = view["close"].to_numpy(float)
-        vol = view["volume"].to_numpy(float)
-        up = c >= o
-
-        # 全量的信号与收盘价：窗口第一根到底是不是「开仓」，得看它的前一根，
-        # 只拿窗口内的数据判断会把每根都误认成开仓点。
-        sig_full = view_all["signal"].to_numpy(int)
-        if self.cfg.long_only:
-            sig_full = np.maximum(sig_full, 0)
-        close_full = view_all["close"].to_numpy(float)
-        sig_view = sig_full[start:start + win]
-        prev = np.concatenate([[0], sig_full[:-1]])[start:start + win]
-
-        # 因子模式下多画一行分数曲线：能直接看到「分数在哪里穿过阈值、
-        # 穿过去之后策略怎么走」，比只看三角标记有用得多。
-        has_score = "factor_score" in view_all.columns
-        score_full = (
-            view_all["factor_score"].to_numpy(float) if has_score else None
-        )
-
-        self.canvas_k.fresh()
-        if has_score:
-            gs = self.canvas_k.fig.add_gridspec(
-                3, 1, height_ratios=[3.6, 0.85, 1.0], hspace=0.08,
-                left=0.082, right=0.962, top=0.935, bottom=0.085,
-            )
-            axf = self.canvas_k.fig.add_subplot(gs[2], sharex=None)
-        else:
-            gs = self.canvas_k.fig.add_gridspec(
-                2, 1, height_ratios=[4.0, 1.0], hspace=0.06,
-                # left 留够：沪铜、碳酸锂这类五位数报价，0.058 会把最高位切掉
-                left=0.082, right=0.962, top=0.935, bottom=0.085,
-            )
-            axf = None
-        ax = self.canvas_k.fig.add_subplot(gs[0])
-        axv = self.canvas_k.fig.add_subplot(gs[1], sharex=ax)
-        if axf is not None:
-            axf.sharex(ax)
-
-        ax.set_facecolor(C_BG)
-        axv.set_facecolor(C_BG)
-        if axf is not None:
-            axf.set_facecolor(C_BG)
-
-        # 持仓区间底色：多头蓝、空头红。合并连续区间用 axvspan，
-        # 避免逐点 fill_between 产生上千个多边形。
-        # 只做多模式下把空头信号裁掉，保证图形与回测口径一致。
-        for dir_val, bg in ((1, C_HOLD_BG), (-1, C_SHORT_BG)):
-            mask = (sig_view == dir_val).astype(int)
-            if not mask.any():
-                continue
-            edges = np.diff(np.concatenate(([0], mask, [0])))
-            for s0, e0 in zip(np.where(edges == 1)[0], np.where(edges == -1)[0]):
-                ax.axvspan(s0 - 0.5, e0 - 0.5, color=bg, alpha=0.07,
-                           lw=0, zorder=0)
-
-        # K 线：用 Collection 一次性提交，5000 根也只产生 2 个图元
-        # （此前用 vlines + bar 会产生上万个 Patch，渲染要十几秒，窗口假死）
-        span = max(float(h.max() - l.min()), 1e-9)
-        width = 0.62 if len(view) < 400 else (0.75 if len(view) < 1200 else 0.9)
-        half = width / 2.0
-        eps = span * 0.0008
-
-        wick_seg = np.stack(
-            [np.column_stack([x, l]), np.column_stack([x, h])], axis=1
-        )
-        ax.add_collection(
-            LineCollection(
-                wick_seg,
-                colors=np.where(up, C_UP, C_DOWN),
-                linewidths=0.75,
-                antialiaseds=False,
-                zorder=3,
-            )
-        )
-
-        bottom = np.minimum(o, c)
-        top = np.maximum(o, c)
-        top = np.where(top - bottom < eps, bottom + eps, top)
-        left, right = x - half, x + half
-        verts = np.stack(
-            [
-                np.column_stack([left, bottom]),
-                np.column_stack([left, top]),
-                np.column_stack([right, top]),
-                np.column_stack([right, bottom]),
-            ],
-            axis=1,
-        )
-        face = np.where(
-            up[:, None], np.array(to_rgba(C_UP)), np.array(to_rgba(C_DOWN))
-        )
-        ax.add_collection(
-            PolyCollection(verts, facecolors=face, edgecolors="none",
-                           antialiaseds=False, zorder=3)
-        )
-
-        # 策略指标线
-        show_overlay = self.chk_ma.currentData()
-        overlay_cfg = {
-            "ma_cross": [("fast_ma", "快线 MA", "#f59e0b", 1.3), ("slow_ma", "慢线 MA", "#2563eb", 1.5)],
-            "donchian": [("upper", "上轨", "#059669", 1.2), ("lower", "下轨", "#dc2626", 1.2)],
-            "atr_channel": [("mid", "均线", "#f59e0b", 1.2), ("upper", "上轨", "#059669", 1.2),
-                            ("lower", "下轨", "#dc2626", 1.2)],
-            "macd": [],
-            "turtle": [("upper", "上轨", "#059669", 1.2), ("lower", "下轨", "#dc2626", 1.2)],
-        }
-        if show_overlay:
-            for col, label, color, lw in overlay_cfg.get(self._k_key, []):
-                if col in view.columns:
-                    y = view[col].to_numpy(float)
-                    ax.plot(x, y, color=color, lw=lw, label=label, zorder=4, alpha=0.95)
-
-        # 持仓连线：把每笔的开仓点和平仓点用虚线连起来，颜色直接表达这笔赚没赚。
-        # 盈利红、亏损绿（A 股习惯）。只在开仓点可见时才画——否则好几笔交易会
-        # 全都从窗口左边缘起笔，看着像凭空冒出来的一堆线。平仓在窗口外时线画到
-        # 右边缘，正好表示「还持有」。
-        for e_i, x_i, d in _extract_trades(sig_full):
-            if e_i < start or e_i >= start + win:
-                continue
-            b = min(x_i, start + win - 1)
-            if b <= e_i:
-                continue
-            gain = (close_full[x_i] - close_full[e_i]) * d
-            ax.plot(
-                [e_i - start, b - start], [close_full[e_i], close_full[b]],
-                color=C_PROFIT if gain >= 0 else C_LOSSLINE,
-                ls=(0, (4, 3)), lw=1.15, alpha=0.88, zorder=5,
-            )
-
-        # 开平仓信号：颜色=持仓方向（紫多 / 琥珀空），形状=开仓/平仓（▲开 ▼平）
-        # 直接反手（多→空 / 空→多）时，平仓和开仓落在同一根上，两个三角会完全重叠，
-        # 后画的把先画的盖掉。这种情况只画开仓标记——平仓本来也由连线交代了。
-        pos = sig_view
-        off = (h.max() - l.min()) * 0.028
-        marks = [
-            ((pos == 1) & (prev != 1), "^", C_LONG_SIG, -1, "开多"),
-            ((pos == 0) & (prev == 1), "v", C_LONG_SIG, +1, "平多"),
-            ((pos == -1) & (prev != -1), "v", C_SHORT_SIG, +1, "开空"),
-            ((pos == 0) & (prev == -1), "^", C_SHORT_SIG, -1, "平空"),
-        ]
-        for cond, marker, color, side, label in marks:
-            idxs = np.where(cond)[0]
-            if not len(idxs):
-                continue
-            y = l[idxs] - off if side < 0 else h[idxs] + off
-            ax.scatter(idxs, y, marker=marker, s=72, c=color,
-                       edgecolors="white", linewidths=0.9, zorder=6, label=label)
-
-        # 最新价参考线。只在窗口右端确实是最新一根时才画，而且用中性灰点线：
-        # 原来用红/绿虚线画，跟「持仓盈亏连线」是同一个样式，看着像凭空多出一笔
-        # 还没平的交易。滚到历史位置时这根线也没意义——那是窗口末价，不是最新价。
-        at_latest = start + win >= total
-        last_color = C_UP if c[-1] >= o[-1] else C_DOWN
-        if at_latest:
-            ax.axhline(c[-1], color="#94a3b8", lw=0.8, ls=":", alpha=0.75, zorder=2)
-        chg = (c[-1] / c[0] - 1.0) * 100
-        tag = "最新" if at_latest else "末价"
-        ax.text(
-            0.995, 0.975,
-            f"{tag} {c[-1]:,.2f}　区间 {chg:+.1f}%",
-            transform=ax.transAxes, ha="right", va="top",
-            fontsize=9.5, color="white", fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.34", fc=last_color, ec="none", alpha=0.92),
-            zorder=8,
-        )
-
-        # 成交量：同样用 Collection 批量提交
-        v_bottom = np.zeros_like(vol)
-        v_verts = np.stack(
-            [
-                np.column_stack([left, v_bottom]),
-                np.column_stack([left, vol]),
-                np.column_stack([right, vol]),
-                np.column_stack([right, v_bottom]),
-            ],
-            axis=1,
-        )
-        v_face = np.where(
-            up[:, None], np.array(to_rgba(C_UP, 0.55)), np.array(to_rgba(C_DOWN, 0.55))
-        )
-        axv.add_collection(
-            PolyCollection(v_verts, facecolors=v_face, edgecolors="none",
-                           antialiaseds=False, zorder=2)
-        )
-        axv.set_ylabel("量", fontsize=8, color=C_MUTED, rotation=0, labelpad=12)
-        axv.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v/1e6:.0f}M" if v >= 1e6 else f"{v/1e3:.0f}K"))
-
-        # ---- 因子分数面板 ----
-        if axf is not None and score_full is not None:
-            sc = score_full[start:start + win]
-            xa = np.arange(len(sc))
-            ok = np.isfinite(sc)
-            if ok.any():
-                axf.plot(xa[ok], sc[ok], color=C_FACTOR, lw=1.1, zorder=4)
-                axf.fill_between(xa, 0.0, np.nan_to_num(sc), where=ok,
-                                 color=C_FACTOR_FILL, alpha=0.16, lw=0, zorder=1)
-            cfg = self._factor_cfg()
-            filtering = self._filter_active()
-            if filtering:
-                lv, sv = cfg.long_th, cfg.short_th
-                axf.axhline(lv, color=C_LONG_SIG, lw=0.9, ls="--", alpha=0.85, zorder=3)
-                # 门槛文字压在分数曲线上，加个半透明白底才读得清
-                box = dict(boxstyle="round,pad=0.15", fc="#ffffff", ec="none", alpha=0.72)
-                if abs(sv - lv) < 1e-9:
-                    # 两个门槛相等（默认都是 0）时只画一条线、一个标签：
-                    # 否则两行文字会精确重叠，糊成一团黑字
-                    axf.text(0.018, lv, f"门槛 {lv:+.1f}",
-                             transform=axf.get_yaxis_transform(),
-                             fontsize=7.5, color=C_LONG_SIG, va="bottom", ha="left",
-                             zorder=6, bbox=box)
-                else:
-                    axf.axhline(sv, color=C_SHORT_SIG, lw=0.9, ls="--", alpha=0.85, zorder=3)
-                    axf.text(0.018, lv, f"多头门槛 {lv:+.1f}",
-                             transform=axf.get_yaxis_transform(),
-                             fontsize=7.5, color=C_LONG_SIG, va="bottom", ha="left",
-                             zorder=6, bbox=box)
-                    axf.text(0.018, sv, f"空头门槛 {sv:+.1f}",
-                             transform=axf.get_yaxis_transform(),
-                             fontsize=7.5, color=C_SHORT_SIG, va="top", ha="left",
-                             zorder=6, bbox=box)
-            else:
-                for lv, col in ((cfg.entry_z, C_LONG_SIG), (-cfg.entry_z, C_SHORT_SIG)):
-                    axf.axhline(lv, color=col, lw=0.9, ls="--", alpha=0.8, zorder=3)
-                for lv in (cfg.exit_z, -cfg.exit_z):
-                    axf.axhline(lv, color=C_MUTED, lw=0.7, ls=":", alpha=0.7, zorder=2)
-            axf.axhline(0.0, color="#cbd5e1", lw=0.7, zorder=2)
-            axf.set_ylabel("因子分", fontsize=8, color=C_MUTED, rotation=0, labelpad=14)
-            axf.grid(True, color=C_GRID, lw=0.5, alpha=0.7)
-            axf.set_axisbelow(True)
-            axf.set_xlim(-1, len(view))
-
-        # 坐标轴
-        ax.set_xlim(-1, len(view))
-        pad = (h.max() - l.min()) * 0.06
-        ax.set_ylim(l.min() - pad, h.max() + pad)
-        ax.grid(True, color=C_GRID, lw=0.6, ls="-", alpha=0.9)
-        ax.set_axisbelow(True)
-        axv.grid(True, color=C_GRID, lw=0.5, alpha=0.7)
-        axv.set_axisbelow(True)
-
-        all_axes = [ax, axv] + ([axf] if axf is not None else [])
-        for a in all_axes:
-            for spine in ("top", "right"):
-                a.spines[spine].set_visible(False)
-            for spine in ("left", "bottom"):
-                a.spines[spine].set_color("#cbd5e1")
-            a.tick_params(colors=C_MUTED, labelsize=9, length=3)
-        for a in all_axes[:-1]:
-            a.tick_params(labelbottom=False)
-
-        # x 轴日期刻度放在最下面那根轴上。格式跟着可视跨度走：180 根 5 分钟
-        # 只有两天半，一律写「年-月」会变成十个一模一样的标签。
-        bottom_ax = all_axes[-1]
-        n_ticks = min(10, max(4, len(view) // 60))
-        tick_pos = np.linspace(0, len(view) - 1, n_ticks).astype(int)
-        span = (view.index[-1] - view.index[0]).total_seconds()
-        if span <= 2 * 86400:
-            fmt = "%m-%d %H:%M"
-        elif span <= 150 * 86400:
-            fmt = "%m-%d"
-        else:
-            fmt = "%Y-%m"
-        bottom_ax.set_xticks(tick_pos)
-        bottom_ax.set_xticklabels(
-            [view.index[i].strftime(fmt) for i in tick_pos],
-            rotation=0, fontsize=9,
-        )
-
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            # 排成一行：开多/平多/开空/平空 四项加两条均线，两行会挡住左上角的 K 线
-            ax.legend(loc="upper left", frameon=True, framealpha=0.92,
-                      edgecolor="#e2e8f0", fontsize=8.5, ncol=len(handles),
-                      handletextpad=0.4, columnspacing=1.1)
-        ax.set_ylabel(MARKETS[self.market]["price_note"], fontsize=9, color=C_MUTED)
-
-        # 标题信息
-        name = item["name"]
-        exch = item["exchange"]
-        exch_cn = EXCHANGE_CN.get(exch, exch)
-        head = f"{sym}  {name}" + (f"（{exch_cn}）" if exch else "")
-        # 「当前状态」永远指最新一根，不是窗口最后一根——否则滚到历史位置时
-        # 标题会跟着变，看着像当前真的空仓了。
-        state = {1: "多头持仓", -1: "空头持仓"}.get(int(sig_full[-1]), "空仓")
-        period = self._period()
-        plabel = "" if period == PERIOD_1D else f" · {PERIOD_LABEL.get(period, period)}"
-        ax.set_title(
-            f"{head}{plabel}   ·   {spec_label}   ·   "
-            f"{view.index[0]:%Y-%m-%d %H:%M} ~ {view.index[-1]:%Y-%m-%d %H:%M}"
-            f"   ·   当前状态：{state}",
-            fontsize=11.5, color=C_TEXT, loc="left", pad=10,
-        )
-        if self.market == "us":
-            source = "东方财富后复权"
-        elif period == PERIOD_1D:
-            source = "Tushare 换月复权"
-        else:
-            src = tqdata.PERIODS.get(period, (period, 1))
-            merged = f"（由 {src[0]} × {src[1]} 合并）" if src[1] > 1 else ""
-            source = f"天勤换月复权{merged}"
-        shown = f"{start + 1:,}–{start + win:,}"
-        self.lbl_chart_title.setText(
-            f"全历史 {len(self.df_sig):,} 根 · 当前显示第 {shown} 根"
-            f"（窗口 {win:,} 根）· 滚轮缩放 / 拖下方滚动条看历史 · {source}"
-        )
-        self.lbl_chart_title.setStyleSheet(
-            f"font-size: 11px; color: {C_MUTED}; padding-left: 4px;"
-        )
-
-        self._sync_kline_scrollbar()
-        # 不用再手动 draw()：退出 frozen() 临界区时会同步补画一帧，
-        # 那样能保证「重建完成」和「绘制」之间不会插进别的重绘。
-
-    # ---------------------------------------------------------- 窗口滚动 / 缩放
-    def _sync_kline_scrollbar(self) -> None:
-        """让滚动条的范围跟上当前数据量与窗口大小。
-
-        数据比窗口还短时直接隐藏——一根能滚的余地都没有，留着只会让人以为坏了。
-        """
-        total, win = self._k_total, self._k_win
-        if total <= win or not hasattr(self, "sb_kline"):
-            self.sb_kline.setVisible(False)
-            return
-        self.sb_kline.setVisible(True)
-        self.sb_kline.blockSignals(True)   # 避免 setValue 反过来触发一次重绘
-        self.sb_kline.setRange(0, total - win)
-        self.sb_kline.setPageStep(win)
-        self.sb_kline.setSingleStep(max(1, win // 10))
-        self.sb_kline.setValue(self._k_start)
-        self.sb_kline.blockSignals(False)
-
-    def _on_kline_scroll(self, value: int) -> None:
-        if self._k_view is None or value == self._k_start:
-            return
-        self._k_start = int(value)
-        self._request_kline_redraw()
-
-    def _request_kline_redraw(self) -> None:
-        """节流重绘：间隔内只留一个待办，到点补画最终位置。
-
-        拖滚动条时 valueChanged 一秒能来几十次，每次都重建图元会堆死事件队列。
-        节流后每秒最多画 K_REDRAW_GAP 帧，而且松手时一定会补最后一帧——
-        不能只有防抖，否则快速拖完停住，画面会停在中间某一帧上。
-        """
-        now = time.monotonic()
-        gap = now - self._k_last_draw
-        if gap >= K_REDRAW_GAP:
-            self._k_pending = False
-            self._k_last_draw = now
-            self._render_kline()
-            return
-        self._k_pending = True
-        self._k_redraw_timer.start(int((K_REDRAW_GAP - gap) * 1000) + 5)
-
-    def _flush_kline_redraw(self) -> None:
-        if not self._k_pending:
-            return
-        self._k_pending = False
-        self._k_last_draw = time.monotonic()
-        self._render_kline()
-
-    def _on_kline_wheel(self, event) -> None:
-        """滚轮缩放：改变窗口根数，并以鼠标所在位置为锚点保持不漂移。"""
-        if self._k_view is None or self._k_total <= 0:
-            return
-        if event.inaxes is None:
-            return
-        old_win = self._k_win
-        step = 0.8 if event.button == "up" else 1.25
-        new_win = int(round(old_win * step))
-        new_win = max(K_WIN_MIN, min(self._k_total, new_win))
-        if new_win == old_win:
-            return
-
-        anchor = event.xdata if event.xdata is not None else (self._k_start + old_win / 2)
-        ratio = (anchor - self._k_start) / max(old_win, 1)
-        self._k_win = new_win
-        self._k_start = int(round(anchor - ratio * new_win))
-        self._k_start = max(0, min(self._k_total - new_win, self._k_start))
-        # 滚轮频率低，直接画，保证每格都有即时反馈
-        self._k_last_draw = time.monotonic()
-        self._k_pending = False
-        self._render_kline()
-
-    # ---------------------------------------------------------- 绩效图
-    def _draw_perf(self) -> None:
-        """绩效页重建，同样走 frozen() 临界区。"""
-        with self.canvas_p.frozen():
-            self._draw_perf_impl()
-
-    def _draw_perf_impl(self) -> None:
-        res, bh = self.res, self.bh
-        fig = self.canvas_p.fresh()
-        gs = fig.add_gridspec(
-            2, 1, height_ratios=[3.0, 1.0], hspace=0.12,
-            left=0.085, right=0.975, top=0.93, bottom=0.085,
-        )
-        ax = fig.add_subplot(gs[0])
-        ax2 = fig.add_subplot(gs[1], sharex=ax)
-
-        eq_s = res.equity / res.equity.iloc[0]
-        eq_b = bh.equity / bh.equity.iloc[0]
-
-        ax.plot(eq_b.index, eq_b.values, color=C_BH, lw=1.5, label="买入持有")
-        ax.plot(eq_s.index, eq_s.values, color=C_STRAT, lw=1.7, label=res.label)
-        ax.fill_between(eq_s.index, 1, eq_s.values,
-                        where=eq_s.values >= 1, color=C_STRAT, alpha=0.06)
-        ax.fill_between(eq_s.index, 1, eq_s.values,
-                        where=eq_s.values < 1, color=C_EXIT, alpha=0.06)
-        ax.axhline(1.0, color="#cbd5e1", lw=0.8, ls="--")
-        ax.set_yscale("log")
-        ax.set_ylabel("净值（对数）", fontsize=9, color=C_MUTED)
-        ax.set_title("策略 vs 买入持有 · 资金曲线", fontsize=11.5, loc="left", color=C_TEXT, pad=8)
-        ax.grid(True, color=C_GRID, lw=0.6, alpha=0.9)
-        ax.set_axisbelow(True)
-        ax.legend(loc="upper left", frameon=False, fontsize=9)
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
-        ax.tick_params(labelbottom=False, colors=C_MUTED, labelsize=9)
-
-        dd_s = drawdown_series(res.equity) * 100
-        dd_b = drawdown_series(bh.equity) * 100
-        ax2.fill_between(dd_b.index, dd_b.values, 0, color=C_BH, alpha=0.35, label="持有回撤")
-        ax2.fill_between(dd_s.index, dd_s.values, 0, color=C_STRAT, alpha=0.45, label="策略回撤")
-        ax2.set_ylabel("回撤 %", fontsize=9, color=C_MUTED)
-        ax2.grid(True, color=C_GRID, lw=0.5, alpha=0.7)
-        ax2.set_axisbelow(True)
-        ax2.legend(loc="lower left", frameon=False, fontsize=8, ncol=2)
-        ax2.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}%"))
-        ax2.tick_params(colors=C_MUTED, labelsize=9)
-
-        ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=8))
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-        for a in (ax, ax2):
-            for spine in ("top", "right"):
-                a.spines[spine].set_visible(False)
-            for spine in ("left", "bottom"):
-                a.spines[spine].set_color("#cbd5e1")
-        for lbl in ax2.get_xticklabels():
-            lbl.set_rotation(0)
-
-    # ---------------------------------------------------------- 指标
-    def _update_metrics(self) -> None:
-        m, b = self.res.metrics, self.bh.metrics
-        self.card_cagr.set_value(f"{m['cagr']*100:.1f}%", C_UP if m["cagr"] >= 0 else C_DOWN)
-        self.card_dd.set_value(f"{m['max_dd']*100:.1f}%", "#ea580c")
-        self.card_sharpe.set_value(
-            f"{m['sharpe']:.2f}",
-            "#0f9d58" if m["sharpe"] >= 1 else ("#1f2937" if m["sharpe"] >= 0.5 else "#ea580c"),
-        )
-        excess = m["cagr"] - b["cagr"]
-        self.card_excess.set_value(
-            f"{excess*100:+.1f}%", "#0f9d58" if excess >= 0 else "#d92b2b"
-        )
-        dir_txt = ""
-        if not self.cfg.long_only:
-            dir_txt = (f" · 多头 {m['long_exposure']*100:.0f}% / 空头 {m['short_exposure']*100:.0f}%"
-                       f" · 空头 {m['n_short']} 笔")
-            if m.get("n_blowup"):
-                dir_txt += f" · 爆仓 {m['n_blowup']} 次"
-        self.lbl_status.setText(
-            f"{m['n_trades']} 笔交易 · 胜率 {m['win_rate']*100:.0f}% · "
-            f"仓位时间 {m['exposure']*100:.0f}% · 平均持仓 {self._hold_text(m['avg_bars'])}{dir_txt}"
-        )
+    # ---------------------------------------------------------- 结果文本
 
     def _result_text(self) -> str:
         """把这次回测的结论摊成一段纯文本。
@@ -3278,38 +2364,23 @@ class MainWindow(QMainWindow):
         两个用处：Agent 页右下角的「运行输出」，以及模型自己发起回测时喂回去的
         那段结果。所以写的是**数字**，不是「回测完成」这种话 —— 模型要的就是数字，
         少一行它就要反过来问用户，而用户手上只有这张图。
+
+        正文由 `ttrade.replay.summary` 生成：「策略交易和组合」页双击回放出来的
+        结果也要喂回模型，两处必须一字不差，否则模型看到两种格式会当成两回事。
         """
         if self.res is None or self.bh is None or self.df_raw is None:
             return ""
-        m, b = self.res.metrics, self.bh.metrics
         item = self._current_item()
         sym = item.get("symbol") or item.get("key") or ""
         ex = item.get("exchange") or ""
         head = f"{sym}_{ex}" if ex else sym
-        period = PERIOD_LABEL.get(self._period(), self._period())
-        label = self._strategy_label or "策略"
-        idx = self.df_raw.index
-        span = f"样本 {len(self.df_raw)} 根（{idx[0]:%Y-%m-%d} → {idx[-1]:%Y-%m-%d}）"
-
-        lines = [f"{head} · {period} · {label}", span]
-        lines += [
-            f"策略  总收益 {m['total_return'] * 100:+.1f}%｜年化 {m['cagr'] * 100:+.2f}%"
-            f"｜最大回撤 {m['max_dd'] * 100:.1f}%｜夏普 {m['sharpe']:.2f}"
-            f"｜卡玛 {m['calmar']:.2f}",
-            f"基准  总收益 {b['total_return'] * 100:+.1f}%｜年化 {b['cagr'] * 100:+.2f}%"
-            f"｜最大回撤 {b['max_dd'] * 100:.1f}%｜夏普 {b['sharpe']:.2f}",
-            f"超额  {(m['cagr'] - b['cagr']) * 100:+.2f}%/年",
-            f"交易  {m['n_trades']} 笔｜胜率 {m['win_rate'] * 100:.0f}%"
-            f"｜盈亏比 {m['profit_factor']:.2f}｜仓位时间 {m['exposure'] * 100:.0f}%"
-            f"｜平均持仓 {self._hold_text(m['avg_bars'])}",
-        ]
-        if not self.cfg.long_only and m.get("n_short"):
-            lines.append(
-                f"方向  多头 {m['long_exposure'] * 100:.0f}% / 空头 {m['short_exposure'] * 100:.0f}%"
-                f"｜空头 {m['n_short']} 笔" + (f"｜爆仓 {m['n_blowup']} 次"
-                                              if m.get("n_blowup") else "")
-            )
-        return "\n".join(lines)
+        period = self._period()
+        rp = replay.Replay(
+            df=self.df_sig, raw=self.df_raw, res=self.res, bh=self.bh,
+            label=self._strategy_label or "策略", period=period,
+            long_only=self.cfg.long_only, bars_per_year=self.cfg.bars_per_year,
+        )
+        return replay.summary(rp, head, PERIOD_LABEL.get(period, period))
 
     def _publish_result(self) -> None:
         """算完了就推一份到 Agent 页。算不出来时由 `_clear_chart` 推错误。"""
@@ -3329,291 +2400,10 @@ class MainWindow(QMainWindow):
         if item is not None:
             self.backtest_done.emit(*item)
 
-    def _hold_text(self, bars: float) -> str:
-        """平均持仓长度的可读写法。
-
-        `avg_bars` 的单位是「根」，日线一根就是一天，分钟级一根只有几十分钟。
-        统一写「天」会把 1 小时的 160 根说成 160 天（实际约 32 个交易日）。
-        """
-        if self._period() == PERIOD_1D:
-            return f"{bars:.0f} 天"
-        bpy = float(self.cfg.bars_per_year or 252)
-        days = bars / bpy * 365.25 if bpy > 0 else 0.0
-        return f"{bars:.0f} 根（约 {days:.0f} 天）"
-
-    def _update_table(self) -> None:
-        m, b = self.res.metrics, self.bh.metrics
-
-        def pct(x):
-            return f"{x*100:.2f}%"
-
-        rows = [
-            ("年化收益 CAGR", pct(m["cagr"]), pct(b["cagr"]), m["cagr"] >= b["cagr"]),
-            ("累计收益", pct(m["total_return"]), pct(b["total_return"]), m["total_return"] >= b["total_return"]),
-            ("最大回撤", pct(m["max_dd"]), pct(b["max_dd"]), m["max_dd"] >= b["max_dd"]),
-            ("夏普比率", f"{m['sharpe']:.2f}", f"{b['sharpe']:.2f}", m["sharpe"] >= b["sharpe"]),
-            ("卡玛比率", f"{m['calmar']:.2f}", f"{b['calmar']:.2f}", m["calmar"] >= b["calmar"]),
-            ("年化波动", pct(m["ann_vol"]), pct(b["ann_vol"]), m["ann_vol"] <= b["ann_vol"]),
-            ("仓位时间占比", pct(m["exposure"]), "100.00%", None),
-            ("　其中多头", pct(m["long_exposure"]), "100.00%", None),
-            ("　其中空头", pct(m["short_exposure"]), "0.00%", None),
-            ("交易次数", f"{m['n_trades']}", "1", None),
-            ("　多头 / 空头", f"{m['n_long']} / {m['n_short']}", "1 / 0", None),
-            ("胜率", pct(m["win_rate"]), "—", None),
-            ("盈亏比", f"{m['profit_factor']:.2f}", "—", None),
-            ("平均每笔收益", pct(m["avg_trade"]), "—", None),
-            ("平均持仓", self._hold_text(m["avg_bars"]), "—", None),
-            ("最佳单笔", pct(m["best_trade"]), "—", None),
-            ("最差单笔", pct(m["worst_trade"]), "—", None),
-            ("期末资金", f"${m['final_equity']:,.0f}", f"${b['final_equity']:,.0f}",
-             m["final_equity"] >= b["final_equity"]),
-        ]
-
-        self.table.setRowCount(len(rows))
-        for i, (name, sv, bv, better) in enumerate(rows):
-            it0 = QTableWidgetItem(name)
-            it0.setForeground(QColor("#475569"))
-            it1 = QTableWidgetItem(sv)
-            it1.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            it1.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))
-            it2 = QTableWidgetItem(bv)
-            it2.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            it2.setForeground(QColor(C_MUTED))
-            if better is True:
-                it1.setForeground(QColor("#0f9d58"))
-            elif better is False:
-                it1.setForeground(QColor("#d92b2b"))
-            self.table.setItem(i, 0, it0)
-            self.table.setItem(i, 1, it1)
-            self.table.setItem(i, 2, it2)
-            self.table.setRowHeight(i, 26)
-
-    # ---------------------------------------------------------- 因子分析页
-    def _ensure_report(self) -> pd.DataFrame:
-        """当前标的的全因子评估表。按「市场+标的」缓存，切参数不用重算。
-
-        47 个因子约 0.5 秒，每次拖滑杆都重算会明显拖慢交互，所以缓存住。
-        """
-        key = f"{self.market}:{self.cb_symbol.currentData()}"
-        if self._f_report is not None and self._f_report_key == key:
-            return self._f_report
-        df = self.df_raw
-        if df is None or df.empty:
-            return pd.DataFrame()
-        cfg = self._factor_cfg()
-        try:
-            rep = factor_metrics.factor_report(
-                df, list(factors.FACTORS), horizon=cfg.horizon,
-                window=cfg.window, method=cfg.method,
-            )
-        except Exception:  # noqa: BLE001
-            rep = pd.DataFrame()
-        self._f_report = rep
-        self._f_report_key = key
-        return rep
-
-    def _refresh_factor_tab(self) -> None:
-        """刷新因子分析页：表格 + 四格图。没有因子在用时也显示全因子一览。"""
-        df = self.df_raw
-        if df is None or df.empty:
-            return
-        cfg = self._factor_cfg()
-        rep = self._ensure_report()
-        if rep.empty:
-            self.lbl_frep.setText("因子评估失败")
-            return
-
-        out = self.factor_outcome
-        selected = list(out.pack.fmat.columns) if out is not None else self._selected_factor_keys()
-        sel_set = set(selected)
-
-        self.tbl_factor.setRowCount(0)
-        for _, r in rep.iterrows():
-            i = self.tbl_factor.rowCount()
-            self.tbl_factor.insertRow(i)
-            on = r["key"] in sel_set
-
-            def cell(text, align_right=True, bold=False, color=None):
-                it = QTableWidgetItem(str(text))
-                if align_right:
-                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if bold:
-                    f = it.font()
-                    f.setBold(True)
-                    it.setFont(f)
-                if color:
-                    it.setForeground(QColor(color))
-                return it
-
-            name = ("● " if on else "　") + str(r["label"])
-            self.tbl_factor.setItem(i, 0, cell(name, False, on, "#1d4ed8" if on else None))
-
-            ic = r.get("ic")
-            ic_color = None
-            if pd.notna(ic):
-                ic_color = "#1d4ed8" if ic > 0 else "#b91c1c"
-                self.tbl_factor.setItem(i, 1, cell(f"{ic:+.4f}", True, on, ic_color))
-            elif r.get("key") in factors.AUX_KEYS:
-                # 展期 / 期权因子在美股、以及没下过衍生数据的期货品种上是空的。
-                # 留白会让人以为「算出来是 0」，写清楚是没数据。
-                it = cell("无数据", True, False, "#94a3b8")
-                it.setToolTip("该标的没有真实合约 / 期权数据，这个因子无法计算")
-                self.tbl_factor.setItem(i, 1, it)
-            else:
-                self.tbl_factor.setItem(i, 1, cell("", True, on))
-
-            for j, col in enumerate(("ir", "ic_pos", "t", "mono", "turnover"), start=2):
-                v = r.get(col)
-                if pd.isna(v) if isinstance(v, float) else v is None:
-                    txt = ""
-                elif col == "ic_pos":
-                    txt = f"{v:.0%}"
-                elif col == "t":
-                    txt = f"{v:+.2f}"
-                else:
-                    txt = f"{v:+.3f}" if col in ("ir", "mono") else f"{v:.3f}"
-                self.tbl_factor.setItem(i, j, cell(txt, True, on))
-            self.tbl_factor.setRowHeight(i, 23)
-
-        n_ok = int(rep["t"].notna().sum()) if "t" in rep else 0
-        n_sig = int((rep["t"].abs() > 2).sum()) if "t" in rep else 0
-        self.lbl_frep.setText(
-            f"{len(rep)} 个因子 · 前向 {cfg.horizon} 日 · 标准化窗口 {cfg.window} 日\n"
-            f"|t|>2 的因子 {n_sig} 个（Newey-West 调整后），有效评估 {n_ok} 个"
-        )
-
-        self._plot_factor_charts(df, cfg, rep, out)
-
-    def _plot_factor_charts(self, df, cfg, rep, out) -> None:
-        """四格图：IC 时序 / IC 衰减 / 分位收益 / 特征重要度（或分数与收益）。"""
-        with self.canvas_f.frozen():
-            self._plot_factor_charts_impl(df, cfg, rep, out)
-
-    def _plot_factor_charts_impl(self, df, cfg, rep, out) -> None:
-        fig = self.canvas_f.fresh()
-        axes = fig.subplots(2, 2)
-        fig.subplots_adjust(left=0.075, right=0.975, top=0.93, bottom=0.09,
-                            hspace=0.34, wspace=0.22)
-        a_ic, a_decay, a_q, a_last = axes.flat
-
-        for a in axes.flat:
-            a.set_facecolor(C_BG)
-            a.grid(True, color=C_GRID, lw=0.5, alpha=0.75)
-            a.set_axisbelow(True)
-            for spine in ("top", "right"):
-                a.spines[spine].set_visible(False)
-            for spine in ("left", "bottom"):
-                a.spines[spine].set_color("#cbd5e1")
-            a.tick_params(colors=C_MUTED, labelsize=8.5, length=3)
-
-        keys = list(out.pack.fmat.columns) if out is not None else self._selected_factor_keys()
-        primary = keys[0] if keys else None
-
-        # ---- 1. IC 时序
-        if primary:
-            f = factors.standardize(factors.raw(df, primary), window=cfg.window, method=cfg.method)
-            fwd = factor_metrics.forward_return(df, cfg.horizon)
-            ser = factor_metrics.ic_series(f, fwd, cfg.window).dropna()
-            if len(ser) > 10:
-                a_ic.plot(ser.index, ser.to_numpy(), color=C_IC, lw=0.9)
-                a_ic.axhline(0, color="#94a3b8", lw=0.8)
-                mu = float(ser.mean())
-                a_ic.axhline(mu, color=C_IC_NEG, lw=0.9, ls="--", alpha=0.85)
-                a_ic.set_title(
-                    f"滚动 IC · {factors.FACTORS[primary].label}"
-                    f"（均值 {mu:+.3f}）",
-                    fontsize=9.5, color=C_TEXT, loc="left",
-                )
-            else:
-                a_ic.set_title("滚动 IC（样本不足）", fontsize=9.5, color=C_TEXT, loc="left")
-        else:
-            a_ic.set_title("滚动 IC（未选因子）", fontsize=9.5, color=C_TEXT, loc="left")
-        a_ic.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.2f}"))
-        # 20 年日频，默认定位器会塞十几个年份标签，在这么小的子图里会连成一片。
-        # 限到 5 个刻度并只留年份，够看趋势又不糊。
-        a_ic.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=5))
-        a_ic.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-        a_ic.tick_params(axis="x", labelsize=8)
-
-        # ---- 2. IC 衰减
-        if primary:
-            decay = factor_metrics.ic_decay(df, primary, window=cfg.window, method=cfg.method)
-            xs = np.arange(len(decay))
-            vals = decay.to_numpy(dtype=float)
-            a_decay.bar(xs, vals, color=[C_IC if v >= 0 else C_IC_NEG for v in vals],
-                        width=0.62, alpha=0.85)
-            a_decay.axhline(0, color="#94a3b8", lw=0.8)
-            a_decay.set_xticks(xs)
-            a_decay.set_xticklabels([str(h) for h in decay.index])
-            a_decay.set_xlabel("持有期（交易日）", fontsize=8.5, color=C_MUTED)
-            a_decay.set_title("IC 衰减", fontsize=9.5, color=C_TEXT, loc="left")
-        a_decay.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.2f}"))
-
-        # ---- 3. 分位收益
-        if primary:
-            f = factors.standardize(factors.raw(df, primary), window=cfg.window, method=cfg.method)
-            q = factor_metrics.quantile_returns(
-                f, factor_metrics.forward_return(df, cfg.horizon), 5, cfg.window
-            )
-            if len(q):
-                xs = np.arange(len(q))
-                vals = q.to_numpy(dtype=float) * 100
-                a_q.bar(xs, vals, color=[C_IC if v >= 0 else C_IC_NEG for v in vals],
-                        width=0.6, alpha=0.85)
-                a_q.axhline(0, color="#94a3b8", lw=0.8)
-                a_q.set_xticks(xs)
-                a_q.set_xticklabels([f"Q{i+1}" for i in range(len(q))])
-                mono = factor_metrics.monotonicity(q)
-                ttl = "分位收益" + ("" if pd.isna(mono) else f"（单调性 {mono:+.2f}）")
-                a_q.set_title(ttl, fontsize=9.5, color=C_TEXT, loc="left")
-                a_q.set_ylabel("%", fontsize=8.5, color=C_MUTED)
-        a_q.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.2f}"))
-
-        # ---- 4. 特征重要度 / 综合分数
-        imp = out.pack.importance if out is not None else None
-        if imp is not None and len(imp):
-            top = imp.head(10)[::-1]
-            names = [factors.FACTORS[k].label if k in factors.FACTORS else k for k in top.index]
-            a_last.barh(np.arange(len(top)), top.to_numpy(), color=C_FACTOR, alpha=0.85)
-            a_last.set_yticks(np.arange(len(top)))
-            a_last.set_yticklabels(names, fontsize=8)
-            a_last.set_title(
-                f"因子重要度 · {mlmodels.MODELS.get(cfg.model, {}).get('label', cfg.model)}",
-                fontsize=9.5, color=C_TEXT, loc="left",
-            )
-        elif out is not None:
-            sc = out.pack.score.dropna()
-            if len(sc) > 30:
-                a_last.plot(sc.index, sc.to_numpy(), color=C_FACTOR, lw=0.8)
-                a_last.axhline(0, color="#94a3b8", lw=0.8)
-                for lv, col in ((cfg.entry_z, C_LONG_SIG), (-cfg.entry_z, C_SHORT_SIG)):
-                    a_last.axhline(lv, color=col, lw=0.8, ls="--", alpha=0.75)
-                a_last.set_title("综合因子分数", fontsize=9.5, color=C_TEXT, loc="left")
-                a_last.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=5))
-                a_last.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-                a_last.tick_params(axis="x", labelsize=8)
-        else:
-            a_last.set_title("特征重要度（机器学习模式可用）", fontsize=9.5,
-                             color=C_MUTED, loc="left")
-
-        for a in axes.flat:
-            a.title.set_fontsize(9.5)
-
-        notes = []
-        if out is not None:
-            notes.extend(out.notes)
-        notes.append(
-            "口径：IC 为秩相关；ICIR=滚动IC均值/标准差；t 值经 Newey-West 调整"
-            "（滚动窗口重叠会严重高估显著性）；分位与方向均按 PIT 滚动计算"
-        )
-        self.lbl_fnote.setText(" · ".join(n for n in notes if n))
-
     # ---------------------------------------------------------- 生命周期
     def closeEvent(self, event) -> None:
         """关窗前先让更新线程收尾，避免线程还在写 CSV 就被强杀。"""
         self._closing = True
-        if self._k_redraw_timer.isActive():
-            self._k_redraw_timer.stop()
         self.data_page.shutdown()
         self._cancel_factor_worker()
         # 组合页每条账户连接一个 QThread，窗口关掉时线程还在跑 wait_update
