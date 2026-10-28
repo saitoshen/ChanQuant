@@ -553,6 +553,91 @@ def check_factor_refresh() -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def check_main_backfill() -> None:
+    """库里只有近几年数据时，增量必须把前面那段也补上。
+
+    增量原来只看 `last_dt`：库里最后一根在哪就从哪往前推 3 天，**从不看第一根**。
+    早期版本用两年窗口跑过一轮的品种，之后每次只补最新几根，那几年永远补不上，
+    而日志显示「+14 行」看着完全正常。RB 的 1h 实测停在两年前（3369 根），
+    5m 同期是 164544 根。
+    """
+    import tempfile
+
+    try:
+        from ttrade import tqfetch as D
+    except Exception as exc:  # noqa: BLE001
+        skip("主连补历史缺口", f"无法导入 tqfetch：{exc}")
+        return
+
+    old_env = os.environ.get("TRENDDESK_TQ_DB")
+    tmpdir = tempfile.mkdtemp(prefix="tqmain_")
+    os.environ["TRENDDESK_TQ_DB"] = os.path.join(tmpdir, "t.duckdb")
+    real_dl = D.download_many
+    try:
+        today = pd.Timestamp.today().normalize()
+        have = pd.DataFrame({
+            "dt": pd.date_range(today - pd.Timedelta(days=700), today, freq="h"),
+            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+            "volume": 1, "open_oi": 1, "close_oi": 1,
+        })
+        have["adj_factor"] = 1.0
+        with S.connect() as con:
+            S.upsert_bars(con, "RB", "SHFE", "1h", have)
+
+        spans: list[tuple] = []
+
+        def fake_dl(api, jobs, period, out_dir, tag, max_parallel=8, errors=None):
+            spans.extend([(j[1], j[2]) for j in jobs])
+            out = {}
+            for sym, s, e in jobs:
+                n = max(2, (e - s).days * 4)
+                out[sym] = pd.DataFrame({
+                    "dt": pd.date_range(pd.Timestamp(s), periods=n, freq="6h"),
+                    "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+                    "volume": 1, "open_oi": 1, "close_oi": 1,
+                })
+            return out
+
+        D.download_many = fake_dl
+        D.write_main_many(None, [("RB", "SHFE")], "1h", 10)
+
+        hard = (today - pd.Timedelta(days=3650)).date()
+        first = have["dt"].iloc[0]
+        last = have["dt"].iloc[-1]
+        check("主连补历史：库里起点偏晚时要拆成两段", len(spans) == 2, f"{len(spans)} 段")
+        if len(spans) == 2:
+            (h0, h1), (t0, _t1) = spans
+            check("主连补历史：头段从回溯区间开始", h0 <= hard + pd.Timedelta(days=2),
+                  f"{h0} vs {hard}")
+            check("主连补历史：头段止于库里第一根之前", h1 < first.date(), f"{h1}")
+            check("主连补历史：尾段从最后一根往前推",
+                  t0 <= last.date() - pd.Timedelta(days=2), f"{t0}")
+
+        # 库里数据已经完整覆盖回溯区间时，不能多下一段
+        spans.clear()
+        with S.connect() as con:
+            full = pd.DataFrame({
+                "dt": pd.date_range(today - pd.Timedelta(days=3800), today, freq="h"),
+                "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+                "volume": 1, "open_oi": 1, "close_oi": 1,
+            })
+            full["adj_factor"] = 1.0
+            S.upsert_bars(con, "HC", "SHFE", "1h", full)
+        D.write_main_many(None, [("HC", "SHFE")], "1h", 10)
+        check("主连补历史：覆盖完整时不重复补", len(spans) == 1, f"{len(spans)} 段")
+    except Exception as exc:  # noqa: BLE001
+        check("主连补历史缺口", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        D.download_many = real_dl
+        if old_env is None:
+            os.environ.pop("TRENDDESK_TQ_DB", None)
+        else:
+            os.environ["TRENDDESK_TQ_DB"] = old_env
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -566,6 +651,7 @@ def main() -> int:
     check_live_helpers()
     check_cli_entry()
     check_factor_refresh()
+    check_main_backfill()
     for k in ks:
         try:
             check_one(k)

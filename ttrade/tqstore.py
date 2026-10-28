@@ -233,6 +233,23 @@ def last_dt(symbol: str, exchange: str, period: str):
     return pd.Timestamp(r[0]) if r and r[0] is not None else None
 
 
+def first_dt(symbol: str, exchange: str, period: str):
+    """库里这个品种该周期最早的一根。
+
+    增量更新只看 `last_dt` 是不够的：早期用短窗口（两年）下过的品种，之后每次
+    都只补最新几根，前面缺的那几年永远补不上，而且日志显示「+14 行」看着像正常
+    增量。RB 的 1h 就这样停在两年前。
+    """
+    if not exists():
+        return None
+    with connect(read_only=True) as con:
+        r = con.execute(
+            "SELECT min(dt) FROM bars WHERE symbol=? AND exchange=? AND period=?",
+            [symbol, exchange, period],
+        ).fetchone()
+    return pd.Timestamp(r[0]) if r and r[0] is not None else None
+
+
 def bar_count(symbol: str, exchange: str, period: str) -> int:
     if not exists():
         return 0

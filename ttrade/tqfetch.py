@@ -740,34 +740,45 @@ def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
     end = date.today()
     hard_start = end - timedelta(days=365 * years)
 
-    jobs: list[tuple[str, date, date, str, str]] = []
+    tail: list[tuple[str, date, date, str, str]] = []
+    head: list[tuple[str, date, date, str, str]] = []
     factors: dict[tuple[str, str], pd.Series] = {}
     for sym, ex in pairs:
         rec = S.load_switch(sym, ex)
         factors[(sym, ex)] = adj_factor_series(rec) if len(rec) else pd.Series(dtype=float)
-        start = hard_start
-        have = S.last_dt(sym, ex, period)
-        if have is not None:
-            # 往前推 3 天重叠，覆盖「上次下到一半」和节假日边界；主键冲突会覆盖
-            start = max(start, (have - timedelta(days=3)).date())
-        jobs.append((main_symbol(sym, ex), start, end, sym, ex))
+        tq = main_symbol(sym, ex)
+        last = S.last_dt(sym, ex, period)
+        first = S.first_dt(sym, ex, period)
+        if last is None:
+            tail.append((tq, hard_start, end, sym, ex))
+            continue
+        # 尾段：往前推 3 天重叠，覆盖「上次下到一半」和节假日边界；主键冲突会覆盖
+        tail.append((tq, max(hard_start, (last - timedelta(days=3)).date()), end, sym, ex))
+        # 头段：库里最早那根比回溯区间晚，说明前面那段从来没下过。早期版本用两年
+        # 窗口跑过一轮，之后增量只看 last_dt，于是那几年永远补不上 —— RB 的 1h
+        # 就这样停在 2024-10，每次日志还显示「+14 行」像正常增量。
+        if first is not None:
+            head_end = (first - timedelta(days=1)).date()
+            if head_end > hard_start + timedelta(days=1):
+                head.append((tq, hard_start, head_end, sym, ex))
 
     out: dict[str, int] = {}
+    first_seen: dict[str, pd.Timestamp] = {}
     chunk = max(1, int(max_parallel))
-    for i in range(0, len(jobs), chunk):
-        batch = jobs[i : i + chunk]
+
+    def run(batch: list[tuple[str, date, date, str, str]], label: str, report: bool) -> None:
         frames = download_many(
             api, [(t, s, e) for t, s, e, _, _ in batch], period, tq_root(),
-            f"MAIN_{period}", max_parallel=chunk,
+            label, max_parallel=chunk,
         )
         with S.connect() as con:
             for tq_sym, _s, _e, sym, ex in batch:
                 key = f"{sym}_{ex}"
                 df = frames.get(tq_sym)
                 if df is None or df.empty:
-                    out[key] = 0
-                    if on_row is not None:
-                        on_row(key, 0, None)
+                    out.setdefault(key, 0)
+                    if report and on_row is not None:
+                        on_row(key, out[key], first_seen.get(key))
                     continue
                 df["adj_factor"] = factor_at(factors[(sym, ex)], trading_days(df["dt"]))
                 n = S.upsert_bars(con, sym, ex, period, df)
@@ -776,9 +787,19 @@ def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
                 # 先对齐换月点：天勤的映射和序列偶尔差一个交易日，因子要跟序列走。
                 realign_switch(con, sym, ex)
                 refresh_factors(con, sym, ex, period)
-                out[key] = n
-                if on_row is not None:
-                    on_row(key, n, df["dt"].iloc[0])
+                out[key] = out.get(key, 0) + n
+                dt0 = df["dt"].iloc[0]
+                if key not in first_seen or dt0 < first_seen[key]:
+                    first_seen[key] = dt0
+                if report and on_row is not None:
+                    on_row(key, out[key], first_seen[key])
+
+    # 头段先跑：补历史缺口。这一段不回调 —— 同一个品种稍后还会跑尾段，
+    # 回调两次会让调用方的「第几个品种」计数翻倍。
+    for i in range(0, len(head), chunk):
+        run(head[i : i + chunk], f"MAIN_{period}_head", report=False)
+    for i in range(0, len(tail), chunk):
+        run(tail[i : i + chunk], f"MAIN_{period}", report=True)
     return out
 
 
