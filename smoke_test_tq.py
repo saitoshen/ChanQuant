@@ -1809,6 +1809,221 @@ def check_factor_manual() -> None:
         check("平台手册", False, f"{type(exc).__name__}: {exc}")
 
 
+def check_agent_attachments() -> None:
+    """附件 + 运行输出：文档能读、图片能缩、结果能喂回模型。
+
+    这条链最容易出的问题是「附件加进去了，但发出去的是空消息」：图片编码失败
+    会静默给一个空 b64，模型收到一个 data URI 里什么都没有的部件，接口直接 400，
+    而用户只看到「出错了」。
+    """
+    import time
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from ttrade import agent as A
+    from ttrade import attachments as ATT
+
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="td_att_")
+
+        # 1) 图片：大图要缩，透明底不能变黑，b64 不能是空的
+        png = os.path.join(tmpdir, "big.png")
+        a = None
+        try:
+            from PIL import Image
+
+            Image.new("RGBA", (3000, 1800), (10, 20, 30, 0)).save(png)
+            a = ATT.load(png)
+            check("附件：大图缩到 1600 以内", a.ok and "缩到" in a.note, a.note)
+            check("附件：图片有 base64", len(a.b64) > 1000, f"{len(a.b64)} 字符")
+            check("附件：图片按 jpeg 传", a.mime == "image/jpeg", a.mime)
+        except ImportError:
+            skip("附件：图片缩放", "没装 Pillow")
+
+        # 2) 文本：utf-8 与 gbk 都要读得出来。中文 Windows 导出的 csv 十有八九
+        #    是 gbk，按 utf-8 硬解会满屏问号，模型读到的数字是错的还不自知
+        utf = os.path.join(tmpdir, "a.md")
+        open(utf, "w", encoding="utf-8").write("# 需求\n用 20 日动量")
+        b = ATT.load(utf)
+        check("附件：utf-8 文本能读", b.ok and "20 日动量" in b.text, b.text[:20])
+
+        gbk = os.path.join(tmpdir, "b.csv")
+        open(gbk, "wb").write("日期,收盘\n2024-01-02,100\n".encode("gbk"))
+        c = ATT.load(gbk)
+        check("附件：gbk 文本能读", c.ok and "收盘" in c.text, c.text[:20])
+
+        # 3) docx 自己解压读，不依赖 python-docx
+        import zipfile
+
+        docx = os.path.join(tmpdir, "n.docx")
+        with zipfile.ZipFile(docx, "w") as z:
+            z.writestr(
+                "word/document.xml",
+                "<w:document><w:body><w:p><w:r><w:t>第一段</w:t></w:r></w:p>"
+                "<w:p><w:r><w:t>第二段</w:t></w:r></w:p></w:body></w:document>",
+            )
+        d = ATT.load(docx)
+        check("附件：docx 抠出文字且分段", d.ok and d.text.splitlines() == ["第一段", "第二段"],
+              repr(d.text))
+
+        # 4) 认不出来的格式要**说清楚怎么办**，不能默默当成文本读
+        bad = os.path.join(tmpdir, "x.xlsx")
+        open(bad, "w").write("x")
+        e = ATT.load(bad)
+        check("附件：不支持的格式给出提示",
+              not e.ok and "不支持" in e.note and "截图" in e.note, e.note)
+
+        # 5) 拼消息：没图必须是纯字符串（老网关只吃字符串），有图才是 parts
+        check("附件：纯文档拼成字符串",
+              isinstance(ATT.content("看这个", [b, c]), str), "")
+        parts = ATT.content("看这个", [a, b])
+        check("附件：带图拼成 parts",
+              isinstance(parts, list) and parts[0]["type"] == "text"
+              and parts[-1]["type"] == "image_url", "")
+        check("附件：图片走 data URI",
+              parts[-1]["image_url"]["url"].startswith("data:image/jpeg;base64,"), "")
+
+        # 6) 带图消息的 content 是列表，`len()` 数出来是部件数不是字数
+        check("附件：text_of 摊平 parts",
+              "看这个" in A.text_of(parts) and "一张图片" in A.text_of(parts),
+              A.text_of(parts)[:30])
+
+        # 7) 历史里只留最近两条带图消息的图 —— 四十条全留就是十几兆请求体
+        hist = [{"role": "user", "content": ATT.content(f"第{i}张", [a])} for i in range(4)]
+        kept = A._prune_images(hist, keep=2)
+        imgs = sum(1 for m in kept
+                   if any(p.get("type") == "image_url" for p in m["content"]))
+        check("附件：老图不再重复传", imgs == 2, f"{imgs} 条还带着图")
+        msgs = A.build_messages(hist, "还有吗")
+        check("附件：build_messages 保留多模态",
+              isinstance(msgs[-2]["content"], list), type(msgs[-2]["content"]).__name__)
+
+        # 8) 提示词要教它怎么看附件、报错后先查手册
+        prompt = A.SYSTEM_PROMPT
+        check("提示词：说明附件怎么读", "附件" in prompt and "不要问「附件里是什么」" in prompt, "")
+        check("提示词：报错后先查手册", "注册失败" in prompt and "先查手册" in prompt, "")
+
+        # 9) 界面：输出框、附件按钮、回测结果自动喂回
+        from PySide6.QtWidgets import QApplication
+
+        from gui import agent_page as G
+
+        app = QApplication.instance() or QApplication([])
+        sent: list = []
+
+        def fake_chat(self, messages, on_delta=None, should_stop=None):
+            sent.append(messages)
+            return "收到"
+
+        old_chat = A.LLMClient.chat
+        A.LLMClient.chat = fake_chat
+        pg = None
+        try:
+            pg = G.AgentPage()
+            pg.cfg.api_key = "k"
+            pg.cfg.provider = "deepseek"
+            pg.cfg.base_url = "https://api.deepseek.com/v1"
+            pg.cfg.model = "deepseek-chat"
+            pg.cfg.confirm_trade = False
+
+            def pump(n: int = 60) -> None:
+                for _ in range(n):
+                    app.processEvents()
+                    time.sleep(0.01)
+
+            check("输出框：控件都在",
+                  hasattr(pg, "out") and hasattr(pg, "btn_out_feed")
+                  and hasattr(pg, "btn_attach"), "")
+
+            pg.push_output("第一次 A")
+            pg.push_output("第二次 B")
+            check("输出框：逐条追加", pg.out.toPlainText().count("次 ") == 2,
+                  pg.out.toPlainText()[:40])
+            check("输出框：有内容才能发回", pg.btn_out_feed.isEnabled(), "")
+
+            # 拖滑杆会连着来一串，只该留下最后一条
+            pg._clear_output()
+            pg.push_output("拖 1", True)
+            pg.push_output("拖 2", True)
+            check("输出框：连续调整覆盖上一条",
+                  pg.out.toPlainText().count("拖") == 1, pg.out.toPlainText()[-12:])
+
+            # 灌配置时「中间态 + 收尾」会各算一次，同一份结果不能记两条
+            pg._clear_output()
+            pg.push_output("同一份结果")
+            pg.push_output("同一份结果")
+            check("输出框：同一份结果不记两条",
+                  pg.out.toPlainText().count("同一份结果") == 1,
+                  pg.out.toPlainText())
+
+            # 模型发起的回测：结果要自动喂回去，不然它只能问用户
+            pg._clear_output()
+            sent.clear()
+            pg.begin_backtest_feedback()
+            pg.push_output("年化 +12.3%")
+            pump()
+            fed = bool(sent) and "12.3" in str(sent[-1][-1]["content"])
+            check("输出框：Agent 发起的回测自动回喂", fed, f"{len(sent)} 轮")
+            check("输出框：喂过一次就清标记", pg._expect_bt is False, "")
+
+            # 用户手动回测 / 拖参数不该触发一轮对话
+            pg._clear_output()
+            sent.clear()
+            pump()
+            pg.push_output("手动跑的结果")
+            pump()
+            check("输出框：手动回测不打扰模型", not sent, f"{len(sent)} 轮")
+
+            # 注册失败：报错和契约必须一起回到模型手里。以前失败只写在界面上，
+            # 模型以为自己成功了，下一轮接着按错的假设聊
+            from ttrade import userfactors as UF
+
+            tmp2 = tempfile.mkdtemp(prefix="td_uf2_")
+            old_path = UF.path
+            UF.path = lambda: os.path.join(tmp2, "uf.json")
+            try:
+                sent.clear()
+                pg._register_factor({
+                    "key": "zz_smoke_bad", "label": "坏", "func": "f_x",
+                    "code": "def f_x(df):\n    return _col(df, 'close').reset_index(drop=True)",
+                })
+                pump()
+                note = str(sent[-1][-1]["content"]) if sent else ""
+                check("注册失败：报错回喂模型", "注册失败" in note, f"{len(sent)} 轮")
+                check("注册失败：契约随报错一起给", "写因子的契约" in note, f"{len(note)} 字符")
+            finally:
+                UF.path = old_path
+
+            # 附件条：加一个真文件，chip 要出现，点掉要消失
+            pg._atts = [b]
+            pg._refresh_atts()
+            check("附件条：有附件才显示", not pg.att_box.isHidden(), "")
+            pg._drop_att(0)
+            check("附件条：删掉后隐藏", pg.att_box.isHidden() and not pg._atts, "")
+
+            # 端到端：带图发一条，发出去的必须是 parts，发完附件条要清空
+            sent.clear()
+            pg._atts = [a] if (a is not None and a.ok) else []
+            if pg._atts:
+                pg.ed_input.setPlainText("照这张图写个因子")
+                pg._send()
+                pump()
+                body = sent[-1][-1]["content"] if sent else ""
+                check("附件：发送时走多模态",
+                      isinstance(body, list) and body[-1]["type"] == "image_url",
+                      type(body).__name__)
+                check("附件：发完清空附件条", not pg._atts and pg.att_box.isHidden(), "")
+                check("附件：正文带上文件名", "big.png" in A.text_of(body), "")
+        finally:
+            A.LLMClient.chat = old_chat
+            if pg is not None:
+                try:
+                    pg.shutdown()
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception as exc:  # noqa: BLE001
+        check("附件 / 输出框", False, f"{type(exc).__name__}: {exc}")
+
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -1835,6 +2050,7 @@ def main() -> int:
     check_agent_memory()
     check_agent_fs()
     check_factor_manual()
+    check_agent_attachments()
     for k in ks:
         try:
             check_one(k)

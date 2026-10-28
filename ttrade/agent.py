@@ -425,6 +425,22 @@ SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务�
 
 一次只查一段，别一口气把整份手册拉进对话。
 
+**注册失败、或者试算报错时，先查手册再改**。平台会把报错原样发给你，那是最准的
+线索：说「长度不一致」就去 `contract` 看返回值的约定，说「没有名为 xxx 的函数」
+就是 `func` 和代码里的函数名对不上。不要凭猜测连着改三次同一个地方。
+
+## 附件
+
+用户可能直接丢图片或文档进来：
+
+- **图片**（截图、行情图、别人的策略截图）：图像本身会随消息传给你，直接看。
+  看不清就说看不清，不要猜数字
+- **文档**（md/txt/csv/json/docx）：正文会以「【附件 N：文件名】」开头拼在消息里，
+  那是文件内容，不是用户说的话
+
+拿到附件先判断它要你干什么：是让你照着重写一个因子，还是让你核对一份数据。
+**不要问「附件里是什么」** —— 你能看见。
+
 ## 注册新因子
 
 平台**支持运行时注册因子**，不用让用户手动去因子管理页填表。用户描述一个平台
@@ -535,7 +551,57 @@ def _system_prompt(allow_fs: bool) -> str:
     return SYSTEM_PROMPT + FS_PROMPT.replace("{root}", root)
 
 
-def build_messages(history: list[dict], user_text: str, memory: str = "",
+def text_of(content) -> str:
+    """把消息内容摊平成纯文本。
+
+    带附件的消息 `content` 是 parts 列表（`[{"type": "text", ...},
+    {"type": "image_url", ...}]`）。记忆压缩、长度统计这些地方只想要文字，
+    直接 `len(content)` 数出来的是「2 个部件」，不是字数。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for p in content:
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") == "text":
+                out.append(str(p.get("text") or ""))
+            elif p.get("type") == "image_url":
+                out.append("（一张图片）")
+        return "\n".join(x for x in out if x)
+    return str(content or "")
+
+
+def _prune_images(history: list[dict], keep: int = 2) -> list[dict]:
+    """只保留最近 `keep` 条带图消息的图像数据。
+
+    一张截图 base64 后两三百 KB，四十条历史全留着就是十几兆的请求体 —— 又慢又
+    容易被网关按体积拒掉。图早就被模型看过了，隔了几轮再传一遍没有意义。
+    """
+    out = list(history)
+    seen = 0
+    for i in range(len(out) - 1, -1, -1):
+        c = out[i].get("content")
+        if not isinstance(c, list):
+            continue
+        if not any(isinstance(p, dict) and p.get("type") == "image_url" for p in c):
+            continue
+        seen += 1
+        if seen <= keep:
+            continue
+        out[i] = {
+            "role": out[i].get("role", "user"),
+            "content": [
+                {"type": "text", "text": "（早前发过的图片，为省体积这里不再重复传）"}
+                if isinstance(p, dict) and p.get("type") == "image_url" else p
+                for p in c
+            ],
+        }
+    return out
+
+
+def build_messages(history: list[dict], user_text: str | list, memory: str = "",
                    allow_fs: bool = False) -> list[dict]:
     """拼一份完整消息列表：系统提示 + 长期记忆 + 历史 + 本轮。
 
@@ -544,6 +610,9 @@ def build_messages(history: list[dict], user_text: str, memory: str = "",
 
     `allow_fs` 为真时追加「读写平台文件」那段。**这是能力开关，不是提示语**：
     关着的时候提示词里不提这件事，模型就不会写出必然被拒的动作块。
+
+    `user_text` 可以是字符串，也可以是带图的多模态 parts 列表（见
+    `attachments.content()`）—— 这里只负责原样放进消息，不关心它是什么形态。
     """
     msgs = [{"role": "system", "content": _system_prompt(allow_fs)}]
     if memory.strip():
@@ -553,7 +622,7 @@ def build_messages(history: list[dict], user_text: str, memory: str = "",
                        "不是用户这一轮说的。用到时当作已知事实，不要向用户复述这份清单。\n\n"
                        + memory.strip(),
         })
-    for m in history:
+    for m in _prune_images(history):
         if m.get("role") in ("user", "assistant") and m.get("content"):
             msgs.append({"role": m["role"], "content": m["content"]})
     msgs.append({"role": "user", "content": user_text})
@@ -587,7 +656,7 @@ def memory_messages(convo: list[dict]) -> list[dict]:
     lines = []
     for m in convo:
         role = "用户" if m.get("role") == "user" else "助手"
-        text = _CODE_BLOCK.sub("（此处有一段代码或数据块，已省略）", m.get("content") or "")
+        text = _CODE_BLOCK.sub("（此处有一段代码或数据块，已省略）", text_of(m.get("content")))
         lines.append(f"{role}：{text.strip()}")
     return [{"role": "user", "content": MEMORY_PROMPT + "\n".join(lines)}]
 

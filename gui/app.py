@@ -716,6 +716,11 @@ class FactorWorker(QObject):
 
 # ------------------------------------------------------------------ 主窗口
 class MainWindow(QMainWindow):
+    # 回测算完了：把结论摊成纯文本推给 Agent 页右下角的「运行输出」。
+    # 第二个参数是「这一条允许被下一条覆盖」—— 拖滑杆时 220ms 就重算一次，
+    # 不许覆盖的话输出框一秒刷十几条，人根本看不清。
+    backtest_done = Signal(str, bool)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("趋势跟踪研究台 · 美股 / 国内期货")
@@ -743,6 +748,11 @@ class MainWindow(QMainWindow):
         self.fparam_widgets: dict[str, QWidget] = {}
         self.fparam_scales: dict[str, int] = {}
         self._pending = False
+        # 灌配置时会顺带触发好几次计算（切市场、换品种各算一遍），那些都是中间态。
+        # 这段时间的输出先攒着，等最后一次算完再发 —— 否则 Agent 会拿着上一个品种
+        # 的数字讨论这一笔，而且看着毫无破绽
+        self._pub_guard = 0
+        self._pub_queue: tuple[str, bool] | None = None
 
         # 因子相关状态
         self.family = FAMILY_RULE
@@ -831,6 +841,9 @@ class MainWindow(QMainWindow):
         # 删掉同理：不重建的话下拉里还留着一条，选中就报「因子不存在」
         self.agent_page.factor_removed.connect(self._on_factor_removed)
         self.agent_page.strategy_removed.connect(self._on_strategy_removed)
+        # 回测结论同步到 Agent 页的输出框。这条链是单向的：研究页算完就往那儿推，
+        # 输出框不反过来驱动计算
+        self.backtest_done.connect(self.agent_page.push_output)
 
         self.trade_page.connect_requested.connect(self._on_trade_connect)
         self.trade_page.disconnect_requested.connect(self._on_live_stop)
@@ -900,26 +913,35 @@ class MainWindow(QMainWindow):
 
         内置模板没有品种（`cfg.symbol` 为空），这时候只换策略和参数，
         品种保持用户当前选的那个 —— 换个品种不该顺带把标的也换掉。
+
+        灌配置的过程里，切市场、换品种、换策略各会触发一次重算，那些都是**中间
+        态**（上一个品种、上一个策略算出来的）。这些输出先攒着，只把最后一次发
+        出去 —— 不然 Agent 会拿着 AAPL 的双均线数字，一本正经地讨论螺纹。
         """
         self._switch_page(0)
-        if cfg.symbol:
-            self.apply_config(cfg)
-            return
-        f = self.cb_family.findData("rule")
-        if f >= 0:
-            self.cb_family.setCurrentIndex(f)
-        r = self.cb_strategy.findData(cfg.rule_key)
-        if r >= 0:
-            self.cb_strategy.setCurrentIndex(r)
-        for name, val in (cfg.rule_params or {}).items():
-            w = self.param_widgets.get(name)
-            if w is None:
-                continue
-            try:
-                w.setValue(int(round(float(val) * self.param_scales.get(name, 1))))
-            except (TypeError, ValueError):
-                continue
-        self._schedule(immediate=True)
+        self._pub_guard += 1
+        try:
+            if cfg.symbol:
+                self.apply_config(cfg)
+            else:
+                f = self.cb_family.findData("rule")
+                if f >= 0:
+                    self.cb_family.setCurrentIndex(f)
+                r = self.cb_strategy.findData(cfg.rule_key)
+                if r >= 0:
+                    self.cb_strategy.setCurrentIndex(r)
+                for name, val in (cfg.rule_params or {}).items():
+                    w = self.param_widgets.get(name)
+                    if w is None:
+                        continue
+                    try:
+                        w.setValue(int(round(float(val) * self.param_scales.get(name, 1))))
+                    except (TypeError, ValueError):
+                        continue
+                self._schedule(immediate=True)
+        finally:
+            self._pub_guard -= 1
+        self._flush_publish()
 
     def _on_agent_portfolio(self, cfg) -> None:
         self._switch_page(2)
@@ -929,6 +951,9 @@ class MainWindow(QMainWindow):
         """Agent 给了交易动作。动作**已经在界面上确认过**才走到这里。"""
         p = action.payload
         if action.kind == "backtest":
+            # 先告诉 Agent 页「这次结果要喂回模型」。用户自己点回测不该触发一轮
+            # 对话，只有模型问出来的结果才值得它接着往下说
+            self.agent_page.begin_backtest_feedback()
             self._on_agent_study(SStore.StrategyConfig(
                 symbol=p.get("symbol", ""),
                 exchange=p.get("exchange", ""),
@@ -2326,6 +2351,7 @@ class MainWindow(QMainWindow):
                 base_df = run_strategy(df, rkey, self._current_params())
             except Exception as exc:  # noqa: BLE001
                 self.lbl_status.setText(f"策略计算失败：{exc}")
+                self._publish(f"策略计算失败：{exc}", True)
                 return
             rule_signal = base_df["signal"].to_numpy(int)
 
@@ -2357,6 +2383,7 @@ class MainWindow(QMainWindow):
                 )
         except Exception as exc:  # noqa: BLE001
             self.lbl_status.setText(f"因子计算失败：{exc}")
+            self._publish(f"因子计算失败：{exc}", True)
             return
         self._apply_outcome(out, rule_signal)
 
@@ -2424,6 +2451,7 @@ class MainWindow(QMainWindow):
         if self._closing or seq != self._f_seq:
             return
         self.lbl_status.setText(f"机器学习训练失败：{msg}")
+        self._publish(f"机器学习训练失败：{msg}", True)
 
     def _clear_chart(self, msg: str) -> None:
         """没有数据时把图清空并写一句话。
@@ -2443,6 +2471,9 @@ class MainWindow(QMainWindow):
                 w.set_value("—", C_MUTED)
         if hasattr(self, "tbl_factor"):
             self.tbl_factor.setRowCount(0)
+        # 算不出来也得让 Agent 那边看见原因。「没有结果」和「结果是 0」在界面上
+        # 长得一模一样，模型分不清就只能反过来问用户
+        self._publish(f"没有结果：{msg}", True)
         try:
             fig = self.canvas_k.fresh()
             ax = fig.add_subplot(111)
@@ -2465,6 +2496,7 @@ class MainWindow(QMainWindow):
         self._update_metrics()
         self._update_table()
         self._refresh_factor_tab()
+        self._publish_result()
 
     def _apply_outcome(self, out: fstrat.FactorOutcome, rule_signal) -> None:
         """因子计算完成后的统一收尾。"""
@@ -2495,6 +2527,7 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText(
                 f"所选因子在当前标的没有任何可用值（{why}），因此不会产生信号"
             )
+        self._publish_result()
 
     # ---------------------------------------------------------- 实时行情
     def _wire_live(self) -> None:
@@ -3238,6 +3271,63 @@ class MainWindow(QMainWindow):
             f"{m['n_trades']} 笔交易 · 胜率 {m['win_rate']*100:.0f}% · "
             f"仓位时间 {m['exposure']*100:.0f}% · 平均持仓 {self._hold_text(m['avg_bars'])}{dir_txt}"
         )
+
+    def _result_text(self) -> str:
+        """把这次回测的结论摊成一段纯文本。
+
+        两个用处：Agent 页右下角的「运行输出」，以及模型自己发起回测时喂回去的
+        那段结果。所以写的是**数字**，不是「回测完成」这种话 —— 模型要的就是数字，
+        少一行它就要反过来问用户，而用户手上只有这张图。
+        """
+        if self.res is None or self.bh is None or self.df_raw is None:
+            return ""
+        m, b = self.res.metrics, self.bh.metrics
+        item = self._current_item()
+        sym = item.get("symbol") or item.get("key") or ""
+        ex = item.get("exchange") or ""
+        head = f"{sym}_{ex}" if ex else sym
+        period = PERIOD_LABEL.get(self._period(), self._period())
+        label = self._strategy_label or "策略"
+        idx = self.df_raw.index
+        span = f"样本 {len(self.df_raw)} 根（{idx[0]:%Y-%m-%d} → {idx[-1]:%Y-%m-%d}）"
+
+        lines = [f"{head} · {period} · {label}", span]
+        lines += [
+            f"策略  总收益 {m['total_return'] * 100:+.1f}%｜年化 {m['cagr'] * 100:+.2f}%"
+            f"｜最大回撤 {m['max_dd'] * 100:.1f}%｜夏普 {m['sharpe']:.2f}"
+            f"｜卡玛 {m['calmar']:.2f}",
+            f"基准  总收益 {b['total_return'] * 100:+.1f}%｜年化 {b['cagr'] * 100:+.2f}%"
+            f"｜最大回撤 {b['max_dd'] * 100:.1f}%｜夏普 {b['sharpe']:.2f}",
+            f"超额  {(m['cagr'] - b['cagr']) * 100:+.2f}%/年",
+            f"交易  {m['n_trades']} 笔｜胜率 {m['win_rate'] * 100:.0f}%"
+            f"｜盈亏比 {m['profit_factor']:.2f}｜仓位时间 {m['exposure'] * 100:.0f}%"
+            f"｜平均持仓 {self._hold_text(m['avg_bars'])}",
+        ]
+        if not self.cfg.long_only and m.get("n_short"):
+            lines.append(
+                f"方向  多头 {m['long_exposure'] * 100:.0f}% / 空头 {m['short_exposure'] * 100:.0f}%"
+                f"｜空头 {m['n_short']} 笔" + (f"｜爆仓 {m['n_blowup']} 次"
+                                              if m.get("n_blowup") else "")
+            )
+        return "\n".join(lines)
+
+    def _publish_result(self) -> None:
+        """算完了就推一份到 Agent 页。算不出来时由 `_clear_chart` 推错误。"""
+        text = self._result_text()
+        if text:
+            self._publish(text, False)
+
+    def _publish(self, text: str, coalesce: bool) -> None:
+        """往 Agent 页推一条输出。`_pub_guard` 期间只留最后一条。"""
+        if self._pub_guard:
+            self._pub_queue = (text, coalesce)
+            return
+        self.backtest_done.emit(text, coalesce)
+
+    def _flush_publish(self) -> None:
+        item, self._pub_queue = self._pub_queue, None
+        if item is not None:
+            self.backtest_done.emit(*item)
 
     def _hold_text(self, bars: float) -> str:
         """平均持仓长度的可读写法。

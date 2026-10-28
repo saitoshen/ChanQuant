@@ -3,15 +3,28 @@
 和「策略研究」「账户透视和交易」「策略交易和组合」并列的第四个大页面。
 
     ┌─────────────┬──────────────────────────┬──────────────┐
-    │ 因子库       │                          │              │
-    │ 策略库       │      对话（大）           │  详情面板     │
-    │ 研报库       │                          │  公式 / 代码  │
-    ├─────────────┤  ──────────────────────  │  逻辑 / 图例  │
-    │ 模型状态     │  [输入框]  [发送] [停止]  │              │
+    │ 因子库       │                          │  详情面板     │
+    │ 策略库       │      对话（大）           │  公式 / 代码  │
+    │ 研报库       │                          │  逻辑 / 图例  │
+    ├─────────────┤  ──────────────────────  ├──────────────┤
+    │ 模型状态     │  [附件] [输入框]          │  运行输出     │
+    │             │  [发送] [停止]            │  回测数字     │
     └─────────────┴──────────────────────────┴──────────────┘
 
 四个库共用同一个详情面板：左边选中什么，右边就显示什么。对话是常驻的，切换库不会
 把聊天记录弄丢 —— 用户经常是「看到一半想问一句」。
+
+## 为什么右下角要有「运行输出」
+
+回测的数字原来只出现在「策略研究」页的绩效卡上。模型跑完回测后只能凭记忆问
+「结果是多少」，而用户手上根本没有一处可以复制粘贴的地方 —— 他得切到另一个
+页面、从四张卡片里逐个抄。现在研究页算完就把结论推到这里，模型自己发起的那次
+还会直接喂回给模型，它不用再问。
+
+## 为什么文档走文本、图片走多模态
+
+见 `ttrade.attachments`。一句话：图片没有文本等价物，只能让模型自己看；文档
+本来就是文字，拼进消息最省事也最兼容。
 
 ## 为什么模型调用要单开线程
 
@@ -58,6 +71,7 @@ from PySide6.QtWidgets import (
 
 from ttrade import agent as A
 from ttrade import agent_memory as Mem
+from ttrade import attachments as ATT
 from ttrade import factors as F
 from ttrade import library_docs as L
 from ttrade import strategy_store as SStore
@@ -605,6 +619,11 @@ class AgentPage(QWidget):
         self._memo_thread: QThread | None = None
         self._memo_warned = False     # 压缩失败只提示一次，别每轮都刷
         self._tool_turns = 0            # 本轮提问已经连续自动跑了几次工具动作（查手册 / 读写文件）
+        self._atts: list[ATT.Attachment] = []   # 待发送的附件
+        self._out: list[str] = []      # 运行输出（整段重绘，见 `push_output`）
+        self._out_merge = False        # 上一条输出是否允许被覆盖（拖滑杆时别刷屏）
+        self._last_output = ""         # 最近一次输出原文，给「发给 Agent」用
+        self._expect_bt = False        # 下一次回测结果要自动喂回模型
         self._build()
         self._refresh_status()
         self._fill_factors()
@@ -772,15 +791,31 @@ class AgentPage(QWidget):
         self.log.setOpenExternalLinks(True)
         lay.addWidget(self.log, 1)
 
+        # 附件条：只在有附件时出现，免得平时白占一行
+        self.att_box = QWidget()
+        self.att_lay = QHBoxLayout(self.att_box)
+        self.att_lay.setContentsMargins(0, 0, 0, 0)
+        self.att_lay.setSpacing(4)
+        self.att_box.setVisible(False)
+        lay.addWidget(self.att_box)
+
         self.ed_input = QPlainTextEdit()
         self.ed_input.setPlaceholderText(
             "比如：螺纹现在适合做多吗？用双均线帮我回测一下，1 手。"
-            "（Ctrl+Enter 发送）"
+            "（Ctrl+Enter 发送，可以带图片和文档）"
         )
         self.ed_input.setFixedHeight(84)
         lay.addWidget(self.ed_input)
 
         row = QHBoxLayout()
+        self.btn_attach = QPushButton("附件")
+        self.btn_attach.setObjectName("Ghost")
+        self.btn_attach.setToolTip(
+            "添加图片（截图、行情图）或文档（md/txt/csv/docx）。\n"
+            "图片需要模型支持视觉（GPT-4o、GLM-4V、Qwen-VL 等），纯文本模型会报错。"
+        )
+        self.btn_attach.clicked.connect(self._attach_files)
+        row.addWidget(self.btn_attach)
         self.lbl_state = QLabel("")
         self.lbl_state.setObjectName("Hint")
         row.addWidget(self.lbl_state, 1)
@@ -802,11 +837,67 @@ class AgentPage(QWidget):
         lay = QVBoxLayout(card)
         lay.setContentsMargins(12, 10, 12, 10)
         lay.setSpacing(6)
+
+        # 上下分：详情在上，运行输出在下。输出单独一块而不是塞进对话流 ——
+        # 回测结论是「看数字」的，混在聊天记录里翻起来太费劲，而且模型每轮
+        # 都要重新问一遍「结果是多少」。
+        split = QSplitter(Qt.Vertical)
+        split.setChildrenCollapsible(False)
+
+        top = QWidget()
+        tl = QVBoxLayout(top)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(6)
         t = QLabel("详情")
         t.setObjectName("SectionTitle")
-        lay.addWidget(t)
+        tl.addWidget(t)
         self.detail = QTextBrowser()
-        lay.addWidget(self.detail, 1)
+        tl.addWidget(self.detail, 1)
+        split.addWidget(top)
+        split.addWidget(self._build_output())
+        split.setSizes([420, 240])
+        lay.addWidget(split, 1)
+        return card
+
+    def _build_output(self) -> QWidget:
+        """回测 / 计算结果的输出框。
+
+        以前这些数字只出现在「策略研究」页的绩效卡上，Agent 说「把结果贴给我」
+        时用户根本没地方找。这里既给人看，也能一键发回给模型。
+        """
+        card = QWidget()
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        head = QHBoxLayout()
+        t = QLabel("运行输出")
+        t.setObjectName("SectionTitle")
+        head.addWidget(t)
+        self.lbl_out = QLabel("")
+        self.lbl_out.setObjectName("Hint")
+        head.addWidget(self.lbl_out, 1)
+        self.btn_out_feed = QPushButton("发给 Agent")
+        self.btn_out_feed.setObjectName("Ghost")
+        self.btn_out_feed.setToolTip("把最近一次输出作为消息发给模型，它就不用再问你结果是什么了")
+        self.btn_out_feed.setEnabled(False)
+        self.btn_out_feed.clicked.connect(self._feed_last_output)
+        head.addWidget(self.btn_out_feed)
+        btn_clear = QPushButton("清空")
+        btn_clear.setObjectName("Ghost")
+        btn_clear.clicked.connect(self._clear_output)
+        head.addWidget(btn_clear)
+        lay.addLayout(head)
+
+        self.out = QPlainTextEdit()
+        self.out.setReadOnly(True)
+        self.out.setPlaceholderText(
+            "回测跑完，这里会出现收益、回撤、夏普、交易笔数。\n"
+            "Agent 让你回测时，结果会自动发回给它。"
+        )
+        self.out.setStyleSheet("font-family: Consolas, 'Microsoft YaHei', monospace;"
+                               "font-size: 11px;")
+        lay.addWidget(self.out, 1)
         return card
 
     # ---------------------------------------------------------- 列表填充
@@ -999,29 +1090,160 @@ class AgentPage(QWidget):
         if self._busy:
             return
         text = self.ed_input.toPlainText().strip()
-        if not text:
+        if not text and not self._atts:
             return
         ok, why = self.cfg.ready()
         if not ok:
+            # 配置没就绪时**不能**清空输入框和附件 —— 弹完设置回来还得重打一遍
             self._set_state(why, C_BAD)
             self._open_settings()
             return
 
+        atts, self._atts = self._atts, []
+        self._refresh_atts()
         self.ed_input.clear()
+        if not text:
+            # 只丢了个附件、一句话没说。给一句占位，别让模型收到一条空消息
+            text = "看一下这个附件。"
         self._append(
             f"<p style='margin:12px 0 2px 0'><b style='color:{C_USER}'>你</b></p>"
             f"<p style='margin:0 0 8px 0;line-height:160%'>{_esc(text)}</p>"
         )
+        if atts:
+            self._append(
+                f"<p style='color:{C_MUTED};font-size:11px;margin:0 0 8px 0'>"
+                f"{_esc(ATT.describe(atts))}</p>"
+            )
         self._append(f"<p style='margin:12px 0 2px 0'><b>助手</b></p>")
 
-        self._history.append({"role": "user", "content": text})
+        # 有图就是多模态 parts，没图就是纯字符串 —— 老网关只吃字符串
+        body = ATT.content(text, atts)
+        self._history.append({"role": "user", "content": body})
         self._tool_turns = 0
+        # 新问题把上一轮的「等回测结果」作废：上一轮的回测要是没跑起来（异常提前
+        # 返回），标记会一直挂着，下一次用户自己拖参数就会莫名其妙触发一轮对话
+        self._expect_bt = False
         msgs = A.build_messages(
-            A.trim_history(self._history[:-1]), text, memory=Mem.brief(),
+            A.trim_history(self._history[:-1]), body, memory=Mem.brief(),
             allow_fs=self.cfg.allow_fs,
         )
         self._stream_buf = ""
         self._start_worker(msgs)
+
+    # ---------------------------------------------------------- 附件
+
+    def _attach_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "添加附件", "", ATT.file_filter()
+        )
+        if not paths:
+            return
+        bad = []
+        for p in paths:
+            if any(a.path == p for a in self._atts):
+                continue            # 同一个文件加两次没意义，还白占体积
+            a = ATT.load(p)
+            if a.ok:
+                self._atts.append(a)
+            else:
+                bad.append(f"{a.name}：{a.note}")
+        self._refresh_atts()
+        if bad:
+            # 读不了的文件不进附件条，否则发出去模型也只看到一行「打不开」
+            QMessageBox.warning(self, "这些文件加不上", "\n".join(bad))
+        if self._atts:
+            self._set_state(f"已添加 {len(self._atts)} 个附件", C_MUTED)
+
+    def _refresh_atts(self) -> None:
+        while self.att_lay.count():
+            it = self.att_lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+        for i, a in enumerate(self._atts):
+            tip = a.note or ("图片会缩到 1600px 以内" if a.kind == "image" else "文字会整段发给模型")
+            btn = QPushButton(f"{a.name}　✕")
+            btn.setObjectName("Ghost")
+            btn.setToolTip(f"{a.size_text()}｜{tip}")
+            btn.clicked.connect(lambda _=False, k=i: self._drop_att(k))
+            self.att_lay.addWidget(btn)
+        self.att_lay.addStretch(1)
+        self.att_box.setVisible(bool(self._atts))
+
+    def _drop_att(self, idx: int) -> None:
+        if 0 <= idx < len(self._atts):
+            self._atts.pop(idx)
+        self._refresh_atts()
+
+    # ---------------------------------------------------------- 运行输出
+
+    def push_output(self, text: str, coalesce: bool = False) -> None:
+        """往「运行输出」里写一段。`coalesce=True` 表示这次可能连着来一串
+        （拖滑杆每 220ms 重算一次），用新的覆盖上一条，别刷屏。
+
+        整段重绘而不是增量插入：输出最多六十条，重绘比维护「删最后一段」的
+        游标逻辑简单得多，也不会因为换行把块数算错。
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        entry = f"[{time.strftime('%H:%M:%S')}] {text}"
+        if self._out and text == self._last_output:
+            # 同一份结果算了两遍（灌配置时的中间态 + 收尾那一次），别记两条
+            self._out[-1] = entry
+        elif coalesce and self._out and self._out_merge:
+            self._out[-1] = entry
+        else:
+            self._out.append(entry)
+        self._out_merge = coalesce
+        del self._out[:-60]
+
+        self.out.setPlainText("\n\n".join(self._out))
+        sb = self.out.verticalScrollBar()
+        sb.setValue(sb.maximum())
+        self._last_output = text
+        self.btn_out_feed.setEnabled(not self._busy)
+        self.lbl_out.setText(f"{len(self._out)} 条")
+
+        # 模型自己发起的回测：结果直接喂回去，它就不用再问「输出是什么」
+        if self._expect_bt:
+            self._expect_bt = False
+            if self.cfg.ready():
+                self._after_tool(
+                    "回测跑完了，下面是平台算出来的完整结果：\n\n" + text +
+                    "\n\n直接基于这些数字回答，不要让用户再贴一遍。"
+                )
+
+    def begin_backtest_feedback(self) -> None:
+        """标记「下一次回测结果要喂回模型」。
+
+        只有模型自己发起的回测才这样。用户手动点「回测」、拖参数时也走同一条
+        计算链路，那些结果不该自动触发一轮对话 —— 白烧 token，还打断人。
+        """
+        self._expect_bt = True
+
+    def _feed_last_output(self) -> None:
+        if not self._last_output or self._busy:
+            return
+        if not self.cfg.ready():
+            self._set_state("先配置模型", C_BAD)
+            return
+        self._append(
+            f"<p style='margin:12px 0 2px 0'><b style='color:{C_USER}'>你</b></p>"
+            f"<p style='color:{C_MUTED};font-size:11px;margin:0 0 8px 0'>"
+            "（把运行输出发给 Agent）</p>"
+        )
+        self._after_tool(
+            "用户把「运行输出」面板里最近一次的结果发给你了：\n\n" + self._last_output
+        )
+
+    def _clear_output(self) -> None:
+        self._out.clear()
+        self._out_merge = False
+        self._last_output = ""
+        self.out.clear()
+        self.btn_out_feed.setEnabled(False)
+        self.lbl_out.setText("")
 
     def _start_worker(self, msgs: list) -> None:
         self._set_busy(True)
@@ -1120,7 +1342,8 @@ class AgentPage(QWidget):
         if n < self.MEMO_AT - self.MEMO_KEEP:
             return
         chunk = self._history[:n]
-        chars = sum(len(m.get("content") or "") for m in chunk)
+        # 带图消息的 content 是 parts 列表，`len()` 数出来是部件数不是字数
+        chars = sum(len(A.text_of(m.get("content"))) for m in chunk)
         # 全是「嗯」「好」就再攒攒；但历史快到硬上限时必须压，否则 `trim_history`
         # 会直接把这截丢掉，什么也留不下
         if chars < 400 and len(self._history) < A.MAX_HISTORY - 2:
@@ -1181,6 +1404,9 @@ class AgentPage(QWidget):
         self._busy = on
         self.btn_send.setEnabled(not on)
         self.btn_stop.setEnabled(on)
+        # 正在生成时不能把输出塞回去：`_after_tool` 会另起一个线程，两个 worker
+        # 抢同一个 `self._worker`，先结束的那个会把新的状态抹掉
+        self.btn_out_feed.setEnabled(not on and bool(self._last_output))
         if on:
             self._set_state("正在生成…", C_MUTED)
 
@@ -1353,6 +1579,21 @@ class AgentPage(QWidget):
         if not ok:
             self._append(f"<p style='color:{C_BAD}'>注册失败：{_esc(msg)}</p>")
             self._set_state("因子注册失败", C_BAD)
+            # 报错必须回到模型手里。以前只写在界面上，模型以为自己成功了，
+            # 下一轮接着按错的假设聊 —— 用户看到的就是「它一直问我结果」。
+            #
+            # 契约那一节（705 字符）直接随报错贴上去，不指望它自己想起来查：
+            # 一次失败只值一轮重试，让它多发一次 doc 请求去换同样的文字不划算。
+            # 原语源码五千多字，那个按需查。
+            from ttrade import factor_manual as M
+
+            self._after_tool(
+                f"因子「{f.key}」注册失败，平台的原始报错是：\n{msg}\n\n"
+                f"{M.CONTRACT}\n\n"
+                "改好之后重新给一个 factor 动作块。要是怀疑原语用法不对，先查：\n"
+                '{"action": "doc", "topic": "primitives"}  原语的真实源码\n'
+                '{"action": "doc", "topic": "factor:mom_20"}  照抄一个能跑的写法'
+            )
             return
 
         self._append(
@@ -1381,6 +1622,12 @@ class AgentPage(QWidget):
         if not ok:
             self._append(f"<p style='color:{C_BAD}'>注册失败：{_esc(msg)}</p>")
             self._set_state("策略注册失败", C_BAD)
+            self._after_tool(
+                f"策略「{s.key}」注册失败，平台的原始报错是：\n{msg}\n\n"
+                "改之前先查手册：策略能用的原语在\n"
+                '{"action": "doc", "topic": "primitives"}  的「策略里额外能用的」一节，'
+                "返回值约定见 \"contract\"。改好后重新给一个 strategy 动作块。"
+            )
             return
 
         self._append(

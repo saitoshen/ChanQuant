@@ -507,16 +507,31 @@ def _run() -> tuple[bool, list[str]]:
             manual_info = f"{len(M.manual())} 字符 / {len(FACTORS)} 个因子"
         except Exception as exc:  # noqa: BLE001
             manual_ok, manual_info = False, f"{type(exc).__name__}: {exc}"
+        # 回测结论要推到 Agent 页右下角的输出框。以前这些数字只活在绩效卡上，
+        # 模型问「结果是多少」时用户根本没有一处能复制 —— 这条链断了就是老毛病复发
+        out_ok = False
+        out_info = ""
+        try:
+            text = win._result_text()
+            out_ok = bool(text) and bool(getattr(ap, "_last_output", ""))
+            out_info = f"{len(text)} 字符"
+        except Exception as exc:  # noqa: BLE001
+            out_info = f"{type(exc).__name__}: {exc}"
         agent_ok = (
             ap is not None
             and hasattr(ap, "btn_del_factor")
             and hasattr(ap, "btn_del_strat")
             and hasattr(ap, "btn_manual")
+            # 附件与运行输出也是函数里 import / 新建的控件，缺一个功能就没了
+            and hasattr(ap, "btn_attach")
+            and hasattr(ap, "out")
+            and hasattr(ap, "btn_out_feed")
             and not ap.btn_del_factor.isEnabled()
             and not ap.btn_del_strat.isEnabled()
             and ap.cfg.allow_fs is False
             and fs_ok
             and manual_ok
+            and out_ok
         )
         # K 线可视窗口：初始应停在最新一段，且滚动条范围与窗口自洽
         k_ok = (
@@ -594,9 +609,10 @@ def _run() -> tuple[bool, list[str]]:
         if not agent_ok:
             raise RuntimeError(
                 "交易Agent 页异常：删除按钮初始状态不对，或升级权限的文件模块 / "
-                "平台手册取不到"
+                "平台手册取不到 / 回测结果没推到输出框"
                 + (f"（{fs_err}）" if fs_err else "")
                 + (f"（手册：{manual_info}）" if not manual_ok else "")
+                + (f"（输出：{out_info}）" if not out_ok else "")
             )
         if not wheel_ok:
             raise RuntimeError(
@@ -617,7 +633,7 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"因子分析页图轴数为 {n_axes}，应为 4")
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
                 f"{factor_info}，滚轮缩放 {wheel_info}，数据管理页就绪，"
-                f"手册 {manual_info}")
+                f"手册 {manual_info}，输出 {out_info}")
 
     check("构建主窗口（端到端）", _window)
 

@@ -98,6 +98,8 @@ HIDDEN = [
     "ttrade.agent_fs",
     # 平台手册同理：只有 Agent 查手册时才 import，漏了就是「点了手册没反应」
     "ttrade.factor_manual",
+    # 附件：也是点「附件」按钮时才 import，漏了就是「加图片没反应」
+    "ttrade.attachments",
     "gui.data_page",
 ]
 
