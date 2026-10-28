@@ -78,7 +78,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ttrade import factor_metrics, factors, mlmodels, tqdata, tqlive, updater
+from ttrade import factor_metrics, factors, mlmodels, tqdata, tqlive
 from ttrade import factor_strategy as fstrat
 from ttrade import strategy_store as SStore
 from gui.agent_page import AgentPage
