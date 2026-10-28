@@ -60,6 +60,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLayout,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -79,7 +80,10 @@ from PySide6.QtWidgets import (
 
 from ttrade import factor_metrics, factors, mlmodels, tqdata, tqlive, updater
 from ttrade import factor_strategy as fstrat
+from ttrade import strategy_store as SStore
+from gui.agent_page import AgentPage
 from gui.live import LiveController
+from gui.portfolio_page import PortfolioPage
 from gui.trade_page import TradePage
 from ttrade.backtest import (
     BacktestConfig,
@@ -847,6 +851,9 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._populate_symbols()
+        # 延后一拍：等界面完全建好、第一次分析排上队之后再灌配置，
+        # 否则 apply_config 里的 _schedule(immediate=True) 会和首帧抢数据加载。
+        QTimer.singleShot(0, self._restore_last_config)
 
     # ---------------------------------------------------------- UI 构建
     def _build_ui(self) -> None:
@@ -858,7 +865,7 @@ class MainWindow(QMainWindow):
 
         outer.addWidget(self._build_page_bar())
 
-        # 两个平行的大页面：策略研究 / 账户透视和交易。
+        # 四个平行的大页面：策略研究 / 账户透视和交易 / 策略交易和组合 / 交易Agent。
         # 用 QStackedWidget 而不是外层 QTabWidget：页签放在顶部一条自绘的按钮条上，
         # 视觉上和侧边栏的卡片、内层的三个页签区分得开，不会变成「两层页签」。
         self.pages = QStackedWidget()
@@ -866,7 +873,15 @@ class MainWindow(QMainWindow):
         self.live = LiveController(self)
         self.trade_page = TradePage(self.live)
         self.pages.addWidget(self.trade_page)
+        self.portfolio_page = PortfolioPage()
+        self.pages.addWidget(self.portfolio_page)
+        self.agent_page = AgentPage()
+        self.pages.addWidget(self.agent_page)
         outer.addWidget(self.pages, 1)
+
+        self.agent_page.study_requested.connect(self._on_agent_study)
+        self.agent_page.trade_requested.connect(self._on_agent_trade)
+        self.agent_page.portfolio_requested.connect(self._on_agent_portfolio)
 
         self.trade_page.connect_requested.connect(self._on_trade_connect)
         self.trade_page.disconnect_requested.connect(self._on_live_stop)
@@ -881,7 +896,13 @@ class MainWindow(QMainWindow):
 
         self.btn_page_study = QPushButton("策略研究")
         self.btn_page_trade = QPushButton("账户透视和交易")
-        for i, b in enumerate((self.btn_page_study, self.btn_page_trade)):
+        self.btn_page_port = QPushButton("策略交易和组合")
+        self.btn_page_agent = QPushButton("交易Agent")
+        self._page_btns = (
+            self.btn_page_study, self.btn_page_trade,
+            self.btn_page_port, self.btn_page_agent,
+        )
+        for i, b in enumerate(self._page_btns):
             b.setObjectName("PageTab")
             b.setCheckable(True)
             b.setMinimumWidth(132)
@@ -896,9 +917,110 @@ class MainWindow(QMainWindow):
         return bar
 
     def _switch_page(self, idx: int) -> None:
-        self.btn_page_study.setChecked(idx == 0)
-        self.btn_page_trade.setChecked(idx == 1)
+        for i, b in enumerate(self._page_btns):
+            b.setChecked(i == idx)
         self.pages.setCurrentIndex(idx)
+        # 切到组合页时重读磁盘：「策略研究」里刚存的配置要立刻能看到
+        if idx == 2:
+            self.portfolio_page.reload()
+        elif idx == 3:
+            self.agent_page.reload()
+
+    # ---------------------------------------------------------- 交易Agent
+
+    def _on_agent_study(self, cfg) -> None:
+        """Agent 要「用某策略回测某品种」：切到研究页并套上配置。
+
+        内置模板没有品种（`cfg.symbol` 为空），这时候只换策略和参数，
+        品种保持用户当前选的那个 —— 换个品种不该顺带把标的也换掉。
+        """
+        self._switch_page(0)
+        if cfg.symbol:
+            self.apply_config(cfg)
+            return
+        f = self.cb_family.findData("rule")
+        if f >= 0:
+            self.cb_family.setCurrentIndex(f)
+        r = self.cb_strategy.findData(cfg.rule_key)
+        if r >= 0:
+            self.cb_strategy.setCurrentIndex(r)
+        for name, val in (cfg.rule_params or {}).items():
+            w = self.param_widgets.get(name)
+            if w is None:
+                continue
+            try:
+                w.setValue(int(round(float(val) * self.param_scales.get(name, 1))))
+            except (TypeError, ValueError):
+                continue
+        self._schedule(immediate=True)
+
+    def _on_agent_portfolio(self, cfg) -> None:
+        self._switch_page(2)
+        self.portfolio_page.accept(cfg)
+
+    def _on_agent_trade(self, action) -> None:
+        """Agent 给了交易动作。动作**已经在界面上确认过**才走到这里。"""
+        p = action.payload
+        if action.kind == "backtest":
+            self._on_agent_study(SStore.StrategyConfig(
+                symbol=p.get("symbol", ""),
+                exchange=p.get("exchange", ""),
+                period=p.get("period", "1d"),
+                rule_key=p.get("strategy", ""),
+                rule_params=dict(p.get("params") or {}),
+                volume=int(p.get("volume", 1)),
+            ))
+            return
+
+        if action.kind != "trade":
+            return
+
+        if p.get("mode") == "manual":
+            self._agent_manual(p)
+            return
+
+        key = p.get("strategy", "")
+        if key not in STRATEGIES:
+            self.agent_page.notify(f"平台没有这个策略：{key}", bad=True)
+            return
+        cfg = SStore.StrategyConfig(
+            symbol=p.get("symbol", ""),
+            exchange=p.get("exchange", ""),
+            period=p.get("period", "1d"),
+            rule_key=key,
+            rule_params=dict(p.get("params") or {}),
+            volume=int(p.get("volume", 1)),
+            note="short",
+        )
+        self._switch_page(2)
+        self.portfolio_page.accept(cfg)
+
+    def _agent_manual(self, p: dict) -> None:
+        """主观买卖：只对**当前实时会话**的品种生效。
+
+        合约代码必须取实时会话的 `underlying`（真实主力），不能拿品种名拼 ——
+        主连 `KQ.m@` 只能看行情、不能下单。
+        """
+        sym = p.get("symbol", "")
+        ex = p.get("exchange", "")
+        want = f"{sym}_{ex}" if ex else sym
+        if not self.live.running or self._live_state is None:
+            self.agent_page.notify("还没连上天勤，先到「账户透视和交易」连上账户", bad=True)
+            return
+        if self._live_key != want:
+            self.agent_page.notify(
+                f"当前实时会话是 {self._live_key or '空'}，和 {want} 不一致。"
+                "先在「账户透视和交易」页把实时切到这个品种", bad=True)
+            return
+        und = getattr(self._live_state, "underlying", "") or ""
+        if not und:
+            self.agent_page.notify("还没拿到真实主力合约，等行情推一帧再试", bad=True)
+            return
+        ok = self.live.place(und, p["side"], p["offset"], int(p.get("volume", 1)), None)
+        if ok:
+            side = "买入" if p["side"] == "BUY" else "卖出"
+            self.agent_page.notify(
+                f"已提交：{side} {p['offset']} {und} {p.get('volume', 1)} 手（市价）")
 
     def _build_study_page(self) -> QWidget:
         page = QWidget()
@@ -1220,6 +1342,41 @@ class MainWindow(QMainWindow):
             "不勾选则把空头信号裁掉，只做多。期货默认勾选。"
         )
         cl.addWidget(self.chk_short)
+
+        # ---------------------------------------------- 策略配置（保存 / 入库）
+        cl.addWidget(self._section("策略配置"))
+        self.ed_cfg_name = QLineEdit()
+        self.ed_cfg_name.setPlaceholderText("给这套配置起个名字（可留空）")
+        self.ed_cfg_name.setToolTip(
+            "留空时用「品种 · 策略」自动命名，列表里也能改。"
+        )
+        cl.addWidget(self.ed_cfg_name)
+
+        cfg_row = QWidget()
+        crl = QHBoxLayout(cfg_row)
+        crl.setContentsMargins(0, 0, 0, 0)
+        crl.setSpacing(6)
+        self.btn_save_cfg = QPushButton("保存配置")
+        self.btn_save_cfg.setObjectName("Ghost")
+        self.btn_save_cfg.setToolTip(
+            "保存当前这套配置：下次打开程序自动恢复。\n"
+            "勾了下面那一项时，同时作为一项加进「策略交易和组合」。"
+        )
+        self.btn_save_lib = QPushButton("存入策略库")
+        self.btn_save_lib.setObjectName("Ghost")
+        self.btn_save_lib.setToolTip(
+            "作为模板存进策略库，之后在「策略交易和组合」里可以反复取用。"
+        )
+        crl.addWidget(self.btn_save_cfg)
+        crl.addWidget(self.btn_save_lib)
+        cl.addWidget(cfg_row)
+
+        self.chk_to_portfolio = QCheckBox("同时加入策略交易列表")
+        self.chk_to_portfolio.setToolTip(
+            "勾上后，保存配置 / 存入策略库时会同时把这份配置加进\n"
+            "「策略交易和组合」的策略列表，可以直接启动自动交易。"
+        )
+        cl.addWidget(self.chk_to_portfolio)
 
         lay.addWidget(card)
 
@@ -1546,6 +1703,8 @@ class MainWindow(QMainWindow):
             self.cb_fmodel.currentIndexChanged.connect(self._on_model_changed)
             self.btn_fall.clicked.connect(lambda: self._check_all_factors(True))
             self.btn_fnone.clicked.connect(lambda: self._check_all_factors(False))
+            self.btn_save_cfg.clicked.connect(self._on_save_config)
+            self.btn_save_lib.clicked.connect(self._on_save_library)
             self._wired = True
 
         self._fill_symbols()
@@ -2052,6 +2211,173 @@ class MainWindow(QMainWindow):
             v = wdg.value() / scale
             out[name] = int(round(v)) if scale == 1 else v
         return out
+
+    # ---------------------------------------------------------- 策略配置存取
+    def _current_config(self) -> SStore.StrategyConfig:
+        """把界面上这一套选择收成一份可保存的配置。
+
+        非当前策略族的那一组字段也照收（规则参数在因子模式下照样保留）——
+        用户在两边切来切去不该丢参数。
+        """
+        skey = self.cb_symbol.currentData() or ""
+        if self.market == "cn":
+            sym, _, ex = skey.rpartition("_")
+        else:
+            # 美股的 key 就是代码本身（AAPL），没有「交易所」这一维。
+            # 不能一律 rpartition("_")：AAPL 会被拆成 ("", "", "AAPL")。
+            sym, ex = skey, ""
+        is_factor = self.family == FAMILY_FACTOR
+        fc = self._factor_cfg() if is_factor else None
+        return SStore.StrategyConfig(
+            name=self.ed_cfg_name.text().strip(),
+            symbol=sym,
+            exchange=ex,
+            period=self._period(),
+            family=self.family,
+            rule_key=self.cb_strategy.currentData() or "",
+            rule_params=self._current_params(),
+            factor_mode=self.factor_mode if is_factor else "",
+            factor_keys=self._selected_factor_keys() if is_factor else [],
+            factor_reverse={k: True for k in self._reversed_factor_keys()},
+            factor_cfg=dict(vars(fc)) if fc is not None else {},
+            volume=1,
+            note="short" if self.chk_short.isChecked() else "",
+        )
+
+    def apply_config(self, cfg: SStore.StrategyConfig) -> None:
+        """把一份配置灌回界面。组合页双击一行、启动时恢复上次配置都走这里。
+
+        顺序不能乱：切市场会重建品种列表，所以必须先把市场切过去，再找品种。
+        """
+        mk = "cn" if cfg.exchange else "us"
+        i = self.cb_market.findData(mk)
+        if i >= 0 and i != self.cb_market.currentIndex():
+            self.cb_market.setCurrentIndex(i)      # 同步触发 _on_market_changed
+
+        skey = f"{cfg.symbol}_{cfg.exchange}" if cfg.exchange else cfg.symbol
+        j = self.cb_symbol.findData(skey)
+        if j >= 0:
+            self.cb_symbol.setCurrentIndex(j)
+        k = self.cb_period.findData(cfg.period)
+        if k >= 0:
+            self.cb_period.setCurrentIndex(k)
+
+        f = self.cb_family.findData(cfg.family)
+        if f >= 0:
+            self.cb_family.setCurrentIndex(f)
+        r = self.cb_strategy.findData(cfg.rule_key)
+        if r >= 0:
+            self.cb_strategy.setCurrentIndex(r)     # 重建参数控件
+        for name, val in (cfg.rule_params or {}).items():
+            w = self.param_widgets.get(name)
+            if w is not None:
+                try:
+                    w.setValue(int(round(float(val) * self.param_scales.get(name, 1))))
+                except (TypeError, ValueError):
+                    continue
+
+        if cfg.family == FAMILY_FACTOR:
+            m = self.cb_fmode.findData(cfg.factor_mode)
+            if m >= 0:
+                self.cb_fmode.setCurrentIndex(m)
+            self._apply_factor_keys(cfg.factor_keys, cfg.factor_reverse)
+            self._apply_factor_cfg(cfg.factor_cfg)
+
+        self.chk_short.setChecked(cfg.note == "short")
+        self.ed_cfg_name.setText(cfg.name)
+        self._schedule(immediate=True)
+
+    def _apply_factor_keys(self, keys, reverse) -> None:
+        """恢复因子选择：单因子设下拉，多因子勾表格，反向勾「反」列。"""
+        picked = set(keys or [])
+        if picked:
+            i = self.cb_fsingle.findData(sorted(picked)[0])
+            if i < 0:  # 保持配置里的顺序，优先第一项
+                i = self.cb_fsingle.findData(list(keys)[0])
+            if i >= 0:
+                self.cb_fsingle.setCurrentIndex(i)
+        # 逐行 setCheckState 会逐行触发 itemChanged，每行都排一次重算 ——
+        # 47 行就是 47 次。整段屏蔽信号，最后一次统一刷。
+        self.tbl_fmulti.blockSignals(True)
+        try:
+            for r in range(self.tbl_fmulti.rowCount()):
+                name = self.tbl_fmulti.item(r, 0)
+                if name is None:
+                    continue
+                k = name.data(Qt.UserRole)
+                use = self.tbl_fmulti.item(r, 1)
+                rev = self.tbl_fmulti.item(r, 2)
+                if use is not None:
+                    use.setCheckState(Qt.Checked if k in picked else Qt.Unchecked)
+                if rev is not None:
+                    on = bool((reverse or {}).get(k))
+                    rev.setCheckState(Qt.Checked if on else Qt.Unchecked)
+        finally:
+            self.tbl_fmulti.blockSignals(False)
+
+    def _apply_factor_cfg(self, cfg: dict) -> None:
+        if not cfg:
+            return
+        for name, wdg in self.fparam_widgets.items():
+            if name not in cfg:
+                continue
+            try:
+                wdg.setValue(int(round(float(cfg[name]) * self.fparam_scales.get(name, 1))))
+            except (TypeError, ValueError):
+                continue
+        for key, cb in (("model", self.cb_fmodel), ("orient", self.cb_forient)):
+            v = cfg.get(key)
+            if v:
+                i = cb.findData(v)
+                if i >= 0:
+                    cb.setCurrentIndex(i)
+
+    def _on_save_config(self) -> None:
+        cfg = self._current_config()
+        if not cfg.symbol:
+            self.lbl_status.setText("还没选标的，无法保存配置")
+            return
+        SStore.save_last(cfg)
+        msg = "已保存配置，下次打开自动恢复"
+        if self.chk_to_portfolio.isChecked():
+            # 连点两下会加两条一模一样的策略，跑起来就是双倍仓位。同一个策略
+            # 的同一套参数已经在组合里就不再追加。
+            same = [c for c in SStore.load_portfolio() if c.same_shape(cfg)]
+            if same:
+                msg += "；组合里已有相同配置，没有重复添加"
+            else:
+                item = SStore.add_to_portfolio(cfg)
+                msg += f"；已加入策略交易列表：{item.title()}"
+        self.lbl_status.setText(msg)
+
+    def _on_save_library(self) -> None:
+        cfg = self._current_config()
+        if not cfg.symbol:
+            self.lbl_status.setText("还没选标的，无法存入策略库")
+            return
+        saved = SStore.add_to_library(cfg)
+        msg = f"已存入策略库：{saved.title()}"
+        if self.chk_to_portfolio.isChecked():
+            item = SStore.add_to_portfolio(cfg)
+            msg += f"；已加入策略交易列表：{item.title()}"
+        self.lbl_status.setText(msg)
+
+    def _restore_last_config(self) -> None:
+        """启动时恢复上次保存的配置。
+
+        失败就静默留在默认状态 —— 一份配置读不出来不该挡住程序启动。
+        """
+        try:
+            cfg = SStore.load_last()
+        except Exception:  # noqa: BLE001
+            return
+        if cfg is None or not cfg.symbol:
+            return
+        try:
+            self.apply_config(cfg)
+            self.lbl_status.setText(f"已恢复上次配置：{cfg.title()}")
+        except Exception as exc:  # noqa: BLE001
+            self.lbl_status.setText(f"恢复上次配置失败：{exc}")
 
     # ---------------------------------------------------------- 调度
     def _schedule(self, *_, immediate: bool = False) -> None:
@@ -3339,6 +3665,11 @@ class MainWindow(QMainWindow):
             self._upd_thread.quit()
             self._upd_thread.wait(3000)
         self._cancel_factor_worker()
+        # 组合页每条账户连接一个 QThread，窗口关掉时线程还在跑 wait_update
+        # 会让解释器退出时崩在 TqApi 上。这里等它们真的停下来再放行。
+        self.portfolio_page.shutdown()
+        self.agent_page.shutdown()
+        self.live.stop(wait=True)
         super().closeEvent(event)
 
 

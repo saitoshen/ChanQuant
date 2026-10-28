@@ -684,6 +684,433 @@ def check_main_backfill() -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def check_strategy_store() -> None:
+    """策略配置 / 策略库 / 组合 / 追单设置。
+
+    重点盯两件容易出人命的事：**sid 在存盘时就定下来**（不然每次重启换身份，
+    按 sid 改、按 sid 删全部落空），以及**库和组合互不影响**（模板改了不能
+    悄悄改变正在跑的策略）。
+    """
+    import shutil
+
+    from ttrade import strategy_store as St
+
+    tmpdir = tempfile.mkdtemp(prefix="td_store_")
+    old_dir = St.user_dir
+    St.user_dir = lambda: tmpdir
+    try:
+        a = St.StrategyConfig(
+            symbol="RB", exchange="SHFE", period="1d",
+            rule_key="ma_cross", rule_params={"fast": 5}, volume=2,
+        )
+        check("策略配置：构造时 sid 为空", a.sid == "", a.sid)
+        St.save_portfolio([a])
+        check("策略配置：存盘时补上 sid", bool(a.sid), a.sid)
+        got = St.load_portfolio()
+        check("策略配置：读回的 sid 与存盘一致",
+              bool(got) and got[0].sid == a.sid,
+              f"{got[0].sid if got else '-'} vs {a.sid}")
+
+        b = got[0].clone(volume=7)
+        b.sid = got[0].sid
+        St.update_portfolio(b)
+        check("组合：按 sid 改手数生效", St.load_portfolio()[0].volume == 7,
+              str(St.load_portfolio()[0].volume))
+
+        # 手改 JSON 复制粘贴会造出两条同 sid 的记录，删一条会把另一条也删掉
+        St.save_portfolio([a, a])
+        two = St.load_portfolio()
+        check("组合：重复 sid 自动去重", len({c.sid for c in two}) == 2,
+              str([c.sid for c in two]))
+
+        St.save_library([])
+        St.save_portfolio([])
+        lib = St.add_to_library(a)
+        item = St.add_to_portfolio(lib)
+        item.volume = 9
+        St.update_portfolio(item)
+        check("组合与库解耦：改组合不影响库",
+              St.load_library()[0].volume == a.volume,
+              f"{St.load_library()[0].volume} vs {a.volume}")
+        check("组合与库解耦：sid 不同", item.sid != lib.sid, f"{item.sid} / {lib.sid}")
+
+        # 「保存配置 + 加入组合」连点两下不能变成两条，否则跑起来是双倍仓位
+        check("重复入库：同一套参数认得出", lib.same_shape(lib.clone()), "未认出")
+        check("重复入库：手数不同不算重复",
+              not lib.same_shape(lib.clone(volume=lib.volume + 1)), "误判为重复")
+        check("重复入库：账户不同不算重复",
+              not lib.same_shape(lib.clone(account="另一个")), "误判为重复")
+
+        St.save_chase(St.ChaseConfig(enabled=True, wait_sec=3, retries=2, ticks=5))
+        c = St.load_chase()
+        check("追单设置：往返一致", (c.wait_sec, c.retries, c.ticks) == (3, 2, 5),
+              str(c.to_dict()))
+        St._save(St.CHASE_FILE, {"wait_sec": 0, "retries": -3, "ticks": -1})
+        c = St.load_chase()
+        check("追单设置：非法值收敛",
+              c.wait_sec >= 1 and c.retries >= 0 and c.ticks >= 0, str(c.to_dict()))
+
+        # 配置文件坏了不能连带程序起不来
+        with open(os.path.join(tmpdir, St.PORT_FILE), "w", encoding="utf-8") as fh:
+            fh.write("{坏掉的")
+        check("组合：坏文件读成空表", St.load_portfolio() == [])
+    except Exception as exc:  # noqa: BLE001
+        check("策略配置与组合", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        St.user_dir = old_dir
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def check_strategy_runner() -> None:
+    """多策略引擎：平今判断、理论/实际比对、对齐只补托管合约。"""
+    from ttrade import strategy_runner as R
+    from ttrade import strategy_store as St
+    from ttrade.strategy_runner import PortfolioRunner
+    from ttrade.tqlive import AccountSpec
+
+    class Pos:
+        def __init__(self, long=0, short=0, long_today=0, short_today=0) -> None:
+            self.pos_long = long
+            self.pos_short = short
+            self.pos_long_today = long_today
+            self.pos_short_today = short_today
+
+    class Quote:
+        price_tick = 1.0
+        ask_price1 = 3050.0
+        bid_price1 = 3049.0
+        last_price = 3049.5
+
+    class Api:
+        def __init__(self) -> None:
+            self.orders: list[dict] = []
+
+        def get_quote(self, _sym):
+            return Quote()
+
+        def insert_order(self, **kw):
+            self.orders.append(kw)
+            return "oid"
+
+    try:
+        r = PortfolioRunner(AccountSpec(name="t", kind="sim"), St.ChaseConfig())
+
+        r._pos = {"SHFE.rb2701": Pos(long=3, long_today=2)}
+        check("平今：今仓够就平今", r._offset_for("SHFE.rb2701", "SELL", 2) == "CLOSETODAY")
+        check("平今：今仓不够就平昨", r._offset_for("SHFE.rb2701", "SELL", 3) == "CLOSE")
+        check("平今：空仓时开仓", r._offset_for("SHFE.cu2612", "BUY", 1) == "OPEN")
+        r._pos = {"CFFEX.IF2612": Pos(long=2, long_today=2)}
+        check("平今：中金所不分平今",
+              r._offset_for("CFFEX.IF2612", "SELL", 2) == "CLOSE")
+
+        cfg = St.StrategyConfig(sid="s1", symbol="RB", exchange="SHFE",
+                                period="1d", rule_key="ma_cross", volume=2)
+        st = r.add(cfg)
+        st.running = True
+        st.underlying = "SHFE.rb2701"
+        st.signal = 1
+        st.target = 2
+        r._pos = {"SHFE.rb2701": Pos(), "SHFE.cu2612": Pos(short=1)}
+
+        rows = {x["symbol"]: x for x in r.mismatch()}
+        check("比对：理论仓与账户仓不一致能列出来", set(rows) == {"SHFE.rb2701", "SHFE.cu2612"},
+              str(sorted(rows)))
+        check("比对：有策略在跑的合约标为托管", rows["SHFE.rb2701"]["managed"] is True)
+        check("比对：没策略在跑的合约不算托管", rows["SHFE.cu2612"]["managed"] is False)
+        check("比对：差额方向正确", rows["SHFE.rb2701"]["delta"] == 2,
+              str(rows["SHFE.rb2701"]["delta"]))
+
+        # 一键对齐不能顺手把「策略已停但仓位还在」的合约平掉
+        r.api = Api()
+        n = r.align()
+        check("对齐：只补托管合约", n == 1 and len(r.api.orders) == 1, f"{n} 笔")
+        if r.api.orders:
+            o = r.api.orders[0]
+            check("对齐：方向与手数按差额",
+                  o["symbol"] == "SHFE.rb2701" and o["direction"] == "BUY"
+                  and o["volume"] == 2 and o["offset"] == "OPEN",
+                  str(o))
+
+        # 改手数要让目标仓位立刻跟上，否则得等下一根 bar
+        cfg2 = cfg.clone(volume=5)
+        cfg2.sid = cfg.sid
+        r.update(cfg2)
+        check("改手数：目标仓位立刻重算", st.target == 5, str(st.target))
+        check("改手数：槽位配置已换新", st.cfg.volume == 5, str(st.cfg.volume))
+
+        # 换月：老合约上的仓位不会自己消失，要记下来按 0 目标清掉
+        st.underlying = "SHFE.rb2612"
+        st.retired = ["SHFE.rb2611"]
+        r._pos = {"SHFE.rb2611": Pos(long=3), "SHFE.rb2612": Pos()}
+        st.target = 2
+        theo = r.theoretical()
+        check("换月：老合约目标是 0", theo.get("SHFE.rb2611") == 0, str(theo))
+        check("换月：新合约照常计入", theo.get("SHFE.rb2612") == 2, str(theo))
+        rows2 = {x["symbol"]: x for x in r.mismatch()}
+        check("换月：老合约仍算托管", rows2["SHFE.rb2611"]["managed"] is True,
+              str(rows2.get("SHFE.rb2611")))
+        r.api = Api()
+        n2 = r.align()
+        check("换月：对齐会把老合约平掉", n2 == 2 and len(r.api.orders) == 2, f"{n2} 笔")
+        old = [o for o in r.api.orders if o["symbol"] == "SHFE.rb2611"]
+        check("换月：老合约下的是卖平 3 手",
+              bool(old) and old[0]["direction"] == "SELL" and old[0]["volume"] == 3
+              and old[0]["offset"] == "CLOSE", str(old))
+
+        # 停掉的策略不参与理论持仓汇总
+        st.running = False
+        st.retired = []
+        check("理论持仓：只算运行中的策略", r.theoretical() == {}, str(r.theoretical()))
+
+        check("实时周期：覆盖分钟级与小时级",
+              all(k in R.RT_SEC for k in ("5m", "15m", "30m", "1h", "2h", "4h", "1d")),
+              str(sorted(R.RT_SEC)))
+
+        # 天勤的 kline 是 DataFrame，`kl["datetime"][-1]` 是按**标签**取值，
+        # 会抛 KeyError: -1 —— 曾经让每条策略在第一个 tick 就停机。这里用一份
+        # 结构相同的 DataFrame 把整条「K 线 → 信号 → 目标仓位」走一遍。
+        import pandas as pd
+
+        n = 80
+        base = pd.Timestamp("2026-01-05 09:00").value
+        bars = pd.DataFrame({
+            "datetime": [base + i * 300 * 10**9 for i in range(n)],
+            "open": [3000.0 + i for i in range(n)],
+            "high": [3002.0 + i for i in range(n)],
+            "low": [2998.0 + i for i in range(n)],
+            "close": [3000.0 + i for i in range(n)],
+            "volume": [100.0] * n,
+            "open_oi": [1000.0] * n,
+            "close_oi": [1000.0] * n,
+        })
+        c5 = St.StrategyConfig(sid="s5", symbol="RB", exchange="SHFE",
+                               period="5m", rule_key="ma_cross", volume=2,
+                               rule_params={"fast": 5, "slow": 20})
+        st5 = r.add(c5)
+        r._klines[c5.key()] = bars
+        r._quotes[c5.key()] = None
+        st5.running = True
+        r._refresh_signal(st5)
+        check("信号：能从天勤 K 线算出目标仓位",
+              st5.error == "" and st5.last_bar == int(bars["datetime"].iloc[-1]),
+              f"last_bar={st5.last_bar} err={st5.error}")
+        check("信号：单边上涨给多头、手数乘上", st5.signal == 1 and st5.target == 2,
+              f"signal={st5.signal} target={st5.target}")
+        # 同一根 bar 里不能重复计算
+        st5.signal = 0
+        r._refresh_signal(st5)
+        check("信号：同一根 bar 不重算", st5.signal == 0, str(st5.signal))
+
+        # 周期不认识时必须在 enable 就拒掉，而不是等订阅时抛 KeyError 把策略打死
+        bad = St.StrategyConfig(sid="s9", symbol="RB", exchange="SHFE",
+                                period="7m", rule_key="ma_cross", volume=1)
+        st_bad = r.add(bad)
+        r.enable("s9", True)
+        check("启停：不支持的周期被拒绝",
+              not st_bad.running and "周期" in st_bad.error, st_bad.error)
+    except Exception as exc:  # noqa: BLE001
+        check("多策略引擎", False, f"{type(exc).__name__}: {exc}")
+
+
+def check_library_docs() -> None:
+    """因子库 / 策略库的说明文档必须覆盖注册表，不能漏、不能多。"""
+    from ttrade import library_docs as L
+    from ttrade.factors import FACTORS
+    from ttrade.strategies import STRATEGIES
+
+    try:
+        missing = [k for k in FACTORS if k not in L.FACTOR_DOCS]
+        extra = [k for k in L.FACTOR_DOCS if k not in FACTORS]
+        check("因子文档：覆盖全部注册因子", not missing, f"缺 {missing}")
+        check("因子文档：没有多余条目", not extra, f"多 {extra}")
+
+        no_formula = [k for k in FACTORS if "未收录" in (L.factor_doc(k).formula or "")]
+        check("因子文档：每条都有公式", not no_formula, str(no_formula))
+
+        no_code = [k for k in FACTORS if not L.factor_doc(k).code.strip()]
+        check("因子文档：能取到实现代码", not no_code, f"{len(no_code)} 条取不到")
+
+        smissing = [k for k in STRATEGIES if k not in L.STRATEGY_DOCS]
+        check("策略文档：覆盖全部注册策略", not smissing, f"缺 {smissing}")
+        thin = [
+            k for k in STRATEGIES
+            if not all(getattr(L.strategy_doc(k), f) for f in ("logic", "edge", "fits", "risk"))
+        ]
+        check("策略文档：逻辑/优势/适应/风险齐全", not thin, str(thin))
+
+        brief = L.factor_brief()
+        check("因子清单：一行一个、含公式",
+              brief.count("\n") + 1 == len(FACTORS) and "｜" in brief,
+              f"{brief.count(chr(10)) + 1} 行")
+        check("策略清单：含默认参数",
+              all(k in L.strategy_brief() for k in STRATEGIES), "缺键")
+    except Exception as exc:  # noqa: BLE001
+        check("因子库与策略库文档", False, f"{type(exc).__name__}: {exc}")
+
+
+def check_agent() -> None:
+    """大模型接入层：配置、动作解析、提示词拼装。不联网。"""
+    import shutil
+
+    from ttrade import agent as A
+
+    tmpdir = tempfile.mkdtemp(prefix="td_agent_")
+    old_dir = A.user_dir
+    A.user_dir = lambda: tmpdir
+    try:
+        cfg = A.AgentConfig()
+        ok, why = cfg.ready()
+        check("模型配置：没填 Key 时不能发请求", not ok and "Key" in why, why)
+
+        cfg.api_key = "sk-test"
+        cfg.model = "deepseek-chat"
+        A.save_config(cfg)
+        back = A.load_config()
+        check("模型配置：往返一致",
+              back.api_key == "sk-test" and back.model == "deepseek-chat",
+              back.model)
+
+        check("模型配置：地址拼得对",
+              back.endpoint("/chat/completions")
+              == "https://api.deepseek.com/v1/chat/completions",
+              back.endpoint("/chat/completions"))
+
+        # 推理型模型不能带 temperature，各家会直接 400
+        rc = A.AgentConfig(model="deepseek-reasoner", api_key="k")
+        body = A.LLMClient(rc)._body([], True)
+        check("推理型模型不带温度", "temperature" not in body, str(body))
+        body2 = A.LLMClient(A.AgentConfig(model="gpt-4o", api_key="k"))._body([], True)
+        check("普通模型带温度", "temperature" in body2, str(body2))
+
+        # 动作解析
+        txt = ('先看螺纹。\n```json\n'
+               '{"action":"trade","mode":"auto","symbol":"RB","exchange":"SHFE",'
+               '"period":"1d","strategy":"ma_cross","params":{"fast":50},"volume":2}\n```')
+        a = A.parse_action(txt)
+        check("动作：按策略交易能解析", a.ok and a.payload["strategy"] == "ma_cross",
+              a.error)
+        check("动作：说明里有品种和手数",
+              "RB_SHFE" in a.describe() and "2 手" in a.describe(), a.describe())
+
+        m = A.parse_action('```json\n{"action":"trade","mode":"manual","symbol":"CU",'
+                           '"exchange":"SHFE","side":"SELL","offset":"CLOSETODAY",'
+                           '"volume":1}\n```')
+        check("动作：主观卖出平今", m.ok and m.describe() == "卖出平今 CU_SHFE 1 手",
+              m.describe())
+
+        bad = A.parse_action('```json\n{"action":"trade","mode":"manual","symbol":"CU"}\n```')
+        check("动作：主观交易缺 side 要报错", not bad.ok and "side" in bad.error, bad.error)
+        check("动作：没有动作块就是空", A.parse_action("聊两句").kind == "")
+        check("动作：坏 JSON 不崩", A.parse_action("```json\n{坏的}\n```").error != "")
+
+        # 提示词
+        msgs = A.build_messages([{"role": "user", "content": "旧问题"}], "新问题")
+        check("提示词：系统提示在最前",
+              msgs[0]["role"] == "system" and "趋势跟踪研究台" in msgs[0]["content"])
+        check("提示词：历史在前、本轮在后",
+              msgs[-1]["content"] == "新问题" and len(msgs) == 3, f"{len(msgs)} 条")
+        check("历史：超长会截断", len(A.trim_history([{"role": "user", "content": "x"}] * 100)) == 40)
+    except Exception as exc:  # noqa: BLE001
+        check("大模型接入层", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        A.user_dir = old_dir
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def check_agent_stream() -> None:
+    """流式解析。起一个本地假接口，验证 SSE 拼接、非流式回退、HTTP 错误、中途停止。
+
+    SSE 是最容易「静默失效」的一段：解析错了不会抛异常，只会一个字都出不来，
+    看起来像模型没回话。
+    """
+    import json as _json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from ttrade import agent as A
+
+    mode = {"v": "sse"}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):   # 别把访问日志打到测试输出里
+            pass
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            self.rfile.read(n)
+            if mode["v"] == "401":
+                body = b'{"error":{"message":"invalid api key"}}'
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if mode["v"] == "plain":
+                body = _json.dumps(
+                    {"choices": [{"message": {"content": "纯 JSON 回复"}}]}
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            pieces = ["螺纹", "在均线", "上方。"] if mode["v"] == "sse" else ["x"] * 200
+            try:
+                for piece in pieces:
+                    chunk = {"choices": [{"delta": {"content": piece}}]}
+                    self.wfile.write(
+                        f"data: {_json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionAbortedError):
+                pass      # 客户端中途停止，正常
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port = srv.server_address[1]
+    cfg = A.AgentConfig(provider="custom", base_url=f"http://127.0.0.1:{port}/v1",
+                        model="m", api_key="k")
+    client = A.LLMClient(cfg)
+    msgs = [{"role": "user", "content": "hi"}]
+    try:
+        got: list[str] = []
+        text = client.chat(msgs, on_delta=got.append)
+        check("流式：多段能拼成完整回答", text == "螺纹在均线上方。", repr(text))
+        check("流式：每段都回调了", len(got) == 3, f"{len(got)} 段")
+
+        mode["v"] = "plain"
+        check("流式：网关不支持时回退到整段 JSON",
+              client.chat(msgs) == "纯 JSON 回复", "回退失败")
+
+        mode["v"] = "401"
+        try:
+            client.chat(msgs)
+            check("流式：401 要抛 AgentError", False, "没抛")
+        except A.AgentError as exc:
+            check("流式：401 要抛 AgentError", "401" in str(exc), str(exc)[:60])
+
+        mode["v"] = "sse"
+        seen = {"n": 0}
+
+        def stop():
+            seen["n"] += 1
+            return seen["n"] > 1
+
+        check("流式：能中途停止", client.chat(msgs, should_stop=stop) == "螺纹", "停不下来")
+    except Exception as exc:  # noqa: BLE001
+        check("流式解析", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        srv.shutdown()
+
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -698,6 +1125,11 @@ def main() -> int:
     check_cli_entry()
     check_factor_refresh()
     check_main_backfill()
+    check_strategy_store()
+    check_strategy_runner()
+    check_library_docs()
+    check_agent()
+    check_agent_stream()
     for k in ks:
         try:
             check_one(k)
