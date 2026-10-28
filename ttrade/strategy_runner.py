@@ -64,6 +64,15 @@ FACTOR_MIN_BARS = 300
 # 那样由 5m/1h 合并出来。
 RT_SEC = {**PERIOD_SEC, "15m": 900, "30m": 1800, "2h": 7200, "4h": 14400}
 
+# 分平今 / 平昨的交易所：上期所、能源中心。其余（大商所 / 郑商所 / 中金所）
+# 一律用 CLOSE，给它们发 CLOSETODAY 会被交易所整单打回。
+SPLIT_OFFSET_EX = ("SHFE", "INE")
+
+# 被交易所打回之后的冷却。`tick()` 跟着行情推送跑，一秒能来十几次；没有冷却
+# 的话，一笔注定失败的委托一秒能重报十几遍 —— 日志刷屏，主线程直接卡死。
+REJECT_COOL = 5.0
+MAX_REJECTS = 3
+
 
 def default_margin_rate(symbol: str) -> float:
     """品种的默认保证金率。杠杆 = 1 / 保证金率。
@@ -130,6 +139,9 @@ class SlotState:
     last_action: str = ""
     pending: list = field(default_factory=list)
     retired: list = field(default_factory=list)   # 换月后要清仓的老合约
+    rejects: int = 0           # 连续被交易所打回的次数
+    reject_ts: float = 0.0     # 最近一次被打回的时间，用于冷却
+    reject_msg: str = ""       # 最近一次被打回的原因
 
     def title(self) -> str:
         return self.cfg.title()
@@ -263,6 +275,8 @@ class PortfolioRunner:
             return
         st.running = bool(on)
         st.error = ""
+        st.rejects = 0
+        st.reject_msg = ""
         st.last_action = "启动" if on else "停止"
         if not on:
             self._cancel_all(st)
@@ -481,20 +495,45 @@ class PortfolioRunner:
 
         delta = st.target - st.actual
         if delta == 0:
+            # 仓位对上了，之前的拒单记录可以清了
+            st.rejects = 0
+            st.reject_msg = ""
             return
+        if st.rejects >= MAX_REJECTS:
+            return                       # `_chase` 已经停机，这里只是兜底
+        if st.rejects and time.time() - st.reject_ts < REJECT_COOL:
+            return                       # 刚被打回，冷一会儿再试
         self._send(st, st.underlying, delta)
 
-    def _split_pos(self, symbol: str, side: str) -> tuple[int, int]:
-        """(昨仓, 今仓)。`side` 是 long / short。
+    def _side_pos(self, symbol: str, side: str) -> int:
+        """单边总持仓（手）。`side` 是 long / short。"""
+        p = self._pos.get(symbol) if self._pos is not None else None
+        if p is None:
+            return 0
+
+        def _i(name: str) -> int:
+            try:
+                return int(getattr(p, name, 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return max(_i(f"pos_{side}"), _i(f"volume_{side}"))
+
+    def _split_pos(self, symbol: str, side: str) -> tuple[int, int] | None:
+        """(昨仓, 今仓)；明细还没跟上时返回 None。`side` 是 long / short。
 
         天勤有**两套**字段描述同一件事：模拟盘填 `pos_long_his` / `pos_long_today`，
         实盘 CTP 填 `volume_long_his` / `volume_long_today`。只读一套的话，另一套
         环境里今仓恒为 0 —— 明明全是今天开的仓，也会被判成「昨仓足够」而发 CLOSE，
         交易所直接打回「平昨手数超过持仓仓量」，追单再把这笔注定失败的单重报几次。
+
+        两套加起来还小于总数，说明明细滞后（刚成交那几百毫秒经常这样）。
+        **不能猜**：早先猜成昨仓，发出去必然被打回。返回 None 让调用方等下一轮 ——
+        行情一秒推十几次，下一轮很快就到。
         """
         p = self._pos.get(symbol) if self._pos is not None else None
         if p is None:
-            return 0, 0
+            return None
 
         def _i(name: str) -> int:
             try:
@@ -504,41 +543,50 @@ class PortfolioRunner:
 
         his = max(_i(f"pos_{side}_his"), _i(f"volume_{side}_his"))
         today = max(_i(f"pos_{side}_today"), _i(f"volume_{side}_today"))
-        total = max(_i(f"pos_{side}"), _i(f"volume_{side}"))
-        if his + today < total:
-            # 今昨明细缺失（或只填了总数）：多出来的按昨仓算 —— 平昨先发出去，
-            # 今仓那部分下一笔再补 CLOSETODAY，不会一上来就把整单打回
-            his = total - today
+        if his + today < self._side_pos(symbol, side):
+            return None
         return his, today
 
-    def _legs(self, symbol: str, delta: int) -> list[tuple[str, int]]:
-        """把一次调仓拆成「平昨 → 平今 → 开仓」几笔。
+    def _legs(self, symbol: str, delta: int) -> list[tuple[str, int]] | None:
+        """把一次调仓拆成「平昨 → 平今 → 开仓」几笔。今昨明细没就绪时返回 None。
 
         交易所对 CLOSE / CLOSETODAY 的手数**分别**校验：CLOSE 超过昨仓会被整单
         打回。反手时最明显 —— 持 5 手多、目标 -3 手空，delta = -8，整笔当 CLOSE
         发出去就是「平 8 手多」，而实际只有 5 手，于是被拒、重报、再被拒。
 
-        所以先按实际今昨仓把能平的平掉，剩下的才是开仓。上期所、大商所、郑商所
-        区分平今；中金所不区分，一律 CLOSE。
+        **只有上期所（SHFE）和能源中心（INE）分平今平昨**，其余交易所（含大商所、
+        郑商所、中金所）一律用 CLOSE。判交易所必须看 `symbol` 的前缀
+        （`SHFE.rb2601` → `SHFE`）。早先写 `symbol.startswith("CFFEX")` 永远不成立，
+        于是给大商所也发了 CLOSETODAY，整单被交易所打回。
         """
         vol = abs(int(delta))
         if vol <= 0:
             return []
         direction = "BUY" if delta > 0 else "SELL"
         side = "long" if direction == "SELL" else "short"
-        his, today = self._split_pos(symbol, side)
-        have = his + today
+        ex = (symbol.split(".")[0] or "").upper()
+        split = ex in SPLIT_OFFSET_EX
+
+        his = today = 0
+        have = self._side_pos(symbol, side)
+        if split and have > 0:
+            got = self._split_pos(symbol, side)
+            if got is None:
+                return None              # 明细还没跟上，等下一轮，别瞎猜
+            his, today = got
+            have = max(have, his + today)
+
         out: list[tuple[str, int]] = []
         if have > 0:
             closing = min(vol, have)
-            if symbol.startswith("CFFEX"):
-                out.append(("CLOSE", closing))
-            else:
+            if split:
                 n_his = min(closing, his)
                 if n_his > 0:
                     out.append(("CLOSE", n_his))
                 if closing > n_his:
                     out.append(("CLOSETODAY", closing - n_his))
+            else:
+                out.append(("CLOSE", closing))
         rest = vol - min(vol, have)
         if rest > 0:
             out.append(("OPEN", rest))
@@ -578,6 +626,9 @@ class PortfolioRunner:
 
     def _send(self, st: SlotState, symbol: str, delta: int) -> None:
         legs = self._legs(symbol, delta)
+        if legs is None:
+            st.last_action = "持仓今昨明细未就绪，等下一轮"
+            return
         if not legs:
             return
         direction = "BUY" if delta > 0 else "SELL"
@@ -638,14 +689,26 @@ class PortfolioRunner:
 
             if status == "FINISHED":
                 st.last_action = "已成交"
+                st.rejects = 0
+                st.reject_msg = ""
                 continue
 
             if status == "DEAD":
                 if o.phase != "cancelling":
-                    # 不是我们撤的：拒单、涨跌停打回、资金不足……记一笔就走
+                    # 不是我们撤的：拒单、涨跌停打回、资金不足……
+                    # 只记一笔是不够的 —— `_rebalance` 下一轮照样再发，而 tick
+                    # 跟着行情推送一秒能跑十几次，一个注定失败的单会把日志刷爆、
+                    # 把主线程拖死。所以计数 + 冷却，连续几次直接停机。
                     why = getattr(order, "last_msg", "") or "未知原因"
-                    st.last_action = f"委托被拒：{why}"
+                    st.rejects += 1
+                    st.reject_ts = now
+                    st.reject_msg = why
+                    st.last_action = f"委托被拒（第 {st.rejects} 次）：{why}"
                     self._log(f"{st.title()}：{st.last_action}")
+                    if st.rejects >= MAX_REJECTS:
+                        st.error = f"连续 {st.rejects} 次被拒，已停机：{why}"
+                        st.running = False
+                        self._log(f"{st.title()}：{st.error}")
                     continue
                 if o.retries >= self.chase.retries:
                     st.last_action = f"追单 {o.retries} 次仍未成交，放弃"
@@ -760,6 +823,8 @@ class PortfolioRunner:
                 continue
             direction = "BUY" if delta > 0 else "SELL"
             legs = self._legs(sym, delta)
+            if not legs:
+                continue
             price = self._price_at(sym, direction)
             if not price or price != price:
                 continue

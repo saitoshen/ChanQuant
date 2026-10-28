@@ -546,6 +546,10 @@ def _run() -> tuple[bool, list[str]]:
         app.setStyleSheet(STYLE_SHEET)
 
         win = MainWindow()
+        # 启动不能自动接实时：一开机就去连天勤账户，网络一慢窗口看着就是卡死，
+        # 只是看回测的人也不该被动登录资金账号。这里必须**构造完立刻**判 ——
+        # 后面 processEvents() 跑够 1.5 秒会把上膛定时器触发掉，那是正常的
+        live_off = (win._live_armed is False) and (win.live.running is False)
         win.resize(1280, 820)
         win.show()
         app.processEvents()
@@ -784,6 +788,11 @@ def _run() -> tuple[bool, list[str]]:
             )
         if not factor_ok:
             raise RuntimeError(f"因子面板控件缺失：{factor_info}")
+        if not live_off:
+            raise RuntimeError(
+                "启动时自动接了实时（_live_armed 已置位或 live 已在跑）："
+                "一开机就连账户，网络慢的时候界面看着像卡死"
+            )
         # 因子分析页列出**全部**因子（算不出的显示「无数据」），所以行数应等于
         # 因子库大小。用 `n_factors` 而不是写死数字：加因子时这里不用改。
         if n_rows < n_factors:

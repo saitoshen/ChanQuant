@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 from datetime import date
 
 import numpy as np  # noqa: F401  （保留给后续数值校验用）
@@ -943,11 +944,22 @@ def check_strategy_runner() -> None:
     from ttrade.tqlive import AccountSpec
 
     class Pos:
-        def __init__(self, long=0, short=0, long_today=0, short_today=0) -> None:
+        """天勤的持仓对象。两套字段都填：模拟盘填 `pos_*`，实盘 CTP 填 `volume_*`。"""
+
+        def __init__(self, long=0, short=0, long_today=0, short_today=0,
+                     long_his=None, short_his=None) -> None:
             self.pos_long = long
             self.pos_short = short
             self.pos_long_today = long_today
             self.pos_short_today = short_today
+            self.pos_long_his = (long - long_today) if long_his is None else long_his
+            self.pos_short_his = (short - short_today) if short_his is None else short_his
+            self.volume_long = long
+            self.volume_short = short
+            self.volume_long_today = long_today
+            self.volume_short_today = short_today
+            self.volume_long_his = self.pos_long_his
+            self.volume_short_his = self.pos_short_his
 
     class Quote:
         price_tick = 1.0
@@ -1005,8 +1017,33 @@ def check_strategy_runner() -> None:
               r._legs("CFFEX.IF2612", -2) == [("CLOSE", 2)],
               str(r._legs("CFFEX.IF2612", -2)))
 
+        # **只有上期所 / 能源中心分平今**。大商所、郑商所一律 CLOSE。
+        # 早先写 `symbol.startswith("CFFEX")`，而 symbol 形如 `SHFE.rb2601`，
+        # 这个条件永远不成立 —— 于是给大商所也发了 CLOSETODAY，整单被打回
+        r._pos = {"DCE.i2601": Pos(long=3, long_today=2)}
+        check("平仓：大商所不分平今，一律 CLOSE",
+              r._legs("DCE.i2601", -3) == [("CLOSE", 3)],
+              str(r._legs("DCE.i2601", -3)))
+        r._pos = {"CZCE.TA601": Pos(long=2, long_today=2)}
+        check("平仓：郑商所不分平今，一律 CLOSE",
+              r._legs("CZCE.TA601", -2) == [("CLOSE", 2)],
+              str(r._legs("CZCE.TA601", -2)))
+        r._pos = {"INE.sc2612": Pos(long=2, long_today=2)}
+        check("平仓：能源中心分平今",
+              r._legs("INE.sc2612", -2) == [("CLOSETODAY", 2)],
+              str(r._legs("INE.sc2612", -2)))
+
+        # 今昨明细滞后（刚成交那几百毫秒）时不能瞎猜。猜成昨仓 → 发 CLOSE →
+        # 交易所回「平昨手数不能超过持仓仓量」→ 追单重报 → 一秒刷十几条
+        p_lag = Pos(long=3, long_his=0, long_today=0)
+        r._pos = {"SHFE.rb2701": p_lag}
+        check("平仓：今昨明细没就绪时返回 None，不瞎猜",
+              r._legs("SHFE.rb2701", -3) is None,
+              str(r._legs("SHFE.rb2701", -3)))
+
         # 实盘 CTP 只填 volume_* 那一套，pos_* 全是 0。只读 pos_* 会把今仓当昨仓
         p_ctp = Pos()
+        p_ctp.volume_short = 4
         p_ctp.volume_short_today = 4
         r._pos = {"SHFE.ag2612": p_ctp}
         check("平仓：实盘只填 volume_* 也能认出今仓",
@@ -1197,6 +1234,70 @@ def check_strategy_runner() -> None:
 
         for sid in ("s-cap", "s-risk", "s-fix"):
             r.remove(sid)
+
+        # ---- 拒单不能只记一笔 ----
+        # `tick()` 跟着行情推送跑，一秒能来十几次。没有冷却 + 计数的话，
+        # 一笔注定失败的委托一秒能重报十几遍，日志刷屏、主线程直接卡死
+        # （截图上「平昨手数不能超过持仓仓量」刷屏就是这个）。
+        rej = St.StrategyConfig(sid="s-rej", symbol="RB", exchange="SHFE",
+                                period="1d", rule_key="ma_cross", volume=1)
+        st_rej = r.add(rej)
+        st_rej.underlying = "SHFE.rb2701"
+        st_rej.running = True
+        st_rej.target = 1
+        r._pos = {}
+        r.chase = St.ChaseConfig(enabled=True, wait_sec=1, retries=2, ticks=1)
+
+        def _rejected() -> None:
+            r._orders = {"oidR": type("O", (), {
+                "status": "DEAD", "volume_left": 1,
+                "last_msg": "平昨手数(0)不能超过持仓仓量(0)",
+            })()}
+            st_rej.pending = [R.PendingOrder(
+                order_id="oidR", symbol="SHFE.rb2701", direction="BUY",
+                offset="OPEN", volume=1, price=3000.0, ts=0.0,
+            )]
+            r._chase(st_rej)
+            st_rej.pending.clear()
+
+        _rejected()
+        check("拒单：记下次数与原因",
+              st_rej.rejects == 1 and "不能超过持仓仓量" in st_rej.reject_msg,
+              f"{st_rej.rejects} / {st_rej.reject_msg}")
+
+        r.api = Api()
+        st_rej.reject_ts = time.time()
+        r._rebalance(st_rej)
+        check("拒单：冷却期内不重报", not r.api.orders, f"{len(r.api.orders)} 笔")
+
+        st_rej.reject_ts = time.time() - 60
+        r._rebalance(st_rej)
+        check("拒单：冷却结束才重报", len(r.api.orders) == 1, f"{len(r.api.orders)} 笔")
+        st_rej.pending.clear()
+
+        r.api = Api()
+        st_rej.rejects = 0
+        st_rej.running = True
+        st_rej.error = ""
+        for _ in range(3):
+            _rejected()
+        check("拒单：连续 3 次自动停机",
+              st_rej.running is False and st_rej.rejects == 3,
+              f"running={st_rej.running} rejects={st_rej.rejects}")
+        check("拒单：停机原因写进 error", "已停机" in st_rej.error, st_rej.error)
+
+        r.api = Api()
+        st_rej.target = 2
+        r._rebalance(st_rej)
+        check("拒单：停机后不再发单", not r.api.orders, f"{len(r.api.orders)} 笔")
+
+        # 重新启动要能清掉旧的拒单记录，否则一启动就是「已停机」
+        r.enable("s-rej", False)
+        r.enable("s-rej", True)
+        check("拒单：重新启动清空计数",
+              st_rej.rejects == 0 and st_rej.running is True,
+              f"rejects={st_rej.rejects} running={st_rej.running}")
+        r.remove("s-rej")
 
         check("实时周期：覆盖分钟级与小时级",
               all(k in R.RT_SEC for k in ("5m", "15m", "30m", "1h", "2h", "4h", "1d")),
