@@ -644,7 +644,7 @@ class PortfolioPage(QWidget):
         self.lbl_limit.setObjectName("Hint")
         self.lbl_limit.setToolTip(
             "交易所对每个账户的日内报单 / 撤单笔数有硬上限，"
-            "本程序在 500 次时自动停手"
+            "本程序达到上限时自动停手"
         )
         lay.addWidget(self.lbl_limit)
 
@@ -1221,9 +1221,7 @@ class PortfolioPage(QWidget):
         limits = [v.get("limits") for v in self._snaps.values() if v.get("limits")]
         if limits:
             self.lbl_limit.setText(" · ".join(limits))
-            used = self._snaps and any(
-                "500/500" in (v.get("limits") or "") for v in self._snaps.values()
-            )
+            used = any(v.get("limit_used") for v in self._snaps.values())
             self.lbl_limit.setStyleSheet(
                 f"color: {C_BAD if used else C_MUTED}; font-size: 11px;")
         else:

@@ -275,6 +275,44 @@ def check_live_helpers() -> None:
     empty = L.merge_live(pd.DataFrame(), bars)
     check("实时③没有本地历史时整段当实时",
           len(empty) == 2 and bool((empty["adj_factor"] == 1.0).all()))
+    # 15m/30m/2h/4h 的实时订阅：订**源周期**（5m/1h）再本地合并，和本地历史
+    # 同一口径。直接订原生 15m 会和 5m×3 合并的历史错位（:00/:15 vs :10/:25），
+    # 拼起来就是碎的 —— 和 1h 那个坑同源。
+    class _SubApi:
+        def __init__(self):
+            self.secs = []
+
+        def get_quote(self, _sym):
+            return None
+
+        def get_kline_serial(self, _sym, sec, data_length=0):
+            self.secs.append(sec)
+            return None
+
+    for per, sec, nn in (("5m", 300, 1), ("15m", 300, 3), ("30m", 300, 6),
+                         ("1h", 3600, 1), ("2h", 3600, 2), ("4h", 3600, 4)):
+        h = L.LiveHub(L.AccountSpec())
+        h.api = _SubApi()
+        h.subscribe("AG", "SHFE", per)
+        check(f"实时⑧{per} 订源周期 {sec}s", h.api.secs == [sec], str(h.api.secs))
+        check(f"实时⑧{per} 合并根数 {nn}", h._n == nn, str(h._n))
+
+    # 合成规则：3 根 5m → 1 根 15m（open 取首、close 取尾、量累加）
+    from ttrade import tqdata as TQ
+    five = pd.DataFrame({
+        "open": [1.0, 2.0, 3.0], "high": [1.5, 2.5, 3.5],
+        "low": [0.5, 1.5, 2.5], "close": [1.2, 2.2, 3.2],
+        "volume": [1.0, 2.0, 3.0], "open_oi": [5.0, 6.0, 7.0],
+        "close_oi": [5.0, 6.0, 7.0],
+    }, index=pd.DatetimeIndex(
+        ["2026-01-05 09:05", "2026-01-05 09:10", "2026-01-05 09:15"],
+        name="datetime"))
+    q = TQ.resample(five, 3)
+    check("实时⑨resample 3 根合 1 根",
+          len(q) == 1 and float(q["open"].iloc[0]) == 1.0
+          and float(q["close"].iloc[0]) == 3.2 and float(q["volume"].iloc[0]) == 6.0,
+          f"{len(q)} 根")
+
 
     # 账户配置：实盘缺参数必须报错，不能静默退化成模拟
     bad = L.AccountSpec(name="x", kind="account", user="u", password="p")
@@ -1677,6 +1715,53 @@ def check_sizing() -> None:
           abs(bh.trades[0].lots - 166) < 0.01, str(bh.trades[0].lots))
 
 
+def check_no_blowup() -> None:
+    """回测**不做爆仓强平**。
+
+    权益亏穿（净值转负）也要照跑到最后一根：回测是虚拟测试，杠杆按保证金率算，
+    比实盘敢开的大得多，强平掉只会把后半段历史抹掉。守三件事：
+    亏穿之后持仓还在、净值能继续算（不是被钉在 0）、绩效里没有 NaN。
+    """
+    from ttrade.backtest import BacktestConfig, run_backtest
+
+    try:
+        n = 200
+        idx = pd.date_range("2020-01-01", periods=n, freq="D")
+        px = np.linspace(100.0, 400.0, n)      # 一路涨，空头必然亏穿
+        df = pd.DataFrame({"open": px, "high": px * 1.01, "low": px * 0.99,
+                           "close": px, "signal": -1}, index=idx)
+        cfg = BacktestConfig(initial_cash=100_000, sizing="fixed", volume=100,
+                             multiplier=10.0, fee_rate=0.0, slippage=0.0)
+        res = run_backtest(df, cfg)
+        eq = res.equity
+
+        check("回测：不强平（净值能转负）", float(eq.min()) < 0,
+              f"最低权益 {eq.min():,.0f}")
+        check("回测：亏穿之后仍持仓到最后",
+              int((res.position != 0).sum()) == n - 1,
+              f"持仓 {int((res.position != 0).sum())}/{n - 1} 根")
+        # 原来亏穿那根会被写成 0 并从此停摆，曲线变成一条平线
+        check("回测：净值不是被钉在 0", float(eq.iloc[-1]) < 0,
+              f"期末 {eq.iloc[-1]:,.0f}")
+        # 比例型指标（夏普 / 年化波动 / 卡玛）在亏穿后没有意义，标 NaN；
+        # 绝对值指标（累计收益 / 回撤 / 期末资金）照常给，不能变成 NaN
+        check("回测：亏穿后夏普/波动/卡玛标 NaN",
+              res.metrics["sharpe"] != res.metrics["sharpe"]
+              and res.metrics["ann_vol"] != res.metrics["ann_vol"]
+              and res.metrics["calmar"] != res.metrics["calmar"],
+              f"{res.metrics['sharpe']}/{res.metrics['ann_vol']}")
+        bad = {k: v for k, v in res.metrics.items()
+               if k not in ("sharpe", "ann_vol", "calmar")
+               and isinstance(v, float) and v != v}
+        check("回测：绝对值指标没有 NaN", not bad, str(bad))
+        check("回测：累计收益可以小于 -100%", res.metrics["total_return"] < -1.0,
+              f"{res.metrics['total_return']:.2f}")
+        check("回测：已经没有爆仓这个指标", "n_blowup" not in res.metrics,
+              str(sorted(res.metrics)[:4]))
+    except Exception as exc:  # noqa: BLE001
+        check("回测不强平", False, f"{type(exc).__name__}: {exc}")
+
+
 def check_library_docs() -> None:
     """因子库 / 策略库的说明文档必须覆盖注册表，不能漏、不能多。"""
     from ttrade import library_docs as L
@@ -3073,7 +3158,7 @@ def check_day_limit() -> None:
     """日内报单 / 撤单额度。
 
     交易所对每个账户的日内报单笔数、撤单笔数都有硬上限，超了轻则当天限制开仓、
-    重则被列入重点监控。这里守三件事：到 500 就停手、跨交易日归零、重启不清零。
+    重则被列入重点监控。这里守三件事：到额度就停手、跨交易日归零、重启不清零。
     """
     from datetime import datetime
 
@@ -3102,10 +3187,11 @@ def check_day_limit() -> None:
     old_dir = DL.user_dir
     DL.user_dir = lambda: tmpdir
     try:
+        check("额度：报单上限 1000", DL.DAY_ORDER_LIMIT == 1000, str(DL.DAY_ORDER_LIMIT))
         lim = DL.DayLimit("测试账户")
         for _ in range(DL.DAY_ORDER_LIMIT):
             lim.order()
-        check("额度：报单满 500 次后拒绝", lim.order() is False, str(lim.order_left()))
+        check("额度：报单满额度后拒绝", lim.order() is False, str(lim.order_left()))
         check("额度：剩余次数归零", lim.order_left() == 0, str(lim.order_left()))
 
         # 重启程序不能清零 —— 交易所记的是账户当天已经发出去多少笔
@@ -3118,7 +3204,7 @@ def check_day_limit() -> None:
         other = DL.DayLimit("撤单测试")
         for _ in range(DL.DAY_CANCEL_LIMIT):
             other.cancel()
-        check("额度：撤单满 500 次后拒绝", other.cancel() is False)
+        check("额度：撤单满额度后拒绝", other.cancel() is False)
         check("额度：撤单用满不影响报单", other.order() is True)
 
         # 跨交易日归零
@@ -3295,7 +3381,8 @@ def check_topup() -> None:
         runner2._top_up(st3)
         check("补历史：同样的失败不重复刷日志", logs == [], str(logs))
 
-        # 15m 策略要额外订一份 5m —— 库里没有 15m 这张表
+        # 15m 策略落库也落 5m —— 库里没有 15m 这张表。`_subscribe` 订的就已经
+        # 是 5m 了，所以这里必须**复用**那条序列，不能为补库再订一份（重复订阅）
         asked: list = []
 
         class Api:
@@ -3310,9 +3397,17 @@ def check_topup() -> None:
                                             period="15m", rule_key="ma_cross",
                                             volume=1))
         runner2._klines[runner2._skey(st2.cfg)] = ser
+        got: list = []
+
+        def keep(serial, *a, **k):
+            got.append(serial)
+            return {"added": 0, "src": "5m", "last": None, "error": "", "ok": True}
+
+        topup.save = keep
         runner2._top_up(st2)
-        check("补历史：15m 策略额外订 5m 来落库",
-              asked == [("KQ.m@SHFE.rb", 300)], str(asked))
+        check("补历史：15m 策略复用已订的 5m 序列，不再额外订阅",
+              asked == [] and len(got) == 1 and got[0] is ser,
+              f"额外订阅 {asked} / 落库 {len(got)} 次")
 
         # 同一个品种的 5m 和 1h 是两条序列。共用一个订阅槽的话，后订阅的
         # 策略直接拿到前一条 —— 1h 策略按 5m 信号下单，补库还会把 5m 的 bar
@@ -3378,6 +3473,7 @@ def main() -> int:
     check_day_limit()
     check_topup()
     check_sizing()
+    check_no_blowup()
     check_intraday_aux()
     check_library_docs()
     check_agent()

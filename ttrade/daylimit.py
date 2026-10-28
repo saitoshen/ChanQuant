@@ -6,7 +6,7 @@
 两条原则：
 
 - **按账户、按交易日**。夜盘 21:00 起算的是**下一个**交易日，所以计数器不能按
-  自然日切 —— 否则 23:59 用完 500 次、过 0 点又是一条好汉，而交易所眼里还是
+  自然日切 —— 否则 23:59 用完 1000 次、过 0 点又是一条好汉，而交易所眼里还是
   同一个交易日。
 - **落盘**。重启程序不清零。交易所记的是账户当天已经发出去多少笔，重启一下就
   绕过限制是自欺欺人。
@@ -24,9 +24,9 @@ from datetime import datetime, timedelta
 
 from ttrade.paths import user_dir
 
-# 交易所口径的硬上限。写 500 是保守值：多数期货公司给客户的是这个量级，
+# 交易所口径的硬上限。写 1000 是保守值：多数期货公司给客户的是这个量级，
 # 具体数字各家不同，宁早停不要被限制。
-DAY_ORDER_LIMIT = 500
+DAY_ORDER_LIMIT = 1000
 DAY_CANCEL_LIMIT = 500
 
 LIMIT_FILE = "trade_limits.json"
@@ -130,6 +130,10 @@ class DayLimit:
 
     def cancel_left(self) -> int:
         return max(0, DAY_CANCEL_LIMIT - int(self.state()["cancels"]))
+
+    def exhausted(self) -> bool:
+        """报单或撤单额度已经用尽。界面据此把那一行标红。"""
+        return self.order_left() <= 0 or self.cancel_left() <= 0
 
     def summary(self) -> str:
         s = self.state()

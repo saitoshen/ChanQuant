@@ -209,6 +209,21 @@ def merge_bars(df: pd.DataFrame, n: int) -> pd.DataFrame:
     return out
 
 
+def resample(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    """把**源周期**序列按 n 根合成目标周期，口径与 `load_main` 完全一致。
+
+    实时订阅为了和本地历史对得上，必须走同一条合并规则：15m/30m 的历史是 5m×3/×6
+    按交易日内 cumcount 切出来的；直接订天勤原生 15m，时间边界差一截（原生落在
+    :00/:15/:30/:45，合并落在 :10/:25/:40/:55），拼起来就是碎的。所以订阅源周期，
+    再用这个函数合到目标周期。2h/4h 同理走 1h。
+    """
+    if df is None or df.empty or n <= 1:
+        return df
+    d = df.copy()
+    d["trading_day"] = trading_days(d.index).to_numpy()
+    return merge_bars(d, n)
+
+
 def summary() -> dict:
     """统计天勤数据的覆盖情况，给界面和自检用。"""
     st = tqstore.stats()

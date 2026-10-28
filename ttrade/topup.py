@@ -11,8 +11,9 @@
 
 库里的 15m / 30m / 2h / 4h 不是独立存的，是 5m / 1h 合并出来的（见
 `tqdata.PERIODS`）。把 15m 的 bar 硬写进 15m 表，读的时候只会去找 5m，
-白写一场 —— 界面还是「没有数据」。所以补库一律落到源周期上；15m 之类的策略
-由调用方多订一份 5m 序列，见 `PortfolioRunner._top_up`。
+白写一场 —— 界面还是「没有数据」。所以补库一律落到源周期上；而引擎订阅
+本来就订的是源周期（见 `PortfolioRunner._subscribe`），这里直接复用那条
+序列，不用另外再订一份。
 
 ## 正在走的那根不写
 
@@ -28,10 +29,6 @@ import pandas as pd
 from ttrade import tqstore
 from ttrade.tqdata import source_period, trading_days
 from ttrade.tqlive import bars_from_serial
-
-# 补多久。用户要的是「最近一个月」：5m 一天约 48 根，21 个交易日 ≈ 1000；
-# 1h 一天约 6 根 ≈ 130。各留一倍余量，长假前也算得够。
-TOUP_BARS = {"5m": 2000, "1h": 400}
 
 # 能落库的源周期。1d 不在这里：日线走另一条链路，别混进来
 SOURCE_PERIODS = ("5m", "1h")

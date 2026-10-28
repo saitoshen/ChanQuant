@@ -29,7 +29,7 @@ import pandas as pd
 
 from . import daylimit
 from .paths import user_dir
-from .tqdata import trading_days
+from .tqdata import PERIODS, resample, trading_days
 from .tqfetch import PERIOD_SEC, local_time
 from .tqsdk_symbols import main_symbol
 
@@ -220,6 +220,7 @@ class LiveHub:
         self.last_error = ""
         self.key = ""            # 品种_交易所
         self.period = ""
+        self._n = 1              # 目标周期相对源周期的合并根数
         self.tq_symbol = ""      # KQ.m@SHFE.rb
         self.underlying = ""     # 当前真实主力合约
         self._klines = None
@@ -278,16 +279,21 @@ class LiveHub:
         """
         if self.api is None:
             raise RuntimeError("还没连接")
-        if period not in PERIOD_SEC:
-            raise ValueError(f"实时只支持 {', '.join(PERIOD_SEC)}，收到 {period}")
+        # 订**源周期**再本地合并：15m/30m 的本地历史是 5m×3/×6 合出来的，
+        # 直接订原生 15m 时间边界对不上，拼起来就是碎的（2h/4h 同理用 1h）
+        src, n = PERIODS.get(period, (period, 1))
+        sec = PERIOD_SEC.get(src)
+        if sec is None:
+            raise ValueError(f"实时不支持 {period}（源周期 {src} 没有对应秒数）")
         key = f"{symbol}_{exchange}"
         if key == self.key and period == self.period and self._klines is not None:
             return
         tq_sym = main_symbol(symbol, exchange)
         self._quote = self.api.get_quote(tq_sym)
         self._klines = self.api.get_kline_serial(
-            tq_sym, PERIOD_SEC[period], data_length=KLINE_LEN
+            tq_sym, sec, data_length=min(10000, KLINE_LEN * max(1, n))
         )
+        self._n = n
         self.key, self.period, self.tq_symbol = key, period, tq_sym
         self.underlying = ""
 
@@ -310,7 +316,7 @@ class LiveHub:
     # ---- 读 ----
 
     def bars(self) -> pd.DataFrame:
-        return bars_from_serial(self._klines, self.period)
+        return resample(bars_from_serial(self._klines, self.period), self._n)
 
     def state(self) -> LiveState:
         """拷一份普通数据出来。界面线程只碰这个，不碰天勤对象。"""

@@ -1309,8 +1309,14 @@ class ResultView(QObject):
         ax.fill_between(eq_s.index, 1, eq_s.values,
                         where=eq_s.values < 1, color="#dc2626", alpha=0.06)
         ax.axhline(1.0, color="#cbd5e1", lw=0.8, ls="--")
-        ax.set_yscale("log")
-        ax.set_ylabel("净值（对数）", fontsize=9, color=C_MUTED)
+        # 权益可能被亏穿成负数（回测不再强平，见 `backtest.run_backtest`）。
+        # 负数在对数轴上没有位置：matplotlib 会把这一段直接丢掉，曲线看着像
+        # 「亏光那天就停了」—— 又变回强平的效果。有非正值就退回线性轴
+        positive = bool((eq_s > 0).all()) and (
+            bh is None or bool((eq_b > 0).all()))
+        if positive:
+            ax.set_yscale("log")
+        ax.set_ylabel("净值（对数）" if positive else "净值", fontsize=9, color=C_MUTED)
         ax.set_title(
             "策略 vs 买入持有 · 资金曲线" if bh is not None else "组合资金曲线（等权）",
             fontsize=11.5, loc="left", color=C_TEXT, pad=8,
@@ -1360,7 +1366,8 @@ class ResultView(QObject):
             card_cagr.set_value(f"{m['cagr']*100:.1f}%", C_UP if m["cagr"] >= 0 else C_DOWN)
             self.card_dd.set_value(f"{m['max_dd']*100:.1f}%", "#ea580c")
             self.card_sharpe.set_value(
-                f"{m['sharpe']:.2f}",
+                # 权益亏穿过时夏普是 NaN（见 `backtest._metrics`），写「—」
+                "—" if m["sharpe"] != m["sharpe"] else f"{m['sharpe']:.2f}",
                 "#0f9d58" if m["sharpe"] >= 1
                 else ("#1f2937" if m["sharpe"] >= 0.5 else "#ea580c"),
             )
@@ -1376,8 +1383,6 @@ class ResultView(QObject):
         if not self.long_only:
             dir_txt = (f" · 多头 {m['long_exposure']*100:.0f}% / 空头 {m['short_exposure']*100:.0f}%"
                        f" · 空头 {m['n_short']} 笔")
-            if m.get("n_blowup"):
-                dir_txt += f" · 爆仓 {m['n_blowup']} 次"
         self.status.emit(
             f"{m['n_trades']} 笔交易 · 胜率 {m['win_rate']*100:.0f}% · "
             f"仓位时间 {m['exposure']*100:.0f}% · "
@@ -1391,7 +1396,12 @@ class ResultView(QObject):
         b = self.bh.metrics if self.bh is not None else None
 
         def pct(x):
-            return f"{x*100:.2f}%"
+            # 亏穿过之后年化波动是 NaN（见 `backtest._metrics`）：写「—」，
+            # 别让表格里出现「nan%」
+            return "—" if x != x else f"{x*100:.2f}%"
+
+        def num(x):
+            return "—" if x != x else f"{x:.2f}"
 
         rows = [
             ("年化收益 CAGR", pct(m["cagr"]), pct(b["cagr"]) if b else "—",
@@ -1400,10 +1410,10 @@ class ResultView(QObject):
              None if b is None else m["total_return"] >= b["total_return"]),
             ("最大回撤", pct(m["max_dd"]), pct(b["max_dd"]) if b else "—",
              None if b is None else m["max_dd"] >= b["max_dd"]),
-            ("夏普比率", f"{m['sharpe']:.2f}", f"{b['sharpe']:.2f}" if b else "—",
-             None if b is None else m["sharpe"] >= b["sharpe"]),
-            ("卡玛比率", f"{m['calmar']:.2f}", f"{b['calmar']:.2f}" if b else "—",
-             None if b is None else m["calmar"] >= b["calmar"]),
+            ("夏普比率", num(m["sharpe"]), num(b["sharpe"]) if b else "—",
+             None if b is None or m["sharpe"] != m["sharpe"] else m["sharpe"] >= b["sharpe"]),
+            ("卡玛比率", num(m["calmar"]), num(b["calmar"]) if b else "—",
+             None if b is None or m["calmar"] != m["calmar"] else m["calmar"] >= b["calmar"]),
             ("年化波动", pct(m["ann_vol"]), pct(b["ann_vol"]) if b else "—",
              None if b is None else m["ann_vol"] <= b["ann_vol"]),
             ("仓位时间占比", pct(m["exposure"]), "100.00%" if b else "—", None),
@@ -1485,8 +1495,6 @@ class ResultView(QObject):
             note = []
             if t.open_position:
                 note.append("持仓中")
-            if t.blowup:
-                note.append("爆仓强平")
             vals = [str(i + 1)]
             if with_name:
                 vals.append(str(name))

@@ -205,8 +205,6 @@ class PortfolioRunner:
         # 已经补过历史的 (品种, 交易所, 源周期)。一台机器开着几十条策略时，
         # 同一个品种会被好几条共享，补一次就够了 —— 每补一次都要写一次库
         self._topped: set[tuple[str, str, str]] = set()
-        # 非源周期策略（15m / 30m / 2h / 4h）为补库额外订的源周期序列
-        self._top_klines: dict[tuple[str, str, str], object] = {}
         # (品种, 交易所, 源周期) -> 上次尝试的时刻。见 `TOP_RETRY`
         self._top_try: dict[tuple[str, str, str], float] = {}
         # 上次失败的原因。同样的原因只打一条日志，不然每 2 秒刷一行
@@ -434,8 +432,11 @@ class PortfolioRunner:
             self._top_up(st)      # 第一次没订成源周期的话，这里接着试
             return
         tq = main_symbol(st.cfg.symbol, st.cfg.exchange)
+        # 订**源周期**再本地合并（15m/30m 走 5m，2h/4h 走 1h），和本地历史的
+        # 合并口径一致；直接订原生 15m 时间边界对不上，拼起来就是碎的
+        src, n = tqdata.PERIODS.get(st.cfg.period, (st.cfg.period, 1))
         self._klines[key] = self.api.get_kline_serial(
-            tq, RT_SEC[st.cfg.period], data_length=KLINE_LEN
+            tq, RT_SEC[src], data_length=min(10000, KLINE_LEN * max(1, n))
         )
         self._quotes[key] = self.api.get_quote(tq)
         self._top_up(st)
@@ -444,8 +445,8 @@ class PortfolioRunner:
         """把引擎手上这份实时 K 线写回本地库，库里就不再停在几天前。
 
         落的是**源周期**（5m / 1h）：15m / 30m / 2h / 4h 在库里本来就是由它们
-        合并出来的，单独存一份读的时候根本对不上。所以非源周期的策略要多订
-        一份源周期序列 —— 只补最近一个月，不碰更早的历史。
+        合并出来的，单独存一份读的时候根本对不上。`_subscribe` 现在一律订源
+        周期，所以这里直接复用那份序列，不再为补库多订一条。
 
         失败不抛：补数据是锦上添花，不该把正在跑的策略打死。刚订阅时序列还
         没填充是常态（`ok=False`），下一 tick 再来。
@@ -462,21 +463,7 @@ class PortfolioRunner:
         if now - self._top_try.get(slot, 0.0) < TOP_RETRY:
             return
         self._top_try[slot] = now
-        if src == st.cfg.period:
-            serial = self._klines.get(self._skey(st.cfg))
-        else:
-            serial = self._top_klines.get(slot)
-            if serial is None:
-                try:
-                    tq = main_symbol(st.cfg.symbol, st.cfg.exchange)
-                    serial = self.api.get_kline_serial(
-                        tq, RT_SEC[src], data_length=topup.TOUP_BARS.get(src, 800)
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self._log(f"{st.title()}：补历史订不上 {src}（"
-                              f"{type(exc).__name__}: {exc}）")
-                    return
-                self._top_klines[slot] = serial
+        serial = self._klines.get(self._skey(st.cfg))
         if serial is None or not len(serial):
             return
         r = topup.save(serial, st.cfg.symbol, st.cfg.exchange, src)
@@ -545,6 +532,9 @@ class PortfolioRunner:
         换月跳空也按前复权抹平。
         """
         live = bars_from_serial(kl, st.cfg.period)
+        n = tqdata.PERIODS.get(st.cfg.period, (st.cfg.period, 1))[1]
+        if n > 1:
+            live = tqdata.resample(live, n)
         if live.empty:
             return live
         key = self._skey(st.cfg)
@@ -1148,7 +1138,9 @@ class PortfolioRunner:
         if kl is None or not len(kl):
             return None
         try:
-            return bars_from_serial(kl, st.cfg.period)
+            df = bars_from_serial(kl, st.cfg.period)
+            n = tqdata.PERIODS.get(st.cfg.period, (st.cfg.period, 1))[1]
+            return tqdata.resample(df, n)
         except Exception:  # noqa: BLE001
             return None
 
@@ -1195,6 +1187,7 @@ class PortfolioRunner:
             # `want_bars()` 点名的策略才带，其余时候是空字典
             "bars": {sid: self.bars_of(sid) for sid in want} if want else {},
             "limits": self.limit.summary(),
+            "limit_used": self.limit.exhausted(),
             "aligning": len(self._align_slot.pending),
             "align_action": self._align_slot.last_action,
         }

@@ -613,12 +613,10 @@ class MainWindow(QMainWindow):
         # 延后一拍：等界面完全建好、第一次分析排上队之后再灌配置，
         # 否则 apply_config 里的 _schedule(immediate=True) 会和首帧抢数据加载。
         QTimer.singleShot(0, self._restore_last_config)
-        # 启动**不自动接实时**。早先 250ms 后就去连天勤：要建连接、拉账户、
-        # （以前还会补历史），网络稍慢整个程序看着就是卡住，而且一开机就把
-        # 资金账号挂上去，也没人想在看回测的时候被动登录。改成界面稳定之后
-        # 才「上膛」，之后用户切品种 / 切周期才接。
+        # 启动后先让界面画完第一帧，再「上膛」并接实时（`_arm_live`）。直接
+        # 250ms 就去连天勤的话，要建连接、拉账户，网络稍慢整个程序看着就是卡住。
         QTimer.singleShot(1500, self._arm_live)
-        self.lbl_live_msg.setText("实时未启动（切换品种或周期会自动接上）")
+        self.lbl_live_msg.setText("实时未启动")
 
     # ---------------------------------------------------------- UI 构建
     def _build_ui(self) -> None:
@@ -2412,21 +2410,28 @@ class MainWindow(QMainWindow):
         return sym, ex
 
     def _arm_live(self) -> None:
-        """界面稳定之后才允许自动接实时。
+        """界面稳定之后「上膛」，并**立刻接一次**实时行情。
 
         `apply_config()` 恢复上次配置时会 `setCurrentIndex()`，那会触发
-        `_on_symbol_changed` → `_auto_live()`。启动阶段这一下不算用户操作 ——
-        不拦的话，「默认不接实时」等于没改。
+        `_on_symbol_changed` → `_auto_live()`。启动阶段这一下不算用户操作，
+        所以先拦着，等界面画完第一帧再放开。
+
+        放开的同时主动接一次：打开「K 线与信号」看到的就是当前行情，这是默认
+        预期。早先只上膛不接，结果不换品种、不切周期就永远等不到连接 ——
+        尤其是 1h：一分钟里也不会换一次品种，图就一直停在库里最后一根。
+        `TRENDDESK_NO_LIVE=1` 时不接（离屏截图 / 冒烟测试不该真去登录天勤）。
         """
         self._live_armed = True
+        if os.environ.get("TRENDDESK_NO_LIVE"):
+            self.lbl_live_msg.setText("实时未启动（TRENDDESK_NO_LIVE）")
+            return
+        self._auto_live()
 
     def _auto_live(self) -> None:
-        """用户切品种 / 周期时接上实时行情。
+        """接上实时行情：启动时一次，之后用户切品种 / 周期再各接一次。
 
-        K 线与信号页并进公共视图之后，「启动实时」按钮没了。但也不能一开机
-        就去连账户 —— 网络一慢界面就像卡死，而且看回测的人未必想登录资金账号。
-        所以：启动不接，等用户主动换品种或周期再接；条件不够就写一句原因，
-        不弹窗、不拦人。
+        K 线与信号页并进公共视图之后，「启动实时」按钮没了，所以这里就是唯一
+        的入口。条件不够就写一句原因，不弹窗、不拦人（比如没配天勤账户）。
         """
         if not self._live_armed:
             return
@@ -2516,7 +2521,8 @@ class MainWindow(QMainWindow):
     def _on_live_state(self, st) -> None:
         self._live_state = st
         q = st.quote or {}
-        if q and self._live_base is not None:
+        # 不要求本地历史存在：没补过历史时实时段照样在跑，报价更该看得见
+        if q:
             und = q.get("underlying") or ""
             self.lbl_live_msg.setText(
                 f"{q.get('name', '')} {und} {q.get('last', 0):.2f}"
@@ -2525,7 +2531,7 @@ class MainWindow(QMainWindow):
 
     def _on_live_bars(self, live_df) -> None:
         """实时 K 线到了：新 bar 就整体重算，同一根内只刷价格。"""
-        if self._closing or self._live_base is None or live_df is None or live_df.empty:
+        if self._closing or live_df is None or live_df.empty:
             return
         pair = self._current_pair()
         if pair is None or self._live_key != f"{pair[0]}_{pair[1]}":
@@ -2539,13 +2545,18 @@ class MainWindow(QMainWindow):
                 and now - self._live_patch_ts < 0.4):
             return
         self._live_patch_ts = now
+        # 本地一根都没有（这个周期还没补过历史，或者补历史失败了）时也要画：
+        # 实时段自己就是全部行情，3000 根 1h 足够算指标。早先这里在
+        # `_live_base is None` 上直接 return，表现是「标签写着实时中、图一动不动」
         merged = tqlive.merge_live(self._live_base, live_df)
         if merged.empty:
             return
-        ts = merged.index[-1]
-        new_bar = self._live_last is not None and ts != self._live_last
+        # 拿**实时段**的最后一根判断「是不是新 bar」。合并后的最后一根可能是库里
+        # 更晚的那根（下载写进了半根活 bar），拿它比会一直判成「同一根」，
+        # 实时 bar 永远进不了图
+        new_bar = self._live_last is not None and ts_new != self._live_last
         first = self._live_last is None
-        self._live_last = ts
+        self._live_last = ts_new
         if first or new_bar:
             # 新 bar 走完整重算：信号只认走完的 bar，避免一根没走完的 K 线反复开平
             self.run_analysis(df_override=merged)

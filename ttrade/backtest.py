@@ -7,7 +7,9 @@
 4. **仓位按手数下**（见 `BacktestConfig.sizing`）：期货是「分配资金 ÷ 每手保证金」，
    杠杆由品种自己的保证金比例决定；美股没有杠杆概念，走 `unit` 口径（名义敞口 =
    权益）；
-5. 空头遇到价格暴涨导致权益归零时强制平仓（爆仓），后续不再交易；
+5. **不做爆仓强平**。权益亏穿（为负）也照跑到底：回测是虚拟测试，杠杆按品种
+   保证金率算，比实盘敢开的大得多，强平掉只会把后半段历史抹掉。要看的是「这套
+   规则从头到尾发生了什么」，而不是「几几年被抬走」；
 6. 空仓时资金闲置（不计利息）。
 
 ## 为什么权益是「现金 + 浮动盈亏」而不是「市值」
@@ -90,7 +92,6 @@ class Trade:
     bars: int
     direction: int = 1            # 1=多头，-1=空头
     open_position: bool = False
-    blowup: bool = False          # 是否因爆仓强平
     lots: float = 0.0             # 这笔实际下了多少手（unit 口径是份额，小数）
 
 
@@ -106,7 +107,7 @@ class Result:
 _METRIC_KEYS = (
     "total_return", "cagr", "ann_vol", "sharpe", "max_dd", "calmar",
     "exposure", "long_exposure", "short_exposure",
-    "n_trades", "n_long", "n_short", "n_blowup",
+    "n_trades", "n_long", "n_short",
     "win_rate", "avg_trade", "profit_factor",
     "avg_bars", "best_trade", "worst_trade",
 )
@@ -118,12 +119,23 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
     if len(equity) < 2:
         return {k: 0.0 for k in _METRIC_KEYS}
 
+    # 权益可能被亏穿成负数（回测不再强平，见 `run_backtest`）。拿负数当基数算
+    # 收益率没有意义 —— -100 亏到 -50 会算出 +50% —— 所以只保留「上一根还是
+    # 正的」那些，之后的收益记 0，波动和夏普不会再被翻号后的假反弹污染
     ret = equity.pct_change().fillna(0.0)
-    total = equity.iloc[-1] / equity.iloc[0] - 1.0
+    ret = ret.where(equity.shift(1) > 0, 0.0)
+    ratio = equity.iloc[-1] / equity.iloc[0]
+    total = ratio - 1.0
 
     days = max((equity.index[-1] - equity.index[0]).days, 1)
     years = days / 365.25
-    cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1 / years) - 1 if years > 0 else 0.0
+    # 负数开 1/years 次方是复数，直接算「全部亏完」
+    if years <= 0:
+        cagr = 0.0
+    elif ratio <= 0:
+        cagr = -1.0
+    else:
+        cagr = ratio ** (1 / years) - 1
 
     bpy = float(bars_per_year or TRADING_DAYS)
     vol = ret.std(ddof=1) * np.sqrt(bpy) if ret.std(ddof=1) > 0 else 0.0
@@ -132,6 +144,13 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
     dd_series = equity / equity.cummax() - 1.0
     max_dd = float(dd_series.min())
     calmar = cagr / abs(max_dd) if max_dd < 0 else 0.0
+
+    # 权益一旦被亏穿，「相对上一根」的百分比收益会在 0 附近炸开（300 → 20000
+    # 就是 +6500%），年化波动能算出六位数、夏普随之失去意义，卡玛也是。这三个
+    # 是**比例型**指标，亏穿过就标 NaN，界面显示「—」；累计收益、最大回撤、
+    # 期末资金这些绝对值指标照常给
+    if float(equity.min()) <= 0:
+        vol = sharpe = calmar = float("nan")
 
     pos = position.reindex(equity.index).fillna(0)
     long_expo = float((pos > 0).mean())
@@ -166,7 +185,6 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
         "n_trades": n,
         "n_long": sum(1 for t in closed if t.direction == 1),
         "n_short": sum(1 for t in closed if t.direction == -1),
-        "n_blowup": sum(1 for t in trades if t.blowup),
         "win_rate": float(win_rate),
         "avg_trade": avg_trade,
         "profit_factor": profit_factor,
@@ -258,7 +276,6 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     cash = float(cfg.initial_cash)
     lots = 0.0                   # 正=多，负=空，0=空仓（unit 口径是份额）
     pos = 0                      # 1=多，-1=空，0=平
-    dead = False                 # 爆仓后停止交易
     pos_state = np.zeros(n, dtype=int)
     equity = np.zeros(n, dtype=float)
     trades: list[Trade] = []
@@ -266,7 +283,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     entry_bar = 0
     entry_dir = 1
 
-    def close_position(i: int, price: float, held: float, blowup: bool = False) -> None:
+    def close_position(i: int, price: float, held: float) -> None:
         nonlocal entry_price, entry_date
         if entry_price is None:
             return
@@ -279,17 +296,12 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
                 ret=_trade_ret(entry_dir, entry_price, price),
                 bars=i - entry_bar,
                 direction=entry_dir,
-                blowup=blowup,
                 lots=abs(float(held)),
             )
         )
         entry_price = entry_date = None
 
     for i in range(n):
-        if dead:
-            equity[i] = 0.0
-            continue
-
         want = target[i]
         if want != pos:
             # ---- 先平掉现有仓位 ----
@@ -314,14 +326,6 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
                     pos = want
 
         eq = cash + (lots * mult * (close[i] - entry_price) if pos != 0 else 0.0)
-
-        # ---- 爆仓：权益归零则强平 ----
-        if eq <= 0 and pos != 0:
-            cash += lots * mult * (close[i] - entry_price)
-            close_position(i, close[i], lots, blowup=True)
-            cash, lots, pos = 0.0, 0.0, 0
-            dead = True
-            eq = 0.0
 
         pos_state[i] = pos
         equity[i] = eq

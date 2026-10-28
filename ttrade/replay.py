@@ -105,6 +105,17 @@ def hold_text(bars: float, period: str, bars_per_year: float = 252.0) -> str:
     return f"{bars:.0f} 根（约 {days:.0f} 天）"
 
 
+def _num(x) -> str:
+    """两位小数；NaN 写「—」。权益被亏穿时夏普 / 卡玛是 NaN（见
+    `backtest._metrics`），直接格式化会写出「nan」，模型读到也莫名其妙。"""
+    try:
+        if x != x:
+            return "—"
+    except TypeError:
+        return "—"
+    return f"{float(x):.2f}"
+
+
 def summary(rp: "Replay", head: str, period: str) -> str:
     """把一次回放摊成一段纯文本。
 
@@ -132,13 +143,13 @@ def summary(rp: "Replay", head: str, period: str) -> str:
     lines = [title, span]
     lines.append(
         f"策略  总收益 {m['total_return'] * 100:+.1f}%｜年化 {m['cagr'] * 100:+.2f}%"
-        f"｜最大回撤 {m['max_dd'] * 100:.1f}%｜夏普 {m['sharpe']:.2f}"
-        f"｜卡玛 {m['calmar']:.2f}"
+        f"｜最大回撤 {m['max_dd'] * 100:.1f}%｜夏普 {_num(m['sharpe'])}"
+        f"｜卡玛 {_num(m['calmar'])}"
     )
     if b is not None:
         lines.append(
             f"基准  总收益 {b['total_return'] * 100:+.1f}%｜年化 {b['cagr'] * 100:+.2f}%"
-            f"｜最大回撤 {b['max_dd'] * 100:.1f}%｜夏普 {b['sharpe']:.2f}"
+            f"｜最大回撤 {b['max_dd'] * 100:.1f}%｜夏普 {_num(b['sharpe'])}"
         )
         lines.append(f"超额  {(m['cagr'] - b['cagr']) * 100:+.2f}%/年")
     lines.append(
@@ -150,7 +161,6 @@ def summary(rp: "Replay", head: str, period: str) -> str:
         lines.append(
             f"方向  多头 {m['long_exposure'] * 100:.0f}% / 空头 {m['short_exposure'] * 100:.0f}%"
             f"｜空头 {m['n_short']} 笔"
-            + (f"｜爆仓 {m['n_blowup']} 次" if m.get("n_blowup") else "")
         )
     return "\n".join(lines)
 
