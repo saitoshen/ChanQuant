@@ -2622,6 +2622,54 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+_INSTANCE_NAME = "TrendDesk-single-instance-7f3a"
+
+
+def _claim_instance(app) -> bool:
+    """单实例：已经有窗口在跑就把那个叫到前面，自己退出。
+
+    两个进程连同一个天勤账户时，后连上的那个**拿不到资金和持仓** —— 服务端
+    只把账户数据喂给其中一个，界面上就是「已连接，但六个资金卡片全是 —、
+    三张表全空」，看着跟卡死一样。更糟的是前一个进程如果还停在组合页的调仓
+    循环里，两个进程会互相把仓位改来改去（一个平、一个开，来回刷）。
+
+    用 `QLocalServer` 而不是文件锁：进程被强杀时命名管道由系统回收，不会留下
+    一个「上次没删掉的锁文件」把人挡在外面。
+    """
+    try:
+        from PySide6.QtNetwork import QLocalServer, QLocalSocket
+    except Exception:      # noqa: BLE001 - 没有 QtNetwork 就别拦，别耽误启动
+        return True
+
+    probe = QLocalSocket()
+    probe.connectToServer(_INSTANCE_NAME)
+    if probe.waitForConnected(300):
+        probe.write(b"show")
+        probe.flush()
+        probe.waitForBytesWritten(300)
+        probe.disconnectFromServer()
+        return False
+
+    QLocalServer.removeServer(_INSTANCE_NAME)
+    server = QLocalServer(app)
+    if not server.listen(_INSTANCE_NAME):
+        return True        # 服务端起不来也不能拦人，宁可多开也不要打不开
+
+    def _on_conn() -> None:
+        conn = server.nextPendingConnection()
+        if conn is not None:
+            conn.disconnected.connect(conn.deleteLater)
+        win = getattr(app, "_main_window", None)
+        if win is not None:
+            win.showNormal()
+            win.raise_()
+            win.activateWindow()
+
+    server.newConnection.connect(_on_conn)
+    app._instance_server = server      # 挂住，别被 GC 回收
+    return True
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("趋势跟踪研究台")
@@ -2629,7 +2677,11 @@ def main() -> int:
     setup_light_palette(app)
     app.setStyleSheet(STYLE_SHEET)
 
+    if not _claim_instance(app):
+        return 0
+
     win = MainWindow()
+    app._main_window = win
     win.show()
 
     if not win.store.symbols:

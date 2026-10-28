@@ -206,6 +206,7 @@ class TradePage(QWidget):
         super().__init__(parent)
         self.live = live
         self._state = LiveState()
+        self._sig: dict[str, object] = {}     # 每张表上次画的内容，没变就不重画
         self._accounts: list[AccountSpec] = tqlive.load_accounts()
         self._build()
         self._reload_accounts()
@@ -492,9 +493,30 @@ class TradePage(QWidget):
                 if self.sp_price.value() <= 0:
                     self.sp_price.setValue(float(last or 0))
 
-        self._fill_positions(st.positions)
-        self._fill_orders(st.orders)
-        self._fill_trades(st.trades)
+        # 表格每 0.4 秒重建一次，一天几百条委托时一次要几百毫秒 —— 切到本页
+        # 第一帧就得摆几千个单元格，看着就是「一切过来就卡住」。内容没变就跳过。
+        self._fill_if_changed(
+            "pos", st.positions, self._fill_positions,
+            tuple((r.get("symbol"), r.get("pos"), r.get("pos_long_today"),
+                   r.get("pos_short_today"), round(r.get("float_profit") or 0, 2),
+                   round(r.get("margin") or 0, 2))
+                  for r in st.positions),
+        )
+        self._fill_if_changed(
+            "ord", st.orders, self._fill_orders,
+            tuple((r.get("order_id"), r.get("status"), r.get("volume_left"),
+                   r.get("last_msg")) for r in st.orders),
+        )
+        self._fill_if_changed(
+            "trd", st.trades, self._fill_trades,
+            tuple(r.get("trade_id") for r in st.trades),
+        )
+
+    def _fill_if_changed(self, name: str, rows: list[dict], fill, sig) -> None:
+        if self._sig.get(name) == sig:
+            return
+        self._sig[name] = sig
+        fill(rows)
 
     def _fill_positions(self, rows: list[dict]) -> None:
         t = self.tbl_pos

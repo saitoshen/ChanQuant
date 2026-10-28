@@ -184,6 +184,12 @@ def merge_live(local: pd.DataFrame, live: pd.DataFrame) -> pd.DataFrame:
 # ------------------------------------------------------------------ 会话
 
 
+# 委托 / 成交表最多显示多少条。一天下来「被拒的废单」能有几百上千条
+# （拒单循环那种情况），全塞进 QTableWidget 之后，切到账户页第一帧要摆
+# 几万个单元格，界面直接卡死。只留最近的，用户要看细节有委托号可查。
+SNAP_ROWS = 200
+
+
 @dataclass
 class LiveState:
     """一次快照，界面拿去直接刷控件。全是普通 dict/list，不持有天勤对象。"""
@@ -408,8 +414,14 @@ class LiveHub:
         src = self._orders
         if src is None:
             return []
+        items = list(src.items()) if hasattr(src, "items") else []
+        # **先挑后拼**：一天被拒的废单能有几千条，全拼一遍 dict 再截断，
+        # 等于每 0.4 秒白烧一次 CPU，还要和主线程抢 GIL。先排序取前 N 条，
+        # 只给这几条建 dict。
+        items.sort(key=lambda kv: (getattr(kv[1], "status", "") != "ALIVE",
+                                   -self._num(kv[1], "insert_date_time")))
         out = []
-        for oid, o in (src.items() if hasattr(src, "items") else []):
+        for oid, o in items[:SNAP_ROWS]:
             out.append({
                 "order_id": oid,
                 "symbol": getattr(o, "instrument_id", "") or getattr(o, "symbol", ""),
@@ -422,16 +434,16 @@ class LiveHub:
                 "last_msg": getattr(o, "last_msg", ""),
                 "insert_date_time": self._num(o, "insert_date_time"),
             })
-        # 还活着的排前面，其次按时间倒序
-        out.sort(key=lambda r: (r["status"] != "ALIVE", -r["insert_date_time"]))
         return out
 
     def _trades_snapshot(self) -> list[dict]:
         src = self._trades
         if src is None:
             return []
+        items = list(src.items()) if hasattr(src, "items") else []
+        items.sort(key=lambda kv: -self._num(kv[1], "trade_date_time"))
         out = []
-        for tid, t in (src.items() if hasattr(src, "items") else []):
+        for tid, t in items[:SNAP_ROWS]:
             out.append({
                 "trade_id": tid,
                 "order_id": getattr(t, "order_id", ""),
@@ -442,7 +454,6 @@ class LiveHub:
                 "volume": int(self._num(t, "volume")),
                 "trade_date_time": self._num(t, "trade_date_time"),
             })
-        out.sort(key=lambda r: -r["trade_date_time"])
         return out
 
     # ---- 写 ----

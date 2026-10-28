@@ -329,6 +329,37 @@ def check_live_helpers() -> None:
           and rows[0]["open_price_short"] == 109360.0,
           f"{rows[0]['open_price_long']}")
 
+    # 委托 / 成交快照只留最近 N 条。一天被拒的废单能有几千条，全塞进
+    # QTableWidget 之后，切到「账户透视和交易」第一帧就要摆几万个单元格，
+    # 界面直接卡死（用户报的「一切到这个页就卡住」）
+    def _ord(i, status="FINISHED"):
+        return SimpleNamespace(
+            instrument_id="ag2612", direction="SELL", offset="CLOSE",
+            volume_orign=2, volume_left=0, limit_price=13112.0, status=status,
+            last_msg="平昨手数超过持仓仓量", insert_date_time=1e18 - i,
+        )
+
+    hub._orders = {f"o{i}": _ord(i) for i in range(L.SNAP_ROWS * 3)}
+    rows = hub._orders_snapshot()
+    check("实时⑧委托快照只留最近 N 条", len(rows) == L.SNAP_ROWS, f"{len(rows)} 条")
+    check("实时⑧委托按时间倒序",
+          rows[0]["insert_date_time"] > rows[-1]["insert_date_time"])
+
+    hub._orders = {**{f"o{i}": _ord(i) for i in range(L.SNAP_ROWS * 3)},
+                   "alive": _ord(0, status="ALIVE")}
+    rows = hub._orders_snapshot()
+    check("实时⑧未成交委托不会被截掉", rows[0]["status"] == "ALIVE", rows[0]["status"])
+
+    def _trd(i):
+        return SimpleNamespace(
+            order_id=f"o{i}", instrument_id="ag2612", direction="SELL",
+            offset="CLOSE", price=13112.0, volume=2, trade_date_time=1e18 - i,
+        )
+
+    hub._trades = {f"t{i}": _trd(i) for i in range(L.SNAP_ROWS * 3)}
+    rows = hub._trades_snapshot()
+    check("实时⑧成交快照只留最近 N 条", len(rows) == L.SNAP_ROWS, f"{len(rows)} 条")
+
     old = os.environ.get("LOCALAPPDATA")
     tmpdir = tempfile.mkdtemp(prefix="tqacct_")
     os.environ["LOCALAPPDATA"] = tmpdir

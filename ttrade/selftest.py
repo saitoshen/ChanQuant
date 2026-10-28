@@ -553,6 +553,12 @@ def _run() -> tuple[bool, list[str]]:
         win.resize(1280, 820)
         win.show()
         app.processEvents()
+        # 启动时首次回测是延后 220ms 排队的（先让窗口画出来再算）。自检里没有
+        # 真的事件循环，这里直接把它跑完 —— 否则它会挑在后面测滚轮 / 组合的
+        # 时候插进来重画一次，窗口被重置，滚轮那项就时好时坏。
+        if getattr(win, "_pending", False):
+            win._deferred_run()
+            app.processEvents()
         n = len(win.store.symbols)
         has_res = getattr(win, "res", None) is not None
         # 数据管理页：五个页面按钮一一对应，补数据的控件在数据页里。
