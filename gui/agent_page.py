@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -339,6 +340,65 @@ class ConfirmDialog(QDialog):
         return self.chk_silent.isChecked()
 
 
+class ManualDialog(QDialog):
+    """平台手册预览。
+
+    整份约四万字，用只读文本框摊开 —— 用户要核对「模型到底看到了什么」时，
+    翻这里比翻源码快。另存为 Markdown 是给「想把手册喂给别的模型」用的。
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        from ttrade import factor_manual as M
+
+        self.setWindowTitle("平台手册 · 数据与因子")
+        self.resize(900, 720)
+        self.text = M.manual()
+
+        lay = QVBoxLayout(self)
+        head = QLabel(
+            "「交易Agent」查资料时看到的就是这份内容：行情从哪来、平台注入了哪些"
+            "原语、每个因子的完整实现。它自己也会用 doc 动作按需取其中一段。"
+        )
+        head.setWordWrap(True)
+        head.setObjectName("Hint")
+        lay.addWidget(head)
+
+        box = QPlainTextEdit(self.text)
+        box.setReadOnly(True)
+        box.setStyleSheet(
+            "font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 12px;"
+        )
+        lay.addWidget(box, 1)
+
+        row = QHBoxLayout()
+        self.lbl_info = QLabel(f"{len(self.text)} 字符")
+        self.lbl_info.setObjectName("Hint")
+        row.addWidget(self.lbl_info, 1)
+        btn_save = QPushButton("另存为 Markdown")
+        btn_save.setObjectName("Ghost")
+        btn_save.clicked.connect(self._save)
+        row.addWidget(btn_save)
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.accept)
+        row.addWidget(btn_close)
+        lay.addLayout(row)
+
+    def _save(self) -> None:
+        from ttrade import factor_manual as M
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存平台手册",
+            os.path.join(user_dir(), "platform_manual.md"),
+            "Markdown (*.md)",
+        )
+        if not path:
+            return
+        ok, msg = M.save(path)
+        self.lbl_info.setText(msg)
+        self.lbl_info.setStyleSheet(f"color: {C_OK if ok else C_BAD}; font-size: 11px;")
+
+
 class SettingsDialog(QDialog):
     """模型配置。"""
 
@@ -544,7 +604,7 @@ class AgentPage(QWidget):
         self._memo_worker: MemoWorker | None = None
         self._memo_thread: QThread | None = None
         self._memo_warned = False     # 压缩失败只提示一次，别每轮都刷
-        self._fs_turns = 0            # 本轮提问已经连续自动跑了几次文件动作
+        self._tool_turns = 0            # 本轮提问已经连续自动跑了几次工具动作（查手册 / 读写文件）
         self._build()
         self._refresh_status()
         self._fill_factors()
@@ -580,15 +640,24 @@ class AgentPage(QWidget):
         self.tabs.currentChanged.connect(self._on_tab)
         lay.addWidget(self.tabs, 1)
 
-        foot = QHBoxLayout()
+        foot = QVBoxLayout()
+        foot.setSpacing(4)
         self.lbl_model = QLabel("")
         self.lbl_model.setObjectName("Hint")
         self.lbl_model.setWordWrap(True)
-        foot.addWidget(self.lbl_model, 1)
+        foot.addWidget(self.lbl_model)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.btn_manual = QPushButton("手册")
+        self.btn_manual.setObjectName("Ghost")
+        self.btn_manual.setToolTip("平台手册：数据链路、注入的原语、每个因子的完整实现")
+        self.btn_manual.clicked.connect(self._open_manual)
+        row.addWidget(self.btn_manual)
         btn_cfg = QPushButton("设置")
         btn_cfg.setObjectName("Ghost")
         btn_cfg.clicked.connect(self._open_settings)
-        foot.addWidget(btn_cfg)
+        row.addWidget(btn_cfg)
+        foot.addLayout(row)
         lay.addLayout(foot)
         return card
 
@@ -946,7 +1015,7 @@ class AgentPage(QWidget):
         self._append(f"<p style='margin:12px 0 2px 0'><b>助手</b></p>")
 
         self._history.append({"role": "user", "content": text})
-        self._fs_turns = 0
+        self._tool_turns = 0
         msgs = A.build_messages(
             A.trim_history(self._history[:-1]), text, memory=Mem.brief(),
             allow_fs=self.cfg.allow_fs,
@@ -1009,7 +1078,7 @@ class AgentPage(QWidget):
         self._pending_report = ""
 
     def _on_thread_done(self) -> None:
-        # 旧线程收尾时不能动状态：文件动作会连着起好几轮，上一轮的 `finished`
+        # 旧线程收尾时不能动状态：工具动作会连着起好几轮，上一轮的 `finished`
         # 可能比新一轮晚到，一律清空的话新线程就没人管了（按钮提前变灰）。
         if self.sender() is not None and self.sender() is not self._thread:
             return
@@ -1043,9 +1112,9 @@ class AgentPage(QWidget):
         """
         if self._memo_thread is not None or not self.cfg.ready():
             return
-        # 文件动作还在自动续跑：这段历史下一秒就要用，压掉再删会让模型丢掉
-        # 刚读到的文件内容。等这轮结束、用户下一句再压
-        if self._fs_turns:
+        # 工具动作还在自动续跑：这段历史下一秒就要用，压掉再删会让模型丢掉
+        # 刚查到的内容。等这轮结束、用户下一句再压
+        if self._tool_turns:
             return
         n = len(self._history) - self.MEMO_KEEP
         if n < self.MEMO_AT - self.MEMO_KEEP:
@@ -1122,9 +1191,12 @@ class AgentPage(QWidget):
     # ---------------------------------------------------------- 动作
 
     def _handle_action(self, action: A.Action) -> None:
-        # 文件动作自己管确认框（读直接做、写必须弹），所以先走掉
+        # 工具动作自己管确认框（文件写入必须弹、读和查手册不用），所以先走掉
         if action.kind == "fs":
             self._run_fs_action(action)
+            return
+        if action.kind == "doc":
+            self._run_doc_action(action)
             return
 
         # 只有「会改本机状态」的动作才拦：下单、注册因子。回测是只读操作，为它
@@ -1160,11 +1232,24 @@ class AgentPage(QWidget):
         )
         self.trade_requested.emit(action)
 
-    # ---------------------------------------------------------- 文件动作
+    # ---------------------------------------------------------- 工具动作
 
-    # 一次提问里最多连续自动跑几轮文件动作。模型拿到读取结果后可能再读、再写，
+    # 一次提问里最多连续自动跑几轮工具动作。模型拿到结果后可能再查、再读、再写，
     # 不封顶的话它俩能来回刷到把 token 烧光。
-    MAX_FS_TURNS = 4
+    MAX_TOOL_TURNS = 4
+
+    def _run_doc_action(self, action: A.Action) -> None:
+        """查平台手册。只读本地文本，不碰磁盘、不弹框。"""
+        from ttrade import factor_manual as M
+
+        topic = action.payload.get("topic", "")
+        title, body = M.resolve(topic)
+        self._append(
+            f"<p style='color:{C_MUTED};font-size:11px'>已查阅平台手册：{_esc(title)}"
+            f"（{len(body)} 字符）</p>"
+        )
+        self._set_state(f"已查手册：{title}", C_OK)
+        self._after_tool(f"平台手册「{title}」的内容：\n\n{body}")
 
     def _run_fs_action(self, action: A.Action) -> None:
         """执行 `fs` 动作：读和列目录直接做，写必须弹确认框。"""
@@ -1188,19 +1273,19 @@ class AgentPage(QWidget):
         if op == "list":
             text, err = FS.list_dir(path)
             if err:
-                self._after_fs(f"列出 {path} 失败：{err}")
+                self._after_tool(f"列出 {path} 失败：{err}")
                 return
             self._append(
                 f"<p style='color:{C_MUTED};font-size:11px'>已列出 {_esc(path)}</p>"
                 f"<pre style='font-size:11px'>{_esc(text)}</pre>"
             )
-            self._after_fs(f"目录 {path} 的内容：\n{text}")
+            self._after_tool(f"目录 {path} 的内容：\n{text}")
             return
 
         if op == "read":
             text, err = FS.read_text(path)
             if err:
-                self._after_fs(f"读取 {path} 失败：{err}")
+                self._after_tool(f"读取 {path} 失败：{err}")
                 return
             # 日志里只贴前 4000 字符：整篇贴进去 QTextBrowser 会卡，而用户
             # 真要核对时看文件本身更快。喂给模型的仍是全文。
@@ -1211,7 +1296,7 @@ class AgentPage(QWidget):
                 f"<pre style='white-space:pre-wrap;font-family:Consolas,monospace;"
                 f"font-size:11px'>{_esc(shown)}</pre>"
             )
-            self._after_fs(f"文件 {path} 的全文：\n```\n{text}\n```")
+            self._after_tool(f"文件 {path} 的全文：\n```\n{text}\n```")
             return
 
         # 写：内容摊开给人看。读可以不问，写不行 —— 一次覆盖就是几十行没了。
@@ -1219,15 +1304,15 @@ class AgentPage(QWidget):
         dlg = ConfirmDialog(action, self)
         if dlg.exec() != QDialog.Accepted:
             self._append(f"<p style='color:{C_MUTED};font-size:11px'>已取消写入。</p>")
-            self._after_fs(f"用户拒绝写入 {path}，不要重试同一个改动，先问清楚要改什么。")
+            self._after_tool(f"用户拒绝写入 {path}，不要重试同一个改动，先问清楚要改什么。")
             return
         ok, msg = FS.write_text(path, content)
         color = C_OK if ok else C_BAD
         self._append(f"<p style='color:{color}'>{_esc(msg)}</p>")
         self._set_state(msg[:80], color)
-        self._after_fs(("写入成功：" if ok else "写入失败：") + msg)
+        self._after_tool(("写入成功：" if ok else "写入失败：") + msg)
 
-    def _after_fs(self, result: str) -> None:
+    def _after_tool(self, result: str) -> None:
         """把执行结果喂回模型，让它接着干。
 
         标成 `user` 角色是协议限制：OpenAI 兼容端点里没有 `tool` 角色，塞进
@@ -1235,16 +1320,17 @@ class AgentPage(QWidget):
         """
         note = "【平台执行结果】\n" + result + "\n\n需要继续就再给一个动作块，不需要就用人话总结。"
         self._history.append({"role": "user", "content": note})
-        if self._fs_turns >= self.MAX_FS_TURNS:
+        if self._tool_turns >= self.MAX_TOOL_TURNS:
             self._append(
-                f"<p style='color:{C_MUTED};font-size:11px'>文件动作已连续执行 "
-                f"{self._fs_turns} 轮，先停在这里。要继续就再发一句。</p>"
+                f"<p style='color:{C_MUTED};font-size:11px'>工具动作已连续执行 "
+                f"{self._tool_turns} 轮，先停在这里。要继续就再发一句。</p>"
             )
             return
-        self._fs_turns += 1
+        self._tool_turns += 1
         msgs = A.build_messages(
             A.trim_history(self._history[:-1]), note,
-            memory=Mem.brief(), allow_fs=True,
+            # 沿用当前开关：关着的时候不能因为「续跑」就悄悄把文件能力塞回去
+            memory=Mem.brief(), allow_fs=self.cfg.allow_fs,
         )
         self._append("<p style='margin:12px 0 2px 0'><b>助手</b></p>")
         self._stream_buf = ""
@@ -1483,6 +1569,9 @@ class AgentPage(QWidget):
         self._set_state(f"研报已保存：{name}.md", C_OK)
 
     # ---------------------------------------------------------- 设置
+
+    def _open_manual(self) -> None:
+        ManualDialog(self).exec()
 
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self.cfg, self)

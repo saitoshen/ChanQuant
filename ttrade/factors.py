@@ -64,6 +64,20 @@ def _col(df: pd.DataFrame, name: str) -> pd.Series:
     return pd.to_numeric(df[name], errors="coerce").astype(float)
 
 
+def _oi(df: pd.DataFrame) -> pd.Series:
+    """持仓量，统一取法。
+
+    **两条数据链路的列名不一样**：Tushare 日线 CSV 叫 `open_interest`，天勤
+    分钟线叫 `open_oi`（还多一个收盘时的 `close_oi`）。因子直接写
+    `df["open_interest"]` 在分钟线上就是 KeyError / 全 NaN —— 曾经 `oi_change`
+    在 1h/5m 上整列空着，看起来像「天勤不给持仓量」，其实数据一直在。
+    """
+    for name in ("open_interest", "open_oi"):
+        if name in df.columns:
+            return pd.to_numeric(df[name], errors="coerce").astype(float)
+    return _nan_series(df)
+
+
 def _safe_log_ratio(a: pd.Series, b: pd.Series) -> pd.Series:
     """ln(a/b)，任一侧非正时返回 NaN。"""
     ok = (a > 0) & (b > 0)
@@ -416,11 +430,8 @@ def f_illiq(df: pd.DataFrame) -> pd.Series:
 
 def f_oi_change(df: pd.DataFrame) -> pd.Series:
     """持仓量 20 日变化率。期货特有：增仓上涨比减仓上涨更可信。"""
-    if "open_interest" not in df.columns:
-        return _nan_series(df)
-    oi = pd.to_numeric(df["open_interest"], errors="coerce")
-    oi = oi.where(oi > 0)
-    return oi.pct_change(20)
+    oi = _oi(df)
+    return oi.where(oi > 0).pct_change(20)
 
 
 # ---------------------------------------------------------------- 形态 / 结构

@@ -96,6 +96,8 @@ HIDDEN = [
     # Agent 的升级权限：`agent_fs` 只在函数里 import（默认权限下根本用不到），
     # 打包时要是漏了，用户勾上那个开关之后每一次文件动作都会 ImportError
     "ttrade.agent_fs",
+    # 平台手册同理：只有 Agent 查手册时才 import，漏了就是「点了手册没反应」
+    "ttrade.factor_manual",
     "gui.data_page",
 ]
 

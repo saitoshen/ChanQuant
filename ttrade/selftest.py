@@ -493,14 +493,30 @@ def _run() -> tuple[bool, list[str]]:
             fs_ok = bool(root) and os.path.isdir(root)
         except Exception as exc:  # noqa: BLE001
             fs_ok, fs_err = False, f"{type(exc).__name__}: {exc}"
+        # 平台手册同样是函数里 import 的。而且它靠 inspect 取源码 —— 打包后
+        # 如果 .py 没打进去，手册会退化成一堆空代码块，界面上看不出来，
+        # 模型照着学就是一片空白。这里要求每段都有代码。
+        manual_ok = True
+        manual_info = ""
+        try:
+            from ttrade import factor_manual as M
+            from ttrade.factors import FACTORS
+
+            sec = M.factor_section("mom_20")
+            manual_ok = "def f_mom_20(" in sec and "def _ret(" in M.primitive_section()
+            manual_info = f"{len(M.manual())} 字符 / {len(FACTORS)} 个因子"
+        except Exception as exc:  # noqa: BLE001
+            manual_ok, manual_info = False, f"{type(exc).__name__}: {exc}"
         agent_ok = (
             ap is not None
             and hasattr(ap, "btn_del_factor")
             and hasattr(ap, "btn_del_strat")
+            and hasattr(ap, "btn_manual")
             and not ap.btn_del_factor.isEnabled()
             and not ap.btn_del_strat.isEnabled()
             and ap.cfg.allow_fs is False
             and fs_ok
+            and manual_ok
         )
         # K 线可视窗口：初始应停在最新一段，且滚动条范围与窗口自洽
         k_ok = (
@@ -577,8 +593,10 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError("数据管理页缺失或初始状态异常")
         if not agent_ok:
             raise RuntimeError(
-                "交易Agent 页异常：删除按钮初始状态不对，或升级权限的文件模块取不到"
+                "交易Agent 页异常：删除按钮初始状态不对，或升级权限的文件模块 / "
+                "平台手册取不到"
                 + (f"（{fs_err}）" if fs_err else "")
+                + (f"（手册：{manual_info}）" if not manual_ok else "")
             )
         if not wheel_ok:
             raise RuntimeError(
@@ -598,7 +616,8 @@ def _run() -> tuple[bool, list[str]]:
         if n_axes != 4:
             raise RuntimeError(f"因子分析页图轴数为 {n_axes}，应为 4")
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
-                f"{factor_info}，滚轮缩放 {wheel_info}，数据管理页就绪")
+                f"{factor_info}，滚轮缩放 {wheel_info}，数据管理页就绪，"
+                f"手册 {manual_info}")
 
     check("构建主窗口（端到端）", _window)
 

@@ -119,7 +119,12 @@ def save_all(items: list[UserFactor]) -> None:
 # ---------------------------------------------------------------- 编译与试算
 
 def _namespace() -> dict:
-    """因子代码能看见的东西：np / pd、几个内置工具、白名单 builtins。"""
+    """因子代码能看见的东西：np / pd、内置工具、白名单 builtins。
+
+    **这里的清单必须和手册 `factor_manual` 里的一致**。手册是模型写代码时
+    唯一的教材，写着一个这里没有的名字，模型照抄就是 NameError —— 而它不会
+    去看源码，只会把「注册失败」当成自己的错。
+    """
     from ttrade import factors as F
 
     return {
@@ -131,6 +136,15 @@ def _namespace() -> dict:
         "_ret": F._ret,
         "_safe_div": F._safe_div,
         "_nan_series": F._nan_series,
+        "_oi": F._oi,
+        "_atr": F._atr,
+        "_safe_log_ratio": F._safe_log_ratio,
+        # 展期四件套。内置的 12 个展期因子全是它们的薄壳，不注入的话模型
+        # 想写「展期收益率的变化率」只能从 c1_close/c2_close 重新拼一遍
+        "_roll_yield": F._roll_yield,
+        "_roll_annual": F._roll_annual,
+        "_roll_curv": F._roll_curv,
+        "_roll_change": F._roll_change,
     }
 
 

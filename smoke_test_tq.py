@@ -1713,6 +1713,102 @@ def check_agent_fs() -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def check_factor_manual() -> None:
+    """平台手册：覆盖全部因子、代码不是空壳、原语有源码、doc 动作能解析。
+
+    这份东西是给模型当教材的，错了比没有更糟 —— 模型会照着错的列名写因子，
+    然后在另一种数据上整列 NaN，而且不报错。
+    """
+    from ttrade import agent as A
+    from ttrade import factor_manual as M
+    from ttrade import library_docs as L
+    from ttrade.factors import FACTORS
+
+    try:
+        # 每个因子都要有条目，且代码块不是空的
+        missing, no_code = [], []
+        for k in FACTORS:
+            sec = M.factor_section(k)
+            if "###" not in sec:
+                missing.append(k)
+            elif "```python" not in sec:
+                no_code.append(k)
+        check("手册：覆盖全部因子", not missing, str(missing[:5]))
+        check("手册：每个因子都有实现代码", not no_code, str(no_code[:5]))
+
+        # 内置因子的源码必须是真源码，不能是「（未收录公式）」这种占位
+        placeholders = [k for k in FACTORS
+                        if "未收录" in (L.factor_doc(k).formula if L.factor_doc(k) else "")]
+        check("手册：没有未收录公式的因子", not placeholders, str(placeholders[:5]))
+
+        # 原语段必须有源码 —— 这是「代码展示不全」的正解：
+        # `f_mom_20` 只有一行 `_ret(...)`，不给 `_ret` 的定义等于什么都没说
+        prims = M.primitive_section()
+        for name in ("_ret", "_safe_div", "_col", "_oi"):
+            check(f"手册：原语 {name} 有源码", f"def {name}(" in prims, "")
+
+        # 手册和沙箱必须一致。手册是模型唯一的教材：写着一个沙箱里没有的名字，
+        # 模型照抄就是 NameError，而它只会把「注册失败」当成自己写错了
+        from ttrade import userfactors as UF
+        from ttrade import userstrategies as US
+
+        ns = UF._namespace()
+        missing = [n for n in M._FACTOR_PRIMITIVES if n not in ns]
+        check("手册：因子原语都能在沙箱里用", not missing, str(missing))
+        sns = US._namespace()
+        missing_s = [n for n in M._STRATEGY_PRIMITIVES if n not in sns]
+        check("手册：策略原语都能在沙箱里用", not missing_s, str(missing_s))
+        # 反过来也查一遍：沙箱里多给的东西，手册里也得写着
+        extra = [
+            n for n in ns
+            if n.startswith("_") and not n.startswith("__")
+            and n not in M._FACTOR_PRIMITIVES
+        ]
+        check("手册：沙箱里没有手册之外的原语", not extra, str(extra))
+
+        data = M.DATA_GUIDE
+        # 列名两套这件事必须写清楚：这是最容易踩且不报错的坑
+        check("手册：写明两套持仓量列名",
+              "open_interest" in data and "open_oi" in data and "_oi(df)" in data, "")
+        check("手册：写明复权口径", "qfq" in data and "adj_factor" in data, "")
+        check("手册：写明衍生列来源", "data_futures_aux" in data, "")
+
+        # topic 解析
+        for t, kw in (("data", "行情数据"), ("primitives", "原语"),
+                      ("contract", "契约"), ("factors", "索引"),
+                      ("cat:趋势", "趋势因子"), ("factor:mom_20", "动量 20 日")):
+            title, body = M.resolve(t)
+            check(f"手册：topic {t} 解析", kw in (title + body), title)
+        title, body = M.resolve("这不是个 topic")
+        check("手册：不认识的 topic 回索引", "索引" in title or "不认识" in body, title)
+
+        # 整份手册能拼出来，长度在合理区间（太短说明哪段没拼上）
+        full = M.manual()
+        check("手册：全文长度合理", 20000 < len(full) < 200000, f"{len(full)} 字符")
+        check("手册：全文含全部章节",
+              all(s in full for s in ("## 一、", "## 二、", "## 三、", "## 四、")), "")
+
+        # 动作解析
+        a = A.parse_action('```json\n{"action":"doc","topic":"factors"}\n```')
+        check("动作：查手册能解析", a.ok and "factors" in a.describe(), a.error)
+        check("动作：查手册缺 topic 要报错",
+              not A.parse_action('```json\n{"action":"doc"}\n```').ok, "")
+        # doc 是只读动作，不该被当成交易动作发给主窗口
+        check("动作：doc 不是交易动作", a.kind == "doc", a.kind)
+
+        # 提示词里得告诉模型有这么个东西，否则它不会去查
+        prompt = A.build_messages([], "问")[0]["content"]
+        check("提示词：提到平台手册", '"action": "doc"' in prompt, "")
+        check("提示词：列了常用 topic",
+              all(t in prompt for t in ("data", "primitives", "contract", "factors")), "")
+        # 提示词里原来那句「df 含 open_oi/close_oi」是错的（日线叫 open_interest），
+        # 模型照着写会在日线上全 NaN
+        check("提示词：不再教错列名",
+              "open/high/low/close/volume/open_oi" not in prompt, "")
+    except Exception as exc:  # noqa: BLE001
+        check("平台手册", False, f"{type(exc).__name__}: {exc}")
+
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -1738,6 +1834,7 @@ def main() -> int:
     check_user_strategies()
     check_agent_memory()
     check_agent_fs()
+    check_factor_manual()
     for k in ks:
         try:
             check_one(k)

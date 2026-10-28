@@ -399,7 +399,31 @@ SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务�
 ```
 
 - 要往库里加**新策略**：`{"action": "strategy", ...}`，见下
+- 需要查平台手册时：`{"action": "doc", ...}`，见下
 - 不需要执行任何操作时，**不要输出 json 块**
+
+## 平台手册（写因子之前必查）
+
+平台有一份手册，写清了行情是怎么来的（三条数据链路、**每条链路各自的列名**、
+复权口径、缺数据长什么样）、平台往命名空间里注入了哪些原语（`_ret` / `_col` /
+`_oi` 的真实源码）、以及全部因子的完整实现。
+
+**不要凭印象猜列名**。写因子、或者回答「这个数据从哪来」之前，先查手册：
+
+```json
+{"action": "doc", "topic": "factors"}
+```
+
+| topic | 内容 |
+|---|---|
+| `data` | 行情数据：链路、列名、复权、缺数据 |
+| `primitives` | 原语源码（`_ret`、`_col`、`_oi`、`standardize` 等） |
+| `contract` | 写因子/策略的契约与常见错误 |
+| `factors` | 全部因子索引（一行一个，先看这个） |
+| `cat:趋势` | 整类因子的完整实现（趋势/反转/波动/量能/形态/展期/期权） |
+| `factor:mom_20` | 单个因子的完整实现 |
+
+一次只查一段，别一口气把整份手册拉进对话。
 
 ## 注册新因子
 
@@ -417,10 +441,13 @@ SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务�
 
 写代码的硬约束，违反任何一条都会注册失败：
 
-1. **签名固定** `def f_xxx(df) -> pd.Series`，`df` 的索引是 datetime，含
-   `open/high/low/close/volume/open_oi/close_oi`
+1. **签名固定** `def f_xxx(df) -> pd.Series`，`df` 的索引是 datetime，一定有
+   `open/high/low/close/volume`。持仓量**不要直接写列名**：日线 CSV 叫
+   `open_interest`、天勤分钟线叫 `open_oi`，写死一个在另一种数据上就是全 NaN。
+   用 `_oi(df)`，两个名字都认
 2. **不要写 import**。`np`、`pd` 已经注入；`_col(df, 列名)` 取衍生列（没有该列
-   时返回全 NaN，不要自己判空）、`_ret(c, n)`、`_safe_div(a, b)` 也可用
+   时返回全 NaN，不要自己判空）、`_ret(c, n)`、`_safe_div(a, b)` 也可用。
+   完整清单和源码查 `doc` 动作的 `primitives`
 3. **返回等长 Series，索引和 df 完全一致**。不要 `dropna()`、不要 `reset_index()`
    —— 预热期的 NaN 要留着，下游统一处理
 4. **必须 PIT**：只用 `rolling` / `ewm` / `shift(正数)`，**绝不出现 `shift(-n)`**。
@@ -448,7 +475,7 @@ SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务�
 硬约束，违反任何一条都会注册失败：
 
 1. **签名 `def sig_xxx(df, 参数...)`**，`df` 索引是 datetime，含
-   `open/high/low/close/volume/open_oi/close_oi`
+   `open/high/low/close/volume`（持仓量用 `_oi(df)`）
 2. **不要写 import**。`np`、`pd`、`sma`、`ema`、`atr`、`true_range`、
    `_position_state(多头进/多头出/空头进/空头出)` 都已注入，直接用
 3. **返回带 `signal` 列的等长 DataFrame**。`signal` 是当日收盘后的目标仓位：
@@ -609,6 +636,8 @@ class Action:
                 return f"列出目录 {path or '.'}"
             n = len(p.get("content") or "")
             return f"写入 {path}（{n} 字符）"
+        if self.kind == "doc":
+            return f"查平台手册：{p.get('topic', '')}"
         return self.kind
 
 
@@ -703,6 +732,17 @@ def _parse_fs(obj: dict) -> Action:
     return Action("fs", obj)
 
 
+def _parse_doc(obj: dict) -> Action:
+    """查手册的动作块。topic 认不认识交给 `factor_manual.resolve()` ——
+    那里解析不了会回一份索引，比在这里拒掉更有用。"""
+    topic = str(obj.get("topic") or "").strip()
+    if not topic:
+        return Action("doc", obj, "缺少 topic（data / primitives / contract / factors / "
+                                  "cat:趋势 / factor:<key>）")
+    obj["topic"] = topic
+    return Action("doc", obj)
+
+
 def parse_action(text: str) -> Action:
     """从回答里挖出动作块。没有就返回 kind 为空串的 Action。
 
@@ -720,7 +760,7 @@ def parse_action(text: str) -> Action:
         return Action("", {}, "动作块不是对象")
 
     kind = str(obj.get("action") or "").strip().lower()
-    if kind not in ("trade", "backtest", "factor", "strategy", "fs"):
+    if kind not in ("trade", "backtest", "factor", "strategy", "fs", "doc"):
         return Action("")
     if kind == "factor":
         # 注册因子不需要品种 —— 因子是横截面的，对哪个标的算由用户决定
@@ -731,6 +771,9 @@ def parse_action(text: str) -> Action:
     if kind == "fs":
         # 也不带品种：改哪个文件是 path 说了算
         return _parse_fs(obj)
+    if kind == "doc":
+        # 查手册更不需要品种
+        return _parse_doc(obj)
     if not obj.get("symbol"):
         return Action(kind, obj, "缺少品种")
 
