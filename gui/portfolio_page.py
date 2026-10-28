@@ -619,6 +619,15 @@ class PortfolioPage(QWidget):
         self.lbl_conn = QLabel("未启动")
         self.lbl_conn.setObjectName("Hint")
         lay.addWidget(self.lbl_conn)
+        # 交易所对日内报单 / 撤单次数有硬上限，超了会被限制交易。这一格让人
+        # 随时看得到还剩多少，而不是等停手了才去翻日志
+        self.lbl_limit = QLabel("")
+        self.lbl_limit.setObjectName("Hint")
+        self.lbl_limit.setToolTip(
+            "交易所对每个账户的日内报单 / 撤单笔数有硬上限，"
+            "本程序在 500 次时自动停手"
+        )
+        lay.addWidget(self.lbl_limit)
 
         lay.addStretch(1)
         self.lbl_msg = QLabel("")
@@ -1096,6 +1105,17 @@ class PortfolioPage(QWidget):
                 if j == 5 and not managed:
                     item.setForeground(QColor(C_MUTED))
                 m.setItem(i, j, item)
+
+        limits = [v.get("limits") for v in self._snaps.values() if v.get("limits")]
+        if limits:
+            self.lbl_limit.setText(" · ".join(limits))
+            used = self._snaps and any(
+                "500/500" in (v.get("limits") or "") for v in self._snaps.values()
+            )
+            self.lbl_limit.setStyleSheet(
+                f"color: {C_BAD if used else C_MUTED}; font-size: 11px;")
+        else:
+            self.lbl_limit.setText("")
 
         if not self.ctl.running:
             self.lbl_mon.setText("未启动。策略跑起来之后这里才会比对。")

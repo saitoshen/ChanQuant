@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass, field
 
 import pandas as pd
 
+from . import daylimit
 from .paths import user_dir
 from .tqdata import trading_days
 from .tqfetch import PERIOD_SEC, local_time
@@ -229,6 +230,9 @@ class LiveHub:
         self._trades = None
         self._order_book: dict = {}
         self._targets: dict = {}
+        # 交易所对日内报单 / 撤单次数有硬上限。组合页的引擎和这里共用同一份
+        # 落盘计数（同一个账户、同一个进程只能有一份）
+        self.limit = daylimit.DayLimit(spec.label())
 
     # ---- 生命周期 ----
 
@@ -469,6 +473,11 @@ class LiveHub:
             raise RuntimeError("还没连接")
         if volume <= 0:
             raise ValueError("手数必须大于 0")
+        if not self.limit.order():
+            raise RuntimeError(
+                f"今日报单已达 {daylimit.DAY_ORDER_LIMIT} 次上限，"
+                "再发会被交易所限制交易，明天再来"
+            )
         kwargs = {}
         if limit_price is not None and limit_price > 0:
             kwargs["limit_price"] = float(limit_price)
@@ -482,6 +491,11 @@ class LiveHub:
         """撤单。同样是入队，下一次 `wait_update()` 才发。"""
         if self.api is None:
             raise RuntimeError("还没连接")
+        if not self.limit.cancel():
+            raise RuntimeError(
+                f"今日撤单已达 {daylimit.DAY_CANCEL_LIMIT} 次上限，"
+                "再撤会被交易所限制交易"
+            )
         self.api.cancel_order(order_id)
 
     def set_target(self, symbol: str, volume: int) -> None:

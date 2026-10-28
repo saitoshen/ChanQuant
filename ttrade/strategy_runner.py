@@ -48,6 +48,7 @@ import pandas as pd
 
 from ttrade import factor_strategy as fstrat
 from ttrade import replay
+from ttrade import daylimit
 from ttrade import strategy_store as SStore
 from ttrade.strategies import run_strategy
 from ttrade.tqfetch import PERIOD_SEC
@@ -167,6 +168,10 @@ class PortfolioRunner:
         self._pos = None
         self._orders = None
         self._log_fn = None
+        # 交易所对日内报单 / 撤单次数有硬上限，超了会限制交易。按账户按交易日数，
+        # 落盘 —— 重启程序不清零，见 ttrade/daylimit.py
+        self.limit = daylimit.DayLimit(self.spec.label())
+        self._halted = ""
 
     # ---- 生命周期 ----
 
@@ -272,6 +277,12 @@ class PortfolioRunner:
             return
         if on and st.cfg.period not in RT_SEC:
             st.error = f"实时不支持 {st.cfg.period} 周期（可用：{'/'.join(RT_SEC)}）"
+            return
+        if on and self.limit.order_left() <= 0:
+            st.error = (f"今日报单已达 {daylimit.DAY_ORDER_LIMIT} 次上限，"
+                        "再发会被交易所限制交易，明天再开")
+            st.running = False
+            self._log(f"{st.title()}：{st.error}")
             return
         st.running = bool(on)
         st.error = ""
@@ -505,6 +516,47 @@ class PortfolioRunner:
             return                       # 刚被打回，冷一会儿再试
         self._send(st, st.underlying, delta)
 
+    # ---- 日内额度 ----
+
+    def _halt(self, reason: str) -> None:
+        """额度用完就全部停机。继续重试只会把交易所的限制招来。"""
+        if self._halted == reason:
+            return
+        self._halted = reason
+        for st in self._slots.values():
+            if st.running:
+                st.running = False
+                st.error = reason
+        self._log(reason)
+
+    def _order(self, **kw):
+        """统一下单入口。额度不够返回 None，调用方按「没发出去」处理。
+
+        计数在**发报文之前** +1：就算 `insert_order` 抛异常也认这一笔，因为报文
+        可能已经到了交易所 —— 宁可少用一次额度，不要超。
+        """
+        if self.api is None:
+            return None
+        if not self.limit.order():
+            self._halt(
+                f"今日报单已达 {daylimit.DAY_ORDER_LIMIT} 次上限，已停止调仓"
+                "（再发会被交易所限制交易）"
+            )
+            return None
+        return self.api.insert_order(**kw)
+
+    def _cancel(self, order) -> None:
+        """统一撤单入口。撤单次数也是交易所盯的一项。"""
+        if self.api is None or order is None:
+            return
+        if not self.limit.cancel():
+            self._halt(f"今日撤单已达 {daylimit.DAY_CANCEL_LIMIT} 次上限，已停止调仓")
+            return
+        try:
+            self.api.cancel_order(order)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _side_pos(self, symbol: str, side: str) -> int:
         """单边总持仓（手）。`side` 是 long / short。"""
         p = self._pos.get(symbol) if self._pos is not None else None
@@ -638,10 +690,14 @@ class PortfolioRunner:
             return
         parts = []
         for offset, vol in legs:
-            oid = self._order_id(self.api.insert_order(
+            order = self._order(
                 symbol=symbol, direction=direction, offset=offset,
                 volume=vol, limit_price=price,
-            ))
+            )
+            if order is None:
+                st.last_action = "今日报单次数已用完，停手"
+                break
+            oid = self._order_id(order)
             st.pending.append(
                 PendingOrder(order_id=oid, symbol=symbol, direction=direction,
                              offset=offset, volume=vol, price=price, ts=time.time())
@@ -660,7 +716,7 @@ class PortfolioRunner:
             try:
                 order = self._orders.get(o.order_id) if self._orders is not None else None
                 if order is not None and getattr(order, "status", "") == "ALIVE":
-                    self.api.cancel_order(order)
+                    self._cancel(order)
             except Exception:  # noqa: BLE001
                 pass
         st.pending.clear()
@@ -721,10 +777,14 @@ class PortfolioRunner:
                 if self.chase.use_market and o.retries >= self.chase.retries:
                     price = float("nan")     # 天勤用 NaN 表示市价
                 try:
-                    o.order_id = self._order_id(self.api.insert_order(
+                    again = self._order(
                         symbol=o.symbol, direction=o.direction, offset=o.offset,
                         volume=o.volume, limit_price=price,
-                    ))
+                    )
+                    if again is None:
+                        st.last_action = "今日报单次数已用完，停手"
+                        continue
+                    o.order_id = self._order_id(again)
                     o.price = price
                     st.last_action = f"追单第 {o.retries} 次 @ {price:.2f}"
                     self._log(f"{st.title()}：{st.last_action}")
@@ -752,12 +812,9 @@ class PortfolioRunner:
             if now - o.ts < self.chase.wait_sec:
                 keep.append(o)
                 continue
-            try:
-                if order is not None:
-                    self.api.cancel_order(order)
-                o.phase = "cancelling"
-            except Exception:  # noqa: BLE001
-                pass
+            if order is not None:
+                self._cancel(order)
+            o.phase = "cancelling"
             keep.append(o)
         st.pending = keep
 
@@ -829,10 +886,9 @@ class PortfolioRunner:
             if not price or price != price:
                 continue
             for offset, vol in legs:
-                self.api.insert_order(
-                    symbol=sym, direction=direction, offset=offset,
-                    volume=vol, limit_price=price,
-                )
+                if self._order(symbol=sym, direction=direction, offset=offset,
+                               volume=vol, limit_price=price) is None:
+                    break
                 n += 1
                 self._log(f"对齐 {sym}：{direction} {offset} {vol} 手 @ {price:.2f}")
         return n
@@ -867,4 +923,5 @@ class PortfolioRunner:
                 for st in self._slots.values()
             ],
             "mismatch": self.mismatch(),
+            "limits": self.limit.summary(),
         }

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -2847,6 +2848,131 @@ def check_result_view() -> None:
         check("结果视图", False, f"{type(exc).__name__}: {exc}")
 
 
+def check_day_limit() -> None:
+    """日内报单 / 撤单额度。
+
+    交易所对每个账户的日内报单笔数、撤单笔数都有硬上限，超了轻则当天限制开仓、
+    重则被列入重点监控。这里守三件事：到 500 就停手、跨交易日归零、重启不清零。
+    """
+    from datetime import datetime
+
+    from ttrade import daylimit as DL
+
+    try:
+        check("额度：周二白天算周二",
+              DL.trading_day(datetime(2026, 10, 27, 10, 0)) == "2026-10-27",
+              DL.trading_day(datetime(2026, 10, 27, 10, 0)))
+        check("额度：夜盘归下一交易日",
+              DL.trading_day(datetime(2026, 10, 27, 21, 30)) == "2026-10-28",
+              DL.trading_day(datetime(2026, 10, 27, 21, 30)))
+        check("额度：周五夜盘归下周一",
+              DL.trading_day(datetime(2026, 10, 23, 21, 30)) == "2026-10-26",
+              DL.trading_day(datetime(2026, 10, 23, 21, 30)))
+        check("额度：周六凌晨仍算周一",
+              DL.trading_day(datetime(2026, 10, 24, 1, 0)) == "2026-10-26",
+              DL.trading_day(datetime(2026, 10, 24, 1, 0)))
+        check("额度：周一凌晨算周一",
+              DL.trading_day(datetime(2026, 10, 26, 1, 0)) == "2026-10-26",
+              DL.trading_day(datetime(2026, 10, 26, 1, 0)))
+    except Exception as exc:  # noqa: BLE001
+        check("额度：交易日映射", False, f"{type(exc).__name__}: {exc}")
+
+    tmpdir = tempfile.mkdtemp(prefix="tqlimit_")
+    old_dir = DL.user_dir
+    DL.user_dir = lambda: tmpdir
+    try:
+        lim = DL.DayLimit("测试账户")
+        for _ in range(DL.DAY_ORDER_LIMIT):
+            lim.order()
+        check("额度：报单满 500 次后拒绝", lim.order() is False, str(lim.order_left()))
+        check("额度：剩余次数归零", lim.order_left() == 0, str(lim.order_left()))
+
+        # 重启程序不能清零 —— 交易所记的是账户当天已经发出去多少笔
+        again = DL.DayLimit("测试账户")
+        check("额度：重启后计数还在", again.order_left() == 0, str(again.order_left()))
+        check("额度：换账户各算各的",
+              DL.DayLimit("另一个").order_left() == DL.DAY_ORDER_LIMIT)
+
+        # 撤单和报单是两条线，互不占额度
+        other = DL.DayLimit("撤单测试")
+        for _ in range(DL.DAY_CANCEL_LIMIT):
+            other.cancel()
+        check("额度：撤单满 500 次后拒绝", other.cancel() is False)
+        check("额度：撤单用满不影响报单", other.order() is True)
+
+        # 跨交易日归零
+        path = os.path.join(tmpdir, DL.LIMIT_FILE)
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["测试账户"]["day"] = "2000-01-01"
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        check("额度：跨交易日归零",
+              DL.DayLimit("测试账户").order_left() == DL.DAY_ORDER_LIMIT,
+              str(DL.DayLimit("测试账户").order_left()))
+
+        # 组合引擎：额度用尽既不能发单，也要停机，不能一直重试
+        from ttrade import strategy_store as St
+        from ttrade.strategy_runner import PortfolioRunner
+        from ttrade.tqlive import AccountSpec
+
+        class _Quote:
+            price_tick = 1.0
+            ask_price1 = 3050.0
+            bid_price1 = 3049.0
+            last_price = 3049.5
+
+        class _Api:
+            def __init__(self):
+                self.n = 0
+
+            def get_quote(self, _sym):
+                return _Quote()
+
+            def insert_order(self, **kw):
+                self.n += 1
+                return type("O", (), {"order_id": f"o{self.n}"})()
+
+        # 计数按 `spec.label()` 走（"名字 · 类型"），不是光看名字
+        spec = AccountSpec(name="测试账户", kind="kq")
+        full = DL.DayLimit(spec.label())
+        for _ in range(DL.DAY_ORDER_LIMIT):
+            full.order()
+        runner = PortfolioRunner(spec, St.ChaseConfig())
+        runner.api = _Api()
+        cfg = St.StrategyConfig(sid="s-limit", symbol="RB", exchange="SHFE",
+                                period="1d", rule_key="ma_cross", volume=1)
+        slot = runner.add(cfg)
+        slot.running = True
+        slot.underlying = "SHFE.rb2701"
+        runner._pos = {}
+        runner._send(slot, "SHFE.rb2701", 1)
+        check("额度：用尽后不发单", runner.api.n == 0, f"{runner.api.n} 笔")
+        check("额度：用尽后停机", slot.running is False and "上限" in slot.error,
+              slot.error)
+        check("额度：快照带上今日用量",
+              "今日报单" in runner.snapshot()["limits"],
+              runner.snapshot()["limits"])
+
+        # 账户页的手动下单走另一条链路，也要拦
+        from ttrade import tqlive as L
+
+        hub = L.LiveHub(spec)
+        hub.api = object()
+        try:
+            hub.place("SHFE.rb2701", "BUY", "OPEN", 1, 3000.0)
+            check("额度：手动下单也会被拦", False, "没有抛异常")
+        except RuntimeError as exc:
+            check("额度：手动下单也会被拦", "上限" in str(exc), str(exc))
+    except Exception as exc:  # noqa: BLE001
+        check("额度：整体", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        DL.user_dir = old_dir
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -2864,6 +2990,7 @@ def main() -> int:
     check_main_backfill()
     check_strategy_store()
     check_strategy_runner()
+    check_day_limit()
     check_sizing()
     check_intraday_aux()
     check_library_docs()
