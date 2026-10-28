@@ -1035,9 +1035,11 @@ def check_library_docs() -> None:
         smissing = [k for k in STRATEGIES if k not in L.STRATEGY_DOCS
                     and not STRATEGIES[k].code]
         check("策略文档：覆盖全部注册策略", not smissing, f"缺 {smissing}")
+        # 只管内置策略：用户注册的策略没有手写文档，四个字段里只有 logic 有值
+        # （兜底成 spec.desc），拿同一把尺子量会把「用 Agent 存了一条策略」判成错
         thin = [
-            k for k in STRATEGIES
-            if not all(getattr(L.strategy_doc(k), f) for f in ("logic", "edge", "fits", "risk"))
+            k for k in STRATEGIES if k in L.STRATEGY_DOCS
+            and not all(getattr(L.strategy_doc(k), f) for f in ("logic", "edge", "fits", "risk"))
         ]
         check("策略文档：逻辑/优势/适应/风险齐全", not thin, str(thin))
 
@@ -2032,7 +2034,32 @@ def check_result_view() -> None:
     """
     from ttrade import replay
     from ttrade import strategy_store as SStore
-    from ttrade.backtest import combine, month_matrix, stage_table
+
+    def _intraday(days: pd.DatetimeIndex, px) -> pd.DataFrame:
+        """把日线收盘摊成每天 8 根 30 分钟线，用来测混合周期的组合。
+
+        价格在当天和次日收盘之间线性走 —— 不需要真实形态，只要「同一天有多个
+        时间戳、且和日线策略的日期重合但 bar 数差几十倍」这个结构。
+        """
+        ts, p = [], []
+        for i, d in enumerate(days):
+            a = float(px[i])
+            b = float(px[min(i + 1, len(px) - 1)])
+            for k in range(8):
+                ts.append(d + pd.Timedelta(hours=9 + k))
+                p.append(a + (b - a) * k / 8.0)
+        return pd.DataFrame(
+            {"open": p, "high": [v * 1.002 for v in p],
+             "low": [v * 0.998 for v in p], "close": p, "volume": 1000.0},
+            index=pd.DatetimeIndex(ts),
+        )
+    from ttrade.backtest import (
+        _to_daily,
+        combine,
+        combine_trades,
+        month_matrix,
+        stage_table,
+    )
 
     try:
         rng = np.random.default_rng(7)
@@ -2095,19 +2122,65 @@ def check_result_view() -> None:
         fcfg = replay.factor_config({"window": 120, "已经删掉的字段": 1})
         check("回放：旧配置的多余字段被忽略", fcfg.window == 120, str(fcfg.window))
 
-        # 组合：等权 = 归一化后逐日取均值，交易记录直接拼接
+        # 组合：曲线先各自压成「每个交易日一个点」再等权平均。按时间戳并集
+        # 直接对齐的话，混合周期（30 分钟 + 日线）的组合每天有几十个点只有分钟
+        # 级参与、一个点两条都参与，均值在两者之间来回跳 —— 画出来是一条上下
+        # 翻飞的带子，看着像净值乱跳，其实是成分每天都在变
         combo = combine([r1.res, r2.res], label="组合")
-        norm = pd.concat([r1.res.equity / r1.res.equity.iloc[0],
-                          r2.res.equity / r2.res.equity.iloc[0]], axis=1).mean(axis=1)
-        check("组合：曲线是归一化后的均值",
-              bool(np.allclose(combo.equity.values, (norm * 100_000).values)))
+        check("组合：曲线落在日频上",
+              all(t.hour == 0 and t.minute == 0 for t in combo.equity.index))
+        check("组合：一天一个点",
+              combo.equity.index.is_unique
+              and len(combo.equity) == len(combo.equity.index.normalize().unique()),
+              f"{len(combo.equity)} 点")
         check("组合：首日净值等于初始资金",
               abs(float(combo.equity.iloc[0]) - 100_000) < 1e-6,
               f"{combo.equity.iloc[0]:.2f}")
+        # 两条日线策略的日期完全重合，等权就是归一化后的均值
+        norm = pd.concat([r1.res.equity / r1.res.equity.iloc[0],
+                          r2.res.equity / r2.res.equity.iloc[0]], axis=1).mean(axis=1)
+        check("组合：日线等权等于归一化均值",
+              bool(np.allclose(combo.equity.values, (norm * 100_000).values)))
         check("组合：交易记录是两条之和",
               len(combo.trades) == len(r1.res.trades) + len(r2.res.trades),
               f"{len(combo.trades)} 笔")
         check("组合：指标齐全", "cagr" in combo.metrics and "max_dd" in combo.metrics)
+
+        # 混合周期：30 分钟 + 日线。压完的点数必须等于「并集里的交易日数」，
+        # 而不是「分钟级 bar 数」
+        c3 = SStore.StrategyConfig(symbol="TEST", period="30m", rule_key="ma_cross",
+                                   rule_params={"fast": 5, "slow": 20})
+        r3 = replay.run(c3, _intraday(idx[:160], close[:160]), with_bh=False)
+        check("混合：30 分钟回放能出结果", r3.ok, r3.error)
+        check("混合：原始曲线确实是分钟级",
+              any(t.hour != 0 for t in r3.res.equity.index))
+        daily = _to_daily(r3.res.equity)
+        check("混合：压成日频后一天一个点",
+              len(daily) == len(daily.index.normalize().unique())
+              and all(t.hour == 0 for t in daily.index),
+              f"{len(daily)} 点")
+        mixed = combine([r3.res, r1.res], label="组合")
+        check("混合：组合曲线也落在日频上",
+              all(t.hour == 0 and t.minute == 0 for t in mixed.equity.index))
+        check("混合：点数不超过并集交易日数",
+              len(mixed.equity) <= len(set(r1.res.equity.index.normalize())
+                                      | set(r3.res.equity.index.normalize())),
+              f"{len(mixed.equity)} 点")
+
+        # 交易记录按开仓时间混排。分组拼接的话，表格是「A 从 2021 一路做到
+        # 2023，然后 B 又从 2021 开始」—— 读起来像先后跑了两遍
+        pairs = combine_trades([("日线", r1.res), ("30 分钟", r3.res)])
+        check("混排：条数等于两条之和",
+              len(pairs) == len(r1.res.trades) + len(r3.res.trades),
+              f"{len(pairs)} 笔")
+        check("混排：按开仓时间单调",
+              all(pairs[i][1].entry_date <= pairs[i + 1][1].entry_date
+                  for i in range(len(pairs) - 1)))
+        names = [n for n, _t in pairs]
+        check("混排：两个策略交替出现",
+              "日线" in names and "30 分钟" in names
+              and names.index("30 分钟") < len(names) - 1 - names[::-1].index("日线"),
+              str(names[:8]))
 
         # 结论文本：组合没有基准，不能写出「基准 / 超额」两行
         text_one = replay.summary(r1, "TEST", "日线")

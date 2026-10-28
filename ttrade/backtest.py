@@ -299,10 +299,33 @@ def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None) -> Result:
     return Result(equity=eq, position=ps, trades=[trade], metrics=m, label="买入持有")
 
 
+def _to_daily(eq: pd.Series) -> pd.Series:
+    """把一个净值 / 仓位序列压成「每个交易日一个点」，取当天最后一根。
+
+    分钟级一天有几十个点。直接按时间戳并集和日线策略对齐的话，组合的均值会在
+    「只有分钟级参与」和「两条都参与」之间来回跳 —— 画出来是一条上下翻飞的
+    带子，看着像净值在乱跳，其实是成分每天都在变。统一到交易日之后，每一天
+    都是同一组策略的盯市净值，组合的每日盈亏才可比。
+    """
+    s = eq.dropna()
+    if s.empty:
+        return s
+    return s.groupby(s.index.normalize()).last()
+
+
 def combine(results: list[Result], label: str = "组合",
-            bars_per_year: float = float(TRADING_DAYS),
             initial_cash: float = 100_000.0) -> Result:
     """把多条资金曲线合成一条等权组合曲线。
+
+    **逐日盯市**：每条曲线先压成「每个交易日一个点」（当天最后一根），再对齐、
+    取均值。单条策略本身就是逐根盯市的（`cash + shares * close`），这里只是
+    把它落到交易日这个共同刻度上 —— 混合周期（30 分钟 + 1 小时 + 日线）的组合
+    也只有这样才说得清「今天一共赚了多少」。
+
+    对齐用 `ffill(limit_area="inside")`：净值在两根 bar 之间是常数，往前填是
+    精确的；但只填「自己区间内部」的空档，策略还没上线、或者数据已经结束的
+    日子保持空 —— 往后一直填的话，一条 2020 年就停掉的策略会以最后那点净值
+    一直参与组合，把后面的曲线压平。
 
     **先各自归一化到 1 再平均**，不是直接平均净值：一个品种 3000 点、另一个
     80 块，初始资金也可能不同，直接平均出来的数字没有任何含义。
@@ -312,40 +335,52 @@ def combine(results: list[Result], label: str = "组合",
     算（把每天的收益取均值再连乘），调仓成本没计进去，收益会略好看一点 ——
     两种口径都能自圆其说，这里选更保守的那种，并在标题里写明「等权」。
 
-    某条策略还没上线（或者已经没数据）的日期**不参与**当天的均值 —— 用 1.0
-    去填等于凭空多出一份现金，会把组合净值稀释成「一半空仓」，看起来像策略
-    失效。所以用 skipna 的均值，让曲线在成分变化处保持连续。
+    某条策略还没上线的日子**不参与**当天的均值 —— 用 1.0 去填等于凭空多出
+    一份现金，会把组合净值稀释成「一半空仓」，看起来像策略失效。
 
-    交易记录直接拼接：组合不合并对冲，各策略各自开平，看的时候要能分清是
-    谁做的这一笔。
+    交易记录用 `combine_trades()` 合并，别直接拼接：拼接出来是「A 的全部交易，
+    然后 B 的全部交易」，看不出两条策略其实在同一段时间里并行。
     """
     curves: list[pd.Series] = []
     poss: list[pd.Series] = []
     trades: list[Trade] = []
     for r in results:
-        eq = r.equity.dropna()
+        eq = _to_daily(r.equity)
         if len(eq) < 2:
             continue
         curves.append(eq / float(eq.iloc[0]))
-        poss.append(r.position.reindex(eq.index).fillna(0))
+        poss.append(_to_daily(r.position))
         trades += list(r.trades)
 
     if not curves:
         blank = pd.Series(dtype=float)
         return Result(equity=blank, position=blank, trades=[], metrics={}, label=label)
 
-    mat = pd.concat(curves, axis=1).sort_index()
-    eq = mat.mean(axis=1, skipna=True).dropna()
-    pos = (
-        pd.concat(poss, axis=1).sort_index()
-        .mean(axis=1, skipna=True)
-        .reindex(eq.index)
-        .fillna(0.0)
-    )
-    eq = eq * float(initial_cash)
-    m = _metrics(eq, pos, trades, bars_per_year)
+    grid = pd.DatetimeIndex(sorted(set().union(*[c.index for c in curves])))
+    mat = pd.concat([c.reindex(grid).ffill(limit_area="inside") for c in curves], axis=1)
+    eq = mat.mean(axis=1, skipna=True).dropna() * float(initial_cash)
+
+    pmat = pd.concat([p.reindex(grid).ffill(limit_area="inside") for p in poss], axis=1)
+    pos = pmat.mean(axis=1, skipna=True).reindex(eq.index).fillna(0.0)
+
+    # 年化口径按组合自己的日频算。沿用某一条成分的 bars_per_year 会错得离谱：
+    # 一条 30 分钟策略一年几千根，拿它去年化日频曲线，夏普会虚高一个量级
+    bpy = bars_per_year(eq.index)
+    m = _metrics(eq, pos, trades, bpy)
     m["final_equity"] = float(eq.iloc[-1])
     return Result(equity=eq, position=pos, trades=trades, metrics=m, label=label)
+
+
+def combine_trades(named: list[tuple[str, Result]]) -> list[tuple[str, Trade]]:
+    """把几个策略的逐笔交易合成一条时间线，按开仓时间排序。
+
+    顺序很重要：按策略分组拼接的话，表格是「A 从 2023 年一路做到 2026 年，
+    然后 B 又从 2023 年开始」—— 看起来像先后跑了两遍，而不是两条策略在同一段
+    时间里并行。按开仓时间排，读起来才是真正的时间线。
+    """
+    out = [(name, t) for name, r in named for t in r.trades]
+    out.sort(key=lambda nt: (nt[1].entry_date, nt[1].exit_date))
+    return out
 
 
 def drawdown_series(equity: pd.Series) -> pd.Series:

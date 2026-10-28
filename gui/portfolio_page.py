@@ -85,7 +85,7 @@ from gui.result_view import PERIOD_LABEL, ResultView, ViewCtx
 from ttrade import replay
 from ttrade import strategy_store as SStore
 from ttrade import tqlive
-from ttrade.backtest import bars_per_year, combine
+from ttrade.backtest import combine, combine_trades
 from ttrade.strategy_runner import PortfolioRunner
 from ttrade.universe import cn_name
 
@@ -848,10 +848,13 @@ class PortfolioPage(QWidget):
         # 的交易时间差几十分钟是有意义的），持仓长度也改用「根（约 N 天）」
         periods = {c.period for c, _r in reps}
         period = periods.pop() if len(periods) == 1 else ""
-        bpy = bars_per_year(reps[0][1].res.equity.index)
-        res = combine([rp.res for _c, rp in reps], label="组合", bars_per_year=bpy)
-        # 交易记录要带策略名：组合不合并对冲，得能分清哪一笔是谁做的
-        trades = [(c.title(), t) for c, rp in reps for t in rp.res.trades]
+        res = combine([rp.res for _c, rp in reps], label="组合")
+        # 这里的 bars_per_year 是给 `hold_text` 换算「平均持仓 N 根」用的，取的是
+        # **策略自己的** bar 频率（交易记录里的 bars 就是它）。组合曲线本身落在
+        # 日频上，那个频率在 `combine` 内部算指标时用，别混用
+        bpy = reps[0][1].bars_per_year
+        # 交易记录按开仓时间混排：分组拼接的话，表格看起来像「先跑完 A 再跑 B」
+        trades = combine_trades([(c.title(), rp.res) for c, rp in reps])
         ctx = ViewCtx(
             symbol="", name="", exchange="", period=period,
             market=replay.market_of(reps[0][0]), label="组合",
