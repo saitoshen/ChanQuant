@@ -1031,7 +1031,9 @@ def check_library_docs() -> None:
         no_code = [k for k in FACTORS if not L.factor_doc(k).code.strip()]
         check("因子文档：能取到实现代码", not no_code, f"{len(no_code)} 条取不到")
 
-        smissing = [k for k in STRATEGIES if k not in L.STRATEGY_DOCS]
+        # 同因子：用户注册的策略不在 STRATEGY_DOCS 里，靠 spec.code 兜底
+        smissing = [k for k in STRATEGIES if k not in L.STRATEGY_DOCS
+                    and not STRATEGIES[k].code]
         check("策略文档：覆盖全部注册策略", not smissing, f"缺 {smissing}")
         thin = [
             k for k in STRATEGIES
@@ -1111,6 +1113,25 @@ def check_agent() -> None:
         check("提示词：历史在前、本轮在后",
               msgs[-1]["content"] == "新问题" and len(msgs) == 3, f"{len(msgs)} 条")
         check("历史：超长会截断", len(A.trim_history([{"role": "user", "content": "x"}] * 100)) == 40)
+
+        # 提示词里的示例必须是**合法 JSON**。模型会照着抄，示例里塞真换行等于
+        # 教它输出 `parse_action` 解析不了的块 —— 而且错得很隐蔽：模型看着像
+        # 在正常工作，实际每个动作都静默失败
+        import json as _json
+        import re as _re
+
+        blocks = _re.findall(r"```json\s*(\{.*?\})\s*```", A.SYSTEM_PROMPT, _re.S)
+        broken = []
+        for blk in blocks:
+            try:
+                _json.loads(blk)
+            except ValueError:
+                broken.append(blk[:30])
+        check("提示词：示例动作块都是合法 JSON", bool(blocks) and not broken, str(broken))
+
+        kinds = {_json.loads(b).get("action") for b in blocks if b not in broken}
+        check("提示词：四种动作都有示例",
+              {"trade", "backtest", "factor", "strategy"} <= kinds, str(kinds))
     except Exception as exc:  # noqa: BLE001
         check("大模型接入层", False, f"{type(exc).__name__}: {exc}")
     finally:
@@ -1433,6 +1454,168 @@ def check_user_factors() -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def check_user_strategies() -> None:
+    """Agent 注册的自定义策略：沙箱、试算校验、落盘往返、删除。
+
+    比因子多一条「不能全程空仓」—— signal 全 0 的策略在界面上看起来是「策略
+    有效但从不持仓」，用户会以为是数据问题，其实是条件永远不成立。
+    """
+    from ttrade import library_docs as L
+    from ttrade import strategies as S
+    from ttrade import userstrategies as US
+
+    tmpdir = tempfile.mkdtemp(prefix="td_us_")
+    old_path = US.path
+    US.path = lambda: os.path.join(tmpdir, "user_strategies.json")
+    key = "zz_smoke_strat"
+    try:
+        ok, msg = US.register(US.UserStrategy(
+            key=key, label="试", func="sig_x",
+            code="import os\ndef sig_x(df):\n    return df"))
+        check("用户策略：白名单挡住 import", not ok and "跑不起来" in msg, msg)
+
+        ok, msg = US.register(US.UserStrategy(
+            key=key, label="试", func="sig_x",
+            code="def sig_x(df):\n    return df"))
+        check("用户策略：缺 signal 列被拒", not ok and "signal" in msg, msg)
+
+        ok, msg = US.register(US.UserStrategy(
+            key=key, label="试", func="sig_x",
+            code="def sig_x(df):\n    out = df.copy()\n    out['signal'] = 2\n    return out"))
+        check("用户策略：signal 越界被拒", not ok and "只能" in msg, msg)
+
+        ok, msg = US.register(US.UserStrategy(
+            key=key, label="试", func="sig_x",
+            code="def sig_x(df):\n    out = df.copy()\n    out['signal'] = 0\n    return out"))
+        check("用户策略：全程空仓被拒", not ok and "空仓" in msg, msg)
+
+        ok, msg = US.register(US.UserStrategy(
+            key=key, label="试", func="sig_x",
+            code=("def sig_x(df):\n    out = df.copy()\n    out['signal'] = 1\n"
+                  "    return out.iloc[:-5]")))
+        check("用户策略：长度不一致被拒", not ok and "长度" in msg, msg)
+
+        good = US.UserStrategy(
+            key=key, label="冒烟策略", desc="20 日突破",
+            params={"entry": 240, "exit": 720},
+            func="sig_zz",
+            code=("def sig_zz(df, entry=240, exit=720):\n"
+                  "    out = df.copy()\n"
+                  "    hi = out['high'].rolling(entry).max().shift(1)\n"
+                  "    lo = out['low'].rolling(exit).min().shift(1)\n"
+                  "    out['signal'] = _position_state(\n"
+                  "        long_in=out['close'] > hi, long_out=out['close'] < lo,\n"
+                  "        short_in=out['close'] < lo, short_out=out['close'] > hi)\n"
+                  "    return out"))
+        ok, msg = US.register(good)
+        check("用户策略：正常策略注册成功", ok, msg)
+        check("用户策略：进了 STRATEGIES", key in S.STRATEGIES, key)
+
+        spec = S.STRATEGIES.get(key)
+        # 没给 param_meta 时要按默认值推范围，不能套 (1,100) 把 720 夹成 100
+        meta = (spec.param_meta or {}) if spec else {}
+        check("用户策略：参数范围按默认值推导",
+              meta.get("exit", (0, 0, 0))[1] >= 720,
+              str(meta))
+
+        df = US.sample_df()
+        out = S.run_strategy(df, key, {"entry": 120})
+        check("用户策略：能按参数跑出信号",
+              len(out) == len(df) and int((out["signal"] != 0).sum()) > 0,
+              f"{len(out)} 行")
+
+        doc = L.strategy_doc(key)
+        check("用户策略：文档带源码",
+              doc is not None and "def sig_zz" in doc.code, "")
+
+        ok2, msg2 = US.register(good)
+        check("用户策略：重名被拒", not ok2 and "已经有一个" in msg2, msg2)
+        ok3, msg3 = US.register(US.UserStrategy(
+            key="turtle", label="撞名", func="sig_y",
+            code="def sig_y(df):\n    out = df.copy()\n    out['signal'] = 1\n    return out"))
+        check("用户策略：不能覆盖内置策略", not ok3, msg3)
+        ok4, msg4 = US.register(US.UserStrategy(
+            key="Zz-Bad", label="坏代号", func="sig_z",
+            code="def sig_z(df):\n    out = df.copy()\n    out['signal'] = 1\n    return out"))
+        check("用户策略：代号格式校验", not ok4 and "代号" in msg4, msg4)
+
+        box: dict = {}
+        n = US.register_all_into(box)
+        check("用户策略：重启后从盘里挂回来", n == 1 and key in box, f"n={n}")
+        check("用户策略：挂回来的函数能跑",
+              key in box and "signal" in box[key].func(df).columns, "")
+
+        check("用户策略：删除后 STRATEGIES 里没了",
+              US.remove(key) and key not in S.STRATEGIES, "")
+        check("用户策略：删完盘里也没了", US.register_all_into({}) == 0, "")
+        check("用户策略：内置策略删不掉", not US.remove("turtle"), "")
+    except Exception as exc:  # noqa: BLE001
+        check("用户自定义策略", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        US.path = old_path
+        S.STRATEGIES.pop(key, None)
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def check_agent_memory() -> None:
+    """长期记忆：追加去重、按行摊平、封顶、注入 system prompt。"""
+    from ttrade import agent as A
+    from ttrade import agent_memory as Mem
+
+    tmpdir = tempfile.mkdtemp(prefix="td_mem_")
+    old_path = Mem.path
+    Mem.path = lambda: os.path.join(tmpdir, "agent_memory.json")
+    try:
+        check("记忆：初始为空", Mem.count() == 0 and Mem.brief() == "", "")
+
+        n = Mem.append([Mem.MemoryItem(text="- 螺纹只做多，1 手\n- 止损 2×ATR")])
+        check("记忆：追加成功", n == 1 and Mem.count() == 1, f"n={n}")
+
+        n2 = Mem.append([Mem.MemoryItem(text="- 螺纹只做多，1 手\n- 止损 2×ATR")])
+        check("记忆：整条重复被去重", n2 == 0 and Mem.count() == 1, f"n={n2}")
+
+        # 另一条记忆里也提到同一句：存储上不算重复，但注入时不能重复出现
+        Mem.append([Mem.MemoryItem(text="螺纹只做多，1 手")])
+        b = Mem.brief()
+        check("记忆：同一句不重复注入", b.count("螺纹只做多") == 1, repr(b))
+        check("记忆：列表符号不叠加", "- -" not in b, b)
+        check("记忆：一条记忆里的多行摊平成多行",
+              b.count("\n") == 1 and b.startswith("- "), repr(b))
+        Mem.clear()
+        Mem.append([Mem.MemoryItem(text="- 螺纹只做多，1 手\n- 止损 2×ATR")])
+
+        # 封顶：超过 MAX_ITEMS 只留最新的
+        Mem.append([Mem.MemoryItem(text=f"第 {i} 条") for i in range(Mem.MAX_ITEMS + 5)])
+        check("记忆：条数封顶", Mem.count() == Mem.MAX_ITEMS, str(Mem.count()))
+        check("记忆：留下的是最新的",
+              "第 64 条" in Mem.brief() and "第 0 条" not in Mem.brief(), "")
+
+        check("记忆：注入到 system 消息",
+              [m["role"] for m in A.build_messages([], "问", memory="- 螺纹只做多")]
+              == ["system", "system", "user"], "")
+        check("记忆：没记忆时不加空 system 消息",
+              len(A.build_messages([], "问")) == 2, "")
+
+        msg = A.memory_messages([
+            {"role": "user", "content": "帮我注册"},
+            {"role": "assistant", "content": "好\n```json\n{\"a\": 1}\n```\n完成"},
+        ])[0]["content"]
+        check("记忆：压缩请求剔掉代码块",
+              "```" not in msg and "已省略" in msg, msg[-40:])
+
+        Mem.clear()
+        check("记忆：清空后归零", Mem.count() == 0 and Mem.brief() == "", "")
+    except Exception as exc:  # noqa: BLE001
+        check("长期记忆", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        Mem.path = old_path
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -1455,6 +1638,8 @@ def main() -> int:
     check_agent_stream()
     check_agent_thread()
     check_user_factors()
+    check_user_strategies()
+    check_agent_memory()
     for k in ks:
         try:
             check_one(k)

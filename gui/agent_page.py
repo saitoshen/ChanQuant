@@ -56,8 +56,10 @@ from PySide6.QtWidgets import (
 )
 
 from ttrade import agent as A
+from ttrade import agent_memory as Mem
 from ttrade import library_docs as L
 from ttrade import strategy_store as SStore
+from ttrade.strategies import STRATEGIES
 from ttrade.paths import user_dir
 
 C_TEXT = "#1f2937"
@@ -123,6 +125,30 @@ class ChatWorker(QObject):
         self.done.emit(text)
 
 
+class MemoWorker(QObject):
+    """跑在 QThread 里：把一段旧对话压成记忆。
+
+    单独一个类而不是复用 `ChatWorker`：这个不流式、不显示、不需要「停止」，
+    复用只会让 `ChatWorker` 多出一堆 `if quiet` 分支。
+    """
+
+    done = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, cfg: A.AgentConfig, convo: list) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.convo = convo
+
+    def run(self) -> None:
+        try:
+            text = A.LLMClient(self.cfg).chat(A.memory_messages(self.convo))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+            return
+        self.done.emit(text)
+
+
 # ------------------------------------------------------------------ 对话框
 
 
@@ -172,6 +198,49 @@ class ConfirmDialog(QDialog):
             lay.addWidget(warn)
 
             # 注册因子没有「下次不提醒」：每次的代码都不一样，盲签没有意义
+            self.chk_silent = QCheckBox()
+            self.chk_silent.hide()
+            box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            box.button(QDialogButtonBox.Ok).setText("注册")
+            box.button(QDialogButtonBox.Cancel).setText("取消")
+            box.accepted.connect(self.accept)
+            box.rejected.connect(self.reject)
+            lay.addWidget(box)
+            return
+
+        if action.kind == "strategy":
+            # 和注册因子一样：这段代码会在本机跑，而且会拿真金白银的数据做回测，
+            # 所以代码必须摊开给人看。
+            rows = [
+                ("代号", p.get("key", "")),
+                ("说明", p.get("desc", "")),
+                ("默认参数", "　".join(f"{k}={v}" for k, v in (p.get("params") or {}).items())
+                 or "（无参数）"),
+            ]
+            form = QFormLayout()
+            form.setContentsMargins(0, 6, 0, 6)
+            for k, v in rows:
+                if not v:
+                    continue
+                lab = QLabel(str(v))
+                lab.setWordWrap(True)
+                form.addRow(QLabel(k), lab)
+            lay.addLayout(form)
+
+            lay.addWidget(QLabel("实现代码"))
+            code = QPlainTextEdit(p.get("code", ""))
+            code.setReadOnly(True)
+            code.setMinimumHeight(260)
+            code.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
+            lay.addWidget(code)
+
+            warn = QLabel("确认后写入策略库，之后可以在「策略研究」页选它回测或实盘；"
+                          "代码跑不通会注册失败并给出原因。")
+            warn.setWordWrap(True)
+            warn.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
+            lay.addWidget(warn)
+
+            # 策略也没有「下次不提醒」：每次的代码都不一样
             self.chk_silent = QCheckBox()
             self.chk_silent.hide()
             box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -270,6 +339,16 @@ class SettingsDialog(QDialog):
         self.chk_confirm.setChecked(cfg.confirm_trade)
         form.addRow("", self.chk_confirm)
 
+        self.lbl_mem = QLabel(f"{Mem.count()} 条")
+        self.lbl_mem.setObjectName("Hint")
+        btn_mem = QPushButton("清空记忆")
+        btn_mem.setObjectName("Ghost")
+        btn_mem.clicked.connect(self._clear_memory)
+        mem_row = QHBoxLayout()
+        mem_row.addWidget(self.lbl_mem, 1)
+        mem_row.addWidget(btn_mem)
+        form.addRow("长期记忆", mem_row)
+
         note = QLabel(
             "Key 明文存在本机用户目录，不会进版本库。\n"
             "推理型模型（deepseek-reasoner、o 系列）会自动省掉温度参数。"
@@ -321,6 +400,20 @@ class SettingsDialog(QDialog):
             confirm_trade=self.chk_confirm.isChecked(),
         )
 
+    def _clear_memory(self) -> None:
+        """清空长期记忆。对话记录不动 —— 那是两回事。"""
+        n = Mem.count()
+        if n == 0:
+            return
+        ok = QMessageBox.question(
+            self, "清空长期记忆",
+            f"删掉 {n} 条记忆？当前对话记录不受影响，只是下次开窗口不记得这些了。",
+        )
+        if ok != QMessageBox.Yes:
+            return
+        Mem.clear()
+        self.lbl_mem.setText("0 条")
+
     def _test(self) -> None:
         cfg = self.current()
         ok, why = cfg.ready()
@@ -354,6 +447,7 @@ class AgentPage(QWidget):
     trade_requested = Signal(object)      # A.Action
     portfolio_requested = Signal(object)  # SStore.StrategyConfig
     factor_added = Signal(str)            # 新注册的因子 key，主窗口据此刷新下拉
+    strategy_added = Signal(str)          # 新注册的策略 key，同上
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -364,6 +458,9 @@ class AgentPage(QWidget):
         self._busy = False
         self._pending_report = ""     # 正在生成的研报品种，回完自动落盘
         self._stream_buf = ""
+        self._memo_worker: MemoWorker | None = None
+        self._memo_thread: QThread | None = None
+        self._memo_warned = False     # 压缩失败只提示一次，别每轮都刷
         self._build()
         self._refresh_status()
         self._fill_factors()
@@ -555,7 +652,8 @@ class AgentPage(QWidget):
     def _fill_strategies(self) -> None:
         self.lst_strat.clear()
         for d in L.all_strategy_docs():
-            it = QListWidgetItem(f"{d.label}　·　内置")
+            tag = "自定义" if _is_user_strategy(d.key) else "内置"
+            it = QListWidgetItem(f"{d.label}　·　{tag}")
             it.setData(Qt.UserRole, ("rule", d.key))
             it.setToolTip(d.desc)
             self.lst_strat.addItem(it)
@@ -629,15 +727,22 @@ class AgentPage(QWidget):
             if d is None:
                 return
             params = "，".join(f"{k}={v}" for k, v in d.params.items())
+            # 自定义策略没有「优势 / 适应情况 / 风险」这几段（那是给内置策略写死的
+            # 说明），空标题一片白反而像加载失败，所以空的一律不渲染
+            kind = "自定义策略" if _is_user_strategy(d.key) else "内置规则策略"
             html = [
                 f"<h3 style='color:{C_TEXT};margin:0 0 4px 0'>{d.label}</h3>",
-                f"<p style='color:{C_MUTED};margin:0 0 10px 0'>内置规则策略　·　"
+                f"<p style='color:{C_MUTED};margin:0 0 10px 0'>{kind}　·　"
                 f"键名 <code>{d.key}</code></p>",
-                _block("逻辑", d.logic),
-                _block("优势", d.edge),
-                _block("适应情况", d.fits),
-                _block("风险", d.risk),
-                _block("参数", f"默认 {params}。<br>{d.params_help}"),
+            ]
+            for title, body in (
+                ("逻辑", d.logic), ("优势", d.edge),
+                ("适应情况", d.fits), ("风险", d.risk),
+            ):
+                if body:
+                    html.append(_block(title, body))
+            html += [
+                _block("参数", f"默认 {params}。" + (f"<br>{d.params_help}" if d.params_help else "")),
                 _block("实现代码", "", raw=True),
                 _code(d.code),
             ]
@@ -688,10 +793,15 @@ class AgentPage(QWidget):
             if not ok else
             "可以开始问了。比如：「螺纹现在适合做多吗？」「帮我用唐奇安回测铁矿」。"
         )
+        n_mem = Mem.count()
+        mem_line = (
+            f"<br>还记着以前聊过的 {n_mem} 条要点（左下角「设置」里可以清空）。"
+            if n_mem else ""
+        )
         self.log.setHtml(
             f"<p style='color:{C_MUTED};line-height:160%'>"
             f"我是这个平台里的交易助手，能查数据、解释因子、跑回测、按你的话下单。<br>"
-            f"{tip}</p>"
+            f"{tip}{mem_line}</p>"
         )
 
     def _clear_chat(self) -> None:
@@ -723,7 +833,9 @@ class AgentPage(QWidget):
         self._append(f"<p style='margin:12px 0 2px 0'><b>助手</b></p>")
 
         self._history.append({"role": "user", "content": text})
-        msgs = A.build_messages(A.trim_history(self._history[:-1]), text)
+        msgs = A.build_messages(
+            A.trim_history(self._history[:-1]), text, memory=Mem.brief()
+        )
         self._stream_buf = ""
         self._start_worker(msgs)
 
@@ -774,6 +886,8 @@ class AgentPage(QWidget):
             self._save_report(self._pending_report, final)
             self._pending_report = ""
 
+        self._maybe_compress()
+
     def _on_failed(self, msg: str) -> None:
         self._append(f"<p style='color:{C_BAD}'>出错了：{_esc(msg)}</p>")
         self._set_state(msg[:80], C_BAD)
@@ -794,6 +908,83 @@ class AgentPage(QWidget):
         self._worker.stop()
         self._set_state("正在停止…", C_MUTED)
 
+    # ---------------------------------------------------------- 长期记忆
+
+    # 超过 MEMO_AT 条就把最老的一段压成记忆，最近 MEMO_KEEP 条原样留着。
+    # 16 条 = 8 轮：再短的话压缩一次只省下两三轮，请求数白花；再长的话
+    # `trim_history` 的 40 条上限会先把中间那段切掉。
+    MEMO_AT = 16
+    MEMO_KEEP = 8
+
+    def _maybe_compress(self) -> None:
+        """一轮答完之后看一眼：历史够长了就把老的那截压成记忆。
+
+        压缩本身是一次额外的模型请求，所以放后台线程，不能卡住界面 ——
+        用户下一句可能立刻就来。
+        """
+        if self._memo_thread is not None or not self.cfg.ready():
+            return
+        n = len(self._history) - self.MEMO_KEEP
+        if n < self.MEMO_AT - self.MEMO_KEEP:
+            return
+        chunk = self._history[:n]
+        chars = sum(len(m.get("content") or "") for m in chunk)
+        # 全是「嗯」「好」就再攒攒；但历史快到硬上限时必须压，否则 `trim_history`
+        # 会直接把这截丢掉，什么也留不下
+        if chars < 400 and len(self._history) < A.MAX_HISTORY - 2:
+            return
+
+        worker = MemoWorker(self.cfg, chunk)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(lambda text, c=chunk: self._on_memo_done(text, c))
+        worker.failed.connect(self._on_memo_failed)
+        # 同 `ChatWorker`：`started` 连普通函数，不显式 quit 就永远不发 finished
+        worker.done.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_memo_thread_done)
+        self._memo_worker, self._memo_thread = worker, thread
+        thread.start()
+
+    def _on_memo_done(self, text: str, chunk: list) -> None:
+        # 用户中途点了「清空」：这段对话他不要了，那也别往记忆里塞
+        if not chunk or self._history[:len(chunk)] != chunk:
+            return
+        text = (text or "").strip()
+        # 模型判断这段没什么可记的就只回「无」。那也照样丢 —— 留着占上下文，
+        # 而它已经明确说了不值得记
+        saved = 0
+        if text and text not in ("无", "无。", "無"):
+            saved = Mem.append([Mem.MemoryItem(
+                text=text, kind="summary", turns=len(chunk),
+            )])
+
+        # 上面已经确认过这段还是原样，直接切掉
+        del self._history[:len(chunk)]
+
+        if saved:
+            self._append(
+                f"<p style='color:{C_MUTED};font-size:11px'>已把前 {len(chunk)} 条对话"
+                f"压成记忆（共 {Mem.count()} 条），下次开窗口还在。</p>"
+            )
+
+    def _on_memo_failed(self, msg: str) -> None:
+        # 只提示一次：模型没配好时每轮都失败，刷屏比不提示更烦
+        if self._memo_warned:
+            return
+        self._memo_warned = True
+        self._append(
+            f"<p style='color:{C_MUTED};font-size:11px'>记忆压缩没成功"
+            f"（{_esc(msg[:80])}），这段对话先留着，下次再试。</p>"
+        )
+
+    def _on_memo_thread_done(self) -> None:
+        self._memo_worker = None
+        self._memo_thread = None
+
     def _set_busy(self, on: bool) -> None:
         self._busy = on
         self.btn_send.setEnabled(not on)
@@ -813,7 +1004,7 @@ class AgentPage(QWidget):
         #
         # 注册因子**不受** `confirm_trade` 开关控制 —— 那个开关管的是下单，而这里
         # 要执行的是模型写的 Python 代码，每次都不一样，盲签没有意义。
-        need_confirm = action.kind == "factor" or (
+        need_confirm = action.kind in ("factor", "strategy") or (
             self.cfg.confirm_trade and action.kind == "trade"
         )
         if need_confirm:
@@ -831,6 +1022,9 @@ class AgentPage(QWidget):
 
         if action.kind == "factor":
             self._register_factor(action.payload)
+            return
+        if action.kind == "strategy":
+            self._register_strategy(action.payload)
             return
 
         self._append(
@@ -865,6 +1059,34 @@ class AgentPage(QWidget):
         self._set_state(f"已注册因子 {f.key}", C_OK)
         self.reload()
         self.factor_added.emit(f.key)
+
+    def _register_strategy(self, p: dict) -> None:
+        """把模型写的策略落地：试算 → 写盘 → 注册进 STRATEGIES → 刷新左边的库。"""
+        from ttrade import userstrategies as US
+
+        s = US.UserStrategy(
+            key=p.get("key", ""), label=p.get("label", ""), desc=p.get("desc", ""),
+            params=dict(p.get("params") or {}),
+            param_meta={k: list(v) for k, v in (p.get("param_meta") or {}).items()
+                        if isinstance(v, (list, tuple)) and len(v) == 3},
+            func=p.get("func", ""), code=p.get("code", ""),
+        )
+        ok, msg = US.register(s)
+        if not ok:
+            self._append(f"<p style='color:{C_BAD}'>注册失败：{_esc(msg)}</p>")
+            self._set_state("策略注册失败", C_BAD)
+            return
+
+        self._append(
+            f"<p style='color:{C_OK}'>已注册策略「{_esc(s.label)}」（{_esc(s.key)}）。"
+            f"{_esc(msg)}</p>"
+            f"<p style='color:{C_MUTED};font-size:11px'>"
+            "在「策略研究」页的规则策略下拉里能选到它，参数可以拖滑杆调。定义存在 "
+            f"<code>{_esc(US.path())}</code>，不想留就把那一条删掉。</p>"
+        )
+        self._set_state(f"已注册策略 {s.key}", C_OK)
+        self.reload()
+        self.strategy_added.emit(s.key)
 
     # ---------------------------------------------------------- 策略 / 研报动作
 
@@ -913,8 +1135,9 @@ class AgentPage(QWidget):
         self.tabs.setCurrentIndex(1)
         self._prefill(
             "我想做一个新的规则策略：<在这里写思路>。\n"
-            "请给出：入场条件、离场条件、参数与默认值、适合的品种和行情、"
-            "以及用平台已有的 47 个因子能不能近似实现。"
+            "先判断平台已有的 5 套规则策略（双均线、唐奇安、ATR 通道、MACD、海龟）"
+            "调参数能不能覆盖；覆盖不了就写成 strategy 动作块直接注册进策略库。\n"
+            "另外说明：入场条件、离场条件、参数与默认值、适合的品种和行情。"
         )
 
     def _prefill(self, text: str) -> None:
@@ -982,6 +1205,11 @@ class AgentPage(QWidget):
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait(3000)
+        # 压缩线程没有 abort 手段（`MemoWorker` 不流式、拿不到 response），
+        # 只能等它自己跑完这一轮；关窗口时最多等 2 秒，超时就算了
+        if self._memo_thread is not None:
+            self._memo_thread.quit()
+            self._memo_thread.wait(2000)
 
 
 # ------------------------------------------------------------------ 小工具
@@ -1001,6 +1229,16 @@ def _code(text: str) -> str:
         "background:#f6f8fa;padding:8px;border-radius:4px;"
         f"white-space:pre-wrap'>{_esc(text)}</pre>"
     )
+
+
+def _is_user_strategy(key: str) -> bool:
+    """内置策略的 `StrategySpec.code` 是空的，用户注册的把源码挂在上面。
+
+    用这个而不是去读 `user_strategies.json`：列表每次切换都要渲染，为一个
+    标记位读一次盘不值当，而且读盘失败会把自定义策略显示成「内置」。
+    """
+    spec = STRATEGIES.get(key)
+    return bool(spec and spec.code)
 
 
 def _block(title: str, body: str, raw: bool = False) -> str:

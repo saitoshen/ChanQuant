@@ -417,6 +417,8 @@ def strategy_doc(key: str) -> StrategyDoc | None:
     if spec is None:
         return None
     doc = STRATEGY_DOCS.get(key, {})
+    # 用户注册的策略不在 STRATEGY_DOCS 里，源码也取不到（exec 出来的函数没有
+    # 源文件），公式和代码只能靠 `StrategySpec` 自己带着
     return StrategyDoc(
         key=key,
         label=spec.label,
@@ -428,7 +430,7 @@ def strategy_doc(key: str) -> StrategyDoc | None:
         params_help=doc.get("params", ""),
         params=dict(spec.params),
         param_meta=dict(spec.param_meta),
-        code=_source(spec.func),
+        code=spec.code or _source(spec.func),
     )
 
 

@@ -244,6 +244,9 @@ class StrategySpec:
     param_meta: dict = field(default_factory=dict)
     desc: str = ""
     bidirectional: bool = True   # 是否支持做空
+    # 用户注册的策略自带源码：`exec` 出来的函数没有源文件，`inspect.getsource()`
+    # 取不到，库页要展示代码就只能存一份
+    code: str = ""
 
 
 STRATEGIES: dict[str, StrategySpec] = {
@@ -301,3 +304,22 @@ def run_strategy(df: pd.DataFrame, key: str, params: dict | None = None) -> pd.D
     if params:
         p.update({k: v for k, v in params.items() if k in p})
     return spec.func(df, **p)
+
+
+# ---------------------------------------------------------------- 用户自定义策略
+def _load_user_strategies() -> int:
+    """把用户目录里的自定义策略挂进来。
+
+    和 `factors.py` 同一个理由放在文件**末尾**：`userstrategies` 要
+    `from ttrade.strategies import StrategySpec`，这时本模块已经执行到底。
+    失败一律吞掉 —— 用户手改 JSON 改坏了，不该让程序起不来。
+    """
+    try:
+        from ttrade import userstrategies as US
+
+        return US.register_all_into(STRATEGIES)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+USER_STRATEGY_COUNT = _load_user_strategies()

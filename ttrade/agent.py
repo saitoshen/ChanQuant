@@ -362,7 +362,8 @@ SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务�
 - 数据：国内商品期货 78 个品种（日线 20 年，5 分钟/1 小时 10 年，天勤主连 + 真实合约），美股 34 只（东财后复权）
 - 47 个内置因子：趋势/反转/波动/量能/形态/展期/期权七类，每个都有数学公式与实现代码；
   用户注册的自定义因子会追加进同一个库
-- 5 套规则策略：双均线、唐奇安突破、ATR 通道、MACD、海龟（突破 + ATR 止损）
+- 5 套内置规则策略：双均线、唐奇安突破、ATR 通道、MACD、海龟（突破 + ATR 止损），
+  用户注册的自定义策略会追加进同一个库
 - 因子策略三种模式：单因子、多因子等权、机器学习多因子（含线性模型与图神经网络）
 - 回测：次日开盘成交、双边成本、逐笔保证金、爆仓保护；方向由滚动 IC 决定，不用未来信息
 - 实盘：天勤 TqSdk，支持快期模拟与实盘账户，多策略组合、追单、持仓对齐
@@ -387,7 +388,14 @@ SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务�
 
 - 按策略交易：`"mode": "auto"`，带 `strategy` 与 `params`
 - 主观买卖：`"mode": "manual"`，带 `"side": "BUY"|"SELL"`、`"offset": "OPEN"|"CLOSE"|"CLOSETODAY"`
-- 只想回测不交易：`{"action": "backtest", ...}`，字段同上但不带 mode
+- 只想回测不交易：把 `action` 换成 `backtest`，其余字段同上但不带 `mode`：
+
+```json
+{"action": "backtest", "symbol": "RB", "exchange": "SHFE", "period": "1d",
+ "strategy": "ma_cross", "params": {"fast": 50, "slow": 200}}
+```
+
+- 要往库里加**新策略**：`{"action": "strategy", ...}`，见下
 - 不需要执行任何操作时，**不要输出 json 块**
 
 ## 注册新因子
@@ -396,12 +404,12 @@ SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务�
 没有的想法时，把它写成动作块，用户确认后就会进因子库：
 
 ```json
-{"action": "factor", "key": "roll_yield_main", "label": "展期收益率·主力",
- "category": "展期", "hint_dir": 1,
- "formula": "ln(P近/P次近) / (T次近 - T近) × 365",
- "desc": "一句话说明这个因子在测什么",
- "func": "f_roll_yield_main",
- "code": "def f_roll_yield_main(df):\n    near = _col(df, 'c1_close')\n    nxt = _col(df, 'c2_close')\n    d1 = _col(df, 'c1_dte')\n    d2 = _col(df, 'c2_dte')\n    return _safe_div(np.log(_safe_div(near, nxt)), d2 - d1) * 365"}
+{"action": "factor", "key": "vol_price_corr", "label": "量价相关·20 日",
+ "category": "量能", "hint_dir": 0,
+ "formula": "corr(Δlog(close), Δlog(volume), 20)",
+ "desc": "成交量和价格同向变化，说明这段趋势有资金跟随",
+ "func": "f_vol_price_corr",
+ "code": "def f_vol_price_corr(df):\\n    c = _col(df, 'close').pct_change()\\n    v = _col(df, 'volume').pct_change()\\n    return c.rolling(20).corr(v)"}
 ```
 
 写代码的硬约束，违反任何一条都会注册失败：
@@ -420,17 +428,90 @@ SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务�
 
 如果这个想法用现有因子组合就能表达（比如「动量除以波动」），优先建议用多因子模式，
 不要为此新增因子 —— 库里多一个几乎重复的因子，比少一个更难维护。
+
+## 注册新策略
+
+平台**也支持运行时注册规则策略**。用户描述一套平台没有的进出场逻辑时，写成动作块：
+
+```json
+{"action": "strategy", "key": "sbbox_mini", "label": "缩量突破·迷你",
+ "desc": "突破 N 日高点入场，波动率过高时不开仓，跌破 M 日低点离场",
+ "params": {"entry": 240, "exit": 720, "vol_max": 0.4, "atr_n": 200},
+ "param_meta": {"entry": [20, 960, 20], "exit": [60, 1440, 20]},
+ "func": "sig_sbbox_mini",
+ "code": "def sig_sbbox_mini(df, entry=240, exit=720, vol_max=0.4, atr_n=200):\\n    out = df.copy()\\n    hi = out['high'].rolling(entry).max().shift(1)\\n    lo = out['low'].rolling(exit).min().shift(1)\\n    vol = out['close'].pct_change().rolling(20).std()\\n    out['signal'] = _position_state(\\n        long_in=out['close'] > hi,\\n        long_out=out['close'] < lo,\\n        short_in=out['close'] < lo,\\n        short_out=out['close'] > hi,\\n    )\\n    out.loc[vol > vol_max, 'signal'] = 0\\n    return out"}
+```
+
+硬约束，违反任何一条都会注册失败：
+
+1. **签名 `def sig_xxx(df, 参数...)`**，`df` 索引是 datetime，含
+   `open/high/low/close/volume/open_oi/close_oi`
+2. **不要写 import**。`np`、`pd`、`sma`、`ema`、`atr`、`true_range`、
+   `_position_state(多头进/多头出/空头进/空头出)` 都已注入，直接用
+3. **返回带 `signal` 列的等长 DataFrame**。`signal` 是当日收盘后的目标仓位：
+   1 满仓多、0 空仓、-1 满仓空，只能取这三个值
+4. **必须 PIT**：只用 `rolling` / `ewm` / `shift(正数)`，**绝不出现 `shift(-n)`**
+5. **只管出仓位**：不要自己算手续费、滑点、手数、资金曲线，回测引擎统一处理
+6. 参数放进 `params`（带默认值），代码里同名形参接住；`param_meta` 可选，不写就按
+   默认值自动推滑杆范围
+7. `key` 用英文小写加下划线，`label` 用中文
+
+如果现有 5 套策略加参数就能覆盖（比如「海龟把 entry 调成 240」），**先用 backtest
+动作试跑**，不要为此新增策略 —— 库里多一个几乎重复的策略更难维护。
 """
 
 
-def build_messages(history: list[dict], user_text: str) -> list[dict]:
-    """拼一份完整消息列表：系统提示 + 历史 + 本轮。"""
+def build_messages(history: list[dict], user_text: str, memory: str = "") -> list[dict]:
+    """拼一份完整消息列表：系统提示 + 长期记忆 + 历史 + 本轮。
+
+    记忆单独占一条 system 消息，不拼进 `SYSTEM_PROMPT`：一是基础提示词不变，
+    各家服务端的上下文缓存还能命中；二是调试时一眼能看出「这句是记忆喂进去的」。
+    """
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if memory.strip():
+        msgs.append({
+            "role": "system",
+            "content": "## 长期记忆\n\n以下是你在以前的对话里自己压缩出来的要点，"
+                       "不是用户这一轮说的。用到时当作已知事实，不要向用户复述这份清单。\n\n"
+                       + memory.strip(),
+        })
     for m in history:
         if m.get("role") in ("user", "assistant") and m.get("content"):
             msgs.append({"role": m["role"], "content": m["content"]})
     msgs.append({"role": "user", "content": user_text})
     return msgs
+
+
+MEMORY_PROMPT = """把下面这段「交易助手 ↔ 用户」的对话压缩成长期记忆，供以后接着聊时参考。
+
+只写以后还用得上的：
+- 用户关注的标的、周期、账户、手数、风险口径
+- 已经跑出来的数字和结论（收益、夏普、参数、阈值）
+- 已经做过的决定（注册了哪个因子/策略、跑过什么、否决了什么）
+- 用户明确表达过的偏好和要求
+
+不要写：客套话、你的推理过程、被否决的中间方案、代码。
+不要写「用户问了…」这种过程描述，直接写事实。
+一条一行，最多 6 行，每行不超过 40 字。没有值得记的就只回两个字：无。
+
+对话：
+"""
+
+_CODE_BLOCK = re.compile(r"```.*?```", re.S)
+
+
+def memory_messages(convo: list[dict]) -> list[dict]:
+    """把一段对话拼成「压缩成记忆」的请求。
+
+    代码块先剔掉：模型给的因子/策略源码能占上千字，压进记忆既没用又会把
+    真正该记的数字挤掉。
+    """
+    lines = []
+    for m in convo:
+        role = "用户" if m.get("role") == "user" else "助手"
+        text = _CODE_BLOCK.sub("（此处有一段代码或数据块，已省略）", m.get("content") or "")
+        lines.append(f"{role}：{text.strip()}")
+    return [{"role": "user", "content": MEMORY_PROMPT + "\n".join(lines)}]
 
 
 # ------------------------------------------------------------------ 动作解析
@@ -440,7 +521,7 @@ _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
 
 @dataclass
 class Action:
-    kind: str                 # trade / backtest / factor / 空串表示没有动作
+    kind: str                 # trade / backtest / factor / strategy / 空串表示没有动作
     payload: dict = field(default_factory=dict)
     error: str = ""
 
@@ -465,6 +546,9 @@ class Action:
             return f"回测 {sym} {p.get('period', '')}｜{p.get('strategy', '')}"
         if self.kind == "factor":
             return f"注册因子「{p.get('label', '')}」（{p.get('category', '')}）"
+        if self.kind == "strategy":
+            n = len(p.get("params") or {})
+            return f"注册策略「{p.get('label', '')}」（{n} 个参数）"
         return self.kind
 
 
@@ -499,6 +583,44 @@ def _parse_factor(obj: dict) -> Action:
     return Action("factor", obj)
 
 
+def _parse_strategy(obj: dict) -> Action:
+    """注册策略的动作块。只校验「能不能落地」，不评判策略好坏 ——
+    好坏由回测数字说话，不由这里拦。"""
+    key = str(obj.get("key") or "").strip().lower()
+    label = str(obj.get("label") or "").strip()
+    code = str(obj.get("code") or "")
+    if not key:
+        return Action("strategy", obj, "缺少策略代号 key")
+    if not label:
+        return Action("strategy", obj, "缺少显示名 label")
+    if not code.strip():
+        return Action("strategy", obj, "缺少实现代码 code")
+
+    func = str(obj.get("func") or f"sig_{key}").strip()
+    if f"def {func}" not in code:
+        return Action("strategy", obj, f"code 里要定义 def {func}(df, ...)")
+
+    params = obj.get("params") or {}
+    if not isinstance(params, dict):
+        return Action("strategy", obj, "params 要是一个对象")
+    for k, v in params.items():
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            return Action("strategy", obj, f"参数 {k} 的值 {v!r} 不是数字")
+
+    meta = obj.get("param_meta") or {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    obj["key"] = key
+    obj["label"] = label
+    obj["func"] = func
+    obj["code"] = code
+    obj["desc"] = str(obj.get("desc") or "").strip()
+    obj["params"] = params
+    obj["param_meta"] = meta
+    return Action("strategy", obj)
+
+
 def parse_action(text: str) -> Action:
     """从回答里挖出动作块。没有就返回 kind 为空串的 Action。
 
@@ -516,11 +638,14 @@ def parse_action(text: str) -> Action:
         return Action("", {}, "动作块不是对象")
 
     kind = str(obj.get("action") or "").strip().lower()
-    if kind not in ("trade", "backtest", "factor"):
+    if kind not in ("trade", "backtest", "factor", "strategy"):
         return Action("")
     if kind == "factor":
         # 注册因子不需要品种 —— 因子是横截面的，对哪个标的算由用户决定
         return _parse_factor(obj)
+    if kind == "strategy":
+        # 注册的是策略**定义**，也不带品种：同一套逻辑要跑哪个品种是另一件事
+        return _parse_strategy(obj)
     if not obj.get("symbol"):
         return Action(kind, obj, "缺少品种")
 

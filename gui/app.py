@@ -882,8 +882,9 @@ class MainWindow(QMainWindow):
         self.agent_page.study_requested.connect(self._on_agent_study)
         self.agent_page.trade_requested.connect(self._on_agent_trade)
         self.agent_page.portfolio_requested.connect(self._on_agent_portfolio)
-        # Agent 注册了新因子之后，因子下拉要重建，否则库里有了却选不到
+        # Agent 注册了新因子/新策略之后，对应下拉要重建，否则库里有了却选不到
         self.agent_page.factor_added.connect(self._on_factor_added)
+        self.agent_page.strategy_added.connect(self._on_strategy_added)
 
         self.trade_page.connect_requested.connect(self._on_trade_connect)
         self.trade_page.disconnect_requested.connect(self._on_live_stop)
@@ -1114,8 +1115,7 @@ class MainWindow(QMainWindow):
         pr.setSpacing(8)
         pr.addWidget(self._section("规则策略"))
         self.cb_strategy = QComboBox()
-        for key, spec in STRATEGIES.items():
-            self.cb_strategy.addItem(spec.label, key)
+        self._fill_strategy_combo()
         pr.addWidget(self.cb_strategy)
 
         self.lbl_desc = QLabel("")
@@ -1705,6 +1705,33 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.cb_fsingle.setCurrentIndex(idx)
         self.cb_fsingle.blockSignals(False)
+
+    def _fill_strategy_combo(self) -> None:
+        """重建规则策略下拉。注册了新策略之后要重来一遍，否则选不到它。
+
+        内置的排在前面、用户注册的排后面 —— 库里越加越多之后，用户自己的东西
+        不该把原来那 5 套挤到下面去。
+        """
+        keep = self.cb_strategy.currentData()
+        builtin = [k for k in STRATEGIES if not STRATEGIES[k].code]
+        mine = [k for k in STRATEGIES if STRATEGIES[k].code]
+        self.cb_strategy.blockSignals(True)
+        self.cb_strategy.clear()
+        for key in builtin + mine:
+            self.cb_strategy.addItem(STRATEGIES[key].label, key)
+        idx = self.cb_strategy.findData(keep)
+        self.cb_strategy.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cb_strategy.blockSignals(False)
+
+    def _on_strategy_added(self, key: str) -> None:
+        """Agent 注册了新策略：重建下拉并选中它，顺手把参数滑杆也换过去。"""
+        self._fill_strategy_combo()
+        idx = self.cb_strategy.findData(key)
+        if idx >= 0:
+            self.cb_strategy.setCurrentIndex(idx)
+            f = self.cb_family.findData("rule")
+            if f >= 0:
+                self.cb_family.setCurrentIndex(f)
 
     def _multi_state(self) -> dict:
         """当前多因子表格里每个因子的 (参与合成, 反转)。重建时用它保住勾选。"""
