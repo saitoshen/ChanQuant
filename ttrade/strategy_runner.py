@@ -209,6 +209,8 @@ class PortfolioRunner:
         self._top_klines: dict[tuple[str, str, str], object] = {}
         # (品种, 交易所, 源周期) -> 上次尝试的时刻。见 `TOP_RETRY`
         self._top_try: dict[tuple[str, str, str], float] = {}
+        # 上次失败的原因。同样的原因只打一条日志，不然每 2 秒刷一行
+        self._top_err: dict[tuple[str, str, str], str] = {}
 
     # ---- 生命周期 ----
 
@@ -413,8 +415,18 @@ class PortfolioRunner:
 
     # ---- 信号 ----
 
+    @staticmethod
+    def _skey(cfg) -> str:
+        """订阅槽的键。**必须带周期**。
+
+        `cfg.key()` 只是「品种_交易所」，同一个品种的 5m 和 1h 是**两条不同的
+        序列**，共用一槽会让后订阅的策略直接拿到前一条 —— 1h 策略实际按 5m
+        信号下单，补库还会把 5m 的 bar 写进 1h 表（图上最后一截变成五分钟一根）。
+        """
+        return f"{cfg.key()}@{cfg.period}"
+
     def _subscribe(self, st: SlotState) -> None:
-        key = st.cfg.key()
+        key = self._skey(st.cfg)
         if key in self._klines:
             self._top_up(st)      # 第一次没订成源周期的话，这里接着试
             return
@@ -448,7 +460,7 @@ class PortfolioRunner:
             return
         self._top_try[slot] = now
         if src == st.cfg.period:
-            serial = self._klines.get(st.cfg.key())
+            serial = self._klines.get(self._skey(st.cfg))
         else:
             serial = self._top_klines.get(slot)
             if serial is None:
@@ -465,20 +477,24 @@ class PortfolioRunner:
         if serial is None or not len(serial):
             return
         r = topup.save(serial, st.cfg.symbol, st.cfg.exchange, src)
-        if r["error"]:
-            self._topped.add(slot)     # 配置性问题，重试也没用
-            self._log(f"{st.title()}：本地历史没补上（{r['error']}）")
-            return
         if not r["ok"]:
-            return                     # 序列还没填充，下一 tick 接着试
+            # 序列还没填充，或者库被别的连接锁着（下载器在跑、主线程正在读）。
+            # 两种都值得过 2 秒再试 —— 一次写库失败就把这个品种永久放弃，
+            # 会变成「启动那一刻刚好在读数据，之后就再也不补了」。
+            why = r["error"] or "序列还没填充"
+            if self._top_err.get(slot) != why:
+                self._top_err[slot] = why
+                self._log(f"{st.title()}：本地历史稍后再补（{why}）")
+            return
         self._topped.add(slot)
+        self._top_err.pop(slot, None)
         if r["added"]:
             self._log(f"{st.title()}：本地历史补到最新 +{r['added']} 根"
                       f"（{src}，到 {r['last']:%Y-%m-%d %H:%M}）")
 
     def _refresh_signal(self, st: SlotState) -> None:
         self._subscribe(st)
-        key = st.cfg.key()
+        key = self._skey(st.cfg)
         kl = self._klines.get(key)
         if kl is None or not len(kl):
             return
@@ -1078,7 +1094,7 @@ class PortfolioRunner:
         st = self._slots.get(sid)
         if st is None:
             return None
-        kl = self._klines.get(st.cfg.key())
+        kl = self._klines.get(self._skey(st.cfg))
         if kl is None or not len(kl):
             return None
         try:

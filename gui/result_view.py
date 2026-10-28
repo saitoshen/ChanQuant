@@ -645,6 +645,23 @@ class ResultView(QObject):
         self._refresh_trades()
         self._refresh_stages()
 
+    def update_kline(self, df) -> None:
+        """只换 K 线数据、重画那一块。实时刷新用。
+
+        `show_result()` 会把绩效曲线、阶段表、交易记录**全部**重建一遍 ——
+        三万根的净值曲线画一次就是几百毫秒，5 秒来一次，用户只是切到别的
+        页签看一眼，整页也照样卡成「未响应」。实时刷新只有 K 线在变，别付
+        那份额外的钱。
+
+        代价是绩效卡片跟着停在打开那一刻。要最新的绩效，重开一次这条策略
+        就有了 —— 那个动作本来就是一秒级，不该每 5 秒自动跑。
+        """
+        if df is None or not len(df):
+            return
+        self.df = df
+        if self.kind == "single":
+            self._draw_kline(keep_window=True)
+
     def clear(self, msg: str) -> None:
         """没有结果时把图清空并写一句话。
 

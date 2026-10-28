@@ -1420,7 +1420,7 @@ def check_strategy_runner() -> None:
                                sizing="fixed", volume=2,
                                rule_params={"fast": 5, "slow": 20})
         st5 = r.add(c5)
-        r._klines[c5.key()] = bars
+        r._klines[r._skey(c5)] = bars
         r._quotes[c5.key()] = None
         st5.running = True
         r._refresh_signal(st5)
@@ -1444,7 +1444,7 @@ def check_strategy_runner() -> None:
             "close": [1000.0], "volume": [100.0],
             "open_oi": [1000.0], "close_oi": [1000.0],
         })]).reset_index(drop=True)
-        r._klines[c5.key()] = live
+        r._klines[r._skey(c5)] = live
         r._refresh_signal(st5)
         check("信号：新 bar 到了会用刚收盘的那根重算",
               st5.last_bar == int(live["datetime"].iloc[-1]), str(st5.last_bar))
@@ -1493,7 +1493,7 @@ def check_strategy_runner() -> None:
             "close": [1.2, 2.2], "volume": [10.0, 20.0],
             "open_oi": [0.0, 0.0], "close_oi": [0.0, 0.0],
         })
-        r._klines[st_mm.cfg.key()] = kl
+        r._klines[r._skey(st_mm.cfg)] = kl
         got = r.bars_of(st_mm.cfg.sid)
         check("实时 K 线：能取到订阅着的序列", got is not None and len(got) == 2,
               f"{None if got is None else len(got)} 根")
@@ -3219,7 +3219,7 @@ def check_topup() -> None:
         st = runner.add(St.StrategyConfig(sid="t1", symbol="RB", exchange="SHFE",
                                           period="5m", rule_key="ma_cross",
                                           volume=1))
-        runner._klines[st.cfg.key()] = ser
+        runner._klines[runner._skey(st.cfg)] = ser
         runner._top_up(st)
         check("补历史：第一次就写一次", len(calls) == 1, f"{len(calls)} 次")
         # tick() 一秒十几次。指望「下一 tick 再看一眼」会让 3000 行每 tick
@@ -3229,6 +3229,27 @@ def check_topup() -> None:
         runner._top_try.clear()      # 假装过了 2 秒
         runner._top_up(st)
         check("补历史：同一品种只补一次", len(calls) == 1, f"{len(calls)} 次")
+
+        # 写库失败多半是 DuckDB 被别的连接锁着（下载器在跑、主线程正在读），
+        # 那是临时的。一次失败就永久放弃，会变成「启动那一刻刚好在读数据，
+        # 之后就再也不补了」
+        topup.save = lambda *a, **k: {"added": 0, "src": "5m", "last": None,
+                                      "error": "写库失败：Conflicting lock",
+                                      "ok": False}
+        runner2 = PortfolioRunner(AccountSpec(name="补历史测试3", kind="sim"),
+                                  St.ChaseConfig())
+        runner2.api = object()
+        st3 = runner2.add(St.StrategyConfig(sid="t3", symbol="RB", exchange="SHFE",
+                                            period="5m", rule_key="ma_cross",
+                                            volume=1))
+        runner2._klines[runner2._skey(st3.cfg)] = ser
+        runner2._top_up(st3)
+        check("补历史：写库失败不列进已补", not runner2._topped, str(runner2._topped))
+        runner2._top_try.clear()
+        logs: list = []
+        runner2._log_fn = logs.append
+        runner2._top_up(st3)
+        check("补历史：同样的失败不重复刷日志", logs == [], str(logs))
 
         # 15m 策略要额外订一份 5m —— 库里没有 15m 这张表
         asked: list = []
@@ -3244,10 +3265,42 @@ def check_topup() -> None:
         st2 = runner2.add(St.StrategyConfig(sid="t2", symbol="RB", exchange="SHFE",
                                             period="15m", rule_key="ma_cross",
                                             volume=1))
-        runner2._klines[st2.cfg.key()] = ser
+        runner2._klines[runner2._skey(st2.cfg)] = ser
         runner2._top_up(st2)
         check("补历史：15m 策略额外订 5m 来落库",
               asked == [("KQ.m@SHFE.rb", 300)], str(asked))
+
+        # 同一个品种的 5m 和 1h 是两条序列。共用一个订阅槽的话，后订阅的
+        # 策略直接拿到前一条 —— 1h 策略按 5m 信号下单，补库还会把 5m 的 bar
+        # 写进 1h 表，图上最后一截变成五分钟一根
+        class SubApi:
+            def __init__(self) -> None:
+                self.secs: list = []
+
+            def get_kline_serial(self, tq, sec, data_length=0):
+                self.secs.append(sec)
+                return ser
+
+            def get_quote(self, tq):
+                return None
+
+        r3 = PortfolioRunner(AccountSpec(name="订阅测试", kind="sim"),
+                             St.ChaseConfig())
+        r3.api = SubApi()
+        a = r3.add(St.StrategyConfig(sid="a", symbol="AG", exchange="SHFE",
+                                     period="5m", rule_key="ma_cross", volume=1))
+        b = r3.add(St.StrategyConfig(sid="b", symbol="AG", exchange="SHFE",
+                                     period="1h", rule_key="ma_cross", volume=1))
+        r3._subscribe(a)
+        r3._subscribe(b)
+        check("订阅：同品种不同周期各订各的",
+              sorted(r3.api.secs) == [300, 3600], str(r3.api.secs))
+
+        # 各自拿到的也必须是自己的那条
+        check("订阅：各自读到自己的序列",
+              r3._klines.get(r3._skey(a.cfg)) is ser
+              and r3._klines.get(r3._skey(b.cfg)) is ser
+              and len(r3._klines) == 2, str(list(r3._klines)))
     except Exception as exc:  # noqa: BLE001
         check("补历史", False, f"{type(exc).__name__}: {exc}")
     finally:

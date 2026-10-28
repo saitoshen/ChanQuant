@@ -1119,9 +1119,10 @@ class PortfolioPage(QWidget):
         if not rp.ok:
             return
         _tabs, view = self._ensure_view("single")
-        # keep_window：实时刷新只是多了几根，别把用户翻到的位置拽回最新
-        view.show_result(rp.df, rp.raw, rp.res, rp.bh, self._ctx(cfg, rp),
-                         keep_window=True)
+        # **只重画 K 线**。走 `show_result` 会把绩效、阶段表、交易记录全部重建，
+        # 三万点的净值曲线一次几百毫秒；用户切到「交易记录」页签看一眼，也在
+        # 每 5 秒被拖住一次，Windows 直接标成「未响应」
+        view.update_kline(rp.df)
 
     def _render(self) -> None:
         self._render_ts = time.monotonic()
