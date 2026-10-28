@@ -1091,7 +1091,7 @@ def check_strategy_runner() -> None:
         st.target = 2
         r._pos = {"SHFE.rb2701": Pos(), "SHFE.cu2612": Pos(short=1)}
 
-        rows = {x["symbol"]: x for x in r.mismatch()}
+        rows = {x["symbol"]: x for x in r.mismatch(fresh=True)}
         check("比对：理论仓与账户仓不一致能列出来", set(rows) == {"SHFE.rb2701", "SHFE.cu2612"},
               str(sorted(rows)))
         check("比对：有策略在跑的合约标为托管", rows["SHFE.rb2701"]["managed"] is True)
@@ -1139,7 +1139,37 @@ def check_strategy_runner() -> None:
               f"{len(r._align_slot.pending)} 笔")
         r._orders = None
 
+        # 挂在盘口外的对齐单永远不成交。没有超时兜底的话，在途列表永远不清空，
+        # `_rebalance` 就一直让路 —— 整个账户看着像卡死
         r.api = Api()
+        was = [(sl, sl.running) for sl in r.slots()]
+        for sl in r.slots():
+            sl.running = False
+        r._align_slot.pending = [R.PendingOrder(
+            order_id="oidT", symbol="SHFE.rb2701", direction="BUY",
+            offset="OPEN", volume=1, price=3000.0, ts=time.time() - 999,
+        )]
+        r._orders = {"oidT": type("O", (), {
+            "status": "ALIVE", "volume_left": 1, "last_msg": "",
+        })()}
+        r.tick()
+        check("对齐：挂太久自动撤单", len(r.api.cancelled) == 1,
+              f"撤 {len(r.api.cancelled)} 笔")
+        check("对齐：超时后清空在途，策略恢复", not r._align_slot.pending,
+              f"{len(r._align_slot.pending)} 笔")
+        for sl, on in was:
+            sl.running = on
+        r._orders = None
+
+        # 连点两下：5 秒冷却期内不能再下发一轮（用户手动点也是这个节奏）
+        r.api = Api()
+        r._align_ts = time.time()
+        blocked = r.align(close_orphans=False)
+        check("对齐：5 秒内连点不重复下发",
+              blocked == 0 and not r.api.orders, f"{blocked} 笔 / {len(r.api.orders)}")
+
+        r.api = Api()
+        r._align_ts = 0.0                      # 模拟「过了一会儿再点」
         n = r.align()
         check("对齐：默认连未托管仓位一起平", n == 2 and len(r.api.orders) == 2, f"{n} 笔")
         cu = [o for o in r.api.orders if o["symbol"] == "SHFE.cu2612"]
@@ -1230,10 +1260,11 @@ def check_strategy_runner() -> None:
         theo = r.theoretical()
         check("换月：老合约目标是 0", theo.get("SHFE.rb2611") == 0, str(theo))
         check("换月：新合约照常计入", theo.get("SHFE.rb2612") == 2, str(theo))
-        rows2 = {x["symbol"]: x for x in r.mismatch()}
+        rows2 = {x["symbol"]: x for x in r.mismatch(fresh=True)}
         check("换月：老合约仍算托管", rows2["SHFE.rb2611"]["managed"] is True,
               str(rows2.get("SHFE.rb2611")))
         r.api = Api()
+        r._align_ts = 0.0
         n2 = r.align()
         check("换月：对齐会把老合约平掉", n2 == 2 and len(r.api.orders) == 2, f"{n2} 笔")
         r._align_slot.pending.clear()
@@ -1428,6 +1459,122 @@ def check_strategy_runner() -> None:
         r.enable("s9", True)
         check("启停：不支持的周期被拒绝",
               not st_bad.running and "周期" in st_bad.error, st_bad.error)
+        # ---- 比对结果多久刷新一次 ----
+        # 快照 0.4 秒推一次。每推一次都把「全部策略理论仓 × 全部持仓」对一遍，
+        # 账户里合约一多就是白烧 CPU，而仓位是秒级才变一次的东西。缓存 5 秒；
+        # 真正要下单（align）时走 fresh=True，拿旧数补仓会补错手数。
+        r._slots.clear()
+        r._align_slot.pending.clear()
+        r._mm_ts = 0.0
+        st_mm = r.add(St.StrategyConfig(sid="s-mm", symbol="RB", exchange="SHFE",
+                                        period="1d", rule_key="ma_cross", volume=2))
+        st_mm.running = True
+        st_mm.underlying = "SHFE.rb2701"
+        st_mm.target = 2
+        r._pos = {"SHFE.rb2701": Pos()}
+        first = r.mismatch(fresh=True)
+        check("比对：算出来是差 2 手多",
+              len(first) == 1 and first[0]["delta"] == 2, str(first))
+        first[0]["delta"] = 999
+        check("比对：返回副本，改不到缓存",
+              r._mm_cache and r._mm_cache[0]["delta"] == 2, str(r._mm_cache))
+        r._pos = {"SHFE.rb2701": Pos(long=2)}
+        check("比对：5 秒内不重算（仍报差 2 手）",
+              [x["delta"] for x in r.mismatch()] == [2], str(r.mismatch()))
+        check("比对：fresh=True 绕过缓存（此刻已对齐）",
+              r.mismatch(fresh=True) == [], str(r.mismatch(fresh=True)))
+
+        # ---- 界面看 K 线：引擎得把订阅着的实时序列交出去 ----
+        # 组合页原来只画本地库里的历史，打开一看停在几天前。引擎订的本来就是
+        # 实时行情，缺的只是一个通道；而且是「点名才给」，不是每份快照都带。
+        kl = pd.DataFrame({
+            "datetime": [1_700_000_000 * 10**9, 1_700_000_300 * 10**9],
+            "open": [1.0, 2.0], "high": [1.5, 2.5], "low": [0.5, 1.5],
+            "close": [1.2, 2.2], "volume": [10.0, 20.0],
+            "open_oi": [0.0, 0.0], "close_oi": [0.0, 0.0],
+        })
+        r._klines[st_mm.cfg.key()] = kl
+        got = r.bars_of(st_mm.cfg.sid)
+        check("实时 K 线：能取到订阅着的序列", got is not None and len(got) == 2,
+              f"{None if got is None else len(got)} 根")
+        check("实时 K 线：策略不存在返回 None", r.bars_of("没有这个") is None)
+        r.want_bars([st_mm.cfg.sid])
+        check("实时 K 线：点名的策略进了下一份快照",
+              st_mm.cfg.sid in (r.snapshot().get("bars") or {}),
+              str(list(r.snapshot().get("bars") or {})))
+        check("实时 K 线：取完就清空，不每份快照都带",
+              r.snapshot().get("bars") == {}, str(r.snapshot().get("bars")))
+
+        # ---- 退出 / 重启时的遗留委托 ----
+        # 程序被强杀（或直接关机）时 `close()` 跑不到，限价单一直挂在交易所。
+        # 下次连上账户，用户什么都没点，委托却在成交 —— 看着就像「不点按钮
+        # 它自己在下单」。所以每发一笔就记下 order_id，下次连上先撤掉。
+        import shutil
+
+        from ttrade import daylimit as DL2
+        from ttrade import orderbook as OB
+
+        _ob_dir, _dl_dir = OB.user_dir, DL2.user_dir
+        _tmp = tempfile.mkdtemp(prefix="td_ob_")
+        OB.user_dir = lambda: _tmp
+        DL2.user_dir = lambda: _tmp
+        try:
+            check("遗留委托：一开始是空的", OB.load("acct") == [], str(OB.load("acct")))
+            OB.remember("acct", "oidA")
+            OB.remember("acct", "oidB")
+            check("遗留委托：按顺序读回", OB.load("acct") == ["oidA", "oidB"],
+                  str(OB.load("acct")))
+            OB.remember("acct", "oidA")
+            check("遗留委托：重复记不翻倍", OB.load("acct") == ["oidA", "oidB"],
+                  str(OB.load("acct")))
+            OB.forget("acct", "oidA")
+            check("遗留委托：成交后删掉", OB.load("acct") == ["oidB"],
+                  str(OB.load("acct")))
+            check("遗留委托：账户之间各记各的", OB.load("acct2") == [],
+                  str(OB.load("acct2")))
+
+            # 跨交易日的旧名单必须失效。那些单交易所早就作废了，拿旧 id 去撤，
+            # 万一撞上今天复用同一个号的单，撤掉的就是别人正在挂的单
+            _td = OB.trading_day
+            OB.trading_day = lambda: "2000-01-01"
+            OB.remember("stale", "oidOld")
+            OB.trading_day = _td
+            check("遗留委托：跨交易日自动失效", OB.load("stale") == [],
+                  str(OB.load("stale")))
+
+            class _Ord:
+                def __init__(self, status: str) -> None:
+                    self.status = status
+
+            r.api = Api()
+            r._orders = {"oidAlive": _Ord("ALIVE"), "oidDone": _Ord("FINISHED")}
+            OB.remember(r.spec.label(), "oidAlive")
+            OB.remember(r.spec.label(), "oidDone")
+            r._sweep_orders()
+            check("重启：撤掉上次遗留的活单",
+                  r.api.cancelled == [r._orders["oidAlive"]],
+                  str(len(r.api.cancelled)))
+            check("重启：已经结束的单不碰",
+                  r._orders["oidDone"] not in r.api.cancelled)
+            check("重启：名单撤完就清空", OB.load(r.spec.label()) == [],
+                  str(OB.load(r.spec.label())))
+
+            # 退出时要把在途单撤掉。程序都退出了还挂着限价单，等于「没人管的
+            # 仓位」：下次打开账户，用户没点任何按钮，委托却照样成交
+            r._orders = {"oidP": _Ord("ALIVE")}
+            r.api = Api()
+            api_ref = r.api
+            st_mm.pending = [R.PendingOrder(order_id="oidP", symbol="SHFE.rb2701",
+                                            direction="BUY", offset="OPEN",
+                                            volume=1, price=3000.0, ts=time.time())]
+            r.close()
+            check("退出：撤掉在途单", len(api_ref.cancelled) == 1,
+                  str(len(api_ref.cancelled)))
+            check("退出：在途列表清空", not st_mm.pending, str(len(st_mm.pending)))
+        finally:
+            OB.user_dir, DL2.user_dir = _ob_dir, _dl_dir
+            shutil.rmtree(_tmp, ignore_errors=True)
+
     except Exception as exc:  # noqa: BLE001
         check("多策略引擎", False, f"{type(exc).__name__}: {exc}")
 
@@ -3003,6 +3150,117 @@ def check_day_limit() -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def check_topup() -> None:
+    """策略启动时把本地历史补到最新。
+
+    引擎手里的 K 线本来就是实时的，但本地库停在几天前 —— 组合页的 K 线图、
+    回测都拿旧数据。这里守四件事：只落源周期、只写库里没有的、正在走的那根
+    不写、同一品种只补一次。
+    """
+    from ttrade import strategy_store as St
+    from ttrade import topup
+    from ttrade import tqstore
+    from ttrade.strategy_runner import PortfolioRunner
+    from ttrade.tqlive import AccountSpec
+
+    def mk(ts: list, px: list) -> pd.DataFrame:
+        """按天勤的返回格式造一份序列：UTC 纳秒 + OHLCV。"""
+        ns = [int((t - pd.Timedelta(hours=8)).value) for t in ts]
+        return pd.DataFrame({
+            "datetime": ns,
+            "open": px, "high": [p + 1 for p in px],
+            "low": [p - 1 for p in px], "close": [p + 0.5 for p in px],
+            "volume": [100.0] * len(px),
+            "open_oi": [0.0] * len(px), "close_oi": [0.0] * len(px),
+        })
+
+    tmpdir = tempfile.mkdtemp(prefix="tqtopup_")
+    old_env = os.environ.get("TRENDDESK_TQ_DB")
+    os.environ["TRENDDESK_TQ_DB"] = os.path.join(tmpdir, "t.duckdb")
+    real_save = topup.save
+    try:
+        now = pd.Timestamp.now().floor("min")
+        past = [now - pd.Timedelta(minutes=5 * (3 - i)) for i in range(3)]
+        live = now + pd.Timedelta(minutes=5)      # 还在走的那根
+        ser = mk(past + [live], [100.0, 101.0, 102.0, 103.0])
+
+        r = topup.save(ser, "RB", "SHFE", "5m")
+        check("补历史：写进源周期", r["added"] == 3 and r["src"] == "5m", str(r))
+        check("补历史：库里确实多了 3 根",
+              tqstore.bar_count("RB", "SHFE", "5m") == 3,
+              str(tqstore.bar_count("RB", "SHFE", "5m")))
+        # 活 bar 写进去就是一根永久停在半路的「假收盘」，回测拿它算信号
+        check("补历史：正在走的那根不写",
+              tqstore.last_dt("RB", "SHFE", "5m") == past[-1],
+              str(tqstore.last_dt("RB", "SHFE", "5m")))
+
+        r2 = topup.save(ser, "RB", "SHFE", "5m")
+        check("补历史：重叠的不重写", r2["added"] == 0 and r2["ok"], str(r2))
+
+        # 15m / 30m 在库里就是 5m 合并出来的，落盘必须落到 5m
+        r3 = topup.save(ser, "RB", "SHFE", "15m")
+        check("补历史：15m 落到 5m 源周期", r3["src"] == "5m", str(r3))
+        check("补历史：日线不走这条链路",
+              topup.save(ser, "RB", "SHFE", "1d")["error"] != "", "1d 应当被拒")
+        check("补历史：序列还没填充时不置 ok",
+              topup.save(pd.DataFrame(), "RB", "SHFE", "5m")["ok"] is False)
+
+        # 同一个品种被几十条策略共享时只能补一次，每次都写库是自找锁冲突
+        calls: list = []
+
+        def fake(*a, **k):
+            calls.append(a)
+            return {"added": 0, "src": "5m", "last": None, "error": "", "ok": True}
+
+        topup.save = fake
+        runner = PortfolioRunner(AccountSpec(name="补历史测试", kind="sim"),
+                                 St.ChaseConfig())
+        runner.api = object()
+        st = runner.add(St.StrategyConfig(sid="t1", symbol="RB", exchange="SHFE",
+                                          period="5m", rule_key="ma_cross",
+                                          volume=1))
+        runner._klines[st.cfg.key()] = ser
+        runner._top_up(st)
+        check("补历史：第一次就写一次", len(calls) == 1, f"{len(calls)} 次")
+        # tick() 一秒十几次。指望「下一 tick 再看一眼」会让 3000 行每 tick
+        # 转一遍 DataFrame —— 没成功要隔 TOP_RETRY 秒再试
+        runner._top_up(st)
+        check("补历史：2 秒内不重复尝试", len(calls) == 1, f"{len(calls)} 次")
+        runner._top_try.clear()      # 假装过了 2 秒
+        runner._top_up(st)
+        check("补历史：同一品种只补一次", len(calls) == 1, f"{len(calls)} 次")
+
+        # 15m 策略要额外订一份 5m —— 库里没有 15m 这张表
+        asked: list = []
+
+        class Api:
+            def get_kline_serial(self, tq, sec, data_length=0):
+                asked.append((tq, sec))
+                return ser
+
+        runner2 = PortfolioRunner(AccountSpec(name="补历史测试2", kind="sim"),
+                                  St.ChaseConfig())
+        runner2.api = Api()
+        st2 = runner2.add(St.StrategyConfig(sid="t2", symbol="RB", exchange="SHFE",
+                                            period="15m", rule_key="ma_cross",
+                                            volume=1))
+        runner2._klines[st2.cfg.key()] = ser
+        runner2._top_up(st2)
+        check("补历史：15m 策略额外订 5m 来落库",
+              asked == [("KQ.m@SHFE.rb", 300)], str(asked))
+    except Exception as exc:  # noqa: BLE001
+        check("补历史", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        topup.save = real_save
+        if old_env is None:
+            os.environ.pop("TRENDDESK_TQ_DB", None)
+        else:
+            os.environ["TRENDDESK_TQ_DB"] = old_env
+        import shutil
+
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -3021,6 +3279,7 @@ def main() -> int:
     check_strategy_store()
     check_strategy_runner()
     check_day_limit()
+    check_topup()
     check_sizing()
     check_intraday_aux()
     check_library_docs()

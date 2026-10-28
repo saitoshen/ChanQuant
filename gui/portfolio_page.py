@@ -56,7 +56,7 @@ from __future__ import annotations
 import queue
 import time
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -89,6 +89,7 @@ from gui.result_view import PERIOD_LABEL, ResultView, ViewCtx
 from ttrade import replay
 from ttrade import strategy_store as SStore
 from ttrade import tqlive
+from ttrade.tqlive import merge_live
 from ttrade.backtest import combine, combine_trades
 from ttrade.strategies import PARAM_LABELS, STRATEGIES
 from ttrade.strategy_runner import PortfolioRunner
@@ -262,6 +263,10 @@ class PortfolioController(QObject):
 
     def align(self, key: str) -> bool:
         return self._submit(key, lambda r: r.align())
+
+    def req_bars(self, key: str, sids: list) -> bool:
+        """让引擎在下一份快照里带上这些策略的实时 K 线。"""
+        return self._submit(key, lambda r: r.want_bars(sids))
 
     def set_chase(self, chase) -> None:
         for key in list(self._workers):
@@ -501,6 +506,20 @@ class PortfolioPage(QWidget):
         self._chase = SStore.load_chase()
         self._snaps: dict[str, dict] = {}
         self._slot_view: dict[str, dict] = {}     # sid -> 快照里的 slot
+        self._render_ts = 0.0                     # 上次重画两张表的时刻
+        self._mon_sig = None                      # 监控表上次画的内容
+        # 单策略视图的实时 K 线。`_live_base` 是本地库里的历史，实时段每 5 秒
+        # 拼一次 —— 引擎订的是实时行情，界面却只画本地库，打开一看停在几天前，
+        # 用户会以为策略没在跟数据。`_live_busy` 防重入：请求发出去了、快照
+        # 还没回来时再发一次，只会排一串没用的活。
+        self._live_cfg = None
+        self._live_base = None
+        self._live_sid = ""
+        self._live_busy = False
+        self._live_req = 0.0
+        self._live_timer = QTimer(self)
+        self._live_timer.setInterval(5000)
+        self._live_timer.timeout.connect(self._poll_live)
         self._views: dict[str, tuple[QTabWidget, ResultView]] = {}
         self.ctl = PortfolioController(self)
         self._build()
@@ -965,6 +984,11 @@ class PortfolioPage(QWidget):
 
         _tabs, view = self._ensure_view("single")
         view.show_result(rp.df, rp.raw, rp.res, rp.bh, self._ctx(cfg, rp))
+        # 记下本地历史这份「底」，实时段每 5 秒往上拼一次。存 df 而不是重读库：
+        # 库里那份要解码几万行，5 秒重读一次等于白烧
+        self._live_cfg, self._live_base, self._live_sid = cfg, df, cfg.sid
+        self._live_busy = False
+        self._live_timer.start()
         period = PERIOD_LABEL.get(cfg.period, cfg.period)
         # cfg.title() 已经含「品种 · 策略」，别再拼一遍 key 和策略名
         self._show_view("single", f"{cfg.title()}｜{period}"
@@ -1014,6 +1038,8 @@ class PortfolioPage(QWidget):
             price_note="净值", long_only=False, bars_per_year=bpy,
             selected_keys=[], overlay=False,
         )
+        # 组合是几条策略的净值合成，没有「这一条策略的实时 K 线」可言
+        self._stop_live()
         tabs, view = self._ensure_view("portfolio")
         view.show_result(None, None, res, None, ctx, trades=trades)
         names = "、".join(c.title() for c, _r in reps)
@@ -1031,13 +1057,74 @@ class PortfolioPage(QWidget):
             text += "\n未能加入组合：" + "；".join(missing)
         return text
 
+    # 引擎 0.4 秒推一次快照。每次都把两张表全量重画，合约一多主线程就被占满，
+    # 界面上看着就是「一切到这页就卡」。1 秒一次足够看清，也不耽误看数。
+    RENDER_GAP = 1.0
+
     def _on_snapshot(self, key: str, snap: dict) -> None:
         self._snaps[key] = snap
         for slot in snap.get("slots", []):
             self._slot_view[slot["sid"]] = slot
+        bars = snap.get("bars") or {}
+        if bars:
+            self._apply_live(bars)
+        if time.monotonic() - self._render_ts < self.RENDER_GAP:
+            return
         self._render()
 
+    def _stop_live(self) -> None:
+        self._live_timer.stop()
+        self._live_cfg = self._live_base = None
+        self._live_sid = ""
+        self._live_busy = False
+
+    def _poll_live(self) -> None:
+        """5 秒一趟：问引擎要一次当前这条策略的实时 K 线。
+
+        引擎 0.4 秒推一次快照，但那里面不带 K 线（3000 行，每份都带太贵），
+        这里按需点名要。找不到在跑的账户就安静等着 —— 策略没启动时也有图看，
+        只是它停在库里最后一根。
+        """
+        # 不在结果页就别问了：切回列表还每 5 秒转一遍 3000 行，纯浪费
+        if self.stack.currentIndex() != 1:
+            return
+        if self._live_cfg is None or not self.ctl.running:
+            return
+        # 请求发出去了却一直没回来（账户线程在重连之类），别把自己锁死
+        if self._live_busy and time.monotonic() - self._live_req < 10:
+            return
+        sid = self._live_sid
+        for key, snap in self._snaps.items():
+            if any(s.get("sid") == sid for s in (snap.get("slots") or [])):
+                self._live_busy = True
+                self._live_req = time.monotonic()
+                self.ctl.req_bars(key, [sid])
+                return
+
+    def _apply_live(self, bars: dict) -> None:
+        """把实时段拼到本地历史后面，重跑一遍再画。"""
+        self._live_busy = False
+        cfg = self._live_cfg
+        live = bars.get(self._live_sid)
+        if cfg is None or live is None or live.empty:
+            return
+        try:
+            df = merge_live(self._live_base, live)
+            if df is None or df.empty:
+                return
+            rp = replay.run(cfg, df)
+        except Exception as exc:  # noqa: BLE001
+            self._on_failed(f"实时 K 线刷新失败：{type(exc).__name__}: {exc}")
+            return
+        if not rp.ok:
+            return
+        _tabs, view = self._ensure_view("single")
+        # keep_window：实时刷新只是多了几根，别把用户翻到的位置拽回最新
+        view.show_result(rp.df, rp.raw, rp.res, rp.bh, self._ctx(cfg, rp),
+                         keep_window=True)
+
     def _render(self) -> None:
+        self._render_ts = time.monotonic()
         t = self.tbl_strat
         for i, cfg in enumerate(self._items):
             slot = self._slot_view.get(cfg.sid) or {}
@@ -1088,23 +1175,29 @@ class PortfolioPage(QWidget):
                 rows.append((key, r))
         rows.sort(key=lambda kr: (not kr[1].get("managed"), kr[0], kr[1]["symbol"]))
         m = self.tbl_mon
-        m.setRowCount(len(rows))
-        for i, (key, r) in enumerate(rows):
-            managed = bool(r.get("managed"))
-            vals = [
-                key, r["symbol"], str(r["target"]), str(r["actual"]),
-                f"{r['delta']:+d}",
-                "策略持仓" if managed else "未托管（策略已停或手工开仓）",
-            ]
-            for j, v in enumerate(vals):
-                item = QTableWidgetItem(v)
-                if j in (2, 3, 4):
-                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if j == 4:
-                    item.setForeground(QColor(C_BAD if managed else C_MUTED))
-                if j == 5 and not managed:
-                    item.setForeground(QColor(C_MUTED))
-                m.setItem(i, j, item)
+        # 内容没变就不重建。重建一次要给每格新建 QTableWidgetItem，
+        # 几十个合约不一致的时候这活儿一秒干一次，主线程就废了
+        sig = tuple((k, r["symbol"], r["target"], r["actual"], r["delta"],
+                     bool(r.get("managed"))) for k, r in rows)
+        if sig != self._mon_sig:
+            self._mon_sig = sig
+            m.setRowCount(len(rows))
+            for i, (key, r) in enumerate(rows):
+                managed = bool(r.get("managed"))
+                vals = [
+                    key, r["symbol"], str(r["target"]), str(r["actual"]),
+                    f"{r['delta']:+d}",
+                    "策略持仓" if managed else "未托管（策略已停或手工开仓）",
+                ]
+                for j, v in enumerate(vals):
+                    item = QTableWidgetItem(v)
+                    if j in (2, 3, 4):
+                        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    if j == 4:
+                        item.setForeground(QColor(C_BAD if managed else C_MUTED))
+                    if j == 5 and not managed:
+                        item.setForeground(QColor(C_MUTED))
+                    m.setItem(i, j, item)
 
         limits = [v.get("limits") for v in self._snaps.values() if v.get("limits")]
         if limits:

@@ -31,6 +31,8 @@ def main() -> int:
         app.processEvents()
         QTimer.singleShot(400, shot2)
 
+    fails: list[str] = []
+
     def shot2():
         app.processEvents()
         win.grab().save(os.path.join(out_dir, "gui_perf.png"))
@@ -38,7 +40,30 @@ def main() -> int:
         print("strategy:", win.cb_strategy.currentText())
         print("metrics:", {k: round(v, 4) if isinstance(v, float) else v
                            for k, v in win.res.metrics.items()})
+
+        # 实时刷新每 5 秒重画一次 K 线。重画不能把用户翻到的位置拽回最新 ——
+        # 否则想看一眼两天前的信号，图会一直弹回右端
+        v = win.view
+        total = v._k_total
+        v._k_win = 120
+        v._k_start = max(0, total - 400)
+        before = v._k_start
+        v.show_result(v.df, v.raw, v.res, v.bh, v.ctx, keep_window=True)
+        if v._k_start != before:
+            fails.append(f"实时刷新把窗口挪了：{before} → {v._k_start}")
+
+        # 贴着右端看的时候，新数据来了要跟着最新走
+        v._k_win = 120
+        v._k_start = max(0, v._k_total - 120)
+        v._k_total += 5
+        v._draw_kline(keep_window=True)
+        if v._k_start != max(0, v._k_total - v._k_win):
+            fails.append(f"贴在右端时没跟到最新：{v._k_start} vs "
+                         f"{max(0, v._k_total - v._k_win)}")
+
         print("saved screenshots")
+        for f in fails:
+            print("FAIL", f)
         app.quit()
 
     QTimer.singleShot(1200, shot)

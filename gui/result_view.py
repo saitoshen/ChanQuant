@@ -608,8 +608,13 @@ class ResultView(QObject):
 
     # ---------------------------------------------------------- 入口
 
-    def show_result(self, df, raw, res, bh, ctx: ViewCtx, trades=None) -> None:
-        """挂一份算好的结果并全部重画。"""
+    def show_result(self, df, raw, res, bh, ctx: ViewCtx, trades=None,
+                    keep_window: bool = False) -> None:
+        """挂一份算好的结果并全部重画。
+
+        `keep_window=True` 用于**同一条策略**的实时刷新：数据多了几根，但用户
+        看的还是那一段。不保留的话每 5 秒被拽回最新，想翻历史根本翻不动。
+        """
         self.df, self.raw, self.res, self.bh = df, raw, res, bh
         self.ctx = ctx
         self.market = ctx.market
@@ -631,7 +636,7 @@ class ResultView(QObject):
         self.pages()          # 确保控件都建好
         if self.kind == "single":
             self.lbl_legend.setText(ctx.legend)
-            self._draw_kline()
+            self._draw_kline(keep_window)
         self._draw_perf()
         self._update_metrics()
         self._update_table()
@@ -678,11 +683,13 @@ class ResultView(QObject):
         c = self.ctx
         return {"symbol": c.symbol, "name": c.name, "exchange": c.exchange}
 
-    def _draw_kline(self) -> None:
-        """切好数据、把可视窗口重置到最新一段，再交给 _render_kline 画。
+    def _draw_kline(self, keep_window: bool = False) -> None:
+        """切好数据、定好可视窗口，再交给 _render_kline 画。
 
         拆成两步是为了滚动/缩放：滚动时数据不变，只挪窗口，没必要重新切
         DataFrame、重算策略——那部分在 _render_kline 里按窗口切片完成。
+
+        `keep_window` 见 `show_result`。
         """
         df = self.df
         if df is None or not len(df):
@@ -697,11 +704,21 @@ class ResultView(QObject):
         if len(view) < 20:
             view = df.tail(120)
 
+        old_total, old_start, old_win = self._k_total, self._k_start, self._k_win
         self._k_view = view
         self._k_total = len(view)
-        # 换标的 / 换策略 / 换区间时回到最新一段，符合看盘习惯
-        self._k_win = min(K_WIN_DEFAULT, self._k_total)
-        self._k_start = max(0, self._k_total - self._k_win)
+        if keep_window and old_total > 0:
+            # 实时刷新不该动用户的位置。原来贴着右端看的，就跟着新右端走；
+            # 已经滚到历史里去的，原地不动 —— 否则每 5 秒被拽回最新一次
+            self._k_win = max(K_WIN_MIN, min(int(old_win), self._k_total))
+            if old_start + old_win >= old_total:
+                self._k_start = max(0, self._k_total - self._k_win)
+            else:
+                self._k_start = max(0, min(self._k_total - self._k_win, old_start))
+        else:
+            # 换标的 / 换策略 / 换区间时回到最新一段，符合看盘习惯
+            self._k_win = min(K_WIN_DEFAULT, self._k_total)
+            self._k_start = max(0, self._k_total - self._k_win)
         # 换图是用户主动操作，不受滚动节流限制
         self._k_last_draw = time.monotonic()
         self._k_pending = False

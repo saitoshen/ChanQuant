@@ -48,7 +48,7 @@ import pandas as pd
 
 from ttrade import factor_strategy as fstrat
 from ttrade import replay
-from ttrade import daylimit
+from ttrade import daylimit, orderbook, topup
 from ttrade import strategy_store as SStore
 from ttrade.strategies import run_strategy
 from ttrade.tqfetch import PERIOD_SEC
@@ -73,6 +73,23 @@ SPLIT_OFFSET_EX = ("SHFE", "INE")
 # 的话，一笔注定失败的委托一秒能重报十几遍 —— 日志刷屏，主线程直接卡死。
 REJECT_COOL = 5.0
 MAX_REJECTS = 3
+
+# 「一键对齐」两次点击之间至少隔这么久。连点两下不该下发两轮。
+ALIGN_GAP = 5.0
+
+# 对齐单最多挂多久。超时就撤掉、清空在途列表，让策略恢复调仓 ——
+# 否则一个挂在盘口外的限价单能让整个账户永远停在「对齐执行中」。
+ALIGN_TIMEOUT = 30.0
+
+# 补历史没成功（刚订阅、序列还没填充）时隔多久再试。`tick()` 跟着行情推送跑，
+# 一秒十几次；每次都把 3000 行转一遍 DataFrame 纯属白烧。
+TOP_RETRY = 2.0
+
+# 仓位比对多久重算一次。比对要把所有策略的理论净仓和整个账户的持仓对一遍，
+# 账户里合约一多就是几百次属性读取；而快照是 0.4 秒推一次的 —— 每推一次都
+# 重算，等于为了一个「秒级才变一次」的数字空转。5 秒一次够看，也够用户点
+# 对齐时拿到的新鲜度（`align()` 会强制重算，见 `mismatch(fresh=True)`）。
+MISMATCH_GAP = 5.0
 
 
 def default_margin_rate(symbol: str) -> float:
@@ -178,6 +195,20 @@ class PortfolioRunner:
         # 一秒十几次 tick，一笔对齐能变成十几笔委托。
         self._align_slot = SlotState(cfg=SStore.StrategyConfig(
             sid="__align__", name="一键对齐", period="1d"))
+        self._align_ts = 0.0
+        # 上一次算出来的比对结果和它的时间戳。见 `MISMATCH_GAP`。
+        self._mm_cache: list[dict] = []
+        self._mm_ts = 0.0
+        # 界面想看的实时 K 线。放这里而不是让界面直接读 `_klines`：那是天勤的
+        # 活引用，只有 worker 线程能动，跨线程读会撞上它正在被写的时刻。
+        self._want: list[str] = []
+        # 已经补过历史的 (品种, 交易所, 源周期)。一台机器开着几十条策略时，
+        # 同一个品种会被好几条共享，补一次就够了 —— 每补一次都要写一次库
+        self._topped: set[tuple[str, str, str]] = set()
+        # 非源周期策略（15m / 30m / 2h / 4h）为补库额外订的源周期序列
+        self._top_klines: dict[tuple[str, str, str], object] = {}
+        # (品种, 交易所, 源周期) -> 上次尝试的时刻。见 `TOP_RETRY`
+        self._top_try: dict[tuple[str, str, str], float] = {}
 
     # ---- 生命周期 ----
 
@@ -204,8 +235,45 @@ class PortfolioRunner:
         self._pos = self.api.get_position()
         self._orders = self.api.get_order()
         self._log(f"账户已连接：{self.spec.label()}")
+        self._sweep_orders()
+
+    def _sweep_orders(self) -> None:
+        """撤掉上一次运行留下、还挂着的委托。
+
+        程序被强杀（或直接关机）时 `close()` 跑不到，限价单会一直挂在交易所。
+        下次打开账户，用户什么都没点，委托却在成交 —— 那其实是上一次留下的，
+        看着就像「不点按钮它自己在下单」。
+
+        只撤**本程序自己下过**的单（order_id 记在 `live_orders.json`），
+        快期客户端里手点的委托不在名单里，不会被误伤。
+        """
+        ids = orderbook.load(self.spec.label())
+        if not ids:
+            return
+        n = 0
+        for oid in ids:
+            o = self._orders.get(oid) if self._orders is not None else None
+            if o is None or getattr(o, "status", "") != "ALIVE":
+                continue
+            try:
+                self.api.cancel_order(o)
+                n += 1
+            except Exception:  # noqa: BLE001
+                pass
+        orderbook.clear(self.spec.label())
+        if n:
+            self._log(f"撤掉上次遗留的 {n} 笔委托（程序上次没有正常退出）")
 
     def close(self) -> None:
+        # 退之前把在途单撤掉。程序都退出了还留着限价单，等于「没人管的仓位」：
+        # 下次打开账户，用户没点任何按钮，委托却照样成交 —— 那其实就是上一次
+        # 留下的单。强杀时这一段跑不到，靠下次启动的 `_sweep_orders()` 兜底。
+        if self.api is not None:
+            for st in list(self._slots.values()) + [self._align_slot]:
+                try:
+                    self._cancel_all(st)
+                except Exception:  # noqa: BLE001
+                    st.pending.clear()
         api, self.api = self.api, None
         self._klines.clear()
         self._quotes.clear()
@@ -329,22 +397,84 @@ class PortfolioRunner:
 
         # 对齐发出的单也要追、也要撤。它不属于任何策略，单独走一遍。
         if self._align_slot.pending:
-            try:
-                self._chase(self._align_slot)
-            except Exception as exc:  # noqa: BLE001
-                self._log(f"对齐追单出错：{type(exc).__name__}: {exc}")
+            oldest = min(o.ts for o in self._align_slot.pending)
+            if time.time() - oldest > ALIGN_TIMEOUT:
+                # 挂太久了。不撤的话在途列表永远不清空，`_rebalance` 就永远让路，
+                # 整个账户看着像卡死。撤掉、放开，让策略接着跑。
+                self._cancel_all(self._align_slot)
+                self._log(
+                    f"对齐委托 {ALIGN_TIMEOUT:.0f} 秒未成交，已撤单，策略恢复调仓"
+                )
+            else:
+                try:
+                    self._chase(self._align_slot)
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"对齐追单出错：{type(exc).__name__}: {exc}")
 
     # ---- 信号 ----
 
     def _subscribe(self, st: SlotState) -> None:
         key = st.cfg.key()
         if key in self._klines:
+            self._top_up(st)      # 第一次没订成源周期的话，这里接着试
             return
         tq = main_symbol(st.cfg.symbol, st.cfg.exchange)
         self._klines[key] = self.api.get_kline_serial(
             tq, RT_SEC[st.cfg.period], data_length=KLINE_LEN
         )
         self._quotes[key] = self.api.get_quote(tq)
+        self._top_up(st)
+
+    def _top_up(self, st: SlotState) -> None:
+        """把引擎手上这份实时 K 线写回本地库，库里就不再停在几天前。
+
+        落的是**源周期**（5m / 1h）：15m / 30m / 2h / 4h 在库里本来就是由它们
+        合并出来的，单独存一份读的时候根本对不上。所以非源周期的策略要多订
+        一份源周期序列 —— 只补最近一个月，不碰更早的历史。
+
+        失败不抛：补数据是锦上添花，不该把正在跑的策略打死。刚订阅时序列还
+        没填充是常态（`ok=False`），下一 tick 再来。
+        """
+        if self.api is None:
+            return
+        src = topup.source_of(st.cfg.period)
+        if src not in topup.SOURCE_PERIODS:
+            return
+        slot = (st.cfg.symbol, st.cfg.exchange, src)
+        if slot in self._topped:
+            return
+        now = time.time()
+        if now - self._top_try.get(slot, 0.0) < TOP_RETRY:
+            return
+        self._top_try[slot] = now
+        if src == st.cfg.period:
+            serial = self._klines.get(st.cfg.key())
+        else:
+            serial = self._top_klines.get(slot)
+            if serial is None:
+                try:
+                    tq = main_symbol(st.cfg.symbol, st.cfg.exchange)
+                    serial = self.api.get_kline_serial(
+                        tq, RT_SEC[src], data_length=topup.TOUP_BARS.get(src, 800)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"{st.title()}：补历史订不上 {src}（"
+                              f"{type(exc).__name__}: {exc}）")
+                    return
+                self._top_klines[slot] = serial
+        if serial is None or not len(serial):
+            return
+        r = topup.save(serial, st.cfg.symbol, st.cfg.exchange, src)
+        if r["error"]:
+            self._topped.add(slot)     # 配置性问题，重试也没用
+            self._log(f"{st.title()}：本地历史没补上（{r['error']}）")
+            return
+        if not r["ok"]:
+            return                     # 序列还没填充，下一 tick 接着试
+        self._topped.add(slot)
+        if r["added"]:
+            self._log(f"{st.title()}：本地历史补到最新 +{r['added']} 根"
+                      f"（{src}，到 {r['last']:%Y-%m-%d %H:%M}）")
 
     def _refresh_signal(self, st: SlotState) -> None:
         self._subscribe(st)
@@ -562,7 +692,10 @@ class PortfolioRunner:
                 "（再发会被交易所限制交易）"
             )
             return None
-        return self.api.insert_order(**kw)
+        order = self.api.insert_order(**kw)
+        # 记下来。程序下次启动时按这个名单把还挂着的撤掉
+        orderbook.remember(self.spec.label(), self._order_id(order))
+        return order
 
     def _cancel(self, order) -> None:
         """统一撤单入口。撤单次数也是交易所盯的一项。"""
@@ -770,9 +903,11 @@ class PortfolioRunner:
                 st.last_action = "已成交"
                 st.rejects = 0
                 st.reject_msg = ""
+                orderbook.forget(self.spec.label(), o.order_id)
                 continue
 
             if status == "DEAD":
+                orderbook.forget(self.spec.label(), o.order_id)
                 if o.phase != "cancelling":
                     # 不是我们撤的：拒单、涨跌停打回、资金不足……
                     # 只记一笔是不够的 —— `_rebalance` 下一轮照样再发，而 tick
@@ -792,6 +927,7 @@ class PortfolioRunner:
                 if o.retries >= self.chase.retries:
                     st.last_action = f"追单 {o.retries} 次仍未成交，放弃"
                     self._log(f"{st.title()}：{st.last_action}")
+                    orderbook.forget(self.spec.label(), o.order_id)
                     continue
                 o.retries += 1
                 o.phase = "live"
@@ -857,13 +993,21 @@ class PortfolioRunner:
                 out[st.underlying] = out.get(st.underlying, 0) + st.target
         return out
 
-    def mismatch(self) -> list[dict]:
+    def mismatch(self, fresh: bool = False) -> list[dict]:
         """理论持仓与实际持仓不一致的合约。
 
         `managed` 表示这个合约上有**正在运行**的策略。为 False 的多半是「策略停了
         但仓位还留着」，或者是用户手工开的仓。界面靠这个标记把两类分开显示 ——
         前者是策略自己没跟上，后者得先让人看清楚再动。
+
+        结果缓存 `MISMATCH_GAP` 秒：快照 0.4 秒推一次，每次都重算纯属空转。
+        `fresh=True` 绕过缓存 —— 真正要下单（`align()`）时必须用当下的持仓，
+        拿 5 秒前的旧数去补仓，补出来的量就是错的。
         """
+        now = time.time()
+        if not fresh and now - self._mm_ts < MISMATCH_GAP:
+            # 给副本。界面拿到的 list 会被到处传，别让它改到缓存里的 dict。
+            return [dict(r) for r in self._mm_cache]
         theo = self.theoretical()
         keys = set(theo)
         if self._pos is not None:
@@ -879,7 +1023,9 @@ class PortfolioRunner:
                     "symbol": sym, "target": want, "actual": have,
                     "delta": want - have, "managed": sym in theo,
                 })
-        return out
+        self._mm_cache = out
+        self._mm_ts = now
+        return [dict(r) for r in out]
 
     def align(self, close_orphans: bool = True) -> int:
         """把账户仓位调成和策略列表完全一致。返回下发的委托数。
@@ -901,10 +1047,15 @@ class PortfolioRunner:
         if self._align_slot.pending:
             self._log("上一轮对齐还没落地，等它成交或撤掉再点")
             return 0
+        now = time.time()
+        if now - self._align_ts < ALIGN_GAP:
+            self._log(f"对齐刚点过，{ALIGN_GAP:.0f} 秒内不重复下发")
+            return 0
+        self._align_ts = now
         self._align_slot.rejects = 0
         self._align_slot.reject_msg = ""
         n = 0
-        for row in self.mismatch():
+        for row in self.mismatch(fresh=True):
             if not row["managed"] and not close_orphans:
                 continue
             sym = row["symbol"]
@@ -916,9 +1067,38 @@ class PortfolioRunner:
             self._log(f"对齐已下发 {n} 笔，剩下的交给追单")
         return n
 
+    # ---- 给界面看的实时 K 线 ----
+
+    def bars_of(self, sid: str) -> pd.DataFrame | None:
+        """某个策略当前订阅着的 K 线，含正在走的那根。没有就返回 None。
+
+        组合页原来只画本地库里的历史 —— 打开一看停在几天前，用户会以为策略
+        没在跟行情。引擎这边本来就是实时的，缺的只是一个把它交出去的通道。
+        """
+        st = self._slots.get(sid)
+        if st is None:
+            return None
+        kl = self._klines.get(st.cfg.key())
+        if kl is None or not len(kl):
+            return None
+        try:
+            return bars_from_serial(kl, st.cfg.period)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def want_bars(self, sids: list[str]) -> None:
+        """下一份快照里带上这些策略的实时 K 线。
+
+        不做成「每份快照都带」：3000 行转 DataFrame 要几毫秒，0.4 秒一次、
+        账户里还有好几个策略，等于白烧。界面看 K 线是 5 秒一次的事。
+        """
+        self._want = list(sids or [])
+
     # ---- 快照 ----
 
     def snapshot(self) -> dict:
+        # 取一次就清掉。没清的话界面关掉 K 线之后，这份开销还每份快照都付
+        want, self._want = self._want, []
         return {
             "connected": self.alive,
             "error": self.last_error,
@@ -946,6 +1126,8 @@ class PortfolioRunner:
                 for st in self._slots.values()
             ],
             "mismatch": self.mismatch(),
+            # `want_bars()` 点名的策略才带，其余时候是空字典
+            "bars": {sid: self.bars_of(sid) for sid in want} if want else {},
             "limits": self.limit.summary(),
             "aligning": len(self._align_slot.pending),
             "align_action": self._align_slot.last_action,
