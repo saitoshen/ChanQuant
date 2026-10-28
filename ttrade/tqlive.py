@@ -304,6 +304,10 @@ class LiveHub:
 
     def state(self) -> LiveState:
         """拷一份普通数据出来。界面线程只碰这个，不碰天勤对象。"""
+        # 快照要先取：`underlying` 是在 `_quote_snapshot()` 里跟着主连 quote 更新的，
+        # 先构造 LiveState 会拿到上一轮的值（订阅后的第一次必然为空），而自动下单
+        # 正是靠它拿真实合约 —— 空一次就丢一次信号。
+        quote = self._quote_snapshot()
         st = LiveState(
             connected=self.api is not None,
             error=self.last_error,
@@ -311,7 +315,7 @@ class LiveHub:
             period=self.period,
             underlying=self.underlying,
         )
-        st.quote = self._quote_snapshot()
+        st.quote = quote
         st.account = self._account_snapshot()
         st.positions = self._positions_snapshot()
         st.orders = self._orders_snapshot()

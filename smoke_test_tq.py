@@ -207,6 +207,25 @@ def check_live_helpers() -> None:
     except ValueError as exc:
         check("实时④实盘缺参数报错", "缺少参数" in str(exc), str(exc))
 
+    # state() 必须先刷新 quote 再读 underlying：underlying 是在 _quote_snapshot()
+    # 里跟着主连 quote 更新的，先构造 LiveState 会拿到上一轮的值 —— 订阅后的第一次
+    # 必然为空，而自动下单正是靠它拿真实合约，空一次就丢一次信号。
+    class _Q:
+        instrument_id = "KQ.m@SHFE.rb"
+        instrument_name = "螺纹主连"
+        underlying_symbol = "SHFE.rb2701"
+        datetime = "2026-10-28 09:00:00"
+        last_price = 3047.0
+        bid_price1 = 3046.0
+        ask_price1 = 3047.0
+
+    hub = L.LiveHub(L.AccountSpec())
+    hub._quote = _Q()
+    st = hub.state()
+    check("实时⑥underlying 不能慢一拍", st.underlying == "SHFE.rb2701", repr(st.underlying))
+    check("实时⑥quote 快照与 underlying 同源",
+          st.quote.get("underlying") == "SHFE.rb2701", repr(st.quote.get("underlying")))
+
     old = os.environ.get("LOCALAPPDATA")
     tmpdir = tempfile.mkdtemp(prefix="tqacct_")
     os.environ["LOCALAPPDATA"] = tmpdir
