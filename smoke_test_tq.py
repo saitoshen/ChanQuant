@@ -880,16 +880,29 @@ def check_strategy_runner() -> None:
         bid_price1 = 3049.0
         last_price = 3049.5
 
+    class Order(dict):
+        """tqsdk 3.x 的 `insert_order()` 返回的是这个：dict 子类，不可哈希。
+
+        早先代码把返回值直接当订单号存起来，下一轮 `dict.get(Order)` 就抛
+        `TypeError: unhashable type: 'Order'`，策略在第一个 tick 之后全部停机。
+        """
+
     class Api:
         def __init__(self) -> None:
             self.orders: list[dict] = []
+            self.cancelled: list = []
+            self._seq = 0
 
         def get_quote(self, _sym):
             return Quote()
 
         def insert_order(self, **kw):
             self.orders.append(kw)
-            return "oid"
+            self._seq += 1
+            return Order(order_id=f"oid{self._seq}")
+
+        def cancel_order(self, order):
+            self.cancelled.append(order)
 
     try:
         r = PortfolioRunner(AccountSpec(name="t", kind="sim"), St.ChaseConfig())
@@ -919,16 +932,89 @@ def check_strategy_runner() -> None:
         check("比对：差额方向正确", rows["SHFE.rb2701"]["delta"] == 2,
               str(rows["SHFE.rb2701"]["delta"]))
 
-        # 一键对齐不能顺手把「策略已停但仓位还在」的合约平掉
+        # 一键对齐的语义是「账户和策略列表完全一致」，但平别人的仓得能关掉
         r.api = Api()
-        n = r.align()
-        check("对齐：只补托管合约", n == 1 and len(r.api.orders) == 1, f"{n} 笔")
+        n = r.align(close_orphans=False)
+        check("对齐：只补托管合约（显式关掉平未托管）",
+              n == 1 and len(r.api.orders) == 1, f"{n} 笔")
         if r.api.orders:
             o = r.api.orders[0]
             check("对齐：方向与手数按差额",
                   o["symbol"] == "SHFE.rb2701" and o["direction"] == "BUY"
                   and o["volume"] == 2 and o["offset"] == "OPEN",
                   str(o))
+
+        r.api = Api()
+        n = r.align()
+        check("对齐：默认连未托管仓位一起平", n == 2 and len(r.api.orders) == 2, f"{n} 笔")
+        cu = [o for o in r.api.orders if o["symbol"] == "SHFE.cu2612"]
+        check("对齐：未托管合约反向平掉",
+              bool(cu) and cu[0]["direction"] == "BUY" and cu[0]["volume"] == 1
+              and cu[0]["offset"] == "CLOSE", str(cu))
+
+        # insert_order 返回 Order 对象。把它当订单号存，下一轮查委托就炸
+        r.api = Api()
+        st.pending.clear()
+        r._send(st, "SHFE.rb2701", 1)
+        check("下单：订单号取 Order.order_id 而不是 Order 本身",
+              bool(st.pending) and isinstance(st.pending[0].order_id, str)
+              and st.pending[0].order_id == "oid1",
+              str(st.pending[0].order_id) if st.pending else "没有委托")
+        # ---- 追单状态机：撤 → 等死 → 重报 ----
+        def _chase_once(status="ALIVE", left=1, phase="live", retries=0,
+                        enabled=True, max_retries=3):
+            api = Api()
+            r.api = api
+            r.chase = St.ChaseConfig(enabled=enabled, wait_sec=1,
+                                     retries=max_retries, ticks=2)
+            st.pending = [R.PendingOrder(
+                order_id="oid1", symbol="SHFE.rb2701", direction="BUY",
+                offset="OPEN", volume=1, price=3000.0, ts=0.0,
+                retries=retries, phase=phase,
+            )]
+            r._orders = {"oid1": type("O", (), {
+                "status": status, "volume_left": left, "last_msg": "资金不足",
+            })()}
+            r._chase(st)
+            return api, list(st.pending)
+
+        api, left_over = _chase_once(status="FINISHED", left=0)
+        check("追单：成交后从在途列表里去掉", not left_over and not api.orders)
+
+        api, left_over = _chase_once(status="ALIVE", left=0)
+        check("追单：成交吃满但状态没翻，也当结束", not left_over)
+
+        api, left_over = _chase_once(enabled=False)
+        check("追单：关掉之后不撤不追，单子继续挂着",
+              not api.cancelled and len(left_over) == 1 and left_over[0].phase == "live")
+
+        api, left_over = _chase_once(max_retries=0)
+        check("追单：次数设 0 时只挂着不撤",
+              not api.cancelled and len(left_over) == 1)
+
+        api, left_over = _chase_once()
+        check("追单：超时先撤单，等确认死再重报",
+              len(api.cancelled) == 1 and len(left_over) == 1
+              and left_over[0].phase == "cancelling" and not api.orders,
+              f"撤 {len(api.cancelled)} 次，phase={left_over[0].phase if left_over else '—'}")
+
+        # 这一条是那个「只撤不追」的 bug：撤单确认（DEAD）之后必须重报
+        api, left_over = _chase_once(status="DEAD", phase="cancelling", retries=0)
+        check("追单：撤单确认后重报",
+              len(api.orders) == 1 and len(left_over) == 1
+              and left_over[0].retries == 1 and left_over[0].phase == "live"
+              and left_over[0].order_id == "oid1",
+              f"{len(api.orders)} 笔重报，retries={left_over[0].retries if left_over else '—'}")
+
+        api, left_over = _chase_once(status="DEAD", phase="cancelling", retries=3)
+        check("追单：追满次数就放弃", not left_over and not api.orders)
+
+        api, left_over = _chase_once(status="DEAD", phase="live")
+        check("追单：交易所拒单直接丢掉，不重报",
+              not left_over and not api.orders)
+
+        st.pending.clear()
+        r._orders = None
 
         # 改手数要让目标仓位立刻跟上，否则得等下一根 bar
         cfg2 = cfg.clone(volume=5)
@@ -2026,6 +2112,107 @@ def check_agent_attachments() -> None:
         check("附件 / 输出框", False, f"{type(exc).__name__}: {exc}")
 
 
+def check_portfolio_params() -> None:
+    """组合页的设置参数、回测区间，以及因子策略的实时信号。"""
+    import os
+
+    import numpy as np
+    import pandas as pd
+
+    from ttrade import factor_strategy as fstrat
+    from ttrade import replay
+    from ttrade import strategy_store as St
+    from ttrade.strategy_runner import PortfolioRunner
+    from ttrade.tqlive import AccountSpec
+
+    try:
+        idx = pd.bdate_range("2020-01-01", periods=1200)
+        df = pd.DataFrame({"open": 100.0, "high": 101.0, "low": 99.0,
+                           "close": 100.0, "volume": 1.0}, index=idx)
+        w = replay.window(df, 1.0)
+        check("区间：近 1 年只切一年多的数据",
+              len(w) < len(df) and w.index[-1] == df.index[-1]
+              and len(w) <= 262 + replay.WARMUP_BARS + 2, f"{len(w)} 根")
+        check("区间：前面留了预热段", len(w) > 253, f"{len(w)} 根")
+        check("区间：全部历史原样返回", replay.window(df, 0) is df)
+        check("区间：数据比窗口短时原样返回",
+              len(replay.window(df.iloc[:100], 10)) == 100)
+
+        c = St.StrategyConfig(symbol="RB", exchange="SHFE", rule_key="ma_cross",
+                              range_years=3.0)
+        c2 = St.StrategyConfig.from_dict(c.to_dict())
+        check("区间：配置能存能读", abs(c2.range_years - 3.0) < 1e-9, str(c2.range_years))
+        # 区间只影响看多少年，不改变交易行为，不该被当成「另一套配置」
+        other = St.StrategyConfig.from_dict({**c.to_dict(), "range_years": 0})
+        check("区间：不影响重复判定", c.same_shape(other) is True)
+
+        # 因子策略的实时信号必须和研究页同一套算法：两边各写一份，
+        # 「回测赚钱、实盘亏钱」就永远说不清是策略不行还是实现不一致
+        rng = np.random.default_rng(3)
+        n = 800
+        px = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, n)))
+        live = pd.DataFrame(
+            {"open": px, "high": px * 1.01, "low": px * 0.99,
+             "close": px, "volume": 1.0},
+            index=pd.bdate_range("2022-01-03", periods=n),
+        )
+        fcfg = {"window": 60, "horizon": 5, "entry_z": 1.0, "exit_z": 0.3,
+                "orient": "long_high"}
+        cfgf = St.StrategyConfig(sid="f1", symbol="RB", exchange="SHFE", period="1h",
+                                 family="factor", factor_mode="single",
+                                 factor_keys=["mom_20"], factor_cfg=fcfg)
+        r = PortfolioRunner(AccountSpec(name="t", kind="sim"), St.ChaseConfig())
+        stf = r.add(cfgf)
+        got = r._signal(stf, live)
+        out = fstrat.run_factor_strategy(live, "single", ["mom_20"],
+                                         replay.factor_config(fcfg))
+        want = out.df["signal"].iloc[-1]
+        check("因子实时：信号与回测同一套算法",
+              got == (0 if pd.isna(want) else int(want)), f"{got} vs {want}")
+
+        r.enable(cfgf.sid, True)
+        check("因子实时：单因子策略可以启动",
+              stf.running and not stf.error, stf.error)
+
+        cfgml = cfgf.clone(factor_mode="ml")
+        stml = r.add(cfgml)
+        r.enable(cfgml.sid, True)
+        check("因子实时：机器学习被拒绝并说明原因",
+              not stml.running and "机器学习" in stml.error, stml.error)
+
+        # 历史不够时不抛异常，先空仓等数据
+        check("因子实时：历史不够时给 0 而不是崩",
+              r._signal(stf, live.iloc[:100]) == 0)
+    except Exception as exc:  # noqa: BLE001
+        check("设置参数 / 回测区间 / 因子实时", False, f"{type(exc).__name__}: {exc}")
+        return
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from PySide6.QtWidgets import QApplication
+
+        from gui.portfolio_page import EditDialog
+
+        app = QApplication.instance() or QApplication([])   # noqa: F841
+        cfg = St.StrategyConfig(symbol="RB", exchange="SHFE", rule_key="ma_cross",
+                                rule_params={"fast": 24, "slow": 101},
+                                range_years=2.0)
+        dlg = EditDialog(cfg, ["默认"])
+        check("设置参数：按策略定义生成控件",
+              set(dlg.sp_params) == {"fast", "slow"}, str(sorted(dlg.sp_params)))
+        check("设置参数：回填当前参数", dlg.sp_params["fast"].value() == 24)
+        check("设置参数：回填回测区间", dlg.cb_range.currentData() == 2.0)
+        dlg.sp_params["fast"].setValue(30)
+        dlg.cb_range.setCurrentIndex(3)          # 近 5 年
+        dlg.apply_to(cfg)
+        check("设置参数：改动写回配置",
+              cfg.rule_params == {"fast": 30, "slow": 101} and cfg.range_years == 3.0,
+              f"{cfg.rule_params} / {cfg.range_years}")
+        dlg.deleteLater()
+    except Exception as exc:  # noqa: BLE001
+        check("设置参数对话框", False, f"{type(exc).__name__}: {exc}")
+
+
 def check_result_view() -> None:
     """结果视图：阶段分析的口径、组合合成、离线回放。
 
@@ -2274,6 +2461,7 @@ def main() -> int:
     check_agent_fs()
     check_factor_manual()
     check_agent_attachments()
+    check_portfolio_params()
     check_result_view()
     for k in ks:
         try:

@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -71,12 +72,12 @@ from ttrade import strategy_store as SStore
 from gui.agent_page import AgentPage
 from gui.data_page import DataPage
 from gui.live import LiveController
-from gui.portfolio_page import PortfolioPage
+from gui.portfolio_page import LibraryDialog, PortfolioPage
 from gui.result_view import ResultView, ViewCtx
 from gui.trade_page import TradePage
 from ttrade.backtest import BacktestConfig, bars_per_year, buy_and_hold, run_backtest
 from ttrade.eastmoney import load_local
-from ttrade.strategies import STRATEGIES, run_strategy
+from ttrade.strategies import PARAM_LABELS, STRATEGIES, run_strategy
 from ttrade.universe import UNIVERSE, cn_name, sector_of
 
 DATA_DIR = resolve_data_dir("us")
@@ -265,6 +266,9 @@ EXCHANGE_CN = {
     "INE": "能源中心",
     "GFEX": "广期所",
 }
+
+# 启动时选中的市场。国内期货是现在主要用的那个，美股留着但不再是默认
+DEFAULT_MARKET = "cn"
 
 # 市场元信息：目录、副标题、价格说明、回测成本假设。
 # 成本三项来自 `ttrade.replay.MARKET_COST`：组合页的离线回放用同一份数字，
@@ -524,11 +528,13 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 700)
 
         self.stores = {k: DataStore(k) for k in MARKETS}
-        self.market = "us"
+        # 默认开在国内期货：这是现在主要用的市场，美股只是备着。MARKETS 的
+        # 字典顺序是 us 在前，所以这里必须显式指定，不能靠 items() 的第一项
+        self.market = DEFAULT_MARKET
         self.store = self.stores[self.market]
         self.cfg = BacktestConfig(
-            fee_rate=MARKETS["us"]["fee"], slippage=MARKETS["us"]["slippage"],
-            long_only=not MARKETS["us"]["allow_short"],
+            fee_rate=MARKETS[self.market]["fee"], slippage=MARKETS[self.market]["slippage"],
+            long_only=not MARKETS[self.market]["allow_short"],
         )
         self.df_raw: pd.DataFrame | None = None
         self.df_sig: pd.DataFrame | None = None
@@ -854,6 +860,10 @@ class MainWindow(QMainWindow):
         for mk, info in MARKETS.items():
             n = len(self.stores[mk].items)
             self.cb_market.addItem(f"{info['label']}（{n} 个标的）", mk)
+        # 信号还没连（在 _populate_symbols 里才 connect），这时改选中不会触发重算
+        i = self.cb_market.findData(self.market)
+        if i >= 0:
+            self.cb_market.setCurrentIndex(i)
         cl.addWidget(self.cb_market)
 
         cl.addWidget(self._section("标的"))
@@ -1072,12 +1082,16 @@ class MainWindow(QMainWindow):
         sf.addLayout(self.fparam_box)
         cl.addWidget(self.box_fsel)
 
-        cl.addWidget(self._section("显示区间"))
+        cl.addWidget(self._section("回测区间"))
         self.cb_range = QComboBox()
         for text, years in [("近 1 年", 1), ("近 2 年", 2), ("近 3 年", 3),
                             ("近 5 年", 5), ("近 10 年", 10), ("全部历史", 0)]:
             self.cb_range.addItem(text, years)
         self.cb_range.setCurrentIndex(2)
+        self.cb_range.setToolTip(
+            "策略和回测都只算这一段（起点前多留 250 根让均线预热，图上不显示）。\n"
+            "5 分钟十年是 26 万根，跑因子评估 / 机器学习时选短一点快很多。"
+        )
         cl.addWidget(self.cb_range)
 
         self.chk_ma = QComboBox()
@@ -1088,7 +1102,7 @@ class MainWindow(QMainWindow):
 
         cl.addWidget(self._section("交易方向"))
         self.chk_short = QCheckBox("允许做空（多空双向）")
-        self.chk_short.setChecked(False)
+        self.chk_short.setChecked(bool(MARKETS[self.market]["allow_short"]))
         self.chk_short.setToolTip(
             "勾选后策略会同时做多和做空（signal 取 -1/0/1）；\n"
             "不勾选则把空头信号裁掉，只做多。期货默认勾选。"
@@ -1114,11 +1128,18 @@ class MainWindow(QMainWindow):
             "保存当前这套配置：下次打开程序自动恢复。\n"
             "勾了下面那一项时，同时作为一项加进「策略交易和组合」。"
         )
+        self.btn_load_lib = QPushButton("加载策略")
+        self.btn_load_lib.setObjectName("Ghost")
+        self.btn_load_lib.setToolTip(
+            "从策略库挑一条模板，把它的品种、周期、策略和参数灌回左边。\n"
+            "只是灌界面，不保存 —— 想让它下次自动恢复还得点「保存配置」。"
+        )
         self.btn_save_lib = QPushButton("存入策略库")
         self.btn_save_lib.setObjectName("Ghost")
         self.btn_save_lib.setToolTip(
             "作为模板存进策略库，之后在「策略交易和组合」里可以反复取用。"
         )
+        crl.addWidget(self.btn_load_lib)
         crl.addWidget(self.btn_save_cfg)
         crl.addWidget(self.btn_save_lib)
         cl.addWidget(cfg_row)
@@ -1189,6 +1210,7 @@ class MainWindow(QMainWindow):
             self.cb_fmodel.currentIndexChanged.connect(self._on_model_changed)
             self.btn_fall.clicked.connect(lambda: self._check_all_factors(True))
             self.btn_fnone.clicked.connect(lambda: self._check_all_factors(False))
+            self.btn_load_lib.clicked.connect(self._on_load_library)
             self.btn_save_cfg.clicked.connect(self._on_save_config)
             self.btn_save_lib.clicked.connect(self._on_save_library)
             self._wired = True
@@ -1670,16 +1692,11 @@ class MainWindow(QMainWindow):
 
     def _rebuild_params(self, spec) -> None:
         self._clear_param_box(self.param_box, self.param_widgets, self.param_scales)
-        labels = {
-            "fast": "快线周期", "slow": "慢线周期", "signal_n": "信号周期",
-            "entry": "入场周期", "exit": "离场周期", "n": "通道周期",
-            "k": "ATR 倍数", "atr_n": "ATR 周期", "atr_mult": "止损倍数",
-        }
         for pname, default in spec.params.items():
             lo, hi, step = spec.param_meta.get(pname, (1, 100, 1))
             self._add_param_slider(
                 self.param_box, self.param_widgets, self.param_scales,
-                pname, labels.get(pname, pname), lo, hi, step, default,
+                pname, PARAM_LABELS.get(pname, pname), lo, hi, step, default,
             )
 
     def _rebuild_fparams(self) -> None:
@@ -1738,6 +1755,7 @@ class MainWindow(QMainWindow):
             factor_cfg=dict(vars(fc)) if fc is not None else {},
             volume=1,
             note="short" if self.chk_short.isChecked() else "",
+            range_years=float(self.cb_range.currentData() or 0),
         )
 
     def apply_config(self, cfg: SStore.StrategyConfig) -> None:
@@ -1781,6 +1799,9 @@ class MainWindow(QMainWindow):
 
         self.chk_short.setChecked(cfg.note == "short")
         self.ed_cfg_name.setText(cfg.name)
+        r = self.cb_range.findData(float(getattr(cfg, "range_years", 0) or 0))
+        if r >= 0:
+            self.cb_range.setCurrentIndex(r)      # 触发一次重算，窗口跟着换
         self._schedule(immediate=True)
 
     def _apply_factor_keys(self, keys, reverse) -> None:
@@ -1827,6 +1848,34 @@ class MainWindow(QMainWindow):
                 i = cb.findData(v)
                 if i >= 0:
                     cb.setCurrentIndex(i)
+
+    def _on_load_library(self) -> None:
+        """从策略库挑一条，把它的品种 / 周期 / 策略 / 参数灌回界面。
+
+        只灌界面、不写 `last_config`：用户多半是「拿这条当起点改一改」，
+        直接落盘的话下次启动会被它顶掉，而他原来那套配置就找不回来了。
+        """
+        lib = SStore.load_library()
+        if not lib:
+            self.lbl_status.setText("策略库是空的。先调好一套参数，点「存入策略库」")
+            return
+        dlg = LibraryDialog(
+            lib, self, title="加载策略",
+            hint="选一条模板，把它的品种、周期、策略和参数灌回左边。"
+                 "加载只是填界面，不会自动保存，也不会改动策略库里的原件。",
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+        sid = dlg.sid()
+        cfg = next((c for c in lib if c.sid == sid), None)
+        if cfg is None:
+            return
+        try:
+            self.apply_config(cfg)
+        except Exception as exc:  # noqa: BLE001
+            self.lbl_status.setText(f"加载失败：{exc}")
+            return
+        self.lbl_status.setText(f"已加载「{cfg.title()}」。改完想留住就点「保存配置」")
 
     def _on_save_config(self) -> None:
         cfg = self._current_config()
@@ -1950,6 +1999,11 @@ class MainWindow(QMainWindow):
                     f"先跑：python download_tq.py --main {period} --all"
                 )
             return
+
+        # 「回测区间」不只是显示窗口：策略和回测都只算这一段。5 分钟十年
+        # 26 万根，因子评估 / 机器学习跑一遍要几十秒，而用户通常只想看最近两年。
+        # 前面多留的预热段让均线一进入窗口就是暖的，图上会按区间裁掉。
+        df = replay.window(df, self.cb_range.currentData() or 0)
 
         # 年化口径必须跟着周期走：5 分钟一年约 1.2 万根，按 252 算会把波动
         # 低估一个数量级、夏普虚高一个数量级。

@@ -152,6 +152,32 @@ class Replay:
         return self.res is not None and not self.error
 
 
+WARMUP_BARS = 250      # 回测窗口前面多留几根，让均线一进入窗口就是暖的
+
+
+def window(df: pd.DataFrame | None, years: float) -> pd.DataFrame | None:
+    """按「最近 N 年」截一段行情。`years` 为 0 / None 时原样返回。
+
+    前面多留 `WARMUP_BARS` 根：直接从窗口起点开始算，MA200 之类要空转 200 根，
+    日线近一年就只剩 40 根有信号 —— 图上看起来像「策略一直空仓」。
+    留出预热段之后，窗口内的每一根都是有信号的；代价是窗口前那一段也进了
+    指标计算，收益从预热段开始累计（预热段不开仓，对总收益几乎没有影响）。
+    """
+    if df is None or df.empty:
+        return df
+    try:
+        years = float(years or 0)
+    except (TypeError, ValueError):
+        years = 0.0
+    if years <= 0:
+        return df
+    start = pd.Timestamp(df.index[-1]) - pd.DateOffset(days=int(round(years * 365.25)))
+    if start <= pd.Timestamp(df.index[0]):
+        return df
+    i = int(df.index.searchsorted(start))
+    return df.iloc[max(0, i - WARMUP_BARS):]
+
+
 def run(cfg, df: pd.DataFrame | None, market: str = "",
         with_bh: bool = True) -> Replay:
     """按 `cfg` 跑一遍回测。出错不抛异常，写进 `Replay.error`。
@@ -162,6 +188,12 @@ def run(cfg, df: pd.DataFrame | None, market: str = "",
     mk = market or market_of(cfg)
     if df is None or df.empty:
         return Replay(error=f"{cfg.key()} 没有行情数据")
+
+    # 配置里限定了回测区间就只算这一段。5 分钟十年 26 万根，跑因子评估 /
+    # 机器学习要几十秒，而用户通常只想看最近两年
+    df = window(df, getattr(cfg, "range_years", 0) or 0)
+    if df is None or len(df) < 2:
+        return Replay(error=f"{cfg.key()} 在所选区间里没有足够的行情")
 
     period = getattr(cfg, "period", "") or "1d"
     bt = make_bt(mk, getattr(cfg, "note", "") == "short")

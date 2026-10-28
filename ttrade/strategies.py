@@ -249,6 +249,15 @@ class StrategySpec:
     code: str = ""
 
 
+# 参数的中文名。研究页的滑杆、组合页的「设置参数」、手册都从这里取 ——
+# 同一个 `fast` 在两个界面叫两个名字，用户会以为是两个不同的东西
+PARAM_LABELS = {
+    "fast": "快线周期", "slow": "慢线周期", "signal_n": "信号周期",
+    "entry": "入场周期", "exit": "离场周期", "n": "通道周期",
+    "k": "ATR 倍数", "atr_n": "ATR 周期", "atr_mult": "止损倍数",
+}
+
+
 STRATEGIES: dict[str, StrategySpec] = {
     "ma_cross": StrategySpec(
         key="ma_cross",

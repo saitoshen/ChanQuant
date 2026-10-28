@@ -40,12 +40,15 @@
 必须在它自己的线程里调。界面线程只往队列里塞闭包，worker 每轮 `wait_update`
 之后统一执行。
 
-## 一键对齐为什么不碰未托管合约
+## 一键对齐为什么连未托管仓位一起平
 
-没有策略在跑的合约，理论持仓恒为 0。如果对齐把它们一起算进去，「一键对齐」就变成了
-「把账户清空」—— 策略停掉后留在账户里的仓位、用户手工开的仓，全会被扫掉。
-所以 `mismatch()` 给每行打一个 `managed` 标记，`align()` 只补托管合约，
-未托管的照常列在监控器里，标灰，让人自己处理。
+用户对这个按钮的预期是「账户和策略列表完全一致」。只补托管合约的话，策略停掉后
+留在账户里的仓位、手工开的仓会一直挂在那儿 —— 监控器上永远红着，而按钮点下去
+毫无反应。所以 `align()` 默认把未托管合约也平到 0。
+
+但平仓是真金白银，而且这些仓位往往是用户自己开的。所以点下去先弹确认框，把
+「哪个合约、现在几手、变成几手」一条条列出来，确认了才发单。
+`align(close_orphans=False)` 保留「只补托管」的老行为，给脚本用。
 """
 
 from __future__ import annotations
@@ -86,6 +89,7 @@ from ttrade import replay
 from ttrade import strategy_store as SStore
 from ttrade import tqlive
 from ttrade.backtest import combine, combine_trades
+from ttrade.strategies import PARAM_LABELS, STRATEGIES
 from ttrade.strategy_runner import PortfolioRunner
 from ttrade.universe import cn_name
 
@@ -267,11 +271,12 @@ class PortfolioController(QObject):
 
 
 class LibraryDialog(QDialog):
-    """从策略库挑一条加进组合。"""
+    """从策略库挑一条。两处用：加进组合、在研究页加载参数。"""
 
-    def __init__(self, items: list, parent=None) -> None:
+    def __init__(self, items: list, parent=None, title: str = "从策略库添加",
+                 hint: str = "") -> None:
         super().__init__(parent)
-        self.setWindowTitle("从策略库添加")
+        self.setWindowTitle(title)
         self.setMinimumWidth(520)
         lay = QVBoxLayout(self)
 
@@ -282,14 +287,14 @@ class LibraryDialog(QDialog):
             self.lst.addItem(it)
         if items:
             self.lst.setCurrentRow(0)
+        self.lst.itemDoubleClicked.connect(lambda _i: self.accept())
         lay.addWidget(self.lst, 1)
 
-        hint = QLabel(
-            "加入组合会复制一份独立配置，之后在组合里改手数、改账户都不影响库里的模板。"
-        )
-        hint.setObjectName("Hint")
-        hint.setWordWrap(True)
-        lay.addWidget(hint)
+        tip = QLabel(hint or
+                     "加入组合会复制一份独立配置，之后在组合里改手数、改账户都不影响库里的模板。")
+        tip.setObjectName("Hint")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
 
         box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         box.accepted.connect(self.accept)
@@ -301,13 +306,36 @@ class LibraryDialog(QDialog):
         return "" if it is None else str(it.data(Qt.UserRole))
 
 
+RANGE_CHOICES = [
+    ("全部历史", 0.0), ("近 1 年", 1.0), ("近 2 年", 2.0),
+    ("近 3 年", 3.0), ("近 5 年", 5.0), ("近 10 年", 10.0),
+]
+
+
+def _hint(text: str) -> QLabel:
+    """表单里的一行小字说明。用 QLabel 而不是 groupbox：QSS 里没有它的样式。"""
+    lbl = QLabel(text)
+    lbl.setObjectName("Hint")
+    lbl.setWordWrap(True)
+    return lbl
+
+
 class EditDialog(QDialog):
-    """改一条组合策略的执行参数。"""
+    """一条组合策略的全部可调项。
+
+    分两段，因为影响的范围不一样：
+
+    - **执行**（手数 / 做空 / 账户）只决定实盘怎么下单；
+    - **策略参数**（快线、慢线…）实盘和回测同时生效 —— 改了它，下一根 K 线的
+      信号就按新参数算；
+    - **回测区间**只决定「双击这条策略看哪一段历史」，实盘信号永远只用最近的
+      K 线，和这个值无关。
+    """
 
     def __init__(self, cfg, accounts: list[str], parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("编辑策略")
-        self.setMinimumWidth(380)
+        self.setWindowTitle("设置参数")
+        self.setMinimumWidth(430)
         form = QFormLayout(self)
 
         self.ed_name = QLineEdit(cfg.name)
@@ -331,6 +359,40 @@ class EditDialog(QDialog):
         self.cb_acct.setCurrentIndex(max(idx, 0))
         form.addRow("交易账户", self.cb_acct)
 
+        # ---- 策略参数 ----
+        self.sp_params: dict[str, QSpinBox] = {}
+        spec = STRATEGIES.get(cfg.rule_key) if cfg.family == "rule" else None
+        if spec is not None and spec.params:
+            form.addRow(_hint(f"策略参数 · {spec.label}（实盘与回测同时生效）"))
+            for name, default in spec.params.items():
+                lo, hi, step = spec.param_meta.get(name, (1, 1000, 1))
+                sp = QSpinBox()
+                sp.setRange(int(lo), int(hi))
+                sp.setSingleStep(max(1, int(step)))
+                try:
+                    sp.setValue(int(cfg.rule_params.get(name, default)))
+                except (TypeError, ValueError):
+                    sp.setValue(int(default))
+                self.sp_params[name] = sp
+                form.addRow(PARAM_LABELS.get(name, name), sp)
+        elif cfg.family == "factor":
+            form.addRow(_hint(
+                "因子策略的参数（窗口 / 阈值 / 因子）请在「策略研究」页调好，"
+                "再存入策略库、重新加入组合"
+            ))
+
+        # ---- 回测区间 ----
+        self.cb_range = QComboBox()
+        for text, years in RANGE_CHOICES:
+            self.cb_range.addItem(text, years)
+        i = self.cb_range.findData(float(cfg.range_years or 0))
+        self.cb_range.setCurrentIndex(max(i, 0))
+        self.cb_range.setToolTip(
+            "双击这条策略时回测和看图的范围。\n"
+            "实盘信号只用最近的 K 线，不受这里影响。"
+        )
+        form.addRow("回测区间", self.cb_range)
+
         lab = QLabel(f"{cfg.key()} {cfg.period}｜{cfg.strategy_label()}")
         lab.setObjectName("Hint")
         form.addRow("策略", lab)
@@ -345,6 +407,9 @@ class EditDialog(QDialog):
         cfg.volume = self.sp_vol.value()
         cfg.note = "short" if self.chk_short.isChecked() else ""
         cfg.account = self.cb_acct.currentData() or ""
+        if self.sp_params:
+            cfg.rule_params = {k: sp.value() for k, sp in self.sp_params.items()}
+        cfg.range_years = float(self.cb_range.currentData() or 0.0)
 
 
 # ------------------------------------------------------------------ 页面
@@ -537,8 +602,9 @@ class PortfolioPage(QWidget):
         btn_lib.clicked.connect(self._add_from_library)
         head.addWidget(btn_lib)
 
-        btn_edit = QPushButton("编辑")
+        btn_edit = QPushButton("设置参数")
         btn_edit.setObjectName("Ghost")
+        btn_edit.setToolTip("改手数、账户、策略参数（快线慢线…）和回测区间")
         btn_edit.clicked.connect(self._edit_selected)
         head.addWidget(btn_edit)
 
@@ -582,7 +648,8 @@ class PortfolioPage(QWidget):
         card, lay, head = self._card("监控器")
 
         btn_align = QPushButton("一键对齐")
-        btn_align.setToolTip("把账户仓位补到策略理论持仓")
+        btn_align.setToolTip("让账户持仓与策略列表完全一致：托管合约补到理论持仓，\n"
+                             "没有策略在管的仓位平掉（会先弹确认框）")
         btn_align.clicked.connect(self._align)
         head.addWidget(btn_align)
 
@@ -766,7 +833,10 @@ class PortfolioPage(QWidget):
             legend=("▲紫＝开多　▼紫＝平多" if rp.long_only
                     else "▲紫＝开多　▼紫＝平多　▼琥珀＝开空　▲琥珀＝平空"),
             price_note="价格（后复权）" if not cfg.exchange else "价格（前复权·主力连续）",
-            range_years=None,      # 存下来的策略看全历史，不然「绩效」是可挑选的
+            # 配置里存了回测区间就只画这一段。`replay.run` 已经按区间切过数据，
+            # 前面多留的 250 根预热段在这里被裁掉 —— 指标是全区间算的，图上只显示
+            # 用户选的那几年，两边看到的是同一段行情
+            range_years=(float(cfg.range_years) or None),
             rule_key=cfg.rule_key,
             overlay=True,
             long_only=rp.long_only,
@@ -907,8 +977,11 @@ class PortfolioPage(QWidget):
             elif slot.get("running"):
                 text, color = "运行中", C_OK
                 tip = slot.get("action") or ""
+            elif cfg.enabled:
+                text, color = "已停止", C_MUTED
+                tip = "启动开关是开的，但这一轮没跑起来 —— 看看顶部连接状态和日志"
             else:
-                text, color, tip = "已停止", C_MUTED, "双击启动"
+                text, color, tip = "未启用", C_IDLE, "点「启动 / 停止」把它打开"
             self._set_cell(t, i, 7, text, color)
             it = t.item(i, 7)
             if it is not None and it.toolTip() != tip:
@@ -953,7 +1026,8 @@ class PortfolioPage(QWidget):
             if n_orphan:
                 bits.append(f"{n_orphan} 个合约没有策略在管")
             self.lbl_mon.setText(
-                "，".join(bits) + "。「一键对齐」只补前者。"
+                "，".join(bits) + "。「一键对齐」会把账户摆成和策略列表一致，\n"
+                "未托管的仓位也会被平掉（会先列出来让你确认）。"
             )
             self.lbl_mon.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
 
@@ -1130,22 +1204,51 @@ class PortfolioPage(QWidget):
     # ---------------------------------------------------------- 对齐
 
     def _align(self) -> None:
+        """把账户仓位摆成和策略列表完全一致。**会平掉没有策略在管的仓位**。"""
         if not self.ctl.running:
             self._on_failed("还没启动，无法对齐")
             return
         rows = [r for snap in self._snaps.values() for r in (snap.get("mismatch") or [])]
-        todo = [r for r in rows if r.get("managed")]
-        if not todo:
-            if rows:
-                self._on_log("没有需要对齐的托管合约（列出的都是未托管仓位，请手工处理）")
-            else:
-                self._on_log("没有需要对齐的合约")
+        if not rows:
+            self._on_log("账户仓位与策略理论持仓已经一致，不用对齐")
             return
+
+        managed = [r for r in rows if r.get("managed")]
+        orphans = [r for r in rows if not r.get("managed")]
+
+        # 平别人的仓是真金白银，不能点一下就干。把「动哪些、动多少」摆出来，
+        # 用户点确认才发单
+        lines = []
+        if managed:
+            lines.append(f"按策略理论持仓调整 {len(managed)} 个合约：")
+            for r in managed[:10]:
+                lines.append(f"　{r['symbol']}　{r['actual']} → {r['target']}"
+                             f"（{r['delta']:+d} 手）")
+            if len(managed) > 10:
+                lines.append(f"　…… 还有 {len(managed) - 10} 个")
+        if orphans:
+            lines.append("")
+            lines.append(f"平掉 {len(orphans)} 个没有策略在管的合约：")
+            for r in orphans[:10]:
+                lines.append(f"　{r['symbol']}　持有 {r['actual']:+d} 手 → 0")
+            if len(orphans) > 10:
+                lines.append(f"　…… 还有 {len(orphans) - 10} 个")
+            lines.append("")
+            lines.append("这些仓位多半是策略停掉之后留下的，或者手工开的。"
+                         "平掉之后无法撤销。")
+
+        ans = QMessageBox.question(
+            self, "一键对齐", "\n".join(lines) + "\n\n继续下发委托？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+
         n = 0
         for key, snap in self._snaps.items():
-            if any(r.get("managed") for r in (snap.get("mismatch") or [])):
+            if snap.get("mismatch"):
                 self.ctl.align(key)
-                n += sum(1 for r in snap["mismatch"] if r.get("managed"))
+                n += len(snap["mismatch"])
         self._on_log(f"已下发对齐委托，覆盖 {n} 个合约")
 
     # ---------------------------------------------------------- 交易助手

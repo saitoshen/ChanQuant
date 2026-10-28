@@ -638,6 +638,22 @@ def _run() -> tuple[bool, list[str]]:
         except Exception as exc:  # noqa: BLE001
             combo_info = f"{type(exc).__name__}: {exc}"
 
+        # 回测区间：切片要真的生效。不生效的话 5 分钟十年照样从头算，
+        # 「近 1 年」只是个显示开关，用户以为快了其实没快
+        range_ok = False
+        range_info = ""
+        try:
+            win.cb_range.setCurrentIndex(0)      # 近 1 年
+            win.run_analysis()
+            n_1y = len(win.df_raw)
+            win.cb_range.setCurrentIndex(5)      # 全部历史
+            win.run_analysis()
+            n_all = len(win.df_raw)
+            range_ok = 0 < n_1y < n_all and hasattr(win, "btn_load_lib")
+            range_info = f"近 1 年 {n_1y} 根 / 全部 {n_all} 根"
+        except Exception as exc:  # noqa: BLE001
+            range_info = f"{type(exc).__name__}: {exc}"
+
         win.close()
         app.processEvents()
 
@@ -666,6 +682,11 @@ def _run() -> tuple[bool, list[str]]:
             )
         if not combo_ok:
             raise RuntimeError(f"组合报告异常：{combo_info}")
+        if not range_ok:
+            raise RuntimeError(
+                f"回测区间没生效（{range_info}）：cb_range 只是改了显示窗口，"
+                "策略仍然在全历史上算"
+            )
         if not factor_ok:
             raise RuntimeError(f"因子面板控件缺失：{factor_info}")
         # 因子分析页列出**全部**因子（算不出的显示「无数据」），所以行数应等于
@@ -676,6 +697,7 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"因子分析页图轴数为 {n_axes}，应为 4")
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
                 f"{factor_info}，滚轮缩放 {wheel_info}，组合 {combo_info}，"
+                f"回测区间 {range_info}，"
                 f"数据管理页就绪，手册 {manual_info}，输出 {out_info}")
 
     check("构建主窗口（端到端）", _window)

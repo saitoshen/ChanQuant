@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from ttrade import factor_strategy as fstrat
+from ttrade import replay
 from ttrade import strategy_store as SStore
 from ttrade.strategies import run_strategy
 from ttrade.tqfetch import PERIOD_SEC
@@ -38,6 +40,8 @@ from ttrade.tqsdk_symbols import main_symbol
 
 KLINE_LEN = 3000          # 每个策略回看多少根。日线 3000 根够跑 MA200，5m 够跑一周多
 MIN_BARS = 30             # 少于这么多根不算信号
+# 因子策略要多得多的历史：窗口 252 加上 z 分数，少于这个数算出来的分数全是 NaN
+FACTOR_MIN_BARS = 300
 
 # 实时订阅能直接用的周期。`PERIOD_SEC` 是下载链路的口径，只有 5m/1h/1d；
 # 天勤的 `get_kline_serial` 本身支持 15m / 30m / 2h / 4h，实时段不用像本地历史
@@ -181,6 +185,10 @@ class PortfolioRunner:
         # 停着的时候也算：`_rebalance` 只对 running 的槽位生效，重新启动时
         # 若刚好没出新 bar（`_refresh_signal` 会早退），靠的就是这个值。
         st.target = st.signal * max(1, int(cfg.volume or 1))
+        # 策略参数（快线 / 慢线）也可能一起改了。不清掉 last_bar 的话，
+        # `_refresh_signal` 认为「这根 bar 算过了」直接早退，新参数要等下一根
+        # K 线才生效 —— 用户会以为改了没用。
+        st.last_bar = None
 
     def enable(self, sid: str, on: bool) -> None:
         st = self._slots.get(sid)
@@ -189,8 +197,13 @@ class PortfolioRunner:
         if on and not st.cfg.rule_key and st.cfg.family == "rule":
             st.error = "这条策略没有选规则"
             return
-        if on and st.cfg.family == "factor":
-            st.error = "因子策略暂不支持实时交易，请用规则策略"
+        if on and st.cfg.family == "factor" and (st.cfg.factor_mode or "single") == "ml":
+            # 机器学习每根 K 线都要重训一遍（几百折），放进 tick 循环会把整个
+            # 连接卡住 —— 一个账户的策略是共享同一个 api 的，卡住就是全都停摆
+            st.error = "机器学习因子策略暂不支持实时交易（每根 K 线重训太慢），请改用单因子 / 多因子"
+            return
+        if on and st.cfg.family == "factor" and not st.cfg.factor_keys:
+            st.error = "这条因子策略没有选中因子"
             return
         if on and st.cfg.period not in RT_SEC:
             st.error = f"实时不支持 {st.cfg.period} 周期（可用：{'/'.join(RT_SEC)}）"
@@ -267,12 +280,35 @@ class PortfolioRunner:
         df = bars_from_serial(kl, st.cfg.period)
         if len(df) < MIN_BARS:
             return
-        out = run_strategy(df, st.cfg.rule_key, st.cfg.rule_params)
-        sig = int(out["signal"].iloc[-1])
+        st.signal = self._signal(st, df)
         if st.cfg.note != "short":
-            sig = max(0, sig)            # 不允许做空时把空头信号裁掉
-        st.signal = sig
-        st.target = sig * max(1, int(st.cfg.volume))
+            st.signal = max(0, st.signal)     # 不允许做空时把空头信号裁掉
+        st.target = st.signal * max(1, int(st.cfg.volume))
+
+    def _signal(self, st: SlotState, df: pd.DataFrame) -> int:
+        """按当前配置算出最后一根 bar 上的目标仓位（-1 / 0 / 1）。
+
+        规则策略和因子策略走两条不同的路。因子策略用的是和研究页同一套
+        `run_factor_strategy`：同一个因子、同一组阈值，回测里是几手、实盘就是
+        几手 —— 两边各写一份的话，「回测赚钱、实盘亏钱」永远说不清是策略不行
+        还是实现不一致。
+
+        `orient="auto"` 在实时段有个天然缺陷：方向是按全样本 IC 的符号定的，
+        样本一变就可能翻。用户要是没显式指定方向，日志里会看到它翻。
+        """
+        if st.cfg.family == "factor":
+            if len(df) < FACTOR_MIN_BARS:
+                return 0                 # 历史不够，分数全是 NaN，先空仓等数据
+            out = fstrat.run_factor_strategy(
+                df, st.cfg.factor_mode or "single", list(st.cfg.factor_keys or []),
+                replay.factor_config(st.cfg.factor_cfg or {}),
+            )
+            sig = out.df["signal"].iloc[-1]
+            return 0 if pd.isna(sig) else int(sig)
+
+        out = run_strategy(df, st.cfg.rule_key, st.cfg.rule_params)
+        sig = out["signal"].iloc[-1]
+        return 0 if pd.isna(sig) else int(sig)
 
     # ---- 调仓 ----
 
@@ -351,6 +387,20 @@ class PortfolioRunner:
         base = float(getattr(q, "bid_price1", 0) or 0) or float(getattr(q, "last_price", 0) or 0)
         return base - tick * ticks
 
+    @staticmethod
+    def _order_id(order) -> str:
+        """从 `insert_order()` 的返回值里取订单号。
+
+        tqsdk 3.x 的 `insert_order()` 返回的是 **Order 对象**（dict 子类），不是
+        订单号字符串。早先直接把返回值当 id 存进 `PendingOrder`，下一轮
+        `self._orders.get(o.order_id)` 就拿一个 dict 去查字典 ——
+        `TypeError: unhashable type: 'Order'`，策略在第一个 tick 之后全部停机。
+        """
+        oid = getattr(order, "order_id", None)
+        if oid is None and isinstance(order, dict):
+            oid = order.get("order_id")
+        return str(oid or "")
+
     def _send(self, st: SlotState, symbol: str, delta: int) -> None:
         direction = "BUY" if delta > 0 else "SELL"
         vol = abs(int(delta))
@@ -359,10 +409,10 @@ class PortfolioRunner:
         if not price or price != price:      # NaN / 0 都说明盘口还没来
             st.last_action = "等盘口"
             return
-        oid = self.api.insert_order(
+        oid = self._order_id(self.api.insert_order(
             symbol=symbol, direction=direction, offset=offset,
             volume=vol, limit_price=price,
-        )
+        ))
         st.pending.append(
             PendingOrder(order_id=oid, symbol=symbol, direction=direction,
                          offset=offset, volume=vol, price=price, ts=time.time())
@@ -386,6 +436,16 @@ class PortfolioRunner:
     # ---- 追单 ----
 
     def _chase(self, st: SlotState) -> None:
+        """追单状态机：live →（超时）cancelling →（确认死）重报 → live …
+
+        两个坑，都是「看起来能跑、其实没生效」那种：
+
+        - 撤单之后必须等 `status == "DEAD"` 才重报。旧单还有效的窗口里重报，
+          一次信号会变成两倍仓位；
+        - 判断「这笔结束了」只能看 `FINISHED`（成交）和**自己撤掉之后**的
+          `DEAD`。把 DEAD 一律当成结束，重报那条分支永远走不到 —— 追单就退化
+          成「只撤不追」，界面上「最多追 3 次」是个摆设。
+        """
         if not st.pending or self._orders is None:
             return
         now = time.time()
@@ -395,45 +455,59 @@ class PortfolioRunner:
             status = getattr(order, "status", "") if order is not None else ""
             left = int(getattr(order, "volume_left", 0) or 0) if order is not None else 0
 
-            if status in ("FINISHED", "DEAD") or (order is not None and left == 0):
-                if status == "FINISHED" and left == 0:
-                    st.last_action = "已成交"
-                continue                 # 这笔结束了，不再追
+            if status == "FINISHED":
+                st.last_action = "已成交"
+                continue
 
-            if o.phase == "cancelling":
-                # 等撤单真的生效再重报，否则旧单还有效时重报会重复成交
-                if status == "DEAD":
-                    if o.retries >= self.chase.retries:
-                        st.last_action = f"追单 {o.retries} 次仍未成交，放弃"
-                        self._log(f"{st.title()}：{st.last_action}")
-                        continue
-                    o.retries += 1
-                    o.phase = "live"
-                    o.ts = now
-                    price = self._price_at(o.symbol, o.direction, self.chase.ticks * o.retries)
-                    if self.chase.use_market and o.retries >= self.chase.retries:
-                        price = float("nan")     # 天勤用 NaN 表示市价
-                    try:
-                        o.order_id = self.api.insert_order(
-                            symbol=o.symbol, direction=o.direction, offset=o.offset,
-                            volume=o.volume, limit_price=price,
-                        )
-                        o.price = price
-                        st.last_action = f"追单第 {o.retries} 次 @ {price:.2f}"
-                        self._log(f"{st.title()}：{st.last_action}")
-                    except Exception as exc:  # noqa: BLE001
-                        st.last_action = f"追单失败：{exc}"
-                        continue
+            if status == "DEAD":
+                if o.phase != "cancelling":
+                    # 不是我们撤的：拒单、涨跌停打回、资金不足……记一笔就走
+                    why = getattr(order, "last_msg", "") or "未知原因"
+                    st.last_action = f"委托被拒：{why}"
+                    self._log(f"{st.title()}：{st.last_action}")
+                    continue
+                if o.retries >= self.chase.retries:
+                    st.last_action = f"追单 {o.retries} 次仍未成交，放弃"
+                    self._log(f"{st.title()}：{st.last_action}")
+                    continue
+                o.retries += 1
+                o.phase = "live"
+                o.ts = now
+                price = self._price_at(o.symbol, o.direction, self.chase.ticks * o.retries)
+                if self.chase.use_market and o.retries >= self.chase.retries:
+                    price = float("nan")     # 天勤用 NaN 表示市价
+                try:
+                    o.order_id = self._order_id(self.api.insert_order(
+                        symbol=o.symbol, direction=o.direction, offset=o.offset,
+                        volume=o.volume, limit_price=price,
+                    ))
+                    o.price = price
+                    st.last_action = f"追单第 {o.retries} 次 @ {price:.2f}"
+                    self._log(f"{st.title()}：{st.last_action}")
+                except Exception as exc:  # noqa: BLE001
+                    st.last_action = f"追单失败：{exc}"
+                    continue
                 keep.append(o)
                 continue
 
+            # 已经撤了、还没确认死：什么都别做，等下一轮
+            if o.phase == "cancelling":
+                keep.append(o)
+                continue
+
+            # 成交吃满了但状态还没翻成 FINISHED
+            if order is not None and left == 0:
+                continue
+
+            # 还活着。关掉追单、或者本来就不追，就一直挂着等它自己成交 ——
+            # 这里不能把单子从 pending 里丢掉：丢了 `_rebalance` 会以为没在途，
+            # 立刻再发一笔，仓位直接翻倍
+            if not self.chase.enabled or self.chase.retries <= 0:
+                keep.append(o)
+                continue
             if now - o.ts < self.chase.wait_sec:
                 keep.append(o)
                 continue
-
-            # 超时：撤掉，下一轮确认死了再重报
-            if self.chase.retries <= 0:
-                continue                 # 不追单，挂着就好
             try:
                 if order is not None:
                     self.api.cancel_order(order)
@@ -463,8 +537,8 @@ class PortfolioRunner:
         """理论持仓与实际持仓不一致的合约。
 
         `managed` 表示这个合约上有**正在运行**的策略。为 False 的多半是「策略停了
-        但仓位还留着」，或者是用户手工开的仓。这两种都不该被一键对齐扫掉 ——
-        对齐只补托管合约，剩下的列出来让人自己处理。
+        但仓位还留着」，或者是用户手工开的仓。界面靠这个标记把两类分开显示 ——
+        前者是策略自己没跟上，后者得先让人看清楚再动。
         """
         theo = self.theoretical()
         keys = set(theo)
@@ -483,17 +557,21 @@ class PortfolioRunner:
                 })
         return out
 
-    def align(self) -> int:
-        """把账户仓位补到策略理论持仓。返回下发的委托数。
+    def align(self, close_orphans: bool = True) -> int:
+        """把账户仓位调成和策略列表完全一致。返回下发的委托数。
 
-        只处理 `managed` 的合约：没有策略在跑的合约理论持仓恒为 0，把它们一起
-        「对齐」就是把账户清空，那不是这个按钮的意思。
+        - 托管合约（有策略在跑）：补到理论净仓，多了减、少了加
+        - 未托管合约（没有策略在管）：`close_orphans=True` 时平到 0
+
+        第二类是「策略停掉之后留下的仓」和「手工开的仓」。默认平掉是因为
+        用户对这个按钮的预期就是「一键把账户摆成策略列表的样子」；但这是
+        真金白银，调用方必须先确认过再调，别在启动流程里顺手带上。
         """
         if self.api is None:
             return 0
         n = 0
         for row in self.mismatch():
-            if not row["managed"]:
+            if not row["managed"] and not close_orphans:
                 continue
             sym = row["symbol"]
             delta = row["delta"]

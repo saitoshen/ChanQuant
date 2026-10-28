@@ -67,6 +67,12 @@ class StrategyConfig:
     note: str = ""
     created: str = ""
 
+    # 回测 / 看图的区间（年）。0 = 全部历史。
+    # 5 分钟十年是 26 万根，跑一遍因子评估或机器学习要几十秒 —— 这个值让
+    # 「看一眼这条策略最近怎么样」不必每次都从头算。**不影响实盘交易**：
+    # 实时信号永远只用最近的 K 线。
+    range_years: float = 0.0
+
     # ---- 展示 ----
 
     def key(self) -> str:
@@ -129,6 +135,10 @@ class StrategyConfig:
             cfg.volume = max(1, int(cfg.volume))
         except (TypeError, ValueError):
             cfg.volume = 1
+        try:
+            cfg.range_years = max(0.0, float(cfg.range_years or 0))
+        except (TypeError, ValueError):
+            cfg.range_years = 0.0
         if not isinstance(cfg.rule_params, dict):
             cfg.rule_params = {}
         if not isinstance(cfg.factor_cfg, dict):
@@ -152,7 +162,8 @@ class StrategyConfig:
         资金账号，同一套策略在两个账户上各跑一份是正常用法，不该算重复。
         """
         a, b = self.to_dict(), other.to_dict()
-        for k in ("sid", "name", "created", "enabled"):
+        # range_years 只影响回测看多少年，不改变交易行为，不算「不同配置」
+        for k in ("sid", "name", "created", "enabled", "range_years"):
             a.pop(k, None)
             b.pop(k, None)
         return a == b
