@@ -1111,6 +1111,34 @@ def check_strategy_runner() -> None:
                   and o["volume"] == 2 and o["offset"] == "OPEN",
                   str(o))
 
+        # **对齐发的单必须记进在途列表**。不记的话 `_rebalance` 下一 tick 看到
+        # 仓位还没变就又发一遍 —— 一秒十几次 tick，一笔对齐变成十几笔委托，
+        # 成交之后就是「平了又开、开了又平」。
+        check("对齐：发出的单记进在途列表", len(r._align_slot.pending) == 1,
+              f"{len(r._align_slot.pending)} 笔")
+
+        # 上一轮还没落地时再点，不能再发一轮
+        r.api = Api()
+        again = r.align(close_orphans=False)
+        check("对齐：在途时再点不重复发单",
+              again == 0 and not r.api.orders, f"{again} 笔 / {len(r.api.orders)}")
+
+        # 在途期间策略也不许动手，否则「策略平、对齐开」互相打架
+        r.api = Api()
+        st.target = 5
+        st.actual = 0
+        r._rebalance(st)
+        check("对齐：在途时策略不调仓", not r.api.orders, f"{len(r.api.orders)} 笔")
+
+        # 追单把这一轮追完（成交）之后就收工
+        r._orders = {"oid1": type("O", (), {
+            "status": "FINISHED", "volume_left": 0, "last_msg": "",
+        })()}
+        r._chase(r._align_slot)
+        check("对齐：成交后清空在途列表", not r._align_slot.pending,
+              f"{len(r._align_slot.pending)} 笔")
+        r._orders = None
+
         r.api = Api()
         n = r.align()
         check("对齐：默认连未托管仓位一起平", n == 2 and len(r.api.orders) == 2, f"{n} 笔")
@@ -1118,6 +1146,7 @@ def check_strategy_runner() -> None:
         check("对齐：未托管合约反向平掉",
               bool(cu) and cu[0]["direction"] == "BUY" and cu[0]["volume"] == 1
               and cu[0]["offset"] == "CLOSE", str(cu))
+        r._align_slot.pending.clear()      # 这一轮假设已经成交，继续往下测
 
         # insert_order 返回 Order 对象。把它当订单号存，下一轮查委托就炸
         r.api = Api()
@@ -1207,6 +1236,7 @@ def check_strategy_runner() -> None:
         r.api = Api()
         n2 = r.align()
         check("换月：对齐会把老合约平掉", n2 == 2 and len(r.api.orders) == 2, f"{n2} 笔")
+        r._align_slot.pending.clear()
         old = [o for o in r.api.orders if o["symbol"] == "SHFE.rb2611"]
         check("换月：老合约下的是卖平 3 手",
               bool(old) and old[0]["direction"] == "SELL" and old[0]["volume"] == 3

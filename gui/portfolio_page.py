@@ -1117,8 +1117,15 @@ class PortfolioPage(QWidget):
         else:
             self.lbl_limit.setText("")
 
+        aligning = sum(int(v.get("aligning") or 0) for v in self._snaps.values())
         if not self.ctl.running:
             self.lbl_mon.setText("未启动。策略跑起来之后这里才会比对。")
+            self.lbl_mon.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+        elif aligning:
+            self.lbl_mon.setText(
+                f"对齐执行中：{aligning} 笔委托在途，等它们成交或撤掉。"
+                "这期间策略不调仓，也不用再点。"
+            )
             self.lbl_mon.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
         elif not rows:
             self.lbl_mon.setText("账户仓位与策略理论持仓一致。")
@@ -1314,6 +1321,11 @@ class PortfolioPage(QWidget):
         if not self.ctl.running:
             self._on_failed("还没启动，无法对齐")
             return
+        if any(int(snap.get("aligning") or 0) for snap in self._snaps.values()):
+            # 上一轮还在路上。仓位没变不等于没对齐 —— 单子还在排队 / 追价。
+            # 这时候再发一轮就是「平了又开、开了又平」。
+            self._on_failed("上一轮对齐还在执行（等成交或撤单），稍后再点")
+            return
         rows = [r for snap in self._snaps.values() for r in (snap.get("mismatch") or [])]
         if not rows:
             self._on_log("账户仓位与策略理论持仓已经一致，不用对齐")
@@ -1355,7 +1367,7 @@ class PortfolioPage(QWidget):
             if snap.get("mismatch"):
                 self.ctl.align(key)
                 n += len(snap["mismatch"])
-        self._on_log(f"已下发对齐委托，覆盖 {n} 个合约")
+        self._on_log(f"已下发对齐委托，覆盖 {n} 个合约；剩下交给追单，成交前不用再点")
 
     # ---------------------------------------------------------- 交易助手
 

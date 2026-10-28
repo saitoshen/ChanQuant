@@ -172,6 +172,12 @@ class PortfolioRunner:
         # 落盘 —— 重启程序不清零，见 ttrade/daylimit.py
         self.limit = daylimit.DayLimit(self.spec.label())
         self._halted = ""
+        # 「一键对齐」发出的单放在这个槽位里。它只当在途单的容器，不参与信号：
+        # 对齐是**一次性动作**，发完就交给追单，成交 / 撤完就结束。没有它的话，
+        # 对齐的单没人记，`_rebalance` 下一 tick 看到仓位还没变又发一遍 ——
+        # 一秒十几次 tick，一笔对齐能变成十几笔委托。
+        self._align_slot = SlotState(cfg=SStore.StrategyConfig(
+            sid="__align__", name="一键对齐", period="1d"))
 
     # ---- 生命周期 ----
 
@@ -208,6 +214,7 @@ class PortfolioRunner:
             st.running = False
             st.pending.clear()
             st.retired.clear()
+        self._align_slot.pending.clear()
         if api is not None:
             try:
                 api.close()
@@ -319,6 +326,13 @@ class PortfolioRunner:
                 st.error = f"{type(exc).__name__}: {exc}"
                 st.running = False
                 self._log(f"{st.title()} 出错停机：{st.error}")
+
+        # 对齐发出的单也要追、也要撤。它不属于任何策略，单独走一遍。
+        if self._align_slot.pending:
+            try:
+                self._chase(self._align_slot)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"对齐追单出错：{type(exc).__name__}: {exc}")
 
     # ---- 信号 ----
 
@@ -489,6 +503,11 @@ class PortfolioRunner:
 
     def _rebalance(self, st: SlotState) -> None:
         if not st.underlying:
+            return
+        if self._align_slot.pending:
+            # 一键对齐的委托还在路上。它要达成的目标仓位和策略此刻算出来的
+            # 未必一样（信号刚翻、手数刚变），两边一起动手就会「平了又开」。
+            # 对齐是用户明确要求的动作，让它先落地。
             return
         st.actual = self._net_pos(st.underlying)
         if st.pending:
@@ -676,18 +695,19 @@ class PortfolioRunner:
             oid = order.get("order_id")
         return str(oid or "")
 
-    def _send(self, st: SlotState, symbol: str, delta: int) -> None:
+    def _send(self, st: SlotState, symbol: str, delta: int) -> int:
+        """按差额下发委托，返回实际发出去的笔数。"""
         legs = self._legs(symbol, delta)
         if legs is None:
             st.last_action = "持仓今昨明细未就绪，等下一轮"
-            return
+            return 0
         if not legs:
-            return
+            return 0
         direction = "BUY" if delta > 0 else "SELL"
         price = self._price_at(symbol, direction)
         if not price or price != price:      # NaN / 0 都说明盘口还没来
             st.last_action = "等盘口"
-            return
+            return 0
         parts = []
         for offset, vol in legs:
             order = self._order(
@@ -703,10 +723,13 @@ class PortfolioRunner:
                              offset=offset, volume=vol, price=price, ts=time.time())
             )
             parts.append(f"{offset} {vol}")
+        if not parts:
+            return 0
         st.last_action = (
             f"{'买' if direction == 'BUY' else '卖'} {' + '.join(parts)} 手 @ {price:.2f}"
         )
         self._log(f"{st.title()}：{st.last_action}")
+        return len(parts)
 
     def _cancel_all(self, st: SlotState) -> None:
         if self.api is None:
@@ -867,9 +890,19 @@ class PortfolioRunner:
         第二类是「策略停掉之后留下的仓」和「手工开的仓」。默认平掉是因为
         用户对这个按钮的预期就是「一键把账户摆成策略列表的样子」；但这是
         真金白银，调用方必须先确认过再调，别在启动流程里顺手带上。
+
+        **一次点击只发一轮**。单子记进 `_align_slot.pending`，之后由 `_chase`
+        负责追价 / 撤单 / 重报，追完为止；期间 `_rebalance` 全体让路。上一轮
+        还没落地时再点直接忽略 —— 否则「仓位还没变 → 判定没对齐 → 再发一遍」
+        会变成一个每秒十几次的死循环。
         """
         if self.api is None:
             return 0
+        if self._align_slot.pending:
+            self._log("上一轮对齐还没落地，等它成交或撤掉再点")
+            return 0
+        self._align_slot.rejects = 0
+        self._align_slot.reject_msg = ""
         n = 0
         for row in self.mismatch():
             if not row["managed"] and not close_orphans:
@@ -878,19 +911,9 @@ class PortfolioRunner:
             delta = row["delta"]
             if delta == 0:
                 continue
-            direction = "BUY" if delta > 0 else "SELL"
-            legs = self._legs(sym, delta)
-            if not legs:
-                continue
-            price = self._price_at(sym, direction)
-            if not price or price != price:
-                continue
-            for offset, vol in legs:
-                if self._order(symbol=sym, direction=direction, offset=offset,
-                               volume=vol, limit_price=price) is None:
-                    break
-                n += 1
-                self._log(f"对齐 {sym}：{direction} {offset} {vol} 手 @ {price:.2f}")
+            n += self._send(self._align_slot, sym, delta)
+        if n:
+            self._log(f"对齐已下发 {n} 笔，剩下的交给追单")
         return n
 
     # ---- 快照 ----
@@ -924,4 +947,6 @@ class PortfolioRunner:
             ],
             "mismatch": self.mismatch(),
             "limits": self.limit.summary(),
+            "aligning": len(self._align_slot.pending),
+            "align_action": self._align_slot.last_action,
         }
