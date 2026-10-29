@@ -4,9 +4,8 @@ import os
 import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-# 主窗口启动 1.5 秒后会「上膛」并接实时行情（见 `MainWindow._arm_live`）。
-# 截图不该真去登录天勤：网络一慢就卡在这里，而且 CI 上根本没有账号。
-os.environ["TRENDDESK_NO_LIVE"] = "1"
+# 研究页不再自动连天勤（连接只在「账户透视和交易」页），所以截图不会去登录账户，
+# 不需要额外的开关。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PySide6.QtCore import QTimer

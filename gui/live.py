@@ -140,6 +140,9 @@ class LiveController(QObject):
         self._worker: LiveWorker | None = None
         self.spec = None
         self.key = ""
+        # 这条会话实际用的周期。`_on_live_started` 里不能拿研究页当前选的周期
+        # 去猜 —— 交易页连的时候可能按 5m 连，而研究页正停在日线上。
+        self.period = ""
 
     @property
     def running(self) -> bool:
@@ -150,6 +153,7 @@ class LiveController(QObject):
         """启动实时会话。已经在跑会先停掉 —— 同一时刻只留一条连接。"""
         self.stop(wait=True)
         self.spec = spec
+        self.period = period
         worker = LiveWorker(spec, symbol, exchange, period, need_history)
         thread = QThread(self)
         worker.moveToThread(thread)

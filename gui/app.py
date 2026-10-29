@@ -606,17 +606,15 @@ class MainWindow(QMainWindow):
         self._live_last = None                         # 上一根 bar 的时间，用来判断「新 bar」
         self._live_seq = 0                             # 每次起停自增，丢掉过期的推送
         self._live_patch_ts = 0.0                      # 上次刷未走完那根 bar 的时刻
-        self._live_armed = False                       # 启动阶段的配置恢复不算用户操作
 
         self._build_ui()
         self._populate_symbols()
         # 延后一拍：等界面完全建好、第一次分析排上队之后再灌配置，
         # 否则 apply_config 里的 _schedule(immediate=True) 会和首帧抢数据加载。
         QTimer.singleShot(0, self._restore_last_config)
-        # 启动后先让界面画完第一帧，再「上膛」并接实时（`_arm_live`）。直接
-        # 250ms 就去连天勤的话，要建连接、拉账户，网络稍慢整个程序看着就是卡住。
-        QTimer.singleShot(1500, self._arm_live)
-        self.lbl_live_msg.setText("实时未启动")
+        # **这里不连天勤**。研究页只看本地库里的历史，实时行情归「账户透视和
+        # 交易」页管：账户连接是那页的事，不能在每次回测 / 换品种时顺手登录一遍。
+        self.lbl_live_msg.setText("本地历史（实时行情在「账户透视和交易」页连接）")
 
     # ---------------------------------------------------------- UI 构建
     def _build_ui(self) -> None:
@@ -689,7 +687,7 @@ class MainWindow(QMainWindow):
         self.btn_page_study.setChecked(True)
         lay.addStretch(1)
 
-        self.lbl_live = QLabel("实时未启动")
+        self.lbl_live = QLabel("本地历史")
         self.lbl_live.setObjectName("Hint")
         lay.addWidget(self.lbl_live)
 
@@ -1522,7 +1520,6 @@ class MainWindow(QMainWindow):
             self.chk_short.blockSignals(False)
         self.cfg = self._new_cfg(info)
         self.lbl_sub.setText(info["sub"])
-        self._auto_live()          # 美股没有实时，这条会顺手把旧会话停掉
         self._sync_data_page()
         self._fill_symbols()
         self._sync_period_controls()
@@ -1580,13 +1577,11 @@ class MainWindow(QMainWindow):
     def _on_period_changed(self) -> None:
         self._sync_period_hint()
         self._schedule(immediate=True)
-        self._auto_live()
 
     def _on_symbol_changed(self) -> None:
         # 每个品种下载到的周期不一样，换品种必须重标一次下拉项
         self._sync_period_hint()
         self._schedule()
-        self._auto_live()
 
     def _reload_store(self, market: str) -> None:
         """重建该市场的 DataStore（清掉 DataFrame 缓存），保留当前选中的标的。"""
@@ -2409,66 +2404,20 @@ class MainWindow(QMainWindow):
             return None
         return sym, ex
 
-    def _arm_live(self) -> None:
-        """界面稳定之后「上膛」，并**立刻接一次**实时行情。
-
-        `apply_config()` 恢复上次配置时会 `setCurrentIndex()`，那会触发
-        `_on_symbol_changed` → `_auto_live()`。启动阶段这一下不算用户操作，
-        所以先拦着，等界面画完第一帧再放开。
-
-        放开的同时主动接一次：打开「K 线与信号」看到的就是当前行情，这是默认
-        预期。早先只上膛不接，结果不换品种、不切周期就永远等不到连接 ——
-        尤其是 1h：一分钟里也不会换一次品种，图就一直停在库里最后一根。
-        `TRENDDESK_NO_LIVE=1` 时不接（离屏截图 / 冒烟测试不该真去登录天勤）。
-        """
-        self._live_armed = True
-        if os.environ.get("TRENDDESK_NO_LIVE"):
-            self.lbl_live_msg.setText("实时未启动（TRENDDESK_NO_LIVE）")
-            return
-        self._auto_live()
-
-    def _auto_live(self) -> None:
-        """接上实时行情：启动时一次，之后用户切品种 / 周期再各接一次。
-
-        K 线与信号页并进公共视图之后，「启动实时」按钮没了，所以这里就是唯一
-        的入口。条件不够就写一句原因，不弹窗、不拦人（比如没配天勤账户）。
-        """
-        if not self._live_armed:
-            return
-        if self.market != "cn":
-            if self.live.running:
-                self.live.stop(wait=False)
-            return
-        period = self._period()
-        if period == PERIOD_1D:
-            self.lbl_live_msg.setText("日线不需要实时（切到 5 分钟或 1 小时会自动接上）")
-            return
-        pair = self._current_pair()
-        if pair is None:
-            return
-        key = f"{pair[0]}_{pair[1]}"
-        if self.live.running and self._live_key == key and self._live_period == period:
-            return                      # 已经在接这个品种这个周期，别反复重连
-        spec = self.trade_page._current_spec()
-        if spec is None:
-            self.lbl_live_msg.setText("实时行情需要一个天勤账户（在「账户透视和交易」页添加）")
-            return
-        # 本地一根都没有时才补历史。早先每次启动都补一遍：一个品种十年 5m
-        # 要几十秒到几分钟，期间账户连上了但 K 线不动，看着就是「一打开程序
-        # 就卡住」。已经下过的品种直接用库里的，实时段拼上去就行。
-        base = self.store.get(key, period)
-        need = base is None or len(base) == 0
-        self.live.start(spec, pair[0], pair[1], period, need_history=need)
-        self.lbl_live_msg.setText("正在连接…")
-
     def _on_trade_connect(self, spec) -> None:
-        """从交易页点「连接」：沿用当前选中的品种与周期。
+        """从「账户透视和交易」页点「连接」：这是**唯一**会去连天勤的入口。
+
+        沿用当前选中的品种与周期，只为了有盘口 / 持仓 / 委托可看。
 
         **不补本地历史**。这个动作的语义是「登录账户」，用户要看的是持仓/资金/
         委托，而 `hub.start()` 之后这些东西就有了。补历史一个品种十年 5m 要几十
         秒到几分钟，撞上天勤运维窗口（19:00-19:30）还会一直等到 19:31 —— 为了
-        画 K 线把「登录」卡住几分钟是不划算的。需要长历史的场景是研究页的实时
-        K 线，那里走 `_on_live_toggled`，它照样补。
+        画 K 线把「登录」卡住几分钟是不划算的。
+
+        研究页不再自动接实时（早先换品种 / 换周期各接一次，回测的时候动不动就
+        登录一遍天勤）。这里连上之后，如果品种和周期跟研究页当前选的一致，那页
+        的 K 线照样会跟着实时刷新 —— 走的是同一条 `_on_live_bars`，不用再单开
+        一个连接。
         """
         if self.market != "cn":
             self.trade_page.on_failed("交易只接了国内期货")
@@ -2488,7 +2437,9 @@ class MainWindow(QMainWindow):
     def _on_live_started(self, key: str) -> None:
         sym, _, ex = key.rpartition("_")
         self._live_key = key
-        self._live_period = self._period()
+        # 用会话自己的周期，不是研究页当前选的那个 —— 交易页可能按 5m 连，
+        # 而研究页停在日线上，拿错了会去拼「5 分钟 bar + 日线历史」这种垃圾
+        self._live_period = self.live.period or self._period()
         self._live_seq += 1
         self._live_last = None
         # 工作线程刚把缺口补进库，缓存里的旧数据要作废，否则实时段会接在旧尾巴上
@@ -2498,8 +2449,12 @@ class MainWindow(QMainWindow):
         # 写「0 根历史」看着像出错，直接说清楚是没补。
         n_base = 0 if self._live_base is None else len(self._live_base)
         tail = f"{n_base:,} 根历史" if n_base else "未补本地历史"
+        extra = ""
+        if self._live_period != self._period():
+            # 交易页按 5m 连的，这边在看日线 —— 图不会跟着动，别让人以为卡住了
+            extra = f"；当前图是 {PERIOD_LABEL.get(self._period(), '')}，不跟随"
         self.lbl_live_msg.setText(
-            f"实时中 · {sym} {PERIOD_LABEL.get(self._live_period, '')}（{tail}）"
+            f"实时中 · {sym} {PERIOD_LABEL.get(self._live_period, '')}（{tail}）{extra}"
         )
         self.lbl_live.setText("● 实时")
         self.lbl_live.setStyleSheet(f"color: {C_UP}; font-size: 11px; font-weight: 600;")
@@ -2507,8 +2462,9 @@ class MainWindow(QMainWindow):
     def _on_live_stopped(self) -> None:
         if self.live.running:
             return      # 换品种时旧线程收尾，新的已经在跑了，别把标签刷回去
-        self.lbl_live.setText("实时未启动")
+        self.lbl_live.setText("本地历史")
         self.lbl_live.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+        self.lbl_live_msg.setText("实时已停止（只显示本地历史；连接在「账户透视和交易」页）")
 
     def _on_live_log(self, msg: str) -> None:
         self.lbl_live_msg.setText(msg)
@@ -2536,6 +2492,8 @@ class MainWindow(QMainWindow):
         pair = self._current_pair()
         if pair is None or self._live_key != f"{pair[0]}_{pair[1]}":
             return          # 推送还是上一个品种的，丢掉
+        if self._live_period and self._live_period != self._period():
+            return          # 品种对上了但周期不一样（交易页按 5m 连的，研究页在看日线）
         # 没走完的那根 bar，收盘价每来一个 tick 就变一次。天勤一秒推十几笔，
         # 每笔都 `merge_live` + 重画整张 K 线，主线程直接被占满 —— 界面看着
         # 就是「一打开就卡住」。同一根内限到 2.5 次/秒，肉眼看不出差别。

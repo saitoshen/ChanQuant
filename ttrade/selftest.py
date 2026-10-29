@@ -546,10 +546,11 @@ def _run() -> tuple[bool, list[str]]:
         app.setStyleSheet(STYLE_SHEET)
 
         win = MainWindow()
-        # 启动不能自动接实时：一开机就去连天勤账户，网络一慢窗口看着就是卡死，
-        # 只是看回测的人也不该被动登录资金账号。这里必须**构造完立刻**判 ——
-        # 后面 processEvents() 跑够 1.5 秒会把上膛定时器触发掉，那是正常的
-        live_off = (win._live_armed is False) and (win.live.running is False)
+        # 启动**绝不能**连天勤：研究页只看本地库，账户连接归「账户透视和交易」页。
+        # 早先这里会「上膛」并在 1.5 秒后自动接一次，于是每看一次回测、每换一个
+        # 品种都可能登录一遍账户。构造完立刻判，再跑几轮 processEvents 之后也要
+        # 还是没连 —— 那样才说明没有任何延时定时器偷偷把连接拉起来。
+        live_off = win.live.running is False
         win.resize(1280, 820)
         win.show()
         app.processEvents()
@@ -561,6 +562,8 @@ def _run() -> tuple[bool, list[str]]:
             app.processEvents()
         n = len(win.store.symbols)
         has_res = getattr(win, "res", None) is not None
+        # 跑过几轮事件循环之后再看一眼：延时定时器如果有，这会儿该触发了
+        live_off = live_off and (win.live.running is False)
         # 数据管理页：五个页面按钮一一对应，补数据的控件在数据页里。
         # 衍生数据的两个勾选框只在期货市场出现 —— 美股没有真实合约和期权，
         # 摆在那里只会让人以为「美股也能下期限结构」。
@@ -796,8 +799,8 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"因子面板控件缺失：{factor_info}")
         if not live_off:
             raise RuntimeError(
-                "启动时自动接了实时（_live_armed 已置位或 live 已在跑）："
-                "一开机就连账户，网络慢的时候界面看着像卡死"
+                "启动时自动接了实时（live 已在跑）：研究页不该连账户，"
+                "账户连接只在「账户透视和交易」页"
             )
         # 因子分析页列出**全部**因子（算不出的显示「无数据」），所以行数应等于
         # 因子库大小。用 `n_factors` 而不是写死数字：加因子时这里不用改。
