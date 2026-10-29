@@ -41,7 +41,7 @@ from matplotlib.dates import AutoDateLocator, DateFormatter
 from matplotlib.figure import Figure
 from matplotlib.ticker import FuncFormatter
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -349,6 +349,11 @@ class ResultView(QObject):
         self._k_start = 0
         self._k_last_draw = 0.0
         self._k_pending = False
+        # 不可见时收到的重画请求只记一笔，等画布重新露面时补一帧
+        self._k_dirty = False
+        # 画布有没有真的上过屏。没上过（离屏自检、还没显示过的窗口）就照常画，
+        # 不能因为 `isVisible()` 为假把「算好的图」一直挂着不画
+        self._k_shown = False
         # 十字光标：双击开/关，鼠标扫到哪根读哪根
         self._k_cross = False
         self._k_hover = -1
@@ -417,6 +422,8 @@ class ResultView(QObject):
 
         self.canvas_k = MplCanvas(figsize=(10, 7), dpi=100)
         lay.addWidget(self.canvas_k, 1)
+        # 画布重新露面时补画不可见期间攒下的那一帧，见 `_render_kline`
+        self.canvas_k.installEventFilter(self)
 
         # 横向滚动条：在**不缩放**的前提下平移可视窗口。区间选「全部 20 年」时
         # 5000 根挤在一屏根本没法看，有了它就能保持当前根数左右拖着看历史。
@@ -670,6 +677,11 @@ class ResultView(QObject):
         """
         self.df = self.raw = self.res = self.bh = None
         self.trades = []
+        # 画布已经被换成「一句话」了，不能留着旧窗口等 `eventFilter` 补画时
+        # 把上一张图又摆回来
+        self._k_view = None
+        self._k_total = 0
+        self._k_dirty = False
         self.pages()
         self.status.emit(msg)
         for name in ("card_cagr", "card_dd", "card_sharpe", "card_excess"):
@@ -745,12 +757,36 @@ class ResultView(QObject):
         """按当前窗口 [start, start+win) 重画 K 线，窗口外的数据不进图元。
 
         整个重建过程在画布的 frozen() 临界区里跑，避免半成品状态被重绘。
+
+        **画布藏起来了就一个图元都不建**。一次重建是 matplotlib 整图重来，8000 根
+        要 100~230ms；而这条链路能被实时推送、滚动条回弹、节流定时器补帧好几个
+        地方叫到，逐个堵必然漏。堵在总入口，谁叫都白叫，画布重新露面时
+        `eventFilter` 补一帧 —— 那会儿数据早就备好了，只是没画。
+
+        还没上过屏（离屏自检、窗口还没 show）时不拦：那种场景没有「看得见看不见」
+        之分，拦下来只会让图一直是空的。
         """
-        view_all = self._k_view
-        if view_all is None or not len(view_all):
+        if self._k_shown and not self.canvas_k.isVisible():
+            self._k_dirty = True
             return
         with self.canvas_k.frozen():
             self._render_kline_impl()
+
+    def eventFilter(self, obj, ev) -> bool:
+        """画布重新露面：把藏起来期间攒下的那一帧补上。
+
+        画布可能是被外层换页藏起来的，也可能是研究页里切到了「绩效」页签 ——
+        两种情况都会收到 `QEvent.Show`，所以挂在这里，而不是绑某个具体的切页
+        回调（那种地方以后加一个入口就会漏一个）。
+        """
+        if obj is self.canvas_k and ev.type() == QEvent.Show:
+            self._k_shown = True
+            if self._k_dirty:
+                self._k_dirty = False
+                if self._k_view is not None and len(self._k_view):
+                    with self.canvas_k.frozen():
+                        self._render_kline_impl()
+        return super().eventFilter(obj, ev)
 
     def _render_kline_impl(self) -> None:
         view_all = self._k_view

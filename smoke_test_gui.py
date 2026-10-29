@@ -65,28 +65,32 @@ def main() -> int:
 
         # 停在别的页时不该画 K 线：一次重绘是 matplotlib 整图重建（100~230ms），
         # 实时每秒 2.5 帧，主线程被吃掉三成 —— 表现就是「在账户页点下单，
-        # 按钮要顿一下才反应」。切回研究页要能立刻补上。
+        # 按钮要顿一下才反应」。两道闸各验一次：实时链路整段跳过，以及
+        # 就算有人直接叫 `_render_kline` 也只记一笔、切回来再补。
         pair = win._current_pair()
         win._live_key = f"{pair[0]}_{pair[1]}"
         win._live_period = win._period()
         live = v.df.tail(300).copy()
         live["open_oi"] = 0.0
         live["close_oi"] = 0.0
-        drawn: list[int] = []
-        orig = v._render_kline
-        v._render_kline = lambda: drawn.append(1)
-        try:
-            win._live_last = live.index[-1]      # 当成同一根，只刷最后一根
-            win.pages.setCurrentIndex(1)         # 站到「账户透视和交易」页
-            win._on_live_bars(live)
-            if drawn:
-                fails.append("停在其他页时还在重画 K 线")
-            win.pages.setCurrentIndex(0)         # 回到研究页，这一帧就该画
-            win._on_live_bars(live)
-            if not drawn:
-                fails.append("回到研究页后没有重画 K 线")
-        finally:
-            v._render_kline = orig
+        win._live_last = live.index[-1]          # 当成同一根，只刷最后一根
+        win.tabs.setCurrentIndex(0)              # 内层回到「K 线」页签
+        win.pages.setCurrentIndex(1)             # 站到「账户透视和交易」页
+        app.processEvents()
+        v._k_dirty = False
+        win._on_live_bars(live)
+        if v._k_dirty:
+            fails.append("停在其他页时实时推送仍在动 K 线")
+        v._render_kline()                        # 直接叫也不许真画
+        if not v._k_dirty:
+            fails.append("停在其他页时 _render_kline 没有退化成「记一笔」")
+        win.pages.setCurrentIndex(0)             # 回到研究页：这一帧要补上
+        app.processEvents()
+        if v._k_dirty:
+            fails.append("回到研究页后没有补画 K 线")
+        win._on_live_bars(live)
+        if v._k_dirty:
+            fails.append("回到研究页后实时推送没有重画 K 线")
 
         print("saved screenshots")
         for f in fails:
