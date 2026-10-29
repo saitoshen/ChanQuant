@@ -3842,8 +3842,12 @@ def check_new_factors() -> None:
 
     start = date.today() - timedelta(days=45)
     m5 = tqdata.load_main("RB", "SHFE", "5m", start=start)
-    short = [F.raw(m5, k).notna().sum() for k in intra]
-    check("5m 上日内因子都有值", min(short) > 100, f"最少 {min(short)} 个非空 / {len(m5)} 根")
+    # 数「覆盖了几天」而不是「有多少根非空」：窗口类因子走完才给值，一天里只有
+    # 收盘前那几根有数（close_drive 一天两根），按根数卡会误判
+    ndays = m5.index.normalize().nunique()
+    cover = [F.raw(m5, k).notna().groupby(m5.index.normalize()).any().sum() for k in intra]
+    check("5m 上日内因子每个交易日都算得出来", min(cover) >= ndays - 1,
+          f"最少 {min(cover)} / {ndays} 个交易日")
     h1 = tqdata.load_main("RB", "SHFE", "1h", start=start)
     check("30 分钟窗口在 1h 上留空（切不出这么细）",
           F.raw(h1, "trend_window").isna().all() and F.raw(h1, "quiet_window").isna().all(), "")
@@ -3874,6 +3878,33 @@ def check_new_factors() -> None:
     # 表里没有的品种（尿素）必须整列为空，不能填 0 冒充「有值但没窗口」
     ur = F.raw(tqdata.load_main("UR", "CZCE", "1d_tq"), "season_cal")
     check("没有日历的品种整列为空", ur.isna().all(), f"非空 {int(ur.notna().sum())}")
+
+    # ---- PIT：小周期不能用大周期同时刻的信息 ----
+    # 2026-10-29 查出来的真 bug：窗口收益原来铺满全天，09:05 那根 bar 读到了
+    # 10:15 的收盘价，日内因子 IC 被这条未来信息吹起来。验法是「截断数据看前值
+    # 变不变」—— 截在 09:55，前 12 个值必须和完整数据算出来的一模一样。
+    hh5 = m5.index.strftime("%H:%M")
+    pos = [i for i, t in enumerate(hh5) if t == "09:55"]
+    if pos:
+        k = pos[-1] + 1
+        moved = []
+        for key in F.FACTORS:          # 全部 67 个，不只是那几个窗口因子
+            a = F.raw(m5, key).iloc[max(0, k - 12):k].to_numpy(float)
+            b = F.raw(m5.iloc[:k], key).iloc[-len(a):].to_numpy(float)
+            bad = 0
+            for x, y in zip(a, b):
+                if np.isnan(x) and np.isnan(y):
+                    continue
+                if np.isnan(x) or np.isnan(y):
+                    bad += 1
+                elif abs(x - y) > 1e-9 * max(1.0, abs(x)):
+                    bad += 1
+            if bad:
+                moved.append(f"{key}({bad})")
+        check("PIT：截断在 09:55 后，窗口因子前值不变", not moved, f"变了：{moved}")
+        v = F.raw(m5, "trend_window")[hh5 == "09:10"]
+        check("PIT：09:10 拿不到 09:45-10:15 的收益",
+              int(v.notna().sum()) == 0, f"非空 {int(v.notna().sum())} 个")
 
 def main() -> int:
     ks = keys()

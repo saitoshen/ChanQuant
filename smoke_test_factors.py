@@ -74,6 +74,9 @@ def make_df(n: int = 1000, seed: int = 3, with_oi: bool = True) -> pd.DataFrame:
 
 
 DF = make_df()
+# 品种季节性要按品种查产业日历，真实加载器把它挂在 attrs 上（tqdata / futures）
+DF.attrs["symbol"] = "RB"
+DF.attrs["exchange"] = "SHFE"
 CUT = 800          # 截断点：前 800 行必须完全一致
 KEYS6 = ["mom_20", "mom_60", "mom_120", "rev_5", "vol_20", "breakout_pos"]
 
@@ -126,6 +129,9 @@ def add_aux(df: pd.DataFrame, seed: int = 11) -> pd.DataFrame:
     out["curv"] = rng.normal(0.3, 0.4, n)
     out["pcr"] = np.exp(rng.normal(0.0, 0.3, n))
     out["n_opt"] = rng.integers(20, 300, n)
+    # 展期·日内口径：天勤那份期限结构独有的列（Tushare 的日线合约没有），
+    # 没有它 roll_intraday 整列空，会在这里被当成「算不出样本」
+    out["roll_intra"] = rng.normal(0.0, 0.002, n)
     return out
 
 
@@ -152,11 +158,15 @@ section("1. 因子库")
 BUILTIN = [k for k, s_ in F.FACTORS.items() if not s_.code]
 AUXISH = {k for k, s_ in F.FACTORS.items()
           if s_.category.startswith("展期") or s_.category == "期权"}
-check("因子数量", len(BUILTIN) == 47,
+# 日线上整列空的：日内 6 + 时段 5。它们要分钟级行情才算得出来，这里的 DF 是
+# 合成日线，所以「算不出样本」是预期行为，不算失败（另有用例专门查这一条）
+NO_DAILY = {k for k, s_ in F.FACTORS.items() if s_.category in ("日内", "时段")}
+check("因子数量", len(BUILTIN) == 66,
       f"内置 {len(BUILTIN)}，用户 {len(F.FACTORS) - len(BUILTIN)}")
 check("分类齐全",
-      set(F.CATEGORIES) == {"趋势", "反转", "波动", "量能", "形态",
-                            "展期", "展期 OI3", "展期 OI6", "期权"},
+      set(F.CATEGORIES) == {"趋势", "反转", "波动", "量能", "形态", "日内", "时段",
+                            "展期", "展期 OI3", "展期 OI6", "期权",
+                            "季节性", "品种季节"},
       str(F.CATEGORIES))
 check("展期/期权因子都登记进 AUX_KEYS",
       set(F.AUX_KEYS) == {k for k in AUXISH if not F.FACTORS[k].code},
@@ -166,6 +176,8 @@ check("默认多因子都存在", all(k in F.FACTORS for k in F.DEFAULT_MULTI))
 
 bad_calc, bad_inf, bad_pit = [], [], []
 for key in F.FACTORS:
+    if key in NO_DAILY:
+        continue
     s = F.raw(DF_AUX, key)
     if len(s) != len(DF_AUX) or s.notna().sum() < 100:
         bad_calc.append(key)
@@ -176,7 +188,8 @@ for key in F.FACTORS:
     if not same_series(s, F.raw(DF_AUX.iloc[:CUT], key), CUT):
         bad_pit.append(key)
 
-check("47 个因子都能算出足够样本", not bad_calc, f"异常 {bad_calc}")
+check(f"{len(F.FACTORS) - len(NO_DAILY)} 个日线因子都能算出足够样本",
+      not bad_calc, f"异常 {bad_calc}")
 check("因子值无 inf", not bad_inf, f"含 inf {bad_inf}")
 check("因子计算不含未来信息（截断重算零差异）", not bad_pit, f"有差异 {bad_pit}")
 
@@ -204,9 +217,9 @@ no_aux = F.filter_available(DF, list(F.FACTORS))
 check("无衍生列时展期/期权因子被剔除",
       all(k not in no_aux for k in F.AUX_KEYS),
       str([k for k in F.AUX_KEYS if k in no_aux]))
-check("无衍生列时其它因子不受影响",
-      len(no_aux) == len(F.FACTORS) - len(AUXISH),
-      f"{len(no_aux)}/{len(F.FACTORS)}，应保留 {len(F.FACTORS) - len(AUXISH)}")
+_keep = len(F.FACTORS) - len(AUXISH) - len(NO_DAILY)
+check("无衍生列时其它因子不受影响", len(no_aux) == _keep,
+      f"{len(no_aux)}/{len(F.FACTORS)}，应保留 {_keep}")
 check("无衍生列时展期因子返回全 NaN",
       F.raw(DF, "roll_yield").isna().all())
 
@@ -491,9 +504,10 @@ check("IC 衰减长度 = 持有期个数", len(decay) == 7, str(list(decay.index
 t0 = time.time()
 rep = M.factor_report(DF_AUX, list(F.FACTORS), horizon=5, window=252)
 cost = time.time() - t0
-check("全因子评估 47 行", len(rep) == len(F.FACTORS), str(len(rep)))
-check("全因子 IC 都算得出来", rep["ic"].notna().all(),
-      str(list(rep.loc[rep["ic"].isna(), "key"])))
+check("全因子评估每行一个因子", len(rep) == len(F.FACTORS), str(len(rep)))
+_daily = rep[~rep["key"].isin(NO_DAILY)]
+check("日线因子的 IC 都算得出来", _daily["ic"].notna().all(),
+      str(list(_daily.loc[_daily["ic"].isna(), "key"])))
 check("评估表无 error 列", "error" not in rep.columns or rep["error"].isna().all())
 check("评估表按 |IC| 降序",
       bool((rep["ic"].abs().diff().dropna() <= 1e-12).all()))

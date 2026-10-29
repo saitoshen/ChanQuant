@@ -62,20 +62,47 @@ def _to_day(df: pd.DataFrame, s: pd.Series, how: str = "last") -> pd.Series:
     return pd.Series(g.map(s.groupby(g).agg(how)).to_numpy(float), index=df.index)
 
 
+def _bar_dur(df: pd.DataFrame) -> pd.Timedelta:
+    """bar 的周期：同一交易日内相邻 bar 时间差的中位数。
+
+    午休（11:30→13:30）会拉出一个 2 小时的间隔，但中位数不受影响。
+    """
+    idx = pd.DatetimeIndex(df.index)
+    d = pd.Series(idx).groupby(_day(df)).diff()
+    med = d.dropna().median()
+    return med if pd.notna(med) else pd.Timedelta(minutes=5)
+
+
 def _window_ret(df: pd.DataFrame, t0: str, t1: str, min_bars: int = 1) -> pd.Series:
     """每个交易日 [t0, t1] 这段的收益：窗口内第一根开盘 → 最后一根收盘。
 
-    按「收盘时刻」落进窗口，所以 5m 的 09:45 那根算在 09:45-09:50；1h 的窗口
-    可能只圈到一根 bar，退化成那根自己的涨跌 —— 精度下降但方向不错，比直接
-    返回 NaN 有用。
+    **边界按 bar 的结束时刻算，不按开始时刻。** 天勤的时间戳是 bar 的**开始**：
+    5m 的 14:00 那根覆盖 14:00-14:05，它的收盘价是 14:05 的价格。按开始时刻取
+    `hh <= "14:00"` 会把 14:05 的价算进「14:00 结束」的窗口里，凭空多出 5 分钟
+    未来。改成「bar 结束时刻落在窗口内」就没这个问题：13:55 那根结束于 14:00，
+    算；14:00 那根结束于 14:05，不算。
+
+    1h 上窗口可能只圈到一根 bar，退化成那根自己的涨跌 —— 精度下降但方向不错，
+    比直接返回 NaN 有用（30 分钟的窗口另外有 `min_bars` 兜着）。
+
+    **窗口没走完之前一律 NaN。** 直接 `g.map(r)` 会把整段铺到当天每一根 bar 上，
+    09:05 那根就读到了 10:15 的收盘价 —— 小周期用了大周期同时刻的信息，IC 会
+    虚高，实盘一上就露馅（2026-10-29 用「截断数据看前值变不变」查出来的）。
     """
     if not _intraday(df):
         return _nan(df)
-    hh = _hhmm(df)
-    m = (hh >= t0) & (hh <= t1)
+    g = _day(df)
+    idx = pd.DatetimeIndex(df.index)
+    dur = _bar_dur(df)
+    start_at = pd.Timedelta(hours=int(t0[:2]), minutes=int(t0[3:]))
+    end_at = pd.Timedelta(hours=int(t1[:2]), minutes=int(t1[3:]))
+    base = pd.DatetimeIndex(g).normalize()
+    if t0 >= "20:00":                      # 夜盘挂在交易日的**前一天**晚上
+        base = base - pd.Timedelta(days=1)
+    bar_end = idx + dur
+    m = (bar_end > base + start_at) & (bar_end <= base + end_at)
     if not m.any():
         return _nan(df)
-    g = _day(df)
     sub = df.loc[m]
     o = pd.to_numeric(sub["open"], errors="coerce").groupby(g[m]).first()
     c = pd.to_numeric(sub["close"], errors="coerce").groupby(g[m]).last()
@@ -85,7 +112,8 @@ def _window_ret(df: pd.DataFrame, t0: str, t1: str, min_bars: int = 1) -> pd.Ser
     # 字卖别的货，不如留空
     n = sub.groupby(g[m]).size().reindex(r.index)
     r = r.where(n >= max(1, int(min_bars)))
-    return pd.Series(g.map(r).to_numpy(float), index=df.index)
+    out = pd.Series(g.map(r).to_numpy(float), index=df.index)
+    return out.where(bar_end >= base + end_at)
 
 
 # ---------------------------------------------------------------- 日内
@@ -182,8 +210,10 @@ def f_close_drive(df: pd.DataFrame) -> pd.Series:
         return _nan(df)
     last = _window_ret(df, "14:00", "15:00")
     g = _day(df)
-    hi = pd.to_numeric(df["high"], errors="coerce").groupby(g).transform("max")
-    lo = pd.to_numeric(df["low"], errors="coerce").groupby(g).transform("min")
+    # 振幅用 cummax/cummin 而不是当日全天 max/min：分母也得是「截至当前 bar」
+    # 的振幅，否则 14:55 那根的分母里塞着 14:55 之后才出现的高低点
+    hi = pd.to_numeric(df["high"], errors="coerce").groupby(g).cummax()
+    lo = pd.to_numeric(df["low"], errors="coerce").groupby(g).cummin()
     return last / ((hi - lo) / pd.to_numeric(df["close"], errors="coerce")).replace(
         0.0, np.nan)
 

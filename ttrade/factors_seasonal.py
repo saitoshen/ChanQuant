@@ -78,8 +78,26 @@ def _map_back(df: pd.DataFrame, table: pd.DataFrame) -> pd.Series:
     return pd.Series(vals.to_numpy(dtype=float), index=df.index)
 
 
+def _intraday(df: pd.DataFrame) -> bool:
+    """是不是分钟级数据：平均每个交易日至少两根 bar。"""
+    idx = df.index
+    if not isinstance(idx, pd.DatetimeIndex) or len(idx) < 20:
+        return False
+    return len(idx) >= 2 * idx.normalize().nunique()
+
+
 def _map_daily(df: pd.DataFrame, s: pd.Series) -> pd.Series:
+    """把日频序列铺回每根 bar。
+
+    日线上是恒等；**分钟线上整体后移一个交易日**。`mtd`（当月至今收益）和
+    `frac`（当月已过交易日占比）都是「当日收盘」才算得出来的量，按交易日直接
+    铺到当天所有 bar 上，09:00 那根就拿到了今天收盘的数据 —— 这正是「小周期
+    用了大周期同时刻的信息」。用昨天收盘那份快照，才是实盘那一刻拿得到的。
+    """
     g = _day(df)
+    if _intraday(df):
+        days = pd.DatetimeIndex(sorted(set(pd.DatetimeIndex(g))))
+        g = g.map(pd.Series(days[:-1], index=days[1:]))
     return pd.Series(g.map(s).to_numpy(dtype=float), index=df.index)
 
 
