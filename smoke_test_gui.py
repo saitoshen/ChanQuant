@@ -77,19 +77,19 @@ def main() -> int:
         win.tabs.setCurrentIndex(0)              # 内层回到「K 线」页签
         win.pages.setCurrentIndex(1)             # 站到「账户透视和交易」页
         app.processEvents()
-        v._k_dirty = False
+        v._pending_draw.clear()
         win._on_live_bars(live)
-        if v._k_dirty:
+        if v._pending_draw:
             fails.append("停在其他页时实时推送仍在动 K 线")
         v._render_kline()                        # 直接叫也不许真画
-        if not v._k_dirty:
+        if not v._pending_draw:
             fails.append("停在其他页时 _render_kline 没有退化成「记一笔」")
         win.pages.setCurrentIndex(0)             # 回到研究页：这一帧要补上
         app.processEvents()
-        if v._k_dirty:
+        if v._pending_draw:
             fails.append("回到研究页后没有补画 K 线")
         win._on_live_bars(live)
-        if v._k_dirty:
+        if v._pending_draw:
             fails.append("回到研究页后实时推送没有重画 K 线")
 
         print("saved screenshots")

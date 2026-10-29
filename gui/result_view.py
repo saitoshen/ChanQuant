@@ -349,11 +349,8 @@ class ResultView(QObject):
         self._k_start = 0
         self._k_last_draw = 0.0
         self._k_pending = False
-        # 不可见时收到的重画请求只记一笔，等画布重新露面时补一帧
-        self._k_dirty = False
-        # 画布有没有真的上过屏。没上过（离屏自检、还没显示过的窗口）就照常画，
-        # 不能因为 `isVisible()` 为假把「算好的图」一直挂着不画
-        self._k_shown = False
+        # 藏着的时候收到的重画请求：画布 -> (画法, 参数)，露面时补一帧
+        self._pending_draw: dict = {}
         # 十字光标：双击开/关，鼠标扫到哪根读哪根
         self._k_cross = False
         self._k_hover = -1
@@ -453,6 +450,7 @@ class ResultView(QObject):
         splitter.setChildrenCollapsible(False)
 
         self.canvas_p = MplCanvas(figsize=(7, 6), dpi=100)
+        self.canvas_p.installEventFilter(self)
         splitter.addWidget(self.canvas_p)
 
         right = QWidget()
@@ -530,6 +528,7 @@ class ResultView(QObject):
         splitter.addWidget(left)
 
         self.canvas_f = MplCanvas(figsize=(8, 7), dpi=100)
+        self.canvas_f.installEventFilter(self)
         splitter.addWidget(self.canvas_f)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -592,6 +591,7 @@ class ResultView(QObject):
         lay.setSpacing(6)
 
         self.canvas_s = MplCanvas(figsize=(9, 3), dpi=100)
+        self.canvas_s.installEventFilter(self)
         self.canvas_s.setMinimumHeight(170)
         lay.addWidget(self.canvas_s, 1)
 
@@ -681,7 +681,7 @@ class ResultView(QObject):
         # 把上一张图又摆回来
         self._k_view = None
         self._k_total = 0
-        self._k_dirty = False
+        self._pending_draw.clear()
         self.pages()
         self.status.emit(msg)
         for name in ("card_cagr", "card_dd", "card_sharpe", "card_excess"):
@@ -766,11 +766,28 @@ class ResultView(QObject):
         还没上过屏（离屏自检、窗口还没 show）时不拦：那种场景没有「看得见看不见」
         之分，拦下来只会让图一直是空的。
         """
-        if self._k_shown and not self.canvas_k.isVisible():
-            self._k_dirty = True
+        if self._defer_draw(self.canvas_k, self._render_kline):
             return
         with self.canvas_k.frozen():
             self._render_kline_impl()
+
+    # ---------------------------------------------------------- 画布总闸
+
+    def _defer_draw(self, canvas, fn, *args) -> bool:
+        """画布藏着就先把这次重画记下来，露面时补 —— 返回 True 表示已推迟。
+
+        matplotlib 整图重建是 100ms 起步的活儿（8000 根 K 线 100~230ms，因子页
+        四格图 1 秒以上），画在看不见的页签上纯属白烧主线程：一次「改个参数」
+        里有一半时间在画没人看的图，表现就是「点一下要等两秒」。
+
+        窗口本身还没显示（离屏自检、启动第一帧）时不拦 —— 那种场景没有「看得见
+        看不见」之分，拦下来只会让图一直是空的。看窗口而不是看画布，是因为因子页
+        这种**一开始就不是当前页签**的画布永远等不到第一次 Show。
+        """
+        if not canvas.window().isVisible() or canvas.isVisible():
+            return False
+        self._pending_draw[canvas] = (fn, args)
+        return True
 
     def eventFilter(self, obj, ev) -> bool:
         """画布重新露面：把藏起来期间攒下的那一帧补上。
@@ -779,13 +796,11 @@ class ResultView(QObject):
         两种情况都会收到 `QEvent.Show`，所以挂在这里，而不是绑某个具体的切页
         回调（那种地方以后加一个入口就会漏一个）。
         """
-        if obj is self.canvas_k and ev.type() == QEvent.Show:
-            self._k_shown = True
-            if self._k_dirty:
-                self._k_dirty = False
-                if self._k_view is not None and len(self._k_view):
-                    with self.canvas_k.frozen():
-                        self._render_kline_impl()
+        if ev.type() == QEvent.Show:
+            pend = self._pending_draw.pop(obj, None)
+            if pend is not None:
+                fn, args = pend
+                fn(*args)
         return super().eventFilter(obj, ev)
 
     def _render_kline_impl(self) -> None:
@@ -1322,6 +1337,8 @@ class ResultView(QObject):
         """绩效页重建，同样走 frozen() 临界区。"""
         if self.res is None:
             return
+        if self._defer_draw(self.canvas_p, self._draw_perf):
+            return
         with self.canvas_p.frozen():
             self._draw_perf_impl()
 
@@ -1604,6 +1621,8 @@ class ResultView(QObject):
         canvas = getattr(self, "canvas_s", None)
         if canvas is None:
             return
+        if self._defer_draw(canvas, self._draw_stage_chart, yrs):
+            return
         with canvas.frozen():
             fig = canvas.fresh()
             ax = fig.add_subplot(111)
@@ -1668,6 +1687,10 @@ class ResultView(QObject):
             return
         cfg = self.factor_cfg
         if cfg is None:
+            return
+        # 整个页签（连算带画）一起推迟：`_ensure_report()` 要给 48 个因子各算一遍
+        # IC / ICIR，实测 1.3 秒 —— 没人看这一页的时候算它纯属白等
+        if self._defer_draw(self.canvas_f, self._refresh_factor_tab):
             return
         rep = self._ensure_report()
         if rep.empty:
@@ -1736,6 +1759,8 @@ class ResultView(QObject):
 
     def _plot_factor_charts(self, df, cfg, rep, out) -> None:
         """四格图：IC 时序 / IC 衰减 / 分位收益 / 特征重要度（或分数与收益）。"""
+        if self._defer_draw(self.canvas_f, self._plot_factor_charts, df, cfg, rep, out):
+            return
         with self.canvas_f.frozen():
             self._plot_factor_charts_impl(df, cfg, rep, out)
 

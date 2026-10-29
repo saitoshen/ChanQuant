@@ -326,9 +326,23 @@ class TradePage(QWidget):
         t.setAlternatingRowColors(False)
         h = t.horizontalHeader()
         h.setSectionResizeMode(0, QHeaderView.Stretch)
+        # **不要用 `ResizeToContents`**。它对每一次 `setItem` 都重算全部行的高度
+        # 与宽度，而我们是整表重建（一天几百条委托）：同样的 200 行，第一次填
+        # 28ms，第二次 12 秒 —— 挂上一笔新委托正好触发第二次，界面直接冻住。
+        # 改成固定模式 + 填完调一次 `_fit_columns()`，同一场景 30ms。
         for i in range(1, len(headers)):
-            h.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+            h.setSectionResizeMode(i, QHeaderView.Interactive)
+            t.setColumnWidth(i, 90)
         return t
+
+    def _fit_columns(self, t: QTableWidget) -> None:
+        """填完之后按内容定一次列宽。
+
+        第 0 列是 Stretch（合约名占满剩余），不参与；其余列各算一次，
+        200 行 8 列实测 30ms 上下。
+        """
+        for j in range(1, t.columnCount()):
+            t.resizeColumnToContents(j)
 
     def _build_positions(self) -> QTableWidget:
         self.tbl_pos = self._table(
@@ -536,6 +550,7 @@ class TradePage(QWidget):
                 if j > 0:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 t.setItem(i, j, item)
+        self._fit_columns(t)
 
     def _fill_orders(self, rows: list[dict]) -> None:
         t = self.tbl_orders
@@ -554,6 +569,7 @@ class TradePage(QWidget):
                 if j in (3, 4, 5):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 t.setItem(i, j, item)
+        self._fit_columns(t)
 
     def _fill_trades(self, rows: list[dict]) -> None:
         t = self.tbl_trades
@@ -568,6 +584,7 @@ class TradePage(QWidget):
                 if j in (3, 4):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 t.setItem(i, j, item)
+        self._fit_columns(t)
 
     # ---------------------------------------------------------- 操作
     def _cancel_selected(self) -> None:
