@@ -1219,6 +1219,12 @@ ResourceInUseException: connection has an unfinished result from execute()
   偶尔重复」；
 - 推送节流：状态 0.4 秒一次，K 线只在「最后一根的时间 / 收盘价 / 根数」变化时才发。
 
+主线程这一侧还有一道闸：**人不在研究页就不画 K 线**。一次重绘是 matplotlib 整图
+重建（8000 根 1h 实测 100~230ms），同一根 bar 内每秒最多刷 2.5 次 —— 停在其他页时
+这些时间全白花，主线程被占掉三成，表现就是「在账户透视和交易页点下单，按钮要顿
+一下才反应」。切回研究页时 `_live_last` 还是旧值，下一帧自然判成「新 bar」，走一次
+完整重算把不在的那一段补上。
+
 ### 触发是按 bar 的，不是按 tick 的
 
 `PortfolioRunner.tick()` 每轮 `wait_update()` 之后跑一次，做三件事：

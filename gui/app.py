@@ -630,7 +630,8 @@ class MainWindow(QMainWindow):
         # 用 QStackedWidget 而不是外层 QTabWidget：页签放在顶部一条自绘的按钮条上，
         # 视觉上和侧边栏的卡片、内层的三个页签区分得开，不会变成「两层页签」。
         self.pages = QStackedWidget()
-        self.pages.addWidget(self._build_study_page())
+        self.study_page = self._build_study_page()
+        self.pages.addWidget(self.study_page)
         self.live = LiveController(self)
         self.trade_page = TradePage(self.live)
         self.pages.addWidget(self.trade_page)
@@ -2494,6 +2495,13 @@ class MainWindow(QMainWindow):
             return          # 推送还是上一个品种的，丢掉
         if self._live_period and self._live_period != self._period():
             return          # 品种对上了但周期不一样（交易页按 5m 连的，研究页在看日线）
+        # 人不在研究页就不画。一次重绘是 matplotlib 整图重建，实测 8000 根 1h
+        # 要 100~230ms；实时每秒最多推 2.5 帧，主线程三成时间耗在画一张看不见的
+        # 图上 —— 表现就是「在账户页点下单，按钮要顿一下才反应」。
+        # `_live_last` 故意不更新：切回研究页的下一帧会判成「新 bar」，走一次
+        # 完整重算把不在的这一段补上。
+        if self.pages.currentWidget() is not self.study_page:
+            return
         # 没走完的那根 bar，收盘价每来一个 tick 就变一次。天勤一秒推十几笔，
         # 每笔都 `merge_live` + 重画整张 K 线，主线程直接被占满 —— 界面看着
         # 就是「一打开就卡住」。同一根内限到 2.5 次/秒，肉眼看不出差别。

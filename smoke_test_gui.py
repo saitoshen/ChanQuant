@@ -63,6 +63,31 @@ def main() -> int:
             fails.append(f"贴在右端时没跟到最新：{v._k_start} vs "
                          f"{max(0, v._k_total - v._k_win)}")
 
+        # 停在别的页时不该画 K 线：一次重绘是 matplotlib 整图重建（100~230ms），
+        # 实时每秒 2.5 帧，主线程被吃掉三成 —— 表现就是「在账户页点下单，
+        # 按钮要顿一下才反应」。切回研究页要能立刻补上。
+        pair = win._current_pair()
+        win._live_key = f"{pair[0]}_{pair[1]}"
+        win._live_period = win._period()
+        live = v.df.tail(300).copy()
+        live["open_oi"] = 0.0
+        live["close_oi"] = 0.0
+        drawn: list[int] = []
+        orig = v._render_kline
+        v._render_kline = lambda: drawn.append(1)
+        try:
+            win._live_last = live.index[-1]      # 当成同一根，只刷最后一根
+            win.pages.setCurrentIndex(1)         # 站到「账户透视和交易」页
+            win._on_live_bars(live)
+            if drawn:
+                fails.append("停在其他页时还在重画 K 线")
+            win.pages.setCurrentIndex(0)         # 回到研究页，这一帧就该画
+            win._on_live_bars(live)
+            if not drawn:
+                fails.append("回到研究页后没有重画 K 线")
+        finally:
+            v._render_kline = orig
+
         print("saved screenshots")
         for f in fails:
             print("FAIL", f)
