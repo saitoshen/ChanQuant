@@ -188,6 +188,9 @@ def load_main(
 
     if n > 1:
         out = merge_bars(out, n)
+    # 因子层要靠它认品种（品种季节性日历、按品种的口径判断）。attrs 不走
+    # 计算，只当元数据；merge_bars 里 copy 过，所以放在最后挂。
+    out.attrs["symbol"] = symbol
     return out
 
 

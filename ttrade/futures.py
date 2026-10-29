@@ -505,6 +505,8 @@ def load_local(
         df = attach_aux(df, symbol, exchange, aux_dir)
     except Exception:
         pass
+    # 因子层靠它认品种（品种季节性日历要按品种查表）
+    df.attrs["symbol"] = symbol
     return df
 
 

@@ -3713,6 +3713,7 @@ def check_tq_curve() -> None:
 
     df, note = Q.build(sym, ex, period)
     check(f"期限结构：{sym}_{ex} {period} 能算出来", not df.empty, note)
+    check("期限结构：说明里写明实际用的源周期", "源 " in note, note)
     if df.empty:
         return
     check("期限结构：aux 要读的列一个不少",
@@ -3724,6 +3725,16 @@ def check_tq_curve() -> None:
     both = df.dropna(subset=["c1_dte", "c2_dte"])
     check("期限结构：c1 比 c2 先到期",
           bool((both["c1_dte"] <= both["c2_dte"]).all()), "")
+
+    # 一个品种一个文件，按 1d → 1h → 5m 挑精度最高的那份：库里只要有日线真实
+    # 合约，就该用日线算，而不是被调用方传进来的 5m 带跑
+    with S.connect(read_only=True) as con:
+        has_1d = bool(con.execute(
+            "SELECT count(*) FROM contract_bars WHERE symbol=? AND exchange=?"
+            " AND period='1d'", [sym, ex]).fetchone()[0])
+    if has_1d:
+        _d, note_1d = Q.build(sym, ex, "5m")
+        check("期限结构：有日线时优先用日线（哪怕传的是 5m）", "源 1d" in note_1d, note_1d)
 
     got = Q.build_all([(sym, ex)], period=period)
     path = Q.curve_path(sym, ex)
@@ -3739,6 +3750,65 @@ def check_tq_curve() -> None:
               f"{len(back)} 行")
 
 
+def check_new_factors() -> None:
+    """日内 / 时段 / 季节性三类新因子：口径、留空规则、PIT。"""
+    from datetime import date, timedelta
+
+    import pandas as pd
+
+    from ttrade import factors as F
+    from ttrade import tqdata
+
+    check("因子库：67 个 / 13 类", len(F.FACTORS) == 67 and len(F.CATEGORIES) == 13,
+          f"{len(F.FACTORS)} 个 / {len(F.CATEGORIES)} 类")
+    cats = {k: F.FACTORS[k].category for k in
+            ("vwap_gap", "trend_window", "season_avg", "season_cal", "roll_intraday")}
+    check("新因子归到了对的类别",
+          cats == {"vwap_gap": "日内", "trend_window": "时段", "season_avg": "季节性",
+                   "season_cal": "品种季节", "roll_intraday": "展期"}, str(cats))
+
+    daily = tqdata.load_main("RB", "SHFE", "1d_tq")
+    intra = ("vwap_gap", "pv_pos", "range_break", "intraday_mom", "overnight_gap",
+             "close_drive", "trend_window", "quiet_window")
+    check("日线上日内/时段因子整列为空",
+          all(F.raw(daily, k).isna().all() for k in intra),
+          f"{len(intra)} 个")
+
+    start = date.today() - timedelta(days=45)
+    m5 = tqdata.load_main("RB", "SHFE", "5m", start=start)
+    short = [F.raw(m5, k).notna().sum() for k in intra]
+    check("5m 上日内因子都有值", min(short) > 100, f"最少 {min(short)} 个非空 / {len(m5)} 根")
+    h1 = tqdata.load_main("RB", "SHFE", "1h", start=start)
+    check("30 分钟窗口在 1h 上留空（切不出这么细）",
+          F.raw(h1, "trend_window").isna().all() and F.raw(h1, "quiet_window").isna().all(), "")
+
+    # 季节性 PIT：2024 年 3 月的值必须只由 2023 年及以前的三月算出
+    g = pd.to_datetime(daily["trading_day"])
+    dc = daily["close"].groupby(g).last()
+    r = dc.pct_change()
+    idx = pd.DatetimeIndex(dc.index)
+    tab = r.groupby([idx.year, idx.month]).sum().unstack()
+    want = float(tab.loc[tab.index < 2024, 3].mean())
+    got = F.raw(daily, "season_avg")
+    sel = (g.dt.year == 2024) & (g.dt.month == 3)
+    val = float(got[sel].iloc[0]) if sel.any() else float("nan")
+    check("季节均值严格只用往年同月", abs(val - want) < 1e-9, f"{val:.6f} vs {want:.6f}")
+
+    cal = F.raw(daily, "season_cal")
+    mar = float(cal[(g.dt.month == 3)].iloc[0])
+    aug = float(cal[(g.dt.month == 8)].iloc[0])
+    check("品种季节：螺纹 3 月旺季 +1、8 月无窗口 0", mar == 1.0 and aug == 0.0,
+          f"3 月 {mar:+.0f} / 8 月 {aug:+.0f}")
+    m_daily = tqdata.load_main("M", "DCE", "1d_tq")
+    gm = pd.to_datetime(m_daily["trading_day"])
+    cm = F.raw(m_daily, "season_cal")
+    sep = float(cm[gm.dt.month == 9].iloc[0])
+    check("品种季节：豆粕 9 月收割压力 -1", sep == -1.0, f"{sep:+.0f}")
+
+    # 表里没有的品种（尿素）必须整列为空，不能填 0 冒充「有值但没窗口」
+    ur = F.raw(tqdata.load_main("UR", "CZCE", "1d_tq"), "season_cal")
+    check("没有日历的品种整列为空", ur.isna().all(), f"非空 {int(ur.notna().sum())}")
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -3750,6 +3820,7 @@ def main() -> int:
     check_trading_day()
     check_ranges()
     check_tq_curve()
+    check_new_factors()
     check_contract_incremental()
     check_live_helpers()
     check_live_worker()

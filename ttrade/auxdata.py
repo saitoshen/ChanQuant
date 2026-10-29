@@ -85,20 +85,30 @@ def load_curve(aux_dir: str, symbol: str, exchange: str) -> pd.DataFrame:
 
     两套文件互不覆盖：`data_futures_aux/` 是 Tushare 的 20 年口径，
     `data_tq/curve/` 是天勤合约（十年出头）。同一个日期混着用两个源会让展期值
-    随机跳，所以只做「有就用、没有才退」，不做合并。
+    随机跳，所以价格类列只做「有就用、没有才退」，不做合并。
+
+    **唯一例外是 `roll_intra`**：日内价差漂移只有分钟级真实合约算得出来，
+    Tushare 那份（日线合约）根本没有这一列。它不是「另一个源的同名数据」，
+    而是天勤独有的补充列，所以单独并进来，缺日期就是空。
     """
     df = _read(curve_path(aux_dir, symbol, exchange), CURVE_COLS)
-    if not df.empty:
-        return df
-    # 天勤那份的路径从**数据根目录**推，而不是从 aux_dir 推 —— aux_dir 可能是
-    # 测试用的临时目录，按它推会指到 Temp 下面去
+    alt = _read(_tq_curve_path(symbol, exchange), ["roll_intra"])
+    if df.empty:
+        return alt
+    if not alt.empty and "roll_intra" in alt.columns and "roll_intra" not in df.columns:
+        df = df.join(alt[["roll_intra"]], how="left")
+    return df
+
+
+def _tq_curve_path(symbol: str, exchange: str) -> str:
+    """天勤期限结构的路径。从**数据根目录**推，不从 aux_dir 推 —— aux_dir 可能
+    是测试用的临时目录，按它推会指到 Temp 下面去。"""
     from .paths import data_dir as _data_dir
 
-    alt = os.path.join(
+    return os.path.join(
         os.path.dirname(_data_dir("cn").rstrip("/\\")),
         "data_tq", "curve", f"{symbol}_{exchange}.csv",
     )
-    return _read(alt, CURVE_COLS)
 
 
 def load_opt(aux_dir: str, symbol: str, exchange: str) -> pd.DataFrame:

@@ -258,17 +258,15 @@ def main() -> int:
                     with_retry(f"{sym}_{ex} {period}", job)
 
             # ---- 期限结构（展期因子）：纯本地计算，不联网
+            # 一个品种只落一个文件，内部按 1d → 1h → 5m 挑精度最高的那份，所以
+            # 不管这次下的是哪个周期，跑一遍就够，不用按周期循环
             print("\n[4/4] 期限结构（展期因子）")
             from ttrade import tqcurve
 
-            for period in [p.strip() for p in args.contracts.split(",") if p.strip()]:
-                if period not in PERIOD_SEC:
-                    continue
+            def on_curve(key: str, n: int, note: str) -> None:
+                print(f"  {key}: {note}", flush=True)
 
-                def on_curve(key: str, n: int, note: str) -> None:
-                    print(f"  [{period}] {key}: {note}", flush=True)
-
-                tqcurve.build_all(pairs, period=period, on_row=on_curve)
+            tqcurve.build_all(pairs, period="1d", on_row=on_curve)
     finally:
         sess.close()
 

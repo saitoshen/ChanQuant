@@ -179,6 +179,19 @@ def f_roll_change(df: pd.DataFrame) -> pd.Series:
     return _roll_change(df, "c")
 
 
+def f_roll_intraday(df: pd.DataFrame) -> pd.Series:
+    """日内价差漂移：收盘时的 c1/c2 价差 − 当天第一根 bar 的同一对价差。
+
+    只有分钟级真实合约才算得出来（`tqcurve` 构建期限结构时顺手写进
+    `data_tq/curve/` 的 `roll_intra` 列）。正的表示近月当天相对远月走强，
+    是「谁在被买」的即时读数，日线的展期收益率把这个过程抹平了。
+
+    实测很弱：次日 IC 约 0.011（t≈2.1），5 日以上归零。别当主力因子用，
+    适合当短线择时的辅助项，或者和 `roll_yield` 一起看「水平高 + 还在走强」。
+    """
+    return _col(df, "roll_intra")
+
+
 def f_near_oi_share(df: pd.DataFrame) -> pd.Series:
     """近月持仓占比 c1_oi / (c1_oi + c2_oi)。
 
@@ -593,6 +606,9 @@ _reg(FactorSpec("roll_change", "展期变化", f_roll_change, "展期",
                 "年化展期收益率的 20 日变化，反映曲线陡峭度的动量。"))
 _reg(FactorSpec("near_oi_share", "近月持仓占比", f_near_oi_share, "展期",
                 "近月持仓 / (近月+次近) 持仓，衡量资金是否挤在近月。"))
+# 日内口径的展期：需要分钟级真实合约（天勤），Tushare 那份 aux 里没有这一列
+_reg(FactorSpec("roll_intraday", "展期·日内价差漂移", f_roll_intraday, "展期",
+                "收盘价差减当日开盘价差，近月当天相对远月的强弱变化，需分钟级合约。"))
 
 # 展期·OI3 / OI6：同样四个公式，但换一套选合约的口径。
 # 上面的「展期」是按到期日取最近三腿；这两类是先按持仓量取前 3 / 前 6 个活跃合约，
@@ -638,7 +654,9 @@ _reg(FactorSpec("pcr", "看跌看涨持仓比", f_pcr, "期权",
 
 CATEGORIES: list[str] = [
     "趋势", "反转", "波动", "量能", "形态",
+    "日内", "时段",
     "展期", "展期 OI3", "展期 OI6", "期权",
+    "季节性", "品种季节",
 ]
 
 DEFAULT_SINGLE = "mom_60"
@@ -769,6 +787,15 @@ def _load_user_factors() -> int:
 
 
 USER_FACTOR_COUNT = _load_user_factors()
+
+# 日内 / 时段 / 季节性三类单独成文件：主文件已经八百行，再往里塞二十个因子
+# 会变成一锅粥。它们在模块末尾注册，是因为要用这里的 `FactorSpec` —— 放开头
+# 就是循环导入。
+from ttrade import factors_intraday as _FI   # noqa: E402
+from ttrade import factors_seasonal as _FS   # noqa: E402
+
+_INTRA_FACTORS = _FI.register_into(FACTORS, FactorSpec)
+_SEASON_FACTORS = _FS.register_into(FACTORS, FactorSpec)
 
 # 用户因子可能带来新类别（默认叫「自定义」）。`CATEGORIES` 是界面上分组用的
 # 静态列表，不补进去的话新因子在「策略研究」页的因子下拉里根本不出现 ——

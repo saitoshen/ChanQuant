@@ -21,14 +21,22 @@ Tushare 那份是 20 年、天勤这份是十年出头，混着写会让同一�
 直接复用 `contracts.build_curve`：它只要求「一天的横截面」长成
 `date / ts_code / close / open_interest` 加上一份 `basic`（含 `fut_code`、
 `exchange`、`delist`）。天勤这边缺的只有 `delist`（到期日），从合约代码的
-年月推 —— 商品的最后交易日是交割月的第 15 个自然日前后，股指是第三个周五，
-这里统一取「交割月最后一天」，只影响 `dte` 这个**排序与过滤**用的量，不影响价格。
+年月推 —— 商品的最后交易日是交割月第 15 个自然日前后，股指是第三个周五，这里
+统一取「交割月 15 日」，只影响 `dte` 这个**排序与过滤**用的量，不影响价格。
+
+## 一个品种只有一个文件
+
+期限结构是「每天一根」，5m / 1h / 1d 算出来的是同一张表的不同精度版本，所以不按
+周期分文件。优先级固定为 1d → 1h → 5m：日线本身就是收盘价，最准也最省；没有日线
+才退到分钟线，按交易日取最后一根。否则先跑 5m 再跑 1h，同一个文件被来回覆盖，
+谁也说不清当前这份是哪来的。
 """
 
 from __future__ import annotations
 
 import os
 
+import numpy as np
 import pandas as pd
 
 from . import contracts as C
@@ -43,6 +51,30 @@ def curve_dir() -> str:
 
 def curve_path(symbol: str, exchange: str) -> str:
     return os.path.join(curve_dir(), f"{symbol}_{exchange}.csv")
+
+
+# 算期限结构时优先用哪个周期。日线直接就是收盘价；分钟线还要按交易日聚合一次，
+# 精度没多出来、代价却大几十倍。
+_PREFER = ("1d", "1h", "5m")
+
+
+def _resolve_period(con, symbol: str, exchange: str, period: str) -> str:
+    """挑实际拿来算的周期：1d → 1h → 5m，都没有才用调用方给的那个。
+
+    调用方给的周期只当兜底，不当首选：库里同时有日线和 5m 时，用 5m 算出来的
+    结果和日线几乎一样，却会把已经落盘的日线版本覆盖成低精度的那份。
+    """
+    have = {
+        r[0]
+        for r in con.execute(
+            "SELECT DISTINCT period FROM contract_bars WHERE symbol=? AND exchange=?",
+            [symbol, exchange],
+        ).fetchall()
+    }
+    for p in list(_PREFER) + ([period] if period else []):
+        if p in have:
+            return p
+    return period
 
 
 def _delivery(contract: str) -> pd.Timestamp | None:
@@ -65,19 +97,76 @@ def _delivery(contract: str) -> pd.Timestamp | None:
     return pd.Timestamp(year=year, month=month, day=15)
 
 
+def _merge_drift(out: pd.DataFrame, symbol: str, exchange: str) -> pd.DataFrame:
+    """把「日内价差漂移」并到期限结构上（列 `roll_intra`）。
+
+    口径：取当天收盘时那对 c1/c2，看同一对合约在**当天第一根 bar** 的价差是多少，
+    两者相减。正的表示近月当天相对远月走强。这是只有分钟级数据才拿得到的量，
+    日线上恒等于 0。
+
+    优先 5m、退 1h：粒度越细越接近「日内路径」。没有分钟级合约就原样返回，
+    这一列留空 —— 不拿 0 冒充，0 会被当成「今天价差没动」。
+    """
+    codes = out[["date", "c1_code", "c2_code"]].dropna()
+    if codes.empty:
+        return out
+    with S.connect(read_only=True) as con:
+        rows = pd.DataFrame()
+        for p in ("5m", "1h"):
+            rows = con.execute(
+                "SELECT contract, trading_day, arg_min(close, dt) AS f,"
+                " arg_max(close, dt) AS l FROM contract_bars"
+                " WHERE symbol=? AND exchange=? AND period=? GROUP BY 1, 2",
+                [symbol, exchange, p],
+            ).df()
+            if not rows.empty:
+                break
+    if rows.empty:
+        return out
+
+    rows["td"] = pd.to_datetime(rows["trading_day"])
+    rows["f"] = pd.to_numeric(rows["f"], errors="coerce")
+    rows["l"] = pd.to_numeric(rows["l"], errors="coerce")
+    first = rows.pivot_table(index="td", columns="contract", values="f", aggfunc="last")
+    last = rows.pivot_table(index="td", columns="contract", values="l", aggfunc="last")
+
+    d = codes.set_index("date")
+    rows_i = first.index.get_indexer(d.index)
+    cols_1 = first.columns.get_indexer(d["c1_code"])
+    cols_2 = first.columns.get_indexer(d["c2_code"])
+    ok = (rows_i >= 0) & (cols_1 >= 0) & (cols_2 >= 0)
+
+    def pick(tab: pd.DataFrame) -> np.ndarray:
+        arr = tab.to_numpy(dtype=float)
+        out_v = np.full(len(d), np.nan)
+        out_v[ok] = arr[rows_i[ok], cols_1[ok]]
+        out_v2 = np.full(len(d), np.nan)
+        out_v2[ok] = arr[rows_i[ok], cols_2[ok]]
+        return out_v / out_v2 - 1.0
+
+    drift = pick(last) - pick(first)
+    return out.merge(pd.DataFrame({"date": d.index, "roll_intra": drift}), on="date",
+                     how="left")
+
+
 def build(symbol: str, exchange: str, period: str = "1d") -> tuple[pd.DataFrame, str]:
-    """算一个品种的期限结构。返回 (表, 说明文字)；没有合约数据时表为空。"""
+    """算一个品种的期限结构。返回 (表, 说明文字)；没有合约数据时表为空。
+
+    `period` 只是「优先想用哪个」，实际用哪个由 `_resolve_period` 决定，说明文字
+    里会写清楚（`1678 个交易日（源 1h）`），免得看到结果不知道数据哪来的。
+    """
     if not S.exists():
         return pd.DataFrame(columns=C.CURVE_COLS), "仓库不存在"
     with S.connect(read_only=True) as con:
+        used = _resolve_period(con, symbol, exchange, period)
         df = con.execute(
             "SELECT contract, trading_day, dt, close, close_oi FROM contract_bars"
             " WHERE symbol=? AND exchange=? AND period=? AND trading_day IS NOT NULL"
             " ORDER BY contract, dt",
-            [symbol, exchange, period],
+            [symbol, exchange, used],
         ).df()
     if df.empty:
-        return pd.DataFrame(columns=C.CURVE_COLS), f"没有 {period} 真实合约数据"
+        return pd.DataFrame(columns=C.CURVE_COLS), f"没有 {used} 真实合约数据"
 
     # 分钟级合约一天有几十根，期限结构要的是「每天一根」。取当天最后一根 ——
     # 和 Tushare 那份（日线收盘）口径一致。不聚合的话 build_curve 会把同一天
@@ -107,7 +196,8 @@ def build(symbol: str, exchange: str, period: str = "1d") -> tuple[pd.DataFrame,
     # build_curve 会把分组键 symbol / exchange 一起写进记录；aux 文件的列里
     # 没有这两个（品种就是文件名），带出去会让 join 到 K 线上多两列字符串
     out = out.drop(columns=[c for c in ("symbol", "exchange") if c in out.columns])
-    return out, f"{len(out)} 个交易日"
+    out = _merge_drift(out, symbol, exchange)
+    return out, f"{len(out)} 个交易日（源 {used}）"
 
 
 def build_all(pairs: list[tuple[str, str]], period: str = "1d", on_row=None,
