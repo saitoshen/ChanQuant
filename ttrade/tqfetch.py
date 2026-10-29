@@ -30,6 +30,19 @@ PERIOD_SEC = {"5m": 300, "1h": 3600, "1d": 86400}
 MAIN_YEARS = 10        # 主连默认回溯年数（天勤 5m 最早约 2016 年）
 CONTRACT_YEARS = 10    # 真实合约默认回溯年数（与主连一致）
 
+
+def window_start(years: int = 0, days: int = 0) -> date:
+    """回溯区间的起点。
+
+    `days` 优先于 `years`：界面上的「近 1 天 / 近 1 周 / 近半年」是**天**，用
+    `years` 表达不了（1 年 = 365 天，但「近 1 天」算出来是 0 年）。命令行和
+    老的调用点仍然传 `years`，所以两个都留着。
+    """
+    today = date.today()
+    if days and int(days) > 0:
+        return today - timedelta(days=int(days))
+    return today - timedelta(days=365 * max(1, int(years or MAIN_YEARS)))
+
 BATCH = 30             # query_his_cont_quotes 单次最多查多少个品种
 
 
@@ -365,17 +378,25 @@ def refresh_factors(con, symbol: str, exchange: str, period: str,
     return S.set_adj_factor(con, symbol, exchange, period, td, factor_at(series, td))
 
 
-def daily_close_via(con, symbol: str, exchange: str, period: str = "1h") -> pd.Series:
+def daily_close_via(con, symbol: str, exchange: str, period: str = "") -> pd.Series:
     """从库里聚合出「交易日 → 当日收盘」，用于判断换月点落在哪天。
 
-    优先用 1h：它比 5m 早下完，而且对齐换月只需要日级精度。
+    优先用 1h：它比 5m 早下完，而且对齐换月只需要日级精度。没下过 1h 就退到
+    5m，再没有就用日线 —— 只补了日线的品种同样要对齐换月，不能因为 `period`
+    写死 1h 就整段返回空（那会让 `adj_factor` 停在 1.0，复权全错）。
     """
-    df = con.execute(
-        "SELECT trading_day, dt, close FROM bars"
-        " WHERE symbol=? AND exchange=? AND period=? AND trading_day IS NOT NULL"
-        " ORDER BY dt",
-        [symbol, exchange, period],
-    ).df()
+    order = [period] if period else []
+    order += [p for p in ("1h", "5m", "1d") if p not in order]
+    df = pd.DataFrame()
+    for p in order:
+        df = con.execute(
+            "SELECT trading_day, dt, close FROM bars"
+            " WHERE symbol=? AND exchange=? AND period=? AND trading_day IS NOT NULL"
+            " ORDER BY dt",
+            [symbol, exchange, p],
+        ).df()
+        if not df.empty:
+            break
     if df.empty:
         return pd.Series(dtype=float)
     df["trading_day"] = pd.to_datetime(df["trading_day"])
@@ -618,7 +639,8 @@ def _expired(ts_code: str, today: date) -> bool:
     return bool(ym and ym < (today.year, today.month))
 
 
-def write_contracts(api, sym: str, ex: str, period: str, years: int) -> dict:
+def write_contracts(api, sym: str, ex: str, period: str, years: int,
+                    days: int = 0) -> dict:
     """下载一个品种的全部真实合约（不复权，单个合约本身没有换月跳空）。
 
     十年全品种是几千个合约、上亿行的量级，所以三件事必须做对：
@@ -636,7 +658,7 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int) -> dict:
     # 合并。不归一的话 `PERIOD_SEC[period]` 直接 KeyError
     period = source_period(period)
     end = date.today()
-    start = end - timedelta(days=365 * years)
+    start = window_start(years, days)
 
     try:
         conts = api.query_quotes(
@@ -731,7 +753,7 @@ def _tq_product_of(sym: str, ex: str) -> str:
 
 def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
                     on_row=None, max_parallel: int = 8,
-                    cancel=None) -> dict[str, int]:
+                    cancel=None, days: int = 0) -> dict[str, int]:
     """批量下载主连并写库（原始价 + adj_factor，复权在读取时做）。
 
     一个品种十年 5m 串行要几分钟，78 个品种两个周期就是几小时。这里走 8 路并发，
@@ -747,7 +769,7 @@ def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
     """
     period = source_period(period)
     end = date.today()
-    hard_start = end - timedelta(days=365 * years)
+    hard_start = window_start(years, days)
 
     tail: list[tuple[str, date, date, str, str]] = []
     head: list[tuple[str, date, date, str, str]] = []

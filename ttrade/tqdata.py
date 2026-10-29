@@ -29,7 +29,13 @@ from . import tqstore
 from .paths import data_dir
 
 # 周期名 → (源周期, 合并根数)。源周期就是实际落盘的那个。
+#
+# `1d_tq` 是**天勤日线**，落库时 period 写的是 `1d`；`1d` 这个键留给 Tushare 的
+# 日线 CSV（见 `gui/app.py` 的 PERIOD_1D）。两个键分开是因为它们的历史长度和
+# 主力换月口径都不一样（Tushare 20 年、天勤 10 年出头），已存的策略配置里
+# `period="1d"` 一直是 Tushare，不能因为加了天勤日线就悄悄换源。
 PERIODS: dict[str, tuple[str, int]] = {
+    "1d_tq": ("1d", 1),
     "5m": ("5m", 1),
     "15m": ("5m", 3),
     "30m": ("5m", 6),
@@ -39,9 +45,10 @@ PERIODS: dict[str, tuple[str, int]] = {
 }
 
 # 展示顺序（GUI 的周期下拉框按这个排）
-PERIOD_ORDER = ["5m", "15m", "30m", "1h", "2h", "4h"]
+PERIOD_ORDER = ["1d_tq", "5m", "15m", "30m", "1h", "2h", "4h"]
 
 PERIOD_LABEL = {
+    "1d_tq": "日线",
     "5m": "5 分钟",
     "15m": "15 分钟",
     "30m": "30 分钟",
@@ -49,6 +56,16 @@ PERIOD_LABEL = {
     "2h": "2 小时",
     "4h": "4 小时",
 }
+
+
+def is_daily(period: str) -> bool:
+    """这个周期是不是「一天一根」。
+
+    判断日线口径的地方（坐标轴格式、持仓天数、年化根数）原来都写 `== "1d"`，
+    加了天勤日线之后必须两处都认，否则天勤日线的横轴会显示成 `00:00`。
+    """
+    return period in ("1d", "1d_tq")
+
 
 
 def source_period(period: str) -> str:

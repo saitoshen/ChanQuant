@@ -96,12 +96,19 @@ C_MUTED = "#6b7280"
 C_UP = "#d92b2b"      # 红涨
 C_DOWN = "#0f9d58"    # 绿跌
 
-# 周期。日线走原来的 Tushare CSV（20 年），分钟级走天勤 DuckDB（10 年）。
-# 两者主力换月口径不同（天勤按自己的规则，Tushare 按自己的），所以跨周期的
-# 绝对价位会有细微差异 —— 这是数据源差异，不是 bug。
-PERIOD_1D = "1d"
-GUI_PERIODS = [PERIOD_1D] + tqdata.PERIOD_ORDER   # 下拉框顺序：日线在前，越往后越短
-PERIOD_LABEL = dict(tqdata.PERIOD_LABEL, **{PERIOD_1D: "日线"})
+# 周期。日线有**两个源**：Tushare（20 年、复权因子）和天勤（十年出头）。
+# 分钟级只有天勤。两个日线的主力换月口径不同（天勤按自己的规则，Tushare 按
+# 自己的），所以跨周期的绝对价位会有细微差异 —— 这是数据源差异，不是 bug。
+#
+# 键名特意分开：老配置里的 `period="1d"` 一直是 Tushare，不能因为加了天勤日线
+# 就悄悄换源（历史长度和价格都会变），所以天勤日线用 `1d_tq`。
+PERIOD_1D = "1d"            # Tushare 日线，显示为「日线Tushare」
+PERIOD_1D_TQ = "1d_tq"      # 天勤日线，显示为「日线」
+GUI_PERIODS = (
+    [PERIOD_1D_TQ, PERIOD_1D]
+    + [p for p in tqdata.PERIOD_ORDER if p != PERIOD_1D_TQ]
+)
+PERIOD_LABEL = dict(tqdata.PERIOD_LABEL, **{PERIOD_1D: "日线Tushare"})
 
 # ------------------------------------------------------------------ 策略族
 # 两个大类：规则策略（原有 5 个）、因子策略（单/多/机器学习）。
@@ -460,10 +467,17 @@ class DataStore:
                 # 里做过，这里一直漏着 —— 「下载了真实合约却算不出展期因子」就是
                 # 这个原因。分钟 bar 比衍生表密得多，用 attach_intraday 按上一个
                 # 交易日对齐，避免把当天收盘才有的价差灌进上午的 bar。
+                #
+                # 天勤日线走 attach：那根 K 线和期限结构是同一天同一时刻的，
+                # 谁都不领先谁（和 Tushare 日线分支一个口径）。
                 try:
+                    from ttrade.auxdata import attach as attach_daily
                     from ttrade.auxdata import attach_intraday as attach_intra
 
-                    df = attach_intra(df, sym, ex, AUX_DIR)
+                    if tqdata.is_daily(period):
+                        df = attach_daily(df, sym, ex, AUX_DIR)
+                    else:
+                        df = attach_intra(df, sym, ex, AUX_DIR)
                 except Exception:
                     pass
         except Exception as exc:  # noqa: BLE001
@@ -641,7 +655,9 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.portfolio_page)
         self.agent_page = AgentPage()
         self.pages.addWidget(self.agent_page)
-        self.data_page = DataPage()
+        # 市场单选归数据页自己管（和本页的品种类别解耦），这里只把两个市场的
+        # 标签和目录递进去，省得数据页反过来 import 主窗口造成循环依赖
+        self.data_page = DataPage(MARKETS)
         self.pages.addWidget(self.data_page)
         outer.addWidget(self.pages, 1)
 
@@ -1646,12 +1662,13 @@ class MainWindow(QMainWindow):
                 miss.append(p)
         cur = self._period()
         if cur != PERIOD_1D and not (key and self.store.has_period(key, cur)):
+            src = tqdata.source_period(cur)
             self.lbl_period.setText(
                 f"{PERIOD_LABEL.get(cur, cur)} 数据还没下载：\n"
-                f"python download_tq.py --main {cur} --symbols ..."
+                f"python download_tq.py --main {src} --symbols ..."
             )
         elif miss:
-            self.lbl_period.setText(f"天勤分钟数据已覆盖 {len(GUI_PERIODS) - 1 - len(miss)} 个周期")
+            self.lbl_period.setText(f"天勤数据已覆盖 {len(GUI_PERIODS) - len(miss)} 个周期")
         else:
             self.lbl_period.setText("")
 
@@ -2247,6 +2264,11 @@ class MainWindow(QMainWindow):
                 )
             elif period == PERIOD_1D:
                 self._clear_chart(f"{skey} 数据缺失")
+            elif period == PERIOD_1D_TQ:
+                self._clear_chart(
+                    f"{skey} 没有天勤日线数据\n"
+                    "先跑：python download_tq.py --main 1d --all"
+                )
             else:
                 self._clear_chart(
                     f"{skey} 没有 {PERIOD_LABEL.get(period, period)} 数据\n"
@@ -2506,7 +2528,7 @@ class MainWindow(QMainWindow):
             self.trade_page.on_failed("交易只接了国内期货")
             return
         pair = self._current_pair()
-        period = self._period() if self._period() != PERIOD_1D else "5m"
+        period = "5m" if tqdata.is_daily(self._period()) else self._period()
         if pair is None:
             self.trade_page.on_failed("先在「策略研究」页选一个品种")
             return

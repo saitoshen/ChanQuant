@@ -103,7 +103,7 @@ def hold_text(bars: float, period: str, bars_per_year: float = 252.0) -> str:
     `avg_bars` 的单位是「根」，日线一根就是一天，分钟级一根只有几十分钟。
     统一写「天」会把 1 小时的 160 根说成 160 天（实际约 32 个交易日）。
     """
-    if period == "1d":
+    if period in ("1d", "1d_tq"):
         return f"{bars:.0f} 天"
     bpy = float(bars_per_year or 252)
     days = bars / bpy * 365.25 if bpy > 0 else 0.0

@@ -166,6 +166,12 @@ def check_intraday_aux() -> None:
               [T.source_period(p) for p in ("2h", "4h")] == ["1h", "1h"])
         check("周期：5m/1h/1d 原样",
               [T.source_period(p) for p in ("5m", "1h", "1d")] == ["5m", "1h", "1d"])
+        check("周期：天勤日线 1d_tq 落到 1d",
+              T.source_period("1d_tq") == "1d")
+        check("周期：日线判定同时认 1d 和 1d_tq",
+              T.is_daily("1d") and T.is_daily("1d_tq") and not T.is_daily("1h"))
+        check("周期：天勤日线的展示名是「日线」",
+              T.PERIOD_LABEL.get("1d_tq") == "日线")
 
         aux_dir = A._default_dir()
         key = ""
@@ -3660,6 +3666,79 @@ def check_topup() -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def check_ranges() -> None:
+    """下载区间的档位：Tushare 与天勤各有一套，键不能撞车。"""
+    from ttrade import updater as U
+
+    keys_ = [k for k, _l, _d in U.RANGES]
+    check("区间：Tushare 有「近 1 天 / 近 1 周」", "1d" in keys_ and "1w" in keys_, str(keys_))
+    check("区间：Tushare 有 3 / 5 / 10 年",
+          all(k in keys_ for k in ("3y", "5y", "10y")), str(keys_))
+    check("区间：天数随档位递增",
+          [d for _k, _l, d in U.RANGES][:-1] == sorted([d for _k, _l, d in U.RANGES][:-1]),
+          str([d for _k, _l, d in U.RANGES]))
+
+    from gui.data_page import TQ_RANGES
+
+    days = [d for d, _l in TQ_RANGES]
+    check("区间：天勤六档且递增", days == sorted(days) and len(days) == 6, str(days))
+    check("区间：天勤「近 20 年」是最后一档", days[-1] >= 7000, str(days[-1]))
+
+    from ttrade import tqfetch as F
+
+    check("区间：天数优先于年数",
+          F.window_start(10, 7) == F.window_start(0, 7)
+          and F.window_start(1, 0) > F.window_start(2, 0),
+          "")
+
+
+def check_tq_curve() -> None:
+    """天勤真实合约 → 期限结构 → aux 读取的回退链。"""
+    from ttrade import auxdata as A
+    from ttrade import tqcurve as Q
+    from ttrade import tqstore as S
+
+    if not S.exists():
+        skip("天勤期限结构", "没有 DuckDB")
+        return
+    with S.connect(read_only=True) as con:
+        row = con.execute(
+            "SELECT symbol, exchange, period, count(*) n FROM contract_bars"
+            " GROUP BY 1,2,3 ORDER BY n DESC LIMIT 1"
+        ).fetchone()
+    if not row:
+        skip("天勤期限结构", "库里没有真实合约（--contracts 没跑过）")
+        return
+    sym, ex, period, _n = row
+
+    df, note = Q.build(sym, ex, period)
+    check(f"期限结构：{sym}_{ex} {period} 能算出来", not df.empty, note)
+    if df.empty:
+        return
+    check("期限结构：aux 要读的列一个不少",
+          all(c in df.columns for c in A.CURVE_COLS),
+          f"{len(df.columns)} 列，缺 {[c for c in A.CURVE_COLS if c not in df.columns]}")
+    check("期限结构：每天至少两腿",
+          df["c1_close"].notna().all() and df["c2_close"].notna().any(), "")
+    # 近月比次近月先到期
+    both = df.dropna(subset=["c1_dte", "c2_dte"])
+    check("期限结构：c1 比 c2 先到期",
+          bool((both["c1_dte"] <= both["c2_dte"]).all()), "")
+
+    got = Q.build_all([(sym, ex)], period=period)
+    path = Q.curve_path(sym, ex)
+    check("期限结构：落盘到 data_tq/curve", os.path.exists(path) and got[f"{sym}_{ex}"] > 0,
+          path)
+
+    # aux 目录里没有这个品种的文件 → 必须回退到天勤那份
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        back = A.load_curve(tmp, sym, ex)
+        check("期限结构：aux 缺文件时回退到天勤那份", not back.empty and "c1_close" in back.columns,
+              f"{len(back)} 行")
+
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -3669,6 +3748,8 @@ def main() -> int:
         ks = [k for k in ks if k == sys.argv[1]] or ks
 
     check_trading_day()
+    check_ranges()
+    check_tq_curve()
     check_contract_incremental()
     check_live_helpers()
     check_live_worker()

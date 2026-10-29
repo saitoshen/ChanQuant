@@ -572,6 +572,10 @@ def _run() -> tuple[bool, list[str]]:
         # 自检就必红 —— 而那不是代码坏了，是自检假设了初始状态。
         is_us = win.market == "us"
         dp = getattr(win, "data_page", None)
+        from ttrade import updater as _upd
+
+        src_tq = dp is not None and dp.cb_source.currentData() == "tq"
+        tq_vis = is_us or not src_tq
         has_upd = (
             dp is not None
             and win.pages.count() == 5
@@ -579,12 +583,17 @@ def _run() -> tuple[bool, list[str]]:
             and win.pages.widget(4) is dp
             and dp.market == win.market
             and not dp.busy()
-            and dp.cb_upd_range.count() == 5
+            and dp.cb_upd_range.count() == len(_upd.RANGES)
             and dp.cb_source.count() == 2
-            # 周期是入口，期货下始终能选；美股没有分钟线才藏起来
-            and dp.cb_period.isHidden() == is_us
-            and dp.chk_upd_contracts.isHidden() == is_us
-            and dp.chk_upd_options.isHidden() == is_us
+            # 市场单选归数据页自己管，启动时跟研究页一致
+            and len(dp._market_btns) == 2
+            and dp._market_btns[dp.market].isChecked()
+            # 周期 / 回溯区间 / 真实合约只属于天勤那一路
+            and dp.cb_period.isHidden() == tq_vis
+            and dp.cb_tq_range.isHidden() == tq_vis
+            and dp.chk_tq_contracts.isHidden() == tq_vis
+            and dp.chk_upd_contracts.isHidden() == (is_us or src_tq)
+            and dp.chk_upd_options.isHidden() == (is_us or src_tq)
             and not dp.chk_upd_contracts.isChecked()
             and not dp.chk_upd_options.isChecked()
         )

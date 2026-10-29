@@ -81,7 +81,24 @@ def _read(path: str, cols: list[str]) -> pd.DataFrame:
 
 
 def load_curve(aux_dir: str, symbol: str, exchange: str) -> pd.DataFrame:
-    return _read(curve_path(aux_dir, symbol, exchange), CURVE_COLS)
+    """期限结构。aux 文件缺失时回退到天勤合约算出来的那份。
+
+    两套文件互不覆盖：`data_futures_aux/` 是 Tushare 的 20 年口径，
+    `data_tq/curve/` 是天勤合约（十年出头）。同一个日期混着用两个源会让展期值
+    随机跳，所以只做「有就用、没有才退」，不做合并。
+    """
+    df = _read(curve_path(aux_dir, symbol, exchange), CURVE_COLS)
+    if not df.empty:
+        return df
+    # 天勤那份的路径从**数据根目录**推，而不是从 aux_dir 推 —— aux_dir 可能是
+    # 测试用的临时目录，按它推会指到 Temp 下面去
+    from .paths import data_dir as _data_dir
+
+    alt = os.path.join(
+        os.path.dirname(_data_dir("cn").rstrip("/\\")),
+        "data_tq", "curve", f"{symbol}_{exchange}.csv",
+    )
+    return _read(alt, CURVE_COLS)
 
 
 def load_opt(aux_dir: str, symbol: str, exchange: str) -> pd.DataFrame:
@@ -102,9 +119,9 @@ def attach(
     """
     if aux_dir is None:
         aux_dir = _default_dir()
-    if not os.path.isdir(aux_dir) or df.empty:
-        return df
-    if not isinstance(df.index, pd.DatetimeIndex):
+    # 目录不存在也往下走：期限结构还有一份天勤合约算出来的备份
+    # （`data_tq/curve/`），没有 Tushare 数据的人全靠它
+    if df.empty or not isinstance(df.index, pd.DatetimeIndex):
         return df
 
     parts = [load_curve(aux_dir, symbol, exchange), load_opt(aux_dir, symbol, exchange)]
@@ -142,9 +159,9 @@ def attach_intraday(
     """
     if aux_dir is None:
         aux_dir = _default_dir()
-    if not os.path.isdir(aux_dir) or df.empty:
-        return df
-    if not isinstance(df.index, pd.DatetimeIndex):
+    # 目录不存在也往下走：期限结构还有一份天勤合约算出来的备份
+    # （`data_tq/curve/`），没有 Tushare 数据的人全靠它
+    if df.empty or not isinstance(df.index, pd.DatetimeIndex):
         return df
 
     day = df.index.normalize()

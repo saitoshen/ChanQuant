@@ -37,11 +37,18 @@ from . import us_tushare as us_t
 from .paths import data_dir as resolve_data_dir
 
 # (键, 显示名, 天数)。0 表示「全部」，走全量重下。
+# 前两档（近 1 天 / 近 1 周）是给「每天收盘后补一次」用的：Tushare 一次拉 20 年
+# 和一个品种拉 1 天，耗时差几十倍，日常增量没理由整段重下。
 RANGES: list[tuple[str, str, int]] = [
+    ("1d", "近 1 天", 1),
+    ("1w", "近 1 周", 7),
     ("1m", "近 1 个月", 31),
     ("3m", "近 3 个月", 92),
     ("6m", "近半年", 183),
     ("1y", "近 1 年", 366),
+    ("3y", "近 3 年", 1096),
+    ("5y", "近 5 年", 1826),
+    ("10y", "近 10 年", 3653),
     ("all", "全部 20 年", 0),
 ]
 RANGE_LABELS = {k: label for k, label, _ in RANGES}

@@ -89,7 +89,7 @@ K_WIN_MIN = 40
 K_REDRAW_GAP = 0.15     # 滚动重绘的最小间隔（秒）
 
 PERIOD_1D = "1d"
-PERIOD_LABEL = dict(tqdata.PERIOD_LABEL, **{PERIOD_1D: "日线"})
+PERIOD_LABEL = dict(tqdata.PERIOD_LABEL, **{PERIOD_1D: "日线Tushare"})
 
 
 def _extract_trades(sig) -> list[tuple[int, int, int]]:
@@ -1141,7 +1141,7 @@ class ResultView(QObject):
         if pend != int(sig_full[-1]):
             state += "（下一根开盘" + {1: "开多", -1: "开空"}.get(pend, "平仓") + "）"
         period = self.period
-        plabel = "" if period == PERIOD_1D else f" · {PERIOD_LABEL.get(period, period)}"
+        plabel = "" if tqdata.is_daily(period) else f" · {PERIOD_LABEL.get(period, period)}"
         ax.set_title(
             f"{head}{plabel}   ·   {spec_label}   ·   "
             f"{view.index[0]:%Y-%m-%d %H:%M} ~ {view.index[-1]:%Y-%m-%d %H:%M}"
@@ -1243,7 +1243,7 @@ class ResultView(QObject):
         view = self._k_bars
         row = view.iloc[i]
         ts = view.index[i]
-        fmt = "%Y-%m-%d" if self.period == PERIOD_1D else "%Y-%m-%d %H:%M"
+        fmt = "%Y-%m-%d" if tqdata.is_daily(self.period) else "%Y-%m-%d %H:%M"
         o, h, l, c = (float(row[k]) for k in ("open", "high", "low", "close"))
         pct = (c / o - 1.0) * 100.0 if o else 0.0
         lines = [ts.strftime(fmt)]
@@ -1553,10 +1553,10 @@ class ResultView(QObject):
                 vals.append(str(name))
             vals += [
                 d,
-                f"{t.entry_date:%Y-%m-%d %H:%M}" if self.period != PERIOD_1D
+                f"{t.entry_date:%Y-%m-%d %H:%M}" if not tqdata.is_daily(self.period)
                 else f"{t.entry_date:%Y-%m-%d}",
                 f"{t.entry_price:,.2f}",
-                f"{t.exit_date:%Y-%m-%d %H:%M}" if self.period != PERIOD_1D
+                f"{t.exit_date:%Y-%m-%d %H:%M}" if not tqdata.is_daily(self.period)
                 else f"{t.exit_date:%Y-%m-%d}",
                 f"{t.exit_price:,.2f}",
                 _lots_text(t.lots),

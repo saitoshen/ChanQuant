@@ -2,20 +2,24 @@
 
 - **Tushare**：日线。美股是 20 年后复权，期货是主力连续 + 复权因子；期货还能
   顺带补真实合约（期限结构）和期权（隐含波动率）。
-- **天勤 TqSdk**：分钟线 1h / 5m。只对国内期货有意义 —— 美股没有这条通道，
-  所以当前市场是美股时整块禁用。
+- **天勤 TqSdk**：日线 / 1 小时 / 5 分钟。只对国内期货有意义 —— 美股没有这条
+  通道，所以当前市场是美股时整块禁用。可以顺带下真实合约，并用它们构建展期
+  因子要的期限结构（`data_tq/curve/`）。
 
 两条路都是「先看本地缺哪段、只补缺口」，重复点是安全的；区别只在于数据源、
 限速和耗时。
 
-## 为什么周期是入口而不是数据源的附庸
+## 市场由本页自己选
 
-用户脑子里想的是「我要 5 分钟数据」，不是「我要用天勤」。所以周期放在最上面：
-拖到 1h/5m 就把数据源切到天勤，拖回日线再切回 Tushare。两个源各有主场（日线
-Tushare 有 20 年和复权因子，分钟线只有天勤有），所以两个方向都切。
+以前这一页跟着「策略研究」页的市场走。补数据其实是独立动作 —— 常见的是
+「研究页看着期货，顺手把美股日线补一下」，跟着走反而碍事。现在页顶有单选，
+点过之后主窗口再切市场也不会把它改回去（`_user_picked`）。
 
-只做默认值、不做强制：选完日线仍可以手动把源改成天勤 —— Tushare 额度用光时
-那条路还得走，锁死就把唯一的备选也堵上了。
+## 周期不再兼作数据源开关
+
+老版本里「日线」等于 Tushare、「分钟」等于天勤，所以周期下拉能顺带切源。
+天勤也能下日线之后，一个「日线」对应两个源，再让周期去猜就会把用户想下的
+那份悄悄换掉 —— 所以周期只对天勤那一路生效，源由下拉明确选。
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ if ROOT not in sys.path:
 
 from PySide6.QtCore import QObject, QThread, Signal
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFrame,
@@ -38,6 +43,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QVBoxLayout,
     QWidget,
 )
@@ -47,8 +53,19 @@ from ttrade import updater
 SRC_TUSHARE = "tushare"
 SRC_TQ = "tq"
 
-TQ_PERIODS = [("1h", "1 小时"), ("5m", "5 分钟"), ("1d", "日线")]
-TQ_YEARS = [(1, "近 1 年"), (3, "近 3 年"), (5, "近 5 年"), (10, "近 10 年")]
+TQ_PERIODS = [("1d", "日线"), ("1h", "1 小时"), ("5m", "5 分钟")]
+
+# 天勤的回溯区间。用**天数**而不是年数：用户要的是「近 1 天 / 近 1 周」，年表达
+# 不了。20 年那档等于「全部」—— 天勤日线能给到二十几年，5m 只有十年出头，
+# 取不到的更早部分不报错，只是历史更短。
+TQ_RANGES = [
+    (1, "近 1 天"),
+    (7, "近 1 周"),
+    (30, "近 1 个月"),
+    (92, "近 3 个月"),
+    (183, "近半年"),
+    (7300, "近 20 年"),
+]
 
 
 # ------------------------------------------------------------------ 线程
@@ -115,23 +132,28 @@ class UpdateWorker(QObject):
 
 
 class TqWorker(QObject):
-    """在后台线程里跑天勤补分钟线。
+    """在后台线程里跑天勤补行情。
 
     一次会话补全部品种：每个品种单独 `TqApi()` 等于登录 78 次，光是握手就要
     十几分钟。断线不在这里重试 —— 增量是按库里的最后时间算的，用户再点一次
     就是断点续传，比在这里猜重试策略可靠。
+
+    三件事按顺序做：主连 → 真实合约 → 期限结构（展期因子要用的那份）。后两步
+    可以关掉：真实合约十年 5m 是 8.4 GB，只想跑主连的人没必要下。
     """
 
     progress = Signal(int, int, str)
     done = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, period: str, years: int,
-                 pairs: list[tuple[str, str]] | None = None) -> None:
+    def __init__(self, period: str, days: int,
+                 pairs: list[tuple[str, str]] | None = None,
+                 contracts: bool = True) -> None:
         super().__init__()
         self.period = period
-        self.years = years
+        self.days = int(days or 7300)
         self.pairs = pairs
+        self.contracts = contracts
         self._cancel = False
 
     def cancel(self) -> None:
@@ -139,6 +161,7 @@ class TqWorker(QObject):
 
     def run(self) -> None:
         try:
+            from ttrade import tqcurve
             from ttrade import tqfetch as TQ
             from ttrade import tqstore as S
 
@@ -175,17 +198,44 @@ class TqWorker(QObject):
                     self.progress.emit(done, total, f"{period_label} {done}/{total}　{key}　{tail}")
 
                 got = TQ.write_main_many(
-                    api, pairs, self.period, self.years,
-                    on_row=on_row, cancel=lambda: self._cancel,
+                    api, pairs, self.period, 0,
+                    on_row=on_row, cancel=lambda: self._cancel, days=self.days,
                 )
+
+                # ---- 真实合约 + 期限结构
+                n_contracts = 0
+                if self.contracts and not self._cancel:
+                    for i, (sym, ex) in enumerate(pairs, 1):
+                        if self._cancel:
+                            break
+                        self.progress.emit(i, len(pairs),
+                                           f"真实合约 {i}/{len(pairs)}　{sym}_{ex}…")
+                        try:
+                            TQ.write_contracts(api, sym, ex, self.period, 0, days=self.days)
+                            n_contracts += 1
+                        except Exception as exc:  # noqa: BLE001
+                            # 一个品种的合约失败不该把整轮打断 —— 主连已经落库了
+                            self.progress.emit(i, len(pairs),
+                                               f"真实合约 {sym}_{ex} 失败：{str(exc)[:60]}")
             finally:
                 sess.close()
 
             moved, touched = TQ.refresh_all(pairs)
+
+            n_curve = 0
+            if self.contracts:
+                self.progress.emit(0, 0, "构建期限结构（展期因子）…")
+                built = tqcurve.build_all(pairs, period=self.period)
+                n_curve = sum(1 for v in built.values() if v)
+
             rows = sum(int(v or 0) for v in got.values())
             head = "已取消" if self._cancel else "完成"
+            extra = ""
+            if self.contracts:
+                extra = (f"；真实合约 {n_contracts} 个品种，"
+                         f"期限结构 {n_curve} 个品种")
             self.done.emit(
-                f"天勤 {period_label} {head}：{len(pairs)} 个品种，本次写入 {rows:,} 行；"
+                f"天勤 {period_label} {head}：{len(pairs)} 个品种，本次写入 {rows:,} 行{extra}；"
                 f"新补切换表 {n_switch} 个，校正换月日 {moved} 处，刷新复权 {touched} 个品种周期"
             )
         except Exception as exc:  # noqa: BLE001
@@ -200,11 +250,16 @@ class DataPage(QWidget):
 
     data_changed = Signal(str)     # 市场键：补完之后主窗口要重读标的池
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, markets: dict | None = None, parent=None) -> None:
         super().__init__(parent)
+        # 市场由**本页自己的单选**决定，不再跟着「策略研究」页走：补数据是独立
+        # 动作，经常是「研究页看着期货、顺手把美股日线补一下」。`markets` 由主窗口
+        # 传进来（label / dir），避免这一页反过来 import gui.app 造成循环。
+        self._markets = dict(markets or {})
         self.market = "us"
         self.market_label = "美股"
         self.market_dir = ""
+        self._user_picked = False
         self._upd_worker: UpdateWorker | None = None
         self._upd_thread: QThread | None = None
         self._tq_worker: TqWorker | None = None
@@ -214,12 +269,30 @@ class DataPage(QWidget):
     # ---- 外部 ----
 
     def set_market(self, market: str, label: str, data_dir: str) -> None:
-        """主窗口切市场时调。天勤只对期货有意义，美股下整块禁用。"""
+        """主窗口切市场时给的**默认值**。
+
+        用户在本页点过单选之后就不再覆盖（`_user_picked`）—— 否则在数据页选了
+        「美股」、回研究页点一下期货，这里的选项会被悄悄改回去。
+        """
+        if self._user_picked:
+            return
+        self._apply_market(market, label, data_dir)
+        btn = self._market_btns.get(market)
+        if btn is not None:
+            btn.setChecked(True)
+
+    def _apply_market(self, market: str, label: str, data_dir: str) -> None:
         self.market = market
         self.market_label = label
         self.market_dir = data_dir
         self.lbl_market.setText(f"当前市场：{label}")
         self._sync_controls()
+
+    def _on_market_radio(self, market: str) -> None:
+        info = self._markets.get(market) or {}
+        self._user_picked = True
+        self._apply_market(market, info.get("label", market), info.get("dir", ""))
+        self._log(f"—— 市场切到{info.get('label', market)}")
 
     def busy(self) -> bool:
         return self._upd_thread is not None or self._tq_thread is not None
@@ -239,6 +312,25 @@ class DataPage(QWidget):
         head = QLabel("数据管理")
         head.setObjectName("AppTitle")
         outer.addWidget(head)
+
+        # 市场单选：本页自己选，和「策略研究」页解耦。补数据是独立动作，
+        # 不该因为研究页停在期货就把美股日线补不了。
+        row = QHBoxLayout()
+        row.setSpacing(14)
+        self._market_btns: dict[str, QRadioButton] = {}
+        self._market_group = QButtonGroup(self)
+        for key, label in (("us", "美股"), ("cn", "国内期货")):
+            btn = QRadioButton(label)
+            btn.setChecked(key == self.market)
+            # 用 clicked 而不是 toggled：`setChecked()` 是程序调用，也会发 toggled，
+            # 那样一构造就把 `_user_picked` 置真，主窗口给的默认市场再也设不进来
+            btn.clicked.connect(lambda _=False, k=key: self._on_market_radio(k))
+            self._market_group.addButton(btn)
+            self._market_btns[key] = btn
+            row.addWidget(btn)
+        row.addStretch(1)
+        outer.addLayout(row)
+
         self.lbl_market = QLabel("当前市场：美股")
         self.lbl_market.setObjectName("AppSub")
         outer.addWidget(self.lbl_market)
@@ -260,10 +352,11 @@ class DataPage(QWidget):
         lay.addWidget(self._section("数据源"))
         self.cb_source = QComboBox()
         self.cb_source.addItem("Tushare · 日线", SRC_TUSHARE)
-        self.cb_source.addItem("天勤 TqSdk · 分钟线", SRC_TQ)
+        self.cb_source.addItem("天勤 TqSdk · 日线 / 分钟线", SRC_TQ)
         self.cb_source.currentIndexChanged.connect(self._sync_controls)
         lay.addWidget(self.cb_source)
 
+        # 周期只属于天勤通道：Tushare 那边只有日线，没有可选的。
         # 标题单独存一份：控件藏起来时标题必须跟着藏，否则会留下一行
         # 「周期」下面空着 —— 看着像加载失败
         self.lbl_sec_period = self._section("周期")
@@ -272,14 +365,13 @@ class DataPage(QWidget):
         for key, label in TQ_PERIODS:
             self.cb_period.addItem(label, key)
         self.cb_period.setToolTip(
-            "日线走 Tushare（20 年、含复权因子）；1 小时 / 5 分钟走天勤（10 年）。"
+            "天勤原生只有日线 / 1 小时 / 5 分钟三种 bar，15m/30m/2h/4h 是本地合并的，\n"
+            "不用单独下。日线能追到二十几年，5 分钟最早约 2016 年。"
         )
-        self.cb_period.currentIndexChanged.connect(self._on_period_changed)
         lay.addWidget(self.cb_period)
 
-        # Tushare 通道叫「区间」（近 1 个月…），天勤通道叫「年限」（近 1 年…），
-        # 同一个位置放一个标题，写「区间 / 年限」两边都不算错
-        lay.addWidget(self._section("区间 / 年限"))
+        # Tushare 通道叫「区间」，天勤通道叫「回溯区间」，同一个位置放一个标题
+        lay.addWidget(self._section("区间 / 回溯"))
         self.cb_upd_range = QComboBox()
         for key, label, _days in updater.RANGES:
             self.cb_upd_range.addItem(label, key)
@@ -289,15 +381,27 @@ class DataPage(QWidget):
         )
         lay.addWidget(self.cb_upd_range)
 
-        self.cb_tq_years = QComboBox()
-        for years, label in TQ_YEARS:
-            self.cb_tq_years.addItem(label, years)
-        self.cb_tq_years.setCurrentIndex(3)
-        self.cb_tq_years.setToolTip(
-            "天勤 5 分钟线最早约 2016 年，10 年基本就是全部历史。\n"
-            "库里已有的部分不会重下。"
+        self.cb_tq_range = QComboBox()
+        for days, label in TQ_RANGES:
+            self.cb_tq_range.addItem(label, days)
+        self.cb_tq_range.setCurrentIndex(len(TQ_RANGES) - 1)
+        self.cb_tq_range.setToolTip(
+            "只补这一段，库里已有的部分不会重下。\n"
+            "「近 20 年」对 5 分钟等于全部历史（天勤 5m 最早约 2016 年）。"
         )
-        lay.addWidget(self.cb_tq_years)
+        lay.addWidget(self.cb_tq_range)
+
+        # 天勤的真实合约 + 期限结构。默认勾上：展期那十几个因子全靠它，
+        # 不勾的话界面上那些因子永远是「无数据」，很容易被当成 bug。
+        self.chk_tq_contracts = QCheckBox("一并下载真实合约，并构建展期因子")
+        self.chk_tq_contracts.setChecked(True)
+        self.chk_tq_contracts.setToolTip(
+            "下载每个品种的全部真实合约，再用它们算近/次近/第三近的期限结构，\n"
+            "写到 data_tq/curve/，展期收益率/年化/曲率/变化都读这份。\n\n"
+            "体积：日线全品种约 300 MB；5 分钟十年约 8.4 GB，第一次会很慢。\n"
+            "已经下过的合约会按最后时间增量跳过，重跑不会从头再来。"
+        )
+        lay.addWidget(self.chk_tq_contracts)
 
         self.cb_upd_source = QComboBox()
         for key, label in updater.SOURCE_LABELS.items():
@@ -400,20 +504,6 @@ class DataPage(QWidget):
     def _source(self) -> str:
         return self.cb_source.currentData() or SRC_TUSHARE
 
-    def _on_period_changed(self) -> None:
-        """周期是入口：分钟级 → 天勤，日线 → Tushare。
-
-        双向都切，因为这是两个源各自的主场（日线 Tushare 有 20 年和复权因子，
-        分钟线只有天勤有）。用户仍可以选完日线再手动把源改成天勤 —— 那条路
-        Tushare 额度用光时还得走，所以这里只做默认值，不做强制。
-        """
-        want = SRC_TQ if self.cb_period.currentData() in ("1h", "5m") else SRC_TUSHARE
-        i = self.cb_source.findData(want)
-        if i >= 0 and self.cb_source.currentIndex() != i:
-            self.cb_source.setCurrentIndex(i)
-            return
-        self._sync_controls()
-
     def _sync_controls(self, *_args) -> None:
         """按数据源 + 市场切换可见性。"""
         if not hasattr(self, "cb_upd_range"):
@@ -433,19 +523,13 @@ class DataPage(QWidget):
                 self.cb_source.blockSignals(False)
             tq = False
 
-        # 周期是入口，期货下始终显示 —— 从「日线」拖到「5 分钟」就应该自动
-        # 切到天勤。美股没有分钟线，整块藏起来并锁回日线。
-        self.lbl_sec_period.setVisible(not is_us)
-        self.cb_period.setVisible(not is_us)
-        if is_us:
-            i = self.cb_period.findData("1d")
-            if i >= 0 and self.cb_period.currentIndex() != i:
-                self.cb_period.blockSignals(True)
-                self.cb_period.setCurrentIndex(i)
-                self.cb_period.blockSignals(False)
-
+        # 周期 / 回溯区间 / 真实合约都属于天勤那一路；Tushare 只有日线，
+        # 只显示它自己的「区间」。
+        self.lbl_sec_period.setVisible(tq)
+        self.cb_period.setVisible(tq)
         self.cb_upd_range.setVisible(not tq)
-        self.cb_tq_years.setVisible(tq)
+        self.cb_tq_range.setVisible(tq)
+        self.chk_tq_contracts.setVisible(tq)
         self.cb_upd_source.setVisible(not tq and is_us)
         self.cb_upd_rate.setVisible(not tq and is_us)
         self.lbl_upd_src.setVisible(not tq and not is_us)
@@ -518,8 +602,9 @@ class DataPage(QWidget):
 
     def _start_tq(self) -> None:
         period = self.cb_period.currentData() or "1h"
-        years = int(self.cb_tq_years.currentData() or 10)
-        self._tq_worker = TqWorker(period, years)
+        days = int(self.cb_tq_range.currentData() or 7300)
+        contracts = self.chk_tq_contracts.isChecked()
+        self._tq_worker = TqWorker(period, days, contracts=contracts)
         self._tq_thread = QThread(self)
         self._tq_worker.moveToThread(self._tq_thread)
         self._tq_thread.started.connect(self._tq_worker.run)
@@ -531,11 +616,15 @@ class DataPage(QWidget):
         self._tq_thread.finished.connect(self._on_thread_done)
 
         label = dict(TQ_PERIODS).get(period, period)
+        span = self.cb_tq_range.currentText()
         self.prog_update.setRange(0, 0)
         self.prog_update.setVisible(True)
         self.lbl_upd.setVisible(True)
         self.lbl_upd.setText(f"准备从天勤补 {label}…")
-        self._log(f"—— 天勤补齐 {label}（回溯 {years} 年）")
+        self._log(
+            f"—— 天勤补齐 {label}（{span}）"
+            + ("，含真实合约与展期因子" if contracts else "，只补主连")
+        )
         self.btn_update.setText("取消")
         self.btn_update.setEnabled(True)
         self._tq_thread.start()

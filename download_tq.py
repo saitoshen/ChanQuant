@@ -115,6 +115,8 @@ def main() -> int:
     ap.add_argument("--main", default="", help="下载主连，周期逗号分隔：5m,1h")
     ap.add_argument("--contracts", default="", help="下载真实合约，周期逗号分隔")
     ap.add_argument("--years", type=int, default=0, help="回溯年数（默认主连 10、真实合约 10）")
+    ap.add_argument("--days", type=int, default=0,
+                    help="回溯天数，优先于 --years（界面上的「近 1 天 / 近 1 周」用它）")
     ap.add_argument("--symbols", default="", help="品种代码，逗号分隔")
     ap.add_argument("--all", action="store_true", help="全部品种")
     ap.add_argument("--precise-ratio", action="store_true",
@@ -172,7 +174,7 @@ def main() -> int:
     try:
         # ---- 切换表 ----
         if args.switch or args.main:
-            print("\n[1/3] 主力切换表")
+            print("\n[1/4] 主力切换表")
             todo = [(s_, e_) for s_, e_ in pairs
                     if args.force_switch or not _fresh_switch(s_, e_)]
             print(f"  需要更新 {len(todo)} 个品种（{len(pairs) - len(todo)} 个较新，跳过）", flush=True)
@@ -209,7 +211,7 @@ def main() -> int:
 
         # ---- 主连 ----
         if args.main:
-            print("\n[2/3] 主连")
+            print("\n[2/4] 主连")
             years = args.years or MAIN_YEARS
             for period in [p.strip() for p in args.main.split(",") if p.strip()]:
                 if period not in PERIOD_SEC:
@@ -228,13 +230,14 @@ def main() -> int:
                         else:
                             print(f"  [{period} {done}/{total}] {key}: 无新数据", flush=True)
 
-                    write_main_many(api, pairs, period, years, on_row=on_row)
+                    write_main_many(api, pairs, period, years, on_row=on_row,
+                                    days=args.days)
 
                 with_retry(f"主连 {period}", job)
 
         # ---- 真实合约 ----
         if args.contracts:
-            print("\n[3/3] 真实合约")
+            print("\n[3/4] 真实合约")
             years = args.years or CONTRACT_YEARS
             for period in [p.strip() for p in args.contracts.split(",") if p.strip()]:
                 if period not in PERIOD_SEC:
@@ -243,7 +246,8 @@ def main() -> int:
                 for i, (sym, ex) in enumerate(pairs, 1):
 
                     def job(api, sym=sym, ex=ex, period=period, years=years, i=i):
-                        r = write_contracts(api, sym, ex, period, years)
+                        r = write_contracts(api, sym, ex, period, years,
+                                            days=args.days)
                         print(f"  [{period} {i}/{len(pairs)}] {r['key']}: +{r['rows']} 行"
                               f" / 新下 {r.get('contracts', 0)} 个合约"
                               f" / 跳过 {r.get('skipped', 0)} 个"
@@ -252,6 +256,19 @@ def main() -> int:
                         return r
 
                     with_retry(f"{sym}_{ex} {period}", job)
+
+            # ---- 期限结构（展期因子）：纯本地计算，不联网
+            print("\n[4/4] 期限结构（展期因子）")
+            from ttrade import tqcurve
+
+            for period in [p.strip() for p in args.contracts.split(",") if p.strip()]:
+                if period not in PERIOD_SEC:
+                    continue
+
+                def on_curve(key: str, n: int, note: str) -> None:
+                    print(f"  [{period}] {key}: {note}", flush=True)
+
+                tqcurve.build_all(pairs, period=period, on_row=on_curve)
     finally:
         sess.close()
 
