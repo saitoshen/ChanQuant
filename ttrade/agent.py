@@ -398,6 +398,10 @@ SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务�
  "strategy": "ma_cross", "params": {"fast": 50, "slow": 200}}
 ```
 
+**`strategy` 填什么**：每次提问平台都会附一张「当前平台上的策略」清单，
+照着表里抄 —— 策略库里的模板抄 `sid`（一整套配置，品种/周期/参数都定了，
+`symbol`、`period` 跟着模板走），注册的规则策略抄代号。表里没有的名字不要编。
+
 - 要往库里加**新策略**：`{"action": "strategy", ...}`，见下
 - 需要查平台手册时：`{"action": "doc", ...}`，见下
 - 不需要执行任何操作时，**不要输出 json 块**
@@ -551,6 +555,93 @@ def _system_prompt(allow_fs: bool) -> str:
     return SYSTEM_PROMPT + FS_PROMPT.replace("{root}", root)
 
 
+def _factor_brief(cfg) -> str:
+    """因子策略的一行摘要：单因子/多因子 + 因子名 + 关键阈值。
+
+    只写「单因子 · 1 个因子」等于没说 —— 模型没法判断这条策略是不是用户嘴上
+    说的那条，也没法在用户问「这条怎么做的」时答上来。
+    """
+    try:
+        from ttrade.factors import FACTORS
+    except Exception:  # noqa: BLE001
+        FACTORS = {}
+    names = []
+    for k in (cfg.factor_keys or [])[:4]:
+        spec = FACTORS.get(k)
+        names.append(f"{spec.label}({k})" if spec is not None else str(k))
+    fcfg = cfg.factor_cfg or {}
+    tail = []
+    if fcfg.get("window"):
+        tail.append(f"窗口{fcfg['window']}")
+    if fcfg.get("entry_z"):
+        tail.append(f"阈值{fcfg['entry_z']}")
+    if fcfg.get("horizon"):
+        tail.append(f"持有{fcfg['horizon']}根")
+    if fcfg.get("orient") and fcfg["orient"] != "auto":
+        tail.append({"long_high": "做多高分", "long_low": "做多低分"}.get(
+            fcfg["orient"], fcfg["orient"]))
+    head = cfg.strategy_label()
+    if names:
+        head += "：" + "、".join(names)
+    return head + (f"（{'，'.join(tail)}）" if tail else "")
+
+
+def strategy_catalog() -> str:
+    """当前平台上**真实存在**的策略，拼成给模型看的一段清单。
+
+    基础提示词里只写了 5 套内置规则策略。用户自己存进策略库的模板（「碳酸锂
+    动量60-5m」这种）模型是看不见的 —— 它只能从截图里猜名字，猜完再赌平台认
+    不认，赌输就是「平台没有这个策略」，白跑一轮。
+
+    所以每次提问现拼一份：策略库模板（整份配置，带 sid）+ 注册的策略代号。
+    模型照抄就能对上，不用猜。
+
+    取不到就返回空串，宁可不注入也不让一轮对话发不出去。
+    """
+    try:
+        from ttrade import strategy_store as SStore
+        from ttrade.strategies import STRATEGIES
+    except Exception:  # noqa: BLE001
+        return ""
+
+    try:
+        lib = SStore.load_library()
+    except Exception:  # noqa: BLE001
+        lib = []
+
+    out = ["## 当前平台上的策略（每次提问现取，以这张表为准）"]
+
+    if lib:
+        out.append(
+            "\n### 策略库里的模板 —— 用户存好的整份配置，`\"strategy\"` 填 `sid`（或照抄名字）\n"
+            "品种、周期、参数、手数都定了，用它就是把这一整套搬进组合，不要自己另编参数："
+        )
+        for c in lib:
+            bits = [c.key() or "未选品种", c.period or "1d"]
+            if c.family == "rule":
+                params = " ".join(f"{k}={v}" for k, v in (c.rule_params or {}).items())
+                bits.append(c.strategy_label() + (f" {params}" if params else ""))
+            else:
+                bits.append(_factor_brief(c))
+            bits.append(c.size_text())
+            out.append(f"- `{c.sid}` {c.title()}：{'，'.join(bits)}")
+    else:
+        out.append("\n策略库里现在是空的，用户还没存过模板。")
+
+    keys = [(k, s) for k, s in STRATEGIES.items()]
+    if keys:
+        out.append("\n### 注册的规则策略代号 —— `\"strategy\"` 填代号，参数自己给")
+        for k, s in keys:
+            tag = "自定义" if s.code else "内置"
+            out.append(f"- `{k}` {s.label}（{tag}）")
+
+    out.append(
+        "\n用户说「用某某策略」时**先在上面两张表里找**，照抄表里的 sid 或代号。"
+        "表里没有的，才是真的没有 —— 不要凭截图或印象编一个名字。"
+    )
+    return "\n".join(out)
+
+
 def text_of(content) -> str:
     """把消息内容摊平成纯文本。
 
@@ -602,11 +693,13 @@ def _prune_images(history: list[dict], keep: int = 2) -> list[dict]:
 
 
 def build_messages(history: list[dict], user_text: str | list, memory: str = "",
-                   allow_fs: bool = False) -> list[dict]:
-    """拼一份完整消息列表：系统提示 + 长期记忆 + 历史 + 本轮。
+                   allow_fs: bool = False, catalog: bool = True) -> list[dict]:
+    """拼一份完整消息列表：系统提示 + 长期记忆 + 策略清单 + 历史 + 本轮。
 
     记忆单独占一条 system 消息，不拼进 `SYSTEM_PROMPT`：一是基础提示词不变，
     各家服务端的上下文缓存还能命中；二是调试时一眼能看出「这句是记忆喂进去的」。
+    策略清单同理单独一条 —— 它每次提问都变（用户刚存了模板就得马上可见），
+    塞进 `SYSTEM_PROMPT` 会让缓存整段失效。
 
     `allow_fs` 为真时追加「读写平台文件」那段。**这是能力开关，不是提示语**：
     关着的时候提示词里不提这件事，模型就不会写出必然被拒的动作块。
@@ -622,6 +715,10 @@ def build_messages(history: list[dict], user_text: str | list, memory: str = "",
                        "不是用户这一轮说的。用到时当作已知事实，不要向用户复述这份清单。\n\n"
                        + memory.strip(),
         })
+    if catalog:
+        live = strategy_catalog()
+        if live:
+            msgs.append({"role": "system", "content": live})
     for m in _prune_images(history):
         if m.get("role") in ("user", "assistant") and m.get("content"):
             msgs.append({"role": m["role"], "content": m["content"]})

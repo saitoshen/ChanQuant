@@ -324,7 +324,7 @@ class ConfirmDialog(QDialog):
             rows.append(("周期", str(p["period"])))
         if p.get("strategy"):
             params = p.get("params") or {}
-            rows.append(("策略", f"{p['strategy']} {params if params else ''}".strip()))
+            rows.append(("策略", _strategy_text(p["strategy"], params)))
         if p.get("volume"):
             rows.append(("手数", str(p["volume"])))
         if rows:
@@ -1876,6 +1876,26 @@ def _code(text: str) -> str:
         "background:#f6f8fa;padding:8px;border-radius:4px;"
         f"white-space:pre-wrap'>{_esc(text)}</pre>"
     )
+
+
+def _strategy_text(name, params: dict | None = None) -> str:
+    """确认框里「策略」那一行。
+
+    动作块里现在可能是策略库模板的 `sid`（`a62cd55e1389`）—— 一串十六进制对
+    用户没有意义，看到它根本没法判断要点的是哪条策略。能对上模板就显示模板名
+    和它锁定的品种/周期，对不上就原样显示。
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    try:
+        cfg = SStore.find_library(raw)
+    except Exception:  # noqa: BLE001
+        cfg = None
+    if cfg is not None:
+        return f"{cfg.title()}（策略库模板 · {cfg.key()} {cfg.period}）"
+    tail = f" {params}" if params else ""
+    return (raw + tail).strip()
 
 
 def _is_user_strategy(key: str) -> bool:

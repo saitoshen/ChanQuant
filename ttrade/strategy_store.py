@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass, field
 
@@ -308,6 +310,44 @@ def add_to_library(cfg: StrategyConfig) -> StrategyConfig:
     items.append(cfg)
     save_library(items)
     return cfg
+
+
+_MINE_TAIL = re.compile(r"\s*[·•・\-—_]\s*我的\s*$")
+
+
+def norm_name(s: str) -> str:
+    """名字比对用的归一化。
+
+    Agent 是从**截图**里认名字的，看到的写法是「碳酸锂动量60-5m · 我的」——
+    那个「· 我的」是左侧列表渲染时加的归属标记，不是名字的一部分。用户嘴上
+    说的、库里存的都是「碳酸锂动量60-5m」。不剥掉这截尾巴就永远对不上。
+    顺带抹掉全角空格、大小写和所有空白：手打的名字空格位置全靠缘分。
+    """
+    t = _MINE_TAIL.sub("", str(s or "").strip())
+    # NFKC 顺手把全角字母/数字/空格压成半角：截图 OCR、手打输入法都爱出全角
+    t = unicodedata.normalize("NFKC", t).replace("（我的）", "").replace("(我的)", "")
+    return re.sub(r"\s+", "", t).lower()
+
+
+def find_library(name: str) -> StrategyConfig | None:
+    """按 sid 或名字在策略库里找模板，找不到返回 None。
+
+    同名可能有好几条（用户前后存过两版，比如「白银动量60-1h」现在有三条），
+    取**最后存的**那条：他刚存的那份才是他嘴上说的那份。真正要精确的时候
+    用 sid，`find_library` 认。
+    """
+    want = str(name or "").strip()
+    if not want:
+        return None
+    items = load_library()
+    for c in items:
+        if c.sid and c.sid == want:
+            return c
+    key = norm_name(want)
+    if not key:
+        return None
+    hits = [c for c in items if norm_name(c.title()) == key]
+    return hits[-1] if hits else None
 
 
 def remove_from_library(sid: str) -> bool:

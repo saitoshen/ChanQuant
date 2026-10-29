@@ -29,7 +29,7 @@ import pandas as pd
 from ttrade import factor_strategy as fstrat
 from ttrade import specs
 from ttrade.backtest import BacktestConfig, bars_per_year, buy_and_hold, run_backtest
-from ttrade.strategies import STRATEGIES, run_strategy
+from ttrade.strategies import STRATEGIES, available_text, run_strategy
 
 # 各市场的成本假设。`gui/app.py` 的 MARKETS 直接用这三项，保证「研究页算出来
 # 的数」和「组合页回放出来的数」用同一套假设 —— 两边不一致的话，同一条策略在
@@ -247,7 +247,10 @@ def run(cfg, df: pd.DataFrame | None, market: str = "",
 
     if family == "rule":
         if rule_key not in STRATEGIES:
-            return Replay(error=f"平台没有这个策略：{rule_key or '（空）'}")
+            # 配置是别处（Agent 动作块、手改 JSON）造出来的，`rule_key` 可能填成了
+            # 显示名或者策略库模板名。报错带上可用代号，下一轮能自己改对
+            return Replay(error=(f"平台没有这个策略：{rule_key or '（空）'}。"
+                                 f"可用的代号有：{available_text()}"))
         try:
             base = run_strategy(df, rule_key, dict(getattr(cfg, "rule_params", {}) or {}))
         except Exception as exc:  # noqa: BLE001

@@ -13,6 +13,8 @@ signal 表示「当日收盘后确定的目标仓位」：
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -313,6 +315,48 @@ def run_strategy(df: pd.DataFrame, key: str, params: dict | None = None) -> pd.D
     if params:
         p.update({k: v for k, v in params.items() if k in p})
     return spec.func(df, **p)
+
+
+_MINE_TAIL = re.compile(r"\s*[·•・\-—_]\s*(我的|内置)\s*$")
+
+
+def _norm(s: str) -> str:
+    t = _MINE_TAIL.sub("", str(s or "").strip())
+    t = unicodedata.normalize("NFKC", t)
+    for tail in ("（我的）", "(我的)", "（内置）", "(内置)"):
+        t = t.replace(tail, "")
+    return re.sub(r"\s+", "", t).lower()
+
+
+def resolve_key(name: str) -> str:
+    """把用户或模型写的策略名换成 `STRATEGIES` 里的 key，换不出来返回空串。
+
+    三种写法都认：代号（`ma_cross`）、显示名（`双均线交叉`）、以及左侧列表里
+    带归属尾巴的显示名（`双均线交叉 · 内置`）。后者是渲染时加的，不是名字的
+    一部分 —— 模型从截图里认名字，看到的正是带尾巴的那一版。
+
+    **策略库里的模板不走这里**：那是一整份配置（品种、周期、参数、手数都定了），
+    不是一条规则策略，用 `strategy_store.find_library` 找。
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    if raw in STRATEGIES:
+        return raw
+    want = _norm(raw)
+    if not want:
+        return ""
+    for k, spec in STRATEGIES.items():
+        if _norm(k) == want or _norm(spec.label) == want:
+            return k
+    return ""
+
+
+def available_text(limit: int = 8) -> str:
+    """可用策略的一行摘要，报错时带上，让模型/用户下一轮能自己改对。"""
+    items = [f"{k}（{s.label}）" for k, s in list(STRATEGIES.items())[:limit]]
+    more = len(STRATEGIES) - len(items)
+    return "、".join(items) + (f" 等 {len(STRATEGIES)} 条" if more > 0 else "")
 
 
 # ---------------------------------------------------------------- 用户自定义策略

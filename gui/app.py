@@ -81,7 +81,9 @@ from gui.result_view import ResultView, ViewCtx
 from gui.trade_page import TradePage
 from ttrade.backtest import BacktestConfig, bars_per_year, buy_and_hold, run_backtest
 from ttrade.eastmoney import load_local
-from ttrade.strategies import PARAM_LABELS, STRATEGIES, run_strategy
+from ttrade.strategies import (
+    PARAM_LABELS, STRATEGIES, available_text, resolve_key, run_strategy,
+)
 from ttrade.universe import UNIVERSE, cn_name, sector_of
 
 DATA_DIR = resolve_data_dir("us")
@@ -775,23 +777,76 @@ class MainWindow(QMainWindow):
             return None
         return store.get(key, period or PERIOD_1D)
 
+    def _agent_config(self, p: dict, note: str = ""):
+        """把 Agent 的动作块翻成一份配置。翻不出来返回 `(None, 原因)`。
+
+        `"strategy"` 这个字段模型有三种可能写法，都得认 —— 它只看得见**名字**，
+        截图里没有 key：
+
+        1. `STRATEGIES` 的代号（`ma_cross`）—— 没有歧义，先认这个
+        2. **策略库里的模板**（`a62cd55e1389` / `碳酸锂动量60-5m`）—— 用户自己存
+           好的整份配置，品种、周期、参数都定了，要整套搬走。用户说「把碳酸锂
+           那个策略加进组合」指的就是这个，它**不是**一条规则策略
+        3. `STRATEGIES` 的显示名（`双均线交叉`、`双均线交叉 · 内置`）
+
+        以前只拿 `key in STRATEGIES` 硬比，第 2、3 种写法一律回「平台没有这个
+        策略」，模型再怎么试都没用 —— 它没有别的信息可用了。
+        """
+        name = str(p.get("strategy", "") or "").strip()
+        if not name:
+            return None, "动作块里没有 strategy 字段"
+        try:
+            vol = int(p.get("volume", 0) or 0)
+        except (TypeError, ValueError):
+            vol = 0
+
+        key = name if name in STRATEGIES else ""
+        lib = None if key else SStore.find_library(name)
+        if not key and lib is None:
+            key = resolve_key(name)
+        if not key and lib is None:
+            # 名字去重：同一个模板存过几版（「白银动量60-1h」现在有三条），
+            # 报错里连着列三遍只会让人以为坏了
+            libs = "、".join(dict.fromkeys(c.title() for c in SStore.load_library()))
+            return None, (f"平台没有这个策略：{name}。策略库里现在有：{libs or '（空）'}；"
+                          f"规则策略代号有：{available_text()}")
+
+        if lib is not None:
+            # 模板是一整份配置：品种、周期、参数全照搬，只让手数听动作块的。
+            # 不让 payload 里的 symbol/period 覆盖 —— 那是模型自己从截图猜的，
+            # 猜错一个周期就是另一个策略，静默换掉比报错更糟。
+            cfg = lib.clone()
+            cfg.name = lib.title()
+            if vol > 0:
+                cfg.sizing, cfg.volume = "fixed", vol
+            cfg.note = note
+            return cfg, ""
+
+        return SStore.StrategyConfig(
+            symbol=p.get("symbol", ""),
+            exchange=p.get("exchange", ""),
+            period=p.get("period", "1d"),
+            rule_key=key,
+            rule_params=dict(p.get("params") or {}),
+            # Agent 明说了几手就按固定手数，没说就走「分配资金」口径
+            sizing="fixed" if vol else "capital",
+            volume=vol or 1,
+            note=note,
+        ), ""
+
     def _on_agent_trade(self, action) -> None:
         """Agent 给了交易动作。动作**已经在界面上确认过**才走到这里。"""
         p = action.payload
         if action.kind == "backtest":
+            cfg, why = self._agent_config(p, note="Agent 回测")
+            if cfg is None:
+                self.agent_page.notify(why, bad=True)
+                return
             # 先告诉 Agent 页「这次结果要喂回模型」。用户自己点回测不该触发一轮
-            # 对话，只有模型问出来的结果才值得它接着往下说
+            # 对话，只有模型问出来的结果才值得它接着往下说。放在解析**之后**：
+            # 解析失败就直接返回了，标记挂着会让下一次用户自己点的回测莫名
+            # 触发一轮对话
             self.agent_page.begin_backtest_feedback()
-            cfg = SStore.StrategyConfig(
-                symbol=p.get("symbol", ""),
-                exchange=p.get("exchange", ""),
-                period=p.get("period", "1d"),
-                rule_key=p.get("strategy", ""),
-                rule_params=dict(p.get("params") or {}),
-                # Agent 明说了几手就按固定手数，没说就走「分配资金」口径
-                sizing="fixed" if p.get("volume") else "capital",
-                volume=int(p.get("volume", 1)),
-            )
             # 结果落在「策略交易和组合」，**不**切到「策略研究」：那边是用户手上
             # 正在调的那套参数，模型问一句就把它冲掉说不过去。五个结果页
             # （K线 / 绩效 / 因子 / 交易记录 / 阶段分析）组合页都挂得上。
@@ -806,22 +861,17 @@ class MainWindow(QMainWindow):
             self._agent_manual(p)
             return
 
-        key = p.get("strategy", "")
-        if key not in STRATEGIES:
-            self.agent_page.notify(f"平台没有这个策略：{key}", bad=True)
+        cfg, why = self._agent_config(p, note="short")
+        if cfg is None:
+            self.agent_page.notify(why, bad=True)
             return
-        cfg = SStore.StrategyConfig(
-            symbol=p.get("symbol", ""),
-            exchange=p.get("exchange", ""),
-            period=p.get("period", "1d"),
-            rule_key=key,
-            rule_params=dict(p.get("params") or {}),
-            sizing="fixed" if p.get("volume") else "capital",
-            volume=int(p.get("volume", 1)),
-            note="short",
-        )
         self._switch_page(2)
-        self.portfolio_page.accept(cfg)
+        msg = self.portfolio_page.accept(cfg)
+        # 回执里把**实际用上的**品种/周期/手数写全：模型可能报的是「碳酸锂
+        # 动量60-5m」而模板里定的是 1h，让用户一眼看出到底跑的是哪一套
+        self.agent_page.notify(
+            f"{msg}（{cfg.title()}：{cfg.key() or '未选品种'} {cfg.period}"
+            f" · {cfg.strategy_label()} · {cfg.size_text()}）")
 
     def _agent_manual(self, p: dict) -> None:
         """主观买卖：只对**当前实时会话**的品种生效。
