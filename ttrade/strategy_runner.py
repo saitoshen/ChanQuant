@@ -48,7 +48,7 @@ import pandas as pd
 
 from ttrade import factor_strategy as fstrat
 from ttrade import replay
-from ttrade import daylimit, orderbook, topup, tqdata
+from ttrade import daylimit, orderbook, positionbook, topup, tqdata
 from ttrade import strategy_store as SStore
 from ttrade.strategies import run_strategy
 from ttrade.tqfetch import PERIOD_SEC
@@ -73,6 +73,10 @@ SPLIT_OFFSET_EX = ("SHFE", "INE")
 # 的话，一笔注定失败的委托一秒能重报十几遍 —— 日志刷屏，主线程直接卡死。
 REJECT_COOL = 5.0
 MAX_REJECTS = 3
+
+# 刚记完账（本策略成交）之后，账户持仓明细要过几百毫秒才跟上。这段时间里
+# 账本比账户多是一时的，不能当成「被手工平了」去收窄 —— 见 `_trim`。
+BOOK_GRACE = 3.0
 
 # 「一键对齐」两次点击之间至少隔这么久。连点两下不该下发两轮。
 ALIGN_GAP = 5.0
@@ -150,7 +154,11 @@ class SlotState:
     signal: int = 0
     lots: int = 1              # 一次满仓对应几手（按资金 / 止损金额算出来）
     target: int = 0            # 策略理论净仓（手）
-    actual: int = 0            # 账户在该合约上的实际净仓
+    # **这条策略自己**在各合约上的净仓（手），按自己委托的成交累计，落盘在
+    # `positionbook`。不是账户净仓 —— 账户是所有策略 + 手工单 + 别的平台的和，
+    # 拿它当自己的仓，同品种两条策略就会互相把对方的仓当成自己的。
+    held: dict = field(default_factory=dict)
+    book_ts: float = 0.0       # 最近一次账本变动的时刻，见 `_trim` 的宽限期
     underlying: str = ""       # 当前真实主力合约
     last_bar: object = None
     error: str = ""
@@ -212,6 +220,10 @@ class PortfolioRunner:
         # 算信号用的前复权基准，(品种_交易所@周期) -> qfq 历史。实盘必须和回测
         # 同一份复权口径（见 `_signal_frame`）。主连换月时失效重载。
         self._qfq_base: dict[str, pd.DataFrame] = {}
+        # 第一次跑持仓账本（升级上来的老用户，或者本机第一次跑）。这种时候账户里
+        # 可能已经有仓了，账本从 0 开始会把目标再开一遍 —— 见 `_adopt_if_needed`。
+        self._fresh_book = not positionbook.exists()
+        self._adopted: set[str] = set()
 
     # ---- 生命周期 ----
 
@@ -300,6 +312,9 @@ class PortfolioRunner:
 
     def add(self, cfg: SStore.StrategyConfig) -> SlotState:
         st = SlotState(cfg=cfg)
+        # 账本跟着「账户 + 策略 id」走，重启后接着记。不读回来的话，目标 -11
+        # 会从头再开一遍，账户直接变 -22。
+        st.held = dict(positionbook.load(self.spec.label()).get(cfg.sid, {}))
         self._slots[cfg.sid] = st
         return st
 
@@ -307,6 +322,12 @@ class PortfolioRunner:
         st = self._slots.pop(sid, None)
         if st is not None:
             self._cancel_all(st)
+            # 策略删了，账本也别留着 —— 同 id 再建一条会拿到别人的仓位
+            positionbook.forget(self.spec.label(), sid)
+
+    def _save_book(self, st: SlotState) -> None:
+        st.book_ts = time.time()
+        positionbook.save(self.spec.label(), st.cfg.sid, st.held)
 
     def get(self, sid: str) -> SlotState | None:
         return self._slots.get(sid)
@@ -695,21 +716,32 @@ class PortfolioRunner:
             # 未必一样（信号刚翻、手数刚变），两边一起动手就会「平了又开」。
             # 对齐是用户明确要求的动作，让它先落地。
             return
-        st.actual = self._net_pos(st.underlying)
         if st.pending:
             return                       # 还有没追完的单，等它落地
 
         # 换月留下的老合约先平掉。一次只发一笔，等它落地再谈新合约 ——
         # 同时发两笔，账户上会出现一段「老合约还持着、新合约已开着」的双倍敞口。
         for sym in list(st.retired):
-            have = self._net_pos(sym)
+            have = self._trim(st, sym, int(st.held.get(sym, 0)))
             if have == 0:
                 st.retired.remove(sym)
+                if st.held.pop(sym, None) is not None:
+                    self._save_book(st)
                 continue
-            self._send(st, sym, -have)
+            if self._side_pos(sym, "long" if have > 0 else "short") < abs(have):
+                # 账户明细还没跟上（刚成交）。这时候发出去，`_legs` 会把平不掉
+                # 的部分当成开仓 —— 等下一轮，别抢
+                st.last_action = "老合约持仓还没跟上，等下一轮"
+                return
+            self._send(st, sym, -have, closeable=abs(have))
             return
 
-        delta = st.target - st.actual
+        # 只跟**自己记的仓位**比。账户净仓是所有策略 + 手工单 + 别的平台的和，
+        # 拿它当基准，同品种两条策略就会互相把对方的仓当成自己的 —— 一条想
+        # 空 11 手、一条想空 0 手，账户 -11，两边都认为自己差 11 手，来回对打。
+        self._adopt_if_needed(st)
+        held = self._trim(st, st.underlying, int(st.held.get(st.underlying, 0)))
+        delta = st.target - held
         if delta == 0:
             # 仓位对上了，之前的拒单记录可以清了
             st.rejects = 0
@@ -719,7 +751,91 @@ class PortfolioRunner:
             return                       # `_chase` 已经停机，这里只是兜底
         if st.rejects and time.time() - st.reject_ts < REJECT_COOL:
             return                       # 刚被打回，冷一会儿再试
-        self._send(st, st.underlying, delta)
+        if delta * held < 0:
+            # 要平自己那部分仓。账户明细可能还没跟上（刚成交），这时候发出去，
+            # `_legs` 会把平不掉的量当成开仓 —— 反手开一笔没道理的仓。
+            need = min(abs(delta), abs(held))
+            side = "long" if held > 0 else "short"
+            if self._side_pos(st.underlying, side) < need:
+                st.last_action = "账户持仓还没跟上，等下一轮"
+                return
+        self._send(st, st.underlying, delta, closeable=self._closeable(held, delta))
+
+    @staticmethod
+    def _closeable(held: int, delta: int) -> int:
+        """这次调仓里，本策略手上能拿去平的手数。
+
+        卖（delta<0）能平的是自己多的那部分，买（delta>0）能平的是自己空的那
+        部分。方向相同就是纯加仓，没有可平的量。
+        """
+        if delta < 0:
+            return max(0, int(held))
+        if delta > 0:
+            return max(0, -int(held))
+        return 0
+
+    def _trim(self, st: SlotState, sym: str, held: int) -> int:
+        """账本比账户里实际能平的还多时，按账户收窄。
+
+        只会发生在「有人手工平过、或者别的程序平过」之后：账户里已经没有这些手
+        了，再照着账本去平会被交易所打回；更糟的是 `_legs` 会把平不掉的量当成
+        开仓，反手开出一笔完全没道理的反向仓。所以这里**只收不放** —— 账户比
+        账本多的时候不管，那些多半是别人的仓，本来就不该由这条策略处置。
+
+        刚成交那几百毫秒账户明细还没跟上，`BOOK_GRACE` 之内不判，免得把正常
+        在途的仓位误判成「被别人平了」。
+        """
+        if not held:
+            return 0
+        if time.time() - st.book_ts <= BOOK_GRACE:
+            return held
+        side = "long" if held > 0 else "short"
+        have = self._side_pos(sym, side)
+        if abs(held) <= have:
+            return held
+        fixed = (1 if held > 0 else -1) * have
+        if fixed:
+            st.held[sym] = fixed
+        else:
+            st.held.pop(sym, None)
+        self._save_book(st)
+        self._log(
+            f"{st.title()}：{sym} 账本 {held:+d} 手，账户只有 {have} 手可平，"
+            f"已按账户收窄到 {fixed:+d}（可能被手工或别的程序动过）"
+        )
+        return fixed
+
+    def _adopt_if_needed(self, st: SlotState) -> None:
+        """本机第一次启用持仓账本时，把账户里现有的仓位认给这条策略。
+
+        升级上来的老用户账户里已经有仓了（老版本一直是「把账户对齐到目标」，
+        所以账户 ≈ 目标）。账本从 0 开始的话，目标 -11 会在已有的 -11 之上
+        再开 11 手，账户直接变 -22。所以**账本文件还不存在**这一次，按品种把
+        账户净仓认下来。
+
+        只认一次、只认一条：同品种还有别的策略在跑时不认（分不清是谁的）。
+        文件一旦存在就再也不认 —— 之后账户里多出来的仓位是手工开的、别的平台
+        开的，不属于任何策略，也不该被哪条策略拿去处置。
+        """
+        key = st.cfg.key()
+        if not self._fresh_book or key in self._adopted:
+            return
+        self._adopted.add(key)
+        sym = st.underlying
+        if not sym or st.held.get(sym):
+            return
+        same = [s for s in self._slots.values() if s.cfg.key() == key and s.running]
+        if len(same) > 1:
+            self._log(f"{st.title()}：同品种有 {len(same)} 条策略在跑，"
+                      "账户里已有的仓位分不清是谁的，不认领")
+            return
+        have = self._net_pos(sym)
+        if not have:
+            return
+        st.held[sym] = have
+        self._save_book(st)
+        self._log(f"{st.title()}：认领账户里已有的 {sym} {have:+d} 手"
+                  "（本机第一次启用持仓账本）")
 
     # ---- 日内额度 ----
 
@@ -807,12 +923,17 @@ class PortfolioRunner:
             return None
         return his, today
 
-    def _legs(self, symbol: str, delta: int) -> list[tuple[str, int]] | None:
+    def _legs(self, symbol: str, delta: int,
+              closeable: int | None = None) -> list[tuple[str, int]] | None:
         """把一次调仓拆成「平昨 → 平今 → 开仓」几笔。今昨明细没就绪时返回 None。
 
         交易所对 CLOSE / CLOSETODAY 的手数**分别**校验：CLOSE 超过昨仓会被整单
         打回。反手时最明显 —— 持 5 手多、目标 -3 手空，delta = -8，整笔当 CLOSE
         发出去就是「平 8 手多」，而实际只有 5 手，于是被拒、重报、再被拒。
+
+        `closeable` 是**这条策略自己**能平的手数。不给就按账户持仓算 —— 一键
+        对齐要的就是账户口径。给的话取两者的小值：账户里确实有、而且这部分是
+        自己的，才拿去平；剩下的算开仓。
 
         **只有上期所（SHFE）和能源中心（INE）分平今平昨**，其余交易所（含大商所、
         郑商所、中金所）一律用 CLOSE。判交易所必须看 `symbol` 的前缀
@@ -829,6 +950,8 @@ class PortfolioRunner:
 
         his = today = 0
         have = self._side_pos(symbol, side)
+        if closeable is not None:
+            have = min(have, max(0, int(closeable)))
         if split and have > 0:
             got = self._split_pos(symbol, side)
             if got is None:
@@ -884,9 +1007,10 @@ class PortfolioRunner:
             oid = order.get("order_id")
         return str(oid or "")
 
-    def _send(self, st: SlotState, symbol: str, delta: int) -> int:
+    def _send(self, st: SlotState, symbol: str, delta: int,
+              closeable: int | None = None) -> int:
         """按差额下发委托，返回实际发出去的笔数。"""
-        legs = self._legs(symbol, delta)
+        legs = self._legs(symbol, delta, closeable)
         if legs is None:
             st.last_action = "持仓今昨明细未就绪，等下一轮"
             return 0
@@ -935,6 +1059,27 @@ class PortfolioRunner:
 
     # ---- 追单 ----
 
+    def _book(self, st: SlotState, o: PendingOrder, filled: int) -> None:
+        """把一笔委托的成交记进**本策略自己**的账本。
+
+        平仓和开仓都按方向加减：BUY 一律让净仓 +n，SELL 一律 -n。CLOSE 不是
+        「加回去」—— 账本记的是净仓，卖 3 手平多，净仓本来就是 +5 → +2，和
+        「开 3 手空」是同一次减法。偏移只影响交易所怎么校验，不影响净仓。
+
+        「一键对齐」的委托也走 `_chase`，但它不属于任何策略，不能记进账本 ——
+        记了就会出现一条 id 是 `__align__` 的幽灵策略持仓。
+        """
+        filled = int(filled or 0)
+        if not filled or st is self._align_slot:
+            return
+        sign = 1 if o.direction == "BUY" else -1
+        cur = int(st.held.get(o.symbol, 0)) + sign * filled
+        if cur:
+            st.held[o.symbol] = cur
+        else:
+            st.held.pop(o.symbol, None)
+        self._save_book(st)
+
     def _chase(self, st: SlotState) -> None:
         """追单状态机：live →（超时）cancelling →（确认死）重报 → live …
 
@@ -956,6 +1101,7 @@ class PortfolioRunner:
             left = int(getattr(order, "volume_left", 0) or 0) if order is not None else 0
 
             if status == "FINISHED":
+                self._book(st, o, o.volume)
                 st.last_action = "已成交"
                 st.rejects = 0
                 st.reject_msg = ""
@@ -963,6 +1109,13 @@ class PortfolioRunner:
                 continue
 
             if status == "DEAD":
+                # 撤单 / 拒单之前可能已经成交了一部分，先把这部分记进账本，
+                # 再把 `o.volume` 减掉 —— 不减的话重报会按原手数再发一遍，
+                # 成交之后就是「本该 5 手，实际 8 手」。
+                filled = max(0, o.volume - left)
+                if filled:
+                    self._book(st, o, filled)
+                    o.volume -= filled
                 orderbook.forget(self.spec.label(), o.order_id)
                 if o.phase != "cancelling":
                     # 不是我们撤的：拒单、涨跌停打回、资金不足……
@@ -980,6 +1133,8 @@ class PortfolioRunner:
                         st.running = False
                         self._log(f"{st.title()}：{st.error}")
                     continue
+                if o.volume <= 0:
+                    continue             # 已经全部成交，只是状态翻成了 DEAD
                 if o.retries >= self.chase.retries:
                     st.last_action = f"追单 {o.retries} 次仍未成交，放弃"
                     self._log(f"{st.title()}：{st.last_action}")
@@ -1016,6 +1171,7 @@ class PortfolioRunner:
 
             # 成交吃满了但状态还没翻成 FINISHED
             if order is not None and left == 0:
+                self._book(st, o, o.volume)
                 continue
 
             # 还活着。关掉追单、或者本来就不追，就一直挂着等它自己成交 ——
@@ -1118,10 +1274,34 @@ class PortfolioRunner:
             delta = row["delta"]
             if delta == 0:
                 continue
-            n += self._send(self._align_slot, sym, delta)
+            sent = self._send(self._align_slot, sym, delta)
+            if sent:
+                # 对齐的目标就是 `sum(target)`，所以发完之后各策略的账本正好
+                # 是「自己的 target」。不跟着摆的话：停掉的策略留着 -11 的账本，
+                # 对齐把仓平了，再启动它目标 -11、账本 -11、差额 0 —— 它会以为
+                # 自己还空着 11 手，实际上账户是平的。
+                self._sync_after_align(sym)
+            n += sent
         if n:
             self._log(f"对齐已下发 {n} 笔，剩下的交给追单")
         return n
+
+    def _sync_after_align(self, sym: str) -> None:
+        """对齐发出去之后，把各策略的账本摆成「对齐完成时的样子」。
+
+        运行中且就是这个合约的策略，账本取它自己的 `target`；其余情况（策略停着、
+        或者这是换月留下的老合约）归 0 —— 对齐会把这些当未托管平掉。
+        """
+        for st in self._slots.values():
+            if sym not in st.held:
+                continue
+            if st.running and sym == st.underlying and st.target:
+                st.held[sym] = int(st.target)
+            else:
+                st.held.pop(sym, None)
+            if sym in st.retired and sym not in st.held:
+                st.retired.remove(sym)
+            self._save_book(st)
 
     # ---- 给界面看的实时 K 线 ----
 
@@ -1175,7 +1355,6 @@ class PortfolioRunner:
                     "running": st.running,
                     "signal": st.signal,
                     "target": st.target,
-                    "actual": st.actual,
                     "underlying": st.underlying,
                     "error": st.error,
                     "action": st.last_action,

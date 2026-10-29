@@ -2,7 +2,6 @@
 
 和「策略研究」「账户透视和交易」平级的第三个大页面。它管的是**跑起来之后的事**：
 组合里有哪些策略、每个绑哪个账户、现在跑到哪一步、账户仓位和策略理论仓位对不对得上。
-
 页面结构：
 
     顶部  默认账户 / 启动全部 / 停止全部 / 状态灯
@@ -49,6 +48,22 @@
 但平仓是真金白银，而且这些仓位往往是用户自己开的。所以点下去先弹确认框，把
 「哪个合约、现在几手、变成几手」一条条列出来，确认了才发单。
 `align(close_orphans=False)` 保留「只补托管」的老行为，给脚本用。
+
+## 为什么策略列表里没有「实际仓位」
+
+账户是**一个**，策略是**一群**。同一个品种完全可能被两条策略同时交易，账户里的
+净仓是它们的和 —— 单看账户分不出哪几手是谁的。而且用户可能同时在别的平台上跑
+自动交易，或者自己手工下单，这些仓也都混在同一个账户里。
+
+所以「每条策略的实际仓位」这个东西根本不存在。早先那栏显示的是账户净仓，再拿它
+和理论仓比对、不一致就自动发单补齐，结果是：
+
+- 两条策略做同一个品种时互相把对方的仓当成自己的，一条要 -11、一条要 0，
+  两边都认为自己差 11 手，来回对打；
+- 用户手工开一笔仓，策略立刻把它当成自己的偏差平掉 —— 甚至开成反向仓。
+
+现在策略只跟**自己记的仓位**比（`ttrade/positionbook.py`，按自己委托的成交累计、
+落盘），账户里多出来的部分一概不碰。要对齐账户，只有这里的一键对齐一个入口。
 """
 
 from __future__ import annotations
@@ -721,7 +736,7 @@ class PortfolioPage(QWidget):
         head.addWidget(btn_del)
 
         self.tbl_strat = self._table(
-            ["名称", "标的", "策略", "仓位", "账户", "理论", "实际", "状态"]
+            ["名称", "标的", "策略", "仓位", "账户", "理论", "状态"]
         )
         # 多选是为了组合报告。双击原来是「启动 / 停止」，但那个动作有同名按钮，
         # 而「看一眼这条策略的历史表现」没有别的入口 —— 双击给后者更值。
@@ -874,7 +889,7 @@ class PortfolioPage(QWidget):
                     if j == 3:
                         item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                     t.setItem(i, j, item)
-                for j in (5, 6, 7):
+                for j in (5, 6):
                     t.setItem(i, j, QTableWidgetItem("—"))
             if keep:
                 for i in range(t.rowCount()):
@@ -1132,7 +1147,6 @@ class PortfolioPage(QWidget):
             if i >= t.rowCount():
                 break
             theo = _int(slot.get("target"))
-            real = _int(slot.get("actual"))
             # 仓位列写「口径 → 实际算出来的手数」。手数依赖价格和每手保证金，
             # 存盘时算不出来，只有引擎跑起来才知道 —— 所以两段拼在一起显示。
             lots = _int(slot.get("lots"))
@@ -1164,10 +1178,10 @@ class PortfolioPage(QWidget):
                         if slot else "还没启动"
                     )
 
-            # 运行中且仓位对不上才标红。停掉的策略留着仓位往往是用户故意的，
-            # 那是「未托管」的事，监控器里会单独列出来。
-            off = bool(slot.get("running")) and real != theo
-            self._set_cell(t, i, 6, str(real), C_BAD if off else C_TEXT)
+            # 这里**不再有「实际」列**。账户净仓是所有策略 + 手工单 + 别的平台的
+            # 和，单条策略的「实际」根本不存在，拿账户去比只会显示成一片红。
+            # 要核对账户，看右下监控器（策略理论 / 账户实际 / 差额），对齐也只在
+            # 那里的一键对齐里做。
 
             # 状态列只放短标签，「买了 2 手 @ 3046」这种细节放 tooltip ——
             # 塞进表格会把列挤成一团，横向滚动条一起来就没人看了。
@@ -1183,8 +1197,8 @@ class PortfolioPage(QWidget):
                 tip = "启动开关是开的，但这一轮没跑起来 —— 看看顶部连接状态和日志"
             else:
                 text, color, tip = "未启用", C_IDLE, "点「启动 / 停止」把它打开"
-            self._set_cell(t, i, 7, text, color)
-            it = t.item(i, 7)
+            self._set_cell(t, i, 6, text, color)
+            it = t.item(i, 6)
             if it is not None and it.toolTip() != tip:
                 it.setToolTip(tip)
 
