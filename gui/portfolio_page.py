@@ -449,19 +449,29 @@ class EditDialog(QDialog):
         form.addRow("交易账户", self.cb_acct)
 
         # ---- 策略参数 ----
-        self.sp_params: dict[str, QSpinBox] = {}
+        # 小数参数（vol_ratio 0.4、stop_mult 2.5）必须用 QDoubleSpinBox：
+        # QSpinBox 的 setRange(int(lo), int(hi)) 会把 (0.1, 1.5) 夹成 (0, 1)，
+        # 0.4 读出来是 0 —— 用户什么都没改，策略的波幅门槛就变成 0 了
+        self.sp_params: dict[str, QWidget] = {}
         spec = STRATEGIES.get(cfg.rule_key) if cfg.family == "rule" else None
         if spec is not None and spec.params:
             form.addRow(_hint(f"策略参数 · {spec.label}（实盘与回测同时生效）"))
             for name, default in spec.params.items():
                 lo, hi, step = spec.param_meta.get(name, (1, 1000, 1))
-                sp = QSpinBox()
-                sp.setRange(int(lo), int(hi))
-                sp.setSingleStep(max(1, int(step)))
+                cur = cfg.rule_params.get(name, default)
+                if isinstance(default, float):
+                    sp = QDoubleSpinBox()
+                    sp.setDecimals(2)
+                    sp.setRange(float(lo), float(hi))
+                    sp.setSingleStep(float(step))
+                else:
+                    sp = QSpinBox()
+                    sp.setRange(int(lo), int(hi))
+                    sp.setSingleStep(max(1, int(step)))
                 try:
-                    sp.setValue(int(cfg.rule_params.get(name, default)))
+                    sp.setValue(float(cur) if isinstance(default, float) else int(cur))
                 except (TypeError, ValueError):
-                    sp.setValue(int(default))
+                    sp.setValue(default)
                 self.sp_params[name] = sp
                 form.addRow(PARAM_LABELS.get(name, name), sp)
         elif cfg.family == "factor":

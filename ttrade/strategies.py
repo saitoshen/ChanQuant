@@ -235,6 +235,203 @@ def strat_turtle(
     return out
 
 
+def strat_sbbox_mini(
+    df: pd.DataFrame,
+    entry: int = 240,
+    exit_n: int = 720,
+    vol_ratio: float = 0.4,
+    range_n: int = 1,
+    atr_n: int = 14,
+    stop_mult: float = 5.0,
+) -> pd.DataFrame:
+    """箱体 + 波幅双确认突破（迷你版），设计用于 5 分钟周期。
+
+    入场要**两个条件同时成立**：收盘突破 `entry` 根箱体，且相对当日开盘的偏离
+    不小于 `vol_ratio` 倍的参考波幅。只看突破的话，窄幅横盘里那些一个点的高点
+    也算突破，5 分钟上一天能开十几次；加一条「偏离够大」就把它们滤掉了。
+
+    离场两条：收盘反向走 `stop_mult` 倍 ATR（止损），或者反向突破 `exit_n` 根
+    箱体（趋势结束）。信号在收盘确定，下一根开盘成交 —— 和平台其它策略一致。
+
+    「当日」按**交易日**算，不是自然日：`index + 6h` 再取日期，夜盘 21:00 之后
+    的 K 线就归到第二个交易日了。不这么切的话，晚上九点的开盘价会和早上九点的
+    算成同一天，波幅基准整个错位。
+    """
+    out = df.copy()
+    c, h, l, o = out["close"], out["high"], out["low"], out["open"]
+
+    hi = c.rolling(entry, min_periods=entry).max().shift(1)
+    lo = c.rolling(entry, min_periods=entry).min().shift(1)
+    hi_x = c.rolling(exit_n, min_periods=exit_n).max().shift(1)
+    lo_x = c.rolling(exit_n, min_periods=exit_n).min().shift(1)
+
+    day_key = (out.index + pd.Timedelta(hours=6)).normalize().to_numpy()
+    day_open = o.groupby(day_key).transform("first")
+    dev = c - day_open
+
+    ref_range = (
+        h.rolling(range_n, min_periods=range_n).max().shift(1)
+        - l.rolling(range_n, min_periods=range_n).min().shift(1)
+    )
+    thr = vol_ratio * ref_range
+    a = atr(out, atr_n)
+
+    cu, au = c.to_numpy(), a.to_numpy()
+    bu, bd = (c > hi).to_numpy(), (c < lo).to_numpy()
+    ub, db = (dev > thr).to_numpy(), (-dev > thr).to_numpy()
+    xu, xd = (c < lo_x).to_numpy(), (c > hi_x).to_numpy()
+
+    n = len(out)
+    sig = np.zeros(n, dtype=int)
+    pos = 0
+    epx = np.nan
+    for i in range(n):
+        new_pos = pos
+        if pos == 1:
+            if cu[i] < epx - stop_mult * au[i] or xu[i]:
+                new_pos = 0
+        elif pos == -1:
+            if cu[i] > epx + stop_mult * au[i] or xd[i]:
+                new_pos = 0
+        if pos == 0:
+            if bu[i] and ub[i]:
+                new_pos = 1
+            elif bd[i] and db[i]:
+                new_pos = -1
+        if new_pos != pos:
+            pos = new_pos
+            epx = cu[i] if pos != 0 else np.nan
+        sig[i] = pos
+
+    out["signal"] = sig
+    return out
+
+
+def strat_im_orb(
+    df: pd.DataFrame,
+    entry_start: int = 580,
+    entry_end: int = 620,
+    exit_min: int = 575,
+    vol_ratio: float = 0.4,
+    range_n: int = 1,
+    atr_n: int = 14,
+    stop_mult: float = 3.0,
+) -> pd.DataFrame:
+    """开盘区间突破（ORB）· 时段版，为股指日内设计。
+
+    每天只用 `entry_start`~`entry_end` 这几分钟（默认 09:40~10:20，单位是
+    从 0 点起的分钟数）开仓：价格碰到「当日开盘 ± `vol_ratio` × 前 N 日全天振幅」
+    就顺着方向进，`stop_mult` 倍 ATR 止损，第二天 `exit_min`（默认 09:35）平。
+
+    时段是硬约束，不是优化出来的：开盘头十分钟价格还在找方向，全天什么时候
+    都可能突破 —— 但突破得越晚，离收盘越近，赚的钱越不够覆盖隔夜风险。
+
+    拿日线数据跑这个策略会自动退化成「次日收盘平」：日线没有分钟，`ms` 全是同一个
+    值，`intraday` 判假。留这条退路是为了让用户在日线上也能看个大概，不至于报错。
+    """
+    out = df.copy()
+    out["signal"] = 0
+    n = len(out)
+    if n == 0:
+        return out
+    idx = pd.DatetimeIndex(out.index)
+    o = out["open"].to_numpy(dtype=float)
+    h = out["high"].to_numpy(dtype=float)
+    l = out["low"].to_numpy(dtype=float)
+    c = out["close"].to_numpy(dtype=float)
+    ms = (idx.hour * 60 + idx.minute).to_numpy()
+    days = idx.normalize().to_numpy()
+    intraday = np.unique(ms).size > 1
+
+    uday, dd = np.unique(days, return_inverse=True)
+    dd = np.asarray(dd).reshape(-1)
+    nd = len(uday)
+    day_hi = np.full(nd, -np.inf)
+    day_lo = np.full(nd, np.inf)
+    np.maximum.at(day_hi, dd, h)
+    np.minimum.at(day_lo, dd, l)
+    day_open = np.full(nd, np.nan)
+    seen = np.zeros(nd, dtype=bool)
+    for i in range(n):
+        k = dd[i]
+        if not seen[k]:
+            seen[k] = True
+            day_open[k] = o[i]
+
+    # 参考振幅取**前** range_n 个交易日的全天振幅，绝不能用当天的 —— 当天的
+    # 高低点是收盘后才知道的，拿它当门槛就是未来函数
+    rng_day = day_hi - day_lo
+    rn = max(int(range_n), 1)
+    prev_rng = np.full(nd, np.nan)
+    if nd > rn:
+        prev_rng[rn:] = rng_day[: nd - rn]
+    upper = day_open[dd] + vol_ratio * prev_rng[dd]
+    lower = day_open[dd] - vol_ratio * prev_rng[dd]
+    atr_v = atr(out, atr_n).to_numpy(dtype=float)
+
+    sig = np.zeros(n, dtype=int)
+
+    if intraday:
+        pos = 0
+        entry_px = np.nan
+        entry_atr = np.nan
+        entry_day = -1
+        last = -1
+        for i in range(n):
+            if pos != 0:
+                hit = False
+                if entry_atr == entry_atr:
+                    if pos > 0 and l[i] <= entry_px - stop_mult * entry_atr:
+                        hit = True
+                    if pos < 0 and h[i] >= entry_px + stop_mult * entry_atr:
+                        hit = True
+                out_time = (ms[i] == exit_min) and (dd[i] > entry_day)
+                if hit or out_time:
+                    pos = 0
+                    entry_px = np.nan
+                    entry_atr = np.nan
+                    entry_day = -1
+            if pos == 0 and entry_start <= ms[i] <= entry_end and dd[i] != last:
+                if upper[i] == upper[i] and h[i] >= upper[i]:
+                    pos = 1
+                    entry_px = c[i]
+                    entry_atr = atr_v[i]
+                    entry_day = dd[i]
+                    last = dd[i]
+                elif lower[i] == lower[i] and l[i] <= lower[i]:
+                    pos = -1
+                    entry_px = c[i]
+                    entry_atr = atr_v[i]
+                    entry_day = dd[i]
+                    last = dd[i]
+            sig[i] = pos
+    else:
+        # 日线：一天一根，开盘价就是全天第一个价，突破后只能等收盘或次日平
+        pos = 0
+        entry_day = -1
+        for i in range(n):
+            k = dd[i]
+            if pos != 0 and k > entry_day:
+                pos = 0
+                entry_day = -1
+            if pos == 0 and upper[i] == upper[i]:
+                up_hit = h[i] >= upper[i]
+                dn_hit = l[i] <= lower[i]
+                if up_hit and dn_hit:
+                    # 一根 K 线里上下都碰到：按「先到的那一边」判，用距离近似
+                    pos = 1 if (upper[i] - l[i]) < (h[i] - lower[i]) else -1
+                elif up_hit:
+                    pos = 1
+                elif dn_hit:
+                    pos = -1
+                if pos != 0:
+                    entry_day = k
+            sig[i] = pos
+
+    out["signal"] = sig
+    return out
+
+
 # ---------------------------------------------------------------- 注册表
 @dataclass
 class StrategySpec:
@@ -257,6 +454,11 @@ PARAM_LABELS = {
     "fast": "快线周期", "slow": "慢线周期", "signal_n": "信号周期",
     "entry": "入场周期", "exit": "离场周期", "n": "通道周期",
     "k": "ATR 倍数", "atr_n": "ATR 周期", "atr_mult": "止损倍数",
+    # 下面几条是 sbbox_mini / im_orb 的参数。标签要短：研究页那个滑杆标签
+    # 只有 62px，超过六个汉字就被截断
+    "exit_n": "离场箱体", "vol_ratio": "波幅倍数", "range_n": "参考根数",
+    "stop_mult": "止损倍数",
+    "entry_start": "开仓起(分)", "entry_end": "开仓止(分)", "exit_min": "平仓(分)",
 }
 
 
@@ -305,6 +507,43 @@ STRATEGIES: dict[str, StrategySpec] = {
             "atr_mult": (1.5, 5.0, 0.5),
         },
         desc="唐奇安双向突破 + 2.5×ATR 移动止损，单笔风险可控。",
+    ),
+    # 下面两条原本是用户在「交易Agent」里生成的，2026-10 转为内置：
+    # 用的人多、逻辑也稳定了，再留在用户库里意味着换台机器就没了
+    "sbbox_mini": StrategySpec(
+        key="sbbox_mini",
+        label="箱体+波幅突破·迷你",
+        func=strat_sbbox_mini,
+        params={"entry": 240, "exit_n": 720, "vol_ratio": 0.4,
+                "range_n": 1, "atr_n": 14, "stop_mult": 5.0},
+        param_meta={
+            "entry": (60, 720, 20),
+            "exit_n": (240, 1440, 20),
+            "vol_ratio": (0.1, 1.5, 0.05),
+            "range_n": (1, 96, 1),
+            "atr_n": (5, 60, 1),
+            "stop_mult": (2.0, 12.0, 0.5),
+        },
+        desc="箱体突破 + 相对当日开盘的波幅确认，双条件同时成立才入场；"
+             "反向 5×ATR 或反向 720 根箱体离场。设计用于 5 分钟周期。",
+    ),
+    "im_orb": StrategySpec(
+        key="im_orb",
+        label="IM 波幅突破·时段版",
+        func=strat_im_orb,
+        params={"entry_start": 580, "entry_end": 620, "exit_min": 575,
+                "vol_ratio": 0.4, "range_n": 1, "atr_n": 14, "stop_mult": 3.0},
+        param_meta={
+            "entry_start": (540, 600, 5),
+            "entry_end": (600, 690, 5),
+            "exit_min": (555, 600, 5),
+            "vol_ratio": (0.1, 1.0, 0.05),
+            "range_n": (1, 5, 1),
+            "atr_n": (5, 60, 1),
+            "stop_mult": (1.0, 6.0, 0.5),
+        },
+        desc="日内 09:40-10:20 触及「当日开盘 ± 0.4×昨日振幅」开仓，3×ATR 止损，"
+             "次日 09:35 平；日线上自动退化为次日收盘平。",
     ),
 }
 

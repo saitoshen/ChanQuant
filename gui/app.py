@@ -1422,7 +1422,7 @@ class MainWindow(QMainWindow):
         """重建规则策略下拉。注册了新策略之后要重来一遍，否则选不到它。
 
         内置的排在前面、用户注册的排后面 —— 库里越加越多之后，用户自己的东西
-        不该把原来那 5 套挤到下面去。
+        不该把内置那几套挤到下面去。
         """
         keep = self.cb_strategy.currentData()
         builtin = [k for k in STRATEGIES if not STRATEGIES[k].code]

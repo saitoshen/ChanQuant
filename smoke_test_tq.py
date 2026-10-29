@@ -1987,6 +1987,14 @@ def check_library_docs() -> None:
         ]
         check("策略文档：逻辑/优势/适应/风险齐全", not thin, str(thin))
 
+        # 2026-10 从「我的」转成内置的三条。内置的标志是 `code` 为空 —— 列表里
+        # 显示「内置」、删除按钮也不给删；要是哪天又被写回 user_*.json，
+        # `_load_user_*` 会带着 code 覆盖掉内置版本，这三条就该红了
+        for k in ("sbbox_mini", "im_orb"):
+            check(f"内置策略：{k} 不是用户策略", not STRATEGIES[k].code, "")
+        check("内置因子：roll_main_oi 不是用户因子",
+              not FACTORS["roll_main_oi"].code, "")
+
         brief = L.factor_brief()
         check("因子清单：一行一个、含公式",
               brief.count("\n") + 1 == len(FACTORS) and "｜" in brief,

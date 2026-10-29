@@ -238,6 +238,47 @@ def f_roll_change_o6(df: pd.DataFrame) -> pd.Series:
     return _roll_change(df, "o6_")
 
 
+def f_roll_main_oi(df: pd.DataFrame) -> pd.Series:
+    """主力/次主力价差率：近端取持仓最大的腿，远端取它**之后**持仓最大的腿。
+
+    和上面那套「按到期日排三腿再取前两腿」不是一回事：这里两端都由持仓量决定，
+    所以近端一定是最活跃的合约、远端一定比它更远。中国商品期货的主力月份是跳跃的
+    （螺纹只做 1/5/10），按到期日排出来的「近月」经常是个空壳合约，持仓口径不会。
+
+    先试 6 腿（o6_），没数据退回 3 腿（o3_）—— 只下了衍生数据基础档的品种只有
+    o3_。取不到任何一条腿时整列 NaN，`filter_available()` 会自动把它剔掉。
+
+    最后做 5 日均值：单日价差在换腿当天会跳一下，平滑之后才是「期限结构的陡峭度」
+    而不是「今天轮到哪个合约」。
+    """
+    def pick(pre: str):
+        close = np.column_stack([
+            _col(df, f"{pre}{i}_close").to_numpy(dtype=float) for i in (1, 2, 3)
+        ])
+        oi = np.column_stack([
+            _col(df, f"{pre}{i}_oi").to_numpy(dtype=float) for i in (1, 2, 3)
+        ])
+        ok = np.isfinite(close) & np.isfinite(oi)
+        # 用 -inf 占位，argmax 就会跳过缺失的腿；全缺时 has_* 负责把结果打成 NaN
+        i_main = np.where(ok, oi, -np.inf).argmax(axis=1)
+        has_main = ok.any(axis=1)
+        after = (np.arange(3)[None, :] > i_main[:, None]) & ok
+        far = np.where(after, oi, -np.inf)
+        has_far = np.isfinite(far).any(axis=1)
+        i_far = far.argmax(axis=1)
+        rows = np.arange(len(df))
+        near = pd.Series(np.where(has_main, close[rows, i_main], np.nan), index=df.index)
+        nextm = pd.Series(
+            np.where(has_main & has_far, close[rows, i_far], np.nan), index=df.index
+        )
+        return near, nextm
+
+    near, nextm = pick("o6_")
+    if near.notna().sum() == 0:
+        near, nextm = pick("o3_")
+    return _safe_div(near - nextm, nextm).rolling(5, min_periods=3).mean()
+
+
 # ---------------------------------------------------------------- 期权 / 波动率曲面
 # 期权因子是唯一「不靠价格历史就能得到」的一类信息：市场对未来波动的定价
 # 直接写在期权价格里。数据来源见 `ttrade/options.py`。
@@ -575,6 +616,10 @@ _reg(FactorSpec("roll_curv_o6", "展期曲率·OI6", f_roll_curv_o6, "展期 OI6
                 "OI6 口径近端与远端年化斜率之差。"))
 _reg(FactorSpec("roll_change_o6", "展期变化·OI6", f_roll_change_o6, "展期 OI6",
                 "OI6 口径年化展期收益率的 20 日变化。"))
+# 主力/次主力：两端都按持仓量选，和上面「按到期日排三腿」是两套选合约逻辑。
+# 归在「展期」里（用户自己建的那条也在这类），但依赖 o6_ 那套列，没有时退回 o3_
+_reg(FactorSpec("roll_main_oi", "展期收益率·主力次主力（持仓量口径）", f_roll_main_oi, "展期",
+                "近端取持仓最大的腿、远端取其后持仓最大的腿，5 日均值。正值=backwardation。"))
 
 # 期权：需要期权日线反解出的波动率曲面，来自 data_futures_aux
 _reg(FactorSpec("iv_atm", "平值 IV", f_iv_atm, "期权",
