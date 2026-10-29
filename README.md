@@ -67,7 +67,8 @@ v1.6.1 改的是**仓位的口径**，并把三件常用的自定义搬成内置
 
 > **分钟级行情库不在安装包里。** `tq.duckdb` 是 9.6 GB（主连 1.2 GB + 真实合约 8.4 GB），
 > 压不进 200 MB 的包，所以从 v1.5.0 起它一直是运行期按需下载。不想等 3 小时的，两条路：
-> ① 直接下现成的库（百度网盘，链接与提取码见「分钟级行情」一节）；
+> ① 直接下现成的库（百度网盘 2 GB 压缩包，解压出 `tq.duckdb` 放进 `data_tq/`；
+> 链接与提取码见「分钟级行情」一节）；
 > ② 只下 1h —— 天勤免费账户能取 8000 根小时线，78 个品种下来只有几十 MB，
 > 代价是没有 5m，15m/30m 也跟着没有（它们由 5m 合并）。
 
@@ -126,8 +127,8 @@ cp token.example.txt token.txt      # 然后把 token 填进去；token.txt 不�
 8.4 GB），压不进 200 MB 的包。不想等 3 小时下全量，两条路：
 
 ```bash
-# ① 下现成的库：百度网盘，下载 tq.duckdb 放进 data_tq/ 即可
-#    链接 https://pan.baidu.com/s/1HviVhe9K1ghjT3zvJXSm2w?pwd=staj  提取码 staj
+# ① 下现成的库：百度网盘 tq_duckdb.zip（约 2 GB，解压出 tq.duckdb 放进 data_tq/）
+#    链接 https://pan.baidu.com/s/19qPCrh7ajlh40BzTxJTDnw?pwd=cyiv  提取码 cyiv
 
 # ② 只要 1h：天勤免费账户能取 8000 根小时线，78 个品种下来只有几十 MB
 .venv\Scripts\python.exe download_tq.py --main 1h --all
@@ -1047,11 +1048,13 @@ data_tq/tq.duckdb        # 单文件 9.6 GiB（资源管理器显示 9.59 GB，�
 
 | 办法 | 得到什么 | 代价 |
 |---|---|---|
-| 百度网盘下现成的库 | 整库 9.6 GB：主连 + 真实合约，5m + 1h（78 品种、2016-10 起） | 要手工放到 `data_tq/` |
+| 百度网盘下现成的库 | 整库 9.6 GB：主连 + 真实合约，5m + 1h（78 品种、2016-10 起） | 下 2 GB 压缩包，解压后 9.6 GB |
 | 只下 1h（`--main 1h --all`） | 主连 1h，天勤免费账户给 8000 根/品种，几十 MB | 没有 5m，也就没有 15m / 30m |
 
-网盘：<https://pan.baidu.com/s/1HviVhe9K1ghjT3zvJXSm2w?pwd=staj> 提取码 **staj**，
-文件名 `tq.duckdb`，放到 `data_tq/tq.duckdb`（目录结构见「项目结构」）。
+网盘：<https://pan.baidu.com/s/19qPCrh7ajlh40BzTxJTDnw?pwd=cyiv> 提取码 **cyiv**，
+压缩包 `tq_duckdb.zip` 约 2 GB（DuckDB 文件本身已经列存压缩过，再 deflate 一遍还能小到
+五分之一）。**下完必须解压**，把里面的 `tq.duckdb` 放到 `data_tq/tq.duckdb` ——
+放的是解压出来的库文件，不是 zip 本身。放好后程序直接能读，不需要跑任何导入命令。
 
 5m 和 1h **放同一张表**用 `period` 列区分：结构完全一致，分表只会让读取层多一个分支；
 1h 只占 5m 的 1/12，合表的体积代价可以忽略；以后加 1d 或 tick 加个 period 值就行。
@@ -2372,8 +2375,9 @@ aux 的曲线文件从 21.0 MB 涨到 42.3 MB（每个品种多了 18 列），�
 
 行情库 `data_tq/`（十年 5m + 1h）**不打进包**：它是运行期按需下载的数据，不是随包分发的
 资源。这也意味着打完包第一次用分钟级周期时要先跑一次 `download_tq.py`，界面上会提示命令。
-不想下全量的，可以从百度网盘拿现成的 `tq.duckdb`
-（<https://pan.baidu.com/s/1HviVhe9K1ghjT3zvJXSm2w?pwd=staj> 提取码 `staj`），或者只下 1h ——
+不想下全量的，可以从百度网盘拿现成的库：`tq_duckdb.zip`（约 2 GB，**要解压**，
+把里面的 `tq.duckdb` 放进 `data_tq/`）
+（<https://pan.baidu.com/s/19qPCrh7ajlh40BzTxJTDnw?pwd=cyiv> 提取码 `cyiv`），或者只下 1h ——
 详见「分钟级行情」。
 
 > Windows 本地自建包是 190.4 MB（解压 416.9 MB），CI 打出来 202.7 MB。差的 12 MB 不是
