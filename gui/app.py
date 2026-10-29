@@ -1411,7 +1411,9 @@ class MainWindow(QMainWindow):
             self._wired = True
 
         self._fill_symbols()
-        self._sync_period_controls()
+        # 启动时如果记忆的周期没数据（典型：新装包没有天勤分钟库），
+        # 自动退到日线再出图，别让首屏空白
+        self._sync_period_controls(fallback=True)
         self._on_strategy_changed()
         self._on_family_changed()
         self._sync_data_page()
@@ -1634,7 +1636,7 @@ class MainWindow(QMainWindow):
             return PERIOD_1D
         return self.cb_period.currentData() or PERIOD_1D
 
-    def _sync_period_controls(self) -> None:
+    def _sync_period_controls(self, fallback: bool = False) -> None:
         """美股没有分钟数据，周期锁在日线；期货按品种实际下载情况标注。"""
         if not hasattr(self, "cb_period"):
             return
@@ -1647,13 +1649,32 @@ class MainWindow(QMainWindow):
             self.lbl_period.setText("美股只有日线")
             return
         self.cb_period.setEnabled(True)
-        self._sync_period_hint()
+        self._sync_period_hint(fallback)
 
-    def _sync_period_hint(self) -> None:
-        """在当前下拉项上标出「已下载 / 未下载」，避免选到空周期一脸问号。"""
+    def _sync_period_hint(self, fallback: bool = False) -> None:
+        """在当前下拉项上标出「已下载 / 未下载」，避免选到空周期一脸问号。
+
+        `fallback=True`（启动、换市场、换品种）时，当前周期一根都没有就自动退到
+        Tushare 日线。包内自带 94 个品种的日线，新装用户没有天勤分钟库，首屏
+        不该是「一张空白图 + 先跑 download_tq.py」。**用户手动选周期时不退**
+        （`fallback=False`），否则他刚点开 5m 就被弹回日线，看着像下拉框坏了。
+        """
         if self.market == "us" or not hasattr(self, "cb_period"):
             return
         key = self.cb_symbol.currentData() if hasattr(self, "cb_symbol") else None
+        cur = self._period()
+        switched = ""
+        if fallback and key and cur != PERIOD_1D and not self.store.has_period(key, cur):
+            # 用 get() 而不是猜文件名：日线走的是另一条读取路径（复权 + 换月拼接），
+            # 只有它真的读得出来才值得切
+            if self.store.get(key, PERIOD_1D) is not None:
+                i = self.cb_period.findData(PERIOD_1D)
+                if i >= 0:
+                    self.cb_period.blockSignals(True)
+                    self.cb_period.setCurrentIndex(i)
+                    self.cb_period.blockSignals(False)
+                    switched = PERIOD_LABEL.get(cur, cur)
+                    cur = PERIOD_1D
         miss = []
         for i in range(self.cb_period.count()):
             p = self.cb_period.itemData(i)
@@ -1662,8 +1683,9 @@ class MainWindow(QMainWindow):
             self.cb_period.setItemText(i, base if ok else f"{base}（未下载）")
             if not ok:
                 miss.append(p)
-        cur = self._period()
-        if cur != PERIOD_1D and not (key and self.store.has_period(key, cur)):
+        if switched:
+            self.lbl_period.setText(f"{switched} 数据还没下载，已切到日线")
+        elif cur != PERIOD_1D and not (key and self.store.has_period(key, cur)):
             src = tqdata.source_period(cur)
             self.lbl_period.setText(
                 f"{PERIOD_LABEL.get(cur, cur)} 数据还没下载：\n"
@@ -1679,8 +1701,9 @@ class MainWindow(QMainWindow):
         self._schedule(immediate=True)
 
     def _on_symbol_changed(self) -> None:
-        # 每个品种下载到的周期不一样，换品种必须重标一次下拉项
-        self._sync_period_hint()
+        # 每个品种下载到的周期不一样，换品种必须重标一次下拉项；
+        # 新品种没有当前周期就退到日线（同启动，别让用户面对空图）
+        self._sync_period_hint(fallback=True)
         self._schedule()
 
     def _reload_store(self, market: str) -> None:
@@ -2024,6 +2047,12 @@ class MainWindow(QMainWindow):
         k = self.cb_period.findData(cfg.period)
         if k >= 0:
             self.cb_period.setCurrentIndex(k)
+        # 恢复出来的周期可能一根数据都没有：换台机器没下分钟库、或者这个品种
+        # 只下了别的周期。这里也要退一次日线 —— `_populate_symbols` 里那次
+        # 降级发生在恢复配置**之前**，会被这里 setCurrentIndex 覆盖回去。
+        # 自检在没打包 data_tq 的环境里就是卡在这条上（首屏空白 → 首次回测
+        # 没结果 → 自检红）。
+        self._sync_period_controls(fallback=True)
 
         f = self.cb_family.findData(cfg.family)
         if f >= 0:
