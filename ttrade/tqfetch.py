@@ -639,6 +639,30 @@ def _expired(ts_code: str, today: date) -> bool:
     return bool(ym and ym < (today.year, today.month))
 
 
+def _query_contracts(api, sym: str, ex: str) -> list[str]:
+    """品种的全部合约：**在交易的 + 已摘牌的**。
+
+    `expired=True` 在不同版本的天勤 SDK 上语义变过：早期是「包含已摘牌」，
+    现在实测只回已摘牌的 —— 只查一次的话，还没到期的合约一个都下不到，
+    期限结构就永远停在最后一个摘牌日（实测停在了 2026-09-10，之后六周空着，
+    展期因子在最近的交易日全是 NaN，实盘信号直接断掉）。
+
+    所以两个都查、并起来去重。任何一个失败都不影响另一个 —— 只查到一个也
+    比整段失败强。
+    """
+    pid = _tq_product_of(sym, ex)
+    out: set[str] = set()
+    err: Exception | None = None
+    for exp in (False, True):
+        try:
+            out.update(api.query_quotes(
+                ins_class="FUTURE", exchange_id=ex, product_id=pid, expired=exp))
+        except Exception as exc:  # noqa: BLE001
+            err = exc
+    if not out and err is not None:
+        raise err
+    return sorted(out)
+
 def write_contracts(api, sym: str, ex: str, period: str, years: int,
                     days: int = 0) -> dict:
     """下载一个品种的全部真实合约（不复权，单个合约本身没有换月跳空）。
@@ -648,7 +672,7 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int,
     1. **按合约增量**：已到期的合约有数据就整段跳过，没到期的从最后一根往前推
        3 天续下。没有这层跳过，重跑一次等于重下全部。
     2. **并发下载**：见 `download_many()`。串行下一个品种十年要 11 分钟。
-    3. **区间外与空合约也记账**：`query_quotes(expired=True)` 会把品种上市以来
+    3. **区间外与空合约也记账**：`_query_contracts` 会把品种上市以来
        所有合约都返回，十年前就摘牌的那些整段都不需要；另外有些远月合约从挂牌
        到摘牌一笔没成交，每次跑都会白请求一次。前者按到期月份直接过滤，后者写进
        meta，下次跳过。
@@ -661,9 +685,7 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int,
     start = window_start(years, days)
 
     try:
-        conts = api.query_quotes(
-            ins_class="FUTURE", exchange_id=ex, product_id=_tq_product_of(sym, ex), expired=True
-        )
+        conts = _query_contracts(api, sym, ex)
     except Exception as exc:
         return {"key": key, "period": period, "rows": 0, "status": f"查合约失败 {exc}"}
 

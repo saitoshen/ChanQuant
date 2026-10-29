@@ -3736,6 +3736,17 @@ def check_tq_curve() -> None:
         _d, note_1d = Q.build(sym, ex, "5m")
         check("期限结构：有日线时优先用日线（哪怕传的是 5m）", "源 1d" in note_1d, note_1d)
 
+    # 尾部要跟得上行情：只查 expired=True 时在交易的合约一个都下不到，曲线会
+    # 停在最后一个摘牌日（2026-10-29 实测停在了 09-10，之后六周展期因子全空）
+    with S.connect(read_only=True) as con:
+        bmax = con.execute(
+            "SELECT max(trading_day) FROM bars WHERE symbol=? AND exchange=? AND period='1d'",
+            [sym, ex],
+        ).fetchone()[0]
+    if bmax is not None:
+        gap = (pd.Timestamp(bmax) - pd.Timestamp(df["date"].max())).days
+        check("期限结构尾部跟得上行情", gap <= 10, f"差 {gap} 天（行情 {bmax}）")
+
     got = Q.build_all([(sym, ex)], period=period)
     path = Q.curve_path(sym, ex)
     check("期限结构：落盘到 data_tq/curve", os.path.exists(path) and got[f"{sym}_{ex}"] > 0,
