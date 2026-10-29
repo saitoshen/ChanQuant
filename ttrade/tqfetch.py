@@ -501,6 +501,13 @@ def _task_error(task) -> str:
     return "" if exc is None else f"{type(exc).__name__}: {exc}"
 
 
+# `wait_update()` 不填 deadline 就是无限等。服务端把连接掐掉之后 SDK 既不抛异常
+# 也不返回，整个进程就那么僵住（2026-10-29 补 1h 合约时卡在 PP 上 20 分钟，
+# 内存 659MB、CPU 一动不动、日志一行不出）。给它一个截止时间，自己转起来。
+_IDLE_SEC = 60        # 单次 wait_update 最多等多久
+_STALL_SEC = 180      # 这么长时间一个合约都没落地，判定这批已死
+
+
 def download_many(api, jobs: list[tuple[str, date, date]], period: str,
                   out_dir: str, tag: str = "", max_parallel: int = 8,
                   errors: dict[str, str] | None = None) -> dict[str, pd.DataFrame]:
@@ -518,6 +525,11 @@ def download_many(api, jobs: list[tuple[str, date, date]], period: str,
     中间那一拍足够 asyncio 把清理跑完，读到的才是完整文件。
 
     失败的合约写进 `errors`（合约 → 异常文本），不再静默当成「没数据」。
+
+    **卡死保护**：连接被服务端悄悄掐掉时 SDK 既不抛异常也不返回，`wait_update()`
+    会一直阻塞（2026-10-29 补 1h 合约时卡在 PP 上 20 分钟，CPU 一动不动、日志
+    一行不出）。所以每拍都带 deadline，且 `_STALL_SEC` 内一个合约都没落地就把
+    剩下的全部记成「等待超时」退出，交给调用方重试。
     """
     from tqsdk.tools import DataDownloader
 
@@ -528,6 +540,7 @@ def download_many(api, jobs: list[tuple[str, date, date]], period: str,
     inflight = 0
     limit = max(1, int(max_parallel))
     used: list[str] = []
+    last_progress = time.time()
     try:
         while queue or running or ready:
             # 1) 消化上一拍结束的任务：此刻协程的 finally 已经跑完，文件已关闭
@@ -539,6 +552,7 @@ def download_many(api, jobs: list[tuple[str, date, date]], period: str,
             ready = []
 
             # 2) 补满并发
+            launched = 0
             while queue and inflight < limit:
                 seq, (sym, start, end) = queue.pop(0)
                 path = _dl_path(out_dir, period, seq)
@@ -554,10 +568,11 @@ def download_many(api, jobs: list[tuple[str, date, date]], period: str,
                 )
                 running.append((seq, sym, task, path))
                 inflight += 1
+                launched += 1
 
             if not (running or queue):
                 break
-            api.wait_update()
+            api.wait_update(deadline=time.time() + _IDLE_SEC)
 
             # 3) 挑出这一拍结束的，下一轮再读
             still = []
@@ -570,6 +585,30 @@ def download_many(api, jobs: list[tuple[str, date, date]], period: str,
                 else:
                     still.append((seq, sym, task, path))
             running = still
+            if launched or ready:
+                last_progress = time.time()
+            # 按墙钟计时，不按循环次数：夜盘时 `wait_update` 一有行情就立刻返回，
+            # 数「拍」的话几毫秒就凑满三拍，把所有品种全判成超时（第一版就是这么
+            # 错的，一晚上 33 个品种全报「等待超时」）。
+            if running and time.time() - last_progress > _STALL_SEC:
+                # 几分钟一个合约都没落地，这批已经死了。把**还没下完的全部**记成
+                # 失败 —— 包括还在排队没发出去的。只记 running 的话，排队里的会被
+                # 当成「查过、没数据」，摘牌合约还会写进 empty:: 元数据永久跳过，
+                # 比卡住更难查。
+                for _seq, sym, task, _path in running:
+                    try:
+                        task._task.cancel()   # 不留悬空协程，否则会和重试抢临时文件
+                    except Exception:         # noqa: BLE001
+                        pass
+                    if errors is not None:
+                        errors.setdefault(sym, "等待超时")
+                for _seq, (sym, _s, _e) in queue:
+                    if errors is not None:
+                        errors.setdefault(sym, "等待超时")
+                running, queue = [], []
+                # 留一拍让协程的 finally 关掉文件句柄，下面 finally 才好清空
+                api.wait_update(deadline=time.time() + 5)
+                break
     finally:
         # 只把内容清空（0 字节），不删文件 —— 下一批还会复用同一批路径
         for p in used:

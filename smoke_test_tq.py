@@ -582,7 +582,7 @@ class _FakeApi:
     def query_quotes(self, **_kw):
         return list(self.conts)
 
-    def wait_update(self) -> None:
+    def wait_update(self, deadline=None) -> None:
         self.calls += 1
         if self.calls > 200:
             raise RuntimeError("测试里不该跑这么久")
@@ -734,7 +734,7 @@ def check_contract_incremental() -> None:
                   f"{list(got)}")
 
             class _HangApi(_FakeApi):
-                def wait_update(self) -> None:
+                def wait_update(self, deadline=None) -> None:
                     raise RuntimeError("与 wss://api.shinnytech.com 的连接失败")
 
             class _HangTask(_Task):
@@ -747,6 +747,43 @@ def check_contract_incremental() -> None:
             except RuntimeError:
                 pass
             check("临时文件：断线中断也要清干净", _no_leftover(tmpdir), _leftover(tmpdir))
+
+            # 卡死保护：连接看着还在（wait_update 正常返回）、但任务永远不结束。
+            # 没有看门狗的话这里会一直转下去 —— 实盘补数据时就是这么僵了 20 分钟。
+            class _StuckTask(_Task):
+                class _T:
+                    @staticmethod
+                    def cancel() -> None:
+                        pass
+
+                _task = _T()
+
+                def is_finished(self) -> bool:
+                    return False
+
+            class _StuckApi:
+                def query_quotes(self, **_kw):
+                    return []
+
+                def wait_update(self, deadline=None) -> None:
+                    pass
+
+            fake_tools.DataDownloader = _StuckTask
+            old_stall = D._STALL_SEC
+            D._STALL_SEC = 0.05
+            try:
+                errs: dict = {}
+                _t0 = time.time()
+                got = D.download_many(_StuckApi(), jobs, "5m", tmpdir, "T",
+                                      max_parallel=2, errors=errs)
+                _cost = time.time() - _t0
+            finally:
+                D._STALL_SEC = old_stall
+            check("卡死保护：卡住后能自己退出", _cost < 20, f"{_cost:.2f}s")
+            check("卡死保护：卡住的合约记进 errors，不当成没数据",
+                  set(errs) == {"SHFE.rb2601", "SHFE.rb2605"}
+                  and all("超时" in v for v in errs.values()), f"{errs}")
+            check("卡死保护：不返回半截数据", got == {}, f"{list(got)}")
         finally:
             for k, v in saved.items():
                 if v is None:
