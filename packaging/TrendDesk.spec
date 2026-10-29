@@ -150,6 +150,13 @@ a = Analysis(
     excludes=EXCLUDES,
     noarchive=False,
     optimize=0,
+    # 平台手册（`factor_manual` / `library_docs`）靠 `inspect.getsource()` 现取
+    # 源码：改了实现手册自动跟着变，不用手抄。但 PYZ 里只有字节码，打包后
+    # getsource 一律返回空串 —— 手册退化成一堆空代码块，界面上完全看不出来，
+    # 模型照着学就是一片空白，Agent 写的因子还会调用根本没定义的原语。
+    # 所以这两个包要**连源码一起**收进包。v1.5.0 的 CI 就是栽在这里：
+    # 手册 33611 字符 → 17639，自检的「交易Agent 页」一项直接红。
+    module_collection_mode={"ttrade": "pyz+py", "gui": "pyz+py"},
 )
 
 pyz = PYZ(a.pure)
