@@ -35,6 +35,33 @@ PORT_FILE = "portfolio.json"
 LAST_FILE = "last_config.json"
 
 
+def _clamp_pct(value, dflt: float, hi: float) -> float:
+    """百分比参数消毒：非数字 / NaN / 非正数退回默认，超上限就夹到上限。
+
+    手改 JSON 写个 `"capital_pct": "30%"` 或者 `-5` 都不该让整份配置加载失败，
+    但也不能让它算出负手数 —— 宁可悄悄退回默认。
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return dflt
+    if v != v or v <= 0:
+        return dflt
+    return min(v, hi)
+
+
+def _pct_of(amount, principal: float, dflt: float) -> float:
+    """老配置的绝对金额 → 占本金的百分比。取不到就退回默认。"""
+    try:
+        a = float(amount or 0)
+    except (TypeError, ValueError):
+        return dflt
+    if a != a or a <= 0 or principal <= 0:
+        return dflt
+    return a / principal * 100.0
+
+
+
 # ------------------------------------------------------------------ 配置对象
 
 
@@ -75,9 +102,18 @@ class StrategyConfig:
     #   capital：分 `capital` 元给这条策略，手数 = capital / 每手保证金
     #   fixed  ：固定 `volume` 手（老行为，想精确控制敞口时用）
     #   risk   ：按止损金额反推手数 = risk_amount / (stop_mult × ATR × 合约乘数)
+    #
+    # `capital` / `risk_amount` 都是**本金乘百分比算出来的**（见下面两个 property）。
+    # 存百分比而不是绝对值，是为了「把本金从 100 万改成 500 万」时手数跟着走 ——
+    # 存「30 万」的话改了本金还得挨个回去重算。
     sizing: str = "capital"
-    capital: float = 500_000.0      # 分配资金（元）
-    risk_amount: float = 20_000.0   # 单笔止损金额（元）
+
+    # 本金：这条策略的账户规模。资金曲线从它起步，资金 / 止损两种口径都按它的
+    # 百分比算。默认 100 万，和「策略研究」页、组合页的默认值保持一致。
+    principal: float = 1_000_000.0
+    capital_pct: float = 30.0       # 「按资金分配」：占本金的百分比
+    risk_pct: float = 1.0           # 「按止损金额」：占本金的百分比
+
     stop_atr_n: int = 14            # 止损用的 ATR 周期
     stop_mult: float = 5.0          # 止损 = stop_mult × ATR
     volume: int = 1                 # 仅 sizing="fixed" 时生效
@@ -94,6 +130,18 @@ class StrategyConfig:
     range_years: float = 0.0
 
     # ---- 展示 ----
+
+    # 这两个是**算出来的**，不是存的：本金 × 百分比。上层（回测、实盘引擎、
+    # 组合页）读的一直是这两个名字，改成 property 之后那边一行都不用动。
+    @property
+    def capital(self) -> float:
+        """「按资金分配」能动用的钱。"""
+        return self.principal * self.capital_pct / 100.0
+
+    @property
+    def risk_amount(self) -> float:
+        """「按止损金额」每笔最多亏的钱。"""
+        return self.principal * self.risk_pct / 100.0
 
     def key(self) -> str:
         """品种键。美股的 exchange 是空的，不能拼出 `AAPL_` 这种尾巴。"""
@@ -134,10 +182,10 @@ class StrategyConfig:
         if mode == "fixed":
             return f"固定 {int(self.volume or 1)} 手"
         if mode == "risk":
-            return f"止损 {self.risk_amount / 10000:g} 万"
+            return f"止损 {self.risk_pct:g}% · {self.risk_amount / 10000:g} 万"
         if mode == "unit":
             return "本金全额"
-        return f"{self.capital / 10000:g} 万"
+        return f"资金 {self.capital_pct:g}% · {self.capital / 10000:g} 万"
 
     def describe(self) -> str:
         """一句话说明，给确认框和日志用。"""
@@ -176,14 +224,31 @@ class StrategyConfig:
         # 默认就该走 risk —— 用固定手数等于把风险敞口交给运气，和它自己的设计相反
         if "sizing" not in d and cfg.rule_key in RISK_SIZED:
             cfg.sizing = "risk"
-        for attr, lo, dflt in (("capital", 0.0, 500_000.0),
-                               ("risk_amount", 0.0, 20_000.0),
-                               ("stop_mult", 0.1, 5.0)):
-            try:
-                v = float(getattr(cfg, attr) or 0)
-                setattr(cfg, attr, v if v >= lo and v == v else dflt)
-            except (TypeError, ValueError):
-                setattr(cfg, attr, dflt)
+        # ---- 本金与仓位百分比 ----
+        # v1.6.0 起存的是「本金 + 百分比」，之前存的是绝对金额（capital /
+        # risk_amount 两个字段）。老配置必须按**原来的钱**折回去，本金默认 100 万：
+        # 50 万折成 50%、2 万折成 2%。不能直接套新默认的 30% / 1% —— 那样用户
+        # 一升级，昨天还在跑的仓今天就变成 0.6 倍，谁受得了。
+        #
+        # 连 capital 字段都没有的老配置（早于「仓位口径」那一版）当年走的是
+        # 500000 / 20000 这两个默认值，所以迁移默认也得是 50% / 2%，不是 30% / 1%。
+        try:
+            cfg.principal = float(cfg.principal or 0)
+        except (TypeError, ValueError):
+            cfg.principal = 0.0
+        if cfg.principal < 10_000 or cfg.principal != cfg.principal:
+            cfg.principal = 1_000_000.0
+        if "capital_pct" not in d:
+            cfg.capital_pct = _pct_of(d.get("capital"), cfg.principal, 50.0)
+        if "risk_pct" not in d:
+            cfg.risk_pct = _pct_of(d.get("risk_amount"), cfg.principal, 2.0)
+        cfg.capital_pct = _clamp_pct(cfg.capital_pct, 30.0, 500.0)
+        cfg.risk_pct = _clamp_pct(cfg.risk_pct, 1.0, 100.0)
+        try:
+            v = float(cfg.stop_mult or 0)
+            cfg.stop_mult = v if v >= 0.1 and v == v else 5.0
+        except (TypeError, ValueError):
+            cfg.stop_mult = 5.0
         try:
             cfg.stop_atr_n = max(1, int(cfg.stop_atr_n or 14))
         except (TypeError, ValueError):

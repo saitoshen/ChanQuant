@@ -363,9 +363,10 @@ class EditDialog(QDialog):
         self.ed_name.setPlaceholderText(cfg.title())
         form.addRow("名称", self.ed_name)
 
-        # ---- 仓位分配 ----
+        # ---- 本金与仓位分配 ----
         # 默认不再是「1 手」：1 手螺纹和 1 手铜差 40 倍名义价值，同一条策略在两个
-        # 品种上跑出来的风险完全不是一回事。默认按「分配资金 ÷ 每手保证金」铺满。
+        # 品种上跑出来的风险完全不是一回事。默认按「本金 × 比例 ÷ 每手保证金」铺满。
+        # 本金单独一行、不跟着口径隐藏：四种口径下它都决定净值曲线的起点。
         self.cb_size = QComboBox()
         for text, val in (("按资金分配", "capital"),
                           ("按止损金额", "risk"),
@@ -374,21 +375,35 @@ class EditDialog(QDialog):
         i = self.cb_size.findData(cfg.sizing or "capital")
         self.cb_size.setCurrentIndex(max(i, 0))
         self.cb_size.setToolTip(
-            "按资金：手数 = 分配资金 ÷ 每手保证金。\n"
+            "按资金：手数 = 本金 × 资金比例 ÷ 每手保证金。\n"
             "杠杆由品种自己的保证金比例决定（商品、股指约 10 倍，国债 30~50 倍）。\n"
-            "按止损金额：手数 = 止损金额 ÷（止损倍数 × ATR × 合约乘数）。\n"
+            "按止损金额：手数 = 本金 × 止损比例 ÷（止损倍数 × ATR × 合约乘数）。\n"
             "固定手数：老的「几手」口径。"
         )
         form.addRow("仓位分配", self.cb_size)
 
+        self.sp_principal = QDoubleSpinBox()
+        self.sp_principal.setRange(10_000, 1_000_000_000)
+        self.sp_principal.setDecimals(0)
+        self.sp_principal.setSingleStep(500_000)
+        self.sp_principal.setSuffix(" 元")
+        self.sp_principal.setValue(float(cfg.principal or 1_000_000))
+        self.sp_principal.setToolTip(
+            "这条策略的账户规模，默认 100 万。\n"
+            "资金曲线从它起步，下面两个比例都按它折算。"
+        )
+        form.addRow("本金", self.sp_principal)
+
         self.sp_capital = QDoubleSpinBox()
-        self.sp_capital.setRange(1000, 100_000_000)
-        self.sp_capital.setDecimals(0)
-        self.sp_capital.setSingleStep(50000)
-        self.sp_capital.setSuffix(" 元")
-        self.sp_capital.setValue(float(cfg.capital or 500_000))
-        self.sp_capital.setToolTip("分给这条策略的钱。手数按每手保证金折算，不按「几手」拍。")
-        form.addRow("分配资金", self.sp_capital)
+        self.sp_capital.setRange(0.1, 500.0)
+        self.sp_capital.setDecimals(1)
+        self.sp_capital.setSingleStep(5.0)
+        self.sp_capital.setSuffix(" %")
+        self.sp_capital.setValue(float(cfg.capital_pct or 30.0))
+        self.sp_capital.setToolTip(
+            "拿本金的百分之多少开仓，默认 30%。手数按每手保证金折算，不按「几手」拍。"
+        )
+        form.addRow("资金比例", self.sp_capital)
 
         self.sp_vol = QSpinBox()
         self.sp_vol.setRange(1, 9999)
@@ -396,13 +411,15 @@ class EditDialog(QDialog):
         form.addRow("固定手数", self.sp_vol)
 
         self.sp_risk = QDoubleSpinBox()
-        self.sp_risk.setRange(1000, 100_000_000)
-        self.sp_risk.setDecimals(0)
-        self.sp_risk.setSingleStep(5000)
-        self.sp_risk.setSuffix(" 元")
-        self.sp_risk.setValue(float(cfg.risk_amount or 20_000))
-        self.sp_risk.setToolTip("打止损时最多亏这么多钱，手数由止损距离反推。")
-        form.addRow("止损金额", self.sp_risk)
+        self.sp_risk.setRange(0.01, 100.0)
+        self.sp_risk.setDecimals(2)
+        self.sp_risk.setSingleStep(0.5)
+        self.sp_risk.setSuffix(" %")
+        self.sp_risk.setValue(float(cfg.risk_pct or 1.0))
+        self.sp_risk.setToolTip(
+            "打止损时最多亏本金的百分之多少，默认 1%，手数由止损距离反推。"
+        )
+        form.addRow("止损比例", self.sp_risk)
 
         self.sp_atr = QSpinBox()
         self.sp_atr.setRange(2, 200)
@@ -475,7 +492,10 @@ class EditDialog(QDialog):
         form.addRow(box)
 
     def _sync_size(self) -> None:
-        """只显示当前口径用得上的字段，免得一堆数字看不出哪个生效。"""
+        """只显示当前口径用得上的字段，免得一堆数字看不出哪个生效。
+
+        本金不参与这个开关：四种口径下它都决定净值曲线的起点。
+        """
         mode = self.cb_size.currentData()
         form = self.layout()
         if form is None:
@@ -493,8 +513,11 @@ class EditDialog(QDialog):
     def apply_to(self, cfg) -> None:
         cfg.name = self.ed_name.text().strip()
         cfg.sizing = self.cb_size.currentData() or "capital"
-        cfg.capital = float(self.sp_capital.value())
-        cfg.risk_amount = float(self.sp_risk.value())
+        # 界面收百分比，配置里存本金 + 百分比（`capital` / `risk_amount` 是
+        # property，按本金折算出来，不用也不能直接赋）
+        cfg.principal = float(self.sp_principal.value())
+        cfg.capital_pct = float(self.sp_capital.value())
+        cfg.risk_pct = float(self.sp_risk.value())
         cfg.stop_atr_n = int(self.sp_atr.value())
         cfg.stop_mult = float(self.sp_stop.value())
         cfg.volume = self.sp_vol.value()
@@ -720,7 +743,7 @@ class PortfolioPage(QWidget):
 
         btn_edit = QPushButton("设置参数")
         btn_edit.setObjectName("Ghost")
-        btn_edit.setToolTip("改仓位分配（资金 / 止损金额 / 固定手数）、账户、"
+        btn_edit.setToolTip("改本金与仓位分配（资金比例 / 止损比例 / 固定手数）、账户、"
                             "策略参数（快线慢线…）和回测区间")
         btn_edit.clicked.connect(self._edit_selected)
         head.addWidget(btn_edit)

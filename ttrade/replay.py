@@ -76,8 +76,13 @@ def make_bt(market: str, allow_short: bool = False,
         # 美股没有保证金这一说，全额买入。漏了这行就是拿 10% 保证金率
         # 给股票上 10 倍杠杆，收益曲线会离谱到一眼看出不对
         bt.multiplier, bt.margin_rate = 1.0, 1.0
-    if bt.capital > 0:
-        # 曲线也从这笔钱起步，否则「不超过现有权益」那条上限会把 50 万压回 10 万
+    # 本金：净值曲线的起点。**不是** capital —— capital 只是「拿多少本金去开仓」，
+    # 30% 的 100 万本金，曲线要从 100 万起步、按 30 万开仓，不能两个都写 30 万
+    principal = float(getattr(cfg, "principal", 0) or 0)
+    if principal > 0:
+        bt.initial_cash = principal
+    elif bt.capital > 0:
+        # 老配置没有本金字段：退回老口径，曲线从分配资金起步
         bt.initial_cash = bt.capital
     return bt
 

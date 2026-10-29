@@ -141,12 +141,12 @@ FACTOR_ORIENTS = [
 # 三个地方算出三个收益曲线的话，用户只会认为程序算错了。
 SIZE_MODES = [
     ("按资金分配", "capital",
-     "分配一笔资金（默认 50 万），按每手保证金算能开几手：\n"
-     "手数 = 资金 ÷ (价格 × 合约乘数 × 保证金比例)。\n"
+     "拿本金的百分之多少去开仓（默认 30%），按每手保证金算能开几手：\n"
+     "手数 = 本金 × 比例 ÷ (价格 × 合约乘数 × 保证金比例)。\n"
      "杠杆就是保证金比例给的：商品 / 股指约 10 倍，国债 30~50 倍。"),
     ("按止损金额", "risk",
-     "每笔最多亏「止损金额」（默认 2 万）：\n"
-     "手数 = 止损金额 ÷ (止损倍数 × ATR × 合约乘数)。\n"
+     "每笔最多亏本金的百分之多少（默认 1%）：\n"
+     "手数 = 本金 × 比例 ÷ (止损倍数 × ATR × 合约乘数)。\n"
      "波动大的品种自动少开，和价格高低无关。"),
     ("固定手数", "fixed", "每笔固定下 N 手，不看价格和资金。"),
     ("按本金全额", "unit",
@@ -1198,27 +1198,47 @@ class MainWindow(QMainWindow):
             self.cb_size.setItemData(self.cb_size.count() - 1, tip, Qt.ToolTipRole)
         cl.addWidget(self.cb_size)
 
+        # 本金：这条策略的账户规模。资金曲线从它起步，下面两个百分比都按它算。
+        # 放在口径选择器**上面**，因为它和选哪种口径无关 —— 换成固定手数时
+        # 本金照样决定净值曲线的起点。
+        self.sp_principal = QDoubleSpinBox()
+        self.sp_principal.setRange(10_000, 1_000_000_000)
+        self.sp_principal.setSingleStep(500_000)
+        self.sp_principal.setDecimals(0)
+        self.sp_principal.setPrefix("本金 ")
+        self.sp_principal.setSuffix(" 元")
+        self.sp_principal.setValue(1_000_000)
+        self.sp_principal.setToolTip(
+            "这条策略的账户规模，默认 100 万。\n"
+            "资金曲线从它起步；「按资金分配」「按止损金额」都按它的百分比折算，"
+            "改了本金手数跟着变。"
+        )
+        cl.addWidget(self.sp_principal)
+
         self.sp_capital = QDoubleSpinBox()
-        self.sp_capital.setRange(10_000, 100_000_000)
-        self.sp_capital.setSingleStep(100_000)
-        self.sp_capital.setDecimals(0)
+        self.sp_capital.setRange(0.1, 500.0)
+        self.sp_capital.setSingleStep(5.0)
+        self.sp_capital.setDecimals(1)
         self.sp_capital.setPrefix("资金 ")
-        self.sp_capital.setSuffix(" 元")
-        self.sp_capital.setValue(500_000)
+        self.sp_capital.setSuffix(" %")
+        self.sp_capital.setValue(30.0)
         self.sp_capital.setToolTip(
-            "这条策略能动用的钱。手数 = 资金 ÷ 每手保证金。\n"
-            "资金曲线也从这笔钱起步，否则下单量会被默认本金卡住。"
+            "拿本金的百分之多少去开仓，默认 30%。\n"
+            "手数 = 本金 × 比例 ÷ 每手保证金（价格 × 乘数 × 保证金比例）。"
         )
         cl.addWidget(self.sp_capital)
 
         self.sp_risk = QDoubleSpinBox()
-        self.sp_risk.setRange(1_000, 10_000_000)
-        self.sp_risk.setSingleStep(5_000)
-        self.sp_risk.setDecimals(0)
+        self.sp_risk.setRange(0.01, 100.0)
+        self.sp_risk.setSingleStep(0.5)
+        self.sp_risk.setDecimals(2)
         self.sp_risk.setPrefix("止损 ")
-        self.sp_risk.setSuffix(" 元")
-        self.sp_risk.setValue(20_000)
-        self.sp_risk.setToolTip("一笔最多亏多少钱。sbbox-mini 这类按波动定仓的策略用它。")
+        self.sp_risk.setSuffix(" %")
+        self.sp_risk.setValue(1.0)
+        self.sp_risk.setToolTip(
+            "每笔最多亏本金的百分之多少，默认 1%。\n"
+            "手数 = 本金 × 比例 ÷（止损倍数 × ATR × 合约乘数）。"
+        )
         cl.addWidget(self.sp_risk)
 
         self.sp_atr = QSpinBox()
@@ -1345,7 +1365,7 @@ class MainWindow(QMainWindow):
             self.cb_strategy.currentIndexChanged.connect(self._on_strategy_changed)
             self.cb_range.currentIndexChanged.connect(self._schedule)
             self.cb_size.currentIndexChanged.connect(self._on_size_changed)
-            for w in (self.sp_capital, self.sp_risk, self.sp_atr,
+            for w in (self.sp_principal, self.sp_capital, self.sp_risk, self.sp_atr,
                       self.sp_stop, self.sp_vol):
                 w.valueChanged.connect(lambda *_: self._schedule())
             self.chk_ma.currentIndexChanged.connect(self._schedule)
@@ -1528,21 +1548,31 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "cb_size"):
             return
         cfg.sizing = self.cb_size.currentData() or "capital"
-        cfg.capital = float(self.sp_capital.value())
-        cfg.risk_amount = float(self.sp_risk.value())
+        # 界面收的是「本金的百分之多少」，配置里存的是折算后的绝对金额 ——
+        # 回测和实盘引擎只认绝对金额（手数 = 金额 ÷ 每手保证金），两边都改会让
+        # 「改了本金手数没变」这种 bug 到处冒
+        principal = float(self.sp_principal.value())
+        cfg.capital = principal * float(self.sp_capital.value()) / 100.0
+        cfg.risk_amount = principal * float(self.sp_risk.value()) / 100.0
         cfg.stop_atr_n = int(self.sp_atr.value())
         cfg.stop_mult = float(self.sp_stop.value())
         cfg.volume = int(self.sp_vol.value())
-        if cfg.capital > 0:
-            # 资金曲线也从这笔钱起步。只改手数不改本金的话，界面上写「50 万」、
-            # 图上的净值还是从 10 万开始，收益百分比看着对、金额全对不上；
-            # 按止损金额定仓时更糟 —— 2 万止损压在 10 万本金上就是每笔赌 20%
-            cfg.initial_cash = cfg.capital
+        if principal > 0:
+            # 资金曲线从**本金**起步，不是从「分给这条策略的那笔钱」起步。
+            # 只改手数不改本金的话，界面上写「100 万本金」，图上的净值还是从
+            # 10 万开始，收益百分比看着对、金额全对不上；按止损金额定仓时更糟
+            # —— 1 万止损压在 10 万本金上就是每笔赌 10%
+            cfg.initial_cash = principal
 
     def _sync_size(self) -> None:
-        """只显示当前口径用得到的输入框。"""
+        """只显示当前口径用得到的输入框。
+
+        本金**一直显示**：它决定净值曲线的起点，四种口径都用得上，藏起来只会
+        让人以为改了没用。
+        """
         mode = self.cb_size.currentData()
-        for w, on in ((self.sp_capital, mode == "capital"),
+        for w, on in ((self.sp_principal, True),
+                      (self.sp_capital, mode == "capital"),
                       (self.sp_risk, mode == "risk"),
                       (self.sp_atr, mode == "risk"),
                       (self.sp_stop, mode == "risk"),
@@ -1948,8 +1978,9 @@ class MainWindow(QMainWindow):
             factor_reverse={k: True for k in self._reversed_factor_keys()},
             factor_cfg=dict(vars(fc)) if fc is not None else {},
             sizing=self.cb_size.currentData() or "capital",
-            capital=float(self.sp_capital.value()),
-            risk_amount=float(self.sp_risk.value()),
+            principal=float(self.sp_principal.value()),
+            capital_pct=float(self.sp_capital.value()),
+            risk_pct=float(self.sp_risk.value()),
             stop_atr_n=int(self.sp_atr.value()),
             stop_mult=float(self.sp_stop.value()),
             volume=int(self.sp_vol.value()),
@@ -2000,8 +2031,9 @@ class MainWindow(QMainWindow):
         i = self.cb_size.findData(getattr(cfg, "sizing", "capital") or "capital")
         if i >= 0:
             self.cb_size.setCurrentIndex(i)
-        self.sp_capital.setValue(float(getattr(cfg, "capital", 0) or 500_000))
-        self.sp_risk.setValue(float(getattr(cfg, "risk_amount", 0) or 20_000))
+        self.sp_principal.setValue(float(getattr(cfg, "principal", 0) or 1_000_000))
+        self.sp_capital.setValue(float(getattr(cfg, "capital_pct", 0) or 30.0))
+        self.sp_risk.setValue(float(getattr(cfg, "risk_pct", 0) or 1.0))
         self.sp_atr.setValue(int(getattr(cfg, "stop_atr_n", 0) or 14))
         self.sp_stop.setValue(float(getattr(cfg, "stop_mult", 0) or 5.0))
         self.sp_vol.setValue(int(getattr(cfg, "volume", 0) or 1))

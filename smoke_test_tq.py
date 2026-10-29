@@ -1489,15 +1489,27 @@ def check_strategy_runner() -> None:
         r._pos = {}
         cap = St.StrategyConfig(sid="s-cap", symbol="RB", exchange="SHFE",
                                 period="1d", rule_key="ma_cross",
-                                sizing="capital", capital=500_000.0)
+                                sizing="capital", principal=1_000_000.0,
+                                capital_pct=50.0)
         st_cap = r.add(cap)
         st_cap.underlying = "SHFE.rb2701"
         check("仓位：50 万 ÷ 每手保证金 4000 = 125 手",
               r._lots(st_cap, 3049.5, 0.0) == 125, str(r._lots(st_cap, 3049.5, 0.0)))
 
+        # 本金是**乘数**：比例不变、本金翻倍，手数跟着翻倍。存百分比的全部意义
+        # 就在这一条 —— 改本金不用挨个回去重算
+        st_cap.cfg.principal = 2_000_000.0
+        check("仓位：本金翻倍 → 手数翻倍",
+              r._lots(st_cap, 3049.5, 0.0) == 250, str(r._lots(st_cap, 3049.5, 0.0)))
+        st_cap.cfg.principal = 1_000_000.0
+        st_cap.cfg.capital_pct = 30.0
+        check("仓位：本金 100 万 × 30% = 30 万 → 75 手",
+              r._lots(st_cap, 3049.5, 0.0) == 75, str(r._lots(st_cap, 3049.5, 0.0)))
+        st_cap.cfg.capital_pct = 50.0
+
         rk = St.StrategyConfig(sid="s-risk", symbol="RB", exchange="SHFE",
                                period="1d", rule_key="sbbox_mini",
-                               sizing="risk", risk_amount=20_000.0,
+                               sizing="risk", principal=1_000_000.0, risk_pct=2.0,
                                stop_mult=5.0, stop_atr_n=14)
         st_rk = r.add(rk)
         st_rk.underlying = "SHFE.rb2701"
@@ -1525,6 +1537,17 @@ def check_strategy_runner() -> None:
         check("仓位：老配置默认按资金 50 万",
               old_cap.sizing == "capital" and old_cap.capital == 500_000.0,
               f"{old_cap.sizing} {old_cap.capital}")
+        # 老配置的绝对金额要折成本金百分比，而且**折完还是原来那笔钱**。
+        # 直接套新默认 30% 的话，用户升级当天手数就变成 0.6 倍
+        old_cap2 = St.StrategyConfig.from_dict(
+            {"sid": "s-old3", "symbol": "RB", "exchange": "SHFE", "rule_key": "ma_cross",
+             "capital": 500_000.0, "risk_amount": 20_000.0}
+        )
+        check("仓位：老配置的金额折成本金百分比",
+              (old_cap2.principal, old_cap2.capital_pct, old_cap2.capital,
+               old_cap2.risk_pct, old_cap2.risk_amount)
+              == (1_000_000.0, 50.0, 500_000.0, 2.0, 20_000.0),
+              f"{old_cap2.capital_pct}% {old_cap2.capital}")
 
         # 保证金拿不到时按品种兜底：国债 3%（约 33 倍）、股指 12%（约 8 倍）
         check("仓位：国债保证金率 3%", abs(R.default_margin_rate("T") - 0.03) < 1e-9)
@@ -2034,7 +2057,13 @@ def check_agent() -> None:
         check("提示词：系统提示在最前",
               msgs[0]["role"] == "system" and "趋势跟踪研究台" in msgs[0]["content"])
         check("提示词：历史在前、本轮在后",
-              msgs[-1]["content"] == "新问题" and len(msgs) == 3, f"{len(msgs)} 条")
+              msgs[-1]["content"] == "新问题" and msgs[-2]["content"] == "旧问题",
+              f"{[m['role'] for m in msgs]}")
+        check("提示词：策略清单夹在基础提示词和对话之间",
+              msgs[0]["role"] == "system"
+              and "当前平台上的策略" in msgs[1]["content"]
+              and msgs[2]["content"] == "旧问题",
+              f"{[m['role'] for m in msgs]}")
         check("历史：超长会截断", len(A.trim_history([{"role": "user", "content": "x"}] * 100)) == 40)
 
         # 提示词里的示例必须是**合法 JSON**。模型会照着抄，示例里塞真换行等于
@@ -2516,10 +2545,10 @@ def check_agent_memory() -> None:
               "第 64 条" in Mem.brief() and "第 0 条" not in Mem.brief(), "")
 
         check("记忆：注入到 system 消息",
-              [m["role"] for m in A.build_messages([], "问", memory="- 螺纹只做多")]
-              == ["system", "system", "user"], "")
+              any(m["role"] == "system" and "螺纹只做多" in m["content"]
+                  for m in A.build_messages([], "问", memory="- 螺纹只做多")), "")
         check("记忆：没记忆时不加空 system 消息",
-              len(A.build_messages([], "问")) == 2, "")
+              not any("## 长期记忆" in m["content"] for m in A.build_messages([], "问")), "")
 
         msg = A.memory_messages([
             {"role": "user", "content": "帮我注册"},
