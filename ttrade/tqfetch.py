@@ -703,7 +703,7 @@ def _query_contracts(api, sym: str, ex: str) -> list[str]:
     return sorted(out)
 
 def write_contracts(api, sym: str, ex: str, period: str, years: int,
-                    days: int = 0) -> dict:
+                    days: int = 0, cancel=None) -> dict:
     """下载一个品种的全部真实合约（不复权，单个合约本身没有换月跳空）。
 
     十年全品种是几千个合约、上亿行的量级，所以三件事必须做对：
@@ -760,9 +760,15 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int,
     # 失败重试一轮：合约级失败基本是下载器偶发（连接抖动、文件句柄），换个批次
     # 再来一次大多能成。**不能静默当成「没数据」** —— 上一轮就是 54 个品种的
     # 合约全被吞掉，日志只写「新下 0 个合约」，看着像正常跳过。
+    stopped = False
     for attempt in (1, 2):
         retry: list[tuple[str, str, date]] = []
         for batch in batches:
+            # 只在批次之间检查：一批 24 个合约正在飞，掐断只会留下一堆半截文件。
+            # 一批最多几十秒，界面上点「取消」等这么久是可以接受的。
+            if cancel is not None and cancel():
+                stopped = True
+                break
             errs: dict[str, str] = {}
             frames = download_many(
                 api, [(c, s, end) for c, _, s in batch], period, tq_root(), key,
@@ -784,7 +790,7 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int,
                         retry.append((c, ts_code, cstart))
                     elif _expired(ts_code, end):
                         new_empty.append(ts_code)
-        if attempt == 2 or not retry:
+        if stopped or attempt == 2 or not retry:
             break
         print(f"    {key} {period}: {len(retry)} 个合约失败，重试一轮", flush=True)
         batches = [retry[i : i + CHUNK] for i in range(0, len(retry), CHUNK)]
@@ -794,13 +800,15 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int,
 
     if failed:
         status = f"{len(failed)} 个合约失败：{next(iter(failed.values()))[:70]}"
+    elif stopped:
+        status = "已取消"
     elif added or skipped or old or blank:
         status = "ok"
     else:
         status = "无数据"
     return {"key": key, "period": period, "rows": added, "contracts": n_con,
             "skipped": skipped, "old": old, "blank": blank + len(new_empty),
-            "failed": len(failed), "status": status}
+            "failed": len(failed), "cancelled": stopped, "status": status}
 
 
 def _tq_product_of(sym: str, ex: str) -> str:

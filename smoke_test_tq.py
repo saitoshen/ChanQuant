@@ -696,6 +696,24 @@ def check_contract_incremental() -> None:
         check("下载失败：失败合约不能被记成空合约",
               r5["blank"] == 0, f"blank={r5['blank']}")
 
+        # ---- 取消 ----
+        # 界面上点「取消」后不能等这一批 24 个合约全飞完才停。批次之间检查一次，
+        # 停的时候要明确回报 cancelled，否则界面会把它算成「这个品种下好了」。
+        seen.clear()
+
+        def ok_dl(api, jobs, period, out_dir, tag, max_parallel=8, errors=None):
+            seen.append([s for s, _, _ in jobs])
+            return {s: _fake_frame(today - pd.Timedelta(hours=1)) for s, _, _ in jobs}
+
+        D.download_many = ok_dl
+        rc = D.write_contracts(_FakeApi(["SHFE.ni2609", "SHFE.ni2612"]),
+                               "NI", "SHFE", "5m", 1, cancel=lambda: True)
+        check("取消：一批都没起就返回",
+              rc.get("cancelled") is True and not seen and rc["contracts"] == 0,
+              f"cancelled={rc.get('cancelled')} 请求={seen}")
+        check("取消：状态写成「已取消」，别冒充 ok",
+              rc["status"] == "已取消", rc["status"])
+
         # ---- 临时文件：正常结束与异常中断都不能留下数据 ----
         # 下面的用例要测真实的 download_many，先把前面替换掉的假下载器还回去。
         D.download_many = real_dl

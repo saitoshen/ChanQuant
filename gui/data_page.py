@@ -204,6 +204,8 @@ class TqWorker(QObject):
 
                 # ---- 真实合约 + 期限结构
                 n_contracts = 0
+                bad: list[str] = []
+                dead = 0
                 if self.contracts and not self._cancel:
                     for i, (sym, ex) in enumerate(pairs, 1):
                         if self._cancel:
@@ -211,12 +213,40 @@ class TqWorker(QObject):
                         self.progress.emit(i, len(pairs),
                                            f"真实合约 {i}/{len(pairs)}　{sym}_{ex}…")
                         try:
-                            TQ.write_contracts(api, sym, ex, self.period, 0, days=self.days)
-                            n_contracts += 1
+                            r = TQ.write_contracts(api, sym, ex, self.period, 0,
+                                                   days=self.days,
+                                                   cancel=lambda: self._cancel)
                         except Exception as exc:  # noqa: BLE001
                             # 一个品种的合约失败不该把整轮打断 —— 主连已经落库了
+                            bad.append(f"{sym}_{ex}：{type(exc).__name__}")
                             self.progress.emit(i, len(pairs),
                                                f"真实合约 {sym}_{ex} 失败：{str(exc)[:60]}")
+                            continue
+                        if r.get("cancelled"):
+                            break     # 用户点了取消，后面的品种一个都别再起
+                        # **不抛异常不等于全下到了**：卡死保护会把没下完的合约记成
+                        # 「等待超时」放进 failed，然后正常返回；「查合约失败」更是
+                        # 直接 early return。这里必须看返回值，否则用户看到「真实
+                        # 合约 78 个品种」以为齐了，展期因子却是断的（CLI 那边一直
+                        # 是看 failed 的）。
+                        if r.get("status") in ("ok", "无数据"):
+                            n_contracts += 1
+                        else:
+                            note = str(r.get("status") or "")[:40]
+                            bad.append(f"{sym}_{ex}：{note}")
+                            self.progress.emit(i, len(pairs),
+                                               f"真实合约 {sym}_{ex} 未下全：{note}")
+                        # 连着几个品种一行都没下到，多半是连接已经死了：重建会话再
+                        # 继续。不重建的话剩下每个品种都要白等一轮看门狗（3 分钟）。
+                        if r.get("rows"):
+                            dead = 0
+                        else:
+                            dead += 1
+                            if dead >= 3:
+                                self.progress.emit(i, len(pairs), "连接似乎已断，重建会话…")
+                                sess.reset()
+                                api = sess.get()
+                                dead = 0
             finally:
                 sess.close()
 
@@ -234,6 +264,9 @@ class TqWorker(QObject):
             if self.contracts:
                 extra = (f"；真实合约 {n_contracts} 个品种，"
                          f"期限结构 {n_curve} 个品种")
+                if bad:
+                    shown = "、".join(bad[:4]) + ("…" if len(bad) > 4 else "")
+                    extra += f"；{len(bad)} 个品种有合约没下全（{shown}），再点一次会续传"
             self.done.emit(
                 f"天勤 {period_label} {head}：{len(pairs)} 个品种，本次写入 {rows:,} 行{extra}；"
                 f"新补切换表 {n_switch} 个，校正换月日 {moved} 处，刷新复权 {touched} 个品种周期"
@@ -641,9 +674,14 @@ class DataPage(QWidget):
     def _on_update_done(self, res) -> None:
         self.lbl_upd.setVisible(True)
         text = res.summary()
+        problems = list(res.errors) + list(res.notes)
         aux = getattr(res, "aux", None)
         if aux is not None:
             text += f"\n衍生数据：{aux.summary()}"
+            # 衍生数据是逐日 try/except 的，失败只记在它自己的 errors 里。不并进
+            # problems 的话，用户只能从「N 天失败」四个字里猜是哪几天 —— 而那几天
+            # 恰好就是期限结构断掉的地方。
+            problems += list(getattr(aux, "errors", []) or [])
         err = getattr(res, "aux_error", "")
         if err:
             text += f"\n衍生数据更新失败：{err}"
@@ -652,7 +690,6 @@ class DataPage(QWidget):
 
         self.data_changed.emit(res.market)
 
-        problems = list(res.errors) + list(res.notes)
         if problems or err:
             more = f"\n… 另有 {len(problems) - 6} 条" if len(problems) > 6 else ""
             QMessageBox.information(
@@ -665,6 +702,10 @@ class DataPage(QWidget):
         self.lbl_upd.setText(text)
         self._log(text)
         self.data_changed.emit(self.market)
+        # 有品种没下全就弹一下：跑几小时的下载用户未必盯着 label 看，而缺的那几个
+        # 合约正是展期因子断掉的地方
+        if "没下全" in text:
+            QMessageBox.information(self, "天勤补齐", text)
 
     def _on_update_failed(self, message: str) -> None:
         self.lbl_upd.setVisible(True)
