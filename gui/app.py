@@ -167,8 +167,10 @@ FACTOR_PARAMS = {
     "horizon": ("预测期数", 1, 20, 1, 5),
     "entry_z": ("进场阈值", 0.3, 3.0, 0.1, 1.0),
     "exit_z": ("离场阈值", 0.0, 1.5, 0.1, 0.3),
-    "train_window": ("训练窗口", 400, 2500, 100, 1000),
-    "step": ("重训间隔", 60, 400, 20, 180),
+    # 单位是**交易日**不是 bar 根数：5m 和日线的「1000」不该是同一段历史。
+    # 换算在 factor_strategy._to_bars() 里做，按数据的 bar 密度来
+    "train_window": ("训练窗口（交易日）", 400, 2500, 100, 1000),
+    "step": ("重训间隔（交易日）", 60, 400, 20, 180),
     "long_th": ("多头门槛", -1.5, 1.5, 0.1, 0.0),
     "short_th": ("空头门槛", -1.5, 1.5, 0.1, 0.0),
 }
@@ -2362,7 +2364,7 @@ class MainWindow(QMainWindow):
         self._f_worker, self._f_thread = worker, thread
         self.lbl_status.setText(
             f"正在训练 {mlmodels.MODELS.get(cfg.model, {}).get('label', cfg.model)}"
-            f"（{len(keys)} 因子，{cfg.train_window} 根训练窗口）…"
+            f"（{len(keys)} 因子，{cfg.train_window} 交易日训练窗口）…"
         )
         thread.start()
 

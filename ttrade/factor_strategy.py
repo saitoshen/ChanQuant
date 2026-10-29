@@ -61,9 +61,16 @@ class FactorConfig:
 
     # 机器学习
     model: str = ML.DEFAULT_MODEL
-    train_window: int = 1000     # 滚动训练窗口
-    step: int = 180              # 每隔多少根重训一次（180≈9 个月）
-    min_train: int = 500         # 首次训练所需最少样本
+    # train_window / step 按**交易日**算，不是按 bar 根数：同样的 1000 天，日线
+    # 是 1000 根、1h 约 6900 根、5m 约 68000 根。参数的意义是「用过去几年训练」，
+    # 跟行情周期无关，具体换算见 `_to_bars()`。
+    #
+    # min_train 不一样，它是**根数**：问的是「多少个样本才够训一个模型」，这是
+    # 统计问题，跟多久的历史无关。换算成交易日反而会在分钟级上把门槛抬到数据
+    # 长度都够不着（5m 的 500 天是 3.4 万根），整段不出信号。
+    train_window: int = 1000     # 滚动训练窗口（交易日）
+    step: int = 180              # 每隔多少交易日重训一次（180≈9 个月）
+    min_train: int = 500         # 首次训练所需最少样本（根）
 
     # 因子过滤
     filter_mode: str = "entry"   # entry（否决整笔）/ delay（延后入场）/ hold（转差离场）
@@ -84,7 +91,7 @@ class FactorConfig:
         c.exit_z = float(min(max(0.0, c.exit_z), c.entry_z))
         c.train_window = int(max(200, c.train_window))
         c.step = int(max(20, c.step))
-        c.min_train = int(max(120, min(c.min_train, c.train_window)))
+        c.min_train = int(max(120, c.min_train))
         return c
 
 
@@ -291,10 +298,18 @@ def build_score(
         )
         score = _rolling_z(pred, cfg.window).rename("score")
         covered = int(pred.notna().sum())
+        _bpd = _bars_per_day(fmat.index)
         notes.append(
             f"{ML.MODELS.get(cfg.model, {}).get('label', cfg.model)} · "
-            f"{n_folds} 折滚动训练，有效预测 {covered}/{len(df)} 根"
+            f"{n_folds} 折滚动训练，训练窗口 {cfg.train_window} 个交易日"
+            f"（{_to_bars(cfg.train_window, _bpd):,} 根），"
+            f"有效预测 {covered}/{len(df)} 根"
         )
+        if n_folds == 0:
+            notes.append(
+                f"数据不足：首次训练要 {cfg.min_train:,} 根，当前只有 {len(fmat):,} 根"
+                f" —— 下载更长的历史，或把训练窗口调小"
+            )
         if covered < len(df) * 0.5:
             notes.append("前段样本不足以训练，该区间不持仓（walk-forward 的正常代价）")
         # 反转开关在 ML 模式下不生效：模型自己从数据里学方向和权重，
@@ -311,6 +326,25 @@ def build_score(
 
 
 # ---------------------------------------------------------------- Walk-forward
+def _bars_per_day(idx) -> float:
+    """平均每个交易日几根 bar。日线 1、1h 约 7~9、5m 约 48~68（含夜盘）。"""
+    idx = pd.DatetimeIndex(idx)
+    if len(idx) < 2:
+        return 1.0
+    nd = idx.normalize().nunique()
+    return len(idx) / float(max(1, nd))
+
+
+def _to_bars(days: int, bpd: float) -> int:
+    """交易日 → bar 根数。
+
+    **不能按数据长度夹取。** 夹了的话窗口长度就取决于「总共有多少行」，等于
+    用了「未来还有多少数据」这条信息：同一个历史时点，今天回测和昨天回测给出
+    的预测会不一样，净值每天都变。数据不够就老老实实不出信号。
+    """
+    return int(max(60, round(int(days) * bpd)))
+
+
 def walk_forward(
     fmat: pd.DataFrame,
     fwd: pd.Series,
@@ -322,7 +356,8 @@ def walk_forward(
 
     时间轴（每折）：
 
-        |<---- 训练窗口 train_window ---->|<-- 预测 step 根 -->|
+        |<---- 训练窗口 train_window ---->|<-- 预测 step -->|
+         （交易日 → 按数据密度换算成根，见 `_to_bars()`）
         a                                b                    c
 
     训练样本只取到 `b - horizon`：第 i 行的标签 `fwd[i]` 要到 i+h 才成立，
@@ -336,14 +371,22 @@ def walk_forward(
     Y = fwd.to_numpy(dtype=float)
     n = len(fmat)
     pred = np.full(n, np.nan)
-    if n <= cfg.min_train + cfg.horizon + 10:
+
+    # 配置里是交易日，这里按数据的 bar 密度换成根数
+    bpd = _bars_per_day(fmat.index)
+    train_bars = _to_bars(cfg.train_window, bpd)
+    step_bars = _to_bars(cfg.step, bpd)
+    # min_train 是根数，不换算；只保证不超过训练窗口
+    min_bars = min(int(cfg.min_train), train_bars)
+
+    if n <= min_bars + cfg.horizon + 10:
         return pd.Series(pred, index=fmat.index), None, 0
 
     bounds = []
-    t = cfg.min_train
+    t = min_bars
     while t < n:
-        bounds.append((max(0, t - cfg.train_window), t, min(n, t + cfg.step)))
-        t += cfg.step
+        bounds.append((max(0, t - train_bars), t, min(n, t + step_bars)))
+        t += step_bars
 
     total = len(bounds)
     imp_acc = np.zeros(len(keys))

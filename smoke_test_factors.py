@@ -889,16 +889,45 @@ check("ML 重要度归一化",
       abs(float(pack_ml.importance.sum()) - 1.0) < 1e-6,
       f"sum={float(pack_ml.importance.sum()):.6f}")
 
+# 训练窗口是**交易日**不是根数：同样的 1000 天，5m 要 48 倍于日线的根数。
+# 单位搞错的话 5m 上「1000」只等于 21 个交易日，模型拿两周数据训练。
+_idx_d = pd.bdate_range("2016-01-04", periods=500)
+
+
+def _sess_5m(days: int) -> pd.DatetimeIndex:
+    """按真实交易时段拼 5m 索引：09:00-11:30 + 13:30-15:00，一天 48 根。
+
+    不能用 `pd.date_range(freq="5min")`：那是连续 24 小时、一天 288 根，期货
+    没有这种行情，拿它算出来的 bar 密度跟实盘差 6 倍，换算断言也就没意义了。
+    """
+    ts = []
+    for d in pd.bdate_range("2024-01-01", periods=days):
+        for a, b in (("09:00", "11:30"), ("13:30", "15:00")):
+            ts.append(pd.date_range(f"{d.date()} {a}", f"{d.date()} {b}",
+                                    freq="5min", inclusive="left"))
+    return pd.DatetimeIndex(np.concatenate([t.values for t in ts]))
+
+
+_idx_5 = _sess_5m(500)
+_bpd_5 = FS._bars_per_day(_idx_5)
+_n_d = FS._to_bars(1000, FS._bars_per_day(_idx_d))
+_n_5 = FS._to_bars(1000, _bpd_5)
+check("5m 每天 48 根（09:00-11:30 + 13:30-15:00）", abs(_bpd_5 - 48.0) < 1e-9,
+      f"{_bpd_5:.2f} 根/天")
+check("训练窗口按交易日换算成根（日线 1000 / 5m 48000）",
+      _n_d == 1000 and _n_5 == 48000, f"日线 {_n_d} 根 / 5m {_n_5} 根")
+
 # 关键 PIT：训练集不得包含 b 时刻还不存在的标签。
 # 做法是把第一折训练窗口尾部 h 个标签改坏 —— 这几行的收益要到 b+h 才成立，
 # 正确实现（tr_end = b-h）不该看它们，**第一折的预测**必须一字不变。
 # 只比第一折的预测区间：后面的折合法地会用到这些标签（那时它们已经成立了）。
-# 注意要用 normalized() 后的 min_train：它会被夹到 train_window 以内。
+# 第一折的起点是 min(min_train, train_window)：DF 是日线（一天一根），
+# train_window 的「交易日」正好等于根数，所以这里可以直接比。
 _cfg_wf = cfg_ml.normalized()
 _fmat_wf = F.factor_frame(DF, KEYS6, 252)
 _fwd_wf = M.forward_return(DF, _cfg_wf.horizon)
 base_pred, _, _ = FS.walk_forward(_fmat_wf, _fwd_wf, _cfg_wf)
-_b = _cfg_wf.min_train
+_b = min(_cfg_wf.min_train, _cfg_wf.train_window)
 _fwd_bad = _fwd_wf.copy()
 _fwd_bad.iloc[_b - _cfg_wf.horizon:_b] = 5.0   # 极端值，一旦混进训练集必然改结果
 alt_pred, _, _ = FS.walk_forward(_fmat_wf, _fwd_bad, _cfg_wf)

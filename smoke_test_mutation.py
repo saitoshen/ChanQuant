@@ -101,7 +101,9 @@ def probe_train_bound(wf_fn) -> bool:
                           min_train=500, model="lightgbm").normalized()
     fwd = M.forward_return(DF, cfg.horizon)
     base, _, _ = wf_fn(FMAT, fwd, cfg)
-    b = cfg.min_train
+    # 第一折起点是 min(min_train, train_window)：DF 是日线，train_window 的
+    # 「交易日」正好等于根数，可以直接比
+    b = min(cfg.min_train, cfg.train_window)
     bad = fwd.copy()
     bad.iloc[b - cfg.horizon:b] = 5.0
     alt, _, _ = wf_fn(FMAT, bad, cfg)
