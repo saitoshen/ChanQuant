@@ -225,7 +225,7 @@ class StrategyConfig:
         if "sizing" not in d and cfg.rule_key in RISK_SIZED:
             cfg.sizing = "risk"
         # ---- 本金与仓位百分比 ----
-        # v1.6.0 起存的是「本金 + 百分比」，之前存的是绝对金额（capital /
+        # v1.6.1 起存的是「本金 + 百分比」，之前存的是绝对金额（capital /
         # risk_amount 两个字段）。老配置必须按**原来的钱**折回去，本金默认 100 万：
         # 50 万折成 50%、2 万折成 2%。不能直接套新默认的 30% / 1% —— 那样用户
         # 一升级，昨天还在跑的仓今天就变成 0.6 倍，谁受得了。
