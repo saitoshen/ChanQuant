@@ -315,3 +315,59 @@ def run(cfg, df: pd.DataFrame | None, market: str = "",
         rule_key=rule_key, period=period, factor_cfg=fc, outcome=out, keys=keys,
         filter_active=filter_active, long_only=bt.long_only, bars_per_year=bpy,
     )
+
+
+def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
+    """截面策略的离线回放。组合页双击一条截面策略走这里。
+
+    截面要的是**一批**品种的行情，调用方按 `cfg.cross_symbols` 各自取好再递进来
+    —— 回放这一层不碰数据源，和研究页 / 批量脚本各用各的取数方式。
+
+    返回的 `Replay` 里 `df` / `raw` 都是空的：截面策略没有「某一条策略的 K 线」，
+    仓位是一篮子权重，画 K 线会误导。视图那边要用组合视图（绩效 / 阶段）。
+    """
+    from ttrade import cross as cross_engine
+
+    mk = market or market_of(cfg)
+    period = getattr(cfg, "period", "") or "1d"
+    years = getattr(cfg, "range_years", 0) or 0
+    frames = {k: window(v, years) for k, v in (frames or {}).items()}
+    frames = {k: v for k, v in frames.items() if v is not None and len(v) > 1}
+    if len(frames) < cross_engine.MIN_CROSS:
+        return Replay(error=(f"截面策略至少要 {cross_engine.MIN_CROSS} 个品种的行情，"
+                             f"现在只有 {len(frames)} 个"))
+
+    panel = cross_engine.close_panel(frames)
+    if panel.empty:
+        return Replay(error="这批品种没有可用的收盘价")
+    bt = make_bt(mk, getattr(cfg, "note", "") == "short", cfg)
+    bt.bars_per_year = bars_per_year(panel.index)
+
+    ccfg = cross_engine.CrossConfig(
+        mode=getattr(cfg, "cross_mode", "hedge") or "hedge",
+        rebalance=max(1, int(getattr(cfg, "cross_rebalance", 5) or 5)),
+        top_pct=float(getattr(cfg, "cross_top_pct", 10.0) or 10.0),
+        long_only=bt.long_only,
+        weight=getattr(cfg, "cross_weight", "equal") or "equal",
+        factor_mode="multi",
+        factor_keys=list(getattr(cfg, "factor_keys", []) or []),
+        factor_reverse=dict(getattr(cfg, "factor_reverse", {}) or {}),
+        timing_family=getattr(cfg, "timing_family", "rule") or "rule",
+        timing_rule_key=getattr(cfg, "timing_rule_key", "") or "",
+        timing_rule_params=dict(getattr(cfg, "timing_rule_params", {}) or {}),
+        timing_factor_mode=getattr(cfg, "timing_factor_mode", "single") or "single",
+        timing_factor_keys=list(getattr(cfg, "timing_factor_keys", []) or []),
+        timing_factor_reverse=dict(getattr(cfg, "timing_factor_reverse", {}) or {}),
+        timing_factor_cfg=dict(getattr(cfg, "timing_factor_cfg", {}) or {}),
+    )
+    mode_cn = "截面对冲" if ccfg.mode == "hedge" else "截面选品种"
+    label = f"{mode_cn} · {len(frames)} 品种 · 每 {ccfg.step()} 根调仓"
+    out = cross_engine.run(frames, ccfg, bt,
+                           profile=getattr(cfg, "cost_profile", "") or None,
+                           label=label)
+    if not out.ok:
+        return Replay(error=out.error or "截面回测没有算出净值")
+    res = cross_engine.to_result(out, label=label, step=ccfg.step(),
+                                 bpy=bt.bars_per_year)
+    return Replay(res=res, bh=None, label=label, family="cross", period=period,
+                  long_only=bt.long_only, bars_per_year=bt.bars_per_year)

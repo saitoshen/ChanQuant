@@ -93,6 +93,25 @@ class StrategyConfig:
     factor_reverse: dict = field(default_factory=dict)
     factor_cfg: dict = field(default_factory=dict)
 
+    # ---- 截面策略（family == "cross"）----
+    # 一次拿一批品种横向比强弱，所以标的不是一个，是一组。`symbol` / `exchange`
+    # 仍然记着「当前在看的那个」，用来在列表里指代这条策略。
+    cross_symbols: list = field(default_factory=list)
+    cross_mode: str = "hedge"           # hedge = 截面对冲；select = 选品种 + 时序
+    cross_rebalance: int = 5            # 调仓间隔（根）
+    cross_top_pct: float = 10.0         # 多最强 / 空最弱的百分比
+    cross_weight: str = "equal"         # equal / score
+
+    # 「选品种 + 时序交易」里的那条时序腿。规则和因子二选一，另一个保留不删 ——
+    # 用户来回切换不该丢参数。
+    timing_family: str = "rule"         # rule / factor
+    timing_rule_key: str = ""
+    timing_rule_params: dict = field(default_factory=dict)
+    timing_factor_mode: str = "single"
+    timing_factor_keys: list = field(default_factory=list)
+    timing_factor_reverse: dict = field(default_factory=dict)
+    timing_factor_cfg: dict = field(default_factory=dict)
+
     # 执行 —— 仓位怎么定
     #
     # 默认**不再固定 1 手**：1 手螺纹和 1 手铜差 40 倍名义价值，同一条策略在两
@@ -157,10 +176,19 @@ class StrategyConfig:
         """列表里显示的名字。用户没起名就用「品种 · 策略」。"""
         if self.name.strip():
             return self.name.strip()
+        if self.family == "cross":
+            # 截面策略没有「一个品种」可言：`key()` 只是品种池里的第一个，
+            # 拿它拼标题会让人以为这条策略只交易那一个
+            return self.strategy_label()
         return f"{self.key()} · {self.strategy_label()}"
 
     def strategy_label(self) -> str:
         """策略的可读名。规则策略直接查表，因子策略拼模式和因子数。"""
+        if self.family == "cross":
+            n = len(self.cross_symbols or [])
+            if self.cross_mode == "select":
+                return f"截面选品种 + 时序（{n} 个品种）"
+            return f"截面对冲 · {self.cross_top_pct:g}%（{n} 个品种）"
         if self.family == "rule":
             from ttrade.strategies import STRATEGIES
 
@@ -176,6 +204,13 @@ class StrategyConfig:
         """参数摘要，给表格的「参数」列用。"""
         if self.family == "rule":
             return " ".join(f"{k}={v}" for k, v in (self.rule_params or {}).items())
+        if self.family == "cross":
+            bits = [f"调仓={int(self.cross_rebalance or 1)}根",
+                    f"top={float(self.cross_top_pct or 0):g}%",
+                    f"权重={'等权' if self.cross_weight != 'score' else '按分数'}"]
+            if self.cross_mode == "select":
+                bits.append(f"时序={'规则' if self.timing_family != 'factor' else '因子'}")
+            return " ".join(bits)
         cfg = self.factor_cfg or {}
         bits = [f"窗口={cfg.get('window', 252)}", f"阈值={cfg.get('entry_z', 1.0)}"]
         if self.factor_mode == "ml":
@@ -195,8 +230,10 @@ class StrategyConfig:
 
     def describe(self) -> str:
         """一句话说明，给确认框和日志用。"""
+        # 截面策略的 `key()` 只是品种池里的第一个，写出来会误导
+        head = self.title() if self.family == "cross" else f"{self.title()}｜{self.key()}"
         return (
-            f"{self.title()}｜{self.key()} {self.period}｜{self.strategy_label()}"
+            f"{head} {self.period}｜{self.strategy_label()}"
             f"｜{self.size_text()}" + (f"｜账户 {self.account}" if self.account else "")
         )
 
@@ -265,6 +302,25 @@ class StrategyConfig:
             cfg.factor_cfg = {}
         if not isinstance(cfg.factor_keys, list):
             cfg.factor_keys = []
+        # 截面策略那组字段同样要消毒：手改 JSON 写成字符串 / 0 / 负数时不能让
+        # 回测直接除零或者永远不调仓
+        for f in ("cross_symbols", "timing_factor_keys"):
+            if not isinstance(getattr(cfg, f), list):
+                setattr(cfg, f, [])
+        for f in ("timing_rule_params", "timing_factor_reverse", "timing_factor_cfg"):
+            if not isinstance(getattr(cfg, f), dict):
+                setattr(cfg, f, {})
+        try:
+            cfg.cross_rebalance = max(1, int(cfg.cross_rebalance or 1))
+        except (TypeError, ValueError):
+            cfg.cross_rebalance = 5
+        cfg.cross_top_pct = _clamp_pct(cfg.cross_top_pct, 10.0, 50.0)
+        if cfg.cross_mode not in ("hedge", "select"):
+            cfg.cross_mode = "hedge"
+        if cfg.cross_weight not in ("equal", "score"):
+            cfg.cross_weight = "equal"
+        if cfg.timing_family not in ("rule", "factor"):
+            cfg.timing_family = "rule"
         return cfg
 
     def clone(self, **changes) -> "StrategyConfig":

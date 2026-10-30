@@ -113,6 +113,25 @@ def _row_z(row: pd.Series) -> pd.Series:
     return (row - float(v.mean())) / sd
 
 
+def _cross_z(panel: pd.DataFrame) -> pd.DataFrame:
+    """整块面板一次算完横截面 Z-score。
+
+    和逐行调 `_row_z` 等价，但快两个数量级：`DataFrame.apply(axis=1)` 要走
+    Python 层，6 个品种 × 8 个因子 × 3 万根就是 150 万次函数调用，一次回测
+    要七十秒 —— 拖一下「调仓间隔」就卡住。pandas 的 `mean/std(axis=1)` 是
+    按列向量化的，同样的数学，毫秒级。
+
+    口径必须和 `_row_z` 完全一致：`ddof=0`、缺值跳过、有效样本不足 `MIN_CROSS`
+    整行 NaN、横截面全一样（std=0）时记 0（没有强弱可分，不是 NaN）。
+    """
+    n = panel.notna().sum(axis=1)
+    mean = panel.mean(axis=1)
+    sd = panel.std(axis=1, ddof=0)
+    z = panel.sub(mean, axis=0).div(sd.replace(0.0, np.nan), axis=0)
+    z = z.mask(sd.eq(0.0), 0.0)
+    return z.mask(n < MIN_CROSS)
+
+
 def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
                 reverse: dict | None = None) -> pd.DataFrame:
     """截面合成分数：每个因子先横截面 Z-score，再按方向取号、等权平均。
@@ -135,7 +154,7 @@ def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
         if len(raw) < MIN_CROSS:
             continue
         panel = pd.concat(raw, axis=1).sort_index().ffill()
-        z = panel.apply(_row_z, axis=1)
+        z = _cross_z(panel)
         if key in rev:
             z = -z
         parts.append(z)
@@ -238,29 +257,118 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     )
 
 
+def to_result(out: "CrossResult", label: str = "", step: int = 1,
+              bpy: float = 252.0):
+    """把 `CrossResult` 包成 `backtest.Result`，好让现成的绩效页直接吃得下。
+
+    截面策略没有「一笔一笔的成交」：仓位是按权重挂着的，用成交笔数去描述它
+    只会得到「0 笔交易」。这里把**每次调仓区间**当成一笔 —— 区间收益为正算赢。
+    这样胜率、盈亏比、最好 / 最差一笔都还有意义，表格也不会整列写 0。
+    """
+    from ttrade.backtest import Result, _metrics
+
+    eq = out.equity.dropna()
+    w = out.weights.reindex(eq.index).fillna(0.0)
+    has_long = (w > 0).any(axis=1)
+    has_short = (w < 0).any(axis=1)
+    pos = pd.Series(0.0, index=eq.index)
+    pos[has_long.to_numpy()] = 1.0
+    pos[(has_short & ~has_long).to_numpy()] = -1.0
+
+    m = dict(_metrics(eq, pos, [], bpy))
+    ret = eq.pct_change().fillna(0.0)
+    step = max(1, int(step or 1))
+    seg: list[float] = []
+    for i in range(0, len(ret), step):
+        chunk = ret.iloc[i:i + step]
+        if len(chunk):
+            seg.append(float((1.0 + chunk).prod() - 1.0))
+    n = len(seg)
+    wins = [x for x in seg if x > 0]
+    losses = [x for x in seg if x <= 0]
+    gross_win = sum(wins)
+    gross_loss = abs(sum(losses))
+    m["n_trades"] = n
+    m["n_long"] = n if bool(has_long.any()) else 0
+    m["n_short"] = n if bool(has_short.any()) else 0
+    m["win_rate"] = (len(wins) / n) if n else 0.0
+    m["avg_trade"] = (sum(seg) / n) if n else 0.0
+    m["profit_factor"] = ((gross_win / gross_loss) if gross_loss > 0
+                          else (999.0 if gross_win > 0 else 0.0))
+    m["avg_bars"] = float(step)
+    m["best_trade"] = max(seg) if seg else 0.0
+    m["worst_trade"] = min(seg) if seg else 0.0
+    # 绩效表里「期末资金」这一行读的是 `final_equity`，`backtest._metrics` 不算
+    # 它（那是 `run_backtest` 事后补的），这里得自己补上
+    m["final_equity"] = float(eq.iloc[-1])
+    return Result(equity=eq, position=pos, trades=[], metrics=m, label=label)
+
+
 def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig) -> pd.DataFrame:
     """多强空弱。多空各占一半名义，净敞口 ≈ 0。"""
-    out = pd.DataFrame(np.nan, index=score.index, columns=score.columns)
+    rows, top, bot, k, ok = _rank(score, cfg)
+    inv = 1.0 / np.maximum(k, 1)
+    if cfg.weight == "score":
+        mat = score.to_numpy(dtype=float)[rows]
+        pos = np.where(top, np.clip(np.nan_to_num(mat), 0.0, None), 0.0)
+        s = pos.sum(axis=1)
+        good = s > 0
+        share = np.zeros_like(pos)
+        share[good] = pos[good] / s[good, None]
+        w = np.where(good[:, None], 0.5 * share, top * (0.5 * inv)[:, None])
+    else:
+        w = top * (0.5 * inv)[:, None]
+    if not cfg.long_only:
+        w = w - bot * (0.5 * inv)[:, None]
+    return _place(score, rows, w, ok)
+
+
+def _rank(score: pd.DataFrame, cfg: CrossConfig):
+    """调仓日上「谁在前、谁在后」一次性排完。
+
+    返回 `(行号, 多头掩码, 空头掩码, 每行几个, 有效行掩码)`。逐行 `nlargest` 在
+    5 分钟全历史上是 4 万多次 pandas 调用、七十秒；这里按轴排序一次就够 ——
+    拖一下「调仓间隔」不至于卡住半分钟。
+
+    NaN 必须排到两端之外：多头侧按 `-inf` 参与排序，空头侧按 `+inf`，这样
+    「有效品种不足」的品种永远不会被选中，和 `dropna()` 之后再排等价。
+    """
     step = cfg.step()
-    for i in range(0, len(score), step):
-        row = score.iloc[i]
-        valid = row.dropna()
-        if len(valid) < MIN_CROSS:
-            continue
-        n = cfg.n_legs(len(valid))
-        w = pd.Series(0.0, index=score.columns)
-        top = valid.nlargest(n).index
-        if cfg.weight == "score":
-            pos = valid[top].clip(lower=0)
-            share = pos / pos.sum() if pos.sum() > 0 else None
-        else:
-            share = None
-        w[top] = (0.5 * share) if share is not None else 0.5 / n
-        if not cfg.long_only:
-            bot = valid.nsmallest(n).index
-            w[bot] = -0.5 / n
-        out.iloc[i] = w
-    return out.ffill().fillna(0.0)
+    rows = np.arange(0, len(score), step)
+    mat = score.to_numpy(dtype=float)[rows] if len(rows) else np.zeros((0, score.shape[1]))
+    n_valid = np.sum(~np.isnan(mat), axis=1)
+    ok = n_valid >= MIN_CROSS
+    pct = float(cfg.top_pct or 0) / 100.0
+    k = np.round(n_valid * pct).astype(int)
+    k = np.maximum(1, np.minimum(k, np.maximum(1, n_valid // 2)))
+    k = np.where(ok, k, 0)
+    width = int(k.max()) if len(k) else 0
+    top = np.zeros(mat.shape, dtype=bool)
+    bot = np.zeros(mat.shape, dtype=bool)
+    if width:
+        hi = np.argsort(-np.where(np.isnan(mat), -np.inf, mat), axis=1, kind="stable")
+        lo = np.argsort(np.where(np.isnan(mat), np.inf, mat), axis=1, kind="stable")
+        for j in range(width):
+            sel = np.nonzero(k > j)[0]
+            if not len(sel):
+                break
+            top[sel, hi[sel, j]] = True
+            bot[sel, lo[sel, j]] = True
+    return rows, top, bot, k, ok
+
+
+def _place(score: pd.DataFrame, rows, w: np.ndarray, ok) -> pd.DataFrame:
+    """把调仓日的权重放回整条时间轴，中间那段沿用上一组。
+
+    有效品种不足的行**留空**而不是清零：`ffill` 之后就是「还没到下一个调仓日，
+    先按上一组持仓挂着」，和逐行那版 `continue` 的语义一致。清零等于凭空平仓，
+    会在净值和换手上多出一批假动作。
+    """
+    dense = np.full((len(score), score.shape[1]), np.nan)
+    if len(rows):
+        dense[rows[ok]] = w[ok]
+    return pd.DataFrame(dense, index=score.index,
+                        columns=score.columns).ffill().fillna(0.0)
 
 
 def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
@@ -275,20 +383,10 @@ def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
         sigs[sym] = _timing_signal(df, cfg)
     sig_panel = pd.concat(sigs, axis=1).sort_index().reindex(score.index).ffill().fillna(0.0)
 
-    out = pd.DataFrame(np.nan, index=score.index, columns=score.columns)
-    step = cfg.step()
-    for i in range(0, len(score), step):
-        row = score.iloc[i]
-        valid = row.dropna()
-        if len(valid) < MIN_CROSS:
-            continue
-        n = cfg.n_legs(len(valid))
-        top = valid.nlargest(n).index
-        w = pd.Series(0.0, index=score.columns)
-        w[top] = 1.0 / n
-        out.iloc[i] = w
+    rows, top, _bot, k, ok = _rank(score, cfg)
+    inv = 1.0 / np.maximum(k, 1)
+    held = _place(score, rows, top * inv[:, None], ok)
     # 选中的那一段里，按时序信号决定持有方向；没选中就是 0
-    held = out.ffill().fillna(0.0)
     return held * sig_panel
 
 

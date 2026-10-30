@@ -439,6 +439,13 @@ class PortfolioRunner:
         st = self._slots.get(sid)
         if st is None:
             return
+        if on and st.cfg.family == "cross":
+            # 截面策略要**同时**持有一篮子品种、按权重整体调仓，而实盘引擎一次
+            # 只管一个合约。硬跑会变成「只按第一个品种下单」，那是最危险的一种
+            # 错误 —— 看着在跑，实际仓位完全不是回测里那条曲线
+            st.error = ("截面策略暂不支持实盘：实盘引擎一次只挂一个合约，"
+                        "截面要一篮子同时按权重调仓。可以先用组合页看回测")
+            return
         if on and not st.cfg.rule_key and st.cfg.family == "rule":
             st.error = "这条策略没有选规则"
             return

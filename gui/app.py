@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import time
@@ -70,16 +71,21 @@ from PySide6.QtWidgets import (
 )
 
 from ttrade import costs, factors, mlmodels, symbols_info, tqdata, tqlive
+from ttrade import cross as cross_engine
 from ttrade import factor_strategy as fstrat
 from ttrade import replay
 from ttrade import strategy_store as SStore
 from gui.agent_page import AgentPage
 from gui.data_page import DataPage
 from gui.live import LiveController
+from gui.pickers import SymbolPicker
 from gui.portfolio_page import LibraryDialog, PortfolioPage
 from gui.result_view import ResultView, ViewCtx
 from gui.trade_page import TradePage
-from ttrade.backtest import BacktestConfig, bars_per_year, buy_and_hold, run_backtest
+from ttrade.backtest import (
+    BacktestConfig, bars_per_year, buy_and_hold, combine, combine_trades,
+    run_backtest,
+)
 from ttrade.eastmoney import load_local
 from ttrade.strategies import (
     PARAM_LABELS, STRATEGIES, available_text, resolve_key, run_strategy,
@@ -116,9 +122,30 @@ PERIOD_LABEL = dict(tqdata.PERIOD_LABEL, **{PERIOD_1D: "日线Tushare"})
 # 拿掉规则本来要开的仓，不自己产生信号。
 FAMILY_RULE = "rule"
 FAMILY_FACTOR = "factor"
+FAMILY_CROSS = "cross"
 FAMILIES = [
     (FAMILY_RULE, "规则策略", "经典技术指标，阈值/交叉直接产生信号"),
     (FAMILY_FACTOR, "因子策略", "因子分数过阈值进出场，可单因子/多因子/机器学习"),
+    (FAMILY_CROSS, "截面策略",
+     "拿一批品种横向比强弱：截面对冲（多强空弱），或截面选品种后再跑时序策略"),
+]
+
+# 截面策略的两种玩法
+CROSS_MODES = [
+    ("hedge", "截面对冲", "多最强的 top X%、空最弱的 bottom X%，净敞口≈0"),
+    ("select", "截面选品种 + 时序交易",
+     "先用截面因子挑 top X%，再让每个品种自己的时序策略决定多空"),
+]
+
+CROSS_WEIGHTS = [
+    ("equal", "等权", "每一条腿分到同样的名义金额"),
+    ("score", "按分数加权", "截面分数越高，多头腿分到的钱越多"),
+]
+
+# 时序策略（只对「选品种 + 时序交易」生效）
+TIMING_FAMILIES = [
+    ("rule", "规则策略", "用下面的规则策略决定这一腿何时开平"),
+    ("factor", "因子策略", "用因子分数决定这一腿何时开平"),
 ]
 
 # 因子模式（因子策略与因子过滤共用）
@@ -957,8 +984,27 @@ class MainWindow(QMainWindow):
         # 「启动实时」挂在 K 线与信号页的标题行上：它只影响这张图，放侧边栏会
         # 让人以为它跟回测参数有关
         self.view.add_chart_action(self._build_live_btn())
-        root.addWidget(self.tabs, 1)
+        # 多品种 / 截面策略是**组合净值**，没有「某一条策略的 K 线」可言，用另一套
+        # 视图（绩效 / 阶段 / 交易记录三页）。两个视图叠在一个 QStackedWidget 里，
+        # 按当前模式切换 —— 把两套页签硬塞进同一个 QTabWidget 会变成 8 个页签。
+        self.view_port = ResultView("portfolio", self)
+        self.tabs_port = QTabWidget()
+        for title, w in self.view_port.pages():
+            self.tabs_port.addTab(w, title)
+        self.view_port.status.connect(self.lbl_status.setText)
+        self.view_stack = QStackedWidget()
+        self.view_stack.addWidget(self.tabs)
+        self.view_stack.addWidget(self.tabs_port)
+        root.addWidget(self.view_stack, 1)
         return page
+
+    def _show_single_view(self) -> None:
+        if hasattr(self, "view_stack"):
+            self.view_stack.setCurrentIndex(0)
+
+    def _show_port_view(self) -> None:
+        if hasattr(self, "view_stack"):
+            self.view_stack.setCurrentIndex(1)
 
     def _build_live_btn(self) -> QPushButton:
         """研究页的实时开关。**手动**：换品种 / 换周期就断开，要再看得自己点。"""
@@ -1019,6 +1065,18 @@ class MainWindow(QMainWindow):
         self.cb_symbol = QComboBox()
         self.cb_symbol.setMaxVisibleItems(18)
         cl.addWidget(self.cb_symbol)
+        # 多品种勾选：截面策略要一批品种，多品种回测也是。按钮上直接写「已选
+        # N 个」，不点开就知道现在是单品种还是组合
+        self.sym_pick = SymbolPicker("多品种回测")
+        self.sym_pick.setToolTip(
+            "勾选多个品种：同一套策略在每个品种上各跑一遍，净值等权平均。\n"
+            "截面策略要求至少 3 个品种。"
+        )
+        cl.addWidget(self.sym_pick)
+        self.lbl_pick = QLabel("")
+        self.lbl_pick.setObjectName("Hint")
+        self.lbl_pick.setWordWrap(True)
+        cl.addWidget(self.lbl_pick)
 
         cl.addWidget(self._section("周期"))
         self.cb_period = QComboBox()
@@ -1043,6 +1101,69 @@ class MainWindow(QMainWindow):
                 self.cb_family.count() - 1, tip, Qt.ToolTipRole
             )
         cl.addWidget(self.cb_family)
+
+        # ---------------------------------------------- 截面策略页
+        # 时序策略（规则 / 因子）**复用下面的两套面板**，不再造一份参数控件：
+        # 截面只是换了个「拿哪些品种、按什么权重」的框架，单腿的进出场逻辑还是
+        # 那套规则策略 / 因子策略，复制一份参数控件只会让两边慢慢走偏。
+        self.box_cross = QWidget()
+        pc = QVBoxLayout(self.box_cross)
+        pc.setContentsMargins(0, 0, 0, 0)
+        pc.setSpacing(8)
+        pc.addWidget(self._section("截面模式"))
+        self.cb_cross_mode = QComboBox()
+        for key, label, tip in CROSS_MODES:
+            self.cb_cross_mode.addItem(label, key)
+            self.cb_cross_mode.setItemData(
+                self.cb_cross_mode.count() - 1, tip, Qt.ToolTipRole)
+        pc.addWidget(self.cb_cross_mode)
+
+        pc.addWidget(self._section("调仓"))
+        self.sp_cross_reb = QSpinBox()
+        self.sp_cross_reb.setRange(1, 2000)
+        self.sp_cross_reb.setValue(5)
+        self.sp_cross_reb.setPrefix("每 ")
+        self.sp_cross_reb.setSuffix(" 根调一次")
+        self.sp_cross_reb.setToolTip(
+            "调仓间隔，单位是 K 线根数。5 分钟周期 48 根约一个交易日，\n"
+            "日线就是「每 5 个交易日」。间隔越短换手越高，成本吃掉的越多。"
+        )
+        pc.addWidget(self.sp_cross_reb)
+
+        self.sp_cross_pct = QDoubleSpinBox()
+        self.sp_cross_pct.setRange(1.0, 50.0)
+        self.sp_cross_pct.setDecimals(1)
+        self.sp_cross_pct.setSingleStep(1.0)
+        self.sp_cross_pct.setValue(10.0)
+        self.sp_cross_pct.setPrefix("选最强的 ")
+        self.sp_cross_pct.setSuffix(" %")
+        self.sp_cross_pct.setToolTip(
+            "多最强的 top X%（空最弱的 bottom X%）。6 个品种、10% 就是各 1 个；\n"
+            "品种少的时候至少算 1 个。"
+        )
+        pc.addWidget(self.sp_cross_pct)
+
+        self.cb_cross_w = QComboBox()
+        for key, label, tip in CROSS_WEIGHTS:
+            self.cb_cross_w.addItem(label, key)
+            self.cb_cross_w.setItemData(
+                self.cb_cross_w.count() - 1, tip, Qt.ToolTipRole)
+        pc.addWidget(self.cb_cross_w)
+
+        self.lbl_cross_timing = self._section("时序策略（选品种模式用）")
+        pc.addWidget(self.lbl_cross_timing)
+        self.cb_timing = QComboBox()
+        for key, label, tip in TIMING_FAMILIES:
+            self.cb_timing.addItem(label, key)
+            self.cb_timing.setItemData(
+                self.cb_timing.count() - 1, tip, Qt.ToolTipRole)
+        pc.addWidget(self.cb_timing)
+
+        self.lbl_cross_hint = QLabel("")
+        self.lbl_cross_hint.setObjectName("Hint")
+        self.lbl_cross_hint.setWordWrap(True)
+        pc.addWidget(self.lbl_cross_hint)
+        cl.addWidget(self.box_cross)
 
         # ---------------------------------------------- 规则策略页
         # 用 show/hide 而不是 QStackedWidget：堆叠容器的高度取所有页的最大值，
@@ -1454,6 +1575,12 @@ class MainWindow(QMainWindow):
             self.chk_short.toggled.connect(self._on_short_toggled)
 
             self.cb_family.currentIndexChanged.connect(self._on_family_changed)
+            self.cb_cross_mode.currentIndexChanged.connect(self._on_cross_mode_changed)
+            self.sp_cross_reb.valueChanged.connect(self._on_cross_param_changed)
+            self.sp_cross_pct.valueChanged.connect(self._on_cross_param_changed)
+            self.cb_cross_w.currentIndexChanged.connect(self._on_cross_param_changed)
+            self.cb_timing.currentIndexChanged.connect(self._on_timing_changed)
+            self.sym_pick.changed.connect(self._on_pick_changed)
             self.cb_fmode.currentIndexChanged.connect(self._on_fmode_changed)
             self.cb_filter_mode.currentIndexChanged.connect(self._on_fmode_changed)
             self.chk_filter.toggled.connect(self._on_filter_toggled)
@@ -1629,7 +1756,29 @@ class MainWindow(QMainWindow):
                             if self.cb_symbol.itemData(i)), 0)
             self.cb_symbol.setCurrentIndex(idx)
         self.cb_symbol.blockSignals(False)
+        if hasattr(self, "sym_pick"):
+            # 换市场要重填清单：保留还在池子里的勾选，没了的自动丢掉
+            self.sym_pick.set_items(self.store.items)
+            self._on_pick_changed()
         self._sync_period_hint()
+
+    def _multi_symbols(self) -> list[str]:
+        """多品种勾选里的键。**少于 2 个就当单品种**，走原来那条路。"""
+        if not hasattr(self, "sym_pick"):
+            return []
+        sel = self.sym_pick.selected()
+        return sel if len(sel) >= 2 else []
+
+    def _on_pick_changed(self) -> None:
+        sel = self._multi_symbols()
+        if hasattr(self, "lbl_pick"):
+            self.lbl_pick.setText(
+                f"多品种：{len(sel)} 个，每个品种各跑一遍再等权平均" if sel else ""
+            )
+        self._sync_cross_controls()
+        # 勾选是**连续动作**：勾 6 个品种会连发 6 次，一次截面回测几秒，用立即
+        # 模式等于让人等 6 遍。走防抖，手停 220ms 之后只算最后一次
+        self._schedule()
 
     def _short_enabled(self) -> bool:
         """当前是否允许做空。美股默认不允许，期货默认允许。"""
@@ -1902,11 +2051,84 @@ class MainWindow(QMainWindow):
 
     def _on_family_changed(self) -> None:
         self.family = self.cb_family.currentData() or FAMILY_RULE
-        is_rule = self.family == FAMILY_RULE
-        self.box_rule.setVisible(is_rule)
-        self.box_factor.setVisible(not is_rule)
+        self._sync_family_panels()
+        self._schedule(immediate=True)
+
+    def _sync_family_panels(self) -> None:
+        """按策略族切换左边那几块面板。
+
+        截面策略要**同时**显示截面自己的参数和「时序策略」那套面板：截面对冲只
+        用截面参数；选品种+时序还要一条时序腿，那条腿就是规则策略或因子策略，
+        直接复用下面两块，不再复制一份参数控件。
+        """
+        fam = self.family
+        is_rule = fam == FAMILY_RULE
+        is_factor = fam == FAMILY_FACTOR
+        is_cross = fam == FAMILY_CROSS
+        # 时序腿只在「选品种」模式下存在。截面对冲没有单腿进出场这回事，把规则
+        # 面板一起摆出来会让人以为那些参数会影响对冲结果
+        mode = self.cb_cross_mode.currentData() if hasattr(self, "cb_cross_mode") else "hedge"
+        timing = self._timing_family() if (is_cross and mode == "select") else ""
+        self.box_cross.setVisible(is_cross)
+        self.box_rule.setVisible(is_rule or (is_cross and timing == "rule"))
+        self.box_factor.setVisible(is_factor or (is_cross and timing == "factor"))
         self.box_filter.setVisible(is_rule)
+        self._sync_cross_controls()
         self._sync_factor_panel()
+
+    def _timing_family(self) -> str:
+        """截面「选品种」模式下的时序策略类型。"""
+        if not hasattr(self, "cb_timing"):
+            return "rule"
+        return self.cb_timing.currentData() or "rule"
+
+    def _cross_mode(self) -> str:
+        """截面模式：hedge（多强空弱）/ select（选品种 + 时序）。"""
+        if not hasattr(self, "cb_cross_mode"):
+            return "hedge"
+        return self.cb_cross_mode.currentData() or "hedge"
+
+    def _sync_cross_controls(self) -> None:
+        """截面面板的提示：够不够品种、这一组参数大概持几条腿。"""
+        if not hasattr(self, "cb_cross_mode"):
+            return
+        sel = self._multi_symbols()
+        mode = self._cross_mode()
+        # 「时序策略」只对选品种模式有意义，截面对冲没有单腿进出场这回事
+        on = self.family == FAMILY_CROSS and mode == "select"
+        for w in (self.lbl_cross_timing, self.cb_timing):
+            w.setVisible(on)
+        if self.family != FAMILY_CROSS:
+            return
+        n = len(sel)
+        legs = int(round(n * float(self.sp_cross_pct.value()) / 100.0)) if n else 0
+        legs = max(1, legs) if n else 0
+        if n < cross_engine.MIN_CROSS:
+            self.lbl_cross_hint.setText(
+                f"截面策略至少要 {cross_engine.MIN_CROSS} 个品种，现在选了 {n} 个。"
+                "在「多品种回测」里勾一下（同一个周期、同一个市场）。"
+            )
+        elif mode == "hedge":
+            self.lbl_cross_hint.setText(
+                f"{n} 个品种，每次调仓多 {legs} 个、空 {legs} 个，"
+                f"多空各占一半名义。"
+            )
+        else:
+            self.lbl_cross_hint.setText(
+                f"{n} 个品种，每次调仓挑出最强的 {legs} 个，"
+                "再由时序策略决定每个品种是多是空还是空仓。"
+            )
+
+    def _on_cross_mode_changed(self, *_a) -> None:
+        self._sync_family_panels()
+        self._schedule(immediate=True)
+
+    def _on_cross_param_changed(self, *_a) -> None:
+        self._sync_cross_controls()
+        self._schedule()
+
+    def _on_timing_changed(self, *_a) -> None:
+        self._sync_family_panels()
         self._schedule(immediate=True)
 
     def _on_filter_toggled(self, _checked: bool) -> None:
@@ -1926,6 +2148,9 @@ class MainWindow(QMainWindow):
         两处共用同一套控件：因子策略和因子过滤不可能同时生效，共用能省一半控件，
         而且从策略改成过滤时勾好的因子还在，不用重勾一遍。
         """
+        if self.family == FAMILY_CROSS:
+            self._sync_cross_factor_panel()
+            return
         self.factor_mode = self._factor_mode()
         show = (self.family == FAMILY_FACTOR) or self._filter_active()
         self.box_fsel.setVisible(show)
@@ -1952,6 +2177,31 @@ class MainWindow(QMainWindow):
 
         self._rebuild_fparams()
         self._refresh_fmode_hint()
+
+    def _sync_cross_factor_panel(self) -> None:
+        """截面模式下的因子面板。
+
+        **截面因子**永远走「多因子」那一套：横截面 Z-score 之后等权平均，单个
+        因子没有「排序」可言。所以多因子表格一直显示。
+
+        **时序腿**如果选了因子，用单因子下拉（`cb_fsingle`）—— 它是另一组控件，
+        和截面因子互不覆盖。两条腿用同一张表的话，改截面因子会顺手改掉时序信号，
+        调参根本分不清是谁在起作用。
+        """
+        self.factor_mode = "multi"
+        self.box_fsel.setVisible(True)
+        self.lbl_fsel.setText("截面因子（横截面 Z-score 后等权）")
+        self.box_fsingle.setVisible(
+            self._cross_mode() == "select" and self._timing_family() == "factor"
+        )
+        self.tbl_fmulti.setVisible(True)
+        self.box_fbtns.setVisible(True)
+        self.lbl_fmodel.setVisible(False)
+        self.cb_fmodel.setVisible(False)
+        self.cb_forient.setVisible(True)
+        self.lbl_fmode.setText("")
+        self._rebuild_fparams()
+        self._sync_single_rev()
 
     def _refresh_fmode_hint(self) -> None:
         if self.family != FAMILY_FACTOR:
@@ -2161,6 +2411,7 @@ class MainWindow(QMainWindow):
             # 不能一律 rpartition("_")：AAPL 会被拆成 ("", "", "AAPL")。
             sym, ex = skey, ""
         is_factor = self.family == FAMILY_FACTOR
+        is_cross = self.family == FAMILY_CROSS
         fc = self._factor_cfg() if is_factor else None
         return SStore.StrategyConfig(
             name=self.ed_cfg_name.text().strip(),
@@ -2170,8 +2421,8 @@ class MainWindow(QMainWindow):
             family=self.family,
             rule_key=self.cb_strategy.currentData() or "",
             rule_params=self._current_params(),
-            factor_mode=self.factor_mode if is_factor else "",
-            factor_keys=self._selected_factor_keys() if is_factor else [],
+            factor_mode=("multi" if is_cross else self.factor_mode) if (is_factor or is_cross) else "",
+            factor_keys=self._selected_factor_keys() if (is_factor or is_cross) else [],
             factor_reverse={k: True for k in self._reversed_factor_keys()},
             factor_cfg=dict(vars(fc)) if fc is not None else {},
             sizing=self.cb_size.currentData() or "capital",
@@ -2184,6 +2435,18 @@ class MainWindow(QMainWindow):
             note="short" if self.chk_short.isChecked() else "",
             range_years=float(self.cb_range.currentData() or 0),
             cost_profile=(self.cb_cost.currentData() or "") if self.market == "cn" else "",
+            cross_symbols=list(self.sym_pick.selected()) if hasattr(self, "sym_pick") else [],
+            cross_mode=self.cb_cross_mode.currentData() or "hedge",
+            cross_rebalance=int(self.sp_cross_reb.value()),
+            cross_top_pct=float(self.sp_cross_pct.value()),
+            cross_weight=self.cb_cross_w.currentData() or "equal",
+            timing_family=self._timing_family(),
+            timing_rule_key=self.cb_strategy.currentData() or "",
+            timing_rule_params=self._current_params(),
+            timing_factor_mode="single",
+            timing_factor_keys=[self.cb_fsingle.currentData()] if self.cb_fsingle.currentData() else [],
+            timing_factor_reverse={k: True for k in self._reversed_factor_keys()},
+            timing_factor_cfg=dict(vars(self._factor_cfg())),
         )
 
     def apply_config(self, cfg: SStore.StrategyConfig) -> None:
@@ -2230,6 +2493,48 @@ class MainWindow(QMainWindow):
                 self.cb_fmode.setCurrentIndex(m)
             self._apply_factor_keys(cfg.factor_keys, cfg.factor_reverse)
             self._apply_factor_cfg(cfg.factor_cfg)
+
+        if cfg.family == FAMILY_CROSS:
+            # 品种勾选要**在截面参数之前**恢复：`_sync_cross_controls` 要按选中
+            # 数量算「这一组参数持几条腿」，勾选没到位提示就是错的
+            syms = [s for s in (cfg.cross_symbols or [])
+                    if s in {it.get("key") for it in self.store.items}]
+            self.sym_pick.set_selected(syms)
+            if hasattr(self, "lbl_pick"):
+                self.lbl_pick.setText(
+                    f"多品种：{len(syms)} 个，每个品种各跑一遍再等权平均"
+                    if len(syms) >= 2 else ""
+                )
+            cm = self.cb_cross_mode.findData(cfg.cross_mode or "hedge")
+            if cm >= 0:
+                self.cb_cross_mode.setCurrentIndex(cm)
+            self.sp_cross_reb.setValue(max(1, int(cfg.cross_rebalance or 5)))
+            self.sp_cross_pct.setValue(float(cfg.cross_top_pct or 10.0))
+            cw = self.cb_cross_w.findData(cfg.cross_weight or "equal")
+            if cw >= 0:
+                self.cb_cross_w.setCurrentIndex(cw)
+            tf = self.cb_timing.findData(cfg.timing_family or "rule")
+            if tf >= 0:
+                self.cb_timing.setCurrentIndex(tf)
+            self._apply_factor_keys(cfg.factor_keys, cfg.factor_reverse)
+            # 时序腿的规则参数在 `timing_rule_params` 里，和主规则参数是两套：
+            # 截面对冲时用户可能在两个模式下调过不同的参数
+            tk = self.cb_strategy.findData(cfg.timing_rule_key or cfg.rule_key)
+            if tk >= 0 and tk != self.cb_strategy.currentIndex():
+                self.cb_strategy.setCurrentIndex(tk)
+            for name, val in (cfg.timing_rule_params or {}).items():
+                w = self.param_widgets.get(name)
+                if w is not None:
+                    try:
+                        w.setValue(int(round(float(val) * self.param_scales.get(name, 1))))
+                    except (TypeError, ValueError):
+                        continue
+            tk = cfg.timing_factor_keys or []
+            if tk:
+                i = self.cb_fsingle.findData(tk[0])
+                if i >= 0:
+                    self.cb_fsingle.setCurrentIndex(i)
+            self._sync_cross_controls()
 
         self.chk_short.setChecked(cfg.note == "short")
         i = self.cb_size.findData(getattr(cfg, "sizing", "capital") or "capital")
@@ -2451,6 +2756,16 @@ class MainWindow(QMainWindow):
         )
 
     def run_analysis(self, df_override: pd.DataFrame | None = None) -> None:
+        # 截面策略和多品种回测都是「一批品种 → 一条组合净值」，和单品种那条
+        # K 线路径完全不是一回事，先分出去
+        if self.family == FAMILY_CROSS:
+            self._run_cross()
+            return
+        syms = self._multi_symbols()
+        if syms:
+            self._run_multi(syms)
+            return
+        self._show_single_view()
         skey = self.cb_symbol.currentData()
         if not skey:
             return
@@ -2549,6 +2864,257 @@ class MainWindow(QMainWindow):
             self._publish(f"因子计算失败：{exc}", True)
             return
         self._apply_outcome(out, rule_signal)
+
+    # ---------------------------------------------------- 多品种 / 截面
+    def _key_parts(self, key: str) -> tuple[str, str]:
+        """品种键拆成 (代码, 交易所)。美股的键就是代码本身，没有交易所。"""
+        if self.market == "cn":
+            sym, _, ex = key.rpartition("_")
+            return sym, ex
+        return key, ""
+
+    def _key_label(self, key: str) -> str:
+        for it in self.store.items:
+            if it.get("key") == key:
+                return it.get("label") or key
+        return key
+
+    def _frames_for(self, keys: list[str], period: str) -> tuple[dict, list[str]]:
+        """按一批品种键取行情，统一裁到「回测区间」。缺数据的单独记下来。"""
+        rng = self.cb_range.currentData() or 0
+        frames: dict[str, pd.DataFrame] = {}
+        missing: list[str] = []
+        for key in keys:
+            df = self.store.get(key, period)
+            if df is None or df.empty:
+                missing.append(self._key_label(key))
+                continue
+            frames[key] = replay.window(df, rng)
+        return frames, missing
+
+    def _backtest_one(self, key: str, df: pd.DataFrame):
+        """单个品种按当前策略跑一遍，返回 `Result`。
+
+        配置要**每个品种单独建一份**：成本按各自的 tick / 手续费算，乘数和保证金
+        也各不相同。共用一份 `self.cfg` 会把上一个品种的 tick 带到下一个头上。
+        """
+        cfg = copy.copy(self.cfg)
+        cfg.bars_per_year = bars_per_year(df.index)
+        self._apply_sizing(cfg)
+        sym, ex = self._key_parts(key)
+        if self.market == "cn":
+            costs.apply(cfg, sym, ex, self.cb_cost.currentData() or None)
+            si = symbols_info.info(sym, ex)
+            cfg.multiplier = float(si.get("mult") or 0) or 1.0
+            cfg.margin_rate = float(si.get("margin") or 0) or 0.1
+        else:
+            cfg.multiplier, cfg.margin_rate = 1.0, 1.0
+
+        rule_signal = None
+        base = df
+        label = ""
+        if self.family == FAMILY_RULE:
+            rkey = self.cb_strategy.currentData()
+            if not rkey:
+                return None
+            base = run_strategy(df, rkey, self._current_params())
+            rule_signal = base["signal"].to_numpy(int)
+            label = STRATEGIES[rkey].label
+
+        if not ((self.family == FAMILY_FACTOR) or self._filter_active()):
+            return run_backtest(base, cfg, label=label)
+
+        keys = self._selected_factor_keys()
+        if not keys:
+            return None
+        fcfg = self._factor_cfg()
+        if rule_signal is None:
+            out = fstrat.run_factor_strategy(df, self.factor_mode, keys, fcfg)
+        else:
+            out = fstrat.run_rule_with_filter(df, rule_signal, self.factor_mode, keys, fcfg)
+        return run_backtest(out.df, cfg, label=out.label)
+
+    def _run_multi(self, keys: list[str]) -> None:
+        """多品种回测：同一套策略在每个品种上各跑一遍，净值等权平均。
+
+        和截面策略不是一回事 —— 各品种之间没有任何比较，也没有多空配对，只是
+        把 N 条独立回测拼成一条曲线，回答「这套参数换一批品种还灵不灵」。
+        """
+        period = self._period()
+        frames, missing = self._frames_for(keys, period)
+        if not frames:
+            self._show_single_view()
+            self._clear_chart(
+                f"勾选的品种都没有 {PERIOD_LABEL.get(period, period)} 数据"
+            )
+            return
+        if self.factor_mode == "ml" and (
+            self.family == FAMILY_FACTOR or self._filter_active()
+        ):
+            # 每折 walk-forward 都要重训，乘上品种数就是几十分钟。同步跑会卡死
+            # 界面，起线程又要 N 条并行 —— 不如直说这条不支持
+            self.lbl_status.setText(
+                "机器学习多因子不支持多品种回测（每个品种都要单独重训一遍），"
+                "请改用单因子 / 多因子"
+            )
+            return
+
+        results, named = [], []
+        failed = [f"{m}：没有行情数据" for m in missing]
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for key, df in frames.items():
+                try:
+                    res = self._backtest_one(key, df)
+                except Exception as exc:  # noqa: BLE001
+                    failed.append(f"{self._key_label(key)}：{exc}")
+                    continue
+                if res is None:
+                    failed.append(f"{self._key_label(key)}：没有产生信号")
+                    continue
+                results.append(res)
+                named.append((self._key_label(key), res))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if not results:
+            self._show_single_view()
+            self._clear_chart("多品种回测没有结果：" + "；".join(failed))
+            return
+
+        res = combine(results, label="多品种等权")
+        trades = combine_trades(named)
+        bpy = bars_per_year(res.equity.index)
+        ctx = ViewCtx(
+            symbol="", name=f"{len(results)} 个品种", exchange="",
+            period=period, market=self.market, label="多品种等权",
+            legend=MARKETS[self.market]["legend"], price_note="净值",
+            range_years=self.cb_range.currentData() or None,
+            long_only=self.cfg.long_only, bars_per_year=bpy,
+            overlay=False, selected_keys=[],
+        )
+        self._show_port_view()
+        self.view_port.show_result(None, None, res, None, ctx, trades=trades)
+        self.res, self.bh, self.df_raw, self.df_sig = res, None, None, None
+        self.factor_outcome = None
+        self._strategy_label = "多品种等权"
+        head = f"多品种（{len(results)} 个）"
+        self.lbl_status.setText(
+            f"{head} · {res.label} · 累计 {res.metrics['total_return'] * 100:+.1f}%"
+            + (f"　缺：{'、'.join(failed)}" if failed else "")
+        )
+        self._publish_port(res, head, period, bpy)
+
+    def _run_cross(self) -> None:
+        """截面策略：一批品种一起排强弱，多强的空弱的（或选出强的再走时序）。"""
+        keys = self.sym_pick.selected() if hasattr(self, "sym_pick") else []
+        if len(keys) < cross_engine.MIN_CROSS:
+            self._show_single_view()
+            self._clear_chart(
+                f"截面策略至少要勾 {cross_engine.MIN_CROSS} 个品种，"
+                f"现在选了 {len(keys)} 个 —— 在「多品种回测」里勾（同市场、同周期）"
+            )
+            return
+        period = self._period()
+        frames, missing = self._frames_for(keys, period)
+        if len(frames) < cross_engine.MIN_CROSS:
+            self._show_single_view()
+            self._clear_chart(
+                f"只有 {len(frames)} 个品种有 {PERIOD_LABEL.get(period, period)} 数据，"
+                f"截面策略至少要 {cross_engine.MIN_CROSS} 个"
+            )
+            return
+
+        fkeys = self._selected_factor_keys()
+        if not fkeys:
+            self.lbl_status.setText("截面策略要先选因子 —— 横截面强弱靠它排序")
+            return
+        rev = {k: True for k in self._reversed_factor_keys()}
+        ccfg = cross_engine.CrossConfig(
+            mode=self.cb_cross_mode.currentData() or "hedge",
+            rebalance=int(self.sp_cross_reb.value()),
+            top_pct=float(self.sp_cross_pct.value()),
+            long_only=self.cfg.long_only,
+            weight=self.cb_cross_w.currentData() or "equal",
+            factor_mode="multi",
+            factor_keys=fkeys,
+            factor_reverse=rev,
+            timing_family=self._timing_family(),
+            timing_rule_key=self.cb_strategy.currentData() or "",
+            timing_rule_params=self._current_params(),
+            timing_factor_mode="single",
+            timing_factor_keys=[self.cb_fsingle.currentData()] if self.cb_fsingle.currentData() else [],
+            timing_factor_reverse=rev,
+            timing_factor_cfg=dict(vars(self._factor_cfg())),
+        )
+        if ccfg.mode == "select" and ccfg.timing_family == "factor" and not ccfg.timing_factor_keys:
+            self.lbl_status.setText("时序腿选了「因子」，但没选时序因子")
+            return
+
+        panel = cross_engine.close_panel(frames)
+        bt = copy.copy(self.cfg)
+        bt.bars_per_year = bars_per_year(panel.index)
+        self._apply_sizing(bt)
+
+        mode_cn = "截面对冲" if ccfg.mode == "hedge" else "截面选品种"
+        label = (f"{mode_cn} · {len(frames)} 品种 · 每 {ccfg.step()} 根调仓")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            out = cross_engine.run(frames, ccfg, bt,
+                                   profile=self.cb_cost.currentData() or None,
+                                   label=label)
+        except Exception as exc:  # noqa: BLE001
+            QApplication.restoreOverrideCursor()
+            self._show_single_view()
+            self._clear_chart(f"截面回测失败：{exc}")
+            return
+        QApplication.restoreOverrideCursor()
+
+        if not out.ok:
+            self._show_single_view()
+            self._clear_chart(f"截面回测失败：{out.error or '没有算出净值'}")
+            return
+
+        res = self._cross_result(out, label, ccfg.step(), bt.bars_per_year)
+        ctx = ViewCtx(
+            symbol="", name=f"{len(frames)} 个品种", exchange="",
+            period=period, market=self.market, label=label,
+            legend=MARKETS[self.market]["legend"], price_note="净值",
+            range_years=self.cb_range.currentData() or None,
+            long_only=ccfg.long_only, bars_per_year=bt.bars_per_year,
+            overlay=False, selected_keys=[],
+        )
+        self._show_port_view()
+        self.view_port.show_result(None, None, res, None, ctx, trades=None)
+        self.res, self.bh, self.df_raw, self.df_sig = res, None, None, None
+        self.factor_outcome = None
+        self._strategy_label = label
+        m = res.metrics
+        self.lbl_status.setText(
+            f"{label} · 累计 {m['total_return'] * 100:+.1f}%"
+            f" · 年化 {m['cagr'] * 100:+.2f}% · 回撤 {m['max_dd'] * 100:.1f}%"
+            f" · 调仓 {m['n_trades']} 次"
+            + (f"　缺：{'、'.join(missing)}" if missing else "")
+        )
+        self._publish_port(res, f"{mode_cn}（{len(frames)} 个品种）", period,
+                           bt.bars_per_year)
+
+    def _cross_result(self, out, label: str, step: int, bpy: float):
+        """把 `CrossResult` 包成 `Result`（细节在 `cross.to_result`）。"""
+        return cross_engine.to_result(out, label=label, step=step, bpy=bpy)
+
+    def _publish_port(self, res, head: str, period: str, bpy: float) -> None:
+        """组合类结果（多品种 / 截面）没有基准也没有原始行情，单独摊一段文本。
+
+        `_result_text` 要求同时有 `df_raw` 和 `bh`，组合两样都没有 —— 复用它会
+        直接返回空串，模型那边就看不到任何数字。
+        """
+        rp = replay.Replay(res=res, bh=None, period=period,
+                           bars_per_year=bpy, long_only=self.cfg.long_only,
+                           label=res.label)
+        text = replay.summary(rp, head, PERIOD_LABEL.get(period, period))
+        if text:
+            self._publish(text, False)
 
     def _start_factor_worker(self, df, keys, cfg, rule_signal) -> None:
         """ML 模式走后台线程。已经在跑的先取消，避免旧结果盖掉新结果。"""

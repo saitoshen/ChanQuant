@@ -102,6 +102,7 @@ from PySide6.QtWidgets import (
 
 from gui.result_view import PERIOD_LABEL, ResultView, ViewCtx
 from ttrade import replay
+from ttrade import cross as cross_engine
 from ttrade import strategy_store as SStore
 from ttrade import tqlive
 from ttrade.tqlive import merge_live
@@ -972,6 +973,36 @@ class PortfolioPage(QWidget):
             return None, f"{key} 没有 {cfg.period} 的行情数据"
         return df, ""
 
+    def _load_frames(self, cfg) -> tuple[dict, str]:
+        """截面策略要一批品种的行情。返回 (frames, 出错原因)。
+
+        单品种那条路（`_load`）只认 `cfg.key()`；截面策略的品种记在
+        `cross_symbols` 里，得一个个取完再一起递进引擎。
+        """
+        keys = list(getattr(cfg, "cross_symbols", []) or [])
+        need = cross_engine.MIN_CROSS
+        if len(keys) < need:
+            return {}, f"只记了 {len(keys)} 个品种，截面策略至少要 {need} 个"
+        if self._loader is None:
+            return {}, "没有接上行情数据源"
+        mk = replay.market_of(cfg)
+        frames: dict = {}
+        missing: list[str] = []
+        for key in keys:
+            try:
+                df = self._loader(mk, key, cfg.period or "1d")
+            except Exception as exc:  # noqa: BLE001
+                missing.append(f"{key}（{exc}）")
+                continue
+            if df is None or df.empty:
+                missing.append(key)
+                continue
+            frames[key] = df
+        if len(frames) < need:
+            return {}, ("取不到足够的行情：" + "、".join(missing)
+                        if missing else "行情为空")
+        return frames, ""
+
     def _ctx(self, cfg, rp, period: str = "") -> ViewCtx:
         return ViewCtx(
             symbol=cfg.symbol,
@@ -1019,16 +1050,43 @@ class PortfolioPage(QWidget):
         「交易 Agent」发起的 backtest 走这里：跑完把文本推回 Agent 页的输出框，
         模型才知道算出来是什么。所以失败也要返回原因，不能只弹个红字。
         """
+        is_cross = getattr(cfg, "family", "") == "cross"
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            df, why = self._load(cfg)
-            if df is None:
-                return f"回测失败：{why}"
-            rp = replay.run(cfg, df)
+            if is_cross:
+                df = None
+                frames, why = self._load_frames(cfg)
+                if not frames:
+                    return f"回测失败：{why}"
+                rp = replay.run_cross(cfg, frames)
+            else:
+                df, why = self._load(cfg)
+                if df is None:
+                    return f"回测失败：{why}"
+                rp = replay.run(cfg, df)
         finally:
             QApplication.restoreOverrideCursor()
         if not rp.ok:
             return f"回测失败：{rp.error}"
+
+        period = PERIOD_LABEL.get(cfg.period, cfg.period)
+        if is_cross:
+            # 截面策略没有「某一条策略的 K 线」：仓位是一篮子权重，画 K 线会
+            # 误导。走组合视图那三页（绩效 / 阶段 / 交易记录）
+            self._stop_live()
+            _tabs, view = self._ensure_view("portfolio")
+            ctx = ViewCtx(
+                symbol="", name=f"{len(getattr(cfg, 'cross_symbols', []) or [])} 个品种",
+                exchange="", period=cfg.period, market=replay.market_of(cfg),
+                label=rp.label, price_note="净值",
+                range_years=float(cfg.range_years or 0) or None,
+                long_only=rp.long_only, bars_per_year=rp.bars_per_year,
+                overlay=False, selected_keys=[],
+            )
+            view.show_result(None, None, rp.res, None, ctx)
+            self._show_view("portfolio", f"{cfg.title()}｜{period}"
+                                         + (f"｜{note}" if note else ""))
+            return replay.summary(rp, cfg.title(), period)
 
         _tabs, view = self._ensure_view("single")
         view.show_result(rp.df, rp.raw, rp.res, rp.bh, self._ctx(cfg, rp))
@@ -1037,7 +1095,6 @@ class PortfolioPage(QWidget):
         self._live_cfg, self._live_base, self._live_sid = cfg, df, cfg.sid
         self._live_busy = False
         self._live_timer.start()
-        period = PERIOD_LABEL.get(cfg.period, cfg.period)
         # cfg.title() 已经含「品种 · 策略」，别再拼一遍 key 和策略名
         self._show_view("single", f"{cfg.title()}｜{period}"
                                  + (f"｜{note}" if note else ""))
@@ -1050,11 +1107,16 @@ class PortfolioPage(QWidget):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             for cfg in cfgs:
-                df, why = self._load(cfg)
-                if df is None:
-                    missing.append(why)
-                    continue
-                rp = replay.run(cfg, df, with_bh=False)
+                if getattr(cfg, "family", "") == "cross":
+                    frames, why = self._load_frames(cfg)
+                    rp = (replay.run_cross(cfg, frames) if frames
+                          else replay.Replay(error=why))
+                else:
+                    df, why = self._load(cfg)
+                    if df is None:
+                        missing.append(why)
+                        continue
+                    rp = replay.run(cfg, df, with_bh=False)
                 if not rp.ok:
                     missing.append(f"{cfg.title()}：{rp.error}")
                     continue

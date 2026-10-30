@@ -1106,6 +1106,16 @@ class AgentPage(QWidget):
             if d is not None:
                 html += [_block("逻辑", d.logic), _block("优势", d.edge),
                          _block("适应情况", d.fits), _block("风险", d.risk)]
+        elif cfg.family == "cross":
+            # 截面策略的「标的」不是一个品种，是一篮子。`cfg.key()` 只写了第一
+            # 个，照着看会以为它只交易那一个
+            syms = list(cfg.cross_symbols or [])
+            html.append(_block(
+                "品种池", f"{len(syms)} 个：{'、'.join(syms)}" if syms else "—"))
+            html.append(_block(
+                "说明", "截面策略目前只做回测：要同时挂一篮子品种、按权重整体调仓，"
+                        "而实盘引擎一次只对一个合约。先在「策略研究」里把参数调好，"
+                        "存进策略库，双击就能看回测。"))
         else:
             # 这句以前写的是「因子策略暂不支持实时交易，只能回测」—— 早就不是
             # 这样了：单因子 / 多因子在「策略交易和组合」里能直接挂实时，只有

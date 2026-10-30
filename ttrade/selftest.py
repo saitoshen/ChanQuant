@@ -858,7 +858,7 @@ def _run() -> tuple[bool, list[str]]:
                        and win.btn_live.text() == "启动实时"
                        and win.study_live.running is False)
 
-        # 因子面板：两个策略族、三种因子模式、47 个因子、四类模型都得在
+        # 因子面板：三个策略族、三种因子模式、47 个因子、四类模型都得在
         fams = {win.cb_family.itemData(i) for i in range(win.cb_family.count())}
         modes = {win.cb_fmode.itemData(i) for i in range(win.cb_fmode.count())}
         filters = {win.cb_filter_when.itemData(i) for i in range(win.cb_filter_when.count())}
@@ -868,7 +868,7 @@ def _run() -> tuple[bool, list[str]]:
         n_rows_f = win.tbl_fmulti.rowCount()
         n_cols_f = win.tbl_fmulti.columnCount()
         factor_ok = (
-            fams == {"rule", "factor"}
+            fams == {"rule", "factor", "cross"}
             and modes == {"single", "multi", "ml"}
             and filters == {"entry", "delay", "hold"}
             # 方向口径三档必须都在，否则「反转」只能相对自动定向，跨品种不可比
@@ -879,6 +879,13 @@ def _run() -> tuple[bool, list[str]]:
             and n_rows_f >= 47
             and n_cols_f == 3
             and win.chk_frev is not None
+            # 多品种勾选 / 截面参数 / 成本档位 / 两套结果视图
+            and win.sym_pick is not None
+            and win.cb_cross_mode.count() >= 2
+            and win.cb_cross_w.count() >= 2
+            and win.cb_timing.count() >= 2
+            and win.view_stack.count() == 2
+            and win.cb_cost.count() >= 3
         )
         factor_info = f"{len(fams)} 族 / {len(modes)} 模式 / {n_factors} 因子 / {n_models} 模型"
 

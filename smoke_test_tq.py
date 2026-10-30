@@ -1210,6 +1210,32 @@ def check_strategy_store() -> None:
         check("策略配置：成本档位往返一致", back.cost_profile == "stress",
               back.cost_profile)
 
+        # 截面字段要能存能读：品种池丢了就等于把策略变成了单品种
+        cx = St.StrategyConfig(
+            name="截面测试", symbol="CU", exchange="SHFE", period="5m",
+            family="cross", cross_symbols=["CU_SHFE", "RB_SHFE", "M_DCE"],
+            cross_mode="select", cross_rebalance=48, cross_top_pct=25.0,
+            cross_weight="score", factor_keys=["mom_20"],
+            timing_family="factor", timing_rule_key="ma_cross",
+            timing_factor_keys=["mom_60"], cost_profile="neutral",
+        )
+        St.add_to_library(cx)
+        cb = next(c for c in St.load_library() if c.sid == cx.sid)
+        check("策略配置：截面字段往返一致",
+              (cb.cross_symbols, cb.cross_mode, cb.cross_rebalance,
+               round(cb.cross_top_pct, 1), cb.cross_weight,
+               cb.timing_family, cb.timing_factor_keys)
+              == (["CU_SHFE", "RB_SHFE", "M_DCE"], "select", 48, 25.0, "score",
+                  "factor", ["mom_60"]),
+              str((cb.cross_symbols, cb.cross_mode, cb.cross_rebalance,
+                   cb.cross_top_pct, cb.cross_weight, cb.timing_family)))
+        check("策略配置：截面的标题不写单个品种",
+              "CU_SHFE" not in cb.title() and "3 个品种" in cb.strategy_label(),
+              cb.title())
+        check("策略配置：截面参数摘要含调仓与 top",
+              "调仓" in cb.params_text() and "top" in cb.params_text(),
+              cb.params_text())
+
         St.save_chase(St.ChaseConfig(enabled=True, wait_sec=3, retries=2, ticks=5))
         c = St.load_chase()
         check("追单设置：往返一致", (c.wait_sec, c.retries, c.ticks) == (3, 2, 5),
@@ -1359,6 +1385,31 @@ def check_cross() -> None:
     check("截面选品种+时序：只持有选中的品种",
           float(sel.weights.abs().sum(axis=1).max()) <= 1.0 + 1e-9,
           str(float(sel.weights.abs().sum(axis=1).max())))
+
+    # 包成 `Result` 之后绩效页要能直接吃：缺一个键就是 KeyError，而界面上
+    # 表现成「点了截面策略整页崩掉」
+    from ttrade.backtest import _METRIC_KEYS
+
+    r = cross.to_result(res, label="截面对冲", step=cfg.step(), bpy=252.0)
+    miss = [k for k in _METRIC_KEYS if k not in r.metrics]
+    check("截面：转 Result 后指标一个不缺", not miss, "缺：" + "、".join(miss))
+    check("截面：转 Result 后带期末资金",
+          "final_equity" in r.metrics and r.metrics["final_equity"] > 0,
+          str(r.metrics.get("final_equity")))
+    check("截面：调仓次数按区间数算", r.metrics["n_trades"] == len(range(0, len(score), 5)),
+          f"{r.metrics['n_trades']} vs {len(range(0, len(score), 5))}")
+
+    # 向量化的横截面 Z-score 必须和逐行那版一模一样：算错了强弱排序就会翻，
+    # 但净值曲线照样画得出来，肉眼看不出来
+    rng = np.random.default_rng(7)
+    panel = pd.DataFrame(rng.normal(size=(60, 4)), columns=list("ABCD"))
+    panel.iloc[::5, 1] = np.nan
+    panel.iloc[3] = 7.0
+    a = panel.apply(cross._row_z, axis=1)
+    b = cross._cross_z(panel)
+    check("截面：向量化 Z-score 与逐行一致",
+          np.allclose(a.fillna(-9).to_numpy(), b.fillna(-9).to_numpy()),
+          str(float(np.nanmax(np.abs(a.to_numpy() - b.to_numpy())))))
 
 
 def check_strategy_runner() -> None:
