@@ -1107,7 +1107,21 @@ class AgentPage(QWidget):
                 html += [_block("逻辑", d.logic), _block("优势", d.edge),
                          _block("适应情况", d.fits), _block("风险", d.risk)]
         else:
-            html.append(_block("说明", "因子策略暂不支持实时交易，只能回测。"))
+            # 这句以前写的是「因子策略暂不支持实时交易，只能回测」—— 早就不是
+            # 这样了：单因子 / 多因子在「策略交易和组合」里能直接挂实时，只有
+            # 机器学习模式因为每根 K 线要重训而只做回测。说明写错会让人白放弃
+            # 一条能跑的链路。
+            mode = {"single": "单因子", "multi": "多因子", "ml": "机器学习"}.get(
+                cfg.factor_mode, cfg.factor_mode or "因子"
+            )
+            if cfg.factor_mode == "ml":
+                body = ("机器学习多因子只能回测：每根 K 线都要重训，实时跟不上。"
+                        "要做实盘请把因子模式改成单因子或多因子。")
+            else:
+                body = (f"{mode}因子策略支持实时交易 —— 在「策略交易和组合」里"
+                        "把它挂上「启动交易」即可，信号按每根走完的 K 线重算。"
+                        "因子过滤（规则策略 + 因子否决）同样可以实盘。")
+            html.append(_block("说明", body))
         self.detail.setHtml("".join(html))
 
     def _show_report(self, cur, _prev) -> None:

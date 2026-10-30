@@ -284,6 +284,9 @@ class DataPage(QWidget):
     """数据管理。与「策略研究」等四个页面平级。"""
 
     data_changed = Signal(str)     # 市场键：补完之后主窗口要重读标的池
+    # 成本档位 / 品种信息改过。**和 data_changed 分开**：那个会让主窗口重建
+    # DataStore 清缓存，为了换个成本档位重读几十万根 K 线不值当
+    cost_changed = Signal()
 
     def __init__(self, markets: dict | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -516,6 +519,39 @@ class DataPage(QWidget):
         #     分钟才落地，所以 15:30；
         #   - 日线可以更晚，17:00 时美股当天的日线也收完了（美东 16:00 收盘 =
         #     北京时间 04:00/05:00），一次把期货和美股都补掉。
+        # ---- 交易成本 / 品种信息 ----
+        # 这两块是**回测口径**，不是补数据。放在这一页是因为「成本、tick、乘数、
+        # 保证金、交易时段」都属于「这个市场长什么样」，和行情库放在一起比塞进
+        # 研究页合理 —— 研究页那列已经很挤了。
+        self.lbl_cost = self._section("交易成本与品种信息")
+        lay.addWidget(self.lbl_cost)
+
+        self.cb_cost = QComboBox()
+        self._fill_cost_combo()
+        self.cb_cost.setToolTip(
+            "国内期货回测用的成本档位。单边成本 = 交易所手续费 × 倍数 + 滑点跳数 × 最小变动价位。\n"
+            "改档位之后，研究页 / 组合页 / 回放都会用新的口径重算。"
+        )
+        self.cb_cost.currentIndexChanged.connect(self._on_cost_pick)
+        lay.addWidget(self.cb_cost)
+
+        row_cost = QHBoxLayout()
+        row_cost.setSpacing(6)
+        self.btn_cost = QPushButton("成本参数…")
+        self.btn_cost.setToolTip("改三档的手续费倍数和滑点跳数")
+        self.btn_cost.clicked.connect(self._open_cost_dialog)
+        row_cost.addWidget(self.btn_cost)
+        self.btn_sym = QPushButton("品种信息…")
+        self.btn_sym.setToolTip("最小跳动、合约乘数、保证金率、手续费、交易时段")
+        self.btn_sym.clicked.connect(self._open_symbol_dialog)
+        row_cost.addWidget(self.btn_sym)
+        lay.addLayout(row_cost)
+
+        self.lbl_cost_hint = QLabel("")
+        self.lbl_cost_hint.setObjectName("Hint")
+        self.lbl_cost_hint.setWordWrap(True)
+        lay.addWidget(self.lbl_cost_hint)
+
         self.lbl_auto = self._section("每日自动补充")
         lay.addWidget(self.lbl_auto)
 
@@ -689,11 +725,98 @@ class DataPage(QWidget):
         self.lbl_upd_src.setVisible(not tq and not is_us)
         for w in (self.lbl_upd_aux, self.chk_upd_contracts, self.chk_upd_options):
             w.setVisible(not tq and not is_us)
+        # 成本 / 品种信息只对国内期货有意义：美股没有交易所手续费、没有最小
+        # 变动价位、也没有保证金这一说
+        if hasattr(self, "lbl_cost"):
+            for w in (self.lbl_cost, self.cb_cost, self.btn_cost, self.btn_sym,
+                      self.lbl_cost_hint):
+                w.setVisible(not is_us)
         self.lbl_tq_hint.setVisible(tq)
 
         if self.busy():
             return
         self.btn_update.setEnabled(True)
+
+    # ---- 交易成本 / 品种信息 ----
+
+    def _fill_cost_combo(self) -> None:
+        from ttrade import costs
+
+        self.cb_cost.blockSignals(True)
+        self.cb_cost.clear()
+        for key, p in costs.PROFILES.items():
+            self.cb_cost.addItem(p["label"], key)
+        i = self.cb_cost.findData(costs.current())
+        self.cb_cost.setCurrentIndex(max(i, 0))
+        self.cb_cost.blockSignals(False)
+        self._sync_cost_hint()
+
+    def _sync_cost_hint(self) -> None:
+        from ttrade import costs
+
+        if not hasattr(self, "lbl_cost_hint"):
+            return
+        p = costs.profile(self.cb_cost.currentData() or None)
+        self.lbl_cost_hint.setText(
+            f"当前用「{p['label']}」：{p['fee_mult']:g} 倍交易所手续费 + "
+            f"{p['slip_ticks']:g} 跳滑点。tick、手续费、保证金在「品种信息」里改。"
+        )
+
+    def _on_cost_pick(self, *_a) -> None:
+        from ttrade import costs
+
+        costs.set_current(self.cb_cost.currentData() or "")
+        self._sync_cost_hint()
+        # 只通知「成本变了」，不冒充「数据变了」—— 后者会让主窗口重建 DataStore、
+        # 清掉所有行情缓存，为了换个成本档位重读几十万根 K 线不值
+        self.cost_changed.emit()
+
+    def _open_cost_dialog(self) -> None:
+        from gui.info_dialogs import CostDialog
+
+        if CostDialog(self).exec():
+            self._fill_cost_combo()
+            self.cost_changed.emit()
+
+    def _symbol_items(self) -> list[dict]:
+        """期货品种清单。取本地清单；清单缺了就退到扫描 CSV。"""
+        try:
+            from ttrade.futures import list_local
+
+            rows = list_local(self.market_dir)
+        except Exception:  # noqa: BLE001
+            rows = []
+        if rows:
+            return rows
+        out = []
+        try:
+            for fn in sorted(os.listdir(self.market_dir)):
+                if not fn.endswith(".csv") or fn.startswith("_"):
+                    continue
+                stem = fn[:-4]
+                sym, _, ex = stem.rpartition("_")
+                if not sym or not ex:
+                    continue
+                out.append({"symbol": sym, "exchange": ex, "name": ""})
+        except OSError:
+            pass
+        return out
+
+    def _open_symbol_dialog(self) -> None:
+        from gui.info_dialogs import SymbolInfoDialog
+
+        items = self._symbol_items()
+        if not items:
+            QMessageBox.information(
+                self, "没有品种",
+                "这个市场还没有本地品种清单。先把日线补一遍再来维护品种信息。",
+            )
+            return
+        dlg = SymbolInfoDialog(items, self.market_dir, self)
+        dlg.exec()
+        # 改完 tick / 乘数 / 保证金，回测口径就变了，让主窗口重算一次
+        self.cost_changed.emit()
+
 
     # ---- 执行 ----
 

@@ -51,10 +51,21 @@ def bars_per_year(index: pd.DatetimeIndex) -> float:
 @dataclass
 class BacktestConfig:
     initial_cash: float = 100_000.0
-    fee_rate: float = 0.0005      # 单边手续费 5bp
-    slippage: float = 0.0005      # 单边滑点 5bp
+    fee_rate: float = 0.0005      # 单边手续费：按成交名义额的比例
+    slippage: float = 0.0005      # 单边滑点：按价格的比例（美股口径）
     long_only: bool = False       # True 时把 -1 裁成 0（股票市场默认）
     bars_per_year: float = float(TRADING_DAYS)   # 日线默认；分钟级由调用方按数据推断
+
+    # ---- 期货口径的成本 ----
+    # 交易所手续费有两种收法：按成交额比例（`fee_rate`）和按手固定（元/手）。
+    # 郑商所、中金所多数品种是后者，用比例去套会差一个数量级，所以两个都留着，
+    # 谁非零用谁（`fee_per_lot` 优先）。
+    fee_per_lot: float = 0.0
+    # 滑点按**跳**算：一跳的价格 = `tick_size`，滑几跳 = `slippage_ticks`。
+    # 螺纹一跳 1 元、铜一跳 10 元，写成一个 bp 永远对不齐。`tick_size` 为 0
+    # 时退回上面的百分比口径（`slippage`）。
+    tick_size: float = 0.0
+    slippage_ticks: float = 0.0
 
     # ---- 仓位怎么定 ----
     #   unit   ：名义敞口 = 权益，不加杠杆、不看乘数（美股、批量脚本）
@@ -75,6 +86,18 @@ class BacktestConfig:
     @property
     def label(self) -> str:
         return "只做多" if self.long_only else "多空双向"
+
+    def slip_amount(self, price: float) -> float:
+        """单边滑点，**价格单位**。按跳算；没有 tick 时退回百分比。"""
+        if self.tick_size > 0 and self.slippage_ticks > 0:
+            return float(self.tick_size) * float(self.slippage_ticks)
+        return abs(float(price)) * float(self.slippage)
+
+    def fee_amount(self, lots: float, mult: float, price: float) -> float:
+        """单边手续费，**金额**。按手收优先，否则按成交名义额。"""
+        if self.fee_per_lot > 0:
+            return abs(float(lots)) * float(self.fee_per_lot)
+        return abs(float(lots)) * float(mult) * float(price) * float(self.fee_rate)
 
     @property
     def budget(self) -> float:
@@ -257,7 +280,6 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
         sig = np.maximum(sig, 0)
     idx = data.index
     n = len(data)
-    fee, slip = cfg.fee_rate, cfg.slippage
     mult = float(cfg.multiplier or 1.0)
     mode = (cfg.sizing or "unit").lower()
 
@@ -306,21 +328,23 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
         if want != pos:
             # ---- 先平掉现有仓位 ----
             if pos != 0:
-                price = open_[i] * (1 - slip) if pos == 1 else open_[i] * (1 + slip)
-                # 平仓：浮动盈亏落地，再扣平仓手续费（按成交名义额）
+                sp = cfg.slip_amount(open_[i])
+                price = open_[i] - sp if pos == 1 else open_[i] + sp
+                # 平仓：浮动盈亏落地，再扣平仓手续费
                 cash += lots * mult * (price - entry_price)
-                cash -= abs(lots) * mult * price * fee
+                cash -= cfg.fee_amount(lots, mult, price)
                 close_position(i, price, lots)
                 lots = 0.0
                 pos = 0
 
             # ---- 再按需开新仓 ----
             if want != 0:
-                price = open_[i] * (1 + slip) if want > 0 else open_[i] * (1 - slip)
+                sp = cfg.slip_amount(open_[i])
+                price = open_[i] + sp if want > 0 else open_[i] - sp
                 a = float(atr_arr[i]) if atr_arr is not None else 0.0
                 q = size_lots(cfg, price, cash, a if a == a else 0.0)
                 if q > 0:
-                    cash -= q * mult * price * fee        # 开仓手续费
+                    cash -= cfg.fee_amount(q, mult, price)   # 开仓手续费
                     lots = q if want > 0 else -q
                     entry_price, entry_date, entry_bar, entry_dir = price, idx[i], i, want
                     pos = want
@@ -363,12 +387,12 @@ def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None) -> Result:
     # 首日就建仓（run_backtest 会延迟一天），用等价方式直接算
     open_ = d["open"].to_numpy(dtype=float)
     close = d["close"].to_numpy(dtype=float)
-    price = open_[0] * (1 + cfg.slippage)
+    price = open_[0] + cfg.slip_amount(open_[0])
     mult = float(cfg.multiplier or 1.0)
     # 基准要和策略用同一套仓位口径，否则「策略 vs 买入持有」是在比杠杆，
     # 不是在比策略。期货上尤其明显：策略 10 倍杠杆、基准全额，比出来毫无意义
     q = size_lots(cfg, price, cfg.initial_cash, 0.0)
-    cash = cfg.initial_cash - q * mult * price * cfg.fee_rate
+    cash = cfg.initial_cash - cfg.fee_amount(q, mult, price)
     equity = cash + q * mult * (close - price)
     eq = pd.Series(equity, index=d.index, name="equity")
     ps = pd.Series(1, index=d.index, name="position")

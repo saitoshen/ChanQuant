@@ -69,7 +69,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ttrade import factors, mlmodels, specs, tqdata, tqlive
+from ttrade import costs, factors, mlmodels, symbols_info, tqdata, tqlive
 from ttrade import factor_strategy as fstrat
 from ttrade import replay
 from ttrade import strategy_store as SStore
@@ -683,6 +683,7 @@ class MainWindow(QMainWindow):
 
         # 数据补完之后标的池可能变了（新上市品种、刚补的分钟线），主窗口要重读
         self.data_page.data_changed.connect(self._on_data_changed)
+        self.data_page.cost_changed.connect(self._on_global_cost_changed)
 
         self.agent_page.study_requested.connect(self._on_agent_study)
         self.agent_page.trade_requested.connect(self._on_agent_trade)
@@ -1242,6 +1243,31 @@ class MainWindow(QMainWindow):
         )
         cl.addWidget(self.cb_range)
 
+        # 交易成本。只对国内期货有效：美股没有「交易所手续费」和「最小变动
+        # 价位」这两回事，一直按 5bp + 5bp 算，选项对它没意义。
+        self.lbl_cost = self._section("交易成本")
+        cl.addWidget(self.lbl_cost)
+        self.cb_cost = QComboBox()
+        for key, p in costs.PROFILES.items():
+            self.cb_cost.addItem(p["label"], key)
+            self.cb_cost.setItemData(
+                self.cb_cost.count() - 1,
+                f"{p['fee_mult']:g} 倍交易所手续费 + {p['slip_ticks']:g} 跳滑点",
+                Qt.ToolTipRole,
+            )
+        i = self.cb_cost.findData(costs.current())
+        self.cb_cost.setCurrentIndex(max(i, 0))
+        self.cb_cost.setToolTip(
+            "国内期货的成本口径：交易所手续费 × 倍数 + 滑点跳数 × 最小变动价位。\n"
+            "乐观 / 中性 / 压力三档在「数据管理」页里可以改，品种的手续费和 tick "
+            "也在那里维护。"
+        )
+        cl.addWidget(self.cb_cost)
+        self.lbl_cost_hint = QLabel("")
+        self.lbl_cost_hint.setObjectName("Hint")
+        self.lbl_cost_hint.setWordWrap(True)
+        cl.addWidget(self.lbl_cost_hint)
+
         # 仓位口径。和「策略交易和组合」页编辑框里的那一组是同一套字段，
         # 存进同一份 StrategyConfig —— 研究页调出来的手数，保存之后实盘和
         # 组合回放必须照着走，否则「研究页赚 30%、实盘亏 5%」会反复上演。
@@ -1320,6 +1346,7 @@ class MainWindow(QMainWindow):
         cl.addWidget(self.sp_vol)
         self._sync_size()
         self._apply_sizing(self.cfg)      # 控件建好了，把默认口径灌进配置
+        self._sync_cost_controls()        # 成本提示要按品种刷新
 
         self.chk_ma = QComboBox()
         cl.addWidget(self._section("K线叠加"))
@@ -1418,6 +1445,7 @@ class MainWindow(QMainWindow):
             self.cb_period.currentIndexChanged.connect(self._on_period_changed)
             self.cb_strategy.currentIndexChanged.connect(self._on_strategy_changed)
             self.cb_range.currentIndexChanged.connect(self._schedule)
+            self.cb_cost.currentIndexChanged.connect(self._on_cost_changed)
             self.cb_size.currentIndexChanged.connect(self._on_size_changed)
             for w in (self.sp_principal, self.sp_capital, self.sp_risk, self.sp_atr,
                       self.sp_stop, self.sp_vol):
@@ -1571,12 +1599,35 @@ class MainWindow(QMainWindow):
     def _fill_symbols(self) -> None:
         self.cb_symbol.blockSignals(True)
         self.cb_symbol.clear()
-        for it in self.store.items:
-            self.cb_symbol.addItem(it["label"], it["key"])
+        if self.market == "cn":
+            # 按交易所分组。78 个品种平铺在一个下拉里，找「碳酸锂」得从头滚到
+            # 尾；分组的组头做成**不可选**的灰条，既当标题又不会混进选择。
+            groups: dict[str, list[dict]] = {}
+            for it in self.store.items:
+                groups.setdefault(it.get("exchange") or "", []).append(it)
+            order = [k for k in symbols_info.EXCHANGES if k in groups]
+            order += [k for k in groups if k not in symbols_info.EXCHANGES]
+            for ex in order:
+                rows = groups[ex]
+                head = symbols_info.EXCHANGES.get(ex, ex)
+                self.cb_symbol.addItem(f"—— {head}（{len(rows)}）——", None)
+                item = self.cb_symbol.model().item(self.cb_symbol.count() - 1)
+                if item is not None:
+                    item.setEnabled(False)
+                for it in rows:
+                    self.cb_symbol.addItem("　" + it["label"], it["key"])
+        else:
+            for it in self.store.items:
+                self.cb_symbol.addItem(it["label"], it["key"])
         if self.store.items:
             default = "AAPL" if self.market == "us" else "CU_SHFE"
             idx = self.cb_symbol.findData(default)
-            self.cb_symbol.setCurrentIndex(idx if idx >= 0 else 0)
+            if idx < 0:
+                # 默认品种不在池子里（比如删了数据）：落到第一个**真品种**，
+                # 不能停在组头上 —— 组头的 data 是 None，选中它等于没选品种
+                idx = next((i for i in range(self.cb_symbol.count())
+                            if self.cb_symbol.itemData(i)), 0)
+            self.cb_symbol.setCurrentIndex(idx)
         self.cb_symbol.blockSignals(False)
         self._sync_period_hint()
 
@@ -1596,8 +1647,26 @@ class MainWindow(QMainWindow):
             fee_rate=info["fee"], slippage=info["slippage"],
             long_only=not (info["allow_short"] and self._short_enabled()),
         )
+        if self.market == "cn":
+            self._apply_cost(cfg)
         self._apply_sizing(cfg)
         return cfg
+
+    def _apply_cost(self, cfg: BacktestConfig) -> BacktestConfig:
+        """把「当前品种 + 当前档位」的成本灌进回测配置。
+
+        必须在**品种确定之后**再调一次：`_new_cfg` 在切市场时就会跑，那时候
+        下拉里还是上一个品种。成本是按品种查 tick 和手续费的，早调一次就会
+        把螺纹的成本算到铜头上。
+        """
+        if not hasattr(self, "cb_symbol"):
+            # 界面还没建好（`__init__` 里第一次 `_new_cfg` 就走这条路）。
+            # 这里不套品种，等 `run_analysis` 拿到品种后再算一次
+            return cfg
+        item = self._current_item()
+        key = self.cb_cost.currentData() if hasattr(self, "cb_cost") else None
+        return costs.apply(cfg, item.get("symbol", "") or "",
+                           item.get("exchange", "") or "", key or None)
 
     def _apply_sizing(self, cfg: BacktestConfig) -> None:
         """把「仓位」那一组控件灌进配置。控件还没建好时什么都不做。"""
@@ -1644,6 +1713,51 @@ class MainWindow(QMainWindow):
         self.cfg = self._new_cfg(MARKETS[self.market])
         self._schedule(immediate=True)
 
+    def _sync_cost_controls(self) -> None:
+        """成本控件只对国内期货有意义，并把「这一档在这个品种上收多少」写出来。
+
+        光写「乐观 / 中性 / 压力」等于没说 —— 用户没法判断压力档到底贵多少。
+        """
+        if not hasattr(self, "cb_cost"):
+            return
+        on = self.market == "cn"
+        for w in (self.lbl_cost, self.cb_cost, self.lbl_cost_hint):
+            w.setVisible(on)
+        if not on:
+            return
+        item = self._current_item()
+        sym, ex = item.get("symbol", "") or "", item.get("exchange", "") or ""
+        if not sym:
+            self.lbl_cost_hint.setText("")
+            return
+        self.lbl_cost_hint.setText(
+            costs.describe(sym, ex, self.cb_cost.currentData() or None)
+        )
+
+    def _on_cost_changed(self, *_a) -> None:
+        self._sync_cost_controls()
+        key = self.cb_cost.currentData() or ""
+        if key:
+            # 研究页选的档位顺手记成全局默认：新存的策略、组合页的回放都用它，
+            # 免得「研究页按压力档看、组合页按乐观档算」这种口径分裂
+            costs.set_current(key)
+        if self.market == "cn":
+            self._apply_cost(self.cfg)
+        self._schedule(immediate=True)
+
+    def _on_global_cost_changed(self) -> None:
+        """数据页里改了成本档位 / 品种信息：把研究页的下拉对齐，然后重算。"""
+        if hasattr(self, "cb_cost"):
+            i = self.cb_cost.findData(costs.current())
+            if i >= 0:
+                self.cb_cost.blockSignals(True)
+                self.cb_cost.setCurrentIndex(i)
+                self.cb_cost.blockSignals(False)
+        self._sync_cost_controls()
+        if self.market == "cn":
+            self._apply_cost(self.cfg)
+        self._schedule(immediate=True)
+
     def _on_market_changed(self) -> None:
         mk = self.cb_market.currentData()
         if mk == self.market:
@@ -1661,6 +1775,7 @@ class MainWindow(QMainWindow):
         self._sync_data_page()
         self._fill_symbols()
         self._sync_period_controls()
+        self._sync_cost_controls()      # 美股没有这一组，期货才显示
         if not self.store.items:
             cmd = "python download.py" if mk == "us" else "python download_futures.py"
             self.lbl_status.setText(f"{info['label']} 本地无数据，请先运行 {cmd}")
@@ -1743,6 +1858,7 @@ class MainWindow(QMainWindow):
         # 每个品种下载到的周期不一样，换品种必须重标一次下拉项；
         # 新品种没有当前周期就退到日线（同启动，别让用户面对空图）
         self._sync_period_hint(fallback=True)
+        self._sync_cost_controls()      # tick / 手续费跟着品种走
         self._schedule()
 
     def _reload_store(self, market: str) -> None:
@@ -2067,6 +2183,7 @@ class MainWindow(QMainWindow):
             volume=int(self.sp_vol.value()),
             note="short" if self.chk_short.isChecked() else "",
             range_years=float(self.cb_range.currentData() or 0),
+            cost_profile=(self.cb_cost.currentData() or "") if self.market == "cn" else "",
         )
 
     def apply_config(self, cfg: SStore.StrategyConfig) -> None:
@@ -2129,6 +2246,16 @@ class MainWindow(QMainWindow):
         r = self.cb_range.findData(float(getattr(cfg, "range_years", 0) or 0))
         if r >= 0:
             self.cb_range.setCurrentIndex(r)      # 触发一次重算，窗口跟着换
+        # 成本档位跟着配置走。屏蔽信号：这里改只是恢复显示，重算由下面那句
+        # `_schedule(immediate=True)` 统一发起，不然会多算一遍
+        cp = getattr(cfg, "cost_profile", "") or ""
+        if cp and hasattr(self, "cb_cost"):
+            i = self.cb_cost.findData(cp)
+            if i >= 0:
+                self.cb_cost.blockSignals(True)
+                self.cb_cost.setCurrentIndex(i)
+                self.cb_cost.blockSignals(False)
+        self._sync_cost_controls()
         self._schedule(immediate=True)
 
     def _apply_factor_keys(self, keys, reverse) -> None:
@@ -2227,7 +2354,13 @@ class MainWindow(QMainWindow):
         if not cfg.symbol:
             self.lbl_status.setText("还没选标的，无法存入策略库")
             return
-        saved = SStore.add_to_library(cfg)
+        try:
+            saved = SStore.add_to_library(cfg)
+        except ValueError as exc:
+            # 重名。库里已经有一条同名的了，让用户自己决定改名还是先删
+            self.lbl_status.setText(str(exc))
+            self._publish(str(exc), True)
+            return
         msg = f"已存入策略库：{saved.title()}"
         if self.chk_to_portfolio.isChecked():
             item = SStore.add_to_portfolio(cfg)
@@ -2356,11 +2489,16 @@ class MainWindow(QMainWindow):
         self.cfg.bars_per_year = bars_per_year(df.index)
         # 仓位口径每次重算都从界面读一遍：控件改了不一定重建 cfg，但这里一定跑
         self._apply_sizing(self.cfg)
+        # 成本也要每次重算：换了品种 tick / 手续费就变了，档位也可能刚改过
+        if self.market == "cn":
+            self._apply_cost(self.cfg)
         item = self._current_item()
         if self.market == "cn":
-            self.cfg.multiplier = specs.multiplier(item.get("symbol", ""),
-                                                   item.get("exchange", ""))
-            self.cfg.margin_rate = specs.margin_rate(item.get("symbol", ""))
+            # 乘数和保证金率走「品种信息」：用户在数据页改过就以他改的为准，
+            # 没改过就是 `specs` 反推出来的默认值（见 `symbols_info.defaults`）
+            si = symbols_info.info(item.get("symbol", ""), item.get("exchange", ""))
+            self.cfg.multiplier = float(si.get("mult") or 0) or 1.0
+            self.cfg.margin_rate = float(si.get("margin") or 0) or 0.1
         else:
             self.cfg.multiplier, self.cfg.margin_rate = 1.0, 1.0
 

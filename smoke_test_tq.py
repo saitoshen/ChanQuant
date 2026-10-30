@@ -1181,6 +1181,35 @@ def check_strategy_store() -> None:
         check("重复入库：账户不同不算重复",
               not lib.same_shape(lib.clone(account="另一个")), "误判为重复")
 
+        # 重名限制：库里出现三条「白银动量60-1h」之后，名字就没法指代任何一条了
+        named = a.clone(name="白银动量60-1h")
+        St.add_to_library(named)
+        dup = a.clone(name="白银动量60-1h")
+        try:
+            St.add_to_library(dup)
+            check("策略库：重名被拒绝", False, "居然存进去了")
+        except ValueError as exc:
+            check("策略库：重名被拒绝", "已经有" in str(exc), str(exc))
+        check("策略库：重名之后库里还是两条",
+              len([c for c in St.load_library()
+                   if St.norm_name(c.title()) == St.norm_name("白银动量60-1h")]) == 1,
+              str([c.title() for c in St.load_library()]))
+        # 没起名的配置不该被挡：同品种同策略、参数不同是正常用法，自动加序号
+        u1 = a.clone()
+        u2 = a.clone(rule_params={"fast": 9})
+        St.add_to_library(u1)
+        St.add_to_library(u2)
+        check("策略库：没起名时自动加序号",
+              u1.name and u2.name and u1.name != u2.name,
+              f"{u1.name} / {u2.name}")
+        # 成本档位要能存能读 —— 同一份策略两套成本结论不同，得能复现
+        cp = a.clone(name="成本口径")
+        cp.cost_profile = "stress"
+        St.add_to_library(cp)
+        back = next(c for c in St.load_library() if c.sid == cp.sid)
+        check("策略配置：成本档位往返一致", back.cost_profile == "stress",
+              back.cost_profile)
+
         St.save_chase(St.ChaseConfig(enabled=True, wait_sec=3, retries=2, ticks=5))
         c = St.load_chase()
         check("追单设置：往返一致", (c.wait_sec, c.retries, c.ticks) == (3, 2, 5),
@@ -1199,6 +1228,70 @@ def check_strategy_store() -> None:
     finally:
         St.user_dir = old_dir
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def check_costs() -> None:
+    """成本档位与品种信息。
+
+    盯三件事：期货成本是「交易所手续费 + N 跳滑点」而不是一个 bp；三档的滑点
+    确实单调（压力 ≥ 中性 ≥ 乐观）；按手收的手续费真的从权益里扣掉了。
+    """
+    from ttrade import backtest as B
+    from ttrade import costs, symbols_info
+
+    check("品种信息：tick 表命中",
+          symbols_info.TICKS.get("RB") == 1.0
+          and symbols_info.TICKS.get("CU") == 10.0
+          and symbols_info.TICKS.get("LC") == 50.0, "tick 表不对")
+    check("品种信息：手续费口径按交易所",
+          symbols_info.defaults("TA", "CZCE")["fee_mode"] == "lot"
+          and symbols_info.defaults("RB", "SHFE")["fee_mode"] == "rate",
+          "手续费口径不对")
+    check("品种信息：交易时段按品种区分",
+          "09:30" in symbols_info.session_of("IF", "CFFEX")
+          and "21:00" in symbols_info.session_of("RB", "SHFE"),
+          symbols_info.session_of("IF", "CFFEX"))
+    # 反推 tick：价格都落在 0.5 的整数倍上，最大公约数就该是 0.5
+    check("品种信息：从价格反推 tick",
+          symbols_info.infer_tick([100.0, 100.5, 101.0, 101.5, 102.0]) == 0.5,
+          str(symbols_info.infer_tick([100.0, 100.5, 101.0, 101.5, 102.0])))
+
+    p = {k: costs.profile(k) for k in ("optimistic", "neutral", "stress")}
+    check("成本档位：滑点单调递增",
+          p["optimistic"]["slip_ticks"] < p["neutral"]["slip_ticks"]
+          < p["stress"]["slip_ticks"],
+          str({k: v["slip_ticks"] for k, v in p.items()}))
+
+    bt = B.BacktestConfig()
+    costs.apply(bt, "RB", "SHFE", "optimistic")
+    check("成本档位：期货按 tick 算滑点",
+          bt.tick_size == 1.0 and bt.slippage_ticks == 1.0 and bt.fee_rate > 0,
+          f"tick={bt.tick_size} ticks={bt.slippage_ticks} fee={bt.fee_rate}")
+    check("成本档位：一手滑点 = 跳数 × tick",
+          abs(bt.slip_amount(3000.0) - 1.0) < 1e-9, str(bt.slip_amount(3000.0)))
+
+    us = B.BacktestConfig()
+    costs.apply(us, "AAPL", "", None, market="us")
+    check("成本档位：美股口径不变",
+          us.fee_rate == costs.US_FEE and us.slippage == costs.US_SLIP
+          and us.fee_per_lot == 0.0, f"{us.fee_rate}/{us.slippage}")
+
+    # 按手收的手续费要真扣：同一段行情，每手手续费调大，期末权益必须变小
+    idx = pd.date_range("2024-01-01", periods=40, freq="D")
+    px = pd.Series(np.linspace(100, 120, 40), index=idx)
+    df = pd.DataFrame({"open": px, "high": px * 1.01, "low": px * 0.99,
+                       "close": px, "signal": [1] * 40})
+
+    def _eq(fee_lot: float) -> float:
+        c = B.BacktestConfig(initial_cash=1_000_000, sizing="fixed", volume=1,
+                             multiplier=10.0, fee_per_lot=fee_lot, fee_rate=0.0,
+                             slippage=0.0)
+        return float(B.run_backtest(df, c).metrics["final_equity"])
+
+    check("回测：按手手续费真的扣钱", _eq(0) > _eq(2000),
+          f"{_eq(0):.0f} vs {_eq(2000):.0f}")
+    check("成本说明：写清这一档收多少", "跳" in costs.describe("CU", "SHFE"),
+          costs.describe("CU", "SHFE"))
 
 
 def check_strategy_runner() -> None:
@@ -4083,6 +4176,7 @@ def main() -> int:
     check_factor_refresh()
     check_main_backfill()
     check_strategy_store()
+    check_costs()
     check_strategy_runner()
     check_day_limit()
     check_topup()

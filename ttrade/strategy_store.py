@@ -123,6 +123,12 @@ class StrategyConfig:
     note: str = ""
     created: str = ""
 
+    # 回测用的成本档位（`ttrade.costs.PROFILES` 的 key：optimistic / neutral /
+    # stress）。空 = 跟全局设置走。存在配置里是为了「同一条策略，乐观和压力两套
+    # 成本都跑一遍看结论稳不稳」—— 存成全局的话，改一下就把所有策略的口径都
+    # 改了，历史回测结果没法复现。
+    cost_profile: str = ""
+
     # 回测 / 看图的区间（年）。0 = 全部历史。
     # 5 分钟十年是 26 万根，跑一遍因子评估或机器学习要几十秒 —— 这个值让
     # 「看一眼这条策略最近怎么样」不必每次都从头算。**不影响实盘交易**：
@@ -276,8 +282,9 @@ class StrategyConfig:
         资金账号，同一套策略在两个账户上各跑一份是正常用法，不该算重复。
         """
         a, b = self.to_dict(), other.to_dict()
-        # range_years 只影响回测看多少年，不改变交易行为，不算「不同配置」
-        for k in ("sid", "name", "created", "enabled", "range_years"):
+        # range_years 只影响回测看多少年，cost_profile 只影响回测算出来的收益，
+        # 都不改变交易行为，不算「不同配置」
+        for k in ("sid", "name", "created", "enabled", "range_years", "cost_profile"):
             a.pop(k, None)
             b.pop(k, None)
         return a == b
@@ -362,14 +369,45 @@ def save_library(items: list[StrategyConfig]) -> None:
 
 
 def add_to_library(cfg: StrategyConfig) -> StrategyConfig:
-    """存进策略库。同 sid 覆盖，否则追加。返回入库后的那份（可能换了 sid）。"""
+    """存进策略库。同 sid 覆盖，否则追加。
+
+    **名字不许重复。** 库里出现三条「白银动量60-1h」之后，用户和 Agent 都没法
+    用名字指代任何一条 —— `find_library` 只能猜「最后存的那条」，删的时候还得
+    靠列表里的位置。重名直接抛 `ValueError`，让调用方去改名。
+
+    例外是**没起名**的配置：名字是「品种 · 策略」自动拼的，同品种同策略存两份
+    参数不同的版本是正常用法，这时自动加序号（`…（2）`），不挡人。
+    """
     items = load_library()
     _ensure_sid(cfg)
     for i, old in enumerate(items):
         if old.sid == cfg.sid:
+            # 同 sid 是「改这一条」：名字撞到**别的**条目也要拦，否则改个名就
+            # 能造出两条重名的
+            want = norm_name(cfg.title())
+            if any(norm_name(o.title()) == want for o in items if o.sid != cfg.sid):
+                raise ValueError(f"策略库里已经有「{cfg.title()}」了，换一个名字")
             items[i] = cfg
             save_library(items)
             return cfg
+
+    if not str(cfg.name or "").strip():
+        base = cfg.title()
+        taken = {norm_name(c.title()) for c in items}
+        if norm_name(base) in taken:
+            n = 2
+            while norm_name(f"{base}（{n}）") in taken:
+                n += 1
+            cfg.name = f"{base}（{n}）"
+    else:
+        want = norm_name(cfg.title())
+        dup = next((o for o in items if norm_name(o.title()) == want), None)
+        if dup is not None:
+            raise ValueError(
+                f"策略库里已经有「{dup.title()}」了。换一个名字，"
+                "或者先删掉库里那一条再存。"
+            )
+
     if not cfg.created:
         cfg.created = time.strftime("%Y-%m-%d %H:%M")
     items.append(cfg)

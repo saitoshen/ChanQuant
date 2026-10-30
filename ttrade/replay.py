@@ -26,8 +26,9 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from ttrade import costs
 from ttrade import factor_strategy as fstrat
-from ttrade import specs
+from ttrade import symbols_info
 from ttrade.backtest import BacktestConfig, bars_per_year, buy_and_hold, run_backtest
 from ttrade.strategies import STRATEGIES, available_text, run_strategy
 
@@ -59,6 +60,12 @@ def make_bt(market: str, allow_short: bool = False,
         slippage=c["slippage"],
         long_only=not (c["allow_short"] and allow_short),
     )
+    if market == "cn":
+        # 期货走「交易所手续费 + N 跳滑点」，按品种查 tick 和费率。
+        # 没有 cfg（批量脚本自己造配置）时保持老口径，交给调用方覆盖。
+        costs.apply(bt, getattr(cfg, "symbol", "") or "",
+                    getattr(cfg, "exchange", "") or "",
+                    getattr(cfg, "cost_profile", "") or None, market="cn")
     if cfg is None:
         return bt
     bt.sizing = getattr(cfg, "sizing", "") or "capital"
@@ -68,10 +75,12 @@ def make_bt(market: str, allow_short: bool = False,
     bt.stop_mult = float(getattr(cfg, "stop_mult", 0) or 5.0)
     bt.volume = int(getattr(cfg, "volume", 0) or 1)
     if market == "cn":
-        # 合约乘数和保证金比例：回测里没有天勤 Quote，只能从本地行情反推
-        bt.multiplier = specs.multiplier(getattr(cfg, "symbol", "") or "",
-                                         getattr(cfg, "exchange", "") or "")
-        bt.margin_rate = specs.margin_rate(getattr(cfg, "symbol", "") or "")
+        # 合约乘数和保证金比例走「品种信息」：用户在数据管理页改过就以他改的
+        # 为准，没改过就是 `specs` 反推 / 按类别给的默认值
+        si = symbols_info.info(getattr(cfg, "symbol", "") or "",
+                               getattr(cfg, "exchange", "") or "")
+        bt.multiplier = float(si.get("mult") or 0) or 1.0
+        bt.margin_rate = float(si.get("margin") or 0) or 0.1
     else:
         # 美股没有保证金这一说，全额买入。漏了这行就是拿 10% 保证金率
         # 给股票上 10 倍杠杆，收益曲线会离谱到一眼看出不对
