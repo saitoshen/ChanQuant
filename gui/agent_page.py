@@ -88,6 +88,7 @@ from ttrade import library_docs as L
 from ttrade import session_files as SF
 from ttrade import skills as S
 from ttrade import strategy_store as SStore
+from ttrade.store import AnyStore
 from ttrade.strategies import STRATEGIES
 from ttrade.paths import user_dir
 
@@ -379,6 +380,72 @@ class MemoWorker(QObject):
 # ------------------------------------------------------------------ 对话框
 
 
+# 确认框里 payload 字段的中文名。没列到的照抄字段名 —— 宁可露出 `file_id`
+# 这种半生不熟的词，也不要把一个字段藏起来让人盲签。
+FIELD_CN = {
+    "reason": "理由", "symbol": "品种", "period": "周期", "strategy": "策略",
+    "params": "参数", "volume": "手数", "side": "方向", "offset": "开平",
+    "price": "价格", "path": "路径", "url": "网址", "title": "标题",
+    "name": "名称", "sheet": "工作表", "sheets": "工作表", "content": "正文",
+    "code": "代码", "file_id": "附件", "op": "操作", "factor": "因子",
+    "rows": "行数", "cols": "列", "desc": "说明", "key": "代号",
+    "category": "类别", "formula": "公式", "mode": "方式", "rule": "规则",
+    "markdown": "正文",
+}
+# 先按这个顺序排，没列到的接在后面
+FIELD_ORDER = ["reason", "symbol", "side", "offset", "volume", "price", "period",
+               "strategy", "params", "path", "url", "op", "name", "title",
+               "sheet", "sheets", "rows", "cols", "file_id", "factor", "rule"]
+# 超过这个长度的值不给 QLabel（会撑爆对话框），单独给一个只读文本框
+LONG_FIELD = 400
+
+
+def _payload_rows(p: dict) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """把动作参数摊成确认框里的 `(字段, 值)` 行，外加要单独给文本框的长内容。
+
+    顺序固定、全字段可见。确认框的唯一职责就是「让人在点确定之前看清要发生什么」，
+    所以宁可多列一行，也不要为了好看把字段藏掉。
+    """
+    side_cn = {"BUY": "买入", "SELL": "卖出"}
+    try:
+        from ttrade.skills.trade import OFFSET_CN
+    except Exception:                # noqa: BLE001
+        OFFSET_CN = {}
+
+    keys = [k for k in FIELD_ORDER if k in p] + [k for k in p if k not in FIELD_ORDER]
+    rows: list[tuple[str, str]] = []
+    longs: list[tuple[str, str]] = []
+    for k in keys:
+        v = p.get(k)
+        if v is None or v == "" or v == [] or v == {}:
+            continue
+        if k == "exchange":
+            continue                 # 已经并进「品种」那一行
+        if k == "period" and p.get("mode") == "manual" and not p.get("strategy"):
+            continue                 # 手动单不看周期，写出来只是噪音
+        if k == "symbol":
+            text = f"{v} {p.get('exchange') or ''}".strip()
+        elif k == "side":
+            text = side_cn.get(str(v), str(v))
+        elif k == "offset":
+            text = OFFSET_CN.get(str(v), str(v))
+        elif k == "mode":
+            text = {"manual": "手动", "strategy": "按策略"}.get(str(v), str(v))
+        elif k == "strategy":
+            text = _strategy_text(str(v), p.get("params") or {})
+        elif isinstance(v, bool):
+            text = "是" if v else "否"
+        elif isinstance(v, dict):
+            text = "　".join(f"{a}={b}" for a, b in v.items()) or "（空）"
+        elif isinstance(v, (list, tuple)):
+            text = "、".join(str(x) for x in v)
+        else:
+            text = str(v)
+        label = FIELD_CN.get(k, k)
+        (longs if len(text) > LONG_FIELD else rows).append((label, text))
+    return rows, longs
+
+
 class ConfirmDialog(QDialog):
     """执行模型给的动作之前确认一次。"""
 
@@ -526,18 +593,12 @@ class ConfirmDialog(QDialog):
             lay.addWidget(box)
             return
 
-        rows = []
-        if p.get("reason"):
-            rows.append(("理由", str(p["reason"])))
-        if p.get("symbol"):
-            rows.append(("品种", f"{p['symbol']} {p.get('exchange', '')}".strip()))
-        if p.get("period"):
-            rows.append(("周期", str(p["period"])))
-        if p.get("strategy"):
-            params = p.get("params") or {}
-            rows.append(("策略", _strategy_text(p["strategy"], params)))
-        if p.get("volume"):
-            rows.append(("手数", str(p["volume"])))
+        # 其余动作（下单 / 导出 / 出网 / 写表格）统一按 payload 摊开。
+        # 以前这里只认「理由/品种/周期/策略/手数」五个字段，是给下单写的；
+        # 后来 `write_pdf` 之类的写动作也走这条路，弹框里只剩一句「确认后立即执行」，
+        # 连写到哪个路径都看不见 —— 等于让人盲签。改成把 payload 全摊开：
+        # 字段名有中文就用中文，没有就照抄；太长的（正文/代码）单独给一个只读框。
+        rows, longs = _payload_rows(p)
         if rows:
             form = QFormLayout()
             form.setContentsMargins(0, 6, 0, 6)
@@ -546,6 +607,14 @@ class ConfirmDialog(QDialog):
                 lab.setWordWrap(True)
                 form.addRow(QLabel(k), lab)
             lay.addLayout(form)
+
+        for title, text in longs:
+            lay.addWidget(QLabel(f"{title}（共 {len(text)} 字符）"))
+            body = QPlainTextEdit(text)
+            body.setReadOnly(True)
+            body.setMinimumHeight(200)
+            body.setStyleSheet(f"font-family: Consolas, monospace; font-size: {FS_CODE}px;")
+            lay.addWidget(body)
 
         warn = QLabel("确认后立即执行，没有撤销。")
         warn.setStyleSheet(f"color: {C_BAD}; font-size: {FS_SMALL}px;")
@@ -858,41 +927,6 @@ class SessAtt:
             df = self.item.frame()
             return f"{len(df)} 行 × {len(df.columns)} 列"
         return f"{len(self.item.text)} 字符"
-
-
-class AnyStore:
-    """两个市场的 DataStore 合成一个查询入口。
-
-    Agent 页不跟市场走：用户可能正在研究页看美股，却在 Agent 页问螺纹。
-    所以查一个品种时两个市场都试，先命中的赢。代号本身不重名 —— 期货带交易所
-    后缀（`RB_SHFE`），美股是纯代码（`AAPL`）。
-    """
-
-    def __init__(self, stores) -> None:
-        self._stores = [s for s in (stores or {}).values() if s is not None]
-
-    @property
-    def items(self) -> list[dict]:
-        out: list[dict] = []
-        for s in self._stores:
-            out.extend(getattr(s, "items", []) or [])
-        return out
-
-    @property
-    def symbols(self) -> list[str]:
-        return [it["key"] for it in self.items]
-
-    def get(self, key: str, period: str = "1d"):
-        for s in self._stores:
-            if key in getattr(s, "symbols", []):
-                return s.get(key, period)
-        return None
-
-    def has_period(self, key: str, period: str) -> bool:
-        for s in self._stores:
-            if key in getattr(s, "symbols", []):
-                return s.has_period(key, period)
-        return False
 
 
 # ------------------------------------------------------------------ 页面

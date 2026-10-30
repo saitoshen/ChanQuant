@@ -3745,7 +3745,7 @@ def check_skills() -> None:
                 "read_excel", "parse_pdf", "read_docx", "write_xlsx", "write_pdf",
                 "factor", "factor_list", "factor_check",
                 "strategy", "strategy_list",
-                "backtest", "trade", "fs"}
+                "backtest", "trade", "fs", "scan"}
         check("能力包：工具都在注册表里", must <= names, str(sorted(must - names)))
         check("能力包：每个工具都挂在已知的包上",
               all(SK.get(n).group in SK.GROUPS for n in names),
@@ -3914,6 +3914,129 @@ def check_skills() -> None:
         check("字号：正文比全局默认大", AP.FS_BODY > 12, str(AP.FS_BODY))
         check("字号：页面样式带上正文字号",
               f"font-size: {AP.FS_BODY}px" in AP.AGENT_QSS, "")
+
+        # ---- 8b) 确认框按 payload 摊开 ----
+        rows, longs = AP._payload_rows({
+            "symbol": "CU", "exchange": "SHFE", "side": "SELL",
+            "offset": "CLOSETODAY", "volume": 2, "markdown": "x" * 500,
+        })
+        check("确认框：品种并上交易所", ("品种", "CU SHFE") in rows, str(rows))
+        check("确认框：方向和开平翻成中文",
+              ("方向", "卖出") in rows and ("开平", "平今") in rows, str(rows))
+        check("确认框：交易所不重复列", all(k != "exchange" for k, _ in rows), str(rows))
+        check("确认框：超长正文单独给文本框",
+              [t for t, _ in longs] == ["正文"] and len(longs[0][1]) == 500, str(longs))
+        check("确认框：手动单不列周期",
+              all(k != "周期" for k, _ in AP._payload_rows(
+                  {"mode": "manual", "symbol": "CU", "period": "1d"})[0]), "")
+
+        # ---- 9) 盯盘扫描（纯造数，不依赖本地行情库） ----
+        import pandas as _pdm
+
+        from ttrade.skills import monitor as MON
+
+        def _mk(closes, highs=None, lows=None, vols=None):
+            n = len(closes)
+            return _pdm.DataFrame({
+                "close": closes,
+                "high": highs if highs is not None else [c * 1.01 for c in closes],
+                "low": lows if lows is not None else [c * 0.99 for c in closes],
+                "volume": vols if vols is not None else [100.0] * n,
+            })
+
+        flat = [100.0] * 21
+        hit = MON._check(_mk(flat + [120.0]), {"rule": "breakout_high", "window": 20})
+        check("盯盘：收盘越过前 20 根最高价算突破",
+              hit is not None and hit["dist"] > 0, str(hit))
+        miss = MON._check(_mk(flat + [99.0]), {"rule": "breakout_high", "window": 20})
+        check("盯盘：没越过不算突破", miss is None, str(miss))
+        # 当根自己也算进去的话，任何一根阳线都会「创新高」—— 必须只看前 N 根
+        spike = _mk(flat + [100.5], highs=[101.0] * 21 + [200.0])
+        check("盯盘：当根自己的高价不参与比较",
+              MON._check(spike, {"rule": "breakout_high", "window": 20}) is None, "")
+
+        low = MON._check(_mk(flat + [80.0]), {"rule": "breakdown_low", "window": 20})
+        check("盯盘：跌破前 20 根最低价算新低",
+              low is not None and low["dist"] < 0, str(low))
+
+        cross = MON._check(_mk([10.0] * 9 + [20.0]),
+                           {"rule": "ma_cross", "fast": 3, "slow": 5})
+        check("盯盘：均线金叉能认出来",
+              cross is not None and "金叉" in cross["kind"], str(cross))
+        try:
+            MON._check(_mk([10.0] * 30), {"rule": "ma_cross", "fast": 20, "slow": 5})
+            bad_cross = ""
+        except ValueError as exc:
+            bad_cross = str(exc)
+        check("盯盘：快线不能长于慢线", "快线" in bad_cross, bad_cross)
+
+        vol = MON._check(_mk(flat + [100.0], vols=[100.0] * 21 + [500.0]),
+                         {"rule": "volume_spike", "window": 20, "ratio": 2.0})
+        check("盯盘：放量按量比判定", vol is not None and vol["rank"] > 2, str(vol))
+
+        check("盯盘：根数不够时不判定",
+              MON._check(_mk([100.0] * 5), {"rule": "breakout_high", "window": 20}) is None,
+              "")
+        check("盯盘：日线才允许全市场扫",
+              MON._is_daily("1d") and MON._is_daily("1d_tq") and not MON._is_daily("5m"),
+              "")
+        check("盯盘：scan 挂在 monitor 包上", SK.get("scan").group == "monitor", "")
+        check("盯盘：规则有枚举约束",
+              "之一" in SK.validate(SK.get("scan"), {"rule": "xxx"})[1], "")
+
+        # ---- 10) MCP 导出 ----
+        import io as _io
+        import json as _json
+
+        from ttrade import mcp_server as MC
+
+        spec = SK.get("query_bars").spec()
+        check("MCP：spec 带 name/description/inputSchema",
+              set(spec) == {"name", "description", "inputSchema"}, str(sorted(spec)))
+        check("MCP：类型翻成标准 JSON Schema",
+              spec["inputSchema"]["properties"]["rows"]["type"] == "integer"
+              and spec["inputSchema"]["properties"]["symbol"]["type"] == "string",
+              _json.dumps(spec["inputSchema"], ensure_ascii=False))
+
+        names_ro = {t.name for t in MC.exposed(False)}
+        names_rw = {t.name for t in MC.exposed(True)}
+        check("MCP：默认不给写工具",
+              "write_pdf" not in names_ro and "web_fetch" not in names_ro, str(names_ro))
+        check("MCP：--allow-write 才放写工具",
+              "write_pdf" in names_rw and "web_fetch" in names_rw, "")
+        check("MCP：下单和平台文件永不暴露",
+              "trade" not in names_rw and "fs" not in names_rw, "")
+        check("MCP：要界面的动作不暴露（handler 为空）",
+              all(MC.S.get(n).handler is not None for n in names_rw), "")
+
+        def _rpc(lines, allow_write=False):
+            fin = _io.StringIO("\n".join(_json.dumps(m) for m in lines) + "\n")
+            fout = _io.StringIO()
+            MC.serve(fin, fout, allow_write)
+            return [_json.loads(x) for x in fout.getvalue().splitlines()]
+
+        out = _rpc([
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18"}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "list_symbols", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+             "params": {"name": "trade", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 5, "method": "bogus/method"},
+        ])
+        check("MCP：通知不回包", len(out) == 5, f"{len(out)} 条")
+        check("MCP：initialize 回客户端要的版本",
+              out[0]["result"]["protocolVersion"] == "2025-06-18", str(out[0]))
+        check("MCP：tools/list 列全只读工具",
+              {t["name"] for t in out[1]["result"]["tools"]} == names_ro, "")
+        check("MCP：tools/call 出文本内容",
+              out[2]["result"]["isError"] is False
+              and out[2]["result"]["content"][0]["type"] == "text", str(out[2])[:120])
+        check("MCP：调不到的工具报 isError",
+              out[3]["result"]["isError"] is True, str(out[3])[:120])
+        check("MCP：未知方法报 -32601", out[4]["error"]["code"] == -32601, "")
     except Exception as exc:  # noqa: BLE001
         check("能力包与附件", False, f"{type(exc).__name__}: {exc}")
 

@@ -848,6 +848,8 @@ def _run() -> tuple[bool, list[str]]:
 
             from ttrade import session_files as _SF
             from ttrade import skills as _SK
+            from ttrade import mcp_server as _MC
+            from ttrade.skills import monitor as _MON
 
             n_tool = len(_SK.REGISTRY)
             tmpd = _tf.mkdtemp(prefix="td_self_")
@@ -862,6 +864,21 @@ def _run() -> tuple[bool, list[str]]:
                 import shutil as _sh
 
                 _sh.rmtree(tmpd, ignore_errors=True)
+            # 盯盘扫描：造一组「前面 20 根都在 100、最后一根 120」的假数据
+            _hit = _MON._check(
+                pd.DataFrame({"close": [100.0] * 21 + [120.0],
+                              "high": [101.0] * 21 + [121.0],
+                              "low": [99.0] * 22,
+                              "volume": [100.0] * 22}),
+                {"rule": "breakout_high", "window": 20},
+            )
+            scan_ok = _hit is not None and _hit["dist"] > 0
+            # MCP 导出的两条硬要求：schema 是标准 JSON Schema、下单永不暴露
+            mcp_ok = (
+                _SK.get("query_bars").spec()["inputSchema"]["properties"]["rows"]["type"]
+                == "integer"
+                and "trade" not in {t.name for t in _MC.exposed(True)}
+            )
             skill_ok = (
                 n_tool >= 17
                 and item is not None
@@ -870,8 +887,12 @@ def _run() -> tuple[bool, list[str]]:
                 and hasattr(ap, "session")
                 and hasattr(ap, "_ctx")
                 and hasattr(ap, "store")
+                and scan_ok
+                and mcp_ok
             )
-            skill_info = f"{n_tool} 个动作，附件读表 {'通' if res.ok else '断'}"
+            skill_info = (f"{n_tool} 个动作，附件读表 {'通' if res.ok else '断'}，"
+                          f"扫描 {'通' if scan_ok else '断'}，"
+                          f"MCP {'通' if mcp_ok else '断'}")
         except Exception as exc:  # noqa: BLE001
             skill_info = f"{type(exc).__name__}: {exc}"
 

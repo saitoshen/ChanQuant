@@ -28,6 +28,7 @@ from ttrade.skills import factor  # noqa: F401
 from ttrade.skills import strategy  # noqa: F401
 from ttrade.skills import trade  # noqa: F401
 from ttrade.skills import web  # noqa: F401
+from ttrade.skills import monitor  # noqa: F401
 from ttrade.skills import fs  # noqa: F401
 
 from ttrade.skills.base import (  # noqa: F401
@@ -48,11 +49,13 @@ from ttrade.skills.base import (  # noqa: F401
     names,
     prompt_block,
     register,
+    to_json_schema,
     validate,
 )
 
 __all__ = [
     "GROUP_ORDER", "GROUPS", "REGISTRY", "RISK_READ", "RISK_TRADE", "RISK_WRITE",
     "SkillContext", "SkillResult", "Tool", "catalog", "default_groups", "dispatch",
-    "get", "group_tools", "names", "prompt_block", "register", "validate",
+    "get", "group_tools", "names", "prompt_block", "register", "to_json_schema",
+    "validate",
 ]

@@ -123,11 +123,16 @@ class Tool:
     max_turns: int = 1             # 允许模型连调几次（读类可以多）
 
     def spec(self) -> dict:
-        """MCP `tools/list` 里的一项。"""
+        """MCP `tools/list` 里的一项。
+
+        `inputSchema` 要翻成**标准 JSON Schema** —— 内部写 `"str"` / `"int"`
+        是为了 `validate()` 少打几个字，但这份 schema 是要发给外部 MCP 客户端的，
+        类型名不合规对方会直接校验失败。
+        """
         return {
             "name": self.name,
             "description": self.description,
-            "inputSchema": self.inputSchema,
+            "inputSchema": to_json_schema(self.inputSchema),
         }
 
 
@@ -184,6 +189,37 @@ _TYPE_ALIASES = {
     "list": list, "array": list,
     "dict": dict, "object": dict,
 }
+
+# 内部简写 → 标准 JSON Schema 的 type 名
+_JSON_TYPES = {
+    "str": "string", "int": "integer", "float": "number", "bool": "boolean",
+    "list": "array", "dict": "object",
+}
+
+
+def to_json_schema(schema: dict) -> dict:
+    """内部简写类型 → 标准 JSON Schema。给 `tools/list` 用。
+
+    只翻 `type`（含 `"str|int"` 这种并集，翻成 `anyOf`），其余字段
+    （`default` / `enum` / `minimum` / `maximum` / `required` / `properties`）
+    原样带过去 —— 它们本来就是标准写法。
+    """
+    if not isinstance(schema, dict):
+        return schema
+    out: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key == "type" and isinstance(value, str) and "|" in value:
+            parts = [p.strip() for p in value.split("|") if p.strip()]
+            out["anyOf"] = [{"type": _JSON_TYPES.get(p, p)} for p in parts]
+        elif key == "type" and isinstance(value, str):
+            out["type"] = _JSON_TYPES.get(value, value)
+        elif key == "properties" and isinstance(value, dict):
+            out["properties"] = {k: to_json_schema(v) for k, v in value.items()}
+        elif key == "items" and isinstance(value, dict):
+            out["items"] = to_json_schema(value)
+        else:
+            out[key] = value
+    return out
 
 
 def _coerce(value, type_spec: str):
