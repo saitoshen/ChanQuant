@@ -386,6 +386,14 @@ class ResultView(QObject):
 
     # ---- K 线与信号
 
+    def add_chart_action(self, w: QWidget) -> None:
+        """往「K线与信号」页标题行右侧挂一个控件（研究页的「启动实时」）。
+
+        必须先调过 `pages()`：那一步才把这一页建出来，`chart_actions` 才有地方挂。
+        主窗口建完 `ResultView` 就立刻 `pages()` 铺页签，顺序上是安全的。
+        """
+        self.chart_actions.addWidget(w)
+
     def _build_chart_page(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -396,7 +404,17 @@ class ResultView(QObject):
         self.lbl_chart_title.setStyleSheet(
             "font-size: 11px; color: #6b7280; padding-left: 4px;"
         )
-        lay.addWidget(self.lbl_chart_title)
+        # 标题行右侧留给宿主挂按钮：「策略研究」页的「启动实时」就放这儿。
+        # 挂在 K 线与信号页而不是侧边栏，是因为它只影响这张图。
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(6)
+        head.addWidget(self.lbl_chart_title, 1)
+        self.chart_actions = QHBoxLayout()
+        self.chart_actions.setContentsMargins(0, 0, 0, 0)
+        self.chart_actions.setSpacing(6)
+        head.addLayout(self.chart_actions)
+        lay.addLayout(head)
 
         # 图例文字：三角、底色的含义随市场不同（期货有做空、美股只有做多），
         # 所以由宿主通过 ViewCtx.legend 递进来，这里不写死。

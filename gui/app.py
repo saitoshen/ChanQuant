@@ -244,6 +244,17 @@ QPushButton:hover { background: #1d4ed8; }
     QPushButton:pressed { background: #1e40af; }
 QPushButton#Ghost { background: #ffffff; color: #334155; border: 1px solid #cbd5e1; }
 QPushButton#Ghost:hover { background: #f8fafc; border-color: #94a3b8; }
+/* 研究页的「启动实时」：默认是普通描边按钮，跑起来变绿 —— 和顶部那个
+   「● 实时」同一套颜色，扫一眼就知道现在吃的是实时还是本地历史 */
+QPushButton#LiveBtn {
+    background: #ffffff; color: #334155; border: 1px solid #cbd5e1;
+    padding: 4px 12px; font-weight: 600;
+}
+QPushButton#LiveBtn:hover { background: #f8fafc; border-color: #94a3b8; }
+QPushButton#LiveBtn:checked {
+    background: #dcfce7; color: #15803d; border: 1px solid #86efac;
+}
+QPushButton#LiveBtn:checked:hover { background: #bbf7d0; }
 QSlider::groove:horizontal { height: 4px; background: #e2e8f0; border-radius: 2px; }
 QSlider::sub-page:horizontal { background: #93c5fd; border-radius: 2px; }
 QSlider::handle:horizontal {
@@ -621,6 +632,9 @@ class MainWindow(QMainWindow):
         self._live_state = None                        # 最近一次 LiveState
         self._live_key = ""
         self._live_period = ""
+        # 当前喂这张图的是哪条会话：`trade`（账户页连的）/ `study`（研究页
+        # 「启动实时」）/ 空（只画本地历史）。两条同时跑时只让其中一条画
+        self._live_src = ""
         self._live_last = None                         # 上一根 bar 的时间，用来判断「新 bar」
         self._live_seq = 0                             # 每次起停自增，丢掉过期的推送
         self._live_patch_ts = 0.0                      # 上次刷未走完那根 bar 的时刻
@@ -630,9 +644,9 @@ class MainWindow(QMainWindow):
         # 延后一拍：等界面完全建好、第一次分析排上队之后再灌配置，
         # 否则 apply_config 里的 _schedule(immediate=True) 会和首帧抢数据加载。
         QTimer.singleShot(0, self._restore_last_config)
-        # **这里不连天勤**。研究页只看本地库里的历史，实时行情归「账户透视和
-        # 交易」页管：账户连接是那页的事，不能在每次回测 / 换品种时顺手登录一遍。
-        self.lbl_live_msg.setText("本地历史（实时行情在「账户透视和交易」页连接）")
+        # **这里不连天勤**。研究页默认只看本地库里的历史；要实时得在「K线与信号」
+        # 页点「启动实时」，换品种 / 换周期会自动断开 —— 回测调参不该顺手登录
+        self.lbl_live_msg.setText("本地历史（要实时看 K 线，点上面的「启动实时」）")
 
     # ---------------------------------------------------------- UI 构建
     def _build_ui(self) -> None:
@@ -651,6 +665,10 @@ class MainWindow(QMainWindow):
         self.study_page = self._build_study_page()
         self.pages.addWidget(self.study_page)
         self.live = LiveController(self)
+        # 研究页自己的行情会话。**不复用 `self.live`**：那条连接绑着账户，起停会
+        # 把「账户透视和交易」页的持仓/委托一起断掉；而研究页要的是纯行情，不带
+        # 账户也能连（见 `LiveHub.start` 的空账户分支）。
+        self.study_live = LiveController(self)
         self.trade_page = TradePage(self.live)
         self.pages.addWidget(self.trade_page)
         self.portfolio_page = PortfolioPage(loader=self._load_bars)
@@ -682,6 +700,7 @@ class MainWindow(QMainWindow):
         self.trade_page.connect_requested.connect(self._on_trade_connect)
         self.trade_page.disconnect_requested.connect(self._on_live_stop)
         self._wire_live()
+        self._wire_study_live()
 
     def _build_page_bar(self) -> QWidget:
         bar = QWidget()
@@ -934,8 +953,25 @@ class MainWindow(QMainWindow):
         for title, w in self.view.pages():
             self.tabs.addTab(w, title)
         self.view.status.connect(self.lbl_status.setText)
+        # 「启动实时」挂在 K 线与信号页的标题行上：它只影响这张图，放侧边栏会
+        # 让人以为它跟回测参数有关
+        self.view.add_chart_action(self._build_live_btn())
         root.addWidget(self.tabs, 1)
         return page
+
+    def _build_live_btn(self) -> QPushButton:
+        """研究页的实时开关。**手动**：换品种 / 换周期就断开，要再看得自己点。"""
+        self.btn_live = QPushButton("启动实时")
+        self.btn_live.setObjectName("LiveBtn")
+        self.btn_live.setCheckable(True)
+        self.btn_live.setToolTip(
+            "连天勤，按当前品种和周期补齐本地历史，再把实时推送拼到 K 线上。\n"
+            "手动开关：换品种或换周期会自动断开 —— 研究页是调参的地方，\n"
+            "不该边拖滑杆边反复登录天勤。\n"
+            "「日线Tushare」没有实时，要实时日线请把周期切到「日线」（天勤）。"
+        )
+        self.btn_live.toggled.connect(self._on_study_live_toggled)
+        return self.btn_live
 
     def _build_sidebar(self) -> QWidget:
         content = QWidget()
@@ -1615,6 +1651,7 @@ class MainWindow(QMainWindow):
         self.market = mk
         self.store = self.stores[mk]
         info = MARKETS[mk]
+        self._stop_study_live()
         if hasattr(self, "chk_short"):
             self.chk_short.blockSignals(True)
             self.chk_short.setChecked(bool(info["allow_short"]))
@@ -1697,10 +1734,12 @@ class MainWindow(QMainWindow):
             self.lbl_period.setText("")
 
     def _on_period_changed(self) -> None:
+        self._stop_study_live()
         self._sync_period_hint()
         self._schedule(immediate=True)
 
     def _on_symbol_changed(self) -> None:
+        self._stop_study_live()
         # 每个品种下载到的周期不一样，换品种必须重标一次下拉项；
         # 新品种没有当前周期就退到日线（同启动，别让用户面对空图）
         self._sync_period_hint(fallback=True)
@@ -2530,6 +2569,15 @@ class MainWindow(QMainWindow):
         self.live.failed.connect(self._on_live_failed)
         self.live.log.connect(self._on_live_log)
 
+    def _wire_study_live(self) -> None:
+        """研究页那条行情会话。信号各走各的槽，但画的是同一张图。"""
+        self.study_live.started.connect(self._on_study_live_started)
+        self.study_live.stopped.connect(self._on_study_live_stopped)
+        self.study_live.bars.connect(self._on_study_live_bars)
+        self.study_live.state.connect(self._on_study_live_state)
+        self.study_live.failed.connect(self._on_study_live_failed)
+        self.study_live.log.connect(self._on_study_live_log)
+
     def _current_pair(self) -> tuple[str, str] | None:
         item = self._current_item()
         if not item:
@@ -2568,6 +2616,9 @@ class MainWindow(QMainWindow):
         if pair is None:
             self.trade_page.on_failed("先在「策略研究」页选一个品种")
             return
+        # 两条会话画的是同一张图，同品种同周期会互相把 `_live_last` 顶掉。账户
+        # 这条连上之后本来就会喂研究页的 K 线（见上面的说明），研究页那条先收掉
+        self._stop_study_live()
         self.live.start(specs, pair[0], pair[1], period, need_history=False)
         self.lbl_live_msg.setText("正在连接…")
 
@@ -2575,12 +2626,81 @@ class MainWindow(QMainWindow):
         self.live.stop(wait=False)
         self.lbl_live_msg.setText("实时已停止")
 
+    # ---- 研究页的实时（手动） ----
+
+    def _on_study_live_toggled(self, on: bool) -> None:
+        if not on:
+            self.study_live.stop(wait=False)
+            self.lbl_live_msg.setText("实时已停止（只显示本地历史）")
+            return
+        err = self._start_study_live()
+        if err:
+            self._sync_live_btn(False)
+            self.lbl_live_msg.setText(err)
+            return
+        self._sync_live_btn(True)
+
+    def _start_study_live(self) -> str:
+        """起研究页的行情会话。返回空串表示已经发出去，否则是要显示的原因。"""
+        if self.market != "cn":
+            return "实时行情只接了国内期货"
+        pair = self._current_pair()
+        if pair is None:
+            return "先选一个品种"
+        period = self._period()
+        if period not in tqdata.PERIODS:
+            # `1d` 是 Tushare 的日线 CSV，没有实时源；天勤日线的键是 `1d_tq`
+            return "「日线Tushare」没有实时行情，要实时日线请把周期切到「日线」（天勤）"
+        # 不清 `_live_src`：连上之前让原来那条会话继续画（多半就是同一个品种），
+        # 连不上也不会把图冻住。接管发生在 `started` 里
+        self.lbl_live_msg.setText(
+            f"正在连接 {pair[0]} {PERIOD_LABEL.get(period, period)}，先补本地历史…"
+        )
+        # 补历史放在 worker 线程里（十年 5m 要几十秒），界面不冻；`ready` 之后
+        # 才开始收 bar，所以这里不用等
+        self.study_live.start(None, pair[0], pair[1], period, need_history=True)
+        return ""
+
+    def _sync_live_btn(self, on: bool) -> None:
+        """按钮状态跟着会话走。必须屏蔽信号，否则 setChecked 又触发一轮 toggled。"""
+        if not hasattr(self, "btn_live"):
+            return
+        self.btn_live.blockSignals(True)
+        self.btn_live.setChecked(on)
+        self.btn_live.setText("■ 实时中" if on else "启动实时")
+        self.btn_live.blockSignals(False)
+
+    def _stop_study_live(self) -> None:
+        """换品种 / 换周期 / 换市场：实时一律断开，按钮回到未点状态。
+
+        研究页是调参的地方。每换一次就重连天勤、重补一遍历史，边拖滑杆边登录
+        既慢又占连接 —— 要实时得自己再点一次。
+        """
+        if hasattr(self, "study_live") and self.study_live.running:
+            self.study_live.stop(wait=False)
+        if self._live_src == "study":
+            self._live_src = ""
+            self._live_last = None
+            self.lbl_live.setText("本地历史")
+            self.lbl_live.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+        self._sync_live_btn(False)
+
     def _on_live_started(self, key: str) -> None:
+        self._live_started_from(key, "trade")
+
+    def _on_study_live_started(self, key: str) -> None:
+        self._live_started_from(key, "study")
+
+    def _live_started_from(self, key: str, src: str) -> None:
         sym, _, ex = key.rpartition("_")
         self._live_key = key
+        # 图归最后启动的那条会话。两条同时跑时（研究页点了实时、交易页也连着），
+        # 让各自的推送都往上画会互相把 `_live_last` 顶掉，表现是「一根 bar 反复重算」。
+        self._live_src = src
         # 用会话自己的周期，不是研究页当前选的那个 —— 交易页可能按 5m 连，
         # 而研究页停在日线上，拿错了会去拼「5 分钟 bar + 日线历史」这种垃圾
-        self._live_period = self.live.period or self._period()
+        ctl = self.study_live if src == "study" else self.live
+        self._live_period = ctl.period or self._period()
         self._live_seq += 1
         self._live_last = None
         # 工作线程刚把缺口补进库，缓存里的旧数据要作废，否则实时段会接在旧尾巴上
@@ -2603,9 +2723,24 @@ class MainWindow(QMainWindow):
     def _on_live_stopped(self) -> None:
         if self.live.running:
             return      # 换品种时旧线程收尾，新的已经在跑了，别把标签刷回去
+        if self._live_src == "study":
+            return      # 图还在研究页那条会话上，别把它的状态刷掉
+        self._live_src = ""
         self.lbl_live.setText("本地历史")
         self.lbl_live.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
         self.lbl_live_msg.setText("实时已停止（只显示本地历史；连接在「账户透视和交易」页）")
+
+    def _on_study_live_stopped(self) -> None:
+        if self.study_live.running:
+            return
+        self._sync_live_btn(False)
+        if self._live_src != "study":
+            return
+        self._live_src = ""
+        self._live_last = None
+        self.lbl_live.setText("本地历史")
+        self.lbl_live.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+        self.lbl_live_msg.setText("实时已停止（只显示本地历史）")
 
     def _on_live_log(self, msg: str) -> None:
         self.lbl_live_msg.setText(msg)
@@ -2616,7 +2751,15 @@ class MainWindow(QMainWindow):
         self.trade_page.on_failed(msg)
 
     def _on_live_state(self, st) -> None:
+        # 只有带账户的那条连接才更新 `_live_state`：Agent 下单要读它的持仓和
+        # 报单额度，行情会话覆盖上去就成了「有行情、没账户」的空状态
         self._live_state = st
+        self._show_quote(st)
+
+    def _on_study_live_state(self, st) -> None:
+        self._show_quote(st)
+
+    def _show_quote(self, st) -> None:
         q = st.quote or {}
         # 不要求本地历史存在：没补过历史时实时段照样在跑，报价更该看得见
         if q:
@@ -2626,8 +2769,23 @@ class MainWindow(QMainWindow):
                 f" · 买 {q.get('bid', 0):.2f} 卖 {q.get('ask', 0):.2f}"
             )
 
+    def _on_study_live_log(self, msg: str) -> None:
+        self.lbl_live_msg.setText(msg)
+
+    def _on_study_live_failed(self, msg: str) -> None:
+        self.lbl_live_msg.setText(msg)
+        self._sync_live_btn(False)
+
     def _on_live_bars(self, live_df) -> None:
+        self._apply_live_bars(live_df, "trade")
+
+    def _on_study_live_bars(self, live_df) -> None:
+        self._apply_live_bars(live_df, "study")
+
+    def _apply_live_bars(self, live_df, src: str) -> None:
         """实时 K 线到了：新 bar 就整体重算，同一根内只刷价格。"""
+        if src != self._live_src:
+            return          # 另一条会话在画这张图，这条的推送丢掉
         if self._closing or live_df is None or live_df.empty:
             return
         pair = self._current_pair()
@@ -2736,6 +2894,8 @@ class MainWindow(QMainWindow):
         self.portfolio_page.shutdown()
         self.agent_page.shutdown()
         self.live.stop(wait=True)
+        # 研究页那条行情连接同理：线程还卡在 wait_update 里，解释器退出会崩在 TqApi
+        self.study_live.stop(wait=True)
         super().closeEvent(event)
 
 

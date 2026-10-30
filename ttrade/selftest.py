@@ -813,6 +813,26 @@ def _run() -> tuple[bool, list[str]]:
         )
         k_info = f"窗口 {rv._k_win}/{rv._k_total} 根" if rv is not None else "无结果视图"
 
+        # 研究页的「启动实时」：挂在 K 线与信号页的标题行上，默认没点；换品种 /
+        # 换周期必须能把它复位（这里不真的连天勤 —— 自检不许联网）。
+        chart_page = rv.pages()[0][1] if rv is not None else None
+        live_btn_ok = (
+            hasattr(win, "btn_live")
+            and chart_page is not None
+            and chart_page.isAncestorOf(win.btn_live)
+            and not win.btn_live.isChecked()
+            and win.btn_live.text() == "启动实时"
+        )
+        # 手动置成「已点」再走一次换品种的复位路径，必须回到未点状态
+        win.btn_live.blockSignals(True)
+        win.btn_live.setChecked(True)
+        win.btn_live.setText("■ 实时中")
+        win.btn_live.blockSignals(False)
+        win._stop_study_live()
+        live_btn_ok = (live_btn_ok and not win.btn_live.isChecked()
+                       and win.btn_live.text() == "启动实时"
+                       and win.study_live.running is False)
+
         # 因子面板：两个策略族、三种因子模式、47 个因子、四类模型都得在
         fams = {win.cb_family.itemData(i) for i in range(win.cb_family.count())}
         modes = {win.cb_fmode.itemData(i) for i in range(win.cb_fmode.count())}
@@ -951,6 +971,10 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(
                 f"K 线窗口状态异常：win={rv._k_win} start={rv._k_start} total={rv._k_total}"
             )
+        if not live_btn_ok:
+            raise RuntimeError(
+                "「启动实时」按钮异常：不在 K 线与信号页上，或换品种后没复位"
+            )
         if not combo_ok:
             raise RuntimeError(f"组合报告异常：{combo_info}")
         if not range_ok:
@@ -973,7 +997,7 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"因子分析页图轴数为 {n_axes}，应为 4")
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
                 f"{factor_info}，滚轮缩放 {wheel_info}，组合 {combo_info}，"
-                f"回测区间 {range_info}，"
+                f"回测区间 {range_info}，实时开关已复位，"
                 f"数据管理页就绪，手册 {manual_info}，输出 {out_info}")
 
     check("构建主窗口（端到端）", _window)

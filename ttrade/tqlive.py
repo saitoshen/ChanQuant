@@ -304,7 +304,11 @@ class LiveHub:
     """
 
     def __init__(self, specs):
-        if isinstance(specs, AccountSpec):
+        # `specs` 为空 = **纯行情会话**：研究页的「启动实时」只要 K 线，不要账户。
+        # 这条链路和下载脚本共用一份鉴权（`read_account()`），不构造任何账户对象。
+        if specs is None:
+            specs = []
+        elif isinstance(specs, AccountSpec):
             specs = [specs]
         self.specs: list[AccountSpec] = list(specs)
         self.spec = self.specs[0] if self.specs else None
@@ -331,7 +335,16 @@ class LiveHub:
         from tqsdk import TqApi, TqAuth
 
         if not self.specs:
-            raise ValueError("没有可连接的账户")
+            # 纯行情会话。天勤允许不带账户建连接（只要 TqAuth），这样研究页的
+            # 实时不依赖「账户透视和交易」页有没有登录，也不会多占一个资金账号
+            # 的连接名额。
+            from ttrade.tqsdk_symbols import read_account
+
+            user, pwd = read_account()
+            if not user or not pwd:
+                raise ValueError("没有配置天勤账户，无法连接实时行情")
+            self.api = TqApi(auth=TqAuth(user, pwd), web_gui=False)
+            return
         for s in self.specs:
             if not s.user or not s.password:
                 raise ValueError(f"账户「{s.name}」缺少天勤账户或密码")
