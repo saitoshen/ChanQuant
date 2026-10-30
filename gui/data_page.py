@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -31,7 +32,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QThread, QTime, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -44,6 +45,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -297,7 +299,15 @@ class DataPage(QWidget):
         self._upd_thread: QThread | None = None
         self._tq_worker: TqWorker | None = None
         self._tq_thread: QThread | None = None
+        self._auto_run = False          # 这一轮是不是定时任务起的（决定弹不弹窗）
+        self._auto_last = ""            # 上次定时补充的日期（YYYY-MM-DD）
         self._build()
+        self._apply_auto_cfg()
+        # 30 秒查一次就够了：定时精度到分钟，没必要每秒唤醒
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(30_000)
+        self._auto_timer.timeout.connect(self._check_auto)
+        self._auto_timer.start()
 
     # ---- 外部 ----
 
@@ -485,6 +495,43 @@ class DataPage(QWidget):
         )
         lay.addWidget(self.chk_upd_options)
 
+        # 每天盘后自动补一次。手动补很容易忘，而展期 / IV 的快照只要断一天，
+        # 实盘就只能拿更旧的期限结构算信号。做成可关的定时器而不是常驻服务：
+        # 程序关了就停，不会在用户不知情的时候跑一次几十分钟的下载。
+        self.lbl_auto = self._section("每日自动补充")
+        lay.addWidget(self.lbl_auto)
+        self.chk_auto = QCheckBox("每天定时补一次（主连 + 真实合约 + 期权）")
+        self.chk_auto.setToolTip(
+            "只在期货市场生效。到点自动跑一遍 Tushare 更新：主力连续日线、\n"
+            "真实合约期限结构、期权隐含波动率。\n\n"
+            "「近 1 天」日常够用（只补昨天缺的那一天）；「近 1 周」适合隔几天\n"
+            "才开一次程序的情况。已经算过的交易日不会重复请求。"
+        )
+        lay.addWidget(self.chk_auto)
+
+        row_auto = QHBoxLayout()
+        row_auto.setSpacing(6)
+        self.time_auto = QTimeEdit()
+        self.time_auto.setDisplayFormat("HH:mm")
+        self.time_auto.setTime(QTime(15, 30))
+        self.time_auto.setToolTip(
+            "默认 15:30：日盘 15:00 收盘，交易所结算数据一般十几分钟后才落地。\n"
+            "定得太早会拿到不完整的当日数据，第二天还得再补一遍。"
+        )
+        row_auto.addWidget(self.time_auto)
+        self.cb_auto_range = QComboBox()
+        for key, label in (("1d", "近 1 天"), ("1w", "近 1 周")):
+            self.cb_auto_range.addItem(label, key)
+        row_auto.addWidget(self.cb_auto_range, 1)
+        lay.addLayout(row_auto)
+
+        self.lbl_auto_hint = QLabel(
+            "只在本程序开着时生效；到点如果正在更新，就等这一轮跑完再补。"
+        )
+        self.lbl_auto_hint.setObjectName("Hint")
+        self.lbl_auto_hint.setWordWrap(True)
+        lay.addWidget(self.lbl_auto_hint)
+
         self.lbl_tq_hint = QLabel(
             "天勤需要行情账号：项目根目录或用户目录下的 tq_account.txt（两行：用户名、密码）。\n"
             "19:00–19:30 是天勤运维窗口，这段时间会自动等待。"
@@ -568,6 +615,10 @@ class DataPage(QWidget):
         self.lbl_upd_src.setVisible(not tq and not is_us)
         for w in (self.lbl_upd_aux, self.chk_upd_contracts, self.chk_upd_options):
             w.setVisible(not tq and not is_us)
+        # 定时补充只跑期货（衍生数据只对期货有意义），美股下整块藏掉
+        for w in (self.lbl_auto, self.chk_auto, self.time_auto,
+                  self.cb_auto_range, self.lbl_auto_hint):
+            w.setVisible(not is_us)
         self.lbl_tq_hint.setVisible(tq)
 
         if self.busy():
@@ -578,6 +629,106 @@ class DataPage(QWidget):
 
     def _log(self, text: str) -> None:
         self.txt_log.appendPlainText(text)
+
+    # ---- 每日定时补充 ----
+
+    AUTO_FILE = "auto_update.json"
+
+    def _auto_path(self) -> str:
+        from ttrade.paths import user_dir
+
+        return os.path.join(user_dir(), self.AUTO_FILE)
+
+    def _apply_auto_cfg(self) -> None:
+        """把存下来的定时设置灌回控件，并把改动接上保存。"""
+        cfg: dict = {}
+        try:
+            with open(self._auto_path(), encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                cfg = d
+        except Exception:  # noqa: BLE001
+            pass
+        self._auto_last = str(cfg.get("last") or "")
+        self.chk_auto.setChecked(bool(cfg.get("enabled", False)))
+        t = QTime.fromString(str(cfg.get("time") or "15:30"), "HH:mm")
+        if t.isValid():
+            self.time_auto.setTime(t)
+        i = self.cb_auto_range.findData(cfg.get("range") or "1d")
+        if i >= 0:
+            self.cb_auto_range.setCurrentIndex(i)
+        self.chk_auto.toggled.connect(self._save_auto_cfg)
+        self.time_auto.timeChanged.connect(self._save_auto_cfg)
+        self.cb_auto_range.currentIndexChanged.connect(self._save_auto_cfg)
+
+    def _save_auto_cfg(self, *_args) -> None:
+        cfg = {
+            "enabled": self.chk_auto.isChecked(),
+            "time": self.time_auto.time().toString("HH:mm"),
+            "range": self.cb_auto_range.currentData() or "1d",
+            "last": self._auto_last,
+        }
+        try:
+            path = self._auto_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, path)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _check_auto(self) -> None:
+        """每 30 秒看一眼：到点、今天还没跑过、手上没活儿，就补一次。
+
+        日期存盘而不是只放内存：半夜跑过一次之后用户重启程序，不该再补一遍。
+        """
+        if not self.chk_auto.isChecked() or self.market != "cn":
+            return
+        from datetime import date
+
+        today = date.today().isoformat()
+        if self._auto_last == today:
+            return
+        if QTime.currentTime() < self.time_auto.time():
+            return
+        if self.busy():
+            return              # 正在更新，下一个 30 秒再看
+        self._auto_last = today
+        self._save_auto_cfg()
+        self._log(f"—— 定时补充开始（{self.time_auto.time().toString('HH:mm')}）")
+        self._start_auto()
+
+    def _start_auto(self) -> None:
+        """定时任务：主连 + 真实合约 + 期权，区间按用户选的那一档。
+
+        和手动更新走同一个 `UpdateWorker`，区别只有两个：市场钉死期货，
+        失败不弹模态框（半夜没人点确定，弹窗会一直挂着）。
+        """
+        key = self.cb_auto_range.currentData() or "1d"
+        dir_cn = (self._markets.get("cn") or {}).get("dir") or self.market_dir
+        self._auto_run = True
+        self._upd_worker = UpdateWorker(
+            "cn", dir_cn, key, updater.SOURCE_TUSHARE, 0.0,
+            aux_contracts=True, aux_options=True,
+        )
+        self._upd_thread = QThread(self)
+        self._upd_worker.moveToThread(self._upd_thread)
+        self._upd_thread.started.connect(self._upd_worker.run)
+        self._upd_worker.progress.connect(self._on_progress)
+        self._upd_worker.done.connect(self._on_update_done)
+        self._upd_worker.failed.connect(self._on_update_failed)
+        self._upd_worker.done.connect(self._upd_thread.quit)
+        self._upd_worker.failed.connect(self._upd_thread.quit)
+        self._upd_thread.finished.connect(self._on_thread_done)
+
+        self.prog_update.setRange(0, 0)
+        self.prog_update.setVisible(True)
+        self.lbl_upd.setVisible(True)
+        self.lbl_upd.setText(f"定时补充（{updater.RANGE_LABELS.get(key, key)}）…")
+        self.btn_update.setText("取消")
+        self.btn_update.setEnabled(True)
+        self._upd_thread.start()
 
     def _on_clicked(self) -> None:
         if self.busy():
@@ -599,6 +750,7 @@ class DataPage(QWidget):
         self._log("… 已请求取消")
 
     def _start_tushare(self) -> None:
+        self._auto_run = False
         mk = self.market
         key = self.cb_upd_range.currentData()
         # 期货没有第二个数据源，直接钉死 Tushare
@@ -691,11 +843,15 @@ class DataPage(QWidget):
         self.data_changed.emit(res.market)
 
         if problems or err:
-            more = f"\n… 另有 {len(problems) - 6} 条" if len(problems) > 6 else ""
-            QMessageBox.information(
-                self, "数据更新",
-                text + ("\n\n" + "\n".join(problems[:6]) + more if problems else ""),
-            )
+            if self._auto_run:
+                # 定时任务多半在没人看着的时候跑，模态框会一直挂在屏幕上
+                self._log("（定时补充：有失败项，见上；下次到点会再试）")
+            else:
+                more = f"\n… 另有 {len(problems) - 6} 条" if len(problems) > 6 else ""
+                QMessageBox.information(
+                    self, "数据更新",
+                    text + ("\n\n" + "\n".join(problems[:6]) + more if problems else ""),
+                )
 
     def _on_tq_done(self, text: str) -> None:
         self.lbl_upd.setVisible(True)
@@ -711,7 +867,10 @@ class DataPage(QWidget):
         self.lbl_upd.setVisible(True)
         self.lbl_upd.setText("更新失败")
         self._log(f"！失败：{message}")
-        QMessageBox.warning(self, "数据更新失败", message)
+        if self._auto_run:
+            self._log("（定时补充失败，下次到点会再试）")
+        else:
+            QMessageBox.warning(self, "数据更新失败", message)
 
     def _on_thread_done(self) -> None:
         for attr in ("_upd_thread", "_tq_thread"):
@@ -727,9 +886,12 @@ class DataPage(QWidget):
         self.btn_update.setText("开始补充")
         self.btn_update.setEnabled(True)
         self.prog_update.setVisible(False)
+        self._auto_run = False
 
     def shutdown(self) -> None:
         """关窗口时收尾：让后台线程别拖着进程。"""
+        if getattr(self, "_auto_timer", None) is not None:
+            self._auto_timer.stop()
         if self._upd_worker is not None:
             self._upd_worker.cancel()
         if self._tq_worker is not None:

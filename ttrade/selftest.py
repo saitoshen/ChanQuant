@@ -596,6 +596,14 @@ def _run() -> tuple[bool, list[str]]:
             and dp.chk_upd_options.isHidden() == (is_us or src_tq)
             and not dp.chk_upd_contracts.isChecked()
             and not dp.chk_upd_options.isChecked()
+            # 每日定时补充：控件在、只对期货显示、默认不勾（不能让用户
+            # 装完就被自动跑一次几十分钟的下载）
+            and hasattr(dp, "chk_auto")
+            and hasattr(dp, "time_auto")
+            and hasattr(dp, "cb_auto_range")
+            and dp.chk_auto.isHidden() == is_us
+            and not dp.chk_auto.isChecked()
+            and dp.cb_auto_range.count() == 2
         )
         # 交易Agent 页：删除按钮在没选中东西时必须是灰的，权限开关默认关。
         # 升级权限的文件模块是**函数里 import** 的，打包漏了只会在用户勾上开关

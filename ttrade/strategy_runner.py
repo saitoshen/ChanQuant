@@ -238,11 +238,86 @@ class PortfolioRunner:
             except Exception:  # noqa: BLE001
                 pass
 
+    # 用到这几类因子的策略，启动前要把衍生快照补到最新
+    _AUX_PREFIXES = ("roll_", "iv_", "near_oi", "pcr")
+
+    def _uses_aux(self) -> bool:
+        for st in self._slots.values():
+            if st.cfg.family == "factor":
+                for k in (st.cfg.factor_keys or []):
+                    if k.startswith(self._AUX_PREFIXES):
+                        return True
+        return False
+
+    def _aux_recent(self) -> bool:
+        """快照都够新吗？只要有一个品种落后就返回 False。
+
+        没有这道检查的话，每天第一次启动都要跑一遍 `update_futures` ——
+        94 个品种逐个请求，实测 125 秒，哪怕一根新数据都没有。判据用自然日差
+        而不是交易日历：差 <= 3 天覆盖周末，节假日会多跑一次（无害）。
+        """
+        try:
+            from datetime import date
+
+            from ttrade.auxdata import _default_dir, load_curve
+
+            aux_dir = _default_dir()
+            for st in self._slots.values():
+                c = load_curve(aux_dir, st.cfg.symbol, st.cfg.exchange)
+                if c.empty:
+                    continue
+                gap = (date.today() - pd.Timestamp(c.index[-1]).date()).days
+                if gap > 3:
+                    return False
+            return True
+        except Exception:  # noqa: BLE001
+            return False                # 判不了就按「落后」处理，宁可多补一次
+
+    def _ensure_aux(self) -> None:
+        """启动前把展期 / IV 的日频快照补到最新。
+
+        这两个因子在分钟线上只能用「上一个交易日」的收盘快照 —— 回测和实盘
+        同一个口径，盘中实时算反而是另一种量。但快照本身得有人去下：用户几天
+        没开程序，它就停在几天前，实盘拿着上周的期限结构算信号，有值但是死的。
+
+        **只在用到这些因子时才补**：没勾展期的策略不该为它白等几十秒。
+        补失败不拦启动 —— Tushare 挂了也得能交易，退回本地快照就是。
+        """
+        if not self._uses_aux():
+            return
+        if self._aux_recent():
+            return                      # 已经是最新的，别每天白跑两分钟
+        try:
+            from ttrade import updater
+
+            self._log("检查期货日线与展期 / 期权数据…")
+            # **先补主力连续日线**：`update_aux` 拿 data_futures 的日期当交易日历，
+            # 日线停在几天前的话它会认为「衍生数据已是最新」，缺的其实是源头。
+            # 窗口给足一年：两个更新函数都只补本地没有的部分，多给的日期不会
+            # 重复请求，只是让「很久没开程序」的缺口一次补完。
+            f = updater.update_futures(
+                None, "1y",
+                progress=lambda d, t, m: self._log(f"  日线 [{d}/{t}] {m}"),
+            )
+            self._log(f"日线：{f.summary()}")
+            res = updater.update_aux(
+                None, range_key="1y", want_contracts=True, want_options=True,
+                progress=lambda d, t, m: self._log(f"  补衍生数据 [{d}/{t}] {m}"),
+            )
+            n = int(getattr(res, "days", 0) or 0)
+            self._log(f"衍生数据已补 {n} 个交易日" if n else "衍生数据已是最新")
+            if getattr(res, "failed", 0):
+                self._log(f"  {res.failed} 天失败，下次启动会再试")
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"衍生数据补充失败（{type(exc).__name__}: {exc}），先用本地快照")
+
     def start(self) -> None:
         from tqsdk import TqApi, TqAuth
 
         if not self.spec.user or not self.spec.password:
             raise ValueError("缺少天勤账户或密码")
+        # 补数据放在连接之前：连上就要开始算信号了，那时候快照还是旧的
+        self._ensure_aux()
         self.api = TqApi(
             self.spec.build(),
             auth=TqAuth(self.spec.user, self.spec.password),
@@ -640,28 +715,37 @@ class PortfolioRunner:
         但如果用户几天没更新衍生数据，快照就停在几天前：因子有值、但那个值是
         上周的期限结构，看着正常其实是死的。
 
-        判据按**交易日**数而不是日历天：正常滞后 1 个交易日，周末跨两天不算。
+        **要看快照文件本身的末日，不能看 df 里最后一个非空值**：
+        `attach_intraday` 用的是 `ffill`，缺的交易日会沿用最后一条快照，
+        df 里永远「有值到今天」，判据就永远不会触发。
+
+        正常滞后 1 个交易日（今天用昨天的），>= 2 才算缺。
         """
         key = self._skey(st.cfg)
         if key in self._aux_warned:
             return
         try:
-            s = pd.to_numeric(df["c1_close"], errors="coerce")
-            if not s.notna().any():
+            from ttrade.auxdata import _default_dir, load_curve, load_opt
+
+            aux_dir = _default_dir()
+            last = None
+            for part in (load_curve(aux_dir, st.cfg.symbol, st.cfg.exchange),
+                         load_opt(aux_dir, st.cfg.symbol, st.cfg.exchange)):
+                if not part.empty:
+                    d = pd.Timestamp(part.index[-1])
+                    last = d if last is None or d < last else last
+            if last is None:
                 return                      # 没有衍生数据，因子本来就是空的
             td = (pd.to_datetime(df["trading_day"]) if "trading_day" in df.columns
                   else pd.Series(pd.DatetimeIndex(df.index).normalize(), index=df.index))
             days = pd.DatetimeIndex(sorted(set(td.dropna())))
-            last = td[s.notna()].iloc[-1]
-            # 正常情况「最新一根 bar 的交易日」就能拿到前一天的快照，lag = 0；
-            # 缺一天就变成 1。所以只要 >= 1 就是缺，不用等两天
             lag = int((days > last).sum())
-            if lag >= 1:
+            if lag >= 2:
                 self._aux_warned.add(key)
                 self._log(
                     f"{st.title()}：衍生数据只到 {str(last)[:10]}，"
-                    f"展期 / 期权因子落后 {lag} 个交易日 —— "
-                    f"去「数据管理」页补一次真实合约 / 期权"
+                    f"落后 {lag} 个交易日 —— 展期 / 期权因子用的是旧快照，"
+                    f"去「数据管理」页补一次"
                 )
         except Exception:  # noqa: BLE001
             pass
