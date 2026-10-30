@@ -198,6 +198,9 @@ class Replay:
     long_only: bool = False
     bars_per_year: float = 252.0
     error: str = ""
+    # 截面策略的 (品种行情, CrossConfig, 分数面板)。「截面因子分析」要拿品种池
+    # 重算横截面 IC，光有净值曲线画不出来
+    cross: object | None = None
 
     @property
     def ok(self) -> bool:
@@ -374,4 +377,5 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
     res = cross_engine.to_result(out, label=label, step=ccfg.step(),
                                  bpy=bt.bars_per_year)
     return Replay(res=res, bh=None, label=label, family="cross", period=period,
-                  long_only=bt.long_only, bars_per_year=bt.bars_per_year)
+                  long_only=bt.long_only, bars_per_year=bt.bars_per_year,
+                  cross=(frames, ccfg, out.score))

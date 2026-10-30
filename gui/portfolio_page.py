@@ -100,7 +100,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.result_view import PERIOD_LABEL, ResultView, ViewCtx
+from gui.result_view import PERIOD_LABEL, ResultView, ViewCtx, set_tab_visible
 from ttrade import replay
 from ttrade import cross as cross_engine
 from ttrade import strategy_store as SStore
@@ -1072,9 +1072,10 @@ class PortfolioPage(QWidget):
         period = PERIOD_LABEL.get(cfg.period, cfg.period)
         if is_cross:
             # 截面策略没有「某一条策略的 K 线」：仓位是一篮子权重，画 K 线会
-            # 误导。走组合视图那三页（绩效 / 阶段 / 交易记录）
+            # 误导。走组合视图那几页（绩效 / 截面因子分析 / 阶段 / 交易记录）
             self._stop_live()
-            _tabs, view = self._ensure_view("portfolio")
+            tabs, view = self._ensure_view("portfolio")
+            set_tab_visible(tabs, "截面因子分析", True)
             ctx = ViewCtx(
                 symbol="", name=f"{len(getattr(cfg, 'cross_symbols', []) or [])} 个品种",
                 exchange="", period=cfg.period, market=replay.market_of(cfg),
@@ -1082,8 +1083,12 @@ class PortfolioPage(QWidget):
                 range_years=float(cfg.range_years or 0) or None,
                 long_only=rp.long_only, bars_per_year=rp.bars_per_year,
                 overlay=False, selected_keys=[],
+                cross=getattr(rp, "cross", None),
             )
-            view.show_result(None, None, rp.res, None, ctx)
+            view.show_result(
+                None, None, rp.res, None, ctx,
+                trades=[(t.symbol or rp.label, t) for t in rp.res.trades],
+            )
             self._show_view("portfolio", f"{cfg.title()}｜{period}"
                                          + (f"｜{note}" if note else ""))
             return replay.summary(rp, cfg.title(), period)
@@ -1151,6 +1156,7 @@ class PortfolioPage(QWidget):
         # 组合是几条策略的净值合成，没有「这一条策略的实时 K 线」可言
         self._stop_live()
         tabs, view = self._ensure_view("portfolio")
+        set_tab_visible(tabs, "截面因子分析", False)
         view.show_result(None, None, res, None, ctx, trades=trades)
         names = "、".join(c.title() for c, _r in reps)
         self._show_view("portfolio", f"组合报告｜{len(reps)} 条策略等权｜{names}")

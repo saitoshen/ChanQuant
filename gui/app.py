@@ -80,7 +80,7 @@ from gui.data_page import DataPage
 from gui.live import LiveController
 from gui.pickers import SymbolPicker
 from gui.portfolio_page import LibraryDialog, PortfolioPage
-from gui.result_view import ResultView, ViewCtx
+from gui.result_view import ResultView, ViewCtx, set_tab_visible
 from gui.trade_page import TradePage
 from ttrade.backtest import (
     BacktestConfig, bars_per_year, buy_and_hold, combine, combine_trades,
@@ -1057,6 +1057,15 @@ class MainWindow(QMainWindow):
     def _show_port_view(self) -> None:
         if hasattr(self, "view_stack"):
             self.view_stack.setCurrentIndex(1)
+
+    def _set_cross_factor_tab_visible(self, on: bool) -> None:
+        """「截面因子分析」只在截面策略跑完时有内容。
+
+        多品种等权组合把它藏起来 —— 那页写的是「这一页只对截面策略有效」，
+        摆在那儿等于提醒用户「我们做了个用不上的页签」。
+        """
+        if hasattr(self, "tabs_port"):
+            set_tab_visible(self.tabs_port, "截面因子分析", on)
 
     def _build_live_btn(self) -> QPushButton:
         """研究页的实时开关。**手动**：换品种 / 换周期就断开，要再看得自己点。"""
@@ -3195,6 +3204,7 @@ class MainWindow(QMainWindow):
             overlay=False, selected_keys=[],
         )
         self._show_port_view()
+        self._set_cross_factor_tab_visible(False)
         self.view_port.show_result(None, None, res, None, ctx, trades=trades)
         self.res, self.bh, self.df_raw, self.df_sig = res, None, None, None
         self.factor_outcome = None
@@ -3326,9 +3336,17 @@ class MainWindow(QMainWindow):
             range_years=self.cb_range.currentData() or None,
             long_only=ccfg.long_only, bars_per_year=bt.bars_per_year,
             overlay=False, selected_keys=[],
+            # 「截面因子分析」要拿品种池重算一遍横截面 IC，光有净值画不出来
+            cross=(frames, ccfg, out.score),
         )
         self._show_port_view()
-        self.view_port.show_result(None, None, res, None, ctx, trades=None)
+        self._set_cross_factor_tab_visible(True)
+        # 交易记录按「品种」分：截面的每一笔只属于一个品种，名字写策略名会让
+        # 几百行看起来像同一笔重复了
+        self.view_port.show_result(
+            None, None, res, None, ctx,
+            trades=[(t.symbol or label, t) for t in res.trades],
+        )
         self.res, self.bh, self.df_raw, self.df_sig = res, None, None, None
         self.factor_outcome = None
         self._strategy_label = label

@@ -116,6 +116,9 @@ class Trade:
     direction: int = 1            # 1=多头，-1=空头
     open_position: bool = False
     lots: float = 0.0             # 这笔实际下了多少手（unit 口径是份额，小数）
+    # 截面策略一笔只对应一个品种，但同一个 `Result` 里混着好几个品种的交易；
+    # 单策略回测只有一只标的，留空即可
+    symbol: str = ""
 
 
 @dataclass

@@ -58,6 +58,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ttrade import cross as cross_engine
 from ttrade import factor_metrics, factors, mlmodels, tqdata
 from ttrade.backtest import drawdown_series, month_matrix, stage_table
 from ttrade.replay import hold_text
@@ -110,6 +111,16 @@ def _extract_trades(sig) -> list[tuple[int, int, int]]:
     if cur != 0 and len(sig):
         out.append((entry, len(sig) - 1, cur))
     return out
+
+
+def set_tab_visible(tabs, title: str, on: bool) -> None:
+    """按标题显隐页签。Qt 的 `setTabVisible` 要下标，标题是两边唯一对得上的东西。"""
+    if tabs is None:
+        return
+    for i in range(tabs.count()):
+        if tabs.tabText(i) == title:
+            tabs.setTabVisible(i, bool(on))
+            return
 
 
 def _lots_text(v: float) -> str:
@@ -291,6 +302,9 @@ class ViewCtx:
     filter_active: bool = False
     selected_keys: list = field(default_factory=list)
     outcome: object | None = None      # fstrat.FactorOutcome
+    # 截面策略的上下文：(frames, CrossConfig, 分数面板)。「截面因子分析」要按
+    # 品种池重算一遍因子的横截面 IC，光有结果曲线画不出来
+    cross: object | None = None
 
 
 # 交易所中文名。放在这里而不是从 app 引，避免环依赖
@@ -342,6 +356,9 @@ class ResultView(QObject):
         self._built = False
         self._report: pd.DataFrame | None = None
         self._report_key = ""
+        # 截面因子分析的缓存：算一遍要遍历所有因子 × 所有品种，切页签不该重算
+        self._cf_rep = None
+        self._cf_key = ""
         # K 线窗口状态
         self._k_view = None
         self._k_total = 0
@@ -380,6 +397,10 @@ class ResultView(QObject):
         out.append(("绩效对比" if self.kind == "single" else "绩效", self._build_perf_page()))
         if self.kind == "single":
             out.append(("因子分析", self._build_factor_page()))
+        else:
+            # 组合视图默认给「多品种等权」用，那一页没意义（宿主会把它藏起来）；
+            # 截面策略跑完才露出来
+            out.append(("截面因子分析", self._build_cross_factor_page()))
         out.append(("交易记录", self._build_trades_page()))
         out.append(("阶段分析", self._build_stages_page()))
         return out
@@ -560,6 +581,69 @@ class ResultView(QObject):
         lay.addWidget(self.lbl_fnote)
         return w
 
+    # ---- 截面因子分析
+
+    def _build_cross_factor_page(self) -> QWidget:
+        """截面策略的因子分析：左边横截面 IC 一览，右边四格图。
+
+        和时序那页长得很像，但**口径完全不同** —— 这里问的是「同一根 bar 上，
+        这个因子给这批品种排的名次，和它们下一段的相对涨跌对不对得上」。
+        所以不能复用 `_build_factor_page`：那边一个品种一条时间轴，这边一张
+        横截面面板。
+        """
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 8, 0)
+        ll.setSpacing(6)
+        cap = QLabel("横截面 IC 一览")
+        cap.setStyleSheet("font-size: 13px; font-weight: 600; color: #0f172a;")
+        ll.addWidget(cap)
+        self.lbl_cfrep = QLabel("")
+        self.lbl_cfrep.setObjectName("Hint")
+        self.lbl_cfrep.setWordWrap(True)
+        ll.addWidget(self.lbl_cfrep)
+
+        # 末两列是截面特有的：覆盖（这个因子在面板上算出数的比例）和期数
+        # （参与统计的 bar 数）。时序那边不用看覆盖 —— 一个品种要么有数据要么没有
+        self.tbl_cfactor = QTableWidget(0, 7)
+        self.tbl_cfactor.setHorizontalHeaderLabels(
+            ["因子", "截面IC", "ICIR", "IC>0", "t(NW)", "覆盖", "期数"]
+        )
+        self.tbl_cfactor.verticalHeader().setVisible(False)
+        self.tbl_cfactor.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl_cfactor.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tbl_cfactor.setShowGrid(False)
+        self.tbl_cfactor.setSortingEnabled(False)
+        hh = self.tbl_cfactor.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in range(1, 7):
+            hh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        ll.addWidget(self.tbl_cfactor, 1)
+        splitter.addWidget(left)
+
+        self.canvas_cf = MplCanvas(figsize=(8, 7), dpi=100)
+        self.canvas_cf.installEventFilter(self)
+        splitter.addWidget(self.canvas_cf)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([430, 760])
+
+        lay.addWidget(splitter)
+
+        self.lbl_cfnote = QLabel("")
+        self.lbl_cfnote.setObjectName("Hint")
+        self.lbl_cfnote.setWordWrap(True)
+        lay.addWidget(self.lbl_cfnote)
+        return w
+
     # ---- 交易记录
 
     def _build_trades_page(self) -> QWidget:
@@ -657,6 +741,7 @@ class ResultView(QObject):
             (ctx.label, t) for t in (res.trades if res is not None else [])
         ]
         self._report, self._report_key = None, ""
+        self._cf_rep, self._cf_key = None, ""
 
         self.pages()          # 确保控件都建好
         if self.kind == "single":
@@ -667,6 +752,8 @@ class ResultView(QObject):
         self._update_table()
         if self.kind == "single":
             self._refresh_factor_tab()
+        else:
+            self._refresh_cross_factor()
         self._refresh_trades()
         self._refresh_stages()
 
@@ -1541,6 +1628,10 @@ class ResultView(QObject):
         # 对着资金曲线查的时候很容易看串行。这里统一按开仓时间排。
         rows = sorted(self.trades, key=lambda nt: (nt[1].entry_date, nt[1].exit_date))
         with_name = self.kind == "portfolio"
+        if with_name:
+            # 组合报告的第二列是「哪条策略」，截面策略则是「哪个品种」
+            head = "品种" if getattr(self.ctx, "cross", None) else "策略"
+            self.tbl_trades.setHorizontalHeaderItem(1, QTableWidgetItem(head))
         n_closed = sum(1 for _n, t in rows if not t.open_position)
         n_open = len(rows) - n_closed
         wins = [t.ret for _n, t in rows if not t.open_position and t.ret > 0]
@@ -1556,7 +1647,10 @@ class ResultView(QObject):
             f"共 {len(rows)} 笔（已平 {n_closed} 笔，持仓中 {n_open} 笔）"
             f" · 盈利 {len(wins)} 笔 / 亏损 {len(losses)} 笔"
             f" · 平均盈利 {avg_win*100:+.2f}% / 平均亏损 {avg_loss*100:+.2f}%"
-            + ("　（组合：按策略分别平仓，不合并对冲）" if with_name else "")
+            + ("　（组合：按策略分别平仓，不合并对冲）"
+               if with_name and not getattr(self.ctx, "cross", None) else
+               "　（截面：一笔 = 某品种一段连续同向持仓，权重变化不算新的一笔）"
+               if with_name else "")
         )
 
         shown = rows
@@ -1899,6 +1993,283 @@ class ResultView(QObject):
             "（滚动窗口重叠会严重高估显著性）；分位与方向均按 PIT 滚动计算"
         )
         self.lbl_fnote.setText(" · ".join(n for n in notes if n))
+
+    # ---------------------------------------------------------- 截面因子分析
+
+    def _ensure_cross_report(self, frames, ccfg, score):
+        """算一遍横截面 IC，缓存起来。
+
+        这个比时序那页便宜（因子数少），但也要遍历「因子 × 品种」，切页签时
+        重算没有意义。缓存键带上分数面板的 id —— 同一条策略重跑会换一个新
+        DataFrame，id 变了自然就重算。
+        """
+        keys = list(getattr(ccfg, "factor_keys", None) or [])
+        key = f"{id(score)}|{getattr(ccfg, 'factor_mode', '')}|{','.join(keys)}"
+        if self._cf_rep is not None and self._cf_key == key:
+            return self._cf_rep
+        try:
+            rep = cross_engine.factor_report(
+                frames, keys, score,
+                fcfg=getattr(ccfg, "factor_cfg", None),
+                reverse=getattr(ccfg, "factor_reverse", None),
+            )
+        except Exception as exc:  # noqa: BLE001
+            rep = cross_engine.CrossReport(
+                pd.DataFrame(), pd.Series(dtype=float),
+                pd.Series(dtype=float), pd.Series(dtype=float),
+                error=f"截面因子评估失败：{exc}",
+            )
+        self._cf_rep, self._cf_key = rep, key
+        return rep
+
+    def _refresh_cross_factor(self) -> None:
+        """刷新截面因子分析页：表格 + 四格图。
+
+        没有截面上下文（「多品种等权」组合）时不能装作有 —— 那个组合是每个
+        品种各跑一遍时序策略再平均，根本没有「同一根 bar 上给品种排名」这回事。
+        """
+        tbl = getattr(self, "tbl_cfactor", None)
+        if tbl is None:
+            return
+        ctx_cross = getattr(self.ctx, "cross", None)
+        if not ctx_cross:
+            self._cross_factor_placeholder()
+            return
+        # 算 + 画一起推迟：没人看这一页的时候算它纯属白等
+        if self._defer_draw(self.canvas_cf, self._refresh_cross_factor):
+            return
+
+        frames, ccfg, score = ctx_cross
+        rep = self._ensure_cross_report(frames, ccfg, score)
+        if rep is None or not rep.ok:
+            msg = (getattr(rep, "error", "") if rep is not None else "") \
+                or "截面因子评估失败"
+            self.lbl_cfrep.setText(msg)
+            tbl.setRowCount(0)
+            return
+
+        def cell(text, align_right=True, bold=False, color=None):
+            it = QTableWidgetItem(str(text))
+            if align_right:
+                it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if bold:
+                f = it.font()
+                f.setBold(True)
+                it.setFont(f)
+            if color:
+                it.setForeground(QColor(color))
+            return it
+
+        tbl.setRowCount(0)
+        for key, r in rep.table.iterrows():
+            i = tbl.rowCount()
+            tbl.insertRow(i)
+            # 合成分数单独一行：它是真正拿去排序的东西，得一眼能找出来
+            main = key == "__score__"
+            name = ("★ " if main else "　") + str(r["label"])
+            tbl.setItem(i, 0, cell(name, False, main,
+                                   C_FACTOR if main else None))
+
+            ic = r.get("ic")
+            if pd.notna(ic):
+                ic_color = C_IC if ic > 0 else C_IC_NEG
+                tbl.setItem(i, 1, cell(f"{ic:+.4f}", True, main, ic_color))
+            else:
+                tbl.setItem(i, 1, cell("", True, main))
+
+            for j, col in enumerate(("ir", "ic_pos", "t", "cover", "n"), start=2):
+                v = r.get(col)
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    txt = ""
+                elif col == "ic_pos":
+                    txt = f"{v:.0%}"
+                elif col == "cover":
+                    txt = f"{v:.0%}"
+                elif col == "n":
+                    txt = f"{int(v)}"
+                elif col == "t":
+                    txt = f"{v:+.2f}"
+                else:
+                    txt = f"{v:+.3f}"
+                tbl.setItem(i, j, cell(txt, True, main))
+            tbl.setRowHeight(i, 23)
+
+        n_sig = int((rep.table["t"].abs() > 2).sum())
+        self.lbl_cfrep.setText(
+            f"{len(rep.table) - 1} 个因子 · 前向 {rep.horizon} 根 · "
+            f"{rep.n_bars} 根 bar · {len(frames)} 个品种\n"
+            f"|t|>2 的因子 {n_sig} 个（Newey-West 调整后）"
+        )
+        self._plot_cross_factor_charts(frames, ccfg, rep)
+
+    def _cross_factor_placeholder(self) -> None:
+        """非截面策略：把这一页说明白，而不是画一张空图。"""
+        self.lbl_cfrep.setText("这一页只对截面策略有效")
+        self.lbl_cfnote.setText(
+            "多品种等权组合不是截面策略 —— 它是每个品种各跑一遍时序策略再把"
+            "资金曲线平均，不存在「同一根 bar 上给品种排名」这回事，也就没有"
+            "横截面 IC 可算。想看横截面 IC，请在「策略研究」里把策略族切到"
+            "「截面对冲」或「截面选品种」。"
+        )
+        self.tbl_cfactor.setRowCount(0)
+        with self.canvas_cf.frozen():
+            fig = self.canvas_cf.fresh()
+            a = fig.add_subplot(111)
+            a.set_facecolor(C_BG)
+            a.set_xticks([])
+            a.set_yticks([])
+            for spine in a.spines.values():
+                spine.set_visible(False)
+            a.text(0.5, 0.52, "非截面策略", ha="center", va="center",
+                   fontsize=15, color=C_TEXT, transform=a.transAxes)
+            a.text(0.5, 0.44, "没有横截面因子分析", ha="center", va="center",
+                   fontsize=10.5, color=C_MUTED, transform=a.transAxes)
+
+    def _plot_cross_factor_charts(self, frames, ccfg, rep) -> None:
+        """四格图：截面 IC 时序 / 分位收益 / 多空价差 / 各因子 IC 条形。"""
+        if self._defer_draw(self.canvas_cf, self._plot_cross_factor_charts,
+                            frames, ccfg, rep):
+            return
+        with self.canvas_cf.frozen():
+            self._plot_cross_factor_charts_impl(frames, ccfg, rep)
+
+    def _plot_cross_factor_charts_impl(self, frames, ccfg, rep) -> None:
+        fig = self.canvas_cf.fresh()
+        axes = fig.subplots(2, 2)
+        fig.subplots_adjust(left=0.085, right=0.975, top=0.93, bottom=0.10,
+                            hspace=0.36, wspace=0.26)
+        a_ic, a_q, a_sp, a_bar = axes.flat
+
+        for a in axes.flat:
+            a.set_facecolor(C_BG)
+            a.grid(True, color=C_GRID, lw=0.5, alpha=0.75)
+            a.set_axisbelow(True)
+            for spine in ("top", "right"):
+                a.spines[spine].set_visible(False)
+            for spine in ("left", "bottom"):
+                a.spines[spine].set_color("#cbd5e1")
+            a.tick_params(colors=C_MUTED, labelsize=8.5, length=3)
+
+        ic = rep.ic.dropna() if rep.ic is not None else pd.Series(dtype=float)
+        span_days = 0.0
+        if len(ic) > 1:
+            try:
+                span_days = (ic.index[-1] - ic.index[0]) / pd.Timedelta(days=1)
+            except TypeError:
+                span_days = float(len(ic))
+
+        def date_axis(a):
+            # `maxticks=5` 在 2~3 年的区间上会让 AutoDateLocator 挑不出合适的
+            # 刻度间隔（它会打一条 "unable to pick an appropriate interval"
+            # 的警告，然后退回一个很怪的默认值）。截面策略的回测窗口常常正好
+            # 是这种长度，所以这里给一个 3~7 的区间
+            a.xaxis.set_major_locator(AutoDateLocator(minticks=3, maxticks=7))
+            # 只写年份时，一年里的几个刻度会全变成同一个「2023」，看着像重影。
+            # 跨度越短，标签就写得越细
+            if span_days <= 400:
+                fmt = "%m-%d"
+            elif span_days <= 2000:
+                fmt = "%y/%m"
+            else:
+                fmt = "%Y"
+            a.xaxis.set_major_formatter(DateFormatter(fmt))
+            a.tick_params(axis="x", labelsize=8)
+
+        # ---- 1. 合成分数的逐期截面 IC
+        if len(ic) > 10:
+            win = max(5, min(60, len(ic) // 8))
+            a_ic.plot(ic.index, ic.to_numpy(), color=C_IC, lw=0.7, alpha=0.45)
+            smooth = ic.rolling(win, min_periods=max(2, win // 2)).mean()
+            a_ic.plot(smooth.index, smooth.to_numpy(), color=C_IC, lw=1.4)
+            a_ic.axhline(0, color="#94a3b8", lw=0.8)
+            mu = float(ic.mean())
+            a_ic.axhline(mu, color=C_IC_NEG, lw=0.9, ls="--", alpha=0.85)
+            a_ic.set_title(
+                f"合成分数 · 逐期截面 IC（均值 {mu:+.3f}，{win} 期平滑）",
+                fontsize=9.5, color=C_TEXT, loc="left",
+            )
+            date_axis(a_ic)
+        else:
+            a_ic.set_title("合成分数 · 逐期截面 IC（样本不足）",
+                           fontsize=9.5, color=C_MUTED, loc="left")
+        a_ic.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.2f}"))
+
+        # ---- 2. 分位收益：Q1 最弱、Qq 最强，柱子该一级级抬高
+        q = rep.quantile.dropna() if rep.quantile is not None else pd.Series(dtype=float)
+        if len(q):
+            xs = np.arange(len(q))
+            vals = q.to_numpy(dtype=float) * 100
+            a_q.bar(xs, vals, color=[C_IC if v >= 0 else C_IC_NEG for v in vals],
+                    width=0.62, alpha=0.85)
+            a_q.axhline(0, color="#94a3b8", lw=0.8)
+            a_q.set_xticks(xs)
+            a_q.set_xticklabels([f"Q{int(b)}" for b in q.index])
+            mono = factor_metrics.monotonicity(q)
+            ttl = "分位平均相对收益"
+            if not pd.isna(mono):
+                ttl += f"（单调性 {mono:+.2f}）"
+            a_q.set_title(ttl, fontsize=9.5, color=C_TEXT, loc="left")
+            a_q.set_ylabel("%", fontsize=8.5, color=C_MUTED)
+        else:
+            a_q.set_title("分位平均相对收益（样本不足）",
+                          fontsize=9.5, color=C_MUTED, loc="left")
+        a_q.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.2f}"))
+
+        # ---- 3. 多空价差累计净值：只做「最强一组减最弱一组」，不含择时
+        sp = rep.spread.dropna() if rep.spread is not None else pd.Series(dtype=float)
+        if len(sp) > 2:
+            nav = sp.to_numpy(dtype=float)
+            a_sp.plot(sp.index, nav, color=C_FACTOR, lw=1.2)
+            a_sp.fill_between(sp.index, 1.0, nav, color=C_FACTOR, alpha=0.12)
+            a_sp.axhline(1.0, color="#94a3b8", lw=0.8, ls="--")
+            tot = float(nav[-1] - 1.0)
+            a_sp.set_title(
+                f"多空价差 · 最强一组减最弱一组（累计 {tot*100:+.1f}%）",
+                fontsize=9.5, color=C_TEXT, loc="left",
+            )
+            date_axis(a_sp)
+        else:
+            a_sp.set_title("多空价差（样本不足）", fontsize=9.5,
+                           color=C_MUTED, loc="left")
+        a_sp.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.2f}"))
+
+        # ---- 4. 各因子横截面 IC：横向条形，一眼看出谁在拖后腿
+        tab = rep.table.dropna(subset=["ic"]) if rep.table is not None else pd.DataFrame()
+        tab = tab[tab["ic"].notna()]
+        if len(tab):
+            tab = tab.sort_values("ic")
+            names = [("★ " if k == "__score__" else "") + str(r["label"])
+                     for k, r in tab.iterrows()]
+            vals = tab["ic"].to_numpy(dtype=float)
+            colors = [C_FACTOR if k == "__score__"
+                      else (C_IC if v >= 0 else C_IC_NEG)
+                      for k, v in zip(tab.index, vals)]
+            ys = np.arange(len(tab))
+            a_bar.barh(ys, vals, color=colors, alpha=0.88)
+            a_bar.axvline(0, color="#94a3b8", lw=0.8)
+            a_bar.set_yticks(ys)
+            a_bar.set_yticklabels(names, fontsize=8)
+            a_bar.set_title("各因子截面 IC", fontsize=9.5, color=C_TEXT, loc="left")
+            a_bar.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.2f}"))
+            if len(tab) > 9:
+                a_bar.tick_params(axis="y", labelsize=7)
+        else:
+            a_bar.set_title("各因子截面 IC（样本不足）", fontsize=9.5,
+                            color=C_MUTED, loc="left")
+
+        for a in axes.flat:
+            a.title.set_fontsize(9.5)
+
+        notes = [
+            "口径：每根 bar 上先给这批品种的因子值和下一段相对收益各排一次名次，"
+            "再算两者的秩相关；相对收益 = 该品种前向收益 − 当期截面均值"
+        ]
+        wname = {"risk": "风险平价", "equal": "等权", "score": "按分数"}.get(
+            getattr(ccfg, "weight", "risk"), "")
+        if wname:
+            notes.append(f"实际下单的资金分配是「{wname}」，这张图只看因子排序能力，不含权重")
+        notes.append("多空价差按「最强一组减最弱一组」等权合成，不含调仓成本和滑点")
+        self.lbl_cfnote.setText(" · ".join(n for n in notes if n))
 
     # ---------------------------------------------------------- 实时
 

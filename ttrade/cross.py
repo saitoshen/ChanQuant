@@ -31,7 +31,7 @@ import pandas as pd
 
 from ttrade import costs, factors, symbols_info
 from ttrade import factor_strategy as fstrat
-from ttrade.backtest import BacktestConfig
+from ttrade.backtest import BacktestConfig, Trade
 from ttrade.strategies import STRATEGIES, run_strategy
 
 MIN_CROSS = 3          # 横截面上至少几个品种有值，才算得出一组强弱
@@ -101,6 +101,12 @@ class CrossResult:
     legs: int = 0                       # 最近一次调仓持了几个品种
     n_rebalance: int = 0
     error: str = ""
+    # 逐笔交易（每腿「同向连续持仓」算一笔）。绩效页的「调仓 N 次」说的是调仓
+    # 动作，交易记录说的是持仓段 —— 两个数本来就不一样
+    trades: list = field(default_factory=list)
+    # 截面分数面板。画「截面因子分析」要用，`score_panel` 已经算过一遍，丢掉
+    # 就得重算十几秒
+    score: pd.DataFrame | None = None
 
     @property
     def ok(self) -> bool:
@@ -375,6 +381,59 @@ def _metrics(equity: pd.Series, bpy: float) -> dict:
             "sharpe": sharpe, "max_dd": dd, "calmar": calmar}
 
 
+def trades_from_weights(weights: pd.DataFrame,
+                        close: pd.DataFrame) -> list[Trade]:
+    """把权重矩阵翻成逐笔交易：每个品种「同向连续持仓」算一笔。
+
+    截面策略没有「一次开一手、一次平一手」的成交，仓位是按权重挂着的。要给出
+    交易记录，只能按**持仓段**切：符号从 0 变成 +1 是开多，从 +1 变成 -1 是
+    平多同时开空（两笔），回到 0 是平仓。
+
+    成交时点按 `run()` 里的口径：第 t 根的权重赚的是 t→t+1 的收益，所以第 t 根
+    收盘建仓、第 t+1 根收盘平仓。持仓段的最后一根如果一直没平，标成「持仓中」，
+    平仓价取最后一根的收盘。
+
+    权重**大小**变了不算新的一笔：风险平价每次调仓都会改大小，按大小切会把一笔
+    三年的多头拆成上百笔，那不是交易记录，那是调仓日志。
+    """
+    out: list[Trade] = []
+    if weights is None or weights.empty:
+        return out
+    idx = weights.index
+    n = len(idx)
+    for sym in weights.columns:
+        if sym not in close:
+            continue
+        w = weights[sym].to_numpy(dtype=float)
+        px = close[sym].to_numpy(dtype=float)
+        sign = np.where(np.isfinite(w), np.sign(w), 0.0)
+        i = 0
+        while i < n:
+            s = sign[i]
+            if s == 0:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n and sign[j + 1] == s:
+                j += 1
+            # 平仓落在「这一段之后的下一根」：第 j 根的权重赚的是 j→j+1 的收益
+            end = j + 1
+            opened = end >= n
+            k = min(end, n - 1)
+            p0, p1 = float(px[i]), float(px[k])
+            ret = (p1 / p0 - 1.0) * s if p0 > 0 else 0.0
+            out.append(Trade(
+                entry_date=idx[i], exit_date=idx[k],
+                entry_price=p0, exit_price=p1, ret=float(ret),
+                bars=int(k - i), direction=int(s), open_position=bool(opened),
+                lots=0.0,          # 截面是权重不是手数，界面上显示「—」
+                symbol=str(sym),
+            ))
+            i = j + 1
+    out.sort(key=lambda t: (t.entry_date, t.exit_date))
+    return out
+
+
 def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
         profile: str | None = None, label: str = "",
         progress=None, cancel=None) -> CrossResult:
@@ -427,6 +486,8 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
         equity=equity, weights=weights, metrics=_metrics(equity, bpy),
         label=label, legs=int(weights.abs().gt(0).sum(axis=1).max() or 0),
         n_rebalance=n_reb,
+        trades=trades_from_weights(weights, close),
+        score=score,
     )
 
 
@@ -434,9 +495,9 @@ def to_result(out: "CrossResult", label: str = "", step: int = 1,
               bpy: float = 252.0):
     """把 `CrossResult` 包成 `backtest.Result`，好让现成的绩效页直接吃得下。
 
-    截面策略没有「一笔一笔的成交」：仓位是按权重挂着的，用成交笔数去描述它
-    只会得到「0 笔交易」。这里把**每次调仓区间**当成一笔 —— 区间收益为正算赢。
-    这样胜率、盈亏比、最好 / 最差一笔都还有意义，表格也不会整列写 0。
+    绩效表里的「交易」还是按**调仓区间**算的（区间收益为正算赢）：截面策略的
+    仓位是按权重挂着的，按成交笔数算胜率会全是 0。交易记录那一页用的是
+    `trades_from_weights` 切出来的持仓段，两者口径不同，各管一处。
     """
     from ttrade.backtest import Result, _metrics
 
@@ -474,7 +535,160 @@ def to_result(out: "CrossResult", label: str = "", step: int = 1,
     # 绩效表里「期末资金」这一行读的是 `final_equity`，`backtest._metrics` 不算
     # 它（那是 `run_backtest` 事后补的），这里得自己补上
     m["final_equity"] = float(eq.iloc[-1])
-    return Result(equity=eq, position=pos, trades=[], metrics=m, label=label)
+    return Result(equity=eq, position=pos, trades=list(out.trades),
+                  metrics=m, label=label)
+
+
+@dataclass
+class CrossReport:
+    """截面因子分析的结论。表格给数字，三条曲线给形状。"""
+
+    table: pd.DataFrame                 # index=因子键（含 "__score__"），列见 `_REP_COLS`
+    ic: pd.Series                       # 合成分数的逐期截面 IC
+    quantile: pd.Series                 # 分位组的平均前向相对收益（index=1..q）
+    spread: pd.Series                   # 多空价差累计净值
+    horizon: int = 5
+    n_bars: int = 0
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.error and self.table is not None and not self.table.empty
+
+
+_REP_COLS = ("label", "ic", "ic_mean", "ir", "ic_pos", "t", "cover")
+
+
+def _row_ic(panel: pd.DataFrame, fwd: pd.DataFrame, min_n: int = MIN_CROSS) -> pd.Series:
+    """逐行（每根 bar）的横截面 Spearman 秩相关。
+
+    秩相关而不是 Pearson：截面只有 6 个品种，Pearson 被一个极端值带偏得太厉害。
+    `rank(axis=1)` 一次排完整张表，比逐行调 `spearman()` 快两个数量级。
+    """
+    rz = panel.rank(axis=1)
+    rf = fwd.rank(axis=1)
+    both = rz.notna() & rf.notna()
+    n = both.sum(axis=1)
+    zc = rz.where(both).sub(rz.where(both).mean(axis=1), axis=0)
+    fc = rf.where(both).sub(rf.where(both).mean(axis=1), axis=0)
+    num = (zc * fc).sum(axis=1)
+    den = np.sqrt((zc ** 2).sum(axis=1) * (fc ** 2).sum(axis=1))
+    ic = num / den.replace(0.0, np.nan)
+    return ic.where(n >= max(2, min_n))
+
+
+def _rel_fwd(frames: dict[str, pd.DataFrame], index, horizon: int) -> pd.DataFrame:
+    """截面相对的前向收益：每根 bar 减去当期的横截面均值。
+
+    和机器学习那边的标签是同一个口径 —— 多空对冲拿不到「整个板块一起涨」的
+    beta，因子要解释的是「谁比谁强」，不是「大家一起涨了多少」。
+    """
+    from ttrade.factor_metrics import forward_return
+
+    cols = {}
+    for sym, df in frames.items():
+        if df is None or df.empty:
+            continue
+        cols[sym] = forward_return(df, horizon).reindex(index)
+    if not cols:
+        return pd.DataFrame(index=index)
+    fwd = pd.concat(cols, axis=1).reindex(index)
+    return fwd.sub(fwd.mean(axis=1), axis=0)
+
+
+def factor_report(frames: dict[str, pd.DataFrame], keys: list[str],
+                  score: pd.DataFrame, fcfg=None, reverse: dict | None = None,
+                  quantiles: int = 5) -> CrossReport:
+    """截面因子分析：每个因子在这批品种上「排得准不准」。
+
+    和时序那套因子分析的差别就在**口径**：时序算的是「这个因子跟自己历史比，
+    高低能不能预测自己的涨跌」；这里算的是「每根 bar 上，因子给这批品种排的
+    名次，和它们下一段相对涨跌的名次对不对得上」。同一个因子两边的 IC 可以
+    差很远 —— 动量在时序上常常是负的（追涨杀跌），在截面上经常是正的（强的
+    继续强）。
+    """
+    from ttrade.factor_metrics import newey_west_t
+
+    if score is None or score.empty:
+        return CrossReport(pd.DataFrame(), pd.Series(dtype=float),
+                           pd.Series(dtype=float), pd.Series(dtype=float),
+                           error="没有截面分数")
+    # `fcfg` 既可能是 FactorConfig（脚本里直接调），也可能是 CrossConfig 里那个
+    # 序列化过的 dict（GUI 走的是这条路）
+    if isinstance(fcfg, dict):
+        horizon = max(1, int(fcfg.get("horizon", 5) or 5))
+    else:
+        horizon = max(1, int(getattr(fcfg, "horizon", 5) or 5))
+    rev = {k for k, v in (reverse or {}).items() if v}
+    index = score.index
+    fwd = _rel_fwd(frames, index, horizon)
+
+    rows = []
+    panels: dict[str, pd.DataFrame] = {}
+    for key in keys or []:
+        if key not in factors.FACTORS:
+            continue
+        raw = {}
+        for sym, df in frames.items():
+            try:
+                raw[sym] = factors.raw(df, key)
+            except Exception:  # noqa: BLE001
+                continue
+        if len(raw) < MIN_CROSS:
+            continue
+        panel = pd.concat(raw, axis=1).sort_index().ffill().reindex(index)
+        if not panel.notna().any().any():
+            continue
+        z = _cross_z(panel)
+        if key in rev:
+            z = -z
+        panels[key] = z
+        rows.append((key, factors.FACTORS[key].label, z))
+
+    # 合成分数也占一行：它是「这一堆因子合起来」的实际排序依据
+    rows.append(("__score__", "合成分数（实际用于排序）", score))
+
+    table = []
+    for key, label, panel in rows:
+        ic = _row_ic(panel, fwd)
+        valid = ic.dropna()
+        n = int(panel.notna().sum().sum())
+        tot = int(panel.shape[0] * max(1, panel.shape[1]))
+        rec = {"key": key, "label": label, "n": int(len(valid)),
+               "cover": (n / tot) if tot else 0.0,
+               "ic": float(valid.mean()) if len(valid) else float("nan"),
+               "ic_mean": float(valid.mean()) if len(valid) else float("nan"),
+               "ic_std": float(valid.std(ddof=1)) if len(valid) > 1 else float("nan"),
+               "ic_pos": float((valid > 0).mean()) if len(valid) else float("nan"),
+               "t": float(newey_west_t(valid.to_numpy())) if len(valid) > 12
+                    else float("nan")}
+        sd = rec["ic_std"]
+        rec["ir"] = (rec["ic_mean"] / sd) if sd and np.isfinite(sd) and sd > 0 \
+            else float("nan")
+        table.append(rec)
+
+    rep = pd.DataFrame(table).set_index("key") if table else pd.DataFrame()
+
+    # 分位收益 + 多空价差：用合成分数分组，看单调性和「两头差多少」
+    qret = pd.Series(dtype=float)
+    spread = pd.Series(dtype=float)
+    ic_score = pd.Series(dtype=float)
+    if "__score__" in rep.index:
+        ic_score = _row_ic(score, fwd)
+        q = max(2, int(quantiles))
+        pct = score.rank(axis=1, pct=True)
+        bucket = np.ceil(pct.to_numpy() * q)
+        means = {}
+        for b in range(1, q + 1):
+            mask = np.isfinite(bucket) & (bucket == b)
+            means[b] = fwd.where(mask).mean(axis=1)
+        qdf = pd.DataFrame(means, index=index)
+        qret = qdf.mean().rename_axis("bucket")
+        top, bot = qdf[q], qdf[1]
+        spread = (1.0 + (top - bot).fillna(0.0)).cumprod()
+
+    return CrossReport(table=rep, ic=ic_score, quantile=qret, spread=spread,
+                       horizon=horizon, n_bars=int(len(score)))
 
 
 def vol_panel(frames: dict[str, pd.DataFrame], index) -> pd.DataFrame:

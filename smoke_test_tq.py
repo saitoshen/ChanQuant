@@ -1509,6 +1509,59 @@ def check_cross() -> None:
     check("截面：调仓次数按区间数算", r.metrics["n_trades"] == len(range(0, len(score), 5)),
           f"{r.metrics['n_trades']} vs {len(range(0, len(score), 5))}")
 
+    # 交易记录：绩效页说「调仓 406 次」而交易记录一片空白，是因为 `to_result`
+    # 把 trades 写死成了 []。截面没有一手一手的成交，只能按「某品种一段连续
+    # 同向持仓」切 —— 权重变大变小不算新的一笔
+    check("截面：交易记录不是空的", len(res.trades) > 0, str(len(res.trades)))
+    check("截面：转 Result 后交易记录透传", len(r.trades) == len(res.trades),
+          f"{len(r.trades)} vs {len(res.trades)}")
+    check("截面：每笔交易都带品种名", all(t.symbol for t in res.trades),
+          str([t.symbol for t in res.trades[:3]]))
+    check("截面：每笔交易方向非 0",
+          all(t.direction in (-1, 1) for t in res.trades),
+          str(sorted({t.direction for t in res.trades})))
+    # 强弱恒定，S0 从头到尾都是多头：一笔，不该被每次调仓切成几十笔
+    s0 = [t for t in res.trades if t.symbol == "S0_X"]
+    check("截面：最强品种全程只有一笔多单",
+          len(s0) == 1 and s0[0].direction == 1 and s0[0].ret > 0,
+          str([(str(t.entry_date.date()), t.direction, round(t.ret, 3)) for t in s0]))
+    s5 = [t for t in res.trades if t.symbol == "S5_X"]
+    check("截面：最弱品种全程只有一笔空单",
+          len(s5) == 1 and s5[0].direction == -1,
+          str([(str(t.entry_date.date()), t.direction) for t in s5]))
+    # 同一品种的两笔不能重叠（平仓当天可以同时开反向）
+    by_sym: dict[str, list] = {}
+    for t in res.trades:
+        by_sym.setdefault(t.symbol, []).append(t)
+    overlapped = []
+    for k, ts in by_sym.items():
+        ts.sort(key=lambda t: t.entry_date)
+        overlapped += [(k, str(a.exit_date), str(b.entry_date))
+                       for a, b in zip(ts, ts[1:]) if a.exit_date > b.entry_date]
+    check("截面：同一品种的交易段不重叠", not overlapped, str(overlapped[:3]))
+
+    # 截面因子分析：同一批品种、同一根 bar 上「因子排的名次」和「下一段相对
+    # 涨跌的名次」对不对得上。强弱恒定，动量必须 IC 接近 1
+    rep = cross.factor_report(frames, ["mom_20", "mom_60"], res.score,
+                              fcfg={"horizon": 5})
+    check("截面因子：能出报告", rep.ok, rep.error)
+    check("截面因子：前向期数从 dict 配置读出来", rep.horizon == 5, str(rep.horizon))
+    check("截面因子：表格含合成分数行", "__score__" in rep.table.index,
+          str(list(rep.table.index)))
+    check("截面因子：动量在截面上排得准（IC>0）",
+          float(rep.table.loc["mom_20", "ic"]) > 0.9,
+          f"{float(rep.table.loc['mom_20', 'ic']):+.3f}")
+    q = rep.quantile.dropna()
+    check("截面因子：分位收益单调递增", len(q) >= 4 and q.is_monotonic_increasing,
+          str(q.round(4).to_dict()))
+    check("截面因子：多空价差赚钱",
+          len(rep.spread.dropna()) > 2 and float(rep.spread.iloc[-1]) > 1.0,
+          str(float(rep.spread.iloc[-1])) if len(rep.spread) else "空")
+    # 没有分数就直说，别抛异常 —— 界面上抛异常就是整页崩
+    empty = cross.factor_report(frames, ["mom_20"], pd.DataFrame())
+    check("截面因子：没有分数时给出错误而不是崩溃",
+          not empty.ok and bool(empty.error), empty.error)
+
     # 向量化的横截面 Z-score 必须和逐行那版一模一样：算错了强弱排序就会翻，
     # 但净值曲线照样画得出来，肉眼看不出来
     rng = np.random.default_rng(7)
@@ -3802,7 +3855,8 @@ def check_result_view() -> None:
         titles_one = [t for t, _ in one.pages()]
         titles_many = [t for t, _ in many.pages()]
         check("视图：单策略五页", len(titles_one) == 5, str(titles_one))
-        check("视图：组合三页", titles_many == ["绩效", "交易记录", "阶段分析"],
+        check("视图：组合四页",
+              titles_many == ["绩效", "截面因子分析", "交易记录", "阶段分析"],
               str(titles_many))
         check("视图：组合绩效表只有两列", many.table.columnCount() == 2,
               str(many.table.columnCount()))

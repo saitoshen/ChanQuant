@@ -1001,7 +1001,7 @@ def _run() -> tuple[bool, list[str]]:
             combo_ok = (
                 tabs is not None
                 and pv is not None
-                and tabs.count() == 3
+                and tabs.count() == 4
                 and pv.table.columnCount() == 2
                 and pv.res is not None
                 and "组合（2 条策略）" in text
@@ -1010,6 +1010,58 @@ def _run() -> tuple[bool, list[str]]:
                           if tabs is not None else "未建出视图")
         except Exception as exc:  # noqa: BLE001
             combo_info = f"{type(exc).__name__}: {exc}"
+
+        # 截面策略跑完：交易记录必须有货（用户报过「绩效说调仓 406 次、交易
+        # 记录一片空白」），并且要长出「截面因子分析」页
+        cross_ok = False
+        cross_info = ""
+        try:
+            import numpy as _np
+            import pandas as _pd
+
+            from ttrade import cross as _cross
+            from ttrade.backtest import BacktestConfig as _Bt
+
+            cidx = _pd.date_range("2024-01-01", periods=200, freq="B")
+            cframes = {}
+            for i, d in enumerate([0.002, 0.0012, 0.0004,
+                                   -0.0004, -0.0012, -0.002]):
+                px = _pd.Series(100.0 * (1 + d) ** _np.arange(len(cidx)), index=cidx)
+                cframes[f"C{i}_X"] = _pd.DataFrame({
+                    "open": px, "high": px, "low": px, "close": px,
+                    "volume": 1000.0,
+                })
+            ccfg = _cross.CrossConfig(mode="hedge", rebalance=5, top_pct=10,
+                                      bot_pct=10, factor_keys=["mom_20"])
+            cbt = _Bt()
+            cout = _cross.run(cframes, ccfg, cbt)
+            win._finish_cross(cout, cout.label or "截面对冲", ccfg, cframes,
+                              win._period(), cbt, [])
+            app.processEvents()
+            pv = win.view_port
+            tabs = win.tabs_port
+            # 「截面因子分析」和「因子分析」一样是**露面才算**：切到那一页才
+            # 算 IC、才画图，省得每次回测都白烧一秒
+            for i in range(tabs.count()):
+                if tabs.tabText(i) == "截面因子分析":
+                    tabs.setCurrentIndex(i)
+                    break
+            app.processEvents()
+            visible = [tabs.tabText(i) for i in range(tabs.count())
+                       if tabs.isTabVisible(i)]
+            cross_ok = (
+                cout.ok
+                and "截面因子分析" in visible
+                and pv.tbl_cfactor.rowCount() >= 2
+                and len(pv.canvas_cf.fig.axes) == 4
+                and pv.tbl_trades.rowCount() > 0
+                and pv.tbl_trades.horizontalHeaderItem(1).text() == "品种"
+            )
+            cross_info = (f"交易 {pv.tbl_trades.rowCount()} 笔 / "
+                          f"因子 {pv.tbl_cfactor.rowCount()} 行 / "
+                          f"页签 {'、'.join(visible)}")
+        except Exception as exc:  # noqa: BLE001
+            cross_info = f"{type(exc).__name__}: {exc}"
 
         # 回测区间：切片要真的生效。不生效的话 5 分钟十年照样从头算，
         # 「近 1 年」只是个显示开关，用户以为快了其实没快
@@ -1063,6 +1115,11 @@ def _run() -> tuple[bool, list[str]]:
             )
         if not combo_ok:
             raise RuntimeError(f"组合报告异常：{combo_info}")
+        if not cross_ok:
+            raise RuntimeError(
+                f"截面结果视图异常（{cross_info}）：交易记录为空，或者没有长出"
+                "「截面因子分析」页"
+            )
         if not range_ok:
             raise RuntimeError(
                 f"回测区间没生效（{range_info}）：cb_range 只是改了显示窗口，"
@@ -1083,6 +1140,7 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"因子分析页图轴数为 {n_axes}，应为 4")
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
                 f"{factor_info}，滚轮缩放 {wheel_info}，组合 {combo_info}，"
+                f"截面 {cross_info}，"
                 f"回测区间 {range_info}，实时开关已复位，"
                 f"数据管理页就绪，手册 {manual_info}，输出 {out_info}")
 
