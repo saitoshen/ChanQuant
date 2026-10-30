@@ -2706,16 +2706,23 @@ def check_agent() -> None:
         import json as _json
         import re as _re
 
-        blocks = _re.findall(r"```json\s*(\{.*?\})\s*```", A.SYSTEM_PROMPT, _re.S)
-        broken = []
+        # v1.8.1 起 `factor` / `strategy` 的示例搬进了技能正文（渐进披露），
+        # 提示词只留最常用的 trade / backtest。四类动作仍然「都能看到示例」，
+        # 只是有些得先 read_skill —— 所以这里查「提示词 + 技能正文」的并集。
+        # 用围栏切块而不是 `\{.*?\}`：示例里有嵌套对象，非贪婪正则会截在
+        # 内层 `}` 上，把合法 JSON 误判成坏的。
+        from ttrade import skillpacks as _SP
+
+        text = "\n".join([A.SYSTEM_PROMPT] + [p.body for p in _SP.load_all()])
+        blocks = [b.strip() for b in _re.findall(r"```json\s*(.*?)```", text, _re.S)]
+        broken, kinds = [], set()
         for blk in blocks:
             try:
-                _json.loads(blk)
+                kinds.add(_json.loads(blk).get("action"))
             except ValueError:
                 broken.append(blk[:30])
         check("提示词：示例动作块都是合法 JSON", bool(blocks) and not broken, str(broken))
 
-        kinds = {_json.loads(b).get("action") for b in blocks if b not in broken}
         check("提示词：四种动作都有示例",
               {"trade", "backtest", "factor", "strategy"} <= kinds, str(kinds))
     except Exception as exc:  # noqa: BLE001
@@ -3385,8 +3392,11 @@ def check_factor_manual() -> None:
         # 提示词里得告诉模型有这么个东西，否则它不会去查
         prompt = A.build_messages([], "问")[0]["content"]
         check("提示词：提到平台手册", '"action": "doc"' in prompt, "")
+        # topic 清单 v1.8.1 起由工具目录（第二条 system 消息）承载，不在
+        # SYSTEM_PROMPT 里 —— 它是「做法」不是「规则」，而且列全要占 200+ 字符
+        full = "\n".join(str(m.get("content")) for m in A.build_messages([], "问"))
         check("提示词：列了常用 topic",
-              all(t in prompt for t in ("data", "primitives", "contract", "factors")), "")
+              all(t in full for t in ("data", "primitives", "contract", "factors")), "")
         # 提示词里原来那句「df 含 open_oi/close_oi」是错的（日线叫 open_interest），
         # 模型照着写会在日线上全 NaN
         check("提示词：不再教错列名",
@@ -3486,7 +3496,14 @@ def check_agent_attachments() -> None:
         # 8) 提示词要教它怎么看附件、报错后先查手册
         prompt = A.SYSTEM_PROMPT
         check("提示词：说明附件怎么读", "附件" in prompt and "不要问「附件里是什么」" in prompt, "")
-        check("提示词：报错后先查手册", "注册失败" in prompt and "先查手册" in prompt, "")
+        # 「注册失败先查手册」v1.8.1 起写在 factor-authoring 技能正文里 ——
+        # 这是「怎么做」不是「必须守的规则」，留在提示词里属于重复。
+        # 但提示词必须负责让它在动手前 read_skill，否则技能等于不存在。
+        from ttrade import skillpacks as _SP
+        skills = "\n".join(p.body for p in _SP.load_all())
+        check("提示词：报错后先查手册",
+              "注册失败" in skills and "先查手册" in skills
+              and "factor-authoring" in prompt, "")
 
         # 9) 界面：输出框、附件按钮、回测结果自动喂回
         from PySide6.QtWidgets import QApplication
@@ -3824,7 +3841,10 @@ def check_skills() -> None:
         _c, why = SK.validate(tool, {"rows": 5})
         check("能力包：缺必填要报错", "file_id" in why, why)
         _c, why = SK.validate(tool, {"file_id": "f1", "rows": 9999})
-        check("能力包：超上限要报错", "不能大于" in why, why)
+        # v1.8.1 起报错是结构化的：字段名 + 期望 + 实收，回灌给模型照着改。
+        # 断言看「三样都在」，不再钉死某句措辞
+        check("能力包：超上限要报错",
+              "rows" in why and "200" in why and "9999" in why, why)
         _c, why = SK.validate(tool, {"file_id": "f1", "bogus": 1})
         check("能力包：多余字段丢掉", not why, why)
 
@@ -4038,7 +4058,8 @@ def check_skills() -> None:
               "")
         check("盯盘：scan 挂在 monitor 包上", SK.get("scan").group == "monitor", "")
         check("盯盘：规则有枚举约束",
-              "之一" in SK.validate(SK.get("scan"), {"rule": "xxx"})[1], "")
+              "breakout_high" in SK.validate(SK.get("scan"), {"rule": "xxx"})[1]
+              and "xxx" in SK.validate(SK.get("scan"), {"rule": "xxx"})[1], "")
 
         # ---- 10) MCP 导出 ----
         import io as _io

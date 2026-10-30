@@ -16,6 +16,7 @@ import pandas as pd
 
 from ttrade import blocks as B
 from ttrade.skills.base import (
+    NO_LIMIT,
     RISK_READ,
     RISK_WRITE,
     SkillResult,
@@ -202,6 +203,7 @@ register(Tool(
 register(Tool(
     name="factor_info",
     group="factor",
+    max_result_chars=NO_LIMIT,
     label="看因子定义",
     description="看一个因子的说明、公式和实现代码",
     risk=RISK_READ,

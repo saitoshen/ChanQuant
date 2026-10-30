@@ -103,6 +103,8 @@ _BT_SCHEMA = {
 register(Tool(
     name="backtest",
     group="backtest",
+    interrupt="cancel",
+    max_result_chars=12000,
     label="跑回测",
     description="按指定品种/周期/策略跑一遍回测，结果显示在组合页",
     risk=RISK_READ,

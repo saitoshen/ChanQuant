@@ -82,6 +82,8 @@ from PySide6.QtWidgets import (
 
 from gui import chat_render as CR
 from ttrade import agent as A
+from ttrade import agent_budget as BUD
+from ttrade import agent_log as ALog
 from ttrade import agent_memory as Mem
 from ttrade import attachments as ATT
 from ttrade import factors as F
@@ -90,6 +92,8 @@ from ttrade import session_files as SF
 from ttrade import skills as S
 from ttrade import strategy_store as SStore
 from ttrade import strategy_templates as TPL
+from ttrade import skillpacks as SP
+from ttrade import subagents as SA
 from ttrade.store import AnyStore
 from ttrade.strategies import STRATEGIES
 from ttrade.paths import user_dir
@@ -356,7 +360,7 @@ class ChatWorker(QObject):
 
 
 class MemoWorker(QObject):
-    """跑在 QThread 里：把一段旧对话压成记忆。
+    """跑在 QThread 里：把一段旧对话整理成记忆，并顺带删掉过时的条目。
 
     单独一个类而不是复用 `ChatWorker`：这个不流式、不显示、不需要「停止」，
     复用只会让 `ChatWorker` 多出一堆 `if quiet` 分支。
@@ -369,18 +373,61 @@ class MemoWorker(QObject):
         super().__init__()
         self.cfg = cfg
         self.convo = convo
+        # 现有记忆的带编号清单。有它模型才能说「第 3 条过时了」——
+        # 没有它就只能一直追加，三个月后全是过期条目。
+        # 编号就是 `load()` 的下标，`apply_changes()` 按同一套编号删。
+        self.existing = "\n".join(
+            f"{i}. {m.text.replace(chr(10), ' / ')}" for i, m in Mem.numbered()
+        )
 
     def run(self) -> None:
         try:
-            text = A.LLMClient(self.cfg).chat(A.memory_messages(self.convo))
+            text = A.LLMClient(self.cfg).chat(
+                A.memory_messages(self.convo, self.existing))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
             return
         self.done.emit(text)
 
 
-# ------------------------------------------------------------------ 对话框
+class SubAgentWorker(QObject):
+    """跑在 QThread 里：派一个子 Agent 出去查 / 复核。
 
+    子 Agent 要连着调好几次模型，一次十几秒到一分钟 —— 放主线程会把整个界面
+    冻住，连「停止」都点不动。和 `ChatWorker` 一样单开线程，只是它不流式，
+    每轮结束报一句进度就够了。
+    """
+
+    step = Signal(str)          # 每轮的中间文字，给状态栏用
+    done = Signal(str)          # 回灌给主 Agent 的正文
+    failed = Signal(str)
+
+    def __init__(self, cfg: "A.AgentConfig", spec, task: str, ctx) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.spec = spec
+        self.task = task
+        self.ctx = ctx
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        try:
+            res = SA.run(self.cfg, self.spec, self.task, self.ctx,
+                         on_step=self.step.emit,
+                         should_stop=lambda: self._stop)
+        except Exception as exc:  # noqa: BLE001 - 子 Agent 挂了不能拖垮主对话
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        if not res.ok:
+            self.failed.emit(res.error)
+            return
+        self.done.emit(res.feed())
+
+
+# ------------------------------------------------------------------ 对话框
 
 # 确认框里 payload 字段的中文名。没列到的照抄字段名 —— 宁可露出 `file_id`
 # 这种半生不熟的词，也不要把一个字段藏起来让人盲签。
@@ -959,8 +1006,12 @@ class AgentPage(QWidget):
         self._msg_start: int | None = None
         self._memo_worker: MemoWorker | None = None
         self._memo_thread: QThread | None = None
+        self._sub_worker: SubAgentWorker | None = None
+        self._sub_thread: QThread | None = None
         self._memo_warned = False     # 压缩失败只提示一次，别每轮都刷
         self._tool_turns = 0            # 本轮提问已经连续自动跑了几次工具动作（查手册 / 读写文件）
+        self._last_tool = ""            # 上一次执行的工具名，用来判「连续调同一个」
+        self._tool_streak = 0           # 同一个工具连续调了几次
         self._atts: list = []          # 待发送的附件（`ATT.Attachment` 或 `SessAtt`）
         self.session = SF.SessionFiles()        # 会话里的附件资源（表格 / PDF / Word）
         self.store = AnyStore({})               # 主窗口把两个市场的 DataStore 递进来
@@ -970,6 +1021,9 @@ class AgentPage(QWidget):
         self._expect_bt = False        # 下一次回测结果要自动喂回模型
         self._build()
         self._refresh_status()
+        # 会话日志：确保目录在，顺手轮转旧文件。这次对话之后可以按它复盘
+        # 「模型当时看到了什么」—— 内存里的 history 会被压缩删掉，日志不会。
+        ALog.start()
         self._fill_factors()
         self._fill_strategies()
         self._fill_reports()
@@ -1653,6 +1707,8 @@ class AgentPage(QWidget):
         body = self._compose(text, atts)
         self._history.append({"role": "user", "content": body})
         self._tool_turns = 0
+        self._last_tool, self._tool_streak = "", 0
+        ALog.log("user", text=body, attachments=[a.name for a in atts] if atts else [])
         # 新问题把上一轮的「等回测结果」作废：上一轮的回测要是没跑起来（异常提前
         # 返回），标记会一直挂着，下一次用户自己拖参数就会莫名其妙触发一轮对话
         self._expect_bt = False
@@ -1869,7 +1925,8 @@ class AgentPage(QWidget):
             if self.cfg.ready():
                 self._after_tool(
                     "回测跑完了，下面是平台算出来的完整结果：\n\n" + text +
-                    "\n\n直接基于这些数字回答，不要让用户再贴一遍。"
+                    "\n\n直接基于这些数字回答，不要让用户再贴一遍。",
+                    S.get("backtest"),
                 )
 
     def begin_backtest_feedback(self) -> None:
@@ -1974,13 +2031,24 @@ class AgentPage(QWidget):
             self._append(f"<p style='color:{C_BAD}'>模型没有返回内容。</p>")
         self._append("<p></p>")
         self._history.append({"role": "assistant", "content": final})
+        ALog.log("assistant", text=final)
 
         action = A.parse_action(final)
-        if action.kind and not action.ok:
+        if action.error:
+            # 界面上给人看一行；同一段结构化说明**回灌给模型**，让它下一轮
+            # 直接改对。以前只写界面，模型以为自己成功了，下一轮接着按错的
+            # 假设聊 —— 用户看到的就是「它一直卡在同一个地方」。
             self._append(
-                f"<p style='color:{C_BAD};font-size:{FS_SMALL}px'>动作块有问题：{_esc(action.error)}</p>"
+                f"<p style='color:{C_BAD};font-size:{FS_SMALL}px'>动作块有问题："
+                f"{_esc(action.error)}</p>"
             )
-        elif action.ok:
+            ALog.log("error", where="action", why=action.error,
+                     tool=action.kind or (action.detail.tool if action.detail else ""))
+            self._after_tool(A.action_error_feedback(action),
+                             S.get(action.kind) if action.kind else None)
+            return
+        if action.ok:
+            ALog.log("action", tool=action.kind, params=action.payload)
             self._handle_action(action)
 
         if self._pending_report:
@@ -1992,6 +2060,7 @@ class AgentPage(QWidget):
     def _on_failed(self, msg: str) -> None:
         # 断了也把已经收到的半截渲染出来 —— 纯文本留着比整段消失强，
         # 至少用户能看见模型说到哪儿了
+        ALog.log("error", where="llm", why=msg)
         if self._msg_start is not None and self._stream_buf.strip():
             self._render_reply(self._stream_buf)
         self._msg_start = None
@@ -2018,6 +2087,12 @@ class AgentPage(QWidget):
             self._set_state("就绪", C_MUTED)
 
     def _stop(self) -> None:
+        # 子 Agent 在跑的时候，「停止」停的应该是它 —— 否则用户点了没反应，
+        # 只能干等一分钟
+        if self._worker is None and self._sub_worker is not None:
+            self._sub_worker.stop()
+            self._set_state("正在停止子助手…", C_MUTED)
+            return
         if self._worker is None:
             return
         self._worker.stop()
@@ -2076,19 +2151,23 @@ class AgentPage(QWidget):
         text = (text or "").strip()
         # 模型判断这段没什么可记的就只回「无」。那也照样丢 —— 留着占上下文，
         # 而它已经明确说了不值得记
-        saved = 0
+        saved = removed = 0
         if text and text not in ("无", "无。", "無"):
-            saved = Mem.append([Mem.MemoryItem(
-                text=text, kind="summary", turns=len(chunk),
-            )])
+            saved, removed = Mem.apply_changes(text, turns=len(chunk))
 
         # 上面已经确认过这段还是原样，直接切掉
         del self._history[:len(chunk)]
+        ALog.log("compress", turns=len(chunk), added=saved, removed=removed)
 
-        if saved:
+        if saved or removed:
+            bits = []
+            if saved:
+                bits.append(f"新增 {saved} 条")
+            if removed:
+                bits.append(f"删掉 {removed} 条过时的")
             self._append(
                 f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>已把前 {len(chunk)} 条对话"
-                f"压成记忆（共 {Mem.count()} 条），下次开窗口还在。</p>"
+                f"整理成记忆（{'，'.join(bits)}；共 {Mem.count()} 条），下次开窗口还在。</p>"
             )
 
     def _on_memo_failed(self, msg: str) -> None:
@@ -2140,6 +2219,8 @@ class AgentPage(QWidget):
 
         ctx = self._ctx()
         if not ctx.allow(tool.group):
+            ALog.log("error", where="permission", why=f"能力包 {tool.group} 未开启",
+                     tool=tool.name)
             self._deny(tool)
             return
 
@@ -2148,7 +2229,9 @@ class AgentPage(QWidget):
             # 代码，每次都不一样，盲签没有意义，所以不受那个开关影响
             if tool.risk != S.RISK_TRADE or self.cfg.confirm_trade:
                 dlg = ConfirmDialog(action, self)
-                if dlg.exec() != QDialog.Accepted:
+                accepted = dlg.exec() == QDialog.Accepted
+                ALog.log("confirm", tool=tool.name, ok=accepted, risk=tool.risk)
+                if not accepted:
                     self._append(
                         f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>已取消。</p>")
                     return
@@ -2185,9 +2268,12 @@ class AgentPage(QWidget):
 
     # ---------------------------------------------------------- 工具动作
 
-    # 一次提问里最多连续自动跑几轮工具动作。模型拿到结果后可能再查、再读、再写，
+    # 一次提问里最多连续自动跑几次工具动作。模型拿到结果后可能再查、再读、再写，
     # 不封顶的话它俩能来回刷到把 token 烧光。
-    MAX_TOOL_TURNS = 4
+    #
+    # 这是**总预算**。每个工具还各有自己的 `Tool.max_turns`（同一个工具连续调
+    # 几次）—— 两个一起用，见 `_spend_turn()`。
+    TURN_BUDGET = 6
 
     def _run_tool(self, tool: "S.Tool", action: A.Action, ctx) -> None:
         """在 `ttrade` 里跑一个纯逻辑工具，把结果渲染出来再回灌模型。
@@ -2205,7 +2291,7 @@ class AgentPage(QWidget):
             self._set_state((res.summary or f"{tool.label}完成")[:80], C_OK)
         # 出错也要回灌：模型得看到「列名不对」「文件读不了」才能改对，
         # 只写在界面上等于让它接着按错的假设往下聊
-        self._after_tool(res.feed_text())
+        self._after_tool(res.feed_text(), tool, res.ok)
 
     def _run_signal(self, action: A.Action) -> None:
         """交给主窗口执行的动作：回测、下单。"""
@@ -2213,6 +2299,88 @@ class AgentPage(QWidget):
             f"<p style='color:{C_OK};font-size:{FS_SMALL}px'>已提交：{_esc(action.describe())}</p>"
         )
         self.trade_requested.emit(action)
+
+    # ---------------------------------------------------------- 子 Agent
+
+    def _run_research(self, action: A.Action) -> None:
+        self._dispatch_subagent(SA.get("research"), str(action.payload.get("task") or ""))
+
+    def _run_verify(self, action: A.Action) -> None:
+        self._dispatch_subagent(SA.get("verify"), str(action.payload.get("claim") or ""))
+
+    def _dispatch_subagent(self, spec, task: str) -> None:
+        """派一个子 Agent 出去，跑完把结论回灌给主 Agent。
+
+        界面先摊开「派给谁、查什么」—— 用户得知道这一轮在等什么，否则看到
+        一个几十秒不动的界面只会以为卡死了。
+        """
+        if spec is None:
+            self._append(f"<p style='color:{C_BAD}'>没有这个子 Agent。</p>")
+            return
+        if self._sub_thread is not None:
+            self._append(
+                f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>"
+                f"上一个「{spec.label}」还在跑，等它回来。</p>")
+            return
+        if not task.strip():
+            self._after_tool(f"{spec.label}没给任务内容，补一句要查什么。", None)
+            return
+        if not self.cfg.ready():
+            self._append(f"<p style='color:{C_BAD}'>先配置模型，{spec.label}才能跑。</p>")
+            return
+
+        self._append(
+            f"<p style='color:{C_USER};font-size:{FS_SMALL}px;margin:8px 0 4px 0'>"
+            f"派了{_esc(spec.label)}：{_esc(task[:120])}</p>"
+        )
+        self._set_busy(True)
+        self._set_state(f"{spec.label}在跑…", C_MUTED)
+
+        worker = SubAgentWorker(self.cfg, spec, task, self._ctx())
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.step.connect(lambda text: self._set_state(
+            f"{spec.label}：{text.strip().splitlines()[0][:60] if text.strip() else '…'}", C_MUTED))
+        worker.done.connect(lambda feed, s=spec: self._on_subagent_done(feed, s))
+        worker.failed.connect(lambda msg, s=spec: self._on_subagent_failed(msg, s))
+        worker.done.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_subagent_thread_done)
+        self._sub_worker, self._sub_thread = worker, thread
+        thread.start()
+
+    def _on_subagent_done(self, feed: str, spec) -> None:
+        self._append(
+            f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>"
+            f"{_esc(spec.label)}回来了。</p>")
+        self._set_state(f"{spec.label}完成", C_OK)
+        ALog.log("tool", tool=spec.name, chars=len(feed), sent=len(feed), ok=True)
+        self._after_tool(feed, S.get(f"run_{spec.name}"))
+
+    def _on_subagent_failed(self, msg: str, spec) -> None:
+        self._append(
+            f"<p style='color:{C_BAD};font-size:{FS_SMALL}px'>"
+            f"{_esc(spec.label)}没跑成：{_esc(msg[:160])}</p>")
+        self._set_state(f"{spec.label}失败", C_BAD)
+        ALog.log("error", where=f"subagent:{spec.name}", why=msg)
+        # 失败也要回灌：主 Agent 得知道这条路走不通，才能换个办法，
+        # 而不是以为还在等结果
+        self._after_tool(
+            f"{spec.label}没有跑成（{msg[:200]}）。不要重试同一个任务，"
+            "直接用你能调的动作自己做，或者告诉用户这一步做不了。",
+            S.get(f"run_{spec.name}"),
+        )
+
+    def _on_subagent_thread_done(self) -> None:
+        self._sub_worker = None
+        self._sub_thread = None
+        # `_after_tool` 用 `singleShot(0)` 起下一轮，先后顺序不定 —— 主对话
+        # 已经在跑就别去动「忙」状态，否则发送按钮会提前变灰
+        if self._thread is None:
+            self._set_busy(False)
 
     def _run_factor(self, action: A.Action) -> None:
         self._register_factor(action.payload)
@@ -2246,19 +2414,19 @@ class AgentPage(QWidget):
         if op == "list":
             text, err = FS.list_dir(path)
             if err:
-                self._after_tool(f"列出 {path} 失败：{err}")
+                self._after_tool(f"列出 {path} 失败：{err}", S.get("fs"), False)
                 return
             self._append(
                 f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>已列出 {_esc(path)}</p>"
                 f"<pre style='font-size:{FS_CODE}px'>{_esc(text)}</pre>"
             )
-            self._after_tool(f"目录 {path} 的内容：\n{text}")
+            self._after_tool(f"目录 {path} 的内容：\n{text}", S.get("fs"))
             return
 
         if op == "read":
             text, err = FS.read_text(path)
             if err:
-                self._after_tool(f"读取 {path} 失败：{err}")
+                self._after_tool(f"读取 {path} 失败：{err}", S.get("fs"), False)
                 return
             # 日志里只贴前 4000 字符：整篇贴进去 QTextBrowser 会卡，而用户
             # 真要核对时看文件本身更快。喂给模型的仍是全文。
@@ -2269,7 +2437,7 @@ class AgentPage(QWidget):
                 f"<pre style='white-space:pre-wrap;font-family:Consolas,monospace;"
                 f"font-size:{FS_CODE}px'>{_esc(shown)}</pre>"
             )
-            self._after_tool(f"文件 {path} 的全文：\n```\n{text}\n```")
+            self._after_tool(f"文件 {path} 的全文：\n```\n{text}\n```", S.get("fs"))
             return
 
         # 写：内容摊开给人看。读可以不问，写不行 —— 一次覆盖就是几十行没了。
@@ -2277,29 +2445,41 @@ class AgentPage(QWidget):
         dlg = ConfirmDialog(action, self)
         if dlg.exec() != QDialog.Accepted:
             self._append(f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>已取消写入。</p>")
-            self._after_tool(f"用户拒绝写入 {path}，不要重试同一个改动，先问清楚要改什么。")
+            self._after_tool(f"用户拒绝写入 {path}，不要重试同一个改动，先问清楚要改什么。",
+                         S.get("fs"), False)
             return
         ok, msg = FS.write_text(path, content)
         color = C_OK if ok else C_BAD
         self._append(f"<p style='color:{color}'>{_esc(msg)}</p>")
         self._set_state(msg[:80], color)
-        self._after_tool(("写入成功：" if ok else "写入失败：") + msg)
+        self._after_tool(("写入成功：" if ok else "写入失败：") + msg, S.get("fs"), ok)
 
-    def _after_tool(self, result: str) -> None:
+    def _after_tool(self, result: str, tool: "S.Tool | None" = None,
+                    ok: bool = True) -> None:
         """把执行结果喂回模型，让它接着干。
+
+        结果先过一遍预算（`agent_budget.clip`）：超长就落盘、只回首尾预览。
+        没有这一步，一次全市场扫描就能把这轮上下文吃光 —— 而模型看半截
+        表格只会瞎猜。
 
         标成 `user` 角色是协议限制：OpenAI 兼容端点里没有 `tool` 角色，塞进
         `assistant` 又会让模型以为那是自己说过的话。
         """
-        note = "【平台执行结果】\n" + result + "\n\n需要继续就再给一个动作块，不需要就用人话总结。"
+        limit = S.DEFAULT_RESULT_CHARS if tool is None else tool.max_result_chars
+        tag = "out" if tool is None else tool.name
+        body = BUD.clip(result, limit, tag)
+
+        note = "【平台执行结果】\n" + body + "\n\n需要继续就再给一个动作块，不需要就用人话总结。"
         self._history.append({"role": "user", "content": note})
-        if self._tool_turns >= self.MAX_TOOL_TURNS:
+        ALog.log("tool", tool=tag, chars=len(result), sent=len(body), ok=ok)
+
+        ok, why = self._spend_turn(tool)
+        if not ok:
             self._append(
-                f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>工具动作已连续执行 "
-                f"{self._tool_turns} 轮，先停在这里。要继续就再发一句。</p>"
+                f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>"
+                f"先停在这里（{_esc(why)}）。要继续就再发一句。</p>"
             )
             return
-        self._tool_turns += 1
         msgs = A.build_messages(
             A.trim_history(self._history[:-1]), note,
             # 沿用当前开关：关着的时候不能因为「续跑」就悄悄把文件能力塞回去
@@ -2313,6 +2493,34 @@ class AgentPage(QWidget):
         # `finished` 可能比新线程先到，直接起会让 `_on_thread_done` 把新线程
         # 的状态抹掉（发送按钮变灰、停止键失灵）
         QTimer.singleShot(0, lambda m=msgs: self._start_worker(m))
+
+    def _spend_turn(self, tool: "S.Tool | None") -> tuple[bool, str]:
+        """扣一次自动续跑额度。返回 `(还能不能继续, 停下来的原因)`。
+
+        两个上限一起用，缺一不可：
+
+        - **总预算** `TURN_BUDGET` 防「来回换着工具刷」—— 查手册、算因子、
+          再查手册，每步都合法，加起来能把 token 烧光
+        - **单工具上限** `Tool.max_turns` 防「拿同一个工具死磕」—— 模型把
+          `rows` 从 100 改到 101 再改到 102，每轮都算一次调用
+
+        交易类工具执行完**一律不续跑**：动完真钱要让用户先看一眼。
+        """
+        if tool is not None and tool.risk == S.RISK_TRADE:
+            return False, "下单之后不再自动续跑，先看一眼再决定"
+        self._tool_turns += 1
+        if self._tool_turns > self.TURN_BUDGET:
+            return False, f"这一轮已经自动执行 {self.TURN_BUDGET} 次工具动作"
+        if tool is None:
+            return True, ""
+        if self._last_tool == tool.name:
+            self._tool_streak += 1
+        else:
+            self._last_tool, self._tool_streak = tool.name, 1
+        cap = max(1, tool.max_turns)
+        if self._tool_streak > cap:
+            return False, f"「{tool.label}」已经连续调了 {cap} 次"
+        return True, ""
 
     def _register_factor(self, p: dict) -> None:
         """把模型写的因子落地：试算 → 写盘 → 注册进 FACTORS → 刷新左边的库。"""

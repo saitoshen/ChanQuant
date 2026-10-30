@@ -32,7 +32,7 @@ APP_NAME = "ChanQuant"
 BUNDLE_ID = "com.chanquant.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
@@ -68,6 +68,13 @@ DATAS += collect_data_files("xgboost", includes=["lib/*", "VERSION"])
 ICON_PNG = os.path.join(PACK, "icon.png")
 if os.path.isfile(ICON_PNG):
     DATAS.append((ICON_PNG, "packaging"))
+
+# 技能包（`ttrade/skillpacks/<name>/SKILL.md`）。运行时是 `os.listdir` 扫出来的，
+# PyInstaller 的静态分析看不到 —— 不显式打进去，打包版的技能列表就是空的，
+# 而源码运行反而是对的。用户自己加的技能在用户目录，不在这里。
+SKILLPACKS = os.path.join(ROOT, "ttrade", "skillpacks")
+if os.path.isdir(SKILLPACKS):
+    DATAS.append((SKILLPACKS, os.path.join("ttrade", "skillpacks")))
 
 # 动态导入的模块，静态分析扫不到，必须显式声明
 HIDDEN = [

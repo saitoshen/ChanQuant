@@ -263,6 +263,7 @@ def _write_pdf(ctx, p: dict) -> SkillResult:
 
 register(Tool(
     name="read_excel",
+    max_result_chars=20000,
     group="doc",
     label="读表格",
     description="按 file_id 读附件的表格内容（可分 sheet、分页、选列）",
@@ -289,6 +290,7 @@ register(Tool(
 
 register(Tool(
     name="parse_pdf",
+    max_result_chars=20000,
     group="doc",
     label="读 PDF",
     description="按 file_id 读附件的 PDF 正文，可指定页码",
@@ -312,6 +314,7 @@ register(Tool(
 
 register(Tool(
     name="read_docx",
+    max_result_chars=20000,
     group="doc",
     label="读 Word",
     description="按 file_id 读附件的 Word 正文（只取文字，不保留表格行列）",

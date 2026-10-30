@@ -29,18 +29,23 @@ from ttrade.skills import strategy  # noqa: F401
 from ttrade.skills import trade  # noqa: F401
 from ttrade.skills import web  # noqa: F401
 from ttrade.skills import monitor  # noqa: F401
+from ttrade.skills import delegate  # noqa: F401
 from ttrade.skills import fs  # noqa: F401
 
 from ttrade.skills.base import (  # noqa: F401
+    DEFAULT_RESULT_CHARS,
     GROUP_ORDER,
     GROUPS,
+    NO_LIMIT,
     REGISTRY,
     RISK_READ,
     RISK_TRADE,
     RISK_WRITE,
+    FieldError,
     SkillContext,
     SkillResult,
     Tool,
+    all_names,
     catalog,
     default_groups,
     dispatch,
@@ -51,11 +56,13 @@ from ttrade.skills.base import (  # noqa: F401
     register,
     to_json_schema,
     validate,
+    validate_detail,
 )
 
 __all__ = [
-    "GROUP_ORDER", "GROUPS", "REGISTRY", "RISK_READ", "RISK_TRADE", "RISK_WRITE",
-    "SkillContext", "SkillResult", "Tool", "catalog", "default_groups", "dispatch",
-    "get", "group_tools", "names", "prompt_block", "register", "to_json_schema",
-    "validate",
+    "DEFAULT_RESULT_CHARS", "GROUP_ORDER", "GROUPS", "NO_LIMIT", "REGISTRY",
+    "RISK_READ", "RISK_TRADE", "RISK_WRITE", "FieldError", "SkillContext",
+    "SkillResult", "Tool", "all_names", "catalog", "default_groups", "dispatch", "get",
+    "group_tools", "names", "prompt_block", "register", "to_json_schema",
+    "validate", "validate_detail",
 ]

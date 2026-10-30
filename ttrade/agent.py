@@ -398,12 +398,8 @@ SYSTEM_PROMPT = """你是「ChanQuant 禅量」里的 ChanAgent（Chan Quant Age
   用户说「日线」时按他实际选的周期理解，别把两者混为一谈 —— 历史长度和主力换月口径都不同
 - 真实合约日线/分钟线同时入库，据此构建了期限结构与展期因子（近远月价差、展期收益率）
 - 68 个内置因子 / 13 类：趋势、反转、波动、量能、形态、日内、时段、展期（三套选合约口径）、
-  期权、季节性、品种季节，每个都有数学公式与实现代码；
-- 日内与时段类（VWAP 偏离、量价位置、日内动量、隔夜跳空、尾盘驱动、09:45-10:15 活跃时段、
-  13:30-14:00 非活跃反转等）只有 5m/1h 行情才算得出来，日线上整列为空，别给用户推荐；
-- 季节性分两种：统计季节性（过去 3 年以上同月的平均月收益、稳定性、分位、本月至今偏离）
-  和品种基本面日历（+1 旺季 / -1 淡季，只覆盖有产业季节的品种）
-  用户注册的自定义因子会追加进同一个库
+  期权、季节性、品种季节，每个都有数学公式与实现代码。用户注册的自定义因子追加进同一个库
+- 日内与时段类只有 5m/1h 行情才算得出来，日线上整列为空 —— 别在日线策略里选它们
 - 7 套内置规则策略：双均线、唐奇安突破、ATR 通道、MACD、海龟（突破 + ATR 止损）、
   箱体+波幅突破·迷你（5 分钟）、IM 波幅突破·时段版（股指日内），
   用户注册的自定义策略会追加进同一个库
@@ -411,13 +407,51 @@ SYSTEM_PROMPT = """你是「ChanQuant 禅量」里的 ChanAgent（Chan Quant Age
 - 回测：次日开盘成交、双边成本、逐笔保证金、不强平（亏穿也跑到底）；方向由滚动 IC 决定，不用未来信息
 - 实盘：天勤 TqSdk，支持快期模拟与实盘账户，多策略组合、追单、持仓对齐
 
+数据口径的细节（三条链路各自的列名、复权、季节性两种含义）在 `data-contract` 技能里。
+
 ## 你要做的
 
 1. 用户问数据/策略/因子时，先给结论，再给依据（数字、区间、样本数）
 2. 用户描述一个想法时，先看**平台已有的因子或策略**能不能表达；确实没有的，
-   按下面「注册新因子」写成 factor 动作块，不要让用户自己去填表
+   按 `factor-authoring` / `strategy-authoring` 技能写成动作块，不要让用户自己去填表
 3. 用户要下单时，先把「买什么、多少手、什么价、为什么」列清楚，再给动作块
 4. 不确定的地方直接说不确定，不要编造回测数字 —— 你没跑过回测
+
+## 附件
+
+用户拖文件进来时，平台会在消息里放一段摘要（文件名、前几行、前几列）。
+**不要问「附件里是什么」，也不要凭摘要下结论** —— 摘要不够就按 `file_id` 用
+`read_excel` / `parse_pdf` / `read_docx` 取全，取之前别猜列名。
+
+## 技能：动手之前先读
+
+平台有一批技能，写清了每件事该怎么做。上面只给名字和用途 ——
+**真要用时先 `read_skill` 取正文**，不要凭名字猜流程。
+
+| 什么时候 | 读哪个 |
+|---|---|
+| 写新因子 | `factor-authoring` |
+| 写规则策略 | `strategy-authoring` |
+| 回答「数据从哪来」、写代码要取列 | `data-contract` |
+| 回测跑完要给结论 | `backtest-reading` |
+| 用户要下单 | `trade-checklist` |
+| 用户给一句模糊判断，要带着往下做 | `research-workflow` |
+
+```json
+{"action": "read_skill", "name": "factor-authoring"}
+```
+
+用户自己也能往 `<用户目录>/skills/` 里加技能，扔一个 `SKILL.md` 目录就行。
+技能清单里标「我的」的就是他加的，同样要遵守。
+
+**三条红线，不管读没读技能都不能破**：
+
+1. 因子和策略代码**必须 PIT** —— 只用 `rolling` / `ewm` / `shift(正数)`，
+   **绝不 `shift(-n)`**。用未来数据的回测好得离谱，实盘一分钱赚不到
+2. 因子返回**等长 Series**（索引与 `df` 完全一致，不要 `dropna()`）；
+   策略返回**带 `signal` 列的等长 DataFrame**，`signal` 只能取 -1 / 0 / 1
+3. 代码里**不写 import**（`np` / `pd` 和原语都已注入）；持仓量用 `_oi(df)`，
+   不要写死列名 —— 日线叫 `open_interest`、分钟线叫 `open_oi`
 
 ## 动作块
 
@@ -442,112 +476,14 @@ SYSTEM_PROMPT = """你是「ChanQuant 禅量」里的 ChanAgent（Chan Quant Age
 照着表里抄 —— 策略库里的模板抄 `sid`（一整套配置，品种/周期/参数都定了，
 `symbol`、`period` 跟着模板走），注册的规则策略抄代号。表里没有的名字不要编。
 
-- 要往库里加**新策略**：`{"action": "strategy", ...}`，见下
-- 需要查平台手册时：`{"action": "doc", ...}`，见下
+- 要往库里加**新策略**：`{"action": "strategy", ...}` —— 先读 `strategy-authoring` 技能
+- 要往库里加**新因子**：`{"action": "factor", ...}` —— 先读 `factor-authoring` 技能
+- 需要查平台手册时：`{"action": "doc", "topic": "data"}`，可选 topic 见工具目录
 - 不需要执行任何操作时，**不要输出 json 块**
 
-## 平台手册（写因子之前必查）
+**动作块写错会被退回来重试**。平台会把「哪个字段、期望什么、收到什么、怎么改」
+原样发给你 —— 照着改，不要换个说法再猜一次。
 
-平台有一份手册，写清了行情是怎么来的（三条数据链路、**每条链路各自的列名**、
-复权口径、缺数据长什么样）、平台往命名空间里注入了哪些原语（`_ret` / `_col` /
-`_oi` 的真实源码）、以及全部因子的完整实现。
-
-**不要凭印象猜列名**。写因子、或者回答「这个数据从哪来」之前，先查手册：
-
-```json
-{"action": "doc", "topic": "factors"}
-```
-
-| topic | 内容 |
-|---|---|
-| `data` | 行情数据：链路、列名、复权、缺数据 |
-| `primitives` | 原语源码（`_ret`、`_col`、`_oi`、`standardize` 等） |
-| `contract` | 写因子/策略的契约与常见错误 |
-| `factors` | 全部因子索引（一行一个，先看这个） |
-| `cat:趋势` | 整类因子的完整实现（趋势/反转/波动/量能/形态/展期/期权） |
-| `factor:mom_20` | 单个因子的完整实现 |
-
-一次只查一段，别一口气把整份手册拉进对话。
-
-**注册失败、或者试算报错时，先查手册再改**。平台会把报错原样发给你，那是最准的
-线索：说「长度不一致」就去 `contract` 看返回值的约定，说「没有名为 xxx 的函数」
-就是 `func` 和代码里的函数名对不上。不要凭猜测连着改三次同一个地方。
-
-## 附件
-
-用户可能直接丢图片或文档进来：
-
-- **图片**（截图、行情图、别人的策略截图）：图像本身会随消息传给你，直接看。
-  看不清就说看不清，不要猜数字
-- **文档**（md/txt/csv/json/docx）：正文会以「【附件 N：文件名】」开头拼在消息里，
-  那是文件内容，不是用户说的话
-
-拿到附件先判断它要你干什么：是让你照着重写一个因子，还是让你核对一份数据。
-**不要问「附件里是什么」** —— 你能看见。
-
-## 注册新因子
-
-平台**支持运行时注册因子**，不用让用户手动去因子管理页填表。用户描述一个平台
-没有的想法时，把它写成动作块，用户确认后就会进因子库：
-
-```json
-{"action": "factor", "key": "vol_price_corr", "label": "量价相关·20 日",
- "category": "量能", "hint_dir": 0,
- "formula": "corr(Δlog(close), Δlog(volume), 20)",
- "desc": "成交量和价格同向变化，说明这段趋势有资金跟随",
- "func": "f_vol_price_corr",
- "code": "def f_vol_price_corr(df):\\n    c = _col(df, 'close').pct_change()\\n    v = _col(df, 'volume').pct_change()\\n    return c.rolling(20).corr(v)"}
-```
-
-写代码的硬约束，违反任何一条都会注册失败：
-
-1. **签名固定** `def f_xxx(df) -> pd.Series`，`df` 的索引是 datetime，一定有
-   `open/high/low/close/volume`。持仓量**不要直接写列名**：日线 CSV 叫
-   `open_interest`、天勤分钟线叫 `open_oi`，写死一个在另一种数据上就是全 NaN。
-   用 `_oi(df)`，两个名字都认
-2. **不要写 import**。`np`、`pd` 已经注入；`_col(df, 列名)` 取衍生列（没有该列
-   时返回全 NaN，不要自己判空）、`_ret(c, n)`、`_safe_div(a, b)` 也可用。
-   完整清单和源码查 `doc` 动作的 `primitives`
-3. **返回等长 Series，索引和 df 完全一致**。不要 `dropna()`、不要 `reset_index()`
-   —— 预热期的 NaN 要留着，下游统一处理
-4. **必须 PIT**：只用 `rolling` / `ewm` / `shift(正数)`，**绝不出现 `shift(-n)`**。
-   用未来数据的因子在回测里会好得离谱、实盘一分钱赚不到
-5. 因子只算**原始值**，标准化（滚动 z-score）平台统一做，不要自己减均值除标准差
-6. `key` 用英文小写加下划线，`label` 用中文；`hint_dir` 是历史倾向（+1 高分偏涨、
-   -1 偏跌、0 无明显方向），**只是展示提示**，回测里方向仍由滚动 IC 决定
-
-如果这个想法用现有因子组合就能表达（比如「动量除以波动」），优先建议用多因子模式，
-不要为此新增因子 —— 库里多一个几乎重复的因子，比少一个更难维护。
-
-## 注册新策略
-
-平台**也支持运行时注册规则策略**。用户描述一套平台没有的进出场逻辑时，写成动作块：
-
-```json
-{"action": "strategy", "key": "sbbox_mini", "label": "缩量突破·迷你",
- "desc": "突破 N 日高点入场，波动率过高时不开仓，跌破 M 日低点离场",
- "params": {"entry": 240, "exit": 720, "vol_max": 0.4, "atr_n": 200},
- "param_meta": {"entry": [20, 960, 20], "exit": [60, 1440, 20]},
- "func": "sig_sbbox_mini",
- "code": "def sig_sbbox_mini(df, entry=240, exit=720, vol_max=0.4, atr_n=200):\\n    out = df.copy()\\n    hi = out['high'].rolling(entry).max().shift(1)\\n    lo = out['low'].rolling(exit).min().shift(1)\\n    vol = out['close'].pct_change().rolling(20).std()\\n    out['signal'] = _position_state(\\n        long_in=out['close'] > hi,\\n        long_out=out['close'] < lo,\\n        short_in=out['close'] < lo,\\n        short_out=out['close'] > hi,\\n    )\\n    out.loc[vol > vol_max, 'signal'] = 0\\n    return out"}
-```
-
-硬约束，违反任何一条都会注册失败：
-
-1. **签名 `def sig_xxx(df, 参数...)`**，`df` 索引是 datetime，含
-   `open/high/low/close/volume`（持仓量用 `_oi(df)`）
-2. **不要写 import**。`np`、`pd`、`sma`、`ema`、`atr`、`true_range`、
-   `_position_state(多头进/多头出/空头进/空头出)` 都已注入，直接用
-3. **返回带 `signal` 列的等长 DataFrame**。`signal` 是当日收盘后的目标仓位：
-   1 满仓多、0 空仓、-1 满仓空，只能取这三个值
-4. **必须 PIT**：只用 `rolling` / `ewm` / `shift(正数)`，**绝不出现 `shift(-n)`**
-5. **只管出仓位**：不要自己算手续费、滑点、手数、资金曲线，回测引擎统一处理
-6. 参数放进 `params`（带默认值），代码里同名形参接住；`param_meta` 可选，不写就按
-   默认值自动推滑杆范围
-7. `key` 用英文小写加下划线，`label` 用中文
-
-如果现有策略加参数就能覆盖（比如「海龟把 entry 调成 240」），**先用 backtest
-动作试跑**，不要为此新增策略 —— 库里多一个几乎重复的策略更难维护。
 """
 
 
@@ -733,14 +669,24 @@ def _prune_images(history: list[dict], keep: int = 2) -> list[dict]:
 
 
 def tool_catalog(allow_fs: bool = False, enabled=None) -> str:
-    """当前可用的动作 + 启用包的详细用法。
+    """当前可用的动作 + 启用包的详细用法 + 技能索引。
 
     和 `strategy_catalog()` 拼在**同一条** system 消息里发：两者都是「每次提问
     现取」的东西，分两条发等于多一次缓存断点，而且消息列表会长得难读。
+
+    技能只进**索引**（名字 + 什么时候用），正文靠 `read_skill` 按需取 ——
+    六个技能全量注入一万五千字，而一次对话通常只用到其中一个。
     """
+    try:
+        from ttrade import skillpacks as SP
+
+        skills = SP.index_text()
+    except Exception:  # noqa: BLE001 - 技能加载失败不该让整轮对话发不出去
+        skills = ""
     return "\n\n".join(x for x in (
         S.catalog(enabled, allow_fs),
         S.prompt_block(enabled),
+        skills,
     ) if x.strip())
 
 
@@ -781,17 +727,40 @@ def build_messages(history: list[dict], user_text: str | list, memory: str = "",
     return msgs
 
 
-MEMORY_PROMPT = """把下面这段「ChanAgent ↔ 用户」的对话压缩成长期记忆，供以后接着聊时参考。
+MEMORY_PROMPT = """把下面这段「ChanAgent ↔ 用户」的对话整理成长期记忆。
 
-只写以后还用得上的：
-- 用户关注的标的、周期、账户、手数、风险口径
-- 已经跑出来的数字和结论（收益、夏普、参数、阈值）
-- 已经做过的决定（注册了哪个因子/策略、跑过什么、否决了什么）
-- 用户明确表达过的偏好和要求
+## 记什么（只有这四类）
 
-不要写：客套话、你的推理过程、被否决的中间方案、代码。
-不要写「用户问了…」这种过程描述，直接写事实。
-一条一行，最多 6 行，每行不超过 40 字。没有值得记的就只回两个字：无。
+- `[user]` 交易风格、风险偏好、常用品种、仓位习惯、账户口径
+- `[feedback]` 用户纠正过你的做法，或者明确认可过的做法。**失败和成功都记** ——
+  只记纠错会让你越来越保守，把用户已经验证过的东西也丢掉
+- `[project]` 某个策略 / 因子实验的结论：哪条有效、哪条失效、为什么
+- `[reference]` 数据口径：手续费、滑点、复权、换月规则、数据源
+
+## 不记什么
+
+- 客套话、你的推理过程、被否决的中间方案、代码
+- **能现算出来的东西**：因子数值、回测收益、K 线形态 —— 需要时重算就行，
+  记下来只会过期
+- 「用户问了…」这种过程描述，直接写事实
+- 一条一行，每行不超过 40 字
+
+## 输出格式（严格照这个写，不要别的话）
+
+新增：
+[user] 偏好日线，单笔风险不超 1%
+[project] AG 30m 动量 2024 年后失效
+
+删除：
+3
+7
+
+## 删除的规矩
+
+只有确认某条**已经过时**（结论被推翻、偏好改了）才删。宁可留着旧的，也不要
+为了「整理」把还有用的删掉。编号写错会删错东西，写之前核对一遍。
+
+没有值得记的、也没有要删的，就只回两个字：无。
 
 对话：
 """
@@ -799,18 +768,27 @@ MEMORY_PROMPT = """把下面这段「ChanAgent ↔ 用户」的对话压缩成�
 _CODE_BLOCK = re.compile(r"```.*?```", re.S)
 
 
-def memory_messages(convo: list[dict]) -> list[dict]:
-    """把一段对话拼成「压缩成记忆」的请求。
+def memory_messages(convo: list[dict], existing: str = "") -> list[dict]:
+    """把一段对话拼成「整理成记忆」的请求。
 
     代码块先剔掉：模型给的因子/策略源码能占上千字，压进记忆既没用又会把
     真正该记的数字挤掉。
+
+    `existing` 是现有记忆的带编号清单 —— 有它模型才能说「第 3 条过时了」。
+    没有它就只能一直追加，三个月后全是过期条目。
     """
     lines = []
     for m in convo:
         role = "用户" if m.get("role") == "user" else "助手"
         text = _CODE_BLOCK.sub("（此处有一段代码或数据块，已省略）", text_of(m.get("content")))
         lines.append(f"{role}：{text.strip()}")
-    return [{"role": "user", "content": MEMORY_PROMPT + "\n".join(lines)}]
+
+    head = MEMORY_PROMPT
+    if existing.strip():
+        head = ("## 现有记忆（编号）\n\n" + existing.strip() + "\n\n"
+                + "上面这些是已经记着的。这次只写**新增**和**要删的编号**，"
+                  "不要重复抄一遍现有的。\n\n" + MEMORY_PROMPT)
+    return [{"role": "user", "content": head + "\n".join(lines)}]
 
 
 # ------------------------------------------------------------------ 动作解析
@@ -823,6 +801,9 @@ class Action:
     kind: str                 # 动作名（= `REGISTRY` 里的 key）；空串表示没有动作
     payload: dict = field(default_factory=dict)
     error: str = ""
+    # 结构化的错误详情。`error` 是给人看的一句话，`detail` 是给模型看的
+    # 「哪个字段、期望什么、收到什么、怎么改」。没有它模型只能瞎猜重试。
+    detail: "S.FieldError | None" = None
 
     @property
     def ok(self) -> bool:
@@ -857,9 +838,13 @@ def parse_action(text: str) -> Action:
 
     只认最后一个代码块：模型有时会在解释里贴示例，最后一个才是它真要执行的。
 
-    合法性完全交给注册表 —— `REGISTRY` 里没有的动作名直接当没有动作，
-    参数按 `inputSchema` 校验，schema 表达不了的规则走 `Tool.prepare`。
-    以前这里有四个 `_parse_xxx` 分支加一个硬编码白名单，加一个动作要改五处。
+    合法性完全交给注册表 —— `REGISTRY` 里没有的动作名、参数按 `inputSchema`
+    校验，schema 表达不了的规则走 `Tool.prepare`。以前这里有四个 `_parse_xxx`
+    分支加一个硬编码白名单，加一个动作要改五处。
+
+    **失败一律带结构化详情**（`Action.detail`）。只回一句「动作块有问题」，
+    模型第二轮还是按同样的猜法再来一遍 —— 界面上那句红字是给人看的，模型
+    看不到。
     """
     blocks = _JSON_BLOCK.findall(text or "")
     if not blocks:
@@ -867,27 +852,65 @@ def parse_action(text: str) -> Action:
     raw = blocks[-1]
     try:
         obj = json.loads(raw)
-    except ValueError:
-        return Action("", {}, "动作块不是合法 JSON")
+    except ValueError as exc:
+        return Action("", {}, f"动作块不是合法 JSON（{exc}）", S.FieldError(
+            reason="动作块不是合法 JSON",
+            hint="代码块里只能放一个 JSON 对象：键和字符串用英文双引号，"
+                 "不要注释、不要尾逗号、不要 markdown",
+        ))
     if not isinstance(obj, dict):
-        return Action("", {}, "动作块不是对象")
+        return Action("", {}, "动作块不是对象", S.FieldError(
+            reason="动作块不是 JSON 对象", got=type(obj).__name__,
+            hint='最外层要写成 {"action": "...", ...}',
+        ))
 
     kind = str(obj.get("action") or "").strip().lower()
     tool = S.get(kind)
     if tool is None:
-        # 模型编了一个平台没有的动作名。当作「没有动作」而不是报错 ——
-        # 报错会把它引到「那我该怎么写」的弯路上去，而回答本身通常是有用的
-        return Action("")
+        # 模型编了一个平台没有的动作名。这里**要说出来** —— 静默当成
+        # 「没有动作」会让用户看到一段说得头头是道、但什么都没发生的回答。
+        near = _near_tools(kind)
+        return Action("", obj, f"平台没有「{kind}」这个动作", S.FieldError(
+            tool=kind, field="action", reason="平台没有这个动作名",
+            expected="、".join(near) if near else "见工具目录",
+            got=kind,
+            hint=("把 action 改成上面列出的名字之一；"
+                  "如果本来就不需要执行操作，就不要输出 json 代码块"),
+        ))
 
     obj.pop("action", None)
-    clean, why = S.validate(tool, obj)
-    if why:
-        return Action(kind, obj, why)
+    clean, bad = S.validate_detail(tool, obj)
+    if bad is not None:
+        return Action(kind, obj, bad.message(), bad)
     if tool.prepare is not None:
         clean, why = tool.prepare(clean)
         if why:
-            return Action(kind, clean, why)
+            return Action(kind, clean, why, S.FieldError(
+                tool=tool.name, reason=why,
+                hint=f"按 {tool.label} 的参数约定改一遍再给动作块",
+            ))
     return Action(kind, clean)
+
+
+def _near_tools(kind: str, n: int = 5) -> list[str]:
+    """猜模型想调哪个。拼错 / 记错名字是常见情况，列几个近似的比空手强。"""
+    if not kind:
+        return []
+    import difflib
+
+    pool = S.all_names()
+    return difflib.get_close_matches(kind, pool, n=n, cutoff=0.4)
+
+
+def action_error_feedback(action: Action) -> str:
+    """把解析失败的动作块变成一段回灌给模型的说明。
+
+    这段要能直接回答模型的三个问题：**错在哪个字段、应该是什么、怎么改**。
+    只写「解析失败」，它下一轮只会换个说法再猜一次。
+    """
+    if action.detail is not None:
+        return action.detail.feedback()
+    return "【动作块有问题】\n原因：" + (action.error or "格式不对")
 
 # ------------------------------------------------------------------ 历史
 

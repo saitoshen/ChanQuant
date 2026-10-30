@@ -36,6 +36,14 @@ RISK_READ = "read"
 RISK_WRITE = "write"
 RISK_TRADE = "trade"
 
+# 工具结果的长度上限。超了落盘、只回首尾预览 —— 一次全市场扫描、一张全表
+# 因子值，序列化出来就是几 MB，直接塞进对话既看不了也白烧 token。
+#
+# `NO_LIMIT` 是给「自己已经限过长度」的工具用的（读文件、查手册）：它们再落盘
+# 会造成 `读文件 → 存盘 → 再读` 的死循环。
+DEFAULT_RESULT_CHARS = 8000
+NO_LIMIT = -1
+
 # 能力包。`default_on` 只影响新装用户，用户在设置页改过就以存盘为准。
 #
 # 除 `web`（会出网）和 `fs`（等于把代码交出去）之外**全部默认开** —— 这是
@@ -87,6 +95,11 @@ GROUPS: dict[str, dict] = {
         "desc": "扫一遍品种快照、找异动",
         "default_on": True,
     },
+    "delegate": {
+        "label": "派助手",
+        "desc": "让只读的研究/复核助手跑一趟，只回结论（中间过程不进上下文）",
+        "default_on": True,
+    },
     "fs": {
         "label": "平台文件",
         "desc": "读写 ChanQuant 目录下的文件。**等于把代码交给模型**，默认关",
@@ -96,7 +109,7 @@ GROUPS: dict[str, dict] = {
 
 # 所有组的顺序（提示词里按这个顺序排，稳定输出便于命中缓存）
 GROUP_ORDER = ["data", "manual", "doc", "factor", "strategy", "backtest",
-               "web", "monitor", "trade", "fs"]
+               "web", "monitor", "delegate", "trade", "fs"]
 
 
 @dataclass
@@ -120,7 +133,39 @@ class Tool:
     # 没有就用 `label` 兜底 —— 确认框里至少得说清要干什么。
     describe: Callable | None = None
     prompt: str = ""               # 详细用法，只在包启用时注入
-    max_turns: int = 1             # 允许模型连调几次（读类可以多）
+    max_turns: int = 1             # 同一个工具允许连续调几次（读类可以多）
+
+    # ---- 下面这几项是照 Claude Code 的 `Tool` 契约补的，每项都有明确用处 ----
+    #
+    # `read_only` 默认从 `risk` 推导（read 就是只读）。显式声明是为了那些
+    # 「风险是 read、但其实会写东西」的工具 —— 比如以后的「扫全市场」会落缓存。
+    read_only: bool | None = None
+    # 能否和别的工具同时跑。只读的能并行，写的不能 —— 两个写操作并发落盘
+    # 会互相覆盖。默认从 `is_read_only()` 推导，要覆盖就显式写。
+    concurrency_safe: bool | None = None
+    # 用户在工具跑着的时候发了新消息，这个工具该被取消还是该跑完。
+    # 长跑回测应该 `cancel`：用户改主意了，让它再算五分钟没有意义。
+    interrupt: str = "block"
+    # 改过名的工具把老名字挂这儿。老会话里的动作块存的是旧名字，改名后重放
+    # 会「平台没有这个动作」—— 别名让它们继续能用。
+    aliases: tuple[str, ...] = ()
+    # 结果超过这么多字符就落盘，只回预览。`NO_LIMIT` 表示不裁。
+    max_result_chars: int = DEFAULT_RESULT_CHARS
+    # 3–10 个词的能力短语，将来做工具检索时给关键词匹配用。
+    # 现在不参与提示词（全量注入反而更省），先把字段留出来。
+    search_hint: str = ""
+
+    def is_read_only(self) -> bool:
+        """显式声明优先，没声明就看 risk。"""
+        return self.risk == RISK_READ if self.read_only is None else bool(self.read_only)
+
+    def is_concurrency_safe(self) -> bool:
+        """只读的默认能并行；写的默认不能。"""
+        return (self.is_read_only() if self.concurrency_safe is None
+                else bool(self.concurrency_safe))
+
+    def clips(self) -> bool:
+        return self.max_result_chars != NO_LIMIT
 
     def spec(self) -> dict:
         """MCP `tools/list` 里的一项。
@@ -157,22 +202,42 @@ class SkillResult:
 
 REGISTRY: dict[str, Tool] = {}
 
+# 别名 → 正式名。工具改名后老动作块还能用（见 `Tool.aliases`）。
+_ALIASES: dict[str, str] = {}
+
 
 def register(tool: Tool) -> Tool:
     if tool.name in REGISTRY:
         raise RuntimeError(f"工具名重复：{tool.name}")
     if tool.group not in GROUPS:
         raise RuntimeError(f"未知能力包：{tool.group}")
+    if tool.interrupt not in ("cancel", "block"):
+        raise RuntimeError(f"interrupt 只能是 cancel / block：{tool.name}")
     REGISTRY[tool.name] = tool
+    for a in tool.aliases:
+        a = str(a).strip().lower()
+        if a and a != tool.name:
+            _ALIASES.setdefault(a, tool.name)
     return tool
 
 
 def get(name: str) -> Tool | None:
-    return REGISTRY.get(name)
+    """按名字取工具。别名也算 —— 老会话里的动作块用的是改名前的名字。"""
+    key = str(name or "").strip().lower()
+    tool = REGISTRY.get(key)
+    if tool is not None:
+        return tool
+    real = _ALIASES.get(key)
+    return REGISTRY.get(real) if real else None
 
 
 def names() -> list[str]:
     return list(REGISTRY)
+
+
+def all_names() -> list[str]:
+    """正式名 + 别名。给「模型把动作名写错」时的近似匹配用。"""
+    return list(REGISTRY) + list(_ALIASES)
 
 
 def group_tools(group: str) -> list[Tool]:
@@ -271,8 +336,65 @@ def _coerce(value, type_spec: str):
     return False, value
 
 
-def validate(tool: Tool, params: dict) -> tuple[dict, str]:
-    """按 `inputSchema` 校验并补默认值。返回 `(干净参数, 错误)`。
+@dataclass
+class FieldError:
+    """参数不对。**给模型看**的错误，不是给用户看的。
+
+    只回一句「参数 window 不对」，模型第二轮还是猜。带上 expected / got /
+    hint，它一次就能改对。这也是 Claude Code 把 `validateInput`（给模型看）
+    和 `checkPermissions`（给用户看）分成两个方法的意义 —— 混在一起会变成
+    「参数写错了也弹一次确认框」。
+    """
+
+    tool: str = ""
+    field: str = ""
+    expected: str = ""
+    got: str = ""
+    hint: str = ""
+    reason: str = ""          # 一句话总述：缺参数 / 类型不对 / 超范围 …
+
+    def message(self) -> str:
+        """一行，给日志和界面用。"""
+        if not self.field:
+            return self.reason or "参数不对"
+        bits = [f"参数 {self.field}"]
+        if self.reason:
+            bits.append(self.reason)
+        if self.expected and self.got:
+            bits.append(f"期望 {self.expected}，收到 {self.got}")
+        return f"{bits[0]}：" + "，".join(bits[1:]) if len(bits) > 1 else bits[0]
+
+    def feedback(self) -> str:
+        """回灌给模型的那一段。字段名写死成中文标签，模型读起来不用猜。"""
+        out = ["【动作块有问题】"]
+        if self.tool:
+            out.append(f"工具：{self.tool}")
+        if self.field:
+            out.append(f"字段：{self.field}")
+        if self.reason:
+            out.append(f"原因：{self.reason}")
+        if self.expected:
+            out.append(f"期望：{self.expected}")
+        if self.got:
+            out.append(f"实际：{self.got}")
+        if self.hint:
+            out.append(f"改法：{self.hint}")
+        return "\n".join(out)
+
+
+def _describe_type(type_spec: str) -> str:
+    return {
+        "str": "字符串", "string": "字符串",
+        "int": "整数", "integer": "整数",
+        "float": "数字", "number": "数字",
+        "bool": "布尔值", "boolean": "布尔值",
+        "list": "数组", "array": "数组",
+        "dict": "对象", "object": "对象",
+    }.get(str(type_spec).strip(), str(type_spec))
+
+
+def validate_detail(tool: Tool, params: dict) -> tuple[dict, FieldError | None]:
+    """按 `inputSchema` 校验并补默认值。返回 `(干净参数, 结构化错误)`。
 
     只实现 JSON Schema 里真正用得到的子集：`type` / `required` / `default` /
     `enum` / `minimum` / `maximum`。**不引 jsonschema 库** —— 它 500KB 起步，
@@ -280,12 +402,19 @@ def validate(tool: Tool, params: dict) -> tuple[dict, str]:
     """
     schema = tool.inputSchema or {}
     props = schema.get("properties") or {}
-    required = set(schema.get("required") or [])
+    required = list(schema.get("required") or [])
     out: dict[str, Any] = {}
 
     for key in required:
         if params.get(key) in (None, ""):
-            return {}, f"缺少参数 {key}"
+            spec = props.get(key) or {}
+            return {}, FieldError(
+                tool=tool.name, field=key, reason="缺少这个必填参数",
+                expected=_describe_type(spec.get("type") or "str"),
+                hint=f"至少要给 {key}" + (
+                    f"，可选值 {' / '.join(map(str, spec['enum']))}"
+                    if spec.get("enum") else ""),
+            )
 
     for key, spec in props.items():
         has = key in params and params[key] is not None
@@ -297,19 +426,43 @@ def validate(tool: Tool, params: dict) -> tuple[dict, str]:
         type_spec = spec.get("type") or "str"
         ok, value = _coerce(value, type_spec)
         if not ok:
-            return {}, f"参数 {key} 应该是 {type_spec}，收到 {value!r}"
+            return {}, FieldError(
+                tool=tool.name, field=key, reason="类型不对",
+                expected=_describe_type(type_spec), got=repr(params[key]),
+                hint=f"把 {key} 改成{_describe_type(type_spec)}",
+            )
         if "enum" in spec and value not in spec["enum"]:
-            return {}, f"参数 {key} 只能是 {spec['enum']} 之一，收到 {value!r}"
+            allowed = " / ".join(map(str, spec["enum"]))
+            return {}, FieldError(
+                tool=tool.name, field=key, reason="不在可选范围内",
+                expected=allowed, got=repr(value),
+                hint=f"{key} 只能填 {allowed} 之一",
+            )
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            if "minimum" in spec and value < spec["minimum"]:
-                return {}, f"参数 {key} 不能小于 {spec['minimum']}"
-            if "maximum" in spec and value > spec["maximum"]:
-                return {}, f"参数 {key} 不能大于 {spec['maximum']}"
+            lo, hi = spec.get("minimum"), spec.get("maximum")
+            if lo is not None and value < lo:
+                return {}, FieldError(
+                    tool=tool.name, field=key, reason="太小了",
+                    expected=f"≥ {lo}", got=str(value),
+                    hint=f"{key} 不能小于 {lo}",
+                )
+            if hi is not None and value > hi:
+                return {}, FieldError(
+                    tool=tool.name, field=key, reason="太大了",
+                    expected=f"≤ {hi}", got=str(value),
+                    hint=f"{key} 不能大于 {hi}",
+                )
         out[key] = value
 
     # schema 里没声明的字段直接丢掉：模型偶尔会多塞一个 `"reason"` 之类的，
     # 留着只会让 handler 里的 `params.get` 读到意料外的东西
-    return out, ""
+    return out, None
+
+
+def validate(tool: Tool, params: dict) -> tuple[dict, str]:
+    """`validate_detail` 的字符串版。老调用方（`dispatch`）不用改。"""
+    clean, err = validate_detail(tool, params)
+    return clean, (err.message() if err is not None else "")
 
 
 # ------------------------------------------------------------------ 提示词目录

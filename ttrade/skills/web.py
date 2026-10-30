@@ -235,6 +235,7 @@ def _web_fetch(ctx, p: dict) -> SkillResult:
 register(Tool(
     name="web_fetch",
     group="web",
+    interrupt="cancel",
     label="抓网页",
     description="取一个网页的正文（只读，不执行 JS）。**会出网**",
     risk=RISK_WRITE,
