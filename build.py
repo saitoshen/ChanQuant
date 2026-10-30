@@ -22,10 +22,10 @@ import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.join(ROOT, "packaging")
-SPEC = os.path.join(PACK, "TrendDesk.spec")
+SPEC = os.path.join(PACK, "ChanQuant.spec")
 DIST = os.path.join(ROOT, "dist")
 BUILD = os.path.join(ROOT, "build")
-APP_NAME = "TrendDesk"
+APP_NAME = "ChanQuant"
 
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
@@ -256,7 +256,7 @@ def package(target: str, base_name: str) -> str | None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="打包趋势跟踪研究台")
+    ap = argparse.ArgumentParser(description="打包 ChanQuant 禅量")
     ap.add_argument("--no-zip", action="store_true", help="不生成压缩包")
     ap.add_argument("--clean", action="store_true", help="打包前清空 build/ 和 dist/")
     ap.add_argument("--install-deps", action="store_true", help="先安装 requirements.txt")

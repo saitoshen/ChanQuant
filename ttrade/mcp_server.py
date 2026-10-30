@@ -30,9 +30,9 @@ python -m ttrade.mcp_server --list       # 打印工具清单，不进协议循�
 客户端配置（Claude Desktop / 任意 MCP 客户端）：
 
 ```json
-{"mcpServers": {"trenddesk": {
+{"mcpServers": {"chanquant": {
   "command": "python", "args": ["-m", "ttrade.mcp_server"],
-  "cwd": "D:/TrendDesk-Dev"}}}
+  "cwd": "D:/ChanQuant-Dev"}}}
 ```
 """
 
@@ -46,7 +46,7 @@ from typing import Any
 
 from ttrade import skills as S
 
-SERVER_INFO = {"name": "trenddesk", "version": "1.0"}
+SERVER_INFO = {"name": "chanquant", "version": "1.0"}
 # 客户端要的版本我们不一定实现过，回自己的；MCP 允许服务端选版本
 PROTOCOL_VERSION = "2024-11-05"
 
@@ -98,7 +98,7 @@ def _ctx() -> S.SkillContext:
 
 def _log(msg: str) -> None:
     """日志只能走 stderr —— stdout 是协议通道，混一行就废了。"""
-    print(f"[trenddesk-mcp] {msg}", file=sys.stderr, flush=True)
+    print(f"[chanquant-mcp] {msg}", file=sys.stderr, flush=True)
 
 
 # ------------------------------------------------------------------ 协议
@@ -178,7 +178,7 @@ def serve(fin, fout, allow_write: bool = False) -> None:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="ttrade.mcp_server",
-                                 description="把 TrendDesk 能力包暴露成 MCP server")
+                                 description="把 ChanQuant 能力包暴露成 MCP server")
     ap.add_argument("--allow-write", action="store_true",
                     help="连 write 级工具一起暴露（会落盘、会出网）")
     ap.add_argument("--list", action="store_true", help="打印工具清单后退出")

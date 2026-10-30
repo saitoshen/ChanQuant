@@ -1,6 +1,6 @@
-# 交易 Agent 改造方案：Skill 体系 + 文档能力 + 消息渲染
+# ChanQuant · 交易 Agent 改造方案：Skill 体系 + 文档能力 + 消息渲染
 
-> 状态：**设计稿，未动代码**。写完等拍板再实施。
+> 状态：**P0 / P1 / P2 已实施，P3 部分实施**（逐项进度见 §6）。
 > 依据：`ttrade/agent.py`（988 行）、`gui/agent_page.py`（2223 行）、
 > `ttrade/attachments.py`、`ttrade/agent_fs.py`、`ttrade/factor_pdf.py` 的现状通读，
 > 加上 Qt 富文本能力的实机探测（见 §5.3）。
@@ -751,4 +751,4 @@ payload 全摊开（字段名有中文用中文，超长正文单独给只读框
 | `ttrade/attachments.py` | 改：支持 `QImage` 入参、`kind="table"` 分支 |
 | `ttrade/daylimit.py` | 改：加 `peek()` 预检 |
 | `requirements.txt` | 改：加 `pypdf` / `openpyxl` / `python-docx` |
-| `packaging/TrendDesk.spec` | 改：`hiddenimports` 加新模块（`openpyxl` 有动态导入，必须显式列） |
+| `packaging/ChanQuant.spec` | 改：`hiddenimports` 加新模块（`openpyxl` 有动态导入，必须显式列） |

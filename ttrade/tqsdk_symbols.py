@@ -9,7 +9,7 @@
 | 交易所后缀 | `SHF/ZCE/CFX/GFE/DCE/INE` | `SHFE/CZCE/CFFEX/GFEX/DCE/INE` |
 | 合约形态 | `CU2601.SHF` | `SHFE.cu2601` |
 
-主连（888）在天勤是 `KQ.m@SHFE.cu`，Tushare 侧 TrendDesk 用的是「品种_交易所」的文件名。
+主连（888）在天勤是 `KQ.m@SHFE.cu`，Tushare 侧 ChanQuant 用的是「品种_交易所」的文件名。
 
 **为什么郑商所的 3 位月份必须带日期才能解析**：天勤的 `CZCE.TA609` 里 `6` 只是年份
 个位，2016 年 9 月和 2026 年 9 月都叫 `TA609`。所以 `to_ts()` 强制要求传参考日期，
@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import re
 
-# TrendDesk 内部交易所名 → 天勤交易所名。两边用的是同一套缩写，保留映射是为了
+# ChanQuant 内部交易所名 → 天勤交易所名。两边用的是同一套缩写，保留映射是为了
 # 以后加交易所（比如将来可能有的雄安）时只改一处。
 TQ_EXCHANGE = {
     "SHFE": "SHFE",

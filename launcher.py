@@ -2,7 +2,7 @@
 
     python launcher.py                    # 源码运行（等价于 python gui/app.py）
     python launcher.py --selftest         # 不开窗口，只做环境自检
-    TrendDesk.exe --selftest              # 验证打包后的程序是否真的能用
+    ChanQuant.exe --selftest              # 验证打包后的程序是否真的能用
 
 单独放一个 launcher 而不是直接拿 `gui/app.py` 当入口，是因为 PyInstaller 会把
 入口脚本当成顶层脚本执行，此时 `__name__ == "__main__"`、`sys.path` 的初始值

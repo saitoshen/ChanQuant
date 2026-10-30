@@ -114,7 +114,7 @@ def load_accounts() -> list[AccountSpec]:
 def save_accounts(specs: list[AccountSpec]) -> None:
     """写本地账户列表。
 
-    密码是明文落在用户目录（`%LOCALAPPDATA%\\TrendDesk\\accounts.json`）里的 ——
+    密码是明文落在用户目录（`%LOCALAPPDATA%\\ChanQuant\\accounts.json`）里的 ——
     和项目里 `tq_account.txt` 的现状一致。这是本机自用工具的取舍：要加密就得管
     一个主密码，用起来反而更麻烦。别把这个文件提交到仓库。
     """

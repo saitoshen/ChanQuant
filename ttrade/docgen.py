@@ -40,7 +40,7 @@ def document_html(blocks: list[dict], title: str = "") -> str:
         head = (
             f"<p style='font-size:19pt;font-weight:700;margin:0 0 2px 0'>{R.inline(title)}</p>"
             f"<p style='font-size:9pt;color:#6b7280;margin:0 0 14px 0'>"
-            f"TrendDesk · 由交易助手生成</p>"
+            f"ChanQuant · 由交易助手生成</p>"
         )
     return (
         "<html><head><meta charset='utf-8'></head>"
@@ -71,8 +71,8 @@ def html_to_pdf(html: str, path: str, title: str = "") -> str:
     w.setPageSize(QPageSize(QPageSize.A4))
     w.setResolution(144)
     w.setPageMargins(QMarginsF(*PAGE_MARGIN), QPageLayout.Millimeter)
-    w.setTitle(title or "TrendDesk 导出")
-    w.setCreator("TrendDesk")
+    w.setTitle(title or "ChanQuant 导出")
+    w.setCreator("ChanQuant")
 
     doc = QTextDocument()
     doc.setHtml(html)

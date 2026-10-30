@@ -8,7 +8,7 @@ set "PYW=%ROOT%.venv\Scripts\pythonw.exe"
 set "PRELOG=%ROOT%output\launch_error.log"
 set "MPLCONFIGDIR=%ROOT%.mplcache"
 if not defined LOCALAPPDATA set "LOCALAPPDATA=%USERPROFILE%\AppData\Local"
-set "ERRLOG=%LOCALAPPDATA%\TrendDesk\logs\error.log"
+set "ERRLOG=%LOCALAPPDATA%\ChanQuant\logs\error.log"
 
 if not exist "%PY%" goto no_venv
 if not exist "%ROOT%output" mkdir "%ROOT%output"
@@ -23,7 +23,7 @@ if exist "%ERRLOG%" move /y "%ERRLOG%" "%ERRLOG%.prev" >nul 2>&1
 
 rem Step 3: launch detached (pythonw has no console). If the app dies on startup
 rem it writes a traceback to error.log, which we pick up after a short wait.
-echo Starting TrendDesk, please wait...
+echo Starting ChanQuant, please wait...
 start "" "%PYW%" "%ROOT%launcher.py"
 ping -n 5 127.0.0.1 >nul 2>&1
 if not exist "%ERRLOG%" exit /b 0
@@ -31,7 +31,7 @@ if not exist "%ERRLOG%" exit /b 0
 rem Step 4: it crashed. Show the traceback, then retry in console mode.
 chcp 65001 >nul
 echo.
-echo [ERROR] TrendDesk crashed during startup. Traceback:
+echo [ERROR] ChanQuant crashed during startup. Traceback:
 echo ----------------------------------------------------------------------
 type "%ERRLOG%"
 echo ----------------------------------------------------------------------

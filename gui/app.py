@@ -1,4 +1,4 @@
-"""趋势跟踪研究台 —— PySide6 桌面程序。
+"""ChanQuant 禅量 —— PySide6 桌面程序。
 
 功能：
 - 左侧选择标的 / 策略族（规则 or 因子）/ 参数 / 显示区间 / 仓位口径
@@ -667,7 +667,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("趋势跟踪研究台 · 美股 / 国内期货")
+        self.setWindowTitle("ChanQuant 禅量 · 静定有界，以智助量化")
         # 自适应屏幕：小屏（如 1536x864）下不超出可视区域
         screen = QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen else None
@@ -1115,7 +1115,7 @@ class MainWindow(QMainWindow):
         hl = QVBoxLayout(head)
         hl.setContentsMargins(4, 0, 4, 4)
         hl.setSpacing(2)
-        t = QLabel("趋势跟踪研究台")
+        t = QLabel("ChanQuant 禅量")
         t.setObjectName("AppTitle")
         self.lbl_sub = QLabel(MARKETS[self.market]["sub"])
         self.lbl_sub.setObjectName("AppSub")
@@ -3966,7 +3966,7 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-_INSTANCE_NAME = "TrendDesk-single-instance-7f3a"
+_INSTANCE_NAME = "ChanQuant-single-instance-7f3a"
 
 
 def _claim_instance(app) -> bool:
@@ -4016,8 +4016,8 @@ def _claim_instance(app) -> bool:
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("趋势跟踪研究台")
-    app.setApplicationDisplayName("趋势跟踪研究台")
+    app.setApplicationName("ChanQuant")
+    app.setApplicationDisplayName("ChanQuant 禅量 · 静定有界，以智助量化")
     icon = app_icon()
     if not icon.isNull():
         app.setWindowIcon(icon)
@@ -4053,7 +4053,7 @@ def _log_fatal(exc: BaseException) -> None:
     """pythonw / .app 启动时没有控制台，把致命错误写入日志便于排查。
 
     日志目录走 ttrade.paths.log_dir()，打包后落在用户目录
-    （Windows: %LOCALAPPDATA%\\TrendDesk\\logs，macOS: ~/Library/Logs 同级）。
+    （Windows: %LOCALAPPDATA%\\ChanQuant\\logs，macOS: ~/Library/Logs 同级）。
     """
     import datetime
     import traceback

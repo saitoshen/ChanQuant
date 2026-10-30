@@ -16,7 +16,7 @@ DeepSeek、Kimi、GLM、混元、MiniMax 都提供 `/chat/completions` 的兼容
 
 ## token 明文存在本机
 
-和 `accounts.json` 一个口径：`%LOCALAPPDATA%/TrendDesk/agent.json`，不进版本库。
+和 `accounts.json` 一个口径：`%LOCALAPPDATA%/ChanQuant/agent.json`，不进版本库。
 要加密就得管一个主密码，对本机自用工具来说更麻烦。**别把这个文件提交上去。**
 
 ## 动作协议
@@ -143,7 +143,7 @@ class AgentConfig:
     # 下单前弹确认框。用户可以勾「下次不提醒」把它关掉 —— 关掉之后模型给的动作
     # 会直接执行，所以设置页里必须能重新打开。
     confirm_trade: bool = True
-    # 升级权限：允许 Agent 读写 TrendDesk 目录下的文件（`fs` 动作）。
+    # 升级权限：允许 Agent 读写 ChanQuant 目录下的文件（`fs` 动作）。
     # 默认关。打开等于把整个平台的代码交给模型，设置页里必须写清楚这一点。
     allow_fs: bool = False
     # 启用的能力包（见 `ttrade/skills/base.py` 的 `GROUPS`）。关掉的包，
@@ -386,8 +386,9 @@ class LLMClient:
 # ------------------------------------------------------------------ 提示词
 
 
-SYSTEM_PROMPT = """你是「趋势跟踪研究台」里的交易助手，服务对象是一位做国内商品期货和美股的个人交易者。
-你的回答必须中文、简洁、给具体数字，不要客套话。
+SYSTEM_PROMPT = """你是「ChanQuant 禅量」里的交易助手，服务对象是一位做国内商品期货和美股的个人交易者。
+平台的理念是「静定有界，以智助量化」：先守边界（仓位上限、亏损底线、模型的适用区间），
+再谈收益。你的回答必须中文、简洁、给具体数字，不要客套话。
 
 ## 平台里有什么
 
@@ -556,7 +557,7 @@ FS_PROMPT = """
 
 ## 升级权限：读写平台文件
 
-用户已打开「升级权限」，你可以读写 TrendDesk 根目录（`{root}`）下的文件。
+用户已打开「升级权限」，你可以读写 ChanQuant 根目录（`{root}`）下的文件。
 改代码之前先 `read` 看清楚现状，改完告诉用户改了什么、要重启哪一部分才生效。
 
 ```json

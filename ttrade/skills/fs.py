@@ -1,4 +1,4 @@
-"""读写 TrendDesk 目录下的文件（`fs` 动作）。
+"""读写 ChanQuant 目录下的文件（`fs` 动作）。
 
 ## 为什么单独一个包、而且默认关
 
@@ -36,7 +36,7 @@ def prepare_fs(p: dict) -> tuple[dict, str]:
     if not path and op != "list":
         return p, "缺少 path"
     if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
-        return p, "path 只能是相对 TrendDesk 根目录的路径"
+        return p, "path 只能是相对 ChanQuant 根目录的路径"
     if ".." in path.split("/"):
         return p, "path 里不能出现 .."
     if op == "write" and "content" not in p:
@@ -61,7 +61,7 @@ register(Tool(
     name="fs",
     group="fs",
     label="平台文件",
-    description="读写 TrendDesk 根目录下的文件（op=read/list/write）",
+    description="读写 ChanQuant 根目录下的文件（op=read/list/write）",
     risk=RISK_WRITE,
     inputSchema={
         "type": "object",

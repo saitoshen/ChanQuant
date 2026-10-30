@@ -12,7 +12,7 @@
 
 ## 出文件落到哪
 
-`ttrade/docgen.py` 的 `export_dir()`（用户目录下的 `export/`）。不往 TrendDesk
+`ttrade/docgen.py` 的 `export_dir()`（用户目录下的 `export/`）。不往 ChanQuant
 安装目录写 —— 打包版可能装在只读位置，而且用户找不着。
 """
 
@@ -242,7 +242,7 @@ def _write_pdf(ctx, p: dict) -> SkillResult:
     md = str(p.get("markdown") or "").strip()
     if not md:
         raise RuntimeError("markdown 是空的，没东西可导出")
-    title = str(p.get("title") or "").strip() or "TrendDesk 导出"
+    title = str(p.get("title") or "").strip() or "ChanQuant 导出"
     path = DG.export_path(p.get("name") or f"{title}.pdf", ".pdf", "导出")
     DG.write_pdf(path, markdown=md, title=title)
 

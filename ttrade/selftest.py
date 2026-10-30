@@ -1,7 +1,7 @@
 """打包后的自检：不打开窗口，验证资源、数据、回测、绘图、Qt 插件是否都正常。
 
-    TrendDesk.exe --selftest     # Windows
-    TrendDesk.app/Contents/MacOS/TrendDesk --selftest   # macOS
+    ChanQuant.exe --selftest     # Windows
+    ChanQuant.app/Contents/MacOS/ChanQuant --selftest   # macOS
 
 打包成窗口程序后没有控制台，`print` 看不到，所以结果同时写入
 `<用户目录>/logs/selftest.log`，并用退出码表示成败（0 成功 / 1 失败）。

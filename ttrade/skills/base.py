@@ -89,7 +89,7 @@ GROUPS: dict[str, dict] = {
     },
     "fs": {
         "label": "平台文件",
-        "desc": "读写 TrendDesk 目录下的文件。**等于把代码交给模型**，默认关",
+        "desc": "读写 ChanQuant 目录下的文件。**等于把代码交给模型**，默认关",
         "default_on": False,
     },
 }

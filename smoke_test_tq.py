@@ -2633,7 +2633,7 @@ def check_agent() -> None:
         # 提示词
         msgs = A.build_messages([{"role": "user", "content": "旧问题"}], "新问题")
         check("提示词：系统提示在最前",
-              msgs[0]["role"] == "system" and "趋势跟踪研究台" in msgs[0]["content"])
+              msgs[0]["role"] == "system" and "ChanQuant" in msgs[0]["content"])
         check("提示词：历史在前、本轮在后",
               msgs[-1]["content"] == "新问题" and msgs[-2]["content"] == "旧问题",
               f"{[m['role'] for m in msgs]}")
@@ -3158,7 +3158,7 @@ def check_agent_fs() -> None:
         check("文件权限：根目录可取", os.path.isdir(FS.root()), FS.root())
 
         # 路径闸门。这层挡不住蓄意破坏，但必须挡住 `../` 和绝对路径 ——
-        # 否则「只能改 TrendDesk 目录」这句话就是假的
+        # 否则「只能改 ChanQuant 目录」这句话就是假的
         ok_path, err = FS.resolve("ttrade/factors.py")
         check("文件权限：正常相对路径能落", bool(ok_path) and not err, err)
         for bad in ("../outside.txt", "a/../../b.txt", "/etc/passwd", "C:/Windows/win.ini"):

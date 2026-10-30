@@ -4,7 +4,7 @@
 用法（在项目根目录执行）：
 
     python build.py                       # 推荐，自动装依赖 + 生成图标 + 打包 + 打包成 zip
-    pyinstaller packaging/TrendDesk.spec  # 直接调用，跳过前置步骤
+    pyinstaller packaging/ChanQuant.spec  # 直接调用，跳过前置步骤
 
 为什么用「目录模式」（onedir）而不是单文件（onefile）：
 
@@ -14,8 +14,8 @@
 3. macOS 的 `.app` 本身就是目录结构，单文件没有意义。
 
 产物：
-    dist/TrendDesk/            Windows：双击 TrendDesk.exe
-    dist/TrendDesk.app         macOS：拖进 /Applications
+    dist/ChanQuant/            Windows：双击 ChanQuant.exe
+    dist/ChanQuant.app         macOS：拖进 /Applications
 """
 
 import os
@@ -28,11 +28,11 @@ HERE = SPECPATH
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 PACK = HERE
 
-APP_NAME = "TrendDesk"
-BUNDLE_ID = "com.trenddesk.app"
+APP_NAME = "ChanQuant"
+BUNDLE_ID = "com.chanquant.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
@@ -234,7 +234,7 @@ if sys.platform == "darwin":
         icon=ICON,
         bundle_identifier=BUNDLE_ID,
         info_plist={
-            "CFBundleDisplayName": "趋势跟踪研究台",
+            "CFBundleDisplayName": "ChanQuant 禅量",
             "CFBundleName": APP_NAME,
             "CFBundleShortVersionString": VERSION,
             "CFBundleVersion": VERSION,

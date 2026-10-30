@@ -135,7 +135,7 @@ def _cover(res: ProfileResult) -> str:
     m = res.meta
     span = m.get("span") or ["—", "—"]
     return "".join([
-        _h1("TrendDesk 因子库深度分析手册"),
+        _h1("ChanQuant 因子库深度分析手册"),
         _p(f"生成时间 {m.get('generated', '—')}　·　分析区间 {span[0]} ~ {span[1]}　·　"
            f"{m.get('n_factors', 0)} 个因子　·　{len(m.get('symbols') or [])} 个品种",
            C_MUTED, "9pt"),
@@ -441,8 +441,8 @@ def write_pdf(res: ProfileResult, path: str, title: str = "") -> str:
     w.setPageSize(QPageSize(QPageSize.A4))
     w.setResolution(144)
     w.setPageMargins(QMarginsF(16, 14, 16, 14), QPageLayout.Millimeter)
-    w.setTitle(title or "TrendDesk 因子库深度分析手册")
-    w.setCreator("TrendDesk")
+    w.setTitle(title or "ChanQuant 因子库深度分析手册")
+    w.setCreator("ChanQuant")
 
     doc = QTextDocument()
     doc.setHtml(build_html(res))

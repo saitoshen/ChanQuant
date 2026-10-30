@@ -1,7 +1,7 @@
 """交易 Agent「升级权限」下的文件读写。
 
 默认权限下 Agent 只能触发平台定义好的动作（下单、回测、注册因子、注册策略），
-碰不到磁盘。打开升级权限后它多一个 `fs` 动作，可以读写 TrendDesk 根目录下的
+碰不到磁盘。打开升级权限后它多一个 `fs` 动作，可以读写 ChanQuant 根目录下的
 任意文件 —— 用途是让它自己改代码、调配置、看日志。
 
 四道闸：
@@ -34,7 +34,7 @@ SKIP_NAMES = {
 
 
 def root() -> str:
-    """可写的「TrendDesk 根目录」。
+    """可写的「ChanQuant 根目录」。
 
     打包成单文件时 `bundle_root()` 指向临时解包目录（`sys._MEIPASS`），往那里
     写等于写进回收站 —— 所以冻结之后取 exe 所在目录。
@@ -62,7 +62,7 @@ def resolve(rel: str) -> tuple[str, str]:
     # 绝对路径一律不收：模型没有理由知道用户的盘符，写绝对路径多半是它在
     # 猜。只收相对路径，根目录就永远是那个根目录。
     if raw.startswith("/") or (len(raw) > 1 and raw[1] == ":"):
-        return "", f"只能用相对路径（相对 TrendDesk 根目录），不收 {rel}"
+        return "", f"只能用相对路径（相对 ChanQuant 根目录），不收 {rel}"
     base = _base()
     full = os.path.realpath(os.path.join(base, raw))
     try:
@@ -71,7 +71,7 @@ def resolve(rel: str) -> tuple[str, str]:
     except ValueError:      # 不同盘符，commonpath 会抛
         inside = False
     if not inside:
-        return "", f"路径跑出 TrendDesk 目录了：{rel}"
+        return "", f"路径跑出 ChanQuant 目录了：{rel}"
     return full, ""
 
 

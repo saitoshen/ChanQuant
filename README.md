@@ -1,4 +1,239 @@
-# 趋势跟踪研究台（美股 + 国内期货）
+# ChanQuant 禅量
+
+> **静定有界，以智助量化**
+> *Calm & bounded, LLM-augmented quant system*
+
+美股 + 国内商品期货的**研究 / 回测 / 实盘 / 交易 Agent** 一体化桌面系统（Python + PySide6）。
+
+它和别的量化工具最不一样的地方在于顺序：**先划边界，再谈收益**。仓位有上限、亏损有底线、
+模型只用它解释得了的因子；边界立住之后，再让大模型（LLM）把「想法 → 因子 → 策略 → 回测 →
+报告 → 下单」这条路上的手工活干掉。
+
+| 模块 | 一句话 |
+|---|---|
+| **数据** | 美股 34 只（东方财富后复权，20 年）+ 国内期货 78 个品种（天勤主连 5m / 1h / 日线十年、真实合约日线、商品期权），DuckDB 落库，千万行级 |
+| **研究** | 67 个内置因子 / 13 类、7 套规则策略、单/多因子与机器学习（LightGBM / XGBoost / GPR / Transformer / 线性 / GNN）、截面策略；全部 Point-In-Time 构造，自带能抓出未来函数的离线自测 |
+| **实盘** | 天勤 TqSdk，多账户、多策略组合、追单、理论 vs 实际持仓监控、一键对齐 |
+| **Agent** | 自然语言驱动。21 个工具分 10 个能力包，按风险分 `read` / `write` / `trade` 三档；关掉的包**不列进提示词**，模型不会写出一个注定被拒的动作 |
+| **可外接** | `python -m ttrade.mcp_server` 把同一套工具吐成 MCP server，默认只放只读工具，下单永不暴露 |
+
+## 名字的由来
+
+**Chan** 是禅，**Quant** 是量化。四个字，对应四件必须守住的事：
+
+- **静** —— 不追热点、不猜顶底。所有结论都从同一份前复权数据、同一个成交假设里长出来，
+  换个页面换个周期，数字不会变
+- **定** —— 口径定死。实盘和回测用同一份数据、同一个窗口、同一套成本；「差不多」在回测里
+  就是自欺
+- **有界** —— 日内报单上限、每条策略自己的本金与止损、模型只用它解释得了的因子。
+  先知道边界在哪，再谈能走多远
+- **以智助量化** —— 大模型不是替你决策的。它干的是查数据、写因子、写策略、跑回测、出报告
+  这些手工活；下单这一步，仍然要人点一下确认
+
+一句话：**静定有界**是约束，**以智助量化**是手段。
+
+## 这套系统里有什么
+
+五个平行的大页面，覆盖从研究到实盘：
+
+| 页面 | 干什么 |
+|---|---|
+| **策略研究** | K 线 + 回测 + 因子分析 + 机器学习打分，产出策略配置 |
+| **账户透视和交易** | 多账户实时持仓 / 委托 / 成交，手动开平仓 |
+| **策略交易和组合** | 多策略自动交易、绑定账户、监控器（理论 vs 实际持仓）、一键对齐；双击一条策略看它的 K 线 / 绩效 / 因子 / 交易记录 / 阶段分析，多选出组合报告 |
+| **交易Agent** | 接大模型（DeepSeek / GPT / Kimi / GLM / 混元 / MiniMax / 自定义），自然语言生成因子、策略、研报，一句话下单；读 Excel / PDF / Word、导出 PDF、扫全市场、抓网页；单个因子审核 / 深度分析、全库手册 |
+| **数据管理** | 补行情：Tushare 日线 / 天勤日线与分钟线（含真实合约、展期因子），先选市场再选周期与区间 |
+
+**仓库**：<https://github.com/saitoshen/ChanQuant>
+**下载成品**：<https://github.com/saitoshen/ChanQuant/releases> — Windows x64 / macOS arm64 / macOS x64
+
+---
+
+
+> **安装包里带的是「轻量库」。** 完整库 11 GB 压不进包，所以随包分发的是
+> `data_tq/tq_lite.duckdb`（287 MB）：主连 5m / 1h / 日线 + 真实合约日线 + 换月表，
+> 装上就有分钟数据，不用先下载。少的只是真实合约的 5m / 1h 明细（8.4 GB，几千个
+> 合约各存一份），那是「按合约看分钟 K 线」和「从库里重算期限结构」才用得上的东西。
+> 要完整库：百度网盘 2 GB 压缩包，解压出 `tq.duckdb` 放进 `data_tq/`（链接与提取码
+> 见「分钟级行情」一节）—— 读取时优先完整库，放进去就自动生效。
+
+| 页面 | 干什么 |
+|---|---|
+| **策略研究** | K 线 + 回测 + 因子分析 + 机器学习打分，产出策略配置 |
+| **账户透视和交易** | 多账户实时持仓 / 委托 / 成交，手动开平仓 |
+| **策略交易和组合** | 多策略自动交易、绑定账户、监控器（理论 vs 实际持仓）、一键对齐；双击一条策略看它的 K 线 / 绩效 / 因子 / 交易记录 / 阶段分析，多选出组合报告 |
+| **交易Agent** | 接大模型（DeepSeek / GPT / Kimi / GLM / 混元 / MiniMax / 自定义），自然语言生成因子、策略、研报，一句话下单；单个因子审核 / 深度分析、全库手册 |
+| **数据管理** | 补行情：Tushare 日线 / 天勤日线与分钟线（含真实合约、展期因子），先选市场再选周期与区间 |
+
+**仓库**：<https://github.com/saitoshen/ChanQuant>
+**下载成品**：<https://github.com/saitoshen/ChanQuant/releases> — Windows x64 / macOS arm64 / macOS x64
+
+---
+## 快速开始
+
+```bash
+# 1. 安装依赖（已内置虚拟环境则跳过）
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# 2. 配置 Tushare token（只下美股可跳过）
+cp token.example.txt token.txt      # 然后把 token 填进去；token.txt 不入库
+
+# 3. 下载数据
+.venv\Scripts\python.exe download.py            # 美股（东财，52 只候选）
+.venv\Scripts\python.exe download_futures.py    # 国内期货日线（Tushare，全品种）
+
+# 3b. 天勤行情（可选，但「账户透视和交易」「策略交易和组合」两个页面要用）
+.venv\Scripts\python.exe download_tq.py --check             # 先看账户与权限
+.venv\Scripts\python.exe download_tq.py --main 1d --all     # 日线主连，快（十几分钟）
+.venv\Scripts\python.exe download_tq.py --main 5m,1h --all  # 分钟线全品种十年，慢（约 3 小时）
+
+# 3b-2. 真实合约 + 展期因子（天勤口径，可选；不做的话展期因子只能用 Tushare 那份）
+.venv\Scripts\python.exe download_tq.py --contracts 1d --all   # 日线合约，约 300 MB
+.venv\Scripts\python.exe download_tq.py --contracts 5m --all   # 5 分钟合约，约 8.4 GB
+
+# 3c. 真实合约与期权（Tushare 口径，可选，展期/期权因子要用）
+.venv\Scripts\python.exe download_aux.py --all
+
+# 4. 批量回测，输出表格 + 图表 + 报告
+.venv\Scripts\python.exe backtest_all.py                 # 美股  -> output/
+.venv\Scripts\python.exe backtest_all.py --market cn     # 期货  -> output/futures/
+.venv\Scripts\python.exe backtest_all.py --market cn --adjust none   # 期货不复权，看换月跳空的影响
+
+# 5. 启动图形界面（顶部五个页面按钮，左侧「品种类别」可切换美股 / 国内期货）
+.venv\Scripts\python.exe launcher.py
+```
+
+天勤只给 **5m 和 1h** 两种原生 bar，其余周期在本地合并：`15m = 5m × 3`、
+`30m = 5m × 6`、`2h = 1h × 2`、`4h = 1h × 4`。所以「补历史」永远只补源周期 ——
+界面上选 15m 去补，实际下的是 5m；选 2h 去补，实际下的是 1h。反过来（直接下
+15m 存成 15m）会两头落空：读的时候 `load_main("15m")` 只去找 5m，白下一场，
+界面上还是「没有数据」。
+
+补数据：`download.py --missing`、`download_futures.py --missing` 只补缺失或过期标的。
+
+**分钟级行情库（`data_tq/tq.duckdb`）不在安装包里** —— 9.6 GB（主连 1.2 GB + 真实合约
+8.4 GB），压不进 200 MB 的包。不想等 3 小时下全量，两条路：
+
+```bash
+# ① 下现成的库：百度网盘 tq_duckdb.zip（约 2 GB，解压出 tq.duckdb 放进 data_tq/）
+#    链接 https://pan.baidu.com/s/19qPCrh7ajlh40BzTxJTDnw?pwd=cyiv  提取码 cyiv
+
+# ② 只要 1h：天勤免费账户能取 8000 根小时线，78 个品种下来只有几十 MB
+.venv\Scripts\python.exe download_tq.py --main 1h --all
+```
+
+② 的代价是**没有 5m，也就没有 15m / 30m**（那两个周期由 5m 合并而来）；2h / 4h 由 1h
+合并，不受影响。天勤账户权限决定能拿到多少历史，免费账户更早的区间取不到。
+
+离线自测（不联网，验证逻辑而不只是「能跑」）：
+
+```bash
+.venv\Scripts\python.exe smoke_test_updater.py   # 增量更新：38 项
+.venv\Scripts\python.exe smoke_test_factors.py   # 因子链路：179 项（含未来函数探针）
+.venv\Scripts\python.exe smoke_test_factors.py --fast   # 跳过 Transformer，快 1.5 秒
+.venv\Scripts\python.exe smoke_test_tq.py        # 天勤链路：2653 项（平今/追单/换月/SSE/衍生列）
+.venv\Scripts\python.exe smoke_test_mutation.py  # 变异检验：6 项，证明探针不是摆设
+.venv\Scripts\python.exe scan_ic.py              # 全样本因子 IC（README 里那两张表的来源）
+```
+
+### 换目录 / 换机器之后（只在 `.venv` 是直接复制过来时需要）
+
+项目连同 `.venv` 一起拷到别的路径（比如从 C 盘挪到 D 盘）之后，venv 里有两类
+东西还指着旧目录，症状都不明显：
+
+| 症状 | 原因 |
+|---|---|
+| `pip.exe` / `pyinstaller.exe` 静默失败：退出码 1、**没有任何输出** | console script 是「launcher + 一行 shebang + zip」，shebang 里写死了旧路径的 `python.exe` |
+| 激活 venv 之后 `python` 仍然跑到旧环境 | `activate` 里的 `VIRTUAL_ENV` 是绝对路径 |
+
+跑一次就好：
+
+```bash
+.venv\Scripts\python.exe packaging\relocate_venv.py           # 修
+.venv\Scripts\python.exe packaging\relocate_venv.py --check   # 只看不动
+```
+
+它会改 `activate*` 里的 `VIRTUAL_ENV`、按各 `dist-info/entry_points.txt`
+重新生成 `Scripts\*.exe`，最后扫一遍确认没有残留。
+
+> **shebang 为什么只能重建、不能改**：那行 shebang 夹在 launcher 可执行文件和
+> zip 归档之间，而 zip 的中央目录记录着每个条目的字节偏移 —— 长度一变，偏移全错，
+> 整个 zip 就失效了。补 NUL 或补空格凑回原长度也不行：distlib 的 launcher 会把
+> 整段交给 `CreateProcess`，两种填充实测都是退出码 1、无输出。所以走
+> `distlib.ScriptMaker` 重新生成，结构完整、shebang 是新的。
+>
+> `pyvenv.cfg` 里的 `home` **不要动** —— 它指向创建 venv 时用的那个 Python 安装，
+> 不在项目里，改了就真起不来。脚本只改 `command` 那一行（纯历史记录）。
+>
+> `__pycache__` 里的 `.pyc` 同样记着旧源路径，但那只影响 traceback 的显示，
+> 不影响运行，不用管。
+
+### 启动 GUI 的四种方式
+
+按「省事 → 可控」排序，随便挑一种：
+
+| 方式 | 命令 / 操作 | 适用场景 |
+|---|---|---|
+| 双击脚本 | `启动GUI.bat`（或 `start_gui.bat`） | 日常使用，无黑窗口 |
+| 无控制台 | `.venv\Scripts\pythonw.exe launcher.py` | 等价于双击，但能自己控制参数 |
+| 带控制台 | `.venv\Scripts\python.exe launcher.py` | **排查启动问题用这个**，异常直接打在屏幕上 |
+| 已打包程序 | 双击 `dist/ChanQuant/ChanQuant.exe` | 不想装 Python 环境 |
+
+`launcher.py` 是唯一入口，源码运行和打包运行走同一条路径。`--selftest` 可以不开窗口做环境自检：
+
+```bat
+.venv\Scripts\python.exe launcher.py --selftest
+```
+
+**如果双击没反应**：先跑带控制台的那条，错误会直接显示；或者看崩溃日志
+
+```bat
+type "%LOCALAPPDATA%\ChanQuant\logs\error.log"
+```
+
+> **踩过的坑：`.bat` 必须是 CRLF 换行。**
+> 有一次 `启动GUI.bat` 被工具以纯 LF 写出，双击后窗口一闪就没。原因不是 Python 出错——
+> 而是 `cmd.exe` 解析 LF-only 批处理时，`if not exist ... (` 这类块结构会错乱，
+> 条件判断结果**反转**，明明 venv 存在却打印「venv not found」然后 `exit /b 1`。
+> 复现方式：同一份脚本存成 LF 跑一次就能看到。仓库里 `.gitattributes` 已声明
+> `*.bat text eol=crlf`，但 git 只在**检出时**转换，不会回头修工作区里已存在的 LF 文件，
+> 所以遇到这种情况直接重写文件为 CRLF 即可，别指望 `git checkout` 能救。
+
+### Tushare token 配置
+
+代码库里**不存 token**，`ttrade/futures.py::read_token()` 按以下优先级查找：
+
+1. 环境变量 `TUSHARE_TOKEN`（CI 或临时会话）
+2. 项目根目录 `token.txt`
+3. 用户配置目录 `token.txt`（Windows `%LOCALAPPDATA%\ChanQuant`，macOS `~/Library/Application Support/ChanQuant`）
+
+三处都没有时抛出的错误里会直接写出这三条路径。仓库里只提交 `token.example.txt`。
+
+
+## 版本演进
+
+> 下面按时间顺序记每一版改了什么、为什么改。开头几段是项目起点时的原话 —— 留着是想说明
+> 「为什么先啃数据口径，再做策略」。
+
+
+### v1.8.0 —— 改名 ChanQuant + Agent 能力包
+
+- **改名 ChanQuant** —— 仓库、安装包、窗口标题、用户数据目录全改了。
+  老用户升上来**不会丢东西**：旧的 `%LOCALAPPDATA%\TrendDesk` 会在第一次启动时整目录搬到
+  `%LOCALAPPDATA%\ChanQuant`，账户、策略、自建因子、对话记忆、日限额都跟着过来
+- **交易 Agent 有了能力包体系** —— 10 个包 21 个工具，按风险分 `read` / `write` / `trade`
+  三档；加一个工具只写一处 `register(Tool(...))`，动作解析、参数校验、提示词全自动
+  （`agent.py` 净删 200 行）。设置页可以逐包开关，关掉的包不列进提示词
+- **文档能力** —— 读 Excel / PDF / Word、导出 PDF 与 xlsx；附件资源化（消息里只放 300 字符
+  摘要，模型按需取全表）。`web_fetch` 四道闸：只 http/https、解析后查 IP 防内网、
+  逐跳查重定向、5MB 截断
+- **盯盘扫描** —— 「现在哪些品种突破 20 日高点」这类**横截面**问题一句话出表，
+  四条规则（新高 / 新低 / 均线交叉 / 放量），日线 112 个品种 4.7 秒扫完
+- **MCP server** —— `python -m ttrade.mcp_server`，13 个只读工具；`write` 要显式开，
+  `trade` 永不暴露
+- **界面** —— Agent 页字号整体放大（正文 15px）；图标换成**禅圆 + 朱砂 K 线**
+
 
 从**东方财富**拉取美股主要标的近 20 年日线（后复权）、从**Tushare**拉取国内期货全品种主力连续合约日线
 （按 `fut_daily_adj` 复权因子消除换月跳空），跑五套经典趋势跟踪策略，与「买入持有」做逐标的、分组、板块、
@@ -181,174 +416,12 @@ v1.7.1 修的是**截面策略的结果页**：
 - **截面资金分配加风险平价并设为默认** —— `w ∝ 1/σ`（60 根滚动波动率），每腿内部按
   1/σ 分，多空各 50% 名义额不动，净敞口仍是 0
 
-> **安装包里带的是「轻量库」。** 完整库 11 GB 压不进包，所以随包分发的是
-> `data_tq/tq_lite.duckdb`（287 MB）：主连 5m / 1h / 日线 + 真实合约日线 + 换月表，
-> 装上就有分钟数据，不用先下载。少的只是真实合约的 5m / 1h 明细（8.4 GB，几千个
-> 合约各存一份），那是「按合约看分钟 K 线」和「从库里重算期限结构」才用得上的东西。
-> 要完整库：百度网盘 2 GB 压缩包，解压出 `tq.duckdb` 放进 `data_tq/`（链接与提取码
-> 见「分钟级行情」一节）—— 读取时优先完整库，放进去就自动生效。
-
-| 页面 | 干什么 |
-|---|---|
-| **策略研究** | K 线 + 回测 + 因子分析 + 机器学习打分，产出策略配置 |
-| **账户透视和交易** | 多账户实时持仓 / 委托 / 成交，手动开平仓 |
-| **策略交易和组合** | 多策略自动交易、绑定账户、监控器（理论 vs 实际持仓）、一键对齐；双击一条策略看它的 K 线 / 绩效 / 因子 / 交易记录 / 阶段分析，多选出组合报告 |
-| **交易Agent** | 接大模型（DeepSeek / GPT / Kimi / GLM / 混元 / MiniMax / 自定义），自然语言生成因子、策略、研报，一句话下单；单个因子审核 / 深度分析、全库手册 |
-| **数据管理** | 补行情：Tushare 日线 / 天勤日线与分钟线（含真实合约、展期因子），先选市场再选周期与区间 |
-
-**仓库**：<https://github.com/saitoshen/TrendDesk>
-**下载成品**：<https://github.com/saitoshen/TrendDesk/releases> — Windows x64 / macOS arm64 / macOS x64
-
----
-
-## 快速开始
-
-```bash
-# 1. 安装依赖（已内置虚拟环境则跳过）
-python -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-
-# 2. 配置 Tushare token（只下美股可跳过）
-cp token.example.txt token.txt      # 然后把 token 填进去；token.txt 不入库
-
-# 3. 下载数据
-.venv\Scripts\python.exe download.py            # 美股（东财，52 只候选）
-.venv\Scripts\python.exe download_futures.py    # 国内期货日线（Tushare，全品种）
-
-# 3b. 天勤行情（可选，但「账户透视和交易」「策略交易和组合」两个页面要用）
-.venv\Scripts\python.exe download_tq.py --check             # 先看账户与权限
-.venv\Scripts\python.exe download_tq.py --main 1d --all     # 日线主连，快（十几分钟）
-.venv\Scripts\python.exe download_tq.py --main 5m,1h --all  # 分钟线全品种十年，慢（约 3 小时）
-
-# 3b-2. 真实合约 + 展期因子（天勤口径，可选；不做的话展期因子只能用 Tushare 那份）
-.venv\Scripts\python.exe download_tq.py --contracts 1d --all   # 日线合约，约 300 MB
-.venv\Scripts\python.exe download_tq.py --contracts 5m --all   # 5 分钟合约，约 8.4 GB
-
-# 3c. 真实合约与期权（Tushare 口径，可选，展期/期权因子要用）
-.venv\Scripts\python.exe download_aux.py --all
-
-# 4. 批量回测，输出表格 + 图表 + 报告
-.venv\Scripts\python.exe backtest_all.py                 # 美股  -> output/
-.venv\Scripts\python.exe backtest_all.py --market cn     # 期货  -> output/futures/
-.venv\Scripts\python.exe backtest_all.py --market cn --adjust none   # 期货不复权，看换月跳空的影响
-
-# 5. 启动图形界面（顶部五个页面按钮，左侧「品种类别」可切换美股 / 国内期货）
-.venv\Scripts\python.exe launcher.py
-```
-
-天勤只给 **5m 和 1h** 两种原生 bar，其余周期在本地合并：`15m = 5m × 3`、
-`30m = 5m × 6`、`2h = 1h × 2`、`4h = 1h × 4`。所以「补历史」永远只补源周期 ——
-界面上选 15m 去补，实际下的是 5m；选 2h 去补，实际下的是 1h。反过来（直接下
-15m 存成 15m）会两头落空：读的时候 `load_main("15m")` 只去找 5m，白下一场，
-界面上还是「没有数据」。
-
-补数据：`download.py --missing`、`download_futures.py --missing` 只补缺失或过期标的。
-
-**分钟级行情库（`data_tq/tq.duckdb`）不在安装包里** —— 9.6 GB（主连 1.2 GB + 真实合约
-8.4 GB），压不进 200 MB 的包。不想等 3 小时下全量，两条路：
-
-```bash
-# ① 下现成的库：百度网盘 tq_duckdb.zip（约 2 GB，解压出 tq.duckdb 放进 data_tq/）
-#    链接 https://pan.baidu.com/s/19qPCrh7ajlh40BzTxJTDnw?pwd=cyiv  提取码 cyiv
-
-# ② 只要 1h：天勤免费账户能取 8000 根小时线，78 个品种下来只有几十 MB
-.venv\Scripts\python.exe download_tq.py --main 1h --all
-```
-
-② 的代价是**没有 5m，也就没有 15m / 30m**（那两个周期由 5m 合并而来）；2h / 4h 由 1h
-合并，不受影响。天勤账户权限决定能拿到多少历史，免费账户更早的区间取不到。
-
-离线自测（不联网，验证逻辑而不只是「能跑」）：
-
-```bash
-.venv\Scripts\python.exe smoke_test_updater.py   # 增量更新：38 项
-.venv\Scripts\python.exe smoke_test_factors.py   # 因子链路：179 项（含未来函数探针）
-.venv\Scripts\python.exe smoke_test_factors.py --fast   # 跳过 Transformer，快 1.5 秒
-.venv\Scripts\python.exe smoke_test_tq.py        # 天勤链路：2653 项（平今/追单/换月/SSE/衍生列）
-.venv\Scripts\python.exe smoke_test_mutation.py  # 变异检验：6 项，证明探针不是摆设
-.venv\Scripts\python.exe scan_ic.py              # 全样本因子 IC（README 里那两张表的来源）
-```
-
-### 换目录 / 换机器之后（只在 `.venv` 是直接复制过来时需要）
-
-项目连同 `.venv` 一起拷到别的路径（比如从 C 盘挪到 D 盘）之后，venv 里有两类
-东西还指着旧目录，症状都不明显：
-
-| 症状 | 原因 |
-|---|---|
-| `pip.exe` / `pyinstaller.exe` 静默失败：退出码 1、**没有任何输出** | console script 是「launcher + 一行 shebang + zip」，shebang 里写死了旧路径的 `python.exe` |
-| 激活 venv 之后 `python` 仍然跑到旧环境 | `activate` 里的 `VIRTUAL_ENV` 是绝对路径 |
-
-跑一次就好：
-
-```bash
-.venv\Scripts\python.exe packaging\relocate_venv.py           # 修
-.venv\Scripts\python.exe packaging\relocate_venv.py --check   # 只看不动
-```
-
-它会改 `activate*` 里的 `VIRTUAL_ENV`、按各 `dist-info/entry_points.txt`
-重新生成 `Scripts\*.exe`，最后扫一遍确认没有残留。
-
-> **shebang 为什么只能重建、不能改**：那行 shebang 夹在 launcher 可执行文件和
-> zip 归档之间，而 zip 的中央目录记录着每个条目的字节偏移 —— 长度一变，偏移全错，
-> 整个 zip 就失效了。补 NUL 或补空格凑回原长度也不行：distlib 的 launcher 会把
-> 整段交给 `CreateProcess`，两种填充实测都是退出码 1、无输出。所以走
-> `distlib.ScriptMaker` 重新生成，结构完整、shebang 是新的。
->
-> `pyvenv.cfg` 里的 `home` **不要动** —— 它指向创建 venv 时用的那个 Python 安装，
-> 不在项目里，改了就真起不来。脚本只改 `command` 那一行（纯历史记录）。
->
-> `__pycache__` 里的 `.pyc` 同样记着旧源路径，但那只影响 traceback 的显示，
-> 不影响运行，不用管。
-
-### 启动 GUI 的四种方式
-
-按「省事 → 可控」排序，随便挑一种：
-
-| 方式 | 命令 / 操作 | 适用场景 |
-|---|---|---|
-| 双击脚本 | `启动GUI.bat`（或 `start_gui.bat`） | 日常使用，无黑窗口 |
-| 无控制台 | `.venv\Scripts\pythonw.exe launcher.py` | 等价于双击，但能自己控制参数 |
-| 带控制台 | `.venv\Scripts\python.exe launcher.py` | **排查启动问题用这个**，异常直接打在屏幕上 |
-| 已打包程序 | 双击 `dist/TrendDesk/TrendDesk.exe` | 不想装 Python 环境 |
-
-`launcher.py` 是唯一入口，源码运行和打包运行走同一条路径。`--selftest` 可以不开窗口做环境自检：
-
-```bat
-.venv\Scripts\python.exe launcher.py --selftest
-```
-
-**如果双击没反应**：先跑带控制台的那条，错误会直接显示；或者看崩溃日志
-
-```bat
-type "%LOCALAPPDATA%\TrendDesk\logs\error.log"
-```
-
-> **踩过的坑：`.bat` 必须是 CRLF 换行。**
-> 有一次 `启动GUI.bat` 被工具以纯 LF 写出，双击后窗口一闪就没。原因不是 Python 出错——
-> 而是 `cmd.exe` 解析 LF-only 批处理时，`if not exist ... (` 这类块结构会错乱，
-> 条件判断结果**反转**，明明 venv 存在却打印「venv not found」然后 `exit /b 1`。
-> 复现方式：同一份脚本存成 LF 跑一次就能看到。仓库里 `.gitattributes` 已声明
-> `*.bat text eol=crlf`，但 git 只在**检出时**转换，不会回头修工作区里已存在的 LF 文件，
-> 所以遇到这种情况直接重写文件为 CRLF 即可，别指望 `git checkout` 能救。
-
-### Tushare token 配置
-
-代码库里**不存 token**，`ttrade/futures.py::read_token()` 按以下优先级查找：
-
-1. 环境变量 `TUSHARE_TOKEN`（CI 或临时会话）
-2. 项目根目录 `token.txt`
-3. 用户配置目录 `token.txt`（Windows `%LOCALAPPDATA%\TrendDesk`，macOS `~/Library/Application Support/TrendDesk`）
-
-三处都没有时抛出的错误里会直接写出这三条路径。仓库里只提交 `token.example.txt`。
-
-
 ---
 
 ## 项目结构
 
 ```
-Claw/
+ChanQuant/
 ├── launcher.py            # 桌面程序入口（源码运行 + 打包入口，--selftest 自检）
 ├── 启动GUI.bat            # Windows 双击启动（CRLF，见上文「踩过的坑」）
 ├── start_gui.bat          # 同上，纯 ASCII 文件名的副本（跨平台 clone 保险）
@@ -361,7 +434,7 @@ Claw/
 ├── backtest_all.py        # 批量回测 + 报告生成（--market us|cn）
 ├── scan_ic.py             # 全样本因子 IC 扫描（逐品种时序 IC 再跨品种平均）
 ├── smoke_test_factors.py  # 因子/因子策略离线自测（179 项，含未来函数探针）
-├── smoke_test_tq.py       # 天勤链路自测（2653 项，含平今/追单/换月/SSE 解析/结果视图）
+├── smoke_test_tq.py       # 天勤链路自测（2872 项，含平今/追单/换月/SSE 解析/结果视图）
 ├── smoke_test_gui.py      # 界面冒烟（离屏建窗口、切页、渲染）
 ├── smoke_test_mutation.py # 变异检验：证明上面那些探针真能抓到未来函数
 ├── smoke_test_updater.py  # 增量更新引擎离线自测（38 项，全部打桩）
@@ -376,7 +449,7 @@ Claw/
 ├── token.example.txt      # token 模板（真正的 token.txt 不入库）
 ├── requirements.txt
 ├── packaging/
-│   ├── TrendDesk.spec     # PyInstaller 配置（Windows / macOS 通用）
+│   ├── ChanQuant.spec     # PyInstaller 配置（Windows / macOS 通用）
 │   ├── make_icon.py       # 用 Pillow 生成 .ico / .icns / .png
 │   ├── relocate_venv.py   # 项目换目录后修 .venv 里写死的绝对路径
 │   └── icon.*             # 生成好的图标
@@ -402,6 +475,23 @@ Claw/
 │   ├── agent.py           # 大模型接入（OpenAI 兼容、手写 SSE、动作解析）
 │   ├── agent_memory.py    # Agent 长期记忆（对话压缩成要点，存用户目录）
 │   ├── agent_fs.py        # Agent 升级权限的文件读写（路径闸门、原子覆盖、保留 CRLF）
+│   ├── skills/            # 能力包注册表：10 个包 21 个工具（加工具只改一处）
+│   │   ├── base.py        # Tool / REGISTRY / validate / catalog / dispatch
+│   │   ├── data.py        # 查行情 / 查因子 / 列品种
+│   │   ├── manual.py      # 平台手册
+│   │   ├── doc.py         # 读 Excel / PDF / Word，导出 PDF / xlsx
+│   │   ├── factor.py      # 因子库 + 注册 + 试算
+│   │   ├── strategy.py    # 策略库 + 注册
+│   │   ├── trade.py       # 下单 / 回测的动作协议
+│   │   ├── web.py         # web_fetch（四道闸）
+│   │   ├── monitor.py     # 全市场快照扫描
+│   │   └── fs.py          # 平台文件读写（默认关）
+│   ├── session_files.py   # 附件资源化（file_id + 300 字符摘要，模型按需取）
+│   ├── docgen.py          # PDF / xlsx 导出（和聊天共用同一个渲染器）
+│   ├── render.py          # markdown → Block → Qt 富文本
+│   ├── blocks.py          # 富文本块构造器（表格 / 指标卡 / 代码 / 警示）
+│   ├── store.py           # 两个市场的 DataStore 合成一个查询入口
+│   ├── mcp_server.py      # 把能力包吐成 MCP server（stdio + JSON-RPC）
 │   ├── factor_manual.py   # 平台手册（数据链路 / 注入的原语 / 每个因子的完整实现）
 │   ├── attachments.py     # 对话附件（图片缩放编码、docx/csv 转文本、多模态拼装）
 │   ├── updater.py         # 增量数据更新引擎（区间选择、换源重下、原子写入）
@@ -419,6 +509,8 @@ Claw/
 │   ├── backtest.py        # 逐日回测引擎 + 绩效指标 + 阶段分析（年月切段、组合合成）
 │   ├── replay.py          # 离线回放：按保存的配置跑一遍回测，不碰界面
 │   └── universe.py        # 美股股票池（52 只，按行业分组）
+├── docs/
+│   └── agent-skill-plan.md  # Skill 体系与文档能力的方案与进度
 ├── .github/workflows/
 │   └── build.yml          # 三平台矩阵构建 + 自检 + Release
 ├── data/                  # 美股 CSV
@@ -1707,7 +1799,7 @@ K 线如果反复重算，信号会在盘中来回翻，等于反复开平。刷
 - **按交易日**。夜盘 20:00 之后算**下一个**工作日：周五夜盘归下周一，周一凌晨 01:00
   仍算周一。不能按自然日切，否则 23:59 用完 1000 次、过 0 点又是一条好汉，而交易所
   眼里还是同一个交易日。法定节假日不处理 —— 那些日子本来就不交易。
-- **落盘**（`%LOCALAPPDATA%/TrendDesk/trade_limits.json`）。重启程序不清零。交易所
+- **落盘**（`%LOCALAPPDATA%/ChanQuant/trade_limits.json`）。重启程序不清零。交易所
   记的是账户当天已经发出去多少笔，重启一下就绕过限制是自欺欺人。
 
 计数只在**真要发报文时** +1，所以「算出来 0 手」「盘口还没来」「今昨明细没就绪」
@@ -1723,8 +1815,8 @@ K 线如果反复重算，信号会在盘中来回翻，等于反复开平。刷
 | `sim` 本地模拟 | 纯本地撮合，重启即清空，适合试接口 | 天勤账户 |
 | `account` 实盘 | 期货公司真实资金账号 | 天勤账户 + broker_id + 资金账号 + 密码 |
 
-账户存在 `%LOCALAPPDATA%\TrendDesk\accounts.json`（macOS 在
-`~/Library/Application Support/TrendDesk/`），**密码是明文的**，和项目里
+账户存在 `%LOCALAPPDATA%\ChanQuant\accounts.json`（macOS 在
+`~/Library/Application Support/ChanQuant/`），**密码是明文的**，和项目里
 `tq_account.txt` 的现状一致 —— 本机自用工具的取舍，别把这个文件提交到仓库。
 
 实盘缺参数会直接抛 `ValueError`，不会静默退化成模拟：一个「以为在下实盘、其实在下
@@ -2145,7 +2237,7 @@ bar（`df.iloc[:-1]`）：此刻正是新 bar 刚开盘，用上一根收盘的�
   实例是独立的一份，照跑不误。删之前会数一下有多少份配置在用（策略库 + 组合），
   在确认框里写出来
 - **权限分级**：默认那档只有四个动作（下单 / 回测 / 注册因子 / 注册策略），碰不到
-  磁盘。设置里可以打开「允许 Agent 读写 TrendDesk 目录（升级权限）」，打开时弹警告
+  磁盘。设置里可以打开「允许 Agent 读写 ChanQuant 目录（升级权限）」，打开时弹警告
   —— 它就能读写根目录下的任意文件，包括程序自己的代码和已补好的行情。打开之后
   模型多一个 `{"action": "fs", ...}` 动作：`read` / `list` 直接执行，`write` 是
   **整文件覆盖**、每次都要过确认框（路径、新建还是覆盖、全文都在框里）。一轮提问
@@ -2523,8 +2615,8 @@ macOS 的 `.app` 本身就是目录结构。
 ### 本地打包
 
 ```bash
-.venv\Scripts\python.exe build.py          # Windows -> dist/TrendDesk/TrendDesk.exe
-brew install libomp && python build.py     # macOS   -> dist/TrendDesk.app
+.venv\Scripts\python.exe build.py          # Windows -> dist/ChanQuant/ChanQuant.exe
+brew install libomp && python build.py     # macOS   -> dist/ChanQuant.app
 ```
 
 脚本会自动：装 PyInstaller → 生成图标 → 打包 → 报体积 → 打成 zip。
@@ -2539,8 +2631,8 @@ macOS 上 `brew install libomp` 不是可选项：xgboost 的 wheel 不自带 Op
 打出来的包到底能不能用，不用点界面去猜：
 
 ```bash
-dist\TrendDesk\TrendDesk.exe --selftest              # Windows
-dist/TrendDesk.app/Contents/MacOS/TrendDesk --selftest   # macOS
+dist\ChanQuant\ChanQuant.exe --selftest              # Windows
+dist/ChanQuant.app/Contents/MacOS/ChanQuant --selftest   # macOS
 ```
 
 自检不开窗口，逐项验证并写日志到 `<用户目录>/logs/selftest.log`，退出码 0 表示全过：
@@ -2586,7 +2678,7 @@ CI 里也跑这一步。
 
 这个坑不会报错：界面照常打开、手册照常弹出来，只是里面每段代码都是空的，
 模型照着学就是一片空白，Agent 写的因子还会调用根本没定义的原语。所以
-`TrendDesk.spec` 里给两个包开了源码收集：
+`ChanQuant.spec` 里给两个包开了源码收集：
 
 ```python
 module_collection_mode={"ttrade": "pyz+py", "gui": "pyz+py"},
@@ -2601,9 +2693,9 @@ v1.5.0 第一次发版正是栽在这里：手册从 33611 字符掉到 17639，
 
 | runner | 产物 |
 |---|---|
-| `windows-latest` | `TrendDesk-win64.zip` |
-| `macos-latest`（Apple Silicon） | `TrendDesk-macos-arm64.zip` |
-| `macos-15-intel`（Intel） | `TrendDesk-macos-x64.zip` |
+| `windows-latest` | `ChanQuant-win64.zip` |
+| `macos-latest`（Apple Silicon） | `ChanQuant-macos-arm64.zip` |
+| `macos-15-intel`（Intel） | `ChanQuant-macos-x64.zip` |
 
 触发方式两种：**打 `v*` 标签**（构建 + 发 Release），或到 Actions 页面手动 Run workflow。
 推 `main` 不会触发——数据文件大，不必每次提交都重建。
@@ -2652,7 +2744,7 @@ LC_RPATH       /usr/local/opt/libomp/lib      # x86_64
 shutil.copy2(libomp_src, os.path.join(lib_dir, "libomp.dylib"))
 install_name_tool -change @rpath/libomp.dylib @loader_path/libomp.dylib libxgboost.dylib
 codesign --force --sign - <两个 dylib>     # 改过 Mach-O，原签名失效
-codesign --force --deep --sign - TrendDesk.app   # 外层签名封装了 Frameworks，要整包重签
+codesign --force --deep --sign - ChanQuant.app   # 外层签名封装了 Frameworks，要整包重签
 ```
 
 `@loader_path` 就是 `libxgboost.dylib` 自己所在的目录，两个文件同目录，引用天然成立，
@@ -2668,13 +2760,13 @@ codesign --force --deep --sign - TrendDesk.app   # 外层签名封装了 Framewo
 
 | 平台 | 产物 | 使用方式 |
 |---|---|---|
-| Windows | `dist/TrendDesk/`（内含 `TrendDesk.exe`） | 整个文件夹拷走，双击 exe |
-| macOS | `dist/TrendDesk.app` | 拖进 `/Applications` |
+| Windows | `dist/ChanQuant/`（内含 `ChanQuant.exe`） | 整个文件夹拷走，双击 exe |
+| macOS | `dist/ChanQuant.app` | 拖进 `/Applications` |
 
 macOS 首次打开若提示「已损坏」或「无法验证开发者」，是因为没有开发者签名（ad-hoc 签名不够）：
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/TrendDesk.app
+xattr -dr com.apple.quarantine /Applications/ChanQuant.app
 ```
 
 或者右键点应用 → 打开 → 再点「打开」。要彻底消掉这个提示需要 Apple Developer 账号（$99/年）
@@ -2692,8 +2784,8 @@ xattr -dr com.apple.quarantine /Applications/TrendDesk.app
 macOS 的 `.app` 签名后所在卷是**只读**的。之前 `MPLCONFIGDIR` 和 `error.log` 都指向项目目录，
 源码运行没问题，打包后会静默失败。现在分别走 `cache_dir("mpl")` 和 `log_dir()`：
 
-- Windows：`%LOCALAPPDATA%\TrendDesk\{cache,logs}`
-- macOS：`~/Library/Caches/TrendDesk` 与 `~/Library/Application Support/TrendDesk/logs`
+- Windows：`%LOCALAPPDATA%\ChanQuant\{cache,logs}`
+- macOS：`~/Library/Caches/ChanQuant` 与 `~/Library/Application Support/ChanQuant/logs`
 
 ### 跨平台中文字体
 

@@ -75,7 +75,7 @@ def read_token() -> str:
 
     1. 环境变量 `TUSHARE_TOKEN`（CI / 临时会话用）
     2. 项目根目录 `token.txt`（本机开发用，已在 .gitignore 里）
-    3. 用户配置目录 `TrendDesk/token.txt`（打包后或不想放项目里时用）
+    3. 用户配置目录 `ChanQuant/token.txt`（打包后或不想放项目里时用）
 
     都找不到就抛错，并把怎么配置写清楚，而不是留一个空字符串让接口
     返回一句「请指定正确的接口名」这种无关的报错。
@@ -101,7 +101,7 @@ def read_token() -> str:
         f"  1) 设置环境变量 {TOKEN_ENV}\n"
         "  2) 在项目根目录新建 token.txt，内容只有一行 token\n"
         "  3) 在用户配置目录下新建 token.txt（Windows: "
-        "%LOCALAPPDATA%\\TrendDesk；macOS: ~/Library/Application Support/TrendDesk）\n"
+        "%LOCALAPPDATA%\\ChanQuant；macOS: ~/Library/Application Support/ChanQuant）\n"
         "token 获取地址：https://tushare.pro/user/token"
     )
 

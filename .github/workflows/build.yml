@@ -25,16 +25,16 @@ jobs:
         include:
           - os: windows-latest
             label: Windows x64
-            artifact: TrendDesk-win64
-            archive: dist/TrendDesk-win64.zip
+            artifact: ChanQuant-win64
+            archive: dist/ChanQuant-win64.zip
           - os: macos-latest     # Apple Silicon（macos-14 起默认 arm64）
             label: macOS arm64
-            artifact: TrendDesk-macos-arm64
-            archive: dist/TrendDesk-macos-arm64.zip
+            artifact: ChanQuant-macos-arm64
+            archive: dist/ChanQuant-macos-arm64.zip
           - os: macos-15-intel   # Intel；macos-13 已于 2025-12-04 退役
             label: macOS x64
-            artifact: TrendDesk-macos-x64
-            archive: dist/TrendDesk-macos-x64.zip
+            artifact: ChanQuant-macos-x64
+            archive: dist/ChanQuant-macos-x64.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -51,12 +51,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
-          spec=$(grep -E '^VERSION = ' packaging/TrendDesk.spec | head -1 | sed -E 's/.*"(.*)".*/\1/')
+          spec=$(grep -E '^VERSION = ' packaging/ChanQuant.spec | head -1 | sed -E 's/.*"(.*)".*/\1/')
           pkg=$(grep -E '^__version__ = ' ttrade/__init__.py | head -1 | sed -E 's/.*"(.*)".*/\1/')
           tag="${GITHUB_REF_NAME#v}"
           echo "tag=$tag  spec=$spec  ttrade=$pkg"
           if [ "$spec" != "$tag" ]; then
-            echo "::error::packaging/TrendDesk.spec 里 VERSION=$spec，与 tag v$tag 不一致"
+            echo "::error::packaging/ChanQuant.spec 里 VERSION=$spec，与 tag v$tag 不一致"
             exit 1
           fi
           if [ "$pkg" != "$tag" ]; then
@@ -114,12 +114,12 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            ./dist/TrendDesk/TrendDesk.exe --selftest || { cat "$LOCALAPPDATA/TrendDesk/logs/selftest.log"; exit 1; }
-            cat "$LOCALAPPDATA/TrendDesk/logs/selftest.log"
+            ./dist/ChanQuant/ChanQuant.exe --selftest || { cat "$LOCALAPPDATA/ChanQuant/logs/selftest.log"; exit 1; }
+            cat "$LOCALAPPDATA/ChanQuant/logs/selftest.log"
           else
-            ./dist/TrendDesk.app/Contents/MacOS/TrendDesk --selftest || {
-              cat "$HOME/Library/Application Support/TrendDesk/logs/selftest.log"; exit 1; }
-            cat "$HOME/Library/Application Support/TrendDesk/logs/selftest.log"
+            ./dist/ChanQuant.app/Contents/MacOS/ChanQuant --selftest || {
+              cat "$HOME/Library/Application Support/ChanQuant/logs/selftest.log"; exit 1; }
+            cat "$HOME/Library/Application Support/ChanQuant/logs/selftest.log"
           fi
 
       - name: 列出产物

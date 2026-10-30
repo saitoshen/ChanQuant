@@ -1,6 +1,6 @@
 """策略配置、策略库、交易组合的本地持久化。
 
-三个 JSON 都落在 `%LOCALAPPDATA%/TrendDesk/` 下：
+三个 JSON 都落在 `%LOCALAPPDATA%/ChanQuant/` 下：
 
 - `strategy_lib.json` —— 策略库。用户在「策略研究」里存的配置模板，可复用、可导出。
 - `portfolio.json`    —— 交易组合。`策略交易和组合` 页面里那一列正在跑的策略。

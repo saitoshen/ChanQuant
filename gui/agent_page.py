@@ -744,11 +744,11 @@ class SettingsDialog(QDialog):
 
         # 权限分级。默认那档能做的事都写在提示词里（下单 / 回测 / 注册因子和策略），
         # 这一档是额外放开磁盘 —— 等于把平台自己的代码交给模型，所以要拦一道警告。
-        self.chk_fs = QCheckBox("允许 Agent 读写 TrendDesk 目录（升级权限）")
+        self.chk_fs = QCheckBox("允许 Agent 读写 ChanQuant 目录（升级权限）")
         self.chk_fs.setChecked(cfg.allow_fs)
         self.chk_fs.setToolTip(
             "关着：Agent 只能下单、回测、注册因子和策略。\n"
-            "打开：多一个文件动作，可读写 TrendDesk 根目录下的任意文件。"
+            "打开：多一个文件动作，可读写 ChanQuant 根目录下的任意文件。"
         )
         self.chk_fs.toggled.connect(self._on_fs_toggled)
         form.addRow("", self.chk_fs)
@@ -840,7 +840,7 @@ class SettingsDialog(QDialog):
             return
         ok = QMessageBox.warning(
             self, "升级权限",
-            "打开之后，Agent 可以读写 TrendDesk 目录下的任何文件 —— 包括程序"
+            "打开之后，Agent 可以读写 ChanQuant 目录下的任何文件 —— 包括程序"
             "自己的代码、配置和历史数据。\n\n"
             "模型改错了代码，平台可能起不来；写错了数据文件，已经补好的行情"
             "可能被覆盖。每次写入仍会弹一次确认框，读文件不会。\n\n"
@@ -2084,7 +2084,7 @@ class AgentPage(QWidget):
         """能力包关着时怎么告诉用户。要指名去哪打开 —— 只说「没有权限」等于没说。"""
         if tool.group == "fs":
             msg = ("模型想读写平台文件，但「升级权限」没打开。到左下角「设置」里勾上"
-                   "「允许 Agent 读写 TrendDesk 目录」才能用。")
+                   "「允许 Agent 读写 ChanQuant 目录」才能用。")
         else:
             label = S.GROUPS.get(tool.group, {}).get("label", tool.group)
             msg = (f"「{label}」这个能力包现在是关着的，所以没法执行「{tool.label}」。"
@@ -2147,7 +2147,7 @@ class AgentPage(QWidget):
             self._append(
                 f"<p style='color:{C_BAD}'>模型想{_esc(action.describe())}，"
                 "但升级权限没打开。到左下角「设置」里勾上「允许 Agent 读写 "
-                "TrendDesk 目录」才能用。</p>"
+                "ChanQuant 目录」才能用。</p>"
             )
             self._set_state("升级权限未开启", C_BAD)
             return

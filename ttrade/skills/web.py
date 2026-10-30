@@ -47,7 +47,7 @@ MAX_BYTES = 5 * 1024 * 1024
 MAX_CHARS = 12000
 TIMEOUT = (6, 20)
 MAX_REDIRECTS = 3
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) TrendDesk/1.7 "
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) ChanQuant/1.7 "
       "(+local research tool)")
 
 OK_TYPES = ("text/html", "text/plain", "application/xhtml", "application/json",

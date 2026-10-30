@@ -2,15 +2,27 @@
 
     python packaging/make_icon.py
 
-## 设计思路：QuantBuddy
+## 设计思路：静定有界，以智助量化
 
-这个程序的用法是「用一句人话让它去查数据、跑回测」，所以图标不能做成 K 线图
-—— 那是行情软件的脸，用户看见只会觉得「又一个看盘工具」。要传达的是**有个
-搭子在帮你干量化的活**，于是主体是一个对话气泡（有人在那儿回你话），气泡里
-三根逐级抬高的柱子（量化、在变好），最高那根的顶盖换成琥珀色（在动的那一根）。
+图标里只有三样东西，多的一个都不要：
 
-配色用靛蓝→紫的竖向渐变：比深蓝年轻、比纯绿（金融软件的俗套）干净，圆角
-22.5% 跟系统图标的圆角量级对齐。左上有一层很淡的柔光，避免整块色死板。
+1. **禅圆（円相）** —— 一笔画成、**不闭合**的圆。禅画里的円相讲的是「不完美但
+   完整」，那一小段缺口是「还在继续」。它同时是「有界」：量化的第一件事是知道
+   边界在哪 —— 仓位有上限、亏损有底线、模型有适用区间。
+2. **一根朱砂 K 线** —— 立在圆里。量化这件事本身的符号，也是「以智助量化」的那个
+   「量」。只有一根：两根以上在 16px 下就糊成一团。
+3. **墨底** —— 深墨渐变（不是纯黑），让纸白的笔画浮起来，像灯下看字。
+
+配色是宣纸 + 墨 + 朱砂：纸白 `#EEE7D6` 的圆、朱砂 `#C63C2C` 的 K 线、墨色底。
+朱砂只用在一处 —— 印章的规矩，点睛的地方只该有一个红点。
+
+圆角 22.5%，和系统图标的圆角量级对齐。
+
+## 笔画怎么画
+
+禅圆的笔锋是「起笔重、收笔轻」，所以不是 `arc(width=...)` 能画出来的：沿圆周取
+一圈点，按角度把笔画**宽度**从 `W_MAX` 收到 `W_MIN`，内外半径连成一个多边形再
+填充。这样在 1024 上是一笔有粗细变化的墨，缩到 16px 也还是一圈有轻重感的圆。
 
 ## 只用 Pillow
 
@@ -20,6 +32,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -36,12 +49,20 @@ if hasattr(sys.stdout, "reconfigure"):
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 底色渐变：靛蓝 → 紫
-BG_TOP = (104, 96, 255)
-BG_BOT = (124, 58, 237)
-WHITE = (255, 255, 255)
-INK = (49, 46, 129)        # 柱子最浅那一根
-AMBER = (251, 191, 36)     # 顶盖 / 强调色
+# 墨底：上浅下深，纯黑会显脏
+BG_TOP = (28, 33, 41)
+BG_BOT = (10, 13, 17)
+PAPER = (238, 231, 214)      # 纸白（禅圆）
+VERMILION = (198, 60, 44)    # 朱砂（K 线）
+
+# 禅圆：半径与笔锋
+RING_R = 0.300               # 圆半径（占边长）
+W_MAX = 0.106                # 起笔宽度
+W_MIN = 0.042                # 收笔宽度
+# 缺口开在右上（1~2 点钟）。禅画的円相就是「从下往上扫、收在右上」，
+# 顺带这个开口正好是 ChanQuant 的 C
+GAP_START = -24.0            # 缺口起点（角度，0° 在 3 点钟方向，顺时针为负＝偏上）
+GAP_SPAN = 48.0              # 缺口跨度
 
 
 def _gradient(size: int, top, bot) -> Image.Image:
@@ -52,6 +73,46 @@ def _gradient(size: int, top, bot) -> Image.Image:
         t = y / max(1, size - 1)
         px[0, y] = tuple(int(top[i] + (bot[i] - top[i]) * t) for i in range(3))
     return strip.resize((size, size), Image.BILINEAR)
+
+
+def _enso(img: Image.Image, s: int) -> None:
+    """一笔禅圆：沿圆周按角度收细，内外半径连成多边形再填充。"""
+    cx = cy = s / 2.0
+    r = s * RING_R
+    a0 = GAP_START + GAP_SPAN                 # 起笔
+    a1 = GAP_START + 360.0                    # 收笔
+    steps = max(180, s // 2)                  # 1024 上 512 段，边缘看不出折线
+    outer: list[tuple[float, float]] = []
+    inner: list[tuple[float, float]] = []
+    for i in range(steps + 1):
+        t = i / steps
+        ang = math.radians(a0 + (a1 - a0) * t)
+        # 起笔粗、收笔细；0.75 次幂让粗的一段留得更久，像毛笔压下去再提起来
+        w = s * (W_MIN + (W_MAX - W_MIN) * (1.0 - t) ** 0.75) / 2.0
+        ca, sa = math.cos(ang), math.sin(ang)
+        outer.append((cx + (r + w) * ca, cy + (r + w) * sa))
+        inner.append((cx + (r - w) * ca, cy + (r - w) * sa))
+
+    layer = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).polygon(outer + inner[::-1], fill=PAPER + (255,))
+    img.alpha_composite(layer)
+
+
+def _candle(img: Image.Image, s: int) -> None:
+    """一根朱砂 K 线：上影 + 实体 + 下影，整体略偏右上，重心才不呆。"""
+    cx = s * 0.503
+    body_w = s * 0.082
+    body_top, body_bot = s * 0.408, s * 0.618
+    wick_w = s * 0.019
+
+    d = ImageDraw.Draw(img)
+    # 影线先画，实体后画 —— 实体盖住影线接缝，边界才干净
+    d.rounded_rectangle(
+        [cx - wick_w / 2, s * 0.330, cx + wick_w / 2, s * 0.692],
+        radius=wick_w / 2, fill=VERMILION + (255,))
+    d.rounded_rectangle(
+        [cx - body_w / 2, body_top, cx + body_w / 2, body_bot],
+        radius=body_w * 0.22, fill=VERMILION + (255,))
 
 
 def draw_icon(size: int = 1024) -> Image.Image:
@@ -66,52 +127,17 @@ def draw_icon(size: int = 1024) -> Image.Image:
         [0, 0, s - 1, s - 1], radius=int(s * 0.225), fill=255)
     img.putalpha(mask)
 
-    # 左上柔光
+    # 左上柔光：墨底不能是死的，得有一点灯下反光
     glow = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     ImageDraw.Draw(glow).ellipse(
-        [-int(s * 0.30), -int(s * 0.42), int(s * 0.90), int(s * 0.50)],
-        fill=(255, 255, 255, 30))
+        [-int(s * 0.28), -int(s * 0.40), int(s * 0.88), int(s * 0.48)],
+        fill=(255, 255, 255, 16))
     glow.putalpha(Image.composite(
         glow.getchannel("A"), Image.new("L", (s, s), 0), mask))
     img = Image.alpha_composite(img, glow)
 
-    d = ImageDraw.Draw(img)
-
-    # ---- 对话气泡 ----
-    x0, y0 = int(s * 0.150), int(s * 0.215)
-    x1, y1 = int(s * 0.850), int(s * 0.700)
-    r = int(s * 0.165)
-    # 尾巴先画、气泡后画：两块白色叠在一起，接缝处不会有半透明的缝
-    d.polygon([
-        (x0 + int(s * 0.115), y1 - r // 3),
-        (x0 + int(s * 0.375), y1 - r // 3),
-        (x0 + int(s * 0.085), y1 + int(s * 0.110)),
-    ], fill=WHITE + (252,))
-    d.rounded_rectangle([x0, y0, x1, y1], radius=r, fill=WHITE + (252,))
-
-    # ---- 三根柱子 ----
-    # 高度按气泡高度的比例给，这样改气泡大小不用重调柱子
-    bw = int(s * 0.092)
-    bh = y1 - y0
-    base_y = y1 - int(bh * 0.24)
-    heights = (0.28, 0.44, 0.60)
-    xs = (0.28, 0.50, 0.72)
-    for i, (cx, h) in enumerate(zip(xs, heights)):
-        bx = x0 + int((x1 - x0) * cx)
-        top = base_y - int(bh * h)
-        # 从深靛到亮紫：右边那根最新，颜色也最跳
-        col = tuple(int(INK[k] + (BG_BOT[k] - INK[k]) * (i / 2.0)) for k in range(3))
-        d.rounded_rectangle([bx - bw // 2, top, bx + bw // 2, base_y],
-                            radius=bw // 2, fill=col + (255,))
-
-    # ---- 琥珀顶盖 ----
-    # 画在最高那根的**圆头范围内**，不是浮在上面 —— 早一版把它放在柱子上方，
-    # 结果超出气泡边界，32px 下像一颗掉在外面的糖
-    bx = x0 + int((x1 - x0) * xs[2])
-    top = base_y - int(bh * heights[2])
-    rr = bw // 2
-    d.ellipse([bx - rr, top, bx + rr, top + 2 * rr], fill=AMBER + (255,))
-
+    _enso(img, s)
+    _candle(img, s)
     return img
 
 
