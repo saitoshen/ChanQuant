@@ -61,6 +61,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -84,9 +85,36 @@ from ttrade import agent_memory as Mem
 from ttrade import attachments as ATT
 from ttrade import factors as F
 from ttrade import library_docs as L
+from ttrade import session_files as SF
+from ttrade import skills as S
 from ttrade import strategy_store as SStore
 from ttrade.strategies import STRATEGIES
 from ttrade.paths import user_dir
+
+# 字号。这一页是拿自然语言做量化研究的地方，一屏要读很多字 —— 11px 的
+# 「已提交」「已取消」看完要凑近屏幕，而正文比全局默认的 12px 还小。
+# 统一从这里取，改一处整页跟着变。
+FS_BODY = 15      # 对话正文、详情正文、输入框
+FS_SMALL = 12     # 次要说明（已提交、已取消、工具回执）
+FS_TINY = 11      # 附件条角标、缩略图下面的小字
+FS_HEAD = 17      # 详情卡片标题
+FS_CODE = 13      # 等宽代码
+FS_UI = 14        # 按钮、下拉、列表
+
+# 页面级样式。**只管 Agent 页** —— 别的页有各自的密度，一起放大会挤爆。
+# 注意：Qt 里 widget 自己的 `setStyleSheet` 优先级高于这里，所以下面那些
+# 写死在 QLabel 上的字号也要跟着改，否则会被覆盖回去。
+AGENT_QSS = f"""
+QWidget {{ font-size: {FS_UI}px; }}
+QLabel#SectionTitle {{ font-size: 13px; }}
+QLabel#Hint {{ font-size: {FS_SMALL}px; }}
+QTextBrowser {{ font-size: {FS_BODY}px; }}
+QPlainTextEdit {{ font-size: {FS_BODY}px; }}
+QListWidget {{ font-size: {FS_UI}px; }}
+QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {{ font-size: {FS_UI}px; }}
+QPushButton {{ font-size: {FS_UI}px; }}
+QTabBar::tab {{ font-size: {FS_UI}px; }}
+"""
 
 C_TEXT = "#1f2937"
 C_MUTED = "#6b7280"
@@ -361,7 +389,7 @@ class ConfirmDialog(QDialog):
         lay = QVBoxLayout(self)
 
         head = QLabel(action.describe())
-        head.setStyleSheet(f"font-size: 15px; font-weight: 700; color: {C_TEXT};")
+        head.setStyleSheet(f"font-size: {FS_HEAD}px; font-weight: 700; color: {C_TEXT};")
         lay.addWidget(head)
 
         p = action.payload
@@ -388,12 +416,12 @@ class ConfirmDialog(QDialog):
             code = QPlainTextEdit(p.get("code", ""))
             code.setReadOnly(True)
             code.setMinimumHeight(240)
-            code.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
+            code.setStyleSheet(f"font-family: Consolas, monospace; font-size: {FS_CODE}px;")
             lay.addWidget(code)
 
             warn = QLabel("确认后写入因子库并立刻可用；代码有问题会注册失败并给出原因。")
             warn.setWordWrap(True)
-            warn.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
+            warn.setStyleSheet(f"color: {C_BAD}; font-size: {FS_SMALL}px;")
             lay.addWidget(warn)
 
             # 注册因子没有「下次不提醒」：每次的代码都不一样，盲签没有意义
@@ -430,13 +458,13 @@ class ConfirmDialog(QDialog):
             code = QPlainTextEdit(p.get("code", ""))
             code.setReadOnly(True)
             code.setMinimumHeight(260)
-            code.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
+            code.setStyleSheet(f"font-family: Consolas, monospace; font-size: {FS_CODE}px;")
             lay.addWidget(code)
 
             warn = QLabel("确认后写入策略库，之后可以在「策略研究」页选它回测或实盘；"
                           "代码跑不通会注册失败并给出原因。")
             warn.setWordWrap(True)
-            warn.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
+            warn.setStyleSheet(f"color: {C_BAD}; font-size: {FS_SMALL}px;")
             lay.addWidget(warn)
 
             # 策略也没有「下次不提醒」：每次的代码都不一样
@@ -477,7 +505,7 @@ class ConfirmDialog(QDialog):
             body = QPlainTextEdit(p.get("content") or "")
             body.setReadOnly(True)
             body.setMinimumHeight(280)
-            body.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
+            body.setStyleSheet(f"font-family: Consolas, monospace; font-size: {FS_CODE}px;")
             lay.addWidget(body)
 
             warn = QLabel(
@@ -485,7 +513,7 @@ class ConfirmDialog(QDialog):
                 "重启之后平台可能起不来。"
             )
             warn.setWordWrap(True)
-            warn.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
+            warn.setStyleSheet(f"color: {C_BAD}; font-size: {FS_SMALL}px;")
             lay.addWidget(warn)
 
             self.chk_silent = QCheckBox()
@@ -520,7 +548,7 @@ class ConfirmDialog(QDialog):
             lay.addLayout(form)
 
         warn = QLabel("确认后立即执行，没有撤销。")
-        warn.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
+        warn.setStyleSheet(f"color: {C_BAD}; font-size: {FS_SMALL}px;")
         lay.addWidget(warn)
 
         self.chk_silent = QCheckBox("下次不提醒（可在设置里重新打开）")
@@ -564,7 +592,7 @@ class ManualDialog(QDialog):
         box = QPlainTextEdit(self.text)
         box.setReadOnly(True)
         box.setStyleSheet(
-            "font-family: Consolas, 'Microsoft YaHei', monospace; font-size: 12px;"
+            f"font-family: Consolas, 'Microsoft YaHei', monospace; font-size: {FS_CODE}px;"
         )
         lay.addWidget(box, 1)
 
@@ -593,7 +621,7 @@ class ManualDialog(QDialog):
             return
         ok, msg = M.save(path)
         self.lbl_info.setText(msg)
-        self.lbl_info.setStyleSheet(f"color: {C_OK if ok else C_BAD}; font-size: 11px;")
+        self.lbl_info.setStyleSheet(f"color: {C_OK if ok else C_BAD}; font-size: {FS_SMALL}px;")
 
 
 class SettingsDialog(QDialog):
@@ -656,6 +684,24 @@ class SettingsDialog(QDialog):
         self.chk_fs.toggled.connect(self._on_fs_toggled)
         form.addRow("", self.chk_fs)
 
+        # 能力包开关。关掉的包，提示词里就不列它的工具 —— 模型不会写出一个
+        # 必然被拒的动作块，用户也不会看到「没有权限」这种没头没尾的提示。
+        # `fs` 不在这里：它由上面那个「升级权限」单独管，语义不一样。
+        self._group_boxes: dict[str, QCheckBox] = {}
+        grp = QGroupBox("能力包")
+        glay = QVBoxLayout(grp)
+        glay.setContentsMargins(8, 6, 8, 6)
+        glay.setSpacing(1)
+        for key in S.GROUP_ORDER:
+            if key == "fs" or not S.group_tools(key):
+                continue
+            meta = S.GROUPS.get(key) or {}
+            cb = QCheckBox(f"{meta.get('label', key)}　{meta.get('desc', '')}")
+            cb.setChecked(key in cfg.enabled_groups)
+            self._group_boxes[key] = cb
+            glay.addWidget(cb)
+        form.addRow(grp)
+
         self.lbl_mem = QLabel(f"{Mem.count()} 条")
         self.lbl_mem.setObjectName("Hint")
         btn_mem = QPushButton("清空记忆")
@@ -716,6 +762,7 @@ class SettingsDialog(QDialog):
             timeout=self.cfg.timeout,
             confirm_trade=self.chk_confirm.isChecked(),
             allow_fs=self.chk_fs.isChecked(),
+            enabled_groups=[k for k, cb in self._group_boxes.items() if cb.isChecked()],
         )
 
     def _on_fs_toggled(self, on: bool) -> None:
@@ -757,22 +804,95 @@ class SettingsDialog(QDialog):
         ok, why = cfg.ready()
         if not ok:
             self.lbl_test.setText(why)
-            self.lbl_test.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
+            self.lbl_test.setStyleSheet(f"color: {C_BAD}; font-size: {FS_SMALL}px;")
             return
         self.lbl_test.setText("测试中…")
-        self.lbl_test.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+        self.lbl_test.setStyleSheet(f"color: {C_MUTED}; font-size: {FS_SMALL}px;")
         self.btn_test.setEnabled(False)
         # 界面线程里同步等一次响应（最多 30 秒）。测试按钮是低频操作，
         # 为它再开一个线程不值当，但要把按钮禁掉防止连点。
         try:
             msg = A.LLMClient(cfg).ping()
             self.lbl_test.setText(f"连接正常：{msg}")
-            self.lbl_test.setStyleSheet(f"color: {C_OK}; font-size: 11px;")
+            self.lbl_test.setStyleSheet(f"color: {C_OK}; font-size: {FS_SMALL}px;")
         except Exception as exc:  # noqa: BLE001
             self.lbl_test.setText(str(exc)[:160])
-            self.lbl_test.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
+            self.lbl_test.setStyleSheet(f"color: {C_BAD}; font-size: {FS_SMALL}px;")
         finally:
             self.btn_test.setEnabled(True)
+
+
+# ------------------------------------------------------------------ 会话资源
+
+# 这几类走「资源化」：解析一次存进 `SessionFiles`，消息里只放摘要，
+# 模型要更多就调 `read_excel` / `parse_pdf` 按 file_id 再取。
+# 其余（md / txt / json / 图片）照旧整段内联 —— 它们本来就是一篇短文，
+# 再包一层资源反而多一次往返。
+SESSION_SUFFIXES = SF.TABLE_SUFFIXES | {".pdf", ".docx"}
+
+
+class SessAtt:
+    """附件条上的一个「会话资源」。
+
+    把 `SessionFile` 包成 `ATT.Attachment` 的样子，附件条、`_att_chip`、
+    `ATT.describe()` 都不用改 —— 它们只认 `name` / `kind` / `note` /
+    `size_text()`。`kind` 统一报 `"text"`，这样它会被算进「几份文档」，
+    而不会走进 `ATT.content()` 的文本内联分支（那条分支要 `.text` 字段）。
+    """
+
+    kind = "text"
+
+    def __init__(self, item: "SF.SessionFile") -> None:
+        self.item = item
+        self.name = item.name
+        self.path = item.path
+        self.note = item.note
+        self.file_id = item.file_id
+
+    @property
+    def ok(self) -> bool:
+        return self.item.ok
+
+    def size_text(self) -> str:
+        if self.item.kind == "table":
+            df = self.item.frame()
+            return f"{len(df)} 行 × {len(df.columns)} 列"
+        return f"{len(self.item.text)} 字符"
+
+
+class AnyStore:
+    """两个市场的 DataStore 合成一个查询入口。
+
+    Agent 页不跟市场走：用户可能正在研究页看美股，却在 Agent 页问螺纹。
+    所以查一个品种时两个市场都试，先命中的赢。代号本身不重名 —— 期货带交易所
+    后缀（`RB_SHFE`），美股是纯代码（`AAPL`）。
+    """
+
+    def __init__(self, stores) -> None:
+        self._stores = [s for s in (stores or {}).values() if s is not None]
+
+    @property
+    def items(self) -> list[dict]:
+        out: list[dict] = []
+        for s in self._stores:
+            out.extend(getattr(s, "items", []) or [])
+        return out
+
+    @property
+    def symbols(self) -> list[str]:
+        return [it["key"] for it in self.items]
+
+    def get(self, key: str, period: str = "1d"):
+        for s in self._stores:
+            if key in getattr(s, "symbols", []):
+                return s.get(key, period)
+        return None
+
+    def has_period(self, key: str, period: str) -> bool:
+        for s in self._stores:
+            if key in getattr(s, "symbols", []):
+                return s.has_period(key, period)
+        return False
 
 
 # ------------------------------------------------------------------ 页面
@@ -791,6 +911,7 @@ class AgentPage(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self.setStyleSheet(AGENT_QSS)
         self.cfg = A.load_config()
         self._history: list[dict] = []
         self._worker: ChatWorker | None = None
@@ -804,7 +925,9 @@ class AgentPage(QWidget):
         self._memo_thread: QThread | None = None
         self._memo_warned = False     # 压缩失败只提示一次，别每轮都刷
         self._tool_turns = 0            # 本轮提问已经连续自动跑了几次工具动作（查手册 / 读写文件）
-        self._atts: list[ATT.Attachment] = []   # 待发送的附件
+        self._atts: list = []          # 待发送的附件（`ATT.Attachment` 或 `SessAtt`）
+        self.session = SF.SessionFiles()        # 会话里的附件资源（表格 / PDF / Word）
+        self.store = AnyStore({})               # 主窗口把两个市场的 DataStore 递进来
         self._out: list[str] = []      # 运行输出（整段重绘，见 `push_output`）
         self._out_merge = False        # 上一条输出是否允许被覆盖（拖滑杆时别刷屏）
         self._last_output = ""         # 最近一次输出原文，给「发给 Agent」用
@@ -815,6 +938,18 @@ class AgentPage(QWidget):
         self._fill_strategies()
         self._fill_reports()
         self._render_welcome()
+
+    def attach(self, stores) -> None:
+        """主窗口把 DataStore 递进来 —— 查行情、列品种都要用它。
+
+        传 dict（`{"cn": ..., "us": ...}`）而不是单个 store：Agent 页不跟市场走，
+        用户可能在研究页看美股、在这里问螺纹，所以要能同时看到两边。
+        """
+        self.store = AnyStore(stores)
+
+    def _ctx(self) -> "S.SkillContext":
+        """工具执行上下文。三个东西：附件资源、行情库、开关配置。"""
+        return S.SkillContext(session=self.session, store=self.store, cfg=self.cfg)
 
     # ---------------------------------------------------------- 构建
 
@@ -1118,7 +1253,7 @@ class AgentPage(QWidget):
             "Agent 让你回测时，结果会自动发回给它。"
         )
         self.out.setStyleSheet("font-family: Consolas, 'Microsoft YaHei', monospace;"
-                               "font-size: 11px;")
+                               f"font-size: {FS_SMALL}px;")
         lay.addWidget(self.out, 1)
         return card
 
@@ -1165,13 +1300,19 @@ class AgentPage(QWidget):
         if ok:
             # 升级权限是个危险开关，状态要一直看得见，不能只在设置里藏着
             extra = "｜升级权限" if self.cfg.allow_fs else ""
+            # 关掉的能力包也报一声：否则用户会以为模型变笨了，而不是「这个包我关了」
+            off = [S.GROUPS[k]["label"] for k in S.GROUPS
+                   if k != "fs" and S.group_tools(k)
+                   and k not in self.cfg.enabled_groups]
+            if off:
+                extra += "｜已关：" + "、".join(off)
             self.lbl_model.setText(f"{p.label} · {self.cfg.model}{extra}")
             self.lbl_model.setStyleSheet(
-                f"color: {C_BAD if self.cfg.allow_fs else C_OK}; font-size: 11px;"
+                f"color: {C_BAD if self.cfg.allow_fs else C_OK}; font-size: {FS_SMALL}px;"
             )
         else:
             self.lbl_model.setText(f"未配置：{why}")
-            self.lbl_model.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
+            self.lbl_model.setStyleSheet(f"color: {C_BAD}; font-size: {FS_SMALL}px;")
 
     # ---------------------------------------------------------- 详情渲染
 
@@ -1304,7 +1445,7 @@ class AgentPage(QWidget):
         except OSError as exc:
             self.detail.setHtml(f"<p>读不出来：{_esc(str(exc))}</p>")
             return
-        self.detail.setHtml(f"<pre style='white-space:pre-wrap;font-size:12px'>"
+        self.detail.setHtml(f"<pre style='white-space:pre-wrap;font-size:{FS_CODE}px'>"
                             f"{_esc(text)}</pre>")
 
     # ---------------------------------------------------------- 对话
@@ -1329,6 +1470,11 @@ class AgentPage(QWidget):
 
     def _clear_chat(self) -> None:
         self._history.clear()
+        # 附件资源跟对话一起作废：模型手里那些 file_id 一旦清空对话就指不到了，
+        # 留着只会让下一轮的 `read_excel(f1)` 读到上一轮的表
+        self.session.clear()
+        self._atts = []
+        self._refresh_atts()
         self._msg_start = None       # setHtml 会把文档整个换掉，旧位置作废
         self._render_welcome()
 
@@ -1372,13 +1518,14 @@ class AgentPage(QWidget):
         )
         if atts:
             self._append(
-                f"<p style='color:{C_MUTED};font-size:11px;margin:0 0 8px 0'>"
+                f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px;margin:0 0 8px 0'>"
                 f"{_esc(ATT.describe(atts))}</p>"
             )
         self._append(f"<p style='margin:12px 0 2px 0'><b>助手</b></p>")
 
-        # 有图就是多模态 parts，没图就是纯字符串 —— 老网关只吃字符串
-        body = ATT.content(text, atts)
+        # 有图就是多模态 parts，没图就是纯字符串 —— 老网关只吃字符串。
+        # 表格/PDF/Word 不在正文里展开，只附一段摘要（见 `_compose`）
+        body = self._compose(text, atts)
         self._history.append({"role": "user", "content": body})
         self._tool_turns = 0
         # 新问题把上一轮的「等回测结果」作废：上一轮的回测要是没跑起来（异常提前
@@ -1386,7 +1533,7 @@ class AgentPage(QWidget):
         self._expect_bt = False
         msgs = A.build_messages(
             A.trim_history(self._history[:-1]), body, memory=Mem.brief(),
-            allow_fs=self.cfg.allow_fs,
+            allow_fs=self.cfg.allow_fs, enabled=self.cfg.enabled_groups,
         )
         self._stream_buf = ""
         self._msg_start = None
@@ -1410,11 +1557,43 @@ class AgentPage(QWidget):
         if imgs:
             self._add_images(imgs)
 
+    def _compose(self, text: str, atts: list) -> str | list:
+        """把「用户这句话 + 附件」拼成 `content`。
+
+        两类附件分开处理：图片和短文照旧内联（模型直接看 / 直接读），
+        表格和 PDF、Word 只放一段摘要，正文留给 `read_excel` / `parse_pdf` 现取。
+        摘要放在文字部件的末尾而不是单独发一条消息 —— 单独发会让模型以为
+        那是用户说的另一句话。
+        """
+        inline = [a for a in atts if not isinstance(a, SessAtt)]
+        body = ATT.content(text, inline)
+        summary = self.session.summary()
+        if not summary:
+            return body
+        if isinstance(body, list):
+            out = []
+            for part in body:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    out.append({"type": "text", "text": part["text"] + "\n\n" + summary})
+                else:
+                    out.append(part)
+            return out
+        return f"{body}\n\n{summary}".strip()
+
     def _add_paths(self, paths: list[str]) -> None:
         bad = []
         for p in paths:
             if any(a.path == p for a in self._atts):
                 continue            # 同一个文件加两次没意义，还白占体积
+            ext = os.path.splitext(p)[1].lower()
+            if ext in SESSION_SUFFIXES:
+                item = self.session.add_path(p)
+                if item is not None:
+                    self._atts.append(SessAtt(item))
+                else:
+                    bad.append(f"{os.path.basename(p)}：读不了（表格请存成 xlsx/csv，"
+                               "PDF 要是文字版而不是扫描件）")
+                continue
             a = ATT.load(p)
             if a.ok:
                 self._atts.append(a)
@@ -1477,7 +1656,7 @@ class AgentPage(QWidget):
             thumb.setText("PDF" if a.name.lower().endswith(".pdf")
                           else ("DOC" if a.name.lower().endswith((".docx", ".doc")) else "TXT"))
             thumb.setStyleSheet(
-                f"color:{C_MUTED};font-size:9px;font-weight:700;"
+                f"color:{C_MUTED};font-size:{FS_TINY}px;font-weight:700;"
                 "background:#eef2f7;border-radius:3px"
             )
         lay.addWidget(thumb)
@@ -1487,9 +1666,9 @@ class AgentPage(QWidget):
         col.setContentsMargins(0, 0, 0, 0)
         col.setSpacing(0)
         name = QLabel(a.name if len(a.name) <= 16 else a.name[:14] + "…")
-        name.setStyleSheet(f"color:{C_TEXT};font-size:11px")
+        name.setStyleSheet(f"color:{C_TEXT};font-size:{FS_SMALL}px")
         size = QLabel(a.size_text())
-        size.setStyleSheet(f"color:{C_MUTED};font-size:9px")
+        size.setStyleSheet(f"color:{C_MUTED};font-size:{FS_TINY}px")
         col.addWidget(name)
         col.addWidget(size)
         text.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
@@ -1523,7 +1702,10 @@ class AgentPage(QWidget):
 
     def _drop_att(self, idx: int) -> None:
         if 0 <= idx < len(self._atts):
-            self._atts.pop(idx)
+            a = self._atts.pop(idx)
+            # 会话资源要一起删：只从附件条上拿掉的话，模型还能拿 file_id 读到它
+            if isinstance(a, SessAtt):
+                self.session.remove(a.file_id)
         self._refresh_atts()
 
     # ---------------------------------------------------------- 运行输出
@@ -1581,7 +1763,7 @@ class AgentPage(QWidget):
             return
         self._append(
             f"<p style='margin:12px 0 2px 0'><b style='color:{C_USER}'>你</b></p>"
-            f"<p style='color:{C_MUTED};font-size:11px;margin:0 0 8px 0'>"
+            f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px;margin:0 0 8px 0'>"
             "（把运行输出发给 Agent）</p>"
         )
         self._after_tool(
@@ -1671,7 +1853,7 @@ class AgentPage(QWidget):
         action = A.parse_action(final)
         if action.kind and not action.ok:
             self._append(
-                f"<p style='color:{C_BAD};font-size:11px'>动作块有问题：{_esc(action.error)}</p>"
+                f"<p style='color:{C_BAD};font-size:{FS_SMALL}px'>动作块有问题：{_esc(action.error)}</p>"
             )
         elif action.ok:
             self._handle_action(action)
@@ -1780,7 +1962,7 @@ class AgentPage(QWidget):
 
         if saved:
             self._append(
-                f"<p style='color:{C_MUTED};font-size:11px'>已把前 {len(chunk)} 条对话"
+                f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>已把前 {len(chunk)} 条对话"
                 f"压成记忆（共 {Mem.count()} 条），下次开窗口还在。</p>"
             )
 
@@ -1790,7 +1972,7 @@ class AgentPage(QWidget):
             return
         self._memo_warned = True
         self._append(
-            f"<p style='color:{C_MUTED};font-size:11px'>记忆压缩没成功"
+            f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>记忆压缩没成功"
             f"（{_esc(msg[:80])}），这段对话先留着，下次再试。</p>"
         )
 
@@ -1810,51 +1992,71 @@ class AgentPage(QWidget):
 
     def _set_state(self, text: str, color: str = C_MUTED) -> None:
         self.lbl_state.setText(text)
-        self.lbl_state.setStyleSheet(f"color: {color}; font-size: 11px;")
+        self.lbl_state.setStyleSheet(f"color: {color}; font-size: {FS_SMALL}px;")
 
     # ---------------------------------------------------------- 动作
 
     def _handle_action(self, action: A.Action) -> None:
-        # 工具动作自己管确认框（文件写入必须弹、读和查手册不用），所以先走掉
-        if action.kind == "fs":
-            self._run_fs_action(action)
-            return
-        if action.kind == "doc":
-            self._run_doc_action(action)
+        """执行一个动作块。
+
+        三层判断，顺序不能换：
+
+        1. **能力包开没开** —— 关着的包提示词里不列，但模型可能从历史里翻出来
+           一个旧动作块，所以还是要拦一道，并且说清去哪儿打开
+        2. **要不要确认** —— `read` 不问，`write` 问，`trade` 问（且受
+           `confirm_trade` 控制）。`fs` 自己管：读不问、写必问
+        3. **谁来执行** —— 有 `handler` 的在 `ttrade` 里跑，其余按 `ui` 找界面方法
+        """
+        tool = S.get(action.kind)
+        if tool is None:
+            self._append(
+                f"<p style='color:{C_BAD}'>平台没有「{_esc(action.kind)}」这个动作。</p>")
             return
 
-        # 只有「会改本机状态」的动作才拦：下单、注册因子。回测是只读操作，为它
-        # 弹一个「确认后立即执行」的框只会训练用户无脑点确认。
-        #
-        # 注册因子**不受** `confirm_trade` 开关控制 —— 那个开关管的是下单，而这里
-        # 要执行的是模型写的 Python 代码，每次都不一样，盲签没有意义。
-        need_confirm = action.kind in ("factor", "strategy") or (
-            self.cfg.confirm_trade and action.kind == "trade"
-        )
-        if need_confirm:
-            dlg = ConfirmDialog(action, self)
-            if dlg.exec() != QDialog.Accepted:
-                self._append(f"<p style='color:{C_MUTED};font-size:11px'>已取消。</p>")
-                return
-            if action.kind == "trade" and dlg.silent():
-                self.cfg.confirm_trade = False
-                A.save_config(self.cfg)
-                self._append(
-                    f"<p style='color:{C_MUTED};font-size:11px'>"
-                    "以后不再询问，可在设置里重新打开。</p>"
-                )
-
-        if action.kind == "factor":
-            self._register_factor(action.payload)
-            return
-        if action.kind == "strategy":
-            self._register_strategy(action.payload)
+        ctx = self._ctx()
+        if not ctx.allow(tool.group):
+            self._deny(tool)
             return
 
-        self._append(
-            f"<p style='color:{C_OK};font-size:11px'>已提交：{_esc(action.describe())}</p>"
-        )
-        self.trade_requested.emit(action)
+        if tool.risk != S.RISK_READ and not tool.self_confirm:
+            # `confirm_trade` 只管下单：注册因子/策略要执行的是模型现写的 Python
+            # 代码，每次都不一样，盲签没有意义，所以不受那个开关影响
+            if tool.risk != S.RISK_TRADE or self.cfg.confirm_trade:
+                dlg = ConfirmDialog(action, self)
+                if dlg.exec() != QDialog.Accepted:
+                    self._append(
+                        f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>已取消。</p>")
+                    return
+                if tool.risk == S.RISK_TRADE and dlg.silent():
+                    self.cfg.confirm_trade = False
+                    A.save_config(self.cfg)
+                    self._append(
+                        f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>"
+                        "以后不再询问，可在设置里重新打开。</p>"
+                    )
+
+        if tool.handler is not None:
+            self._run_tool(tool, action, ctx)
+            return
+
+        fn = getattr(self, "_run_" + tool.ui, None) if tool.ui else None
+        if fn is None:
+            self._append(
+                f"<p style='color:{C_BAD}'>「{_esc(tool.label)}」没有对应的界面处理。</p>")
+            return
+        fn(action)
+
+    def _deny(self, tool: "S.Tool") -> None:
+        """能力包关着时怎么告诉用户。要指名去哪打开 —— 只说「没有权限」等于没说。"""
+        if tool.group == "fs":
+            msg = ("模型想读写平台文件，但「升级权限」没打开。到左下角「设置」里勾上"
+                   "「允许 Agent 读写 TrendDesk 目录」才能用。")
+        else:
+            label = S.GROUPS.get(tool.group, {}).get("label", tool.group)
+            msg = (f"「{label}」这个能力包现在是关着的，所以没法执行「{tool.label}」。"
+                   "到左下角「设置」→「能力包」里打开它。")
+        self._append(f"<p style='color:{C_BAD}'>{_esc(msg)}</p>")
+        self._set_state("能力包未开启", C_BAD)
 
     # ---------------------------------------------------------- 工具动作
 
@@ -1862,21 +2064,43 @@ class AgentPage(QWidget):
     # 不封顶的话它俩能来回刷到把 token 烧光。
     MAX_TOOL_TURNS = 4
 
-    def _run_doc_action(self, action: A.Action) -> None:
-        """查平台手册。只读本地文本，不碰磁盘、不弹框。"""
-        from ttrade import factor_manual as M
+    def _run_tool(self, tool: "S.Tool", action: A.Action, ctx) -> None:
+        """在 `ttrade` 里跑一个纯逻辑工具，把结果渲染出来再回灌模型。
 
-        topic = action.payload.get("topic", "")
-        title, body = M.resolve(topic)
+        工具返回的是 Block，不是 HTML —— 渲染这一步留在界面层，`ttrade` 那边
+        不需要知道 `QTextBrowser` 长什么样。
+        """
+        res = S.dispatch(ctx, action.kind, action.payload)
+        if res.blocks:
+            self._append(CR.render(res.blocks))
+        if not res.ok:
+            self._append(f"<p style='color:{C_BAD}'>{_esc(res.error)}</p>")
+            self._set_state(f"{tool.label}失败", C_BAD)
+        else:
+            self._set_state((res.summary or f"{tool.label}完成")[:80], C_OK)
+        # 出错也要回灌：模型得看到「列名不对」「文件读不了」才能改对，
+        # 只写在界面上等于让它接着按错的假设往下聊
+        self._after_tool(res.feed_text())
+
+    def _run_signal(self, action: A.Action) -> None:
+        """交给主窗口执行的动作：回测、下单。"""
         self._append(
-            f"<p style='color:{C_MUTED};font-size:11px'>已查阅平台手册：{_esc(title)}"
-            f"（{len(body)} 字符）</p>"
+            f"<p style='color:{C_OK};font-size:{FS_SMALL}px'>已提交：{_esc(action.describe())}</p>"
         )
-        self._set_state(f"已查手册：{title}", C_OK)
-        self._after_tool(f"平台手册「{title}」的内容：\n\n{body}")
+        self.trade_requested.emit(action)
 
-    def _run_fs_action(self, action: A.Action) -> None:
-        """执行 `fs` 动作：读和列目录直接做，写必须弹确认框。"""
+    def _run_factor(self, action: A.Action) -> None:
+        self._register_factor(action.payload)
+
+    def _run_strategy(self, action: A.Action) -> None:
+        self._register_strategy(action.payload)
+
+    def _run_fs(self, action: A.Action) -> None:
+        """执行 `fs` 动作：读和列目录直接做，写必须弹确认框。
+
+        权限判断在 `_handle_action` 里已经做过（`_deny`），这里只管执行。
+        下面那个 `allow_fs` 检查留着当兜底 —— 万一以后有别的路径直接调到这儿。
+        """
         from ttrade import agent_fs as FS
 
         p = action.payload
@@ -1900,8 +2124,8 @@ class AgentPage(QWidget):
                 self._after_tool(f"列出 {path} 失败：{err}")
                 return
             self._append(
-                f"<p style='color:{C_MUTED};font-size:11px'>已列出 {_esc(path)}</p>"
-                f"<pre style='font-size:11px'>{_esc(text)}</pre>"
+                f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>已列出 {_esc(path)}</p>"
+                f"<pre style='font-size:{FS_CODE}px'>{_esc(text)}</pre>"
             )
             self._after_tool(f"目录 {path} 的内容：\n{text}")
             return
@@ -1915,10 +2139,10 @@ class AgentPage(QWidget):
             # 真要核对时看文件本身更快。喂给模型的仍是全文。
             shown = text if len(text) <= 4000 else text[:4000] + "\n……（对话里只显示前 4000 字符）"
             self._append(
-                f"<p style='color:{C_MUTED};font-size:11px'>已读取 {_esc(path)}"
+                f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>已读取 {_esc(path)}"
                 f"（{len(text)} 字符）</p>"
                 f"<pre style='white-space:pre-wrap;font-family:Consolas,monospace;"
-                f"font-size:11px'>{_esc(shown)}</pre>"
+                f"font-size:{FS_CODE}px'>{_esc(shown)}</pre>"
             )
             self._after_tool(f"文件 {path} 的全文：\n```\n{text}\n```")
             return
@@ -1927,7 +2151,7 @@ class AgentPage(QWidget):
         content = p.get("content", "")
         dlg = ConfirmDialog(action, self)
         if dlg.exec() != QDialog.Accepted:
-            self._append(f"<p style='color:{C_MUTED};font-size:11px'>已取消写入。</p>")
+            self._append(f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>已取消写入。</p>")
             self._after_tool(f"用户拒绝写入 {path}，不要重试同一个改动，先问清楚要改什么。")
             return
         ok, msg = FS.write_text(path, content)
@@ -1946,7 +2170,7 @@ class AgentPage(QWidget):
         self._history.append({"role": "user", "content": note})
         if self._tool_turns >= self.MAX_TOOL_TURNS:
             self._append(
-                f"<p style='color:{C_MUTED};font-size:11px'>工具动作已连续执行 "
+                f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>工具动作已连续执行 "
                 f"{self._tool_turns} 轮，先停在这里。要继续就再发一句。</p>"
             )
             return
@@ -1955,6 +2179,7 @@ class AgentPage(QWidget):
             A.trim_history(self._history[:-1]), note,
             # 沿用当前开关：关着的时候不能因为「续跑」就悄悄把文件能力塞回去
             memory=Mem.brief(), allow_fs=self.cfg.allow_fs,
+            enabled=self.cfg.enabled_groups,
         )
         self._append("<p style='margin:12px 0 2px 0'><b>助手</b></p>")
         self._stream_buf = ""
@@ -1998,7 +2223,7 @@ class AgentPage(QWidget):
         self._append(
             f"<p style='color:{C_OK}'>已注册因子「{_esc(f.label)}」（{_esc(f.key)}）。"
             f"{_esc(msg)}</p>"
-            f"<p style='color:{C_MUTED};font-size:11px'>"
+            f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>"
             "在「策略研究」页的因子列表里能选到它。定义存在 "
             f"<code>{_esc(UF.path())}</code>，不想要就在左边选中它、点「删除选中因子」。</p>"
         )
@@ -2032,7 +2257,7 @@ class AgentPage(QWidget):
         self._append(
             f"<p style='color:{C_OK}'>已注册策略「{_esc(s.label)}」（{_esc(s.key)}）。"
             f"{_esc(msg)}</p>"
-            f"<p style='color:{C_MUTED};font-size:11px'>"
+            f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>"
             "在「策略研究」页的规则策略下拉里能选到它，参数可以拖滑杆调。定义存在 "
             f"<code>{_esc(US.path())}</code>，不想要就在左边选中它、点「删除选中策略」。</p>"
         )
@@ -2071,7 +2296,7 @@ class AgentPage(QWidget):
 
         self._append(
             f"<p style='color:{C_OK}'>已删除因子「{_esc(spec.label)}」。</p>"
-            f"<p style='color:{C_MUTED};font-size:11px'>"
+            f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px'>"
             "内置因子不受影响。已经存进策略库的配置不会自动改，重新跑之前记得换因子。</p>"
         )
         self._set_state(f"已删除因子 {key}", C_OK)
@@ -2421,7 +2646,7 @@ class AgentPage(QWidget):
         """别处（主窗口）执行完动作后的回执。写进对话流，用户能翻回去看。"""
         color = C_BAD if bad else C_OK
         self._set_state(msg, color)
-        self._append(f"<p style='color:{color};font-size:11px'>{_esc(msg)}</p>")
+        self._append(f"<p style='color:{color};font-size:{FS_SMALL}px'>{_esc(msg)}</p>")
 
     # ---------------------------------------------------------- 生命周期
 
@@ -2451,7 +2676,7 @@ def _code(text: str) -> str:
     if not text.strip():
         return "<p style='color:#6b7280'>（打包后取不到源码）</p>"
     return (
-        "<pre style='font-family:Consolas,monospace;font-size:11px;"
+        f"<pre style='font-family:Consolas,monospace;font-size:{FS_CODE}px;"
         "background:#f6f8fa;padding:8px;border-radius:4px;"
         f"white-space:pre-wrap'>{_esc(text)}</pre>"
     )

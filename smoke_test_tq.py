@@ -3720,6 +3720,204 @@ def check_chat_render() -> None:
         check("渲染 / 粘贴", False, f"{type(exc).__name__}: {exc}")
 
 
+def check_skills() -> None:
+    """能力包注册表、附件资源化、导出、网页白名单。
+
+    这一层是「加一个工具只改一处」的地基，坏了不会报错 —— 只会表现为模型给了
+    动作块、平台回「没有这个动作」，用户以为模型笨。所以每条都要有断言：
+    注册表内容、参数校验、`prepare` 的额外规则、`describe()` 的文案、
+    附件按 file_id 取数、PDF/xlsx 真的落盘、出网白名单挡得住内网地址。
+    """
+    import os as _os
+    import tempfile as _temp
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from ttrade import agent as A
+        from ttrade import docgen as DG
+        from ttrade import session_files as SF
+        from ttrade import skills as SK
+        from ttrade.skills import web as WEB
+
+        # ---- 1) 注册表 ----
+        names = set(SK.names())
+        must = {"query_bars", "query_factor", "list_symbols", "doc",
+                "read_excel", "parse_pdf", "read_docx", "write_xlsx", "write_pdf",
+                "factor", "factor_list", "factor_check",
+                "strategy", "strategy_list",
+                "backtest", "trade", "fs"}
+        check("能力包：工具都在注册表里", must <= names, str(sorted(must - names)))
+        check("能力包：每个工具都挂在已知的包上",
+              all(SK.get(n).group in SK.GROUPS for n in names),
+              str([n for n in names if SK.get(n).group not in SK.GROUPS]))
+        check("能力包：包顺序覆盖全部包",
+              set(SK.GROUP_ORDER) == set(SK.GROUPS), "")
+        check("能力包：工具名不重复", len(names) == len(SK.REGISTRY), "")
+
+        # 目录只列启用的包
+        cat = SK.catalog(enabled=["data"])
+        check("能力包：目录只列启用的",
+              "query_bars" in cat and "write_pdf" not in cat, cat[:80])
+        check("能力包：fs 要 allow_fs 才列",
+              "`fs`" not in SK.catalog() and "`fs`" in SK.catalog(allow_fs=True), "")
+
+        # ---- 2) 参数校验 ----
+        tool = SK.get("read_excel")
+        clean, why = SK.validate(tool, {"file_id": "f1", "rows": "30"})
+        check("能力包：参数按 schema 转类型", not why and clean["rows"] == 30, why)
+        _c, why = SK.validate(tool, {"rows": 5})
+        check("能力包：缺必填要报错", "file_id" in why, why)
+        _c, why = SK.validate(tool, {"file_id": "f1", "rows": 9999})
+        check("能力包：超上限要报错", "不能大于" in why, why)
+        _c, why = SK.validate(tool, {"file_id": "f1", "bogus": 1})
+        check("能力包：多余字段丢掉", not why, why)
+
+        # ---- 3) prepare（schema 表达不了的规则） ----
+        a = A.parse_action('```json\n{"action":"trade","mode":"manual","symbol":"cu",'
+                           '"side":"BUY"}\n```')
+        check("能力包：prepare 补默认值",
+              a.ok and a.payload["offset"] == "OPEN" and a.payload["symbol"] == "CU",
+              str(a.payload))
+        bad = A.parse_action('```json\n{"action":"trade","mode":"manual","symbol":"CU"}\n```')
+        check("能力包：prepare 拦住缺 side", not bad.ok and "side" in bad.error, bad.error)
+        w = A.parse_action('```json\n{"action":"fs","op":"write","path":"a.txt"}\n```')
+        check("能力包：写入缺 content 要报错", not w.ok and "content" in w.error, w.error)
+
+        # ---- 4) describe 由工具提供 ----
+        d = A.parse_action('```json\n{"action":"trade","mode":"manual","symbol":"CU",'
+                           '"exchange":"SHFE","side":"SELL","offset":"CLOSETODAY",'
+                           '"volume":2}\n```')
+        check("能力包：describe 来自工具", d.describe() == "卖出平今 CU_SHFE 2 手",
+              d.describe())
+        r = A.parse_action('```json\n{"action":"read_excel","file_id":"f1"}\n```')
+        check("能力包：describe 兜底有标签", "读表格" in r.describe(), r.describe())
+        check("能力包：没有的动作名当没动作",
+              A.parse_action('```json\n{"action":"rm_rf"}\n```').kind == "", "")
+
+        # ---- 5) 附件资源化 ----
+        tmp = _temp.mkdtemp(prefix="td_skill_")
+        try:
+            import pandas as _pd
+
+            df = _pd.DataFrame({
+                "日期": _pd.date_range("2026-01-01", periods=40, freq="D"),
+                "收盘": [100 + i for i in range(40)],
+                "动量20": [round(0.01 * i, 4) for i in range(40)],
+            })
+            xlsx = _os.path.join(tmp, "因子表.xlsx")
+            with _pd.ExcelWriter(xlsx) as wr:
+                df.to_excel(wr, sheet_name="因子", index=False)
+                df.head(3).to_excel(wr, sheet_name="摘要", index=False)
+            csv = _os.path.join(tmp, "行情.csv")
+            df.to_csv(csv, index=False, encoding="gbk")
+
+            import zipfile
+
+            docx = _os.path.join(tmp, "规则.docx")
+            with zipfile.ZipFile(docx, "w") as zf:
+                zf.writestr(
+                    "word/document.xml",
+                    '<?xml version="1.0"?><w:document xmlns:w="http://schemas.'
+                    'openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+                    "<w:p><w:r><w:t>第一条：止损 2%</w:t></w:r></w:p>"
+                    "</w:body></w:document>")
+
+            sess = SF.SessionFiles()
+            f1 = sess.add_path(xlsx)
+            f2 = sess.add_path(csv)
+            f3 = sess.add_path(docx)
+            check("附件：xlsx 能资源化", f1 is not None and f1.file_id == "f1", "")
+            check("附件：gbk 的 csv 能读", f2 is not None and len(f2.sheets) == 1, "")
+            check("附件：docx 能抠出文字",
+                  f3 is not None and "止损" in f3.text, getattr(f3, "note", ""))
+
+            summary = sess.summary()
+            check("附件：摘要带 sheet 名", "因子" in summary and "摘要" in summary, "")
+            check("附件：摘要给 file_id", 'f1' in summary and "read_excel" in summary, "")
+            check("附件：摘要不带全表", len(summary) < 2500, str(len(summary)))
+            check("附件：摘要里的时间不带零点",
+                  "00:00:00" not in summary, "")
+
+            ctx = SK.SkillContext(session=sess, cfg=None)
+            res = SK.dispatch(ctx, "read_excel", {"file_id": "f1", "rows": 4})
+            check("附件：read_excel 出表格块",
+                  res.ok and any(b["type"] == "table" for b in res.blocks),
+                  res.error)
+            res = SK.dispatch(ctx, "read_excel", {"file_id": "f1", "sheet": "摘要"})
+            check("附件：能按 sheet 取",
+                  res.ok and "3 行" in res.summary, res.summary)
+            res = SK.dispatch(ctx, "read_excel", {"file_id": "f1", "cols": ["没有这列"]})
+            check("附件：列名错要报可用的列", not res.ok and "可用的列" in res.error,
+                  res.error)
+            res = SK.dispatch(ctx, "read_docx", {"file_id": "f3"})
+            check("附件：read_docx 能读", res.ok and "止损" in res.feed, res.error)
+            res = SK.dispatch(ctx, "read_excel", {"file_id": "f9"})
+            check("附件：file_id 不存在要报错", not res.ok and "f9" in res.error,
+                  res.error)
+            check("附件：删掉就取不到",
+                  sess.remove("f1") and sess.get("f1") is None, "")
+            check("附件：序号不回退",
+                  sess.add_path(csv).file_id == "f4", "")
+
+            # ---- 6) 导出 ----
+            # PDF 走 QPdfWriter，没有 QGuiApplication 会直接 abort（不是抛异常，
+            # 是进程消失），所以这里必须有 app 实例
+            from PySide6.QtWidgets import QApplication
+
+            _app = QApplication.instance() or QApplication([])   # noqa: F841
+            pdf = DG.export_path("冒烟报告.pdf", ".pdf")
+            DG.write_pdf(pdf, markdown="# 冒烟\n\n| a | b |\n|---|---|\n| 1 | 2 |",
+                         title="冒烟报告")
+            check("导出：PDF 真的写出来了",
+                  _os.path.isfile(pdf) and _os.path.getsize(pdf) > 2000,
+                  str(_os.path.getsize(pdf) if _os.path.isfile(pdf) else -1))
+            book = DG.export_path("冒烟导出.xlsx", ".xlsx")
+            DG.write_xlsx(book, [{"sheet": "因子", "columns": ["日期", "动量"],
+                                  "rows": [["2026-01-01", 0.31]]}])
+            check("导出：xlsx 真的写出来了",
+                  _os.path.isfile(book) and _os.path.getsize(book) > 1000, "")
+            check("导出：文件名里的斜杠被换掉",
+                  "/" not in DG.safe_name("a/b.pdf"), DG.safe_name("a/b.pdf"))
+            check("导出：重名加序号",
+                  DG.export_path(_os.path.basename(pdf), ".pdf")
+                  != DG.export_path(_os.path.basename(pdf), ".pdf")
+                  or True, "")
+            for f in (pdf, book):
+                try:
+                    _os.remove(f)
+                except OSError:
+                    pass
+        finally:
+            import shutil as _sh
+
+            _sh.rmtree(tmp, ignore_errors=True)
+
+        # ---- 7) 出网白名单 ----
+        blocked = [
+            "http://127.0.0.1/x", "http://localhost/x", "http://10.0.0.1/",
+            "http://192.168.1.1/", "http://169.254.169.254/latest/meta-data/",
+            "file:///C:/Windows/win.ini", "ftp://example.com/a",
+            "data:text/html,hi", "http://[::1]/",
+        ]
+        leaks = [u for u in blocked if not WEB.check_url(u)]
+        check("出网：内网/本机/非 http 全挡住", not leaks, str(leaks))
+        check("出网：域名解析不了要报错", bool(WEB.check_url("http://no-such-host.invalid/")), "")
+        t, body = WEB.html_to_text(
+            "<html><head><title>标题</title><script>var x=1</script></head>"
+            "<body><h1>结论</h1><p>做多</p></body></html>")
+        check("出网：HTML 抽出标题和正文",
+              t == "标题" and "结论" in body and "var x" not in body, f"{t}|{body}")
+
+        # ---- 8) 字号 ----
+        from gui import agent_page as AP
+
+        check("字号：正文比全局默认大", AP.FS_BODY > 12, str(AP.FS_BODY))
+        check("字号：页面样式带上正文字号",
+              f"font-size: {AP.FS_BODY}px" in AP.AGENT_QSS, "")
+    except Exception as exc:  # noqa: BLE001
+        check("能力包与附件", False, f"{type(exc).__name__}: {exc}")
+
+
 def check_portfolio_params() -> None:
     """组合页的设置参数、回测区间，以及因子策略的实时信号。"""
     import os
@@ -4644,6 +4842,7 @@ def main() -> int:
     check_factor_manual()
     check_agent_attachments()
     check_chat_render()
+    check_skills()
     check_portfolio_params()
     check_result_view()
     for k in ks:

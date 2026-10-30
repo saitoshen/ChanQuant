@@ -21,6 +21,11 @@ tqsdk==3.10.4
 # 分钟级行情仓库（单文件列存，见 ttrade/tqstore.py）
 duckdb==2.0.0
 
+# 文档读写（Agent 的 read_excel / parse_pdf / write_xlsx）。
+# openpyxl 是 pandas 读写 xlsx 的引擎；pypdf 只抽文字，不做 OCR。
+pypdf==6.21.4
+openpyxl==3.1.5
+
 # 仅 download_futures.py 需要；GUI 与回测不 import，但保留在依赖里
 # 让「快速开始」能一路跑通
 tushare==1.4.29

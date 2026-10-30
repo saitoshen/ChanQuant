@@ -39,9 +39,15 @@ from dataclasses import asdict, dataclass, field
 
 import requests
 
+from ttrade import skills as S
 from ttrade.paths import user_dir
 
 CONF_FILE = "agent.json"
+
+# 老配置里没有 `enabled_groups` 这个键时用它兜底。等于「以前能用的动作继续能用」，
+# 新加的 `web` 不在里面 —— 会出网的能力不能靠一次升级就悄悄打开。
+LEGACY_GROUPS = ["data", "manual", "doc", "factor", "strategy", "backtest",
+                 "monitor", "trade"]
 
 
 # ------------------------------------------------------------------ 供应商
@@ -106,6 +112,25 @@ def provider(key: str) -> Provider:
 # ------------------------------------------------------------------ 配置
 
 
+def clean_groups(groups) -> list:
+    """把存盘/界面传来的能力包列表收敛成**合法且有序**的一份。
+
+    三件事：去掉不认识的（升级删过包、手改过配置文件）、去重、按 `GROUP_ORDER`
+    排序。排序是为了让提示词内容稳定 —— 同样的开关，顺序一变服务端的上下文
+    缓存就整段失效。
+    """
+    if not groups:
+        return list(LEGACY_GROUPS)
+    if isinstance(groups, str):
+        groups = [groups]
+    keep = {g for g in groups if isinstance(g, str) and g in S.GROUPS}
+    # `fs` 不归能力包管，混进来会让人以为勾了它就能读写文件
+    keep.discard("fs")
+    if not keep:
+        return list(LEGACY_GROUPS)
+    return [g for g in S.GROUP_ORDER if g in keep]
+
+
 @dataclass
 class AgentConfig:
     provider: str = "deepseek"
@@ -121,6 +146,9 @@ class AgentConfig:
     # 升级权限：允许 Agent 读写 TrendDesk 目录下的文件（`fs` 动作）。
     # 默认关。打开等于把整个平台的代码交给模型，设置页里必须写清楚这一点。
     allow_fs: bool = False
+    # 启用的能力包（见 `ttrade/skills/base.py` 的 `GROUPS`）。关掉的包，
+    # 提示词里就不列它的工具 —— 模型不会写出一个必然被拒的动作块。
+    enabled_groups: list = field(default_factory=lambda: list(LEGACY_GROUPS))
 
     def endpoint(self, path: str) -> str:
         return self.base_url.rstrip("/") + path
@@ -148,6 +176,7 @@ class AgentConfig:
             cfg.timeout = max(10, int(cfg.timeout))
         except (TypeError, ValueError):
             cfg.temperature, cfg.max_tokens, cfg.timeout = 0.3, 2000, 120
+        cfg.enabled_groups = clean_groups(cfg.enabled_groups)
         return cfg
 
 
@@ -702,17 +731,30 @@ def _prune_images(history: list[dict], keep: int = 2) -> list[dict]:
     return out
 
 
+def tool_catalog(allow_fs: bool = False, enabled=None) -> str:
+    """当前可用的动作 + 启用包的详细用法。
+
+    和 `strategy_catalog()` 拼在**同一条** system 消息里发：两者都是「每次提问
+    现取」的东西，分两条发等于多一次缓存断点，而且消息列表会长得难读。
+    """
+    return "\n\n".join(x for x in (
+        S.catalog(enabled, allow_fs),
+        S.prompt_block(enabled),
+    ) if x.strip())
+
+
 def build_messages(history: list[dict], user_text: str | list, memory: str = "",
-                   allow_fs: bool = False, catalog: bool = True) -> list[dict]:
-    """拼一份完整消息列表：系统提示 + 长期记忆 + 策略清单 + 历史 + 本轮。
+                   allow_fs: bool = False, catalog: bool = True,
+                   enabled=None) -> list[dict]:
+    """拼一份完整消息列表：系统提示 + 长期记忆 + 策略清单/工具目录 + 历史 + 本轮。
 
     记忆单独占一条 system 消息，不拼进 `SYSTEM_PROMPT`：一是基础提示词不变，
     各家服务端的上下文缓存还能命中；二是调试时一眼能看出「这句是记忆喂进去的」。
-    策略清单同理单独一条 —— 它每次提问都变（用户刚存了模板就得马上可见），
-    塞进 `SYSTEM_PROMPT` 会让缓存整段失效。
+    策略清单和工具目录同理单独一条 —— 它们每次提问都可能变（用户刚存了模板、
+    刚关了一个能力包就得马上生效），塞进 `SYSTEM_PROMPT` 会让缓存整段失效。
 
-    `allow_fs` 为真时追加「读写平台文件」那段。**这是能力开关，不是提示语**：
-    关着的时候提示词里不提这件事，模型就不会写出必然被拒的动作块。
+    `allow_fs` / `enabled` 是**能力开关，不是提示语**：关着的包，提示词里就不
+    列它的工具，模型也就不会写出一个必然被拒的动作块。
 
     `user_text` 可以是字符串，也可以是带图的多模态 parts 列表（见
     `attachments.content()`）—— 这里只负责原样放进消息，不关心它是什么形态。
@@ -726,7 +768,9 @@ def build_messages(history: list[dict], user_text: str | list, memory: str = "",
                        + memory.strip(),
         })
     if catalog:
-        live = strategy_catalog()
+        live = "\n\n".join(x for x in (
+            strategy_catalog(), tool_catalog(allow_fs, enabled),
+        ) if x.strip())
         if live:
             msgs.append({"role": "system", "content": live})
     for m in _prune_images(history):
@@ -775,7 +819,7 @@ _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
 
 @dataclass
 class Action:
-    kind: str                 # trade / backtest / factor / strategy / fs / 空串表示没有动作
+    kind: str                 # 动作名（= `REGISTRY` 里的 key）；空串表示没有动作
     payload: dict = field(default_factory=dict)
     error: str = ""
 
@@ -783,146 +827,38 @@ class Action:
     def ok(self) -> bool:
         return bool(self.kind) and not self.error
 
+    def tool(self):
+        """这个动作对应的注册项。界面层拿它判风险等级和归属能力包。"""
+        return S.get(self.kind)
+
     def describe(self) -> str:
-        """一行说明，给确认框用。"""
-        p = self.payload
-        sym = f"{p.get('symbol', '')}_{p.get('exchange', '')}".strip("_")
-        if self.kind == "trade" and p.get("mode") == "manual":
-            side = "买入" if p.get("side") == "BUY" else "卖出"
-            off = {"OPEN": "开仓", "CLOSE": "平仓", "CLOSETODAY": "平今"}.get(
-                p.get("offset", "OPEN"), p.get("offset", "")
-            )
-            return f"{side}{off} {sym} {p.get('volume', 1)} 手"
-        if self.kind == "trade":
-            return (f"按策略交易 {sym} {p.get('period', '')}｜"
-                    f"{p.get('strategy', '')}｜{p.get('volume', 1)} 手")
-        if self.kind == "backtest":
-            return f"回测 {sym} {p.get('period', '')}｜{p.get('strategy', '')}"
-        if self.kind == "factor":
-            return f"注册因子「{p.get('label', '')}」（{p.get('category', '')}）"
-        if self.kind == "strategy":
-            n = len(p.get("params") or {})
-            return f"注册策略「{p.get('label', '')}」（{n} 个参数）"
-        if self.kind == "fs":
-            op = p.get("op", "")
-            path = p.get("path", "")
-            if op == "read":
-                return f"读取 {path}"
-            if op == "list":
-                return f"列出目录 {path or '.'}"
-            n = len(p.get("content") or "")
-            return f"写入 {path}（{n} 字符）"
-        if self.kind == "doc":
-            return f"查平台手册：{p.get('topic', '')}"
+        """一行说明，给确认框用。
+
+        文案由工具自己提供（`Tool.describe`）—— 以前这里是一个二十行的 `if` 链，
+        每加一个动作都要来补一段，漏了就显示成一个英文 key。
+        """
+        tool = S.get(self.kind)
+        if tool is not None and tool.describe is not None:
+            try:
+                return tool.describe(self.payload)
+            except Exception:  # noqa: BLE001 - 说明文案出错不该让确认框弹不出来
+                pass
+        if tool is not None:
+            for k in ("symbol", "path", "topic", "file_id", "factor", "strategy", "name"):
+                if self.payload.get(k):
+                    return f"{tool.label}：{self.payload[k]}"
+            return tool.label
         return self.kind
-
-
-def _parse_factor(obj: dict) -> Action:
-    """注册因子的动作块。字段校验只做「能不能落地」，不评判因子好坏。"""
-    key = str(obj.get("key") or "").strip().lower()
-    label = str(obj.get("label") or "").strip()
-    code = str(obj.get("code") or "")
-    if not key:
-        return Action("factor", obj, "缺少因子代号 key")
-    if not label:
-        return Action("factor", obj, "缺少显示名 label")
-    if not code.strip():
-        return Action("factor", obj, "缺少实现代码 code")
-
-    func = str(obj.get("func") or f"f_{key}").strip()
-    if f"def {func}" not in code:
-        return Action("factor", obj, f"code 里要定义 def {func}(df)")
-
-    obj["key"] = key
-    obj["label"] = label
-    obj["func"] = func
-    obj["code"] = code
-    obj["category"] = str(obj.get("category") or "自定义").strip()
-    obj["desc"] = str(obj.get("desc") or "").strip()
-    obj["formula"] = str(obj.get("formula") or "").strip()
-    try:
-        hint = int(obj.get("hint_dir", 1))
-    except (TypeError, ValueError):
-        hint = 1
-    obj["hint_dir"] = hint if hint in (-1, 0, 1) else 1
-    return Action("factor", obj)
-
-
-def _parse_strategy(obj: dict) -> Action:
-    """注册策略的动作块。只校验「能不能落地」，不评判策略好坏 ——
-    好坏由回测数字说话，不由这里拦。"""
-    key = str(obj.get("key") or "").strip().lower()
-    label = str(obj.get("label") or "").strip()
-    code = str(obj.get("code") or "")
-    if not key:
-        return Action("strategy", obj, "缺少策略代号 key")
-    if not label:
-        return Action("strategy", obj, "缺少显示名 label")
-    if not code.strip():
-        return Action("strategy", obj, "缺少实现代码 code")
-
-    func = str(obj.get("func") or f"sig_{key}").strip()
-    if f"def {func}" not in code:
-        return Action("strategy", obj, f"code 里要定义 def {func}(df, ...)")
-
-    params = obj.get("params") or {}
-    if not isinstance(params, dict):
-        return Action("strategy", obj, "params 要是一个对象")
-    for k, v in params.items():
-        if not isinstance(v, (int, float)) or isinstance(v, bool):
-            return Action("strategy", obj, f"参数 {k} 的值 {v!r} 不是数字")
-
-    meta = obj.get("param_meta") or {}
-    if not isinstance(meta, dict):
-        meta = {}
-
-    obj["key"] = key
-    obj["label"] = label
-    obj["func"] = func
-    obj["code"] = code
-    obj["desc"] = str(obj.get("desc") or "").strip()
-    obj["params"] = params
-    obj["param_meta"] = meta
-    return Action("strategy", obj)
-
-
-def _parse_fs(obj: dict) -> Action:
-    """读写平台文件的动作块。真正的路径校验在 `agent_fs.resolve()` 里 ——
-    这里只挡住一眼就能看出来的错，让模型能立刻改对。"""
-    op = str(obj.get("op") or "").strip().lower()
-    if op not in ("read", "list", "write"):
-        return Action("fs", obj, "op 只能是 read / list / write")
-    path = str(obj.get("path") or "").strip().replace("\\", "/")
-    if not path and op != "list":
-        return Action("fs", obj, "缺少 path")
-    if path.startswith("/") or (len(path) > 1 and path[1] == ":"):
-        return Action("fs", obj, "path 只能是相对 TrendDesk 根目录的路径")
-    if ".." in path.split("/"):
-        return Action("fs", obj, "path 里不能出现 ..")
-    if op == "write" and "content" not in obj:
-        return Action("fs", obj, "写入要带 content（整文件覆盖）")
-
-    obj["op"] = op
-    obj["path"] = path or "."
-    obj["content"] = str(obj.get("content") or "")
-    return Action("fs", obj)
-
-
-def _parse_doc(obj: dict) -> Action:
-    """查手册的动作块。topic 认不认识交给 `factor_manual.resolve()` ——
-    那里解析不了会回一份索引，比在这里拒掉更有用。"""
-    topic = str(obj.get("topic") or "").strip()
-    if not topic:
-        return Action("doc", obj, "缺少 topic（data / primitives / contract / factors / "
-                                  "cat:趋势 / factor:<key>）")
-    obj["topic"] = topic
-    return Action("doc", obj)
 
 
 def parse_action(text: str) -> Action:
     """从回答里挖出动作块。没有就返回 kind 为空串的 Action。
 
     只认最后一个代码块：模型有时会在解释里贴示例，最后一个才是它真要执行的。
+
+    合法性完全交给注册表 —— `REGISTRY` 里没有的动作名直接当没有动作，
+    参数按 `inputSchema` 校验，schema 表达不了的规则走 `Tool.prepare`。
+    以前这里有四个 `_parse_xxx` 分支加一个硬编码白名单，加一个动作要改五处。
     """
     blocks = _JSON_BLOCK.findall(text or "")
     if not blocks:
@@ -936,45 +872,21 @@ def parse_action(text: str) -> Action:
         return Action("", {}, "动作块不是对象")
 
     kind = str(obj.get("action") or "").strip().lower()
-    if kind not in ("trade", "backtest", "factor", "strategy", "fs", "doc"):
+    tool = S.get(kind)
+    if tool is None:
+        # 模型编了一个平台没有的动作名。当作「没有动作」而不是报错 ——
+        # 报错会把它引到「那我该怎么写」的弯路上去，而回答本身通常是有用的
         return Action("")
-    if kind == "factor":
-        # 注册因子不需要品种 —— 因子是横截面的，对哪个标的算由用户决定
-        return _parse_factor(obj)
-    if kind == "strategy":
-        # 注册的是策略**定义**，也不带品种：同一套逻辑要跑哪个品种是另一件事
-        return _parse_strategy(obj)
-    if kind == "fs":
-        # 也不带品种：改哪个文件是 path 说了算
-        return _parse_fs(obj)
-    if kind == "doc":
-        # 查手册更不需要品种
-        return _parse_doc(obj)
-    if not obj.get("symbol"):
-        return Action(kind, obj, "缺少品种")
 
-    try:
-        obj["volume"] = max(1, int(obj.get("volume", 1)))
-    except (TypeError, ValueError):
-        obj["volume"] = 1
-    if kind == "trade":
-        mode = str(obj.get("mode") or "auto").lower()
-        if mode not in ("auto", "manual"):
-            return Action(kind, obj, "mode 只能是 auto 或 manual")
-        obj["mode"] = mode
-        if mode == "manual":
-            side = str(obj.get("side") or "").upper()
-            if side not in ("BUY", "SELL"):
-                return Action(kind, obj, "主观交易要给 side=BUY/SELL")
-            obj["side"] = side
-            off = str(obj.get("offset") or "OPEN").upper()
-            if off not in ("OPEN", "CLOSE", "CLOSETODAY"):
-                return Action(kind, obj, "offset 只能是 OPEN/CLOSE/CLOSETODAY")
-            obj["offset"] = off
-        elif not obj.get("strategy"):
-            return Action(kind, obj, "按策略交易要给 strategy")
-    return Action(kind, obj)
-
+    obj.pop("action", None)
+    clean, why = S.validate(tool, obj)
+    if why:
+        return Action(kind, obj, why)
+    if tool.prepare is not None:
+        clean, why = tool.prepare(clean)
+        if why:
+            return Action(kind, clean, why)
+    return Action(kind, clean)
 
 # ------------------------------------------------------------------ 历史
 

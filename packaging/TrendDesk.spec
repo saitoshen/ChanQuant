@@ -62,6 +62,13 @@ if os.path.isfile(LITE_DB):
 # 会静默少一项 —— 自检里「机器学习模型依赖」那一项就是专门守这个的。
 DATAS += collect_data_files("xgboost", includes=["lib/*", "VERSION"])
 
+# 窗口图标。exe 自己的图标是 PyInstaller 从 icon.ico 嵌进去的，但**窗口**图标
+# 要运行时用 QIcon 显式设置（见 gui/app.py 的 app_icon），所以 png 得进包 ——
+# 少了它，打包版任务栏上是 PyInstaller 的默认图标，而源码运行反而是对的
+ICON_PNG = os.path.join(PACK, "icon.png")
+if os.path.isfile(ICON_PNG):
+    DATAS.append((ICON_PNG, "packaging"))
+
 # 动态导入的模块，静态分析扫不到，必须显式声明
 HIDDEN = [
     "matplotlib.backends.backend_qtagg",
@@ -114,6 +121,27 @@ HIDDEN = [
     # 函数内 import 时忘了补 —— 那时表现是「双击策略没反应」
     "gui.result_view",
     "ttrade.replay",
+    # 能力包注册表：`ttrade.skills` 里的每个模块靠 `__init__` 显式 import 完成
+    # 注册。PyInstaller 静态扫描看不到「import 了但没被引用」，漏一个包就是
+    # 界面上那几个动作静默消失（模型给了动作块，平台回「没有这个动作」）
+    "ttrade.skills",
+    "ttrade.skills.base",
+    "ttrade.skills.data",
+    "ttrade.skills.manual",
+    "ttrade.skills.doc",
+    "ttrade.skills.factor",
+    "ttrade.skills.strategy",
+    "ttrade.skills.trade",
+    "ttrade.skills.fs",
+    # 附件资源化与导出
+    "ttrade.session_files",
+    "ttrade.docgen",
+    "ttrade.render",
+    # 文档解析/写入的引擎。openpyxl 被 pandas 按字符串动态 import，
+    # pypdf 只在函数里 import，两个都扫不到
+    "openpyxl",
+    "openpyxl.cell._writer",
+    "pypdf",
 ]
 
 # 用不到的重量级依赖，剔掉能省 100MB 以上

@@ -30,6 +30,23 @@ from ttrade.paths import bundle_root, cache_dir, data_dir as resolve_data_dir, l
 # 打包成 macOS .app 后 ROOT 所在的卷是只读的，写入会静默失败。
 ASSET_ROOT = bundle_root()
 
+
+def app_icon():
+    """窗口图标。找不到就返回空 QIcon，绝不让它把启动搞挂。
+
+    打包后 `packaging/icon.png` 随 datas 一起进包；源码运行时就在项目目录下。
+    exe 自己的图标由 PyInstaller 从 icon.ico 嵌，但窗口图标 Windows 只在没有
+    显式设置时才拿 exe 的 —— 源码运行（python launcher.py）根本没 exe 图标，
+    所以这里统一设一次，两种运行方式看起来一样。
+    """
+    from PySide6.QtGui import QIcon
+
+    for name in ("icon.png", "icon.ico"):
+        path = os.path.join(ASSET_ROOT, "packaging", name)
+        if os.path.exists(path):
+            return QIcon(path)
+    return QIcon()
+
 # matplotlib 缓存目录必须在导入 pyplot 之前指定。放在用户缓存目录而不是包内，
 # 因为 .app 签名后不可写，且字体缓存重建一次要几秒。
 os.environ.setdefault("MPLCONFIGDIR", cache_dir("mpl"))
@@ -752,6 +769,9 @@ class MainWindow(QMainWindow):
         self.portfolio_page = PortfolioPage(loader=self._load_bars)
         self.pages.addWidget(self.portfolio_page)
         self.agent_page = AgentPage()
+        # 行情库递进去：Agent 要能查 K 线、算因子值、列品种。传两个市场的
+        # store，因为它不跟当前市场走（可能在看美股、却问螺纹）
+        self.agent_page.attach(self.stores)
         self.pages.addWidget(self.agent_page)
         # 市场单选归数据页自己管（和本页的品种类别解耦），这里只把两个市场的
         # 标签和目录递进去，省得数据页反过来 import 主窗口造成循环依赖
@@ -3998,6 +4018,9 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("趋势跟踪研究台")
     app.setApplicationDisplayName("趋势跟踪研究台")
+    icon = app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     setup_light_palette(app)
     app.setStyleSheet(STYLE_SHEET)
 

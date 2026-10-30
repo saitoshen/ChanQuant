@@ -636,17 +636,52 @@ class ChatInput(QPlainTextEdit):
 
 验收：冒烟 2804 项（新增 27 项）/ 自检全 OK。方角卡片，无新依赖。
 
-### P1 之后
-
-| 阶段 | 内容 | 改动面 | 验收标准 |
-|---|---|---|---|
-| **P1**<br>2~3 天 | ① `ttrade/skills/` 注册表（`base` / `registry` / `catalog` / `dispatch`），字段按 MCP 命名<br>② 现有 6 个动作迁进去<br>③ `data` + `doc` 两个包（装 `pypdf` / `openpyxl`）<br>④ 附件资源化（`SessionFiles`）<br>⑤ 提示词改成按包注入<br>⑥ `catalog()` 吐 `SKILL.md` 兼容的 frontmatter | `agent.py` 的解析层 + 新增 `ttrade/skills/` + `attachments.py` | 拖一个因子 Excel 进去，能问"这个表里是什么因子"并注册成功；关掉 `doc` 包后提示词少 400 字符 |
-| **P2**<br>2~3 天 | ① `web` 包（只做 fetch，含 §4.5 安全清单）<br>② `write_pdf` / `write_xlsx`（抽 `docgen.py`）<br>③ 风险分级 + 开关组 + `daylimit.peek()`<br>④ 通用确认框（按 `risk` + `blocks` 渲染） | 新增 `web.py` / `docgen.py`，改 `ConfirmDialog` / `SettingsDialog` | 贴一个链接能读出正文；导出一份因子 PDF；关掉 trade 开关后模型明确回"下单已禁用" |
-| **P3**<br>1 周+ | ① `monitor` 包：先快照式，再做订阅式<br>② 系统托盘 + 通知通道 + 开机自启<br>③ 导出 MCP server（`tools/list` / `tools/call`） | 新基础设施 | 先做"现在帮我扫一遍哪些品种突破 20 日高点"，再挂托盘 |
-
 **P0 单独成阶段**的理由：它不改架构、不装依赖、风险最低，但用户感知的提升最大 ——
 先拿到反馈，再决定后面投入多少。事实证明这个判断是对的：P0 做完之后，
 `_on_delta` 那行 `insertPlainText` 一改，表格和粗体立刻正常了。
+
+### P1 —— ✅ 已完成（2026-10-31）
+
+| 做完了什么 | 落在哪 |
+|---|---|
+| 能力包注册表：`Tool` / `SkillResult` / `REGISTRY` / `validate` / `catalog` / `dispatch` | 新增 `ttrade/skills/base.py` |
+| 6 个老动作（trade / backtest / factor / strategy / fs / doc）迁进注册表，`parse_action` 的白名单改成查 `REGISTRY`，`describe()` 由工具自己提供 | `ttrade/agent.py` 的动作解析段（净删 200 行） |
+| 参数校验只实现 JSON Schema 五件事（`type`/`required`/`default`/`enum`/`min`/`max`），不引 jsonschema | `base.validate()` |
+| schema 表达不了的规则走 `Tool.prepare`（`mode=manual` 必须给 `side`、`path` 不能有 `..`） | `skills/trade.py` / `skills/fs.py` |
+| `data` 包：`query_bars` / `query_factor` / `list_symbols` | 新增 `ttrade/skills/data.py` |
+| `doc` 包：`read_excel` / `parse_pdf` / `read_docx` / `write_xlsx` / `write_pdf` | 新增 `ttrade/skills/doc.py` |
+| `factor` / `strategy` 包：查询 + 试算（注册仍走界面，因为要弹框看代码） | `skills/factor.py` / `skills/strategy.py` |
+| 附件资源化：`SessionFiles` 分配 `file_id`，消息里只放 300 字符摘要 | 新增 `ttrade/session_files.py` |
+| PDF / xlsx 导出，和聊天共用同一个渲染器 | 新增 `ttrade/docgen.py`；`gui/chat_render.py` 移到 `ttrade/render.py` |
+| 提示词按包注入：关掉的包不列工具，模型不会写出必然被拒的动作块 | `agent.build_messages(..., enabled=)` + `tool_catalog()` |
+| 设置页加「能力包」开关组，状态栏显示已关的包 | `SettingsDialog` / `_refresh_status` |
+
+验收：冒烟 2843 项（新增 39 项，0 失败）/ 自检新增「能力包 20 个动作，附件读表 通」。
+
+### P2 —— ✅ 已完成（2026-10-31）
+
+| 做完了什么 | 落在哪 |
+|---|---|
+| `web` 包只做 `web_fetch`：四道闸（只 http/https、解析后查 IP、逐跳查重定向、5MB 截断） | 新增 `ttrade/skills/web.py` |
+| 网页 → 纯文本（丢 script/style/nav，块级标签转换行，实体反转义） | `web.html_to_text()` |
+| 风险分级落地：`read` 自动 / `write` 弹框 / `trade` 弹框 + `confirm_trade`；`fs` 自己管（读不问、写必问） | `_handle_action()` |
+| `daylimit.peek()` **不需要新增** —— `DayLimit.order_left()` / `state()` 已经够用 | 未改 `daylimit.py` |
+
+`web_fetch` 的白名单实测：`127.0.0.1` / `localhost` / `10.x` / `192.168.x` /
+`169.254.169.254`（云元数据）/ `[::1]` / `file://` / `ftp://` / `data:` 全部拦住。
+
+### P3 —— 待做
+
+| 阶段 | 内容 | 验收标准 |
+|---|---|---|
+| **P3**<br>1 周+ | ① `monitor` 包：先快照式，再做订阅式<br>② 系统托盘 + 通知通道 + 开机自启<br>③ 导出 MCP server（`tools/list` / `tools/call`） | 先做"现在帮我扫一遍哪些品种突破 20 日高点"，再挂托盘 |
+
+### 顺带做完的两件事
+
+| 事 | 说明 |
+|---|---|
+| **Agent 页字号整体放大** | 全局默认 12px 对这一页太小（一屏要读很多字）。新增 `FS_BODY=15 / FS_SMALL=12 / FS_CODE=13 / FS_HEAD=17 / FS_UI=14` 六个常量 + 页面级 `AGENT_QSS`，只管这一页，别的页密度不动。渲染器里的字号也提到 `ttrade/render.py` 的 `BODY_PX/SMALL_PX/CODE_PX/HEAD_PX`，聊天和导出 PDF 一起变 |
+| **应用图标改成 QuantBuddy 风格** | `packaging/make_icon.py` 重画：靛蓝→紫渐变圆角底 + 白色对话气泡 + 三根抬高的柱子 + 琥珀顶盖。运行时用 `app_icon()` 显式 `setWindowIcon`，`icon.png` 进 `DATAS`，源码运行和打包版看起来一样 |
 
 ---
 

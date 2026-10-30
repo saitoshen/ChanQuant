@@ -835,6 +835,46 @@ def _run() -> tuple[bool, list[str]]:
             chat_info = f"{len(plain)} 字符 / {'表格' if '<table' in html else '无表格'}"
         except Exception as exc:  # noqa: BLE001
             chat_info = f"{type(exc).__name__}: {exc}"
+
+        # 能力包注册表 + 附件资源化。打包时 `ttrade.skills.*` 是靠 spec 的
+        # hiddenimports 收进去的，漏一个包不会报错，只会表现为「模型给了动作块、
+        # 平台回没有这个动作」。这里造一份临时 xlsx 走完整条取数路径。
+        skill_ok = False
+        skill_info = ""
+        try:
+            import tempfile as _tf
+
+            import pandas as pd
+
+            from ttrade import session_files as _SF
+            from ttrade import skills as _SK
+
+            n_tool = len(_SK.REGISTRY)
+            tmpd = _tf.mkdtemp(prefix="td_self_")
+            try:
+                book = os.path.join(tmpd, "t.xlsx")
+                pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}).to_excel(book, index=False)
+                sess = _SF.SessionFiles()
+                item = sess.add_path(book)
+                res = _SK.dispatch(_SK.SkillContext(session=sess),
+                                   "read_excel", {"file_id": "f1"})
+            finally:
+                import shutil as _sh
+
+                _sh.rmtree(tmpd, ignore_errors=True)
+            skill_ok = (
+                n_tool >= 17
+                and item is not None
+                and res.ok
+                and any(b["type"] == "table" for b in res.blocks)
+                and hasattr(ap, "session")
+                and hasattr(ap, "_ctx")
+                and hasattr(ap, "store")
+            )
+            skill_info = f"{n_tool} 个动作，附件读表 {'通' if res.ok else '断'}"
+        except Exception as exc:  # noqa: BLE001
+            skill_info = f"{type(exc).__name__}: {exc}"
+
         agent_ok = (
             ap is not None
             and hasattr(ap, "btn_del_factor")
@@ -857,6 +897,7 @@ def _run() -> tuple[bool, list[str]]:
             and manual_ok
             and out_ok
             and chat_ok
+            and skill_ok
         )
         # K 线可视窗口：初始应停在最新一段，且滚动条范围与窗口自洽。
         # 这些状态现在归 `ResultView` 管（研究页和组合页共用一份实现），
@@ -1186,7 +1227,7 @@ def _run() -> tuple[bool, list[str]]:
                 f"截面 {cross_info}，"
                 f"回测区间 {range_info}，实时开关已复位，"
                 f"数据管理页就绪，手册 {manual_info}，输出 {out_info}，"
-                f"对话渲染 {chat_info}")
+                f"对话渲染 {chat_info}，能力包 {skill_info}")
 
     check("构建主窗口（端到端）", _window)
 
