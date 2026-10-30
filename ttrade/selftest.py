@@ -647,7 +647,12 @@ def _run() -> tuple[bool, list[str]]:
         """真正把主窗口搭起来，验证 UI 代码在打包后也能跑通。"""
         from PySide6.QtWidgets import QApplication
 
-        from gui.app import STYLE_SHEET, MainWindow, setup_light_palette
+        from gui.app import (
+            FAMILY_RULE,
+            STYLE_SHEET,
+            MainWindow,
+            setup_light_palette,
+        )
 
         app = QApplication.instance() or QApplication([])
         setup_light_palette(app)
@@ -803,6 +808,33 @@ def _run() -> tuple[bool, list[str]]:
             out_info = f"{len(text)} 字符"
         except Exception as exc:  # noqa: BLE001
             out_info = f"{type(exc).__name__}: {exc}"
+        # 对话区渲染：模型回的 markdown 必须变成标签，流式那遍纯文本要被抹干净。
+        # 这条以前是断的 —— 表格、粗体、代码块全按原文符号显示，用户看到的
+        # 是一屏 `**` 和竖线。这里直接往 `ap` 上灌一段回答走完整条流式路径。
+        chat_ok = False
+        chat_info = ""
+        try:
+            reply = ("## 结论\n\n螺纹**不适合追多**。\n\n"
+                     "| 参数 | 值 |\n|---|---|\n| fast | 50 |\n")
+            ap.log.clear()
+            ap._stream_buf = ""
+            ap._msg_start = None
+            for i in range(0, len(reply), 9):
+                ap._on_delta(reply[i:i + 9])
+            ap._on_done(reply)
+            app.processEvents()
+            plain = ap.log.toPlainText()
+            html = ap.log.toHtml()
+            chat_ok = (
+                "**" not in plain
+                and "<table" in html
+                and "font-weight:700" in html
+                and plain.count("结论") == 1          # 流式文本确实被替换掉了
+                and hasattr(ap.ed_input, "files_dropped")   # 输入框是 ChatInput
+            )
+            chat_info = f"{len(plain)} 字符 / {'表格' if '<table' in html else '无表格'}"
+        except Exception as exc:  # noqa: BLE001
+            chat_info = f"{type(exc).__name__}: {exc}"
         agent_ok = (
             ap is not None
             and hasattr(ap, "btn_del_factor")
@@ -824,6 +856,7 @@ def _run() -> tuple[bool, list[str]]:
             and fs_ok
             and manual_ok
             and out_ok
+            and chat_ok
         )
         # K 线可视窗口：初始应停在最新一段，且滚动条范围与窗口自洽。
         # 这些状态现在归 `ResultView` 管（研究页和组合页共用一份实现），
@@ -1065,9 +1098,19 @@ def _run() -> tuple[bool, list[str]]:
 
         # 回测区间：切片要真的生效。不生效的话 5 分钟十年照样从头算，
         # 「近 1 年」只是个显示开关，用户以为快了其实没快
+        #
+        # **先钉回「单品种 + 规则策略」**：`df_raw` 只有单品种那条路才有，截面和
+        # 多品种都是「一批品种 → 一条组合净值」，`_finish_cross` 会把它清成 None。
+        # 用户上次停在截面策略的话这里会必红 —— 可那不是代码坏了，是自检假设了
+        # 初始状态（和上面 `is_us` 一个道理）。
         range_ok = False
         range_info = ""
         try:
+            win.family = FAMILY_RULE
+            if hasattr(win, "sym_pick"):
+                win.sym_pick.clear()          # 多品种勾选也清掉，否则走多品种那条路
+            win._sync_family_panels()
+            app.processEvents()
             win.cb_range.setCurrentIndex(0)      # 近 1 年
             win.run_analysis()
             n_1y = len(win.df_raw)
@@ -1142,7 +1185,8 @@ def _run() -> tuple[bool, list[str]]:
                 f"{factor_info}，滚轮缩放 {wheel_info}，组合 {combo_info}，"
                 f"截面 {cross_info}，"
                 f"回测区间 {range_info}，实时开关已复位，"
-                f"数据管理页就绪，手册 {manual_info}，输出 {out_info}")
+                f"数据管理页就绪，手册 {manual_info}，输出 {out_info}，"
+                f"对话渲染 {chat_info}")
 
     check("构建主窗口（端到端）", _window)
 

@@ -40,11 +40,18 @@
 
 from __future__ import annotations
 
+import base64
 import os
+import re
 import time
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QTextCursor
+from PySide6.QtGui import (
+    QDesktopServices,
+    QImage,
+    QPixmap,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -53,6 +60,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -61,6 +69,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTabWidget,
@@ -69,6 +78,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gui import chat_render as CR
 from ttrade import agent as A
 from ttrade import agent_memory as Mem
 from ttrade import attachments as ATT
@@ -90,6 +100,151 @@ def reports_dir() -> str:
     path = os.path.join(user_dir(), "reports")
     os.makedirs(path, exist_ok=True)
     return path
+
+
+# ------------------------------------------------------------------ 输入框
+
+_TABLE_RE = re.compile(r"<table\b.*?</table>", re.S | re.I)
+_ROW_RE = re.compile(r"<tr\b.*?</tr>", re.S | re.I)
+_CELL_RE = re.compile(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", re.S | re.I)
+_TAG_RE = re.compile(r"<[^>]+>")
+_BR_RE = re.compile(r"<br\s*/?>", re.I)
+
+
+def html_table_to_md(html: str) -> str:
+    """从剪贴板的 HTML 里抠表格，转成 markdown。
+
+    用户从网页、Excel、Word 里框选表格复制时，剪贴板里除了纯文本还有一份
+    HTML —— 纯文本那版是拿 Tab 隔开的，粘进来模型读得一塌糊涂（列对不齐、
+    空单元格丢失）。这里直接读 `<table>`，转成 markdown 表格。
+
+    只认第一张表：一次复制多张表的情况极少，而全拼进来会很长。
+    """
+    m = _TABLE_RE.search(html or "")
+    if not m:
+        return ""
+
+    rows = []
+    for tr in _ROW_RE.findall(m.group(0)):
+        cells = []
+        for cell in _CELL_RE.findall(tr):
+            text = _BR_RE.sub(" ", cell)
+            text = _TAG_RE.sub("", text).replace("\xa0", " ")
+            text = re.sub(r"\s+", " ", text).strip()
+            cells.append(text.replace("|", "\\|"))
+        if any(cells):
+            rows.append(cells)
+    if len(rows) < 2:
+        return ""
+
+    n = max(len(r) for r in rows)
+    rows = [r + [""] * (n - len(r)) for r in rows]
+    out = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * n]
+    out += ["| " + " | ".join(r) + " |" for r in rows[1:]]
+    return "\n".join(out) + "\n"
+
+
+class ChatInput(QPlainTextEdit):
+    """能直接接住截图、文件、网页表格的输入框。
+
+    三件事分开走：
+
+    - **截图 / 图片**：`mime.hasImage()` → 交给页面加进附件条。不落临时文件，
+      直接编码进附件，因为 Qt 富文本认 `data:` URI，回显时能内联显示。
+    - **文件**：`mime.hasUrls()` → 路径交给页面，走 `attachments.load()`。
+    - **网页表格**：`mime.hasHtml()` 且里面有 `<table>` → 转 markdown 插进文本。
+
+    剩下的（普通文字）交回父类，别抢走默认的粘贴行为。
+    """
+
+    files_dropped = Signal(list)      # [str 路径] 或 [QImage]
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    # ---------------------------------------------------------- 粘贴
+
+    def canInsertFromMimeData(self, src) -> bool:
+        if src.hasImage() or src.hasUrls():
+            return True
+        if src.hasHtml() and _TABLE_RE.search(src.html() or ""):
+            return True
+        return super().canInsertFromMimeData(src)
+
+    def insertFromMimeData(self, src) -> None:
+        img = self._image_of(src)
+        if img is not None:
+            self.files_dropped.emit([img])
+            return
+
+        paths = self._paths_of(src)
+        if paths:
+            self.files_dropped.emit(paths)
+            return
+
+        if src.hasHtml():
+            md = html_table_to_md(src.html())
+            if md:
+                self.insertPlainText(md)
+                return
+
+        super().insertFromMimeData(src)
+
+    # ---------------------------------------------------------- 拖放
+
+    def dragEnterEvent(self, e) -> None:
+        if e.mimeData().hasImage() or e.mimeData().hasUrls():
+            e.acceptProposedAction()
+            return
+        super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e) -> None:
+        if e.mimeData().hasImage() or e.mimeData().hasUrls():
+            e.acceptProposedAction()
+            return
+        super().dragMoveEvent(e)
+
+    def dropEvent(self, e) -> None:
+        img = self._image_of(e.mimeData())
+        if img is not None:
+            self.files_dropped.emit([img])
+            e.acceptProposedAction()
+            return
+
+        paths = self._paths_of(e.mimeData())
+        if paths:
+            self.files_dropped.emit(paths)
+            e.acceptProposedAction()
+            return
+        super().dropEvent(e)
+
+    # ---------------------------------------------------------- 小工具
+
+    @staticmethod
+    def _image_of(md):
+        """剪贴板里的图。`imageData()` 可能给 QImage 也可能给 QPixmap，都接住。"""
+        if not md.hasImage():
+            return None
+        data = md.imageData()
+        if isinstance(data, QImage) and not data.isNull():
+            return data
+        if isinstance(data, QPixmap) and not data.isNull():
+            return data.toImage()
+        return None
+
+    @staticmethod
+    def _paths_of(md) -> list[str]:
+        if not md.hasUrls():
+            return []
+        out = []
+        for u in md.urls():
+            if not u.isLocalFile():
+                continue              # 从浏览器拖一个链接过来，不是文件
+            p = u.toLocalFile()
+            if p and os.path.isfile(p):
+                out.append(p)
+        return out
 
 
 # ------------------------------------------------------------------ 线程
@@ -643,6 +798,8 @@ class AgentPage(QWidget):
         self._busy = False
         self._pending_report = ""     # 正在生成的研报品种，回完自动落盘
         self._stream_buf = ""
+        # 当前这条回答在文档里的起始位置（流式收尾时从这里整段重排成富文本）
+        self._msg_start: int | None = None
         self._memo_worker: MemoWorker | None = None
         self._memo_thread: QThread | None = None
         self._memo_warned = False     # 压缩失败只提示一次，别每轮都刷
@@ -862,19 +1019,21 @@ class AgentPage(QWidget):
         self.att_box.setVisible(False)
         lay.addWidget(self.att_box)
 
-        self.ed_input = QPlainTextEdit()
+        self.ed_input = ChatInput()
         self.ed_input.setPlaceholderText(
             "比如：螺纹现在适合做多吗？用双均线帮我回测一下，1 手。"
-            "（Ctrl+Enter 发送，可以带图片和文档）"
+            "（Ctrl+Enter 发送；截图可以直接 Ctrl+V 粘，文件可以直接拖进来）"
         )
         self.ed_input.setFixedHeight(84)
+        self.ed_input.files_dropped.connect(self._on_dropped)
         lay.addWidget(self.ed_input)
 
         row = QHBoxLayout()
         self.btn_attach = QPushButton("附件")
         self.btn_attach.setObjectName("Ghost")
         self.btn_attach.setToolTip(
-            "添加图片（截图、行情图）或文档（md/txt/csv/docx）。\n"
+            "添加图片（截图、行情图）或文档（md/txt/csv/xlsx/pdf/docx）。\n"
+            "也可以直接把截图粘进输入框、把文件拖进来。\n"
             "图片需要模型支持视觉（GPT-4o、GLM-4V、Qwen-VL 等），纯文本模型会报错。"
         )
         self.btn_attach.clicked.connect(self._attach_files)
@@ -1170,10 +1329,21 @@ class AgentPage(QWidget):
 
     def _clear_chat(self) -> None:
         self._history.clear()
+        self._msg_start = None       # setHtml 会把文档整个换掉，旧位置作废
         self._render_welcome()
 
     def _append(self, html: str) -> None:
-        self.log.moveCursor(QTextCursor.End)
+        """往对话区尾部追加一段 HTML。
+
+        `insertHtml` 在「光标停在最后一段的末尾」时，会把片段里的**第一个块并进
+        当前段落** —— 于是「你」「助手」会粘在上一句后面，`## 结论` 这种标题也
+        缩成行内，整段对话糊成一片。所以插入前先看看当前块里有没有字，有就断开。
+        """
+        cur = self.log.textCursor()
+        cur.movePosition(QTextCursor.End)
+        if cur.block().text().strip():
+            cur.insertBlock()
+        self.log.setTextCursor(cur)
         self.log.insertHtml(html)
         self.log.moveCursor(QTextCursor.End)
 
@@ -1219,6 +1389,7 @@ class AgentPage(QWidget):
             allow_fs=self.cfg.allow_fs,
         )
         self._stream_buf = ""
+        self._msg_start = None
         self._start_worker(msgs)
 
     # ---------------------------------------------------------- 附件
@@ -1227,8 +1398,19 @@ class AgentPage(QWidget):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "添加附件", "", ATT.file_filter()
         )
-        if not paths:
-            return
+        if paths:
+            self._add_paths(paths)
+
+    def _on_dropped(self, items: list) -> None:
+        """输入框粘/拖进来的东西。里面可能混着路径和 QImage。"""
+        paths = [x for x in items if isinstance(x, str)]
+        imgs = [x for x in items if not isinstance(x, str)]
+        if paths:
+            self._add_paths(paths)
+        if imgs:
+            self._add_images(imgs)
+
+    def _add_paths(self, paths: list[str]) -> None:
         bad = []
         for p in paths:
             if any(a.path == p for a in self._atts):
@@ -1238,10 +1420,24 @@ class AgentPage(QWidget):
                 self._atts.append(a)
             else:
                 bad.append(f"{a.name}：{a.note}")
+        self._finish_add(bad)
+
+    def _add_images(self, imgs: list) -> None:
+        bad = []
+        for img in imgs:
+            n = sum(1 for a in self._atts if a.kind == "image") + 1
+            a = ATT.from_qimage(img, f"截图 {n}.png")
+            if a.ok:
+                self._atts.append(a)
+            else:
+                bad.append(f"截图：{a.note}")
+        self._finish_add(bad)
+
+    def _finish_add(self, bad: list[str]) -> None:
         self._refresh_atts()
         if bad:
             # 读不了的文件不进附件条，否则发出去模型也只看到一行「打不开」
-            QMessageBox.warning(self, "这些文件加不上", "\n".join(bad))
+            QMessageBox.warning(self, "这些加不上", "\n".join(bad))
         if self._atts:
             self._set_state(f"已添加 {len(self._atts)} 个附件", C_MUTED)
 
@@ -1252,14 +1448,78 @@ class AgentPage(QWidget):
             if w is not None:
                 w.deleteLater()
         for i, a in enumerate(self._atts):
-            tip = a.note or ("图片会缩到 1600px 以内" if a.kind == "image" else "文字会整段发给模型")
-            btn = QPushButton(f"{a.name}　✕")
-            btn.setObjectName("Ghost")
-            btn.setToolTip(f"{a.size_text()}｜{tip}")
-            btn.clicked.connect(lambda _=False, k=i: self._drop_att(k))
-            self.att_lay.addWidget(btn)
+            self.att_lay.addWidget(self._att_chip(i, a))
         self.att_lay.addStretch(1)
         self.att_box.setVisible(bool(self._atts))
+
+    def _att_chip(self, idx: int, a: "ATT.Attachment") -> QWidget:
+        """一个附件小卡片：图片给缩略图，文档给类型角标。
+
+        光写文件名的话，用户同时丢两张截图根本分不清哪张是哪张 —— 缩略图
+        比任何文字都直接。
+        """
+        chip = QFrame()
+        chip.setObjectName("AttChip")
+        chip.setStyleSheet(
+            "#AttChip{border:1px solid #e2e8f0;border-radius:4px;background:#f8fafc}"
+        )
+        lay = QHBoxLayout(chip)
+        lay.setContentsMargins(4, 3, 4, 3)
+        lay.setSpacing(6)
+
+        thumb = QLabel()
+        thumb.setFixedSize(34, 34)
+        thumb.setAlignment(Qt.AlignCenter)
+        pix = self._thumb(a)
+        if pix is not None:
+            thumb.setPixmap(pix)
+        else:
+            thumb.setText("PDF" if a.name.lower().endswith(".pdf")
+                          else ("DOC" if a.name.lower().endswith((".docx", ".doc")) else "TXT"))
+            thumb.setStyleSheet(
+                f"color:{C_MUTED};font-size:9px;font-weight:700;"
+                "background:#eef2f7;border-radius:3px"
+            )
+        lay.addWidget(thumb)
+
+        text = QWidget()
+        col = QVBoxLayout(text)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        name = QLabel(a.name if len(a.name) <= 16 else a.name[:14] + "…")
+        name.setStyleSheet(f"color:{C_TEXT};font-size:11px")
+        size = QLabel(a.size_text())
+        size.setStyleSheet(f"color:{C_MUTED};font-size:9px")
+        col.addWidget(name)
+        col.addWidget(size)
+        text.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        lay.addWidget(text)
+
+        tip = a.note or ("图片会缩到 1600px 以内" if a.kind == "image"
+                         else "文字会整段发给模型")
+        chip.setToolTip(f"{a.name}\n{a.size_text()}｜{tip}")
+
+        close = QPushButton("✕")
+        close.setObjectName("Ghost")
+        close.setFixedSize(20, 20)
+        close.setToolTip("移除")
+        close.clicked.connect(lambda _=False, k=idx: self._drop_att(k))
+        lay.addWidget(close)
+        return chip
+
+    @staticmethod
+    def _thumb(a: "ATT.Attachment"):
+        """从附件的 base64 直接拼缩略图。不落临时文件。"""
+        if a.kind != "image" or not a.b64:
+            return None
+        try:
+            data = base64.b64decode(a.b64)
+        except Exception:  # noqa: BLE001
+            return None
+        pm = QPixmap()
+        if not pm.loadFromData(data):
+            return None
+        return pm.scaled(34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
     def _drop_att(self, idx: int) -> None:
         if 0 <= idx < len(self._atts):
@@ -1357,18 +1617,55 @@ class AgentPage(QWidget):
         thread.start()
 
     def _on_delta(self, piece: str) -> None:
+        if self._msg_start is None:
+            # 记下这条回答的起点，收尾时从这里往后整段抹掉重排。
+            # 必须在这里取而不是 `_send` 里：`_send` 之后可能还有别的插入
+            # （附件说明、工具回执），起点取早了会把别人的内容一起抹了。
+            self._msg_start = self.log.textCursor().position()
         self._stream_buf += piece
-        # 直接往文档尾部追加纯文本，比每次重设整篇 HTML 快得多 ——
-        # 流式回答能来上百个片段，重设整篇会把滚动位置也弄丢。
+        # 流式期间仍走纯文本 —— 每次重排整条回答在长回复上会明显卡顿，
+        # 而且滚动位置会被反复重置。收尾那一下再统一换 HTML。
         self.log.moveCursor(QTextCursor.End)
         self.log.insertPlainText(piece)
         self.log.moveCursor(QTextCursor.End)
 
+    def _render_reply(self, text: str) -> None:
+        """把流式期间插入的纯文本换成渲染后的富文本。
+
+        `markdown` 的 `**加粗**`、`| 表格 |`、三反引号代码块原来都是原文照贴 ——
+        因为这里以前只 insertPlainText，收尾也不重排。
+        """
+        start = self._msg_start
+        self._msg_start = None
+        html = CR.render_text(text)
+        if not html:
+            html = "<p></p>"
+
+        doc = self.log.document()
+        if start is None or start < 0 or start > doc.characterCount():
+            # 起点丢了（比如中途被 setHtml 过），退化成追加，至少内容不丢
+            self._append(html)
+            return
+
+        cur = self.log.textCursor()
+        cur.setPosition(start)
+        cur.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+        cur.removeSelectedText()
+        if cur.block().text().strip():
+            # 光标停在「助手」那一行的末尾，直接 insertHtml 会把标题并进那一行
+            cur.insertBlock()
+        self.log.setTextCursor(cur)
+        self.log.insertHtml(html)
+        self.log.moveCursor(QTextCursor.End)
+
     def _on_done(self, text: str) -> None:
         final = text or self._stream_buf
-        self._append("<p></p>")
-        if not final.strip():
+        if final.strip():
+            self._render_reply(final)
+        else:
+            self._render_reply("")
             self._append(f"<p style='color:{C_BAD}'>模型没有返回内容。</p>")
+        self._append("<p></p>")
         self._history.append({"role": "assistant", "content": final})
 
         action = A.parse_action(final)
@@ -1386,7 +1683,17 @@ class AgentPage(QWidget):
         self._maybe_compress()
 
     def _on_failed(self, msg: str) -> None:
-        self._append(f"<p style='color:{C_BAD}'>出错了：{_esc(msg)}</p>")
+        # 断了也把已经收到的半截渲染出来 —— 纯文本留着比整段消失强，
+        # 至少用户能看见模型说到哪儿了
+        if self._msg_start is not None and self._stream_buf.strip():
+            self._render_reply(self._stream_buf)
+        self._msg_start = None
+        self._append(
+            f'<div style="border-left:5px solid {C_BAD};background-color:#fdeaea;'
+            f'padding:8px 10px;margin:6px 0 8px 0">'
+            f'<p style="margin:0;color:{C_BAD};font-weight:700">出错了</p>'
+            f'<p style="margin:0;color:{C_TEXT}">{_esc(msg)}</p></div>'
+        )
         self._set_state(msg[:80], C_BAD)
         self._pending_report = ""
 
@@ -1651,6 +1958,7 @@ class AgentPage(QWidget):
         )
         self._append("<p style='margin:12px 0 2px 0'><b>助手</b></p>")
         self._stream_buf = ""
+        self._msg_start = None
         # 延到下一个事件循环再起线程：这里还在 `_on_done` 里，旧线程的
         # `finished` 可能比新线程先到，直接起会让 `_on_thread_done` 把新线程
         # 的状态抹掉（发送按钮变灰、停止键失灵）

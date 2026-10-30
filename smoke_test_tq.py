@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -3553,6 +3554,172 @@ def check_agent_attachments() -> None:
         check("附件 / 输出框", False, f"{type(exc).__name__}: {exc}")
 
 
+def check_chat_render() -> None:
+    """模型回复的渲染 + 输入框粘贴。
+
+    这条链以前是断的：`_on_delta` 用 `insertPlainText` 逐字追加，`_on_done`
+    也不重排，所以 `**加粗**`、`| 表格 |`、三反引号代码块全是原文照贴。
+    这里盯四件事：markdown 真的变成标签、流式那遍纯文本被抹干净、表格列宽
+    按内容分、粘贴的三条路径（图 / 文件 / 网页表格）都接得住。
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from gui import chat_render as CR
+
+    try:
+        # 1) 解析：每种块都要认出来
+        md = (
+            "## 结论\n\n螺纹**不适合**追多，`mom_20` 掉到 0.31。\n\n"
+            "- 第一条\n- 第二条\n\n"
+            "| 参数 | 值 | 说明 |\n|---|---|---|\n| fast | 50 | 短均线 |\n| ic | -0.031 | 滚动 |\n\n"
+            "> 注意方向\n\n```python\ndef f_x(df):\n    return 1\n```\n\n---\n\n"
+            "[手册](https://example.com/m)\n"
+        )
+        kinds = [b["type"] for b in CR.parse(md)]
+        check("渲染：块类型齐全",
+              kinds == ["head", "text", "list", "table", "quote", "code", "hr", "text"],
+              str(kinds))
+
+        # 2) 表格：列数对得上，数字列右对齐
+        tb = [b for b in CR.parse(md) if b["type"] == "table"][0]
+        check("渲染：表格行数", len(tb["rows"]) == 2, str(tb["rows"]))
+        check("渲染：数字列右对齐", tb["align"] == ["l", "r", "l"], str(tb["align"]))
+
+        # 3) 渲染：markdown 记号不能留在正文里
+        html = CR.render(CR.parse(md))
+        plain = re.sub(r"<[^>]+>", "", html)
+        check("渲染：没有残留 ** 记号", "**" not in plain, plain[:30])
+        check("渲染：粗体成了标签", "font-weight:700" in html, "")
+        check("渲染：表格是 <table>", "<table" in html, "")
+        check("渲染：代码块是 <pre>", "<pre" in html, "")
+        check("渲染：链接保留 href", 'href="https://example.com/m"' in html, "")
+        check("渲染：转义了尖括号", "&lt;" in CR.inline("a < b") and "<b>" not in CR.inline("a < b"), "")
+
+        # 4) 列宽：必须写在每个 td 上 —— 只写 th 的话 Qt 不认（踩过）
+        cell = CR.block_table(["参数", "值"], [["fast", "50"], ["slow", "200"]])
+        h = CR.render([cell])
+        check("渲染：列宽写在 td 上", h.count('width="') >= 4, f"{h.count('width=')} 处")
+
+        # 5) 色条：Qt 只认 td 的 border-left，所以必须拼成窄 td
+        w = CR.render([CR.block_warning("风控", ["买 1 手"], "bad")])
+        check("渲染：告警块用色条单元格",
+              'bgcolor="#b91c1c"' in w and 'bgcolor="#fdeaea"' in w, "")
+        check("渲染：告警块没用 border-left",
+              "border-left" not in w, "")
+
+        # 6) 指标卡片：好坏染色
+        m = CR.render([CR.block_metrics("回测", [("收益", "+38.2%", "good"),
+                                                ("回撤", "-21.4%", "bad")])])
+        check("渲染：指标好坏染色", "#166534" in m and "#b91c1c" in m, "")
+
+        # 7) 认不出的块不能整页空白
+        check("渲染：未知块跳过不崩",
+              CR.render([{"type": "什么鬼"}, CR.block_text("还在")]).count("还在") == 1, "")
+
+        # 8) 剪贴板里的表格（从网页 / Excel / Word 框选复制）转 markdown
+        from gui import agent_page as G
+
+        src = ("<table><tr><th>因子</th><th>IC</th></tr>"
+               "<tr><td>mom_20</td><td>0.031</td></tr></table>")
+        md_tbl = G.html_table_to_md(src)
+        check("粘贴：网页表格转 markdown",
+              md_tbl.startswith("| 因子 | IC |") and "| mom_20 | 0.031 |" in md_tbl, md_tbl[:24])
+        check("粘贴：普通 HTML 不抢", G.html_table_to_md("<p>一段话</p>") == "", "")
+
+        # 9) 界面端到端：流式纯文本 → 收尾换富文本
+        from PySide6.QtWidgets import QApplication
+
+        from ttrade import attachments as ATT
+
+        app = QApplication.instance() or QApplication([])
+        pg = G.AgentPage()
+        try:
+            reply = ("## 结论\n\n螺纹**不适合追多**。\n\n"
+                     "| 参数 | 值 |\n|---|---|\n| fast | 50 |\n")
+            pg.log.clear()
+            pg._stream_buf = ""
+            pg._msg_start = None
+            for i in range(0, len(reply), 7):
+                pg._on_delta(reply[i:i + 7])
+            check("流式：中途是纯文本（不重排，省 CPU）",
+                  "**不适合追多**" in pg.log.toPlainText(), "")
+            pg._on_done(reply)
+            app.processEvents()
+            out = pg.log.toHtml()
+            text = pg.log.toPlainText()
+            check("流式：收尾后没有 ** 记号", "**" not in text, text[:24])
+            check("流式：收尾后有真表格", "<table" in out, "")
+            check("流式：只渲染一份（流式文本被抹掉）", text.count("结论") == 1,
+                  f"结论 x{text.count('结论')}")
+
+            # 10) 追加时必须断开块：`insertHtml` 在段末会把片段首个块并进上一段，
+            #     于是「你」「助手」会粘在上一句后面，`## 结论` 也缩成行内
+            pg.log.clear()
+            pg._append("<p>第一段</p>")
+            pg._append("<p>第二段</p>")
+            check("追加：两段各占一行",
+                  pg.log.toPlainText().splitlines()[:2] == ["第一段", "第二段"],
+                  repr(pg.log.toPlainText()[:20]))
+
+            # 11) 出错也要留下半截 + 红块
+            pg2 = G.AgentPage()
+            pg2._stream_buf = ""
+            pg2._msg_start = None
+            pg2._on_delta("说到一半")
+            pg2._on_failed("连接超时")
+            app.processEvents()
+            h2 = pg2.log.toHtml()
+            check("流式：出错保留半截并标红",
+                  "说到一半" in pg2.log.toPlainText() and "#fdeaea" in h2, "")
+            pg2.shutdown()
+
+            # 11) 输入框：粘贴截图 / 文件 / 网页表格三条路径
+            check("输入框：是 ChatInput", isinstance(pg.ed_input, G.ChatInput), "")
+
+            from PySide6.QtCore import QMimeData, QUrl
+            from PySide6.QtGui import QColor, QImage
+
+            mi = QMimeData()
+            img = QImage(320, 200, QImage.Format_ARGB32)
+            img.fill(QColor("#3366cc"))
+            mi.setImageData(img)
+            pg.ed_input.insertFromMimeData(mi)
+            app.processEvents()
+            check("输入框：粘贴截图进附件条",
+                  len(pg._atts) == 1 and pg._atts[0].kind == "image",
+                  f"{len(pg._atts)} 个")
+
+            mf = QMimeData()
+            here = os.path.abspath("requirements.txt")
+            mf.setUrls([QUrl.fromLocalFile(here)])
+            pg.ed_input.insertFromMimeData(mf)
+            app.processEvents()
+            check("输入框：粘贴文件进附件条",
+                  len(pg._atts) == 2 and pg._atts[1].kind == "text",
+                  f"{len(pg._atts)} 个")
+            check("输入框：附件条显示缩略图",
+                  not pg.att_box.isHidden() and pg.att_lay.count() >= 2, "")
+
+            pg3 = G.AgentPage()
+            mt = QMimeData()
+            mt.setHtml(src)
+            mt.setText("因子\tIC\nmom_20\t0.031")
+            pg3.ed_input.insertFromMimeData(mt)
+            check("输入框：粘贴网页表格转表格文本",
+                  "| mom_20 | 0.031 |" in pg3.ed_input.toPlainText(), "")
+            pg3.shutdown()
+
+            # 12) QImage 直接变附件（不落盘）
+            qa = ATT.from_qimage(img, "截图 1.png")
+            check("附件：QImage 直接转", qa.ok and len(qa.b64) > 200, qa.note)
+        finally:
+            try:
+                pg.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as exc:  # noqa: BLE001
+        check("渲染 / 粘贴", False, f"{type(exc).__name__}: {exc}")
+
+
 def check_portfolio_params() -> None:
     """组合页的设置参数、回测区间，以及因子策略的实时信号。"""
     import os
@@ -4476,6 +4643,7 @@ def main() -> int:
     check_agent_fs()
     check_factor_manual()
     check_agent_attachments()
+    check_chat_render()
     check_portfolio_params()
     check_result_view()
     for k in ks:

@@ -113,11 +113,50 @@ def _load_image(path: str) -> Attachment:
     except Exception as exc:  # noqa: BLE001
         return Attachment(name, path, "bad", note=f"打不开：{exc}")
 
-    note = ""
     try:
         im.seek(0)          # gif 取第一帧，不然后面 save 会拿最后一帧
     except Exception:  # noqa: BLE001
         pass
+    return _pack_image(im, name, path)
+
+
+def from_qimage(qimg, name: str = "截图.png") -> Attachment:
+    """把剪贴板 / 拖放拿到的一张 QImage 变成附件。
+
+    走内存不落盘：`QPixmap` → PNG 字节 → Pillow → 和文件图走同一条缩放/转码路径，
+    这样尺寸上限、透明底铺白、JPEG 85 三个规矩只需要维护一份。
+
+    也不依赖 Qt —— 传进来只要是个有 `save` 的对象就行，方便单测直接喂 Pillow 图。
+    """
+    try:
+        from PIL import Image
+    except Exception:  # noqa: BLE001
+        return Attachment(name, "", "bad", note="没装 Pillow，读不了图片")
+
+    try:
+        if isinstance(qimg, Image.Image):
+            im = qimg.copy()
+        else:
+            from PySide6.QtCore import QBuffer, QByteArray
+
+            buf = QBuffer()
+            buf.open(QBuffer.ReadWrite)
+            if not qimg.save(buf, "PNG"):
+                return Attachment(name, "", "bad", note="这张图存不下来")
+            im = Image.open(io.BytesIO(bytes(buf.data())))
+            im.load()
+            buf.close()
+    except Exception as exc:  # noqa: BLE001
+        return Attachment(name, "", "bad", note=f"读不了这张图：{exc}")
+
+    return _pack_image(im, name, "")
+
+
+def _pack_image(im, name: str, path: str) -> Attachment:
+    """缩到长边 1600、透明底铺白、存成 JPEG。文件图和剪贴板图共用这一段。"""
+    from PIL import Image
+
+    note = ""
     w, h = im.size
     if max(w, h) > MAX_IMAGE_SIDE:
         im.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
