@@ -887,7 +887,54 @@ def _run() -> tuple[bool, list[str]]:
             and win.view_stack.count() == 2
             and win.cb_cost.count() >= 3
         )
-        factor_info = f"{len(fams)} 族 / {len(modes)} 模式 / {n_factors} 因子 / {n_models} 模型"
+
+        # 勾选面板：点一个品种**不能把面板关掉**（`QMenu` 的 checkable action 就会），
+        # 勾选过程中也不能触发重算 —— 一次截面回测几秒，勾 6 个重算 6 遍没法用。
+        # 早先那版就是栽在这两条上，用户的原话是「点完一个这个页面就推出去」。
+        pick_ok = False
+        pick_info = ""
+        try:
+            from gui.pickers import SymbolPicker
+
+            pk = SymbolPicker("自检", win)
+            pk.move(10, 10)
+            pk.show()
+            app.processEvents()
+            pk.set_items([
+                {"key": "A_SHFE", "label": "A", "exchange": "SHFE"},
+                {"key": "B_SHFE", "label": "B", "exchange": "SHFE"},
+                {"key": "C_DCE", "label": "C", "exchange": "DCE"},
+            ], keep=["A_SHFE"])
+            hits: list[int] = []
+            pk.changed.connect(lambda: hits.append(1))
+            pk._toggle()
+            app.processEvents()
+            opened = pk._panel.isVisible()
+            pk._panel._boxes["B_SHFE"].setChecked(True)
+            app.processEvents()
+            still_open = pk._panel.isVisible()
+            picked = pk.selected()
+            during = len(hits)
+            pk._panel.hide()
+            app.processEvents()
+            after = len(hits)
+            pk._panel._toggle_group([{"key": "C_DCE", "label": "C", "exchange": "DCE"}])
+            group_sel = pk.selected()
+            pk._panel._set_all(True)
+            all_n = len(pk.selected())
+            pk._panel._set_all(False)
+            pick_ok = (opened and still_open and during == 0 and after == 1
+                       and picked == ["A_SHFE", "B_SHFE"]
+                       and group_sel == ["A_SHFE", "B_SHFE", "C_DCE"]
+                       and all_n == 3 and not pk.selected())
+            pick_info = (f"打开={opened} 勾选中不关={still_open} "
+                         f"勾选中触发={during} 关闭后触发={after}")
+            pk.deleteLater()
+        except Exception as exc:  # noqa: BLE001
+            pick_info = f"{type(exc).__name__}: {exc}"
+        factor_ok = factor_ok and pick_ok
+        factor_info = (f"{len(fams)} 族 / {len(modes)} 模式 / {n_factors} 因子 / "
+                       f"{n_models} 模型 / 勾选 {pick_info}")
 
         # 因子分析页：表格应铺满全因子，四格图应建出 4 个轴
         win.tabs.setCurrentIndex(2)

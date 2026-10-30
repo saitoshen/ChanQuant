@@ -599,6 +599,45 @@ class FactorWorker(QObject):
         self.done.emit(out)
 
 
+class CrossWorker(QObject):
+    """在后台线程里跑截面回测。
+
+    单因子 / 多因子几十毫秒，同步算完就行；机器学习要跑几十折 walk-forward，
+    6 个品种 × 十年 5 分钟能跑几分钟 —— 放主线程窗口直接假死，连取消都点不动。
+    统一走线程能少一套分支。
+    """
+
+    progress = Signal(int, int, str)   # done, total, message
+    done = Signal(object)              # CrossResult
+    failed = Signal(str)
+
+    def __init__(self, frames: dict, cfg, bt, profile: str, label: str) -> None:
+        super().__init__()
+        self.frames = frames
+        self.cfg = cfg
+        self.bt = bt
+        self.profile = profile
+        self.label = label
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        cb = lambda d, t, m: self.progress.emit(d, t, m)  # noqa: E731
+        try:
+            out = cross_engine.run(
+                self.frames, self.cfg, self.bt, profile=self.profile,
+                label=self.label, progress=cb, cancel=lambda: self._cancel,
+            )
+        except fstrat.Cancelled:
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.done.emit(out)
+
+
 # ------------------------------------------------------------------ 主窗口
 class MainWindow(QMainWindow):
     # 回测算完了：把结论摊成纯文本推给 Agent 页右下角的「运行输出」。
@@ -653,6 +692,11 @@ class MainWindow(QMainWindow):
         # "Internal C++ object already deleted"。用一个标志把它们挡在门外。
         self._closing = False
         self._f_applied = -1              # 已落地的结果序号，防止同一结果重复应用
+        # 截面机器学习同理：几十折 walk-forward 不能放主线程
+        self._c_thread: QThread | None = None
+        self._c_worker: CrossWorker | None = None
+        self._c_seq = 0
+        self._c_applied = -1
 
         # 实时与交易
         self._live_base: pd.DataFrame | None = None   # 订阅时的本地历史，实时段接在它后面
@@ -1130,18 +1174,35 @@ class MainWindow(QMainWindow):
         )
         pc.addWidget(self.sp_cross_reb)
 
+        pc.addWidget(self._section("多空腿数"))
+        # 多空各选百分之几。早先是一个「选最强的 X%」同时管两头 —— 对称写法
+        # 常见，但「多最强的 10%、空最弱的 20%」也讲得通（下跌时弱者更弱），
+        # 而且用户看不出来空头到底选了多少
         self.sp_cross_pct = QDoubleSpinBox()
         self.sp_cross_pct.setRange(1.0, 50.0)
         self.sp_cross_pct.setDecimals(1)
         self.sp_cross_pct.setSingleStep(1.0)
         self.sp_cross_pct.setValue(10.0)
-        self.sp_cross_pct.setPrefix("选最强的 ")
+        self.sp_cross_pct.setPrefix("多最强的 ")
         self.sp_cross_pct.setSuffix(" %")
         self.sp_cross_pct.setToolTip(
-            "多最强的 top X%（空最弱的 bottom X%）。6 个品种、10% 就是各 1 个；\n"
-            "品种少的时候至少算 1 个。"
+            "多头腿：选截面分数最高的 top X%。6 个品种、10% 就是 1 个；\n"
+            "品种少的时候至少算 1 个，最多不超过有效品种数的一半。"
         )
         pc.addWidget(self.sp_cross_pct)
+
+        self.sp_cross_bot = QDoubleSpinBox()
+        self.sp_cross_bot.setRange(1.0, 50.0)
+        self.sp_cross_bot.setDecimals(1)
+        self.sp_cross_bot.setSingleStep(1.0)
+        self.sp_cross_bot.setValue(10.0)
+        self.sp_cross_bot.setPrefix("空最弱的 ")
+        self.sp_cross_bot.setSuffix(" %")
+        self.sp_cross_bot.setToolTip(
+            "空头腿：选截面分数最低的 bottom X%。\n"
+            "多空两边各自平分 50% 的名义额，所以腿数不同也不会产生净敞口。"
+        )
+        pc.addWidget(self.sp_cross_bot)
 
         self.cb_cross_w = QComboBox()
         for key, label, tip in CROSS_WEIGHTS:
@@ -1158,6 +1219,16 @@ class MainWindow(QMainWindow):
             self.cb_timing.setItemData(
                 self.cb_timing.count() - 1, tip, Qt.ToolTipRole)
         pc.addWidget(self.cb_timing)
+
+        # 时序腿的因子用**独立**的下拉：截面因子那边可能已经占了单因子下拉，
+        # 共用一个的话「截面用动量、时序用反转」这种配置根本表达不出来
+        self.lbl_tfactor = QLabel("时序因子")
+        self.lbl_tfactor.setObjectName("SectionTitle")
+        pc.addWidget(self.lbl_tfactor)
+        self.cb_tfactor = QComboBox()
+        self.cb_tfactor.setToolTip("这条时序腿用哪个因子决定开平（分数过阈值进出场）")
+        self._fill_tfactor_combo()
+        pc.addWidget(self.cb_tfactor)
 
         self.lbl_cross_hint = QLabel("")
         self.lbl_cross_hint.setObjectName("Hint")
@@ -1578,8 +1649,10 @@ class MainWindow(QMainWindow):
             self.cb_cross_mode.currentIndexChanged.connect(self._on_cross_mode_changed)
             self.sp_cross_reb.valueChanged.connect(self._on_cross_param_changed)
             self.sp_cross_pct.valueChanged.connect(self._on_cross_param_changed)
+            self.sp_cross_bot.valueChanged.connect(self._on_cross_param_changed)
             self.cb_cross_w.currentIndexChanged.connect(self._on_cross_param_changed)
             self.cb_timing.currentIndexChanged.connect(self._on_timing_changed)
+            self.cb_tfactor.currentIndexChanged.connect(self._on_timing_changed)
             self.sym_pick.changed.connect(self._on_pick_changed)
             self.cb_fmode.currentIndexChanged.connect(self._on_fmode_changed)
             self.cb_filter_mode.currentIndexChanged.connect(self._on_fmode_changed)
@@ -1612,9 +1685,16 @@ class MainWindow(QMainWindow):
 
     def _fill_single_combo(self) -> None:
         """重建单因子下拉。注册了新因子之后要重来一遍，否则选不到它。"""
-        keep = self.cb_fsingle.currentData()
-        self.cb_fsingle.blockSignals(True)
-        self.cb_fsingle.clear()
+        self._fill_factor_combo(self.cb_fsingle, factors.DEFAULT_SINGLE)
+
+    def _fill_tfactor_combo(self) -> None:
+        """重建「时序因子」下拉（截面选品种模式的那条腿）。"""
+        self._fill_factor_combo(self.cb_tfactor, factors.DEFAULT_SINGLE)
+
+    def _fill_factor_combo(self, combo: QComboBox, default: str) -> None:
+        keep = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
         for cat in factors.CATEGORIES:
             keys = [k for k, s in factors.FACTORS.items() if s.category == cat]
             if not keys:
@@ -1622,12 +1702,12 @@ class MainWindow(QMainWindow):
             for i, k in enumerate(keys):
                 spec = factors.FACTORS[k]
                 text = f"{cat} · {spec.label}" if i == 0 else f"　　{spec.label}"
-                self.cb_fsingle.addItem(text, k)
-        target = keep if self.cb_fsingle.findData(keep) >= 0 else factors.DEFAULT_SINGLE
-        idx = self.cb_fsingle.findData(target)
+                combo.addItem(text, k)
+        target = keep if combo.findData(keep) >= 0 else default
+        idx = combo.findData(target)
         if idx >= 0:
-            self.cb_fsingle.setCurrentIndex(idx)
-        self.cb_fsingle.blockSignals(False)
+            combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
 
     def _fill_strategy_combo(self) -> None:
         """重建规则策略下拉。注册了新策略之后要重来一遍，否则选不到它。
@@ -1663,6 +1743,7 @@ class MainWindow(QMainWindow):
         当前选中的正好是被删的那个时，重建后自然落到第一项。
         """
         self._fill_single_combo()
+        self._fill_tfactor_combo()
         self._fill_multi_table()
 
     def _on_strategy_removed(self, _key: str) -> None:
@@ -1714,6 +1795,7 @@ class MainWindow(QMainWindow):
     def _on_factor_added(self, key: str) -> None:
         """Agent 注册了新因子：两个因子控件都得重建，然后选中它。"""
         self._fill_single_combo()
+        self._fill_tfactor_combo()
         self._fill_multi_table()
         idx = self.cb_fsingle.findData(key)
         if idx >= 0:
@@ -2051,6 +2133,9 @@ class MainWindow(QMainWindow):
 
     def _on_family_changed(self) -> None:
         self.family = self.cb_family.currentData() or FAMILY_RULE
+        if self.family != FAMILY_CROSS:
+            # 切走之后还在后台跑的那条截面 ML 不该再把结果挂回来
+            self._cancel_cross_worker()
         self._sync_family_panels()
         self._schedule(immediate=True)
 
@@ -2071,7 +2156,8 @@ class MainWindow(QMainWindow):
         timing = self._timing_family() if (is_cross and mode == "select") else ""
         self.box_cross.setVisible(is_cross)
         self.box_rule.setVisible(is_rule or (is_cross and timing == "rule"))
-        self.box_factor.setVisible(is_factor or (is_cross and timing == "factor"))
+        # 截面策略**总是**要用因子（强弱靠它排），所以因子面板一直显示
+        self.box_factor.setVisible(is_factor or is_cross)
         self.box_filter.setVisible(is_rule)
         self._sync_cross_controls()
         self._sync_factor_panel()
@@ -2096,13 +2182,20 @@ class MainWindow(QMainWindow):
         mode = self._cross_mode()
         # 「时序策略」只对选品种模式有意义，截面对冲没有单腿进出场这回事
         on = self.family == FAMILY_CROSS and mode == "select"
+        timing_factor = on and self._timing_family() == "factor"
         for w in (self.lbl_cross_timing, self.cb_timing):
             w.setVisible(on)
+        for w in (self.lbl_tfactor, self.cb_tfactor):
+            w.setVisible(timing_factor)
+        # 只做多时没有空头腿，那个百分比控件摆着只会让人以为它有用
+        self.sp_cross_bot.setVisible(not self.cfg.long_only)
         if self.family != FAMILY_CROSS:
             return
         n = len(sel)
-        legs = int(round(n * float(self.sp_cross_pct.value()) / 100.0)) if n else 0
-        legs = max(1, legs) if n else 0
+        pct_l = float(self.sp_cross_pct.value())
+        pct_s = float(self.sp_cross_bot.value())
+        legs_l = max(1, int(round(n * pct_l / 100.0))) if n else 0
+        legs_s = max(1, int(round(n * pct_s / 100.0))) if n else 0
         if n < cross_engine.MIN_CROSS:
             self.lbl_cross_hint.setText(
                 f"截面策略至少要 {cross_engine.MIN_CROSS} 个品种，现在选了 {n} 个。"
@@ -2110,12 +2203,12 @@ class MainWindow(QMainWindow):
             )
         elif mode == "hedge":
             self.lbl_cross_hint.setText(
-                f"{n} 个品种，每次调仓多 {legs} 个、空 {legs} 个，"
-                f"多空各占一半名义。"
+                f"{n} 个品种，每次调仓多最强的 {legs_l} 个、"
+                + ("只做多。" if self.cfg.long_only else f"空最弱的 {legs_s} 个。")
             )
         else:
             self.lbl_cross_hint.setText(
-                f"{n} 个品种，每次调仓挑出最强的 {legs} 个，"
+                f"{n} 个品种，每次调仓挑出最强的 {legs_l} 个，"
                 "再由时序策略决定每个品种是多是空还是空仓。"
             )
 
@@ -2181,35 +2274,42 @@ class MainWindow(QMainWindow):
     def _sync_cross_factor_panel(self) -> None:
         """截面模式下的因子面板。
 
-        **截面因子**永远走「多因子」那一套：横截面 Z-score 之后等权平均，单个
-        因子没有「排序」可言。所以多因子表格一直显示。
+        截面因子和时序因子一样有**三种**模式：单因子 / 多因子 / 机器学习。
+        机器学习在截面上尤其对路 —— 它学的就是「同期谁比谁强」，正好是截面
+        策略要的那个排序。
 
-        **时序腿**如果选了因子，用单因子下拉（`cb_fsingle`）—— 它是另一组控件，
-        和截面因子互不覆盖。两条腿用同一张表的话，改截面因子会顺手改掉时序信号，
-        调参根本分不清是谁在起作用。
+        时序腿（选品种模式）用**另一组**控件（`cb_tfactor`），和截面因子互不
+        覆盖：两条腿共用一份选择的话，「截面用动量、时序用反转」这种配置根本
+        表达不出来，改一个还会顺手改掉另一个。
         """
-        self.factor_mode = "multi"
+        self.factor_mode = self.cb_fmode.currentData() or "multi"
+        single = self.factor_mode == "single"
         self.box_fsel.setVisible(True)
-        self.lbl_fsel.setText("截面因子（横截面 Z-score 后等权）")
-        self.box_fsingle.setVisible(
-            self._cross_mode() == "select" and self._timing_family() == "factor"
-        )
-        self.tbl_fmulti.setVisible(True)
-        self.box_fbtns.setVisible(True)
-        self.lbl_fmodel.setVisible(False)
-        self.cb_fmodel.setVisible(False)
-        self.cb_forient.setVisible(True)
-        self.lbl_fmode.setText("")
+        self.lbl_fsel.setText("截面因子")
+        self.box_fsingle.setVisible(single)
+        self.tbl_fmulti.setVisible(not single)
+        self.box_fbtns.setVisible(not single)
+        is_ml = self.factor_mode == "ml"
+        self.lbl_fmodel.setVisible(is_ml)
+        self.cb_fmodel.setVisible(is_ml)
+        self.cb_forient.setVisible(not is_ml)
+        if single:
+            self._sync_single_rev()
         self._rebuild_fparams()
-        self._sync_single_rev()
+        if is_ml and not mlmodels.available():
+            self.lbl_fmode.setText("当前环境没有可用的机器学习库，请先安装依赖。")
+        else:
+            self._refresh_fmode_hint()
 
     def _refresh_fmode_hint(self) -> None:
-        if self.family != FAMILY_FACTOR:
+        if self.family not in (FAMILY_FACTOR, FAMILY_CROSS):
             self.lbl_fmode.setText("")
             return
         for key, _label, tip in FACTOR_MODES:
             if key == self.factor_mode:
-                self.lbl_fmode.setText(tip)
+                self.lbl_fmode.setText(
+                    ("截面：" + tip) if self.family == FAMILY_CROSS else tip
+                )
                 break
 
     def _check_all_factors(self, on: bool) -> None:
@@ -2412,7 +2512,7 @@ class MainWindow(QMainWindow):
             sym, ex = skey, ""
         is_factor = self.family == FAMILY_FACTOR
         is_cross = self.family == FAMILY_CROSS
-        fc = self._factor_cfg() if is_factor else None
+        fc = self._factor_cfg() if (is_factor or is_cross) else None
         return SStore.StrategyConfig(
             name=self.ed_cfg_name.text().strip(),
             symbol=sym,
@@ -2421,7 +2521,7 @@ class MainWindow(QMainWindow):
             family=self.family,
             rule_key=self.cb_strategy.currentData() or "",
             rule_params=self._current_params(),
-            factor_mode=("multi" if is_cross else self.factor_mode) if (is_factor or is_cross) else "",
+            factor_mode=self.factor_mode if (is_factor or is_cross) else "",
             factor_keys=self._selected_factor_keys() if (is_factor or is_cross) else [],
             factor_reverse={k: True for k in self._reversed_factor_keys()},
             factor_cfg=dict(vars(fc)) if fc is not None else {},
@@ -2436,17 +2536,18 @@ class MainWindow(QMainWindow):
             range_years=float(self.cb_range.currentData() or 0),
             cost_profile=(self.cb_cost.currentData() or "") if self.market == "cn" else "",
             cross_symbols=list(self.sym_pick.selected()) if hasattr(self, "sym_pick") else [],
-            cross_mode=self.cb_cross_mode.currentData() or "hedge",
+            cross_mode=self._cross_mode(),
             cross_rebalance=int(self.sp_cross_reb.value()),
             cross_top_pct=float(self.sp_cross_pct.value()),
+            cross_bot_pct=float(self.sp_cross_bot.value()),
             cross_weight=self.cb_cross_w.currentData() or "equal",
             timing_family=self._timing_family(),
             timing_rule_key=self.cb_strategy.currentData() or "",
             timing_rule_params=self._current_params(),
             timing_factor_mode="single",
-            timing_factor_keys=[self.cb_fsingle.currentData()] if self.cb_fsingle.currentData() else [],
+            timing_factor_keys=[self.cb_tfactor.currentData()] if self.cb_tfactor.currentData() else [],
             timing_factor_reverse={k: True for k in self._reversed_factor_keys()},
-            timing_factor_cfg=dict(vars(self._factor_cfg())),
+            timing_factor_cfg=dict(vars(fc)) if fc is not None else {},
         )
 
     def apply_config(self, cfg: SStore.StrategyConfig) -> None:
@@ -2510,13 +2611,18 @@ class MainWindow(QMainWindow):
                 self.cb_cross_mode.setCurrentIndex(cm)
             self.sp_cross_reb.setValue(max(1, int(cfg.cross_rebalance or 5)))
             self.sp_cross_pct.setValue(float(cfg.cross_top_pct or 10.0))
+            self.sp_cross_bot.setValue(float(getattr(cfg, "cross_bot_pct", 0) or 10.0))
             cw = self.cb_cross_w.findData(cfg.cross_weight or "equal")
             if cw >= 0:
                 self.cb_cross_w.setCurrentIndex(cw)
             tf = self.cb_timing.findData(cfg.timing_family or "rule")
             if tf >= 0:
                 self.cb_timing.setCurrentIndex(tf)
+            fm = self.cb_fmode.findData(cfg.factor_mode or "multi")
+            if fm >= 0:
+                self.cb_fmode.setCurrentIndex(fm)     # 重建因子参数控件
             self._apply_factor_keys(cfg.factor_keys, cfg.factor_reverse)
+            self._apply_factor_cfg(cfg.factor_cfg)
             # 时序腿的规则参数在 `timing_rule_params` 里，和主规则参数是两套：
             # 截面对冲时用户可能在两个模式下调过不同的参数
             tk = self.cb_strategy.findData(cfg.timing_rule_key or cfg.rule_key)
@@ -2531,9 +2637,9 @@ class MainWindow(QMainWindow):
                         continue
             tk = cfg.timing_factor_keys or []
             if tk:
-                i = self.cb_fsingle.findData(tk[0])
+                i = self.cb_tfactor.findData(tk[0])
                 if i >= 0:
-                    self.cb_fsingle.setCurrentIndex(i)
+                    self.cb_tfactor.setCurrentIndex(i)
             self._sync_cross_controls()
 
         self.chk_short.setChecked(cfg.note == "short")
@@ -3005,6 +3111,29 @@ class MainWindow(QMainWindow):
         )
         self._publish_port(res, head, period, bpy)
 
+    def _pick_usable_single(self, key: str, frames: dict) -> list[str]:
+        """单因子模式：选中的因子在这批品种上算不出数，就换一个能算的。
+
+        日内因子放到日线上、展期/期权因子放到没有这些列的品种上，结果全是 NaN。
+        单因子只取一个，碰上这种就只剩一句「这些因子都没有数据」，用户还得从四
+        十个因子里猜哪个能用 —— 直接换成第一个算得出来的，下拉里同步过去。
+        """
+        if key and any(factors.available(df, key) for df in frames.values()):
+            return [key]
+        alt = next((k for k in factors.FACTORS
+                    if any(factors.available(df, k) for df in frames.values())), "")
+        if not alt:
+            return [key] if key else []
+        old = factors.FACTORS[key].label if key in factors.FACTORS else key
+        self.cb_fsingle.blockSignals(True)
+        idx = self.cb_fsingle.findData(alt)
+        if idx >= 0:
+            self.cb_fsingle.setCurrentIndex(idx)
+        self.cb_fsingle.blockSignals(False)
+        self.lbl_status.setText(
+            f"单因子「{old}」在这个周期上没有数据，已改用「{factors.FACTORS[alt].label}」")
+        return [alt]
+
     def _run_cross(self) -> None:
         """截面策略：一批品种一起排强弱，多强的空弱的（或选出强的再走时序）。"""
         keys = self.sym_pick.selected() if hasattr(self, "sym_pick") else []
@@ -3029,23 +3158,31 @@ class MainWindow(QMainWindow):
         if not fkeys:
             self.lbl_status.setText("截面策略要先选因子 —— 横截面强弱靠它排序")
             return
+        if self.factor_mode == "ml" and len(fkeys) < 2:
+            self.lbl_status.setText("机器学习截面至少需要勾选 2 个因子")
+            return
+        if self.factor_mode == "single":
+            fkeys = self._pick_usable_single(fkeys[0], frames)
         rev = {k: True for k in self._reversed_factor_keys()}
+        fc = self._factor_cfg()
         ccfg = cross_engine.CrossConfig(
-            mode=self.cb_cross_mode.currentData() or "hedge",
+            mode=self._cross_mode(),
             rebalance=int(self.sp_cross_reb.value()),
             top_pct=float(self.sp_cross_pct.value()),
+            bot_pct=float(self.sp_cross_bot.value()),
             long_only=self.cfg.long_only,
             weight=self.cb_cross_w.currentData() or "equal",
-            factor_mode="multi",
+            factor_mode=self.factor_mode,
             factor_keys=fkeys,
             factor_reverse=rev,
+            factor_cfg=dict(vars(fc)),
             timing_family=self._timing_family(),
             timing_rule_key=self.cb_strategy.currentData() or "",
             timing_rule_params=self._current_params(),
             timing_factor_mode="single",
-            timing_factor_keys=[self.cb_fsingle.currentData()] if self.cb_fsingle.currentData() else [],
+            timing_factor_keys=[self.cb_tfactor.currentData()] if self.cb_tfactor.currentData() else [],
             timing_factor_reverse=rev,
-            timing_factor_cfg=dict(vars(self._factor_cfg())),
+            timing_factor_cfg=dict(vars(fc)),
         )
         if ccfg.mode == "select" and ccfg.timing_family == "factor" and not ccfg.timing_factor_keys:
             self.lbl_status.setText("时序腿选了「因子」，但没选时序因子")
@@ -3057,7 +3194,14 @@ class MainWindow(QMainWindow):
         self._apply_sizing(bt)
 
         mode_cn = "截面对冲" if ccfg.mode == "hedge" else "截面选品种"
-        label = (f"{mode_cn} · {len(frames)} 品种 · 每 {ccfg.step()} 根调仓")
+        fcn = {"single": "单因子", "multi": "多因子", "ml": "机器学习"}.get(
+            ccfg.factor_mode, ccfg.factor_mode)
+        label = (f"{mode_cn} · {fcn} · {len(frames)} 品种 · 每 {ccfg.step()} 根调仓")
+
+        if ccfg.factor_mode == "ml":
+            self._start_cross_worker(frames, ccfg, bt, label, period)
+            return
+
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             out = cross_engine.run(frames, ccfg, bt,
@@ -3069,7 +3213,11 @@ class MainWindow(QMainWindow):
             self._clear_chart(f"截面回测失败：{exc}")
             return
         QApplication.restoreOverrideCursor()
+        self._finish_cross(out, label, ccfg, frames, period, bt, missing)
 
+    def _finish_cross(self, out, label: str, ccfg, frames: dict, period: str,
+                      bt: BacktestConfig, missing: list[str]) -> None:
+        """截面回测收尾：包成 `Result` 挂到组合视图上。同步和线程两条路共用。"""
         if not out.ok:
             self._show_single_view()
             self._clear_chart(f"截面回测失败：{out.error or '没有算出净值'}")
@@ -3096,8 +3244,84 @@ class MainWindow(QMainWindow):
             f" · 调仓 {m['n_trades']} 次"
             + (f"　缺：{'、'.join(missing)}" if missing else "")
         )
-        self._publish_port(res, f"{mode_cn}（{len(frames)} 个品种）", period,
-                           bt.bars_per_year)
+        self._publish_port(res, label, period, bt.bars_per_year)
+
+    def _start_cross_worker(self, frames, ccfg, bt, label: str, period: str) -> None:
+        """截面机器学习走后台线程。已经在跑的先取消，避免旧结果盖掉新结果。"""
+        self._cancel_cross_worker()
+        self._c_seq += 1
+        seq = self._c_seq
+
+        worker = CrossWorker(frames, ccfg, bt,
+                             self.cb_cost.currentData() or None, label)
+        # 收尾要用的上下文挂在 worker 上，靠 `sender()` 取回来。**不能**用
+        # `connect(lambda ...)` 把 seq/上下文带过去：lambda 没有 QObject 接收者，
+        # PySide 会当成直连，`done` 于是在**工作线程**里直接跑 `_finish_cross`，
+        # 一碰控件就是 "Internal C++ object already deleted" / 随机崩溃
+        worker.seq = seq
+        worker.ctx = (ccfg, frames, period, bt)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_cross_progress)
+        worker.done.connect(self._on_cross_done)
+        worker.failed.connect(self._on_cross_failed)
+        worker.done.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+
+        self._c_worker, self._c_thread = worker, thread
+        self._show_port_view()
+        self.lbl_status.setText(
+            f"{label}：正在滚动训练（{len(frames)} 个品种，"
+            f"{ccfg.factor_cfg.get('train_window', 500)} 交易日窗口）…"
+        )
+        thread.start()
+
+    def _cancel_cross_worker(self) -> None:
+        if self._c_worker is not None:
+            self._c_worker.cancel()
+            for sig in (self._c_worker.done, self._c_worker.failed,
+                        self._c_worker.progress):
+                try:
+                    sig.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+        thread = self._c_thread
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait(4000)
+            except RuntimeError:
+                pass
+        self._c_worker = None
+        self._c_thread = None
+
+    def _on_cross_progress(self, done: int, total: int, msg: str) -> None:
+        self.lbl_status.setText(f"截面机器学习：{msg}（共 {total} 折）")
+
+    def _on_cross_done(self, out) -> None:
+        # 上下文从发信号的 worker 上取（见 `_start_cross_worker` 里的说明）
+        w = self.sender()
+        seq = int(getattr(w, "seq", -1))
+        ccfg, frames, period, bt = getattr(w, "ctx", (None, {}, "", None))
+        self._c_worker = None
+        self._c_thread = None
+        if self._closing or seq != self._c_seq or seq == self._c_applied:
+            return
+        self._c_applied = seq
+        self._finish_cross(out, out.label, ccfg, frames, period, bt, [])
+
+    def _on_cross_failed(self, msg: str) -> None:
+        w = self.sender()
+        seq = int(getattr(w, "seq", -1))
+        self._c_worker = None
+        self._c_thread = None
+        if self._closing or seq != self._c_seq:
+            return
+        self._show_single_view()
+        self._clear_chart(f"截面机器学习失败：{msg}")
 
     def _cross_result(self, out, label: str, step: int, bpy: float):
         """把 `CrossResult` 包成 `Result`（细节在 `cross.to_result`）。"""
@@ -3123,12 +3347,15 @@ class MainWindow(QMainWindow):
         seq = self._f_seq
 
         worker = FactorWorker(df, self.factor_mode, keys, cfg, rule_signal)
+        # 同 `_start_cross_worker`：seq 挂在 worker 上，别用 lambda 带过去 ——
+        # 那种连法是直连，收尾会在工作线程里跑，一碰控件就崩
+        worker.seq = seq
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_factor_progress)
-        worker.done.connect(lambda out, s=seq: self._on_factor_done(out, s))
-        worker.failed.connect(lambda msg, s=seq: self._on_factor_failed(msg, s))
+        worker.done.connect(self._on_factor_done)
+        worker.failed.connect(self._on_factor_failed)
         worker.done.connect(thread.quit)
         worker.failed.connect(thread.quit)
         thread.finished.connect(thread.deleteLater)
@@ -3166,7 +3393,8 @@ class MainWindow(QMainWindow):
     def _on_factor_progress(self, done: int, total: int, msg: str) -> None:
         self.lbl_status.setText(f"{msg}（共 {total} 折）")
 
-    def _on_factor_done(self, out, seq: int) -> None:
+    def _on_factor_done(self, out) -> None:
+        seq = int(getattr(self.sender(), "seq", -1))
         self._f_worker = None
         self._f_thread = None
         if self._closing or seq != self._f_seq or seq == self._f_applied:
@@ -3174,7 +3402,8 @@ class MainWindow(QMainWindow):
         self._f_applied = seq
         self._apply_outcome(out, None)
 
-    def _on_factor_failed(self, msg: str, seq: int) -> None:
+    def _on_factor_failed(self, msg: str) -> None:
+        seq = int(getattr(self.sender(), "seq", -1))
         self._f_worker = None
         self._f_thread = None
         if self._closing or seq != self._f_seq:
@@ -3593,6 +3822,7 @@ class MainWindow(QMainWindow):
         self._closing = True
         self.data_page.shutdown()
         self._cancel_factor_worker()
+        self._cancel_cross_worker()
         # 组合页每条账户连接一个 QThread，窗口关掉时线程还在跑 wait_update
         # 会让解释器退出时崩在 TqApi 上。这里等它们真的停下来再放行。
         self.portfolio_page.shutdown()

@@ -347,11 +347,13 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
         mode=getattr(cfg, "cross_mode", "hedge") or "hedge",
         rebalance=max(1, int(getattr(cfg, "cross_rebalance", 5) or 5)),
         top_pct=float(getattr(cfg, "cross_top_pct", 10.0) or 10.0),
+        bot_pct=float(getattr(cfg, "cross_bot_pct", 10.0) or 10.0),
         long_only=bt.long_only,
         weight=getattr(cfg, "cross_weight", "equal") or "equal",
-        factor_mode="multi",
+        factor_mode=getattr(cfg, "factor_mode", "multi") or "multi",
         factor_keys=list(getattr(cfg, "factor_keys", []) or []),
         factor_reverse=dict(getattr(cfg, "factor_reverse", {}) or {}),
+        factor_cfg=dict(getattr(cfg, "factor_cfg", {}) or {}),
         timing_family=getattr(cfg, "timing_family", "rule") or "rule",
         timing_rule_key=getattr(cfg, "timing_rule_key", "") or "",
         timing_rule_params=dict(getattr(cfg, "timing_rule_params", {}) or {}),
@@ -361,7 +363,9 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
         timing_factor_cfg=dict(getattr(cfg, "timing_factor_cfg", {}) or {}),
     )
     mode_cn = "截面对冲" if ccfg.mode == "hedge" else "截面选品种"
-    label = f"{mode_cn} · {len(frames)} 品种 · 每 {ccfg.step()} 根调仓"
+    fcn = {"single": "单因子", "multi": "多因子", "ml": "机器学习"}.get(
+        ccfg.factor_mode, ccfg.factor_mode)
+    label = f"{mode_cn} · {fcn} · {len(frames)} 品种 · 每 {ccfg.step()} 根调仓"
     out = cross_engine.run(frames, ccfg, bt,
                            profile=getattr(cfg, "cost_profile", "") or None,
                            label=label)

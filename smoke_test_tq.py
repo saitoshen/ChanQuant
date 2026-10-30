@@ -1215,7 +1215,8 @@ def check_strategy_store() -> None:
             name="截面测试", symbol="CU", exchange="SHFE", period="5m",
             family="cross", cross_symbols=["CU_SHFE", "RB_SHFE", "M_DCE"],
             cross_mode="select", cross_rebalance=48, cross_top_pct=25.0,
-            cross_weight="score", factor_keys=["mom_20"],
+            cross_bot_pct=20.0, cross_weight="score", factor_mode="ml",
+            factor_keys=["mom_20"],
             timing_family="factor", timing_rule_key="ma_cross",
             timing_factor_keys=["mom_60"], cost_profile="neutral",
         )
@@ -1223,18 +1224,23 @@ def check_strategy_store() -> None:
         cb = next(c for c in St.load_library() if c.sid == cx.sid)
         check("策略配置：截面字段往返一致",
               (cb.cross_symbols, cb.cross_mode, cb.cross_rebalance,
-               round(cb.cross_top_pct, 1), cb.cross_weight,
+               round(cb.cross_top_pct, 1), round(cb.cross_bot_pct, 1),
+               cb.cross_weight, cb.factor_mode,
                cb.timing_family, cb.timing_factor_keys)
-              == (["CU_SHFE", "RB_SHFE", "M_DCE"], "select", 48, 25.0, "score",
-                  "factor", ["mom_60"]),
+              == (["CU_SHFE", "RB_SHFE", "M_DCE"], "select", 48, 25.0, 20.0,
+                  "score", "ml", "factor", ["mom_60"]),
               str((cb.cross_symbols, cb.cross_mode, cb.cross_rebalance,
-                   cb.cross_top_pct, cb.cross_weight, cb.timing_family)))
+                   cb.cross_top_pct, cb.cross_bot_pct, cb.cross_weight,
+                   cb.factor_mode, cb.timing_family)))
         check("策略配置：截面的标题不写单个品种",
               "CU_SHFE" not in cb.title() and "3 个品种" in cb.strategy_label(),
               cb.title())
-        check("策略配置：截面参数摘要含调仓与 top",
-              "调仓" in cb.params_text() and "top" in cb.params_text(),
+        check("策略配置：截面参数摘要含调仓与多空比例",
+              "调仓" in cb.params_text() and "多25%/空20%" in cb.params_text(),
               cb.params_text())
+        # 多空两条腿的百分比各存各的：多头 25% / 空头 20% 是一种常见配置
+        check("策略配置：截面多空百分比分开记",
+              "多25%/空20%" in cb.params_text(), cb.params_text())
 
         St.save_chase(St.ChaseConfig(enabled=True, wait_sec=3, retries=2, ticks=5))
         c = St.load_chase()
@@ -1346,12 +1352,61 @@ def check_cross() -> None:
     check("截面：品种不够时至少 1 个", cross.CrossConfig(top_pct=50).n_legs(3) == 1,
           str(cross.CrossConfig(top_pct=50).n_legs(3)))
 
+    # 多空两条腿各算各的：多头 10% → 1 个，空头 33% → 2 个。共用一个百分比的话
+    # 「多最强 1 个、空最弱 3 个」这种不对称配置就表达不出来
+    split = cross.CrossConfig(mode="hedge", top_pct=10, bot_pct=33.3)
+    check("截面：多空腿数分开算",
+          (split.n_legs(6), split.n_short_legs(6)) == (1, 2),
+          f"{split.n_legs(6)} 多 / {split.n_short_legs(6)} 空")
+    asym = cross.run(frames, cross.CrossConfig(
+        mode="hedge", rebalance=5, top_pct=16.7, bot_pct=33.3,
+        factor_keys=["mom_20"]), BtConfig())
+    check("截面：不对称多空仍然净敞口为 0",
+          asym.ok and abs(float(asym.weights.iloc[-1].sum())) < 1e-9,
+          "" if not asym.ok else str(float(asym.weights.iloc[-1].sum())))
+    # 最后一根可能刚好是空仓（分数全空），取最近一根有仓位的看腿数
+    held = (asym.weights[asym.weights.abs().sum(axis=1) > 0]
+            if asym.ok else pd.DataFrame())
+    n_l = int(held.iloc[-1].gt(0).sum()) if len(held) else 0
+    n_s = int(held.iloc[-1].lt(0).sum()) if len(held) else 0
+    check("截面：空头腿确实比多头多", (n_l, n_s) == (1, 2), f"{n_l} 多 / {n_s} 空")
+
     score = cross.score_panel(frames, ["mom_20"])
     last = score.iloc[-1].dropna()
     check("截面：分数把最强的排第一", last.idxmax() == "S0_X", str(last.round(2).to_dict()))
     check("截面：分数把最弱的排最后", last.idxmin() == "S5_X", str(last.round(2).to_dict()))
     check("截面：横截面 Z-score 均值约 0", abs(float(last.mean())) < 1e-9,
           str(float(last.mean())))
+
+    # 三种因子模式都要能出分数 —— 单因子 / 多因子 / 机器学习，界面上是同一个
+    # 下拉，后端走的是三条不同的路
+    for m in ("single", "multi"):
+        sc = cross.score_panel(frames, ["mom_20", "mom_60"], mode=m)
+        check(f"截面：{m} 模式出分数", not sc.empty and sc.notna().any().any(),
+              str(sc.shape))
+    # 训练窗口要按样本量缩：默认 500 根起训，这 240 根日线直接判「样本太短」
+    from ttrade import factor_strategy as fstrat
+
+    small = fstrat.FactorConfig(min_train=60, train_window=60, step=40, horizon=1)
+    ml = cross.score_panel(frames, ["mom_20", "mom_60", "ma_gap_20"], mode="ml",
+                           fcfg=small)
+    check("截面：机器学习模式出分数", not ml.empty and ml.notna().any().any(),
+          str(ml.shape))
+    try:
+        cross.score_panel(frames, ["mom_20"], mode="ml", fcfg=small)
+        one_factor_ml = "居然跑通了"
+    except ValueError as exc:
+        one_factor_ml = "" if "至少" in str(exc) else str(exc)
+    check("截面：机器学习至少要 2 个因子", not one_factor_ml, one_factor_ml)
+
+    # 全空因子不能把合成分数毒掉：NaN + x 还是 NaN，十几个因子里混进一个
+    # 展期/期权因子（日线库没有这些列），整张分数面板就会变成空的
+    one = cross.score_panel(frames, ["mom_20"], mode="multi")
+    both = cross.score_panel(frames, ["roll_curv", "mom_20"], mode="multi")
+    check("截面：全空因子不毒掉合成",
+          both.shape == one.shape
+          and np.allclose(both.fillna(-9).to_numpy(), one.fillna(-9).to_numpy()),
+          f"{both.shape} vs {one.shape}")
 
     res = cross.run(frames, cfg, BtConfig())
     check("截面：回测能跑出净值", res.ok, res.error)

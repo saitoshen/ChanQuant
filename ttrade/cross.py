@@ -30,10 +30,16 @@ import numpy as np
 import pandas as pd
 
 from ttrade import costs, factors, symbols_info
+from ttrade import factor_strategy as fstrat
 from ttrade.backtest import BacktestConfig
 from ttrade.strategies import STRATEGIES, run_strategy
 
 MIN_CROSS = 3          # 横截面上至少几个品种有值，才算得出一组强弱
+
+# 每折最多喂多少行给模型。截面是「品种 × 时间」堆起来的长表，6 个品种 × 十年
+# 5 分钟就是 100 万行，一折要十几秒；几十折下来是几十分钟。树模型不缺这几百万
+# 行里的重复信息，按等间隔抽到 2 万行，一折 0.5 秒左右，排序结论几乎不变。
+ML_MAX_TRAIN_ROWS = 20_000
 
 
 @dataclass
@@ -42,14 +48,16 @@ class CrossConfig:
 
     mode: str = "hedge"                 # hedge / select
     rebalance: int = 5                  # 调仓间隔，单位是**根**（5m 上 48 根约一天）
-    top_pct: float = 10.0               # 多最强的百分之几；空同理
+    top_pct: float = 10.0               # 多头：选最强的百分之几
+    bot_pct: float = 10.0               # 空头：选最弱的百分之几（可以和多头不同）
     long_only: bool = False
     weight: str = "equal"               # equal = 等权；score = 按分数加权
 
-    # 截面因子
-    factor_mode: str = "multi"          # single / multi
+    # 截面因子。三种模式和时序那边一样：single / multi / ml
+    factor_mode: str = "multi"
     factor_keys: list = field(default_factory=list)
     factor_reverse: dict = field(default_factory=dict)
+    factor_cfg: dict = field(default_factory=dict)   # 窗口 / 模型 / 训练窗口 …
 
     # 选品种之后怎么交易（只对 select 生效）
     timing_family: str = "rule"         # rule / factor
@@ -61,12 +69,20 @@ class CrossConfig:
     timing_factor_cfg: dict = field(default_factory=dict)
 
     def n_legs(self, n_valid: int) -> int:
-        """一边持几个品种。至少 1 个，最多不超过有效品种数的一半。"""
-        k = int(round(n_valid * float(self.top_pct or 0) / 100.0))
-        return max(1, min(k, max(1, n_valid // 2)))
+        """多头持几个品种。至少 1 个，最多不超过有效品种数的一半。"""
+        return _legs(n_valid, self.top_pct)
+
+    def n_short_legs(self, n_valid: int) -> int:
+        """空头持几个品种。默认和多头一样，但可以单独调。"""
+        return _legs(n_valid, self.bot_pct)
 
     def step(self) -> int:
         return max(1, int(self.rebalance or 1))
+
+
+def _legs(n_valid: int, pct: float) -> int:
+    k = int(round(n_valid * float(pct or 0) / 100.0))
+    return max(1, min(k, max(1, n_valid // 2)))
 
 
 @dataclass
@@ -132,9 +148,23 @@ def _cross_z(panel: pd.DataFrame) -> pd.DataFrame:
     return z.mask(n < MIN_CROSS)
 
 
+def _factor_cfg(cfg: "CrossConfig"):
+    """截面因子那一套参数（窗口 / 模型 / 训练窗口 …）转成 `FactorConfig`。"""
+    d = dict(getattr(cfg, "factor_cfg", None) or {})
+    return fstrat.FactorConfig(
+        **{k: v for k, v in d.items()
+           if k in fstrat.FactorConfig.__dataclass_fields__}
+    )
+
+
 def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
-                reverse: dict | None = None) -> pd.DataFrame:
-    """截面合成分数：每个因子先横截面 Z-score，再按方向取号、等权平均。
+                reverse: dict | None = None, mode: str = "multi",
+                fcfg=None, progress=None, cancel=None) -> pd.DataFrame:
+    """截面合成分数。三种模式和时序那边对齐：单因子 / 多因子 / 机器学习。
+
+    - `single`：取第一个因子，横截面 Z-score
+    - `multi`：每个因子先横截面 Z-score，再按方向取号、等权平均
+    - `ml`：把所有品种的样本堆成一张长表，滚动训练一个「相对强弱」模型
 
     因子在某个品种上没数据（美股没持仓量、新品种没有展期）就留 NaN，合成分数
     会自动跳过 —— 一个品种缺一个因子不该让整组排名作废。
@@ -143,6 +173,10 @@ def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
     if not keys:
         raise ValueError("没有选中任何可用因子")
     rev = set(k for k, v in (reverse or {}).items() if v)
+
+    if mode == "ml":
+        return ml_score_panel(frames, keys, fcfg, progress=progress, cancel=cancel)
+
     parts = []
     for key in keys:
         raw = {}
@@ -154,14 +188,134 @@ def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
         if len(raw) < MIN_CROSS:
             continue
         panel = pd.concat(raw, axis=1).sort_index().ffill()
+        if not panel.notna().any().any():
+            # 这个因子在这批品种上一个值都没有（日线库里没有展期 / 期权列）。
+            # 留着它会**毒掉整个平均**：NaN + x 还是 NaN，十几个因子里只要有一个
+            # 全空，合成分数就全空，界面上显示「截面分数全空」却查不出是谁
+            continue
         z = _cross_z(panel)
         if key in rev:
             z = -z
         parts.append(z)
+        if mode == "single":
+            # 单因子就取**第一个真能算出数的**因子：勾了十几个因子时排在最前的
+            # 往往是日线库里没数据的展期 / 期权因子，盲取 keys[0] 会直接报
+            # 「这些因子在当前品种池上都没有足够数据」
+            break
     if not parts:
         raise ValueError("这些因子在当前品种池上都没有足够数据")
-    out = sum(parts) / len(parts)
+    # 按时间取各因子的均值，**跳过缺值**：某个品种缺一个因子时不该让整行作废
+    stacked = pd.concat(parts, axis=1, keys=list(range(len(parts))))
+    out = stacked.T.groupby(level=1).mean().T
     return out.dropna(how="all")
+
+
+def ml_score_panel(frames: dict[str, pd.DataFrame], keys: list[str], fcfg,
+                   progress=None, cancel=None) -> pd.DataFrame:
+    """横截面机器学习打分：把所有品种的样本堆成一张长表，滚动训练。
+
+    和时序 ML 的区别在**标签**。这里预测的是「同期比别的品种强多少」：每根 bar
+    上先把各品种的未来收益减去当期截面均值，模型学的才是排序。用绝对收益当
+    标签的话，模型会先学会「这段行情整体在涨」—— 而截面策略做多空对冲，那个
+    beta 一分钱也拿不到，学得再准也没用。
+
+    训练样本按时间正序切折，训练集只取到 `b - horizon`：第 i 行的标签要等到
+    i+h 才成立，混进训练集就是未来函数。
+    """
+    from ttrade import factor_strategy as fstrat
+    from ttrade import mlmodels as ML
+    from ttrade.factor_metrics import forward_return
+
+    keys = [k for k in (keys or []) if k in factors.FACTORS]
+    if len(keys) < 2:
+        raise ValueError("机器学习至少需要 2 个因子")
+
+    # 特征矩阵必须同构：某个品种缺这一列，整个模型就对不齐。取交集而不是各自
+    # 补 0 —— 补 0 在标准化后的因子空间里是「中位数」，会让该品种凭空多出一个
+    # 中性观测，排名被稀释
+    avail = None
+    for df in frames.values():
+        got = set(factors.filter_available(df, keys))
+        avail = got if avail is None else (avail & got)
+    use = [k for k in keys if k in (avail or set())]
+    if len(use) < 2:
+        raise ValueError("这批品种上没有共同可用的 2 个因子（各自缺的数据不一样）")
+
+    fcfg = fcfg or fstrat.FactorConfig()
+    horizon = max(1, int(fcfg.horizon or 1))
+
+    blocks = []
+    for sym, df in frames.items():
+        fm = factors.factor_frame(df, use, window=fcfg.window, method=fcfg.method)
+        if fm.empty:
+            continue
+        d = fm.copy()
+        d["__fwd"] = forward_return(df, horizon).reindex(fm.index)
+        d["__sym"] = sym
+        blocks.append(d)
+    if not blocks:
+        raise ValueError("这批品种算不出因子矩阵")
+    long = pd.concat(blocks).sort_index()
+    long.index = pd.MultiIndex.from_arrays([long.index, long["__sym"]])
+    long = long.sort_index()
+    # 截面去均值：留下的是「相对强弱」，共同的市场 beta 被减掉了
+    long["__y"] = long["__fwd"] - long.groupby(level=0)["__fwd"].transform("mean")
+
+    X = long[use].to_numpy(dtype=float)
+    X = np.where(np.isfinite(X), X, 0.0)
+    Y = long["__y"].to_numpy(dtype=float)
+    ts = long.index.get_level_values(0).unique()
+    pos = np.searchsorted(ts, long.index.get_level_values(0).to_numpy())
+    n = len(ts)
+
+    bpd = fstrat._bars_per_day(pd.DatetimeIndex(ts))
+    train_bars = fstrat._to_bars(fcfg.train_window, bpd)
+    step_bars = fstrat._to_bars(fcfg.step, bpd)
+    min_bars = min(int(fcfg.min_train), train_bars)
+    if n <= min_bars + horizon + 10:
+        raise ValueError("样本太短，跑不了机器学习的滚动训练")
+
+    bounds = []
+    t = min_bars
+    while t < n:
+        bounds.append((max(0, t - train_bars), t, min(n, t + step_bars)))
+        t += step_bars
+
+    pred = np.full(len(long), np.nan)
+    done = 0
+    for a, b, c in bounds:
+        if cancel and cancel():
+            raise fstrat.Cancelled()
+        tr = (pos >= a) & (pos < b - horizon) & np.isfinite(Y)
+        rows = np.nonzero(tr)[0]
+        if len(rows) < 60:
+            continue
+        stride = max(1, len(rows) // ML_MAX_TRAIN_ROWS)
+        rows = rows[::stride]
+        model = ML.build(fcfg.model)
+        try:
+            model.fit(X[rows], Y[rows])
+        except Exception:  # noqa: BLE001
+            continue
+        want = (pos >= b) & (pos < c)
+        try:
+            pred[want] = model.predict(X[want])
+        except Exception:  # noqa: BLE001
+            continue
+        done += 1
+        if progress:
+            progress(done, len(bounds), f"第 {done}/{len(bounds)} 折训练完成")
+
+    if cancel and cancel():
+        raise fstrat.Cancelled()
+
+    ser = pd.Series(pred, index=long.index, name="pred").dropna()
+    if ser.empty:
+        raise ValueError("机器学习一折都没训出来（样本或因子不足）")
+    panel = ser.unstack().sort_index()
+    # 预测值本身已经同尺度，再做一次横截面标准化是为了和单/多因子那条路的
+    # 「分数」口径一致（按分数加权时两者才可比）。排序不变
+    return _cross_z(panel).dropna(how="all")
 
 
 def cost_vector(frames: dict[str, pd.DataFrame], bt: BacktestConfig,
@@ -215,13 +369,22 @@ def _metrics(equity: pd.Series, bpy: float) -> dict:
 
 
 def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
-        profile: str | None = None, label: str = "") -> CrossResult:
-    """跑一遍截面策略。出错写进 `CrossResult.error`，不抛异常。"""
+        profile: str | None = None, label: str = "",
+        progress=None, cancel=None) -> CrossResult:
+    """跑一遍截面策略。出错写进 `CrossResult.error`，不抛异常。
+
+    `progress` / `cancel` 只给机器学习模式用：walk-forward 要跑几十折，界面
+    那边靠它显示进度、也靠它中途叫停。
+    """
     if not frames or len(frames) < MIN_CROSS:
         return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
                            error=f"截面策略至少要 {MIN_CROSS} 个品种，现在只有 {len(frames)} 个")
     try:
-        score = score_panel(frames, list(cfg.factor_keys or []), cfg.factor_reverse)
+        score = score_panel(frames, list(cfg.factor_keys or []),
+                            cfg.factor_reverse, mode=cfg.factor_mode or "multi",
+                            fcfg=_factor_cfg(cfg), progress=progress, cancel=cancel)
+    except fstrat.Cancelled:
+        raise                     # 用户点的「取消」，不是回测失败
     except Exception as exc:  # noqa: BLE001
         return CrossResult(pd.Series(dtype=float), pd.DataFrame(), error=str(exc))
     if score.empty:
@@ -305,9 +468,15 @@ def to_result(out: "CrossResult", label: str = "", step: int = 1,
 
 
 def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig) -> pd.DataFrame:
-    """多强空弱。多空各占一半名义，净敞口 ≈ 0。"""
-    rows, top, bot, k, ok = _rank(score, cfg)
-    inv = 1.0 / np.maximum(k, 1)
+    """多强空弱。多空各占一半名义，净敞口 ≈ 0。
+
+    多空腿数可以不一样（`top_pct` / `bot_pct`）：多 10% 空 10% 是常见的对称
+    写法，但「多最强的 10%、空最弱的 20%」也讲得通（下跌时弱者更弱）。两边
+    各自按自己的腿数平分 0.5 的名义额，净敞口仍然是 0。
+    """
+    rows, top, bot, k_long, k_short, ok = _rank(score, cfg)
+    inv_l = 1.0 / np.maximum(k_long, 1)
+    inv_s = 1.0 / np.maximum(k_short, 1)
     if cfg.weight == "score":
         mat = score.to_numpy(dtype=float)[rows]
         pos = np.where(top, np.clip(np.nan_to_num(mat), 0.0, None), 0.0)
@@ -315,20 +484,20 @@ def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig) -> pd.DataFrame:
         good = s > 0
         share = np.zeros_like(pos)
         share[good] = pos[good] / s[good, None]
-        w = np.where(good[:, None], 0.5 * share, top * (0.5 * inv)[:, None])
+        w = np.where(good[:, None], 0.5 * share, top * (0.5 * inv_l)[:, None])
     else:
-        w = top * (0.5 * inv)[:, None]
+        w = top * (0.5 * inv_l)[:, None]
     if not cfg.long_only:
-        w = w - bot * (0.5 * inv)[:, None]
+        w = w - bot * (0.5 * inv_s)[:, None]
     return _place(score, rows, w, ok)
 
 
 def _rank(score: pd.DataFrame, cfg: CrossConfig):
     """调仓日上「谁在前、谁在后」一次性排完。
 
-    返回 `(行号, 多头掩码, 空头掩码, 每行几个, 有效行掩码)`。逐行 `nlargest` 在
-    5 分钟全历史上是 4 万多次 pandas 调用、七十秒；这里按轴排序一次就够 ——
-    拖一下「调仓间隔」不至于卡住半分钟。
+    返回 `(行号, 多头掩码, 空头掩码, 多头几个, 空头几个, 有效行掩码)`。
+    逐行 `nlargest` 在 5 分钟全历史上是 4 万多次 pandas 调用、七十秒；这里按轴
+    排序一次就够 —— 拖一下「调仓间隔」不至于卡住半分钟。
 
     NaN 必须排到两端之外：多头侧按 `-inf` 参与排序，空头侧按 `+inf`，这样
     「有效品种不足」的品种永远不会被选中，和 `dropna()` 之后再排等价。
@@ -338,23 +507,30 @@ def _rank(score: pd.DataFrame, cfg: CrossConfig):
     mat = score.to_numpy(dtype=float)[rows] if len(rows) else np.zeros((0, score.shape[1]))
     n_valid = np.sum(~np.isnan(mat), axis=1)
     ok = n_valid >= MIN_CROSS
-    pct = float(cfg.top_pct or 0) / 100.0
-    k = np.round(n_valid * pct).astype(int)
-    k = np.maximum(1, np.minimum(k, np.maximum(1, n_valid // 2)))
-    k = np.where(ok, k, 0)
-    width = int(k.max()) if len(k) else 0
+
+    def _n(pct: float) -> np.ndarray:
+        k = np.round(n_valid * float(pct or 0) / 100.0).astype(int)
+        k = np.maximum(1, np.minimum(k, np.maximum(1, n_valid // 2)))
+        return np.where(ok, k, 0)
+
+    k_long = _n(cfg.top_pct)
+    k_short = (np.zeros(len(rows), dtype=int) if cfg.long_only
+               else _n(cfg.bot_pct))
     top = np.zeros(mat.shape, dtype=bool)
     bot = np.zeros(mat.shape, dtype=bool)
+    width = int(max(k_long.max() if len(k_long) else 0,
+                    k_short.max() if len(k_short) else 0))
     if width:
         hi = np.argsort(-np.where(np.isnan(mat), -np.inf, mat), axis=1, kind="stable")
         lo = np.argsort(np.where(np.isnan(mat), np.inf, mat), axis=1, kind="stable")
         for j in range(width):
-            sel = np.nonzero(k > j)[0]
-            if not len(sel):
-                break
-            top[sel, hi[sel, j]] = True
-            bot[sel, lo[sel, j]] = True
-    return rows, top, bot, k, ok
+            sel = np.nonzero(k_long > j)[0]
+            if len(sel):
+                top[sel, hi[sel, j]] = True
+            sel = np.nonzero(k_short > j)[0]
+            if len(sel):
+                bot[sel, lo[sel, j]] = True
+    return rows, top, bot, k_long, k_short, ok
 
 
 def _place(score: pd.DataFrame, rows, w: np.ndarray, ok) -> pd.DataFrame:
@@ -383,8 +559,8 @@ def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
         sigs[sym] = _timing_signal(df, cfg)
     sig_panel = pd.concat(sigs, axis=1).sort_index().reindex(score.index).ffill().fillna(0.0)
 
-    rows, top, _bot, k, ok = _rank(score, cfg)
-    inv = 1.0 / np.maximum(k, 1)
+    rows, top, _bot, k_long, _k_short, ok = _rank(score, cfg)
+    inv = 1.0 / np.maximum(k_long, 1)
     held = _place(score, rows, top * inv[:, None], ok)
     # 选中的那一段里，按时序信号决定持有方向；没选中就是 0
     return held * sig_panel

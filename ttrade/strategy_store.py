@@ -99,7 +99,8 @@ class StrategyConfig:
     cross_symbols: list = field(default_factory=list)
     cross_mode: str = "hedge"           # hedge = 截面对冲；select = 选品种 + 时序
     cross_rebalance: int = 5            # 调仓间隔（根）
-    cross_top_pct: float = 10.0         # 多最强 / 空最弱的百分比
+    cross_top_pct: float = 10.0         # 多头：选最强的百分比
+    cross_bot_pct: float = 10.0         # 空头：选最弱的百分比（可以和上面不同）
     cross_weight: str = "equal"         # equal / score
 
     # 「选品种 + 时序交易」里的那条时序腿。规则和因子二选一，另一个保留不删 ——
@@ -186,9 +187,11 @@ class StrategyConfig:
         """策略的可读名。规则策略直接查表，因子策略拼模式和因子数。"""
         if self.family == "cross":
             n = len(self.cross_symbols or [])
+            mode = {"single": "单因子", "multi": "多因子", "ml": "机器学习"}.get(
+                self.factor_mode, self.factor_mode or "多因子")
             if self.cross_mode == "select":
-                return f"截面选品种 + 时序（{n} 个品种）"
-            return f"截面对冲 · {self.cross_top_pct:g}%（{n} 个品种）"
+                return f"截面选品种 + 时序（{mode} · {n} 个品种）"
+            return f"截面对冲 · {mode} · 多 {self.cross_top_pct:g}% / 空 {self.cross_bot_pct:g}%（{n} 个品种）"
         if self.family == "rule":
             from ttrade.strategies import STRATEGIES
 
@@ -205,8 +208,11 @@ class StrategyConfig:
         if self.family == "rule":
             return " ".join(f"{k}={v}" for k, v in (self.rule_params or {}).items())
         if self.family == "cross":
-            bits = [f"调仓={int(self.cross_rebalance or 1)}根",
-                    f"top={float(self.cross_top_pct or 0):g}%",
+            mode = {"single": "单因子", "multi": "多因子", "ml": "机器学习"}.get(
+                self.factor_mode, self.factor_mode or "多因子")
+            bits = [f"{mode}·{len(self.factor_keys or [])}因子",
+                    f"调仓={int(self.cross_rebalance or 1)}根",
+                    f"多{float(self.cross_top_pct or 0):g}%/空{float(self.cross_bot_pct or 0):g}%",
                     f"权重={'等权' if self.cross_weight != 'score' else '按分数'}"]
             if self.cross_mode == "select":
                 bits.append(f"时序={'规则' if self.timing_family != 'factor' else '因子'}")
@@ -315,6 +321,7 @@ class StrategyConfig:
         except (TypeError, ValueError):
             cfg.cross_rebalance = 5
         cfg.cross_top_pct = _clamp_pct(cfg.cross_top_pct, 10.0, 50.0)
+        cfg.cross_bot_pct = _clamp_pct(getattr(cfg, "cross_bot_pct", 10.0), 10.0, 50.0)
         if cfg.cross_mode not in ("hedge", "select"):
             cfg.cross_mode = "hedge"
         if cfg.cross_weight not in ("equal", "score"):
