@@ -296,6 +296,23 @@ def check_live_helpers() -> None:
           and pd.notna(merged.loc["2026-10-27 18:00", "trading_day"]))
     check("实时②拼接后索引递增", bool(merged.index.is_monotonic_increasing))
 
+    # 同一根：本地库里已经有这根（日线最典型 —— 下载时把当天那根半成品写进去了），
+    # 实时这份要**覆盖价格**，否则图上最后一根永远停在下载那一刻：顶部报价在跳、
+    # K 线一动不动。因子仍用本地那份（实时段一律 1.0）。
+    tick = bars.copy()
+    tick.loc["2026-10-27 17:00", ["close", "high"]] = [105.0, 106.0]
+    same = L.merge_live(local, tick[tick.index == local.index[-1]])
+    check("实时④同一根用实时价格覆盖",
+          len(same) == 1 and float(same["close"].iloc[-1]) == 105.0
+          and float(same["high"].iloc[-1]) == 106.0,
+          str(same[["close", "high"]].iloc[-1].to_dict()))
+    check("实时④覆盖后因子仍是本地的",
+          float(same["adj_factor"].iloc[-1]) == 0.97,
+          f"{same['adj_factor'].iloc[-1]}")
+    check("实时④不改动传进来的本地表",
+          float(local["close"].iloc[0]) == 102.0,
+          f"{local['close'].iloc[0]}")
+
     empty = L.merge_live(pd.DataFrame(), bars)
     check("实时③没有本地历史时整段当实时",
           len(empty) == 2 and bool((empty["adj_factor"] == 1.0).all()))
@@ -3944,8 +3961,11 @@ def check_new_factors() -> None:
     from ttrade import factors as F
     from ttrade import tqdata
 
-    check("因子库：67 个 / 13 类", len(F.FACTORS) == 67 and len(F.CATEGORIES) == 13,
-          f"{len(F.FACTORS)} 个 / {len(F.CATEGORIES)} 类")
+    # 只钉**内置**的数量。用户自定义因子（Agent 生成的）会挂在同一个 FACTORS 里，
+    # 拿总数去断言的话，用户每加一个因子这条就红一次 —— 那不是代码坏了。
+    n_builtin = len(F.FACTORS) - F.USER_FACTOR_COUNT
+    check(f"因子库：内置 {n_builtin} 个 / 13 类", n_builtin == 66 and len(F.CATEGORIES) == 13,
+          f"{n_builtin} 个内置 + {F.USER_FACTOR_COUNT} 个自定义 / {len(F.CATEGORIES)} 类")
     cats = {k: F.FACTORS[k].category for k in
             ("vwap_gap", "trend_window", "season_avg", "season_cal", "roll_intraday")}
     check("新因子归到了对的类别",

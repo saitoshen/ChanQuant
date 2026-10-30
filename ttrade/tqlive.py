@@ -158,9 +158,13 @@ def bars_from_serial(serial, period: str = "") -> pd.DataFrame:
 def merge_live(local: pd.DataFrame, live: pd.DataFrame) -> pd.DataFrame:
     """把实时 K 线接到本地历史后面。
 
-    只接**严格晚于**本地最后一根的实时 bar。本地最后一根可能是下到一半的，
-    重叠的 bar 一律保留本地那份 —— 本地那份已经带了正确的复权因子，而实时段的
-    因子是 1.0，混着用会在拼接处产生一次假的缩放。
+    只接**严格晚于**本地最后一根的实时 bar，因子用本地那份（本地已经带了正确的
+    复权因子，实时段一律 1.0，混着用会在拼接处产生一次假的缩放）。
+
+    **但同一根要拿实时的价格覆盖**：本地最后一根是下载时写的半根快照，价格停在
+    那一刻，而实时这根一直在动。不覆盖的话图上最后一根永远不动 —— 日线最明显，
+    库里已经有当天那根，实时这根被整根丢掉，一天里价格怎么走图都不变，只有顶部
+    的报价标签在跳。因子仍然沿用本地那份，只换 OHLCV。
     """
     if live is None or live.empty:
         return local if local is not None else pd.DataFrame()
@@ -172,7 +176,15 @@ def merge_live(local: pd.DataFrame, live: pd.DataFrame) -> pd.DataFrame:
 
     add = live[live.index > local.index[-1]].copy()
     if add.empty:
-        return local
+        if live.index[-1] != local.index[-1]:
+            return local      # 实时这根比本地还旧，没什么可补的
+        # 复制一份再改：`local` 是 DataStore 缓存里那张表，就地改会污染下一次回测
+        out = local.copy()
+        row = live.iloc[-1]
+        for c in ("open", "high", "low", "close", "volume", "open_oi", "close_oi"):
+            if c in out.columns and c in live.columns:
+                out.iloc[-1, out.columns.get_loc(c)] = row[c]
+        return out
     add["adj_factor"] = 1.0
     add["trading_day"] = trading_days(add.index).to_numpy()
     for c in ("open_oi", "close_oi"):
