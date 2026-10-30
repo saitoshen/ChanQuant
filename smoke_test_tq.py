@@ -3701,6 +3701,23 @@ def check_topup() -> None:
         check("补历史：序列还没填充时不置 ok",
               topup.save(pd.DataFrame(), "RB", "SHFE", "5m")["ok"] is False)
 
+        # 待换月：切换表里已经有「将来某天换月」，实时补进来的这一段就该乘上那次
+        # 换月的比率。写死 1.0 会让复权价在换月处留一个假跳空（EC 实测 18%），
+        # 而且要到下一次全量下载才自愈 —— 那之前所有回测和信号都是错的。
+        with tqstore.connect() as con:
+            tqstore.upsert_switch(con, "ZN", "SHFE", pd.DataFrame([{
+                "switch_date": (now + pd.Timedelta(days=30)).normalize(),
+                "old_tq": "SHFE.zn2612", "new_tq": "SHFE.zn2703",
+                "old_ts": "ZN2612.SHFE", "new_ts": "ZN2703.SHFE", "ratio": 1.25,
+            }]))
+        topup.save(ser, "ZN", "SHFE", "5m")
+        with tqstore.connect() as con:
+            zf = con.execute(
+                "SELECT adj_factor FROM bars WHERE symbol='ZN' ORDER BY dt"
+            ).df()["adj_factor"].to_numpy(float)
+        check("补历史：待换月时因子取换月比率",
+              len(zf) == 3 and bool(np.allclose(zf, 1.25)), str(zf))
+
         # 同一个品种被几十条策略共享时只能补一次，每次都写库是自找锁冲突
         calls: list = []
 

@@ -85,13 +85,19 @@ def save(serial, symbol: str, exchange: str, period: str) -> dict:
     if df.empty:
         return out
     df = df.copy()
-    # 后复权序列的最新一段因子恒为 1（见 `tqfetch.adj_factor_series`），实时段
-    # 天然落在这一段里。真要换月了，下次全量下载会重算这张表
-    df["adj_factor"] = 1.0
     df["trading_day"] = trading_days(df.index).to_numpy()
-    d = df.reset_index().rename(columns={"datetime": "dt"})
     try:
         with tqstore.connect() as con:
+            # 因子不能一律写 1.0。切换表里要是已经有「待换月」（换月日进了表、
+            # 但 K 线还没走到那一天），这一段就该乘上那次换月的比率 —— 写死 1.0
+            # 会让复权价在换月处留一个假跳空（EC 实测 18%），而且要到下一次全量
+            # 下载才自愈。按当前切换表算：没有待换月时结果仍然是 1.0，与老行为一致。
+            from ttrade.tqfetch import factor_at, switch_series_via
+
+            series = switch_series_via(con, symbol, exchange)
+            df["adj_factor"] = (factor_at(series, pd.Series(df["trading_day"]))
+                                if len(series) else 1.0)
+            d = df.reset_index().rename(columns={"datetime": "dt"})
             out["added"] = tqstore.upsert_bars(con, symbol, exchange, src, d)
     except Exception as exc:  # noqa: BLE001
         out["error"] = f"写库失败：{type(exc).__name__}: {exc}"

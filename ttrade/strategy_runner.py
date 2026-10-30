@@ -450,8 +450,14 @@ class PortfolioRunner:
         if on and st.cfg.family == "factor" and not st.cfg.factor_keys:
             st.error = "这条因子策略没有选中因子"
             return
-        if on and st.cfg.period not in RT_SEC:
-            st.error = f"实时不支持 {st.cfg.period} 周期（可用：{'/'.join(RT_SEC)}）"
+        # 门禁按**源周期**判断。`1d_tq`（天勤日线）在 `RT_SEC` 里没有这个键 ——
+        # 它的源周期是 `1d`，`_subscribe()` 也是这么映射的。按原键判断会让日线
+        # 策略一启动就报「实时不支持 1d_tq」，永远起不来。
+        src = tqdata.PERIODS.get(st.cfg.period, (st.cfg.period, 1))[0]
+        if on and src not in RT_SEC:
+            ok = [p for p in tqdata.PERIOD_ORDER
+                  if tqdata.PERIODS.get(p, (p, 1))[0] in RT_SEC]
+            st.error = f"实时不支持 {st.cfg.period} 周期（可用：{'/'.join(ok)}）"
             return
         if on and self.limit.order_left() <= 0:
             st.error = (f"今日报单已达 {daylimit.DAY_ORDER_LIMIT} 次上限，"

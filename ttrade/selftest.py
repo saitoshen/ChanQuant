@@ -543,6 +543,38 @@ def _run() -> tuple[bool, list[str]]:
 
     check("因子方向口径", _factor_orient)
 
+    def _rt_periods():
+        """每个周期都要能进实时。
+
+        天勤日线的周期键是 `1d_tq`，而 `RT_SEC` 里只有源周期 `1d`。门禁要是按
+        原键判断，日线策略一启用就报「实时不支持 1d_tq」直接停机 —— 界面上是
+        一条红的「错误」，看不出是周期映射的问题。所以这里逐个周期真调一遍
+        `enable()`，而不是只断言常量表包含关系。
+        """
+        from ttrade import strategy_runner as R
+        from ttrade import strategy_store as SStore
+        from ttrade import tqdata
+        from ttrade.tqlive import AccountSpec
+
+        spec = AccountSpec(name="__selftest__", kind="sim")
+        run = R.PortfolioRunner(spec)
+        bad = []
+        for p in tqdata.PERIOD_ORDER:
+            sid = f"__rt_{p}"
+            run.add(SStore.StrategyConfig(
+                sid=sid, name=f"自检 {p}", symbol="RB", exchange="SHFE",
+                period=p, family="factor", factor_mode="single",
+                factor_keys=["rev_5"], account=spec.name))
+            run.enable(sid, True)
+            st = run._slots[sid]
+            if not st.running or st.error:
+                bad.append(f"{p}：{st.error or '未启动'}")
+        if bad:
+            raise RuntimeError("；".join(bad))
+        return f"{len(tqdata.PERIOD_ORDER)} 个周期全部可实时"
+
+    check("实时周期门禁", _rt_periods)
+
     def _ml_deps():
         from ttrade import mlmodels as ML
 
