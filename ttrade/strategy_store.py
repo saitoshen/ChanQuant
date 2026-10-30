@@ -6,6 +6,10 @@
 - `portfolio.json`    —— 交易组合。`策略交易和组合` 页面里那一列正在跑的策略。
 - `last_config.json`  —— 策略研究页上次的配置，下次打开自动恢复。
 
+除了这三份，还有一个**不在磁盘上**的策略库成员：`ttrade.strategy_templates`
+里的内置模板。它随版本发布，只读，`library_view()` 把两边拼起来给界面用；
+`load_library()` 仍然只返回用户自己那份 —— 存盘、删除都只碰用户的东西。
+
 **为什么策略库和组合要分开存**：库是「模板」，组合是「实例」。同一个模板可以
 在组合里跑两份（不同品种、不同手数、不同账户），改组合里的参数不该影响库。
 两边都存完整配置而不是「库 id + 覆盖项」：模板改了以后，正在跑的策略行为跟着变
@@ -24,6 +28,7 @@ import unicodedata
 import uuid
 from dataclasses import asdict, dataclass, field
 
+from ttrade import strategy_templates as TPL
 from ttrade.paths import user_dir
 
 # 按「止损金额」定仓的策略。它们把止损距离写在策略参数里（stop_mult × ATR），
@@ -426,7 +431,22 @@ def _load_list(name: str) -> list[StrategyConfig]:
 
 
 def load_library() -> list[StrategyConfig]:
+    """用户自己的策略库。**不含内置模板** —— 这个函数的返回值会被拿去存盘、
+    删除，混进模板就是往用户的 json 里写一堆只读条目。"""
     return _load_list(LIB_FILE)
+
+
+def is_template(sid: str) -> bool:
+    return TPL.is_template(sid)
+
+
+def library_view() -> list[StrategyConfig]:
+    """界面上的「策略库」= 内置模板 + 我的。
+
+    给列表、选择框用；要写盘的场合一律用 `load_library()`。
+    模板排前面：新用户库里是空的，先看到的是能学的东西，而不是一片空白。
+    """
+    return TPL.all_templates() + load_library()
 
 
 def save_library(items: list[StrategyConfig]) -> None:
@@ -446,6 +466,20 @@ def add_to_library(cfg: StrategyConfig) -> StrategyConfig:
     参数不同的版本是正常用法，这时自动加序号（`…（2）`），不挡人。
     """
     items = load_library()
+    # 内置模板不是库里的一条。存它等于「从模板另存一份到我的」：换新号，
+    # 名字沿用模板名，重名就自己加序号 —— 用户载入模板、改两个数、点保存，
+    # 不该先撞上一条「重名，换个名字」，他根本没起过名；也不该被自动命名成
+    # 「AG_SHFE · 单因子 · 1 个因子」这种他自己没见过的名字。
+    if TPL.is_template(cfg.sid):
+        base = (cfg.name or (TPL.BY_KEY.get(cfg.sid) or {}).get("name", "")).strip()
+        cfg.sid = ""
+        if base:
+            taken = {norm_name(c.title()) for c in items}
+            name, n = base, 2
+            while norm_name(name) in taken:
+                name = f"{base}（{n}）"
+                n += 1
+            cfg.name = name
     _ensure_sid(cfg)
     for i, old in enumerate(items):
         if old.sid == cfg.sid:
@@ -505,10 +539,16 @@ def find_library(name: str) -> StrategyConfig | None:
     同名可能有好几条（用户前后存过两版，比如「白银动量60-1h」现在有三条），
     取**最后存的**那条：他刚存的那份才是他嘴上说的那份。真正要精确的时候
     用 sid，`find_library` 认。
+
+    用户库里没有就**再找一遍内置模板**：新用户的库是空的，他嘴上说的十有八九
+    是界面上看到的那条模板名（或者是 Agent 推荐的模板）。顺序不能反 —— 用户
+    自己存的那条和模板同名时，他说的是自己那条。
     """
     want = str(name or "").strip()
     if not want:
         return None
+    if TPL.is_template(want):
+        return TPL.to_config(want)
     items = load_library()
     for c in items:
         if c.sid and c.sid == want:
@@ -517,10 +557,19 @@ def find_library(name: str) -> StrategyConfig | None:
     if not key:
         return None
     hits = [c for c in items if norm_name(c.title()) == key]
-    return hits[-1] if hits else None
+    if hits:
+        return hits[-1]
+    for k in TPL.keys():
+        cfg = TPL.to_config(k)
+        if cfg is not None and norm_name(cfg.title()) == key:
+            return cfg
+    return None
 
 
 def remove_from_library(sid: str) -> bool:
+    """从库里删一条。内置模板删不掉 —— 它不在库里，返回 False 而不是报错。"""
+    if TPL.is_template(sid):
+        return False
     items = load_library()
     keep = [c for c in items if c.sid != sid]
     if len(keep) == len(items):
@@ -587,12 +636,12 @@ def save_last(cfg: StrategyConfig) -> None:
     _save(LAST_FILE, cfg.to_dict())   # 上次配置不参与按 sid 查找，不必补号
 
 
-# ------------------------------------------------------------------ 交易助手设置
+# ------------------------------------------------------------------ 追单设置
 
 
 @dataclass
 class ChaseConfig:
-    """交易助手：策略发单后没成交怎么追。
+    """追单设置：策略发单后没成交怎么追。
 
     天勤的 `TargetPosTask` 自己会追价，但它按固定节奏重报，遇到涨跌停附近或者
     流动性差的合约经常挂一整天。这里的追单是**上层补刀**：等 N 秒还没成交就撤掉

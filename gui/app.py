@@ -100,6 +100,7 @@ from ttrade import cross as cross_engine
 from ttrade import factor_strategy as fstrat
 from ttrade import replay
 from ttrade import strategy_store as SStore
+from ttrade import strategy_templates as TPL
 from gui.agent_page import AgentPage
 from gui.data_page import DataPage
 from gui.live import LiveController
@@ -761,7 +762,7 @@ class MainWindow(QMainWindow):
 
         outer.addWidget(self._build_page_bar())
 
-        # 四个平行的大页面：策略研究 / 账户透视和交易 / 策略交易和组合 / 交易Agent。
+        # 四个平行的大页面：策略研究 / 账户透视和交易 / 策略交易和组合 / ChanAgent。
         # 用 QStackedWidget 而不是外层 QTabWidget：页签放在顶部一条自绘的按钮条上，
         # 视觉上和侧边栏的卡片、内层的三个页签区分得开，不会变成「两层页签」。
         self.pages = QStackedWidget()
@@ -819,7 +820,12 @@ class MainWindow(QMainWindow):
         self.btn_page_study = QPushButton("策略研究")
         self.btn_page_trade = QPushButton("账户透视和交易")
         self.btn_page_port = QPushButton("策略交易和组合")
-        self.btn_page_agent = QPushButton("交易Agent")
+        self.btn_page_agent = QPushButton("ChanAgent")
+        # 新名字第一次出现，得有一处解释：Chan Quant Agent AI
+        self.btn_page_agent.setToolTip(
+            "ChanAgent · Chan Quant Agent AI\n"
+            "大模型助手：自然语言生成因子 / 策略 / 研报、读附件、扫全市场、一句话下单"
+        )
         self.btn_page_data = QPushButton("数据管理")
         self._page_btns = (
             self.btn_page_study, self.btn_page_trade,
@@ -873,7 +879,7 @@ class MainWindow(QMainWindow):
         """补完数据：标的池、分钟线覆盖都可能变了，重读一遍。"""
         self._reload_store(market)
 
-    # ---------------------------------------------------------- 交易Agent
+    # ---------------------------------------------------------- ChanAgent
 
     def _on_agent_study(self, cfg) -> None:
         """Agent 要「用某策略回测某品种」：切到研究页并套上配置。
@@ -954,6 +960,7 @@ class MainWindow(QMainWindow):
             # 报错里连着列三遍只会让人以为坏了
             libs = "、".join(dict.fromkeys(c.title() for c in SStore.load_library()))
             return None, (f"平台没有这个策略：{name}。策略库里现在有：{libs or '（空）'}；"
+                          f"另有 {len(TPL.keys())} 条内置模板（ChanAgent → 策略库）；"
                           f"规则策略代号有：{available_text()}")
 
         if lib is not None:
@@ -2789,14 +2796,15 @@ class MainWindow(QMainWindow):
         只灌界面、不写 `last_config`：用户多半是「拿这条当起点改一改」，
         直接落盘的话下次启动会被它顶掉，而他原来那套配置就找不回来了。
         """
-        lib = SStore.load_library()
+        lib = SStore.library_view()
         if not lib:
             self.lbl_status.setText("策略库是空的。先调好一套参数，点「存入策略库」")
             return
         dlg = LibraryDialog(
             lib, self, title="加载策略",
             hint="选一条模板，把它的品种、周期、策略和参数灌回左边。"
-                 "加载只是填界面，不会自动保存，也不会改动策略库里的原件。",
+                 "［内置］那批是随版本发布的教学范例，载入只是填界面，"
+                 "不会改动它们，也不会自动保存。",
         )
         if dlg.exec() != QDialog.Accepted:
             return

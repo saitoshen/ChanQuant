@@ -771,7 +771,7 @@ def _run() -> tuple[bool, list[str]]:
         )
         trade_info = (f"{tp.tbl_accts.columnCount()} 列账户表 / "
                       f"{len(tp._accounts)} 个账户" if tp is not None else "无交易页")
-        # 交易Agent 页：删除按钮在没选中东西时必须是灰的，权限开关默认关。
+        # ChanAgent 页：删除按钮在没选中东西时必须是灰的，权限开关默认关。
         # 升级权限的文件模块是**函数里 import** 的，打包漏了只会在用户勾上开关
         # 之后才炸 —— 所以在这里 import 一次，把它变成打包期就能发现的问题。
         ap = getattr(win, "agent_page", None)
@@ -1199,7 +1199,7 @@ def _run() -> tuple[bool, list[str]]:
             )
         if not agent_ok:
             raise RuntimeError(
-                "交易Agent 页异常：删除按钮初始状态不对，或升级权限的文件模块 / "
+                "ChanAgent 页异常：删除按钮初始状态不对，或升级权限的文件模块 / "
                 "平台手册取不到 / 回测结果没推到输出框"
                 + (f"（{fs_err}）" if fs_err else "")
                 + (f"（手册：{manual_info}）" if not manual_ok else "")

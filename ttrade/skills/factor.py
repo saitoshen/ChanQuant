@@ -23,7 +23,7 @@ from ttrade.skills.base import (
     register,
 )
 
-# 清单一次最多列这么多行。67 个内置 + 用户自建，全列出来是三百多行
+# 清单一次最多列这么多行。68 个内置 + 用户自建，全列出来是三百多行
 MAX_LISTED = 120
 
 

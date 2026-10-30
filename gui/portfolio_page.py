@@ -7,7 +7,7 @@
     顶部  默认账户 / 启动全部 / 停止全部 / 状态灯
     左侧  策略列表：增删、单独启停、从策略库添加、绑定交易账户、查看回测
     右侧  监控器：逐合约列出「策略理论 / 账户实际 / 差额」，一键对齐
-    底部  交易助手：等几秒撤单重报、追几次、每次追几跳
+    底部  追单设置：等几秒撤单重报、追几次、每次追几跳
 
 ## 为什么这里也有一套 K 线 / 绩效 / 因子
 
@@ -304,7 +304,9 @@ class LibraryDialog(QDialog):
 
         self.lst = QListWidget()
         for cfg in items:
-            it = QListWidgetItem(f"{cfg.title()}　{cfg.describe()}")
+            # 内置模板和「我的」混在一张表里，得看得出哪条是只读的模板
+            tag = "内置" if SStore.is_template(cfg.sid) else "我的"
+            it = QListWidgetItem(f"［{tag}］{cfg.title()}　{cfg.describe()}")
             it.setData(Qt.UserRole, cfg.sid)
             self.lst.addItem(it)
         if items:
@@ -823,7 +825,7 @@ class PortfolioPage(QWidget):
         lay.setContentsMargins(12, 10, 12, 10)
         lay.setSpacing(8)
 
-        t = QLabel("交易助手")
+        t = QLabel("追单设置")
         t.setObjectName("SectionTitle")
         lay.addWidget(t)
 
@@ -1047,7 +1049,7 @@ class PortfolioPage(QWidget):
     def show_config(self, cfg, note: str = "") -> str:
         """回放一份配置并展示。返回一段纯文本结论（失败时是原因）。
 
-        「交易 Agent」发起的 backtest 走这里：跑完把文本推回 Agent 页的输出框，
+        「ChanAgent」发起的 backtest 走这里：跑完把文本推回 Agent 页的输出框，
         模型才知道算出来是什么。所以失败也要返回原因，不能只弹个红字。
         """
         is_cross = getattr(cfg, "family", "") == "cross"
@@ -1467,7 +1469,9 @@ class PortfolioPage(QWidget):
     # ---------------------------------------------------------- 增删改
 
     def _add_from_library(self) -> None:
-        lib = SStore.load_library()
+        # 内置模板也算「库里的东西」：新用户的库是空的，只给「我的」等于
+        # 让他在这一步无路可走
+        lib = SStore.library_view()
         if not lib:
             self._on_failed("策略库是空的。到「策略研究」页点「存入策略库」")
             return
@@ -1505,7 +1509,7 @@ class PortfolioPage(QWidget):
             self._on_log(f"{cfg.title()}：{cfg.size_text()}")
 
     def accept(self, cfg) -> str:
-        """从「交易Agent」页送来的策略：加进组合，正在跑就直接挂上去。
+        """从「ChanAgent」页送来的策略：加进组合，正在跑就直接挂上去。
 
         返回一句给人看的结果，调用方拿去显示。**不自动开新连接** —— 连接是用户
         在「启动全部」时明确点出来的，一个对话不该顺手把账户连上。
@@ -1594,7 +1598,7 @@ class PortfolioPage(QWidget):
                 n += len(snap["mismatch"])
         self._on_log(f"已下发对齐委托，覆盖 {n} 个合约；剩下交给追单，成交前不用再点")
 
-    # ---------------------------------------------------------- 交易助手
+    # ---------------------------------------------------------- 追单设置
 
     def _load_chase_widgets(self) -> None:
         c = self._chase

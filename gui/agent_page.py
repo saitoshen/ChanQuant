@@ -1,4 +1,4 @@
-"""「交易Agent」页。
+"""ChanAgent（Chan Quant Agent AI）页。
 
 和「策略研究」「账户透视和交易」「策略交易和组合」并列的第四个大页面。
 
@@ -47,6 +47,7 @@ import time
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
+    QColor,
     QDesktopServices,
     QImage,
     QPixmap,
@@ -88,6 +89,7 @@ from ttrade import library_docs as L
 from ttrade import session_files as SF
 from ttrade import skills as S
 from ttrade import strategy_store as SStore
+from ttrade import strategy_templates as TPL
 from ttrade.store import AnyStore
 from ttrade.strategies import STRATEGIES
 from ttrade.paths import user_dir
@@ -651,7 +653,7 @@ class ManualDialog(QDialog):
 
         lay = QVBoxLayout(self)
         head = QLabel(
-            "「交易Agent」查资料时看到的就是这份内容：行情从哪来、平台注入了哪些"
+            "「ChanAgent」查资料时看到的就是这份内容：行情从哪来、平台注入了哪些"
             "原语、每个因子的完整实现。它自己也会用 doc 动作按需取其中一段。"
         )
         head.setWordWrap(True)
@@ -933,7 +935,7 @@ class SessAtt:
 
 
 class AgentPage(QWidget):
-    """交易 Agent。"""
+    """ChanAgent。"""
 
     study_requested = Signal(object)      # SStore.StrategyConfig
     trade_requested = Signal(object)      # A.Action
@@ -1302,18 +1304,67 @@ class AgentPage(QWidget):
             self.lst_factor.addItem(it)
 
     def _fill_strategies(self) -> None:
+        """策略库列表：内置模板按分组排前面，规则策略和「我的」跟在后面。
+
+        分组标题行是 `NoItemFlags` 的：看得见、选不中。没有它，34 条模板和一堆
+        规则策略挤成一列，用户看不出「这几条是一组的、那几条是另一回事」——
+        而这批模板的意义恰恰是「一组一组对比着看」。
+
+        「我的」那一组里，原来的 `· 我的` 尾巴换成了组标题：名字本身就是用户起的，
+        后面挂个后缀，他在搜索框里照着抄就永远对不上（`norm_name` 得专门剥这截）。
+        """
         self.lst_strat.clear()
+        for gkey, glabel, tkeys in TPL.groups_with_items():
+            self._add_group_row(glabel, TPL.GROUP_DESC.get(gkey, ""))
+            for k in tkeys:
+                cfg = TPL.to_config(k)
+                if cfg is None:
+                    continue
+                it = QListWidgetItem(f"　{cfg.title()}")
+                it.setData(Qt.UserRole, ("tpl", k))
+                it.setToolTip(f"{TPL.summary(k)}\n\n{TPL.teach(k)}")
+                self.lst_strat.addItem(it)
+
+        self._add_group_row("规则策略", "不用因子，纯规则。内置的改代码才会消失，"
+                                       "自定义的可以删。")
         for d in L.all_strategy_docs():
             tag = "自定义" if _is_user_strategy(d.key) else "内置"
-            it = QListWidgetItem(f"{d.label}　·　{tag}")
+            it = QListWidgetItem(f"　{d.label}　·　{tag}")
             it.setData(Qt.UserRole, ("rule", d.key))
             it.setToolTip(d.desc)
             self.lst_strat.addItem(it)
-        for cfg in SStore.load_library():
-            it = QListWidgetItem(f"{cfg.title()}　·　我的")
+
+        mine = SStore.load_library()
+        self._add_group_row(
+            "我的策略库",
+            "自己存下来的配置。内置模板载入研究页、改完参数点「存入策略库」，"
+            "副本就落在这里。",
+        )
+        if not mine:
+            self._add_group_row(
+                "（还是空的。选一条内置模板，点下面的「回测」载入研究页改）",
+                "载入只是填界面，不会改模板；改完想留住就点「存入策略库」。",
+                hint=True,
+            )
+        for cfg in mine:
+            it = QListWidgetItem(f"　{cfg.title()}")
             it.setData(Qt.UserRole, ("cfg", cfg.sid))
             it.setToolTip(cfg.describe())
             self.lst_strat.addItem(it)
+
+    def _add_group_row(self, label: str, tip: str = "", hint: bool = False) -> None:
+        """列表里的分组标题。选不中，只是分隔和说明。"""
+        it = QListWidgetItem(f"　{label}" if hint else f"— {label} —")
+        it.setFlags(Qt.NoItemFlags)
+        it.setData(Qt.UserRole, ("head", label))
+        if tip:
+            it.setToolTip(tip)
+        font = it.font()
+        font.setBold(not hint)
+        it.setFont(font)
+        if not hint:
+            it.setForeground(QColor(C_MUTED))
+        self.lst_strat.addItem(it)
 
     def _fill_reports(self) -> None:
         self.lst_report.clear()
@@ -1388,13 +1439,53 @@ class AgentPage(QWidget):
         ]
         self.detail.setHtml("".join(html))
 
+    def _show_template(self, key: str) -> None:
+        """内置模板的详情：先说「这条在演示什么」，再说配方。
+
+        顺序是刻意的。模板的价值不在「能跑」，在于它示范了一个手法；把
+        「演示什么」摆在参数前面，用户才知道该看哪儿 —— 否则 24 个因子名
+        列在那儿，看完只记住「因子很多」。
+        """
+        cfg = TPL.to_config(key)
+        if cfg is None:
+            self.detail.setHtml("<p>这条内置模板找不到了（版本升级时改过名？）。</p>")
+            return
+        group = TPL.GROUP_LABEL.get(TPL.group_of(key), "内置模板")
+        html = [
+            f"<h3 style='color:{C_TEXT};margin:0 0 4px 0'>{cfg.title()}</h3>",
+            # 摘要（几个因子、方向、取反数）不写在这里：下面的「因子组合」块
+            # 说得更细，两处都写就会撞出「单因子 · 动量 · 单因子 · 方向自适应」
+            f"<p style='color:{C_MUTED};margin:0 0 10px 0'>内置模板 · {group}</p>",
+        ]
+        teach = TPL.teach(key)
+        if teach:
+            html.append(_block("这条在演示什么", _esc(teach)))
+        html += [
+            _block("标的", f"{cfg.key()}　{cfg.period}"),
+            _block("因子组合", _factor_mix(cfg)),
+            _block("参数", _esc(TPL.knobs(cfg))),
+            _block("仓位", f"{cfg.size_text()}　（{_sizing_cn(cfg.sizing)}）"),
+        ]
+        gdesc = TPL.GROUP_DESC.get(TPL.group_of(key), "")
+        if gdesc:
+            html.append(_block("这一组在讲什么", _esc(gdesc)))
+        html.append(
+            f"<p style='color:{C_MUTED};font-size:{FS_SMALL}px;margin-top:10px'>"
+            "模板是只读的。点下面的「回测」把它载入研究页，改完参数再"
+            "「存入策略库」，副本会出现在「我的策略库」里 —— 模板本身不会变。</p>"
+        )
+        self.detail.setHtml("".join(html))
+
     def _show_strategy(self, cur, _prev) -> None:
         kind, key = cur.data(Qt.UserRole) if cur is not None else ("", "")
-        # 内置规则策略删不掉；自定义策略和「我的」模板都可以删
+        # 内置模板和内置规则策略都删不掉；自定义策略和「我的」模板可以删
         self.btn_del_strat.setEnabled(
             cur is not None and (kind == "cfg" or (kind == "rule" and _is_user_strategy(key)))
         )
-        if cur is None:
+        if cur is None or kind == "head":
+            return
+        if kind == "tpl":
+            self._show_template(key)
             return
         if kind == "rule":
             d = L.strategy_doc(key)
@@ -1498,7 +1589,7 @@ class AgentPage(QWidget):
         )
         self.log.setHtml(
             f"<p style='color:{C_MUTED};line-height:160%'>"
-            f"我是这个平台里的交易助手，能查数据、解释因子、跑回测、按你的话下单。<br>"
+            f"我是这个平台里的 ChanAgent，能查数据、解释因子、跑回测、按你的话下单。<br>"
             f"{tip}{mem_line}</p>"
         )
 
@@ -2348,6 +2439,9 @@ class AgentPage(QWidget):
         if kind == "cfg":
             self._delete_library_item(str(key))
             return
+        if kind != "rule":
+            # 内置模板 / 分组标题：按钮本来就是灰的，这里再兜一层
+            return
         spec = STRATEGIES.get(key)
         if spec is None or not _is_user_strategy(key):
             return
@@ -2397,6 +2491,10 @@ class AgentPage(QWidget):
         if cur is None:
             return None
         kind, key = cur.data(Qt.UserRole)
+        if kind == "tpl":
+            # 内置模板本身就是一份完整配置（有品种、有周期、有参数），
+            # 直接拿去回测 / 加入组合即可，不用再问用户选什么品种
+            return TPL.to_config(key)
         if kind == "cfg":
             return next((c for c in SStore.load_library() if c.sid == key), None)
         d = L.strategy_doc(key)
@@ -2776,6 +2874,41 @@ def _block(title: str, body: str, raw: bool = False) -> str:
         f"<p style='font-weight:700;margin:10px 0 2px 0'>{title}</p>"
         f"<p style='line-height:150%;margin:0'>{body}</p>"
     )
+
+
+_SIZING_CN = {
+    "capital": "按资金分配", "risk": "按止损金额",
+    "fixed": "固定手数", "unit": "本金全额",
+}
+
+
+def _sizing_cn(mode: str) -> str:
+    return _SIZING_CN.get(str(mode or "capital").lower(), str(mode or "按资金分配"))
+
+
+def _factor_mix(cfg) -> str:
+    """一条配置的因子组合：「n 个因子，其中 k 个取反」+ 逐个因子名。
+
+    取反的因子标红。这是内置模板最该被看见的一层 —— 同一份因子集，反着用
+    几个，结论就完全不同；不标出来，用户只会看到一长串因子名。
+    """
+    if cfg.family == "rule":
+        spec = STRATEGIES.get(cfg.rule_key)
+        return _esc(f"不用因子：{spec.label if spec else (cfg.rule_key or '—')}")
+    keys = list(cfg.factor_keys or [])
+    if not keys:
+        return "—"
+    rev = {k for k, v in ((cfg.factor_cfg or {}).get("reverse") or {}).items() if v}
+    parts = []
+    for k in keys:
+        d = L.factor_doc(k)
+        name = _esc(d.label if d else k)
+        if k in rev:
+            name += f"<span style='color:{C_BAD}'>（取反）</span>"
+        parts.append(name)
+    n_rev = len(rev & set(keys))
+    head = f"{len(keys)} 个因子" + (f"，其中 {n_rev} 个取反" if n_rev else "")
+    return f"<span style='color:{C_MUTED}'>{head}</span><br>" + "、".join(parts)
 
 
 # 研报品种候选。**不查 DuckDB**：建页面时去开库，赶上别的进程在写就会卡住，

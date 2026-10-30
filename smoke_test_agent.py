@@ -1,4 +1,4 @@
-"""交易 Agent 的策略名解析：冒烟。
+"""ChanAgent 的策略名解析：冒烟。
 
     python smoke_test_agent.py
 

@@ -508,7 +508,7 @@ STRATEGIES: dict[str, StrategySpec] = {
         },
         desc="唐奇安双向突破 + 2.5×ATR 移动止损，单笔风险可控。",
     ),
-    # 下面两条原本是用户在「交易Agent」里生成的，2026-10 转为内置：
+    # 下面两条原本是用户在「ChanAgent」里生成的，2026-10 转为内置：
     # 用的人多、逻辑也稳定了，再留在用户库里意味着换台机器就没了
     "sbbox_mini": StrategySpec(
         key="sbbox_mini",

@@ -1,4 +1,4 @@
-# ChanQuant · 交易 Agent 改造方案：Skill 体系 + 文档能力 + 消息渲染
+# ChanQuant · ChanAgent 改造方案：Skill 体系 + 文档能力 + 消息渲染
 
 > 状态：**P0 / P1 / P2 已实施，P3 部分实施**（逐项进度见 §6）。
 > 依据：`ttrade/agent.py`（988 行）、`gui/agent_page.py`（2223 行）、

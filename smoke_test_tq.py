@@ -1166,6 +1166,62 @@ def check_strategy_store() -> None:
 
         St.save_library([])
         St.save_portfolio([])
+        # ---- 内置策略模板 ----
+        # 模板不在库里、也不能被写进库；`library_view()` 才是界面看到的那一份
+        from ttrade import strategy_templates as TPL
+
+        check("内置模板：条数够、键不重复",
+              len(TPL.keys()) == len(set(TPL.keys())) and len(TPL.keys()) >= 30,
+              f"{len(TPL.keys())} 条")
+        check("内置模板：分组都有标题和说明",
+              all(TPL.GROUP_LABEL.get(g) and TPL.GROUP_DESC.get(g)
+                  for g in TPL.GROUP_ORDER), "缺标题或说明")
+        check("内置模板：每条都有「演示什么」",
+              all(TPL.teach(k) for k in TPL.keys()), "有空讲解")
+        check("内置模板：分组条数合计等于总数",
+              sum(len(TPL.keys(g)) for g in TPL.GROUP_ORDER) == len(TPL.keys()),
+              "有模板没归组")
+        # 默认值在模板里抄了一份（为了不 import pandas）。抄了就会漂，所以对一遍
+        from ttrade import factor_strategy as _fs
+
+        fc = _fs.FactorConfig()
+        check("内置模板：因子默认值与 FactorConfig 一致",
+              all(getattr(fc, k) == v for k, v in TPL._FCFG_DEFAULTS.items()
+                  if k != "reverse"), "默认值漂了")
+        sc0 = St.StrategyConfig()
+        check("内置模板：策略默认值与 StrategyConfig 一致",
+              all(getattr(sc0, k) == v for k, v in TPL._SCFG_DEFAULTS.items()),
+              "默认值漂了")
+        check("内置模板：因子策略的 factor_cfg 是全字段",
+              all(set(TPL._FCFG_DEFAULTS) <= set(c.factor_cfg)
+                  for c in TPL.all_templates() if c.family != "rule"),
+              "有稀疏 factor_cfg，载入界面会留着上一条的数值")
+        # `from_dict` 把「缺 capital_pct」当成老配置，会按绝对金额反推成 50%。
+        # 模板必须显式写死，否则一条 30% 仓位的模板载入后变成 50%
+        check("内置模板：仓位百分比没被老配置迁移改掉",
+              all(abs(c.capital_pct - float(TPL.BY_KEY[k].get("capital_pct", 30.0))) < 1e-9
+                  for k, c in zip(TPL.keys(), TPL.all_templates())),
+              "capital_pct 被改成 50%")
+
+        check("内置模板：不在用户库里", St.load_library() == [],
+              str(len(St.load_library())))
+        check("内置模板：library_view 把两边拼起来",
+              len(St.library_view()) == len(TPL.keys()), str(len(St.library_view())))
+        check("内置模板：删不掉", St.remove_from_library(TPL.keys()[0]) is False,
+              "居然删掉了")
+        t1 = St.add_to_library(TPL.to_config("tpl_ag_mom30m"))
+        check("内置模板：另存为我的会换 sid", not St.is_template(t1.sid), t1.sid)
+        check("内置模板：另存保留模板名",
+              t1.title() == TPL.to_config("tpl_ag_mom30m").title(), t1.title())
+        t2 = St.add_to_library(TPL.to_config("tpl_ag_mom30m"))
+        check("内置模板：再存一份自动加序号", t2.title() != t1.title(),
+              f"{t1.title()} / {t2.title()}")
+        check("内置模板：按名字能找到",
+              St.find_library("白银·单因子动量 30m") is not None, "找不到")
+        check("内置模板：按 sid 能找到",
+              St.find_library("tpl_cross_hedge") is not None, "找不到")
+        St.save_library([])
+
         lib = St.add_to_library(a)
         item = St.add_to_portfolio(lib)
         item.volume = 9

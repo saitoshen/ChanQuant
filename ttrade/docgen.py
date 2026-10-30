@@ -40,7 +40,7 @@ def document_html(blocks: list[dict], title: str = "") -> str:
         head = (
             f"<p style='font-size:19pt;font-weight:700;margin:0 0 2px 0'>{R.inline(title)}</p>"
             f"<p style='font-size:9pt;color:#6b7280;margin:0 0 14px 0'>"
-            f"ChanQuant · 由交易助手生成</p>"
+            f"ChanQuant · 由 ChanAgent 生成</p>"
         )
     return (
         "<html><head><meta charset='utf-8'></head>"

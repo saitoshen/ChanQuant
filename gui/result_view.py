@@ -1800,7 +1800,7 @@ class ResultView(QObject):
         cfg = self.factor_cfg
         if cfg is None:
             return
-        # 整个页签（连算带画）一起推迟：`_ensure_report()` 要给 67 个因子各算一遍
+        # 整个页签（连算带画）一起推迟：`_ensure_report()` 要给 68 个因子各算一遍
         # IC / ICIR，实测 1.3 秒 —— 没人看这一页的时候算它纯属白等
         if self._defer_draw(self.canvas_f, self._refresh_factor_tab):
             return
