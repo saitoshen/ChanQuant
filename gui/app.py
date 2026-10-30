@@ -137,7 +137,10 @@ CROSS_MODES = [
      "先用截面因子挑 top X%，再让每个品种自己的时序策略决定多空"),
 ]
 
+# 截面策略「腿内怎么分钱」。**默认风险平价**：铜的日波动是玉米的两三倍，等权
+# 等于让铜一个人决定整条净值曲线；按波动率倒数分，每条腿承担的风险才拉得平
 CROSS_WEIGHTS = [
+    ("risk", "风险平价", "波动率越大分到的钱越少，让每条腿承担的风险差不多"),
     ("equal", "等权", "每一条腿分到同样的名义金额"),
     ("score", "按分数加权", "截面分数越高，多头腿分到的钱越多"),
 ]
@@ -671,6 +674,9 @@ class MainWindow(QMainWindow):
         self.fparam_widgets: dict[str, QWidget] = {}
         self.fparam_scales: dict[str, int] = {}
         self._pending = False
+        # 「改参数自动回测」的用户偏好。多品种会把它强制关掉，但不能改掉这份
+        # 偏好本身 —— 回到单品种时要还原成用户上次选的那样
+        self._auto_pref = True
         # 灌配置时会顺带触发好几次计算（切市场、换品种各算一遍），那些都是中间态。
         # 这段时间的输出先攒着，等最后一次算完再发 —— 否则 Agent 会拿着上一个品种
         # 的数字讨论这一笔，而且看着毫无破绽
@@ -712,6 +718,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._populate_symbols()
+        self._sync_auto_run()
         # 延后一拍：等界面完全建好、第一次分析排上队之后再灌配置，
         # 否则 apply_config 里的 _schedule(immediate=True) 会和首帧抢数据加载。
         QTimer.singleShot(0, self._restore_last_config)
@@ -870,7 +877,8 @@ class MainWindow(QMainWindow):
                         w.setValue(int(round(float(val) * self.param_scales.get(name, 1))))
                     except (TypeError, ValueError):
                         continue
-                self._schedule(immediate=True)
+                # 灌参数属于「加载一条已存的策略」，是显式动作：手动模式下也算
+                self._schedule(immediate=True, force=True)
         finally:
             self._pub_guard -= 1
         self._flush_publish()
@@ -1204,6 +1212,7 @@ class MainWindow(QMainWindow):
         )
         pc.addWidget(self.sp_cross_bot)
 
+        pc.addWidget(self._section("资金分配（腿内）"))
         self.cb_cross_w = QComboBox()
         for key, label, tip in CROSS_WEIGHTS:
             self.cb_cross_w.addItem(label, key)
@@ -1599,20 +1608,6 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(card)
 
-        # 状态
-        self.lbl_status = QLabel("就绪")
-        self.lbl_status.setObjectName("Hint")
-        self.lbl_status.setWordWrap(True)
-        lay.addWidget(self.lbl_status)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-        self.btn_refresh = QPushButton("重新计算")
-        self.btn_refresh.setObjectName("Ghost")
-        self.btn_refresh.clicked.connect(self.run_analysis)
-        btn_row.addWidget(self.btn_refresh)
-        lay.addLayout(btn_row)
-
         # 放进滚动容器：小屏（如 1536x864）下控件不会被挤压重叠
         scroll = QScrollArea()
         scroll.setObjectName("SideScroll")
@@ -1621,7 +1616,41 @@ class MainWindow(QMainWindow):
         scroll.setFixedWidth(296)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.NoFrame)
-        return scroll
+
+        # 状态和「策略回测」**钉在底部**，不跟着侧边栏滚：手动模式下这个按钮是
+        # 唯一的触发入口，滚到看不见就等于没有
+        wrap = QWidget()
+        wl = QVBoxLayout(wrap)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.setSpacing(8)
+        wl.addWidget(scroll, 1)
+
+        self.btn_run = QPushButton("策略回测")
+        self.btn_run.setToolTip(
+            "按左边这套参数跑一遍，结果画到右边。\n"
+            "勾了下面「改参数自动回测」时不用点它，改参数就会自己重算。"
+        )
+        self.btn_run.setMinimumHeight(34)
+        self.btn_run.clicked.connect(self._run_from_button)
+        wl.addWidget(self.btn_run)
+
+        self.chk_auto = QCheckBox("改参数自动回测")
+        self.chk_auto.setChecked(True)
+        self.chk_auto.setToolTip(
+            "勾上：改参数 / 换品种立刻重算（单品种默认）。\n"
+            "不勾：只改界面，点上面的「策略回测」才算。\n"
+            "多品种一律手动 —— 一次要跑好几个品种，自动重算会把界面拖住。"
+        )
+        self.chk_auto.toggled.connect(self._on_auto_run_toggled)
+        wl.addWidget(self.chk_auto)
+
+        self.lbl_status = QLabel("就绪")
+        self.lbl_status.setObjectName("Hint")
+        self.lbl_status.setWordWrap(True)
+        wl.addWidget(self.lbl_status)
+
+        wrap.setFixedWidth(296)
+        return wrap
 
     def _section(self, text: str) -> QLabel:
         lbl = QLabel(text)
@@ -1858,6 +1887,7 @@ class MainWindow(QMainWindow):
                 f"多品种：{len(sel)} 个，每个品种各跑一遍再等权平均" if sel else ""
             )
         self._sync_cross_controls()
+        self._sync_auto_run()
         # 勾选是**连续动作**：勾 6 个品种会连发 6 次，一次截面回测几秒，用立即
         # 模式等于让人等 6 遍。走防抖，手停 220ms 之后只算最后一次
         self._schedule()
@@ -2205,6 +2235,7 @@ class MainWindow(QMainWindow):
             self.lbl_cross_hint.setText(
                 f"{n} 个品种，每次调仓多最强的 {legs_l} 个、"
                 + ("只做多。" if self.cfg.long_only else f"空最弱的 {legs_s} 个。")
+                + f"腿内按{self.cb_cross_w.currentText()}分配。"
             )
         else:
             self.lbl_cross_hint.setText(
@@ -2540,7 +2571,7 @@ class MainWindow(QMainWindow):
             cross_rebalance=int(self.sp_cross_reb.value()),
             cross_top_pct=float(self.sp_cross_pct.value()),
             cross_bot_pct=float(self.sp_cross_bot.value()),
-            cross_weight=self.cb_cross_w.currentData() or "equal",
+            cross_weight=self.cb_cross_w.currentData() or "risk",
             timing_family=self._timing_family(),
             timing_rule_key=self.cb_strategy.currentData() or "",
             timing_rule_params=self._current_params(),
@@ -2612,7 +2643,7 @@ class MainWindow(QMainWindow):
             self.sp_cross_reb.setValue(max(1, int(cfg.cross_rebalance or 5)))
             self.sp_cross_pct.setValue(float(cfg.cross_top_pct or 10.0))
             self.sp_cross_bot.setValue(float(getattr(cfg, "cross_bot_pct", 0) or 10.0))
-            cw = self.cb_cross_w.findData(cfg.cross_weight or "equal")
+            cw = self.cb_cross_w.findData(cfg.cross_weight or "risk")
             if cw >= 0:
                 self.cb_cross_w.setCurrentIndex(cw)
             tf = self.cb_timing.findData(cfg.timing_family or "rule")
@@ -2667,7 +2698,8 @@ class MainWindow(QMainWindow):
                 self.cb_cost.setCurrentIndex(i)
                 self.cb_cost.blockSignals(False)
         self._sync_cost_controls()
-        self._schedule(immediate=True)
+        # 加载一条已存的策略是显式动作：手动模式下也要立刻算一遍
+        self._schedule(immediate=True, force=True)
 
     def _apply_factor_keys(self, keys, reverse) -> None:
         """恢复因子选择：单因子设下拉，多因子勾表格，反向勾「反」列。"""
@@ -2799,7 +2831,59 @@ class MainWindow(QMainWindow):
             self._booting = False
 
     # ---------------------------------------------------------- 调度
-    def _schedule(self, *_, immediate: bool = False) -> None:
+    def _run_from_button(self) -> None:
+        """「策略回测」按钮：显式跑一次，不看自动开关。
+
+        不能直接把 `clicked` 连到 `run_analysis` —— `clicked` 带一个 bool，
+        会当成 `df_override=False` 传进去，后面 `df.empty` 就炸了。
+        """
+        self._pending = False
+        self.run_analysis()
+
+    def _on_auto_run_toggled(self, on: bool) -> None:
+        # 记住用户自己的选择：勾了多品种会被强制关掉，回到单品种时得还原成
+        # 他上次选的那样，不能把「我本来开着自动」这个偏好一起清掉
+        self._auto_pref = bool(on)
+        # 从「手动」切回「自动」时，界面上的参数可能已经和右边结果对不上了 ——
+        # 补算一次，否则要等到下次改参数才更新
+        if on and not getattr(self, "_booting", False):
+            self._schedule()
+
+    @property
+    def _auto_run(self) -> bool:
+        """改参数要不要自动重算。多品种一律 False（勾选框此时是灰的）。"""
+        if not hasattr(self, "chk_auto"):
+            return True
+        return bool(self.chk_auto.isChecked()) and not self._multi_symbols()
+
+    def _sync_auto_run(self) -> None:
+        """多品种强制手动：勾选框置灰且不勾。
+
+        多品种一次要跑 N 个品种（截面还带机器学习的几十折），自动重算等于
+        「勾一个品种卡一次」，所以这里不给选。
+        """
+        if not hasattr(self, "chk_auto"):
+            return
+        multi = bool(self._multi_symbols())
+        want = False if multi else bool(getattr(self, "_auto_pref", True))
+        self.chk_auto.blockSignals(True)
+        self.chk_auto.setChecked(want)
+        self.chk_auto.blockSignals(False)
+        self.chk_auto.setEnabled(not multi)
+        self.chk_auto.setToolTip(
+            "多品种一律手动：一次要跑好几个品种，自动重算会把界面拖住。\n"
+            "点上面的「策略回测」才开始。"
+            if multi else
+            "勾上：改参数 / 换品种立刻重算（单品种默认）。\n"
+            "不勾：只改界面，点上面的「策略回测」才算。"
+        )
+
+    def _hint_manual(self) -> None:
+        """手动模式下参数变了：告诉用户去点按钮，别让人以为界面卡了。"""
+        if hasattr(self, "lbl_status"):
+            self.lbl_status.setText("参数已改 —— 点「策略回测」重算")
+
+    def _schedule(self, *_, immediate: bool = False, force: bool = False) -> None:
         if not self.store.symbols:
             return
         if immediate:
@@ -2810,9 +2894,20 @@ class MainWindow(QMainWindow):
             if getattr(self, "_booting", False):
                 # 启动阶段恢复配置：先让窗口画出来再算。同步算的话，窗口要等
                 # 回测跑完才第一次绘制 —— 用户看到的就是「打开就卡住」。
-                self._schedule()
+                self._schedule(force=True)
+                return
+            if not force and not self._auto_run:
+                # 手动模式连「换品种 / 换策略族」也不自动算：多品种一次几分钟，
+                # 用户要的是「参数摆好，点一下」。界面照常跟着变，只是不动结果
+                self._hint_manual()
                 return
             self.run_analysis()
+            return
+        if not force and not self._auto_run:
+            # 手动模式：参数只改界面，不动结果。多品种永远走这条 —— 一次跑
+            # 几分钟，谁也不想改个下拉等三分钟
+            self._pending = False
+            self._hint_manual()
             return
         if self._pending:
             return
@@ -3171,7 +3266,7 @@ class MainWindow(QMainWindow):
             top_pct=float(self.sp_cross_pct.value()),
             bot_pct=float(self.sp_cross_bot.value()),
             long_only=self.cfg.long_only,
-            weight=self.cb_cross_w.currentData() or "equal",
+            weight=self.cb_cross_w.currentData() or "risk",
             factor_mode=self.factor_mode,
             factor_keys=fkeys,
             factor_reverse=rev,

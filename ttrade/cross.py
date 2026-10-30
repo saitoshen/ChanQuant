@@ -36,6 +36,12 @@ from ttrade.strategies import STRATEGIES, run_strategy
 
 MIN_CROSS = 3          # 横截面上至少几个品种有值，才算得出一组强弱
 
+# 风险平价用的波动率窗口（根）。60 根日线约三个月，5 分钟 48 根一天的话是
+# 一天多一点 —— 都不至于慢到追不上波动率的变化，也不至于快到被一两根异常
+# K 线带偏。少于 20 根算不出标准差时退回等权，别让新上市品种拿到 0 权重。
+VOL_WINDOW = 60
+VOL_MIN_OBS = 20
+
 # 每折最多喂多少行给模型。截面是「品种 × 时间」堆起来的长表，6 个品种 × 十年
 # 5 分钟就是 100 万行，一折要十几秒；几十折下来是几十分钟。树模型不缺这几百万
 # 行里的重复信息，按等间隔抽到 2 万行，一折 0.5 秒左右，排序结论几乎不变。
@@ -51,7 +57,8 @@ class CrossConfig:
     top_pct: float = 10.0               # 多头：选最强的百分之几
     bot_pct: float = 10.0               # 空头：选最弱的百分之几（可以和多头不同）
     long_only: bool = False
-    weight: str = "equal"               # equal = 等权；score = 按分数加权
+    # risk = 风险平价（按波动率倒数分配，默认）；equal = 等权；score = 按分数加权
+    weight: str = "risk"
 
     # 截面因子。三种模式和时序那边一样：single / multi / ml
     factor_mode: str = "multi"
@@ -396,10 +403,13 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     rets = close.pct_change().fillna(0.0)
     cvec = cost_vector(frames, bt, profile).reindex(score.columns).fillna(0.0)
 
+    # 风险平价要各品种的波动率；等权 / 按分数用不上，不算它（滚动标准差在 5 分钟
+    # 全历史上也要几百毫秒）
+    vol = vol_panel(frames, score.index) if cfg.weight == "risk" else None
     if cfg.mode == "select":
-        weights = _select_weights(frames, score, cfg)
+        weights = _select_weights(frames, score, cfg, vol)
     else:
-        weights = _hedge_weights(score, cfg)
+        weights = _hedge_weights(score, cfg, vol)
 
     # 两个权重构造器都返回**稠密**矩阵（每一根 bar 都有值）：调仓日之间保持
     # 上一组的仓位，调仓日整体换一次。不要在这里再 ffill —— 那会把「主动平掉」
@@ -467,17 +477,73 @@ def to_result(out: "CrossResult", label: str = "", step: int = 1,
     return Result(equity=eq, position=pos, trades=[], metrics=m, label=label)
 
 
-def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig) -> pd.DataFrame:
+def vol_panel(frames: dict[str, pd.DataFrame], index) -> pd.DataFrame:
+    """各品种的滚动波动率（收益率的滚动标准差），对齐到截面面板的索引上。
+
+    用**收益率**而不是价格：铜一手 7 万、玉米一手 3 千，价格量级差 20 倍，拿价格
+    标准差当风险，玉米会永远拿到最大权重。收益率才可比。
+
+    `shift(1)` 不是为了防未来函数（`run()` 里权重本来就 `shift(1)` 才成交），
+    而是让第 t 根的权重只用 t 之前已经收完的收益 —— 否则同一根 bar 的收盘价
+    既决定波动率又决定仓位，回测会比实盘乐观。
+    """
+    close = close_panel(frames).reindex(index).ffill()
+    rets = close.pct_change()
+    vol = rets.rolling(VOL_WINDOW, min_periods=VOL_MIN_OBS).std()
+    return vol.reindex(index).ffill()
+
+
+def _rp_share(vol_row: np.ndarray, mask: np.ndarray, total: float) -> np.ndarray:
+    """风险平价的权重：选中的那几只里，波动率越低分到的钱越多。
+
+    严格的风险平价要解一个优化（让每只的风险贡献相等），这里用**逆波动率**：
+    `w_i ∝ 1/σ_i`。它在「各品种相关性相同」时就是精确解，相关系数不一致时是
+    业界最常用的近似 —— 比等权好得多，而且一行公式，看得懂也跑得快。
+
+    波动率算不出来（新品种还没攒够 60 根）时退回等权：给 0 权重等于把它踢出
+    组合，可它明明是刚被截面选中的强者。
+    """
+    out = np.zeros(len(vol_row), dtype=float)
+    idx = np.nonzero(mask)[0]
+    if not len(idx):
+        return out
+    v = vol_row[idx]
+    inv = np.where(np.isfinite(v) & (v > 1e-12), 1.0 / np.maximum(v, 1e-12), np.nan)
+    if not np.isfinite(inv).any():
+        out[idx] = total / len(idx)
+        return out
+    # 缺一个就用这一腿的中位数顶上：既不让它变成 0 权重，也不让它因为「分母小」
+    # 反而拿到最大权重
+    inv = np.where(np.isfinite(inv), inv, np.nanmedian(inv))
+    out[idx] = total * inv / inv.sum()
+    return out
+
+
+def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig,
+                   vol: pd.DataFrame | None = None) -> pd.DataFrame:
     """多强空弱。多空各占一半名义，净敞口 ≈ 0。
 
     多空腿数可以不一样（`top_pct` / `bot_pct`）：多 10% 空 10% 是常见的对称
     写法，但「多最强的 10%、空最弱的 20%」也讲得通（下跌时弱者更弱）。两边
     各自按自己的腿数平分 0.5 的名义额，净敞口仍然是 0。
+
+    腿内怎么分（`weight`）：等权 / 按分数 / 风险平价。风险平价是**每一腿内部**
+    按 1/σ 分 —— 波动大的品种少给钱，多空两侧各自的风险贡献才拉得平；跨腿的
+    0.5 / 0.5 不动，否则净敞口就不是 0 了。
     """
     rows, top, bot, k_long, k_short, ok = _rank(score, cfg)
     inv_l = 1.0 / np.maximum(k_long, 1)
     inv_s = 1.0 / np.maximum(k_short, 1)
-    if cfg.weight == "score":
+    if cfg.weight == "risk" and vol is not None:
+        vmat = vol.to_numpy(dtype=float)[rows]
+        w = np.zeros(vmat.shape, dtype=float)
+        for i in range(len(rows)):
+            if not ok[i]:
+                continue
+            w[i] = _rp_share(vmat[i], top[i], 0.5)
+            if not cfg.long_only:
+                w[i] -= _rp_share(vmat[i], bot[i], 0.5)
+    elif cfg.weight == "score":
         mat = score.to_numpy(dtype=float)[rows]
         pos = np.where(top, np.clip(np.nan_to_num(mat), 0.0, None), 0.0)
         s = pos.sum(axis=1)
@@ -485,10 +551,12 @@ def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig) -> pd.DataFrame:
         share = np.zeros_like(pos)
         share[good] = pos[good] / s[good, None]
         w = np.where(good[:, None], 0.5 * share, top * (0.5 * inv_l)[:, None])
+        if not cfg.long_only:
+            w = w - bot * (0.5 * inv_s)[:, None]
     else:
         w = top * (0.5 * inv_l)[:, None]
-    if not cfg.long_only:
-        w = w - bot * (0.5 * inv_s)[:, None]
+        if not cfg.long_only:
+            w = w - bot * (0.5 * inv_s)[:, None]
     return _place(score, rows, w, ok)
 
 
@@ -548,11 +616,14 @@ def _place(score: pd.DataFrame, rows, w: np.ndarray, ok) -> pd.DataFrame:
 
 
 def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
-                    cfg: CrossConfig) -> pd.DataFrame:
+                    cfg: CrossConfig, vol: pd.DataFrame | None = None) -> pd.DataFrame:
     """先选品种，再让每个品种自己的时序信号决定仓位。
 
     时序信号在**各自的行情表**上算（`strategies.run_strategy` / 因子策略），算完
     再对齐到截面面板的索引上。这样 5 分钟周期里各品种交易时段不同也不会串。
+
+    选中的那几只之间怎么分钱看 `weight`：等权 / 按分数 / 风险平价（默认）。
+    信号是 ±1 时只决定方向，不决定大小 —— 仓位大小由这一层定。
     """
     sigs: dict[str, pd.Series] = {}
     for sym, df in frames.items():
@@ -560,8 +631,16 @@ def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
     sig_panel = pd.concat(sigs, axis=1).sort_index().reindex(score.index).ffill().fillna(0.0)
 
     rows, top, _bot, k_long, _k_short, ok = _rank(score, cfg)
-    inv = 1.0 / np.maximum(k_long, 1)
-    held = _place(score, rows, top * inv[:, None], ok)
+    if cfg.weight == "risk" and vol is not None:
+        vmat = vol.to_numpy(dtype=float)[rows]
+        w = np.zeros(vmat.shape, dtype=float)
+        for i in range(len(rows)):
+            if ok[i]:
+                w[i] = _rp_share(vmat[i], top[i], 1.0)
+    else:
+        inv = 1.0 / np.maximum(k_long, 1)
+        w = top * inv[:, None]
+    held = _place(score, rows, w, ok)
     # 选中的那一段里，按时序信号决定持有方向；没选中就是 0
     return held * sig_panel
 

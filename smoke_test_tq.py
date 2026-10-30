@@ -1241,6 +1241,16 @@ def check_strategy_store() -> None:
         # 多空两条腿的百分比各存各的：多头 25% / 空头 20% 是一种常见配置
         check("策略配置：截面多空百分比分开记",
               "多25%/空20%" in cb.params_text(), cb.params_text())
+        # 资金分配默认风险平价：等权会让波动最大的那个品种主导整条净值曲线
+        check("策略配置：截面资金分配默认风险平价",
+              St.StrategyConfig(family="cross").cross_weight == "risk",
+              St.StrategyConfig(family="cross").cross_weight)
+        wt = a.clone(name="权重口径", family="cross", cross_weight="score")
+        St.add_to_library(wt)
+        back_w = next(c for c in St.load_library() if c.sid == wt.sid)
+        check("策略配置：截面权重口径往返一致",
+              back_w.cross_weight == "score" and "按分数" in back_w.params_text(),
+              f"{back_w.cross_weight} / {back_w.params_text()}")
 
         St.save_chase(St.ChaseConfig(enabled=True, wait_sec=3, retries=2, ticks=5))
         c = St.load_chase()
@@ -1407,6 +1417,51 @@ def check_cross() -> None:
           both.shape == one.shape
           and np.allclose(both.fillna(-9).to_numpy(), one.fillna(-9).to_numpy()),
           f"{both.shape} vs {one.shape}")
+
+    # 风险平价：波动率越大分到的钱越少，每条腿的风险贡献才拉得平。造一批
+    # 「漂移相同、波动率 0.2%→2% 逐级放大」的品种，低波动的必须拿到大头
+    vframes = {}
+    for i, vol in enumerate([0.002, 0.004, 0.008, 0.012, 0.016, 0.02]):
+        r = 0.001 + vol * np.random.default_rng(11 + i).normal(size=len(idx))
+        px = pd.Series(100 * np.cumprod(1 + r), index=idx)
+        vframes[f"V{i}_X"] = pd.DataFrame({"open": px, "high": px, "low": px,
+                                           "close": px, "volume": 1000.0})
+    rp_cfg = cross.CrossConfig(mode="hedge", rebalance=5, top_pct=33.3, bot_pct=33.3,
+                               weight="risk", factor_keys=["mom_20"])
+    check("截面：风险平价是默认权重", cross.CrossConfig().weight == "risk",
+          cross.CrossConfig().weight)
+    rp = cross.run(vframes, rp_cfg, BtConfig())
+    check("截面：风险平价能跑出净值", rp.ok, rp.error)
+    if rp.ok:
+        held = rp.weights[rp.weights.abs().sum(axis=1) > 0]
+        row = held.iloc[-1]
+        longs = row[row > 0]
+        vols = {k: float(df["close"].pct_change().rolling(60, min_periods=20)
+                         .std().iloc[-1]) for k, df in vframes.items()}
+        # 多头腿里不一定有 V0（动量排序看的是涨得最猛的那个），所以按「这一腿里
+        # 谁波动最小」比，而不是按名字比
+        calm = min(longs.index, key=lambda k: vols[k])
+        check("截面：风险平价给低波动更多钱",
+              longs.idxmax() == calm, f"最稳的 {calm} / 拿最多 {longs.idxmax()}")
+        check("截面：风险平价多头合计 0.5",
+              abs(float(longs.sum()) - 0.5) < 1e-9, str(float(longs.sum())))
+        check("截面：风险平价空头合计 -0.5",
+              abs(float(row[row < 0].sum()) + 0.5) < 1e-9,
+              str(float(row[row < 0].sum())))
+        check("截面：风险平价净敞口为 0", abs(float(row.sum())) < 1e-9,
+              str(float(row.sum())))
+        # 风险贡献 = 权重 × 波动率，同一条腿里应该差不多（差一个数量级就是分错了）
+        risk = [abs(v) * vols[k] for k, v in longs.items()]
+        check("截面：风险平价的风险贡献接近相等",
+              max(risk) / max(min(risk), 1e-12) < 2.0,
+              str([round(x, 6) for x in risk]))
+    eqw = cross.run(vframes, cross.CrossConfig(
+        mode="hedge", rebalance=5, top_pct=33.3, bot_pct=33.3,
+        weight="equal", factor_keys=["mom_20"]), BtConfig())
+    check("截面：等权与风险平价的净值不同",
+          eqw.ok and not np.allclose(eqw.equity.to_numpy()[-200:],
+                                     rp.equity.to_numpy()[-200:]),
+          "" if not (eqw.ok and rp.ok) else "居然一模一样")
 
     res = cross.run(frames, cfg, BtConfig())
     check("截面：回测能跑出净值", res.ok, res.error)

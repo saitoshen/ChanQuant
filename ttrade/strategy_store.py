@@ -34,6 +34,10 @@ LIB_FILE = "strategy_lib.json"
 PORT_FILE = "portfolio.json"
 LAST_FILE = "last_config.json"
 
+# 截面策略「腿内怎么分钱」的中文名。策略库表格里要显示，界面下拉也用它，
+# 放一处免得两边慢慢走偏
+_WEIGHT_CN = {"risk": "风险平价", "equal": "等权", "score": "按分数"}
+
 
 def _clamp_pct(value, dflt: float, hi: float) -> float:
     """百分比参数消毒：非数字 / NaN / 非正数退回默认，超上限就夹到上限。
@@ -101,7 +105,7 @@ class StrategyConfig:
     cross_rebalance: int = 5            # 调仓间隔（根）
     cross_top_pct: float = 10.0         # 多头：选最强的百分比
     cross_bot_pct: float = 10.0         # 空头：选最弱的百分比（可以和上面不同）
-    cross_weight: str = "equal"         # equal / score
+    cross_weight: str = "risk"          # risk / equal / score
 
     # 「选品种 + 时序交易」里的那条时序腿。规则和因子二选一，另一个保留不删 ——
     # 用户来回切换不该丢参数。
@@ -213,7 +217,7 @@ class StrategyConfig:
             bits = [f"{mode}·{len(self.factor_keys or [])}因子",
                     f"调仓={int(self.cross_rebalance or 1)}根",
                     f"多{float(self.cross_top_pct or 0):g}%/空{float(self.cross_bot_pct or 0):g}%",
-                    f"权重={'等权' if self.cross_weight != 'score' else '按分数'}"]
+                    f"权重={_WEIGHT_CN.get(self.cross_weight, '风险平价')}"]
             if self.cross_mode == "select":
                 bits.append(f"时序={'规则' if self.timing_family != 'factor' else '因子'}")
             return " ".join(bits)
@@ -324,8 +328,8 @@ class StrategyConfig:
         cfg.cross_bot_pct = _clamp_pct(getattr(cfg, "cross_bot_pct", 10.0), 10.0, 50.0)
         if cfg.cross_mode not in ("hedge", "select"):
             cfg.cross_mode = "hedge"
-        if cfg.cross_weight not in ("equal", "score"):
-            cfg.cross_weight = "equal"
+        if cfg.cross_weight not in ("risk", "equal", "score"):
+            cfg.cross_weight = "risk"
         if cfg.timing_family not in ("rule", "factor"):
             cfg.timing_family = "rule"
         return cfg

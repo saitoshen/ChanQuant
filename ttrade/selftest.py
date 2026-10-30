@@ -886,6 +886,13 @@ def _run() -> tuple[bool, list[str]]:
             and win.cb_timing.count() >= 2
             and win.view_stack.count() == 2
             and win.cb_cost.count() >= 3
+            # 回测触发：一个显式按钮 + 一个「改参数自动回测」开关。多品种一次要
+            # 跑几分钟，没有手动入口就只能靠自动重算硬扛
+            and win.btn_run.text() == "策略回测"
+            and win.chk_auto.isChecked()
+            and win.chk_auto.isEnabled()
+            # 资金分配默认风险平价（第一项）
+            and win.cb_cross_w.itemData(0) == "risk"
         )
 
         # 勾选面板：点一个品种**不能把面板关掉**（`QMenu` 的 checkable action 就会），
