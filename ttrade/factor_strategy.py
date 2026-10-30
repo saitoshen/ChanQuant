@@ -243,6 +243,7 @@ def build_score(
     if not keys:
         raise ValueError("没有选中任何可用因子")
 
+    picked = list(keys)
     keys = F.filter_available(df, keys)
     if not keys:
         raise ValueError("选中的因子在该标的上都没有足够数据（如美股无持仓量）")
@@ -251,6 +252,15 @@ def build_score(
     rawf = F.raw_frame(df, keys)
     fwd = M.forward_return(df, cfg.horizon)
     notes: list[str] = []
+    # 标签上的「N 个」是**过滤后**的数量。少掉几个不是配置被改了，而是这几个
+    # 因子在当前标的 / 当前区间上没有足够观测（典型：展期、期权那类列只有
+    # 本地库才有）。不说明一句，用户看到数字自己变，会以为策略被换了。
+    gone = [k for k in picked if k not in set(keys)]
+    if gone:
+        notes.append(
+            f"已剔除 {len(gone)} 个在该标的上没有足够数据的因子："
+            + "、".join(F.FACTORS[k].label for k in gone)
+        )
 
     if mode == "single":
         k = keys[0]
@@ -261,6 +271,7 @@ def build_score(
             score=score, fmat=fmat, raw=rawf, orient=ori,
             label=f"单因子 · {F.FACTORS[k].label}" + ("（反转）" if rev else ""),
         )
+        pack.notes.extend(notes)      # 「剔除了哪几个因子」这类说明
         if cfg.orient == "auto":
             pack.notes.append("方向由扩张窗口 IC 决定（滞后 h 期，无未来信息）")
             onote = _orient_note(ori, cfg)
@@ -280,6 +291,7 @@ def build_score(
             score=score, fmat=fmat, raw=rawf, orient=ori,
             label=f"多因子等权 · {len(keys)} 个" + (f"（{n_rev} 个反转）" if n_rev else ""),
         )
+        pack.notes.extend(notes)      # 「剔除了哪几个因子」这类说明
         if cfg.orient == "auto":
             pack.notes.append("各因子先按自身 PIT 方向取号，再等权平均")
             onote = _orient_note(ori, cfg)

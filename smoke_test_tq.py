@@ -296,6 +296,25 @@ def check_live_helpers() -> None:
           and pd.notna(merged.loc["2026-10-27 18:00", "trading_day"]))
     check("实时②拼接后索引递增", bool(merged.index.is_monotonic_increasing))
 
+    # 列不能被砍。本地表带着展期 / 期权那几十列（c1_close / iv_near / pcr …），
+    # 实时推送里没有这些。早先按**交集**取列，合并结果里这几列整列消失，
+    # `factors.available()` 一看「一根有值的都没有」就把对应因子踢出合成 ——
+    # 表现是「一开实时，19 个因子变 12 个、反转数也跟着变，策略像自己换了一套」。
+    aux = local.copy()
+    aux["pcr"] = [0.85]
+    aux["c1_close"] = [101000.0]
+    merged2 = L.merge_live(aux, bars)
+    check("实时⑤合并后列一个不少",
+          list(merged2.columns) == list(aux.columns),
+          f"少了：{[c for c in aux.columns if c not in merged2.columns]}")
+    check("实时⑤新 bar 缺的列留空而不是 0",
+          pd.isna(merged2.loc["2026-10-27 18:00", "pcr"])
+          and pd.isna(merged2.loc["2026-10-27 18:00", "c1_close"]),
+          str(merged2.loc["2026-10-27 18:00", ["pcr", "c1_close"]].to_dict()))
+    check("实时⑤历史段辅助列还在",
+          float(merged2.loc["2026-10-27 17:00", "pcr"]) == 0.85,
+          f"{merged2.loc['2026-10-27 17:00', 'pcr']}")
+
     # 同一根：本地库里已经有这根（日线最典型 —— 下载时把当天那根半成品写进去了），
     # 实时这份要**覆盖价格**，否则图上最后一根永远停在下载那一刻：顶部报价在跳、
     # K 线一动不动。因子仍用本地那份（实时段一律 1.0）。

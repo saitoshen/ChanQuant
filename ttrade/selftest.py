@@ -10,6 +10,7 @@ CI 里跑一遍这个就能确认「打出来的包真的能用」，而不用�
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import traceback
@@ -683,6 +684,33 @@ def _run() -> tuple[bool, list[str]]:
 
         src_tq = dp is not None and dp.cb_source.currentData() == "tq"
         tq_vis = is_us or not src_tq
+
+        def _sched_ok(d) -> bool:
+            """两条每日补充日程要和**存盘的那份**一致。
+
+            早先这里写死「默认不勾 / 15:30 / 17:00」—— 用户把每日补充打开之后
+            自检就必红，可那是用户设置，不是代码坏了。没存过盘才该是默认值。
+            """
+            try:
+                with open(d._auto_path(), encoding="utf-8") as fh:
+                    saved = json.load(fh)
+            except Exception:  # noqa: BLE001
+                saved = {}
+            if "aux" not in saved and ("enabled" in saved or "time" in saved):
+                saved = {"aux": saved}        # 老版本只有一条，存的是扁平结构
+            for key, chk, tm, rng in (
+                ("aux", d.chk_auto, d.time_auto, d.cb_auto_range),
+                ("daily", d.chk_daily, d.time_daily, d.cb_daily_range),
+            ):
+                one = saved.get(key) or {}
+                if bool(one.get("enabled", False)) != chk.isChecked():
+                    return False
+                if one.get("time") and tm.time().toString("HH:mm") != str(one["time"]):
+                    return False
+                if one.get("range") and rng.currentData() != one["range"]:
+                    return False
+            return True
+
         has_upd = (
             dp is not None
             and win.pages.count() == 5
@@ -712,12 +740,9 @@ def _run() -> tuple[bool, list[str]]:
             and hasattr(dp, "chk_daily")
             and hasattr(dp, "time_daily")
             and hasattr(dp, "cb_daily_range")
-            and not dp.chk_auto.isChecked()
-            and not dp.chk_daily.isChecked()
             and dp.cb_auto_range.count() == 2
             and dp.cb_daily_range.count() == 2
-            and dp.time_auto.time().toString("HH:mm") == "15:30"
-            and dp.time_daily.time().toString("HH:mm") == "17:00"
+            and _sched_ok(dp)
         )
         # 账户透视页：多账户列表 + 三张表都要带「资金账户」列，委托/成交还要
         # 带「时间」。这些列是逐列摆出来的，漏一列不会报错、只会让人看不出来

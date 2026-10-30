@@ -190,8 +190,15 @@ def merge_live(local: pd.DataFrame, live: pd.DataFrame) -> pd.DataFrame:
     for c in ("open_oi", "close_oi"):
         if c not in add.columns:
             add[c] = 0.0
-    cols = [c for c in local.columns if c in add.columns]
-    return pd.concat([local[cols], add[cols]]).sort_index()
+    # 列要取**本地那份的全部**，不能取交集。本地表里带着展期 / 期权那几十列
+    # （`c1_close` / `iv_near` / `pcr` …），实时推送里没有这些 —— 取交集等于把
+    # 整列从合并结果里删掉，`factors.available()` 一看「这因子一根有值的都没有」
+    # 就把它踢出合成。用户看到的是「一开实时，19 个因子变成 12 个，信号全变了」，
+    # 而且同一根 bar 内只刷价格不重算，标签在两种状态间反复横跳，像是策略自己
+    # 在变。新 bar 缺的列留 NaN：历史段本来就有值，因子仍然算可用，只是最后一根
+    # 的分数是 NaN（`mean(skipna=True)` 会跳过，不影响已走完的 bar）。
+    add = add.reindex(columns=local.columns)
+    return pd.concat([local, add]).sort_index()
 
 
 # ------------------------------------------------------------------ 会话
