@@ -41,10 +41,18 @@ def app_icon():
     """
     from PySide6.QtGui import QIcon
 
-    for name in ("icon.png", "icon.ico"):
+    # 优先用**带多尺寸**的那份：Windows 认 .ico、macOS 认 .icns，它们里面
+    # 16/32/48 各有一张，任务栏和 Alt+Tab 才不会把 1024 的图硬缩成糊的。
+    # .png 只是兜底（Linux、或者图标没重新生成过的时候）
+    names = ("icon.ico", "icon.icns") if sys.platform == "win32" else \
+            ("icon.icns", "icon.ico") if sys.platform == "darwin" else \
+            ("icon.png",)
+    for name in names + ("icon.png",):
         path = os.path.join(ASSET_ROOT, "packaging", name)
         if os.path.exists(path):
-            return QIcon(path)
+            icon = QIcon(path)
+            if not icon.isNull():
+                return icon
     return QIcon()
 
 # matplotlib 缓存目录必须在导入 pyplot 之前指定。放在用户缓存目录而不是包内，
