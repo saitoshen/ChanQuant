@@ -43,8 +43,8 @@ from __future__ import annotations
 import os
 import time
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QTextCursor
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -93,6 +93,34 @@ def reports_dir() -> str:
 
 
 # ------------------------------------------------------------------ 线程
+
+
+class ProfileWorker(QObject):
+    """跑在 QThread 里：整库因子体检。
+
+    只做**计算**，不碰 Qt 的富文本 / 绘图对象 —— `QTextDocument` 和 `QPdfWriter`
+    不是线程安全的，渲染 PDF 那一步必须回主线程（实测 0.3 秒，不会卡）。
+    分析本身十几秒，正好放进线程。
+    """
+
+    progress = Signal(int, int, str)
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, years: int = 10) -> None:
+        super().__init__()
+        self.years = years
+
+    def run(self) -> None:
+        try:
+            from ttrade import factor_profile as FP
+
+            res = FP.build(years=self.years,
+                           progress=lambda d, t, m: self.progress.emit(d, t, m))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.done.emit(res)
 
 
 class ChatWorker(QObject):
@@ -690,6 +718,41 @@ class AgentPage(QWidget):
         self.lst_factor.currentItemChanged.connect(self._show_factor)
         lay.addWidget(self.lst_factor, 1)
 
+        # 因子手册 / 审核 / 深度分析：前两个是「问模型」，最后一个是「出一份 PDF」。
+        # 审核和分析都是把一段结构化提示词塞进对话框再发出去 —— 用户能看见自己
+        # 问了什么，也能接着追问，比弹一个黑盒窗口有用。
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        self.btn_audit = QPushButton("因子审核")
+        self.btn_audit.setObjectName("Ghost")
+        self.btn_audit.setToolTip(
+            "让模型对选中因子做 PIT 审核：有没有用到未来数据、衍生数据是否过旧、"
+            "夜盘 bar 的交易日归属是否合理、时段边界有没有缝"
+        )
+        self.btn_audit.setEnabled(False)
+        self.btn_audit.clicked.connect(self._audit_factor)
+        row.addWidget(self.btn_audit)
+
+        self.btn_deep = QPushButton("因子深度分析")
+        self.btn_deep.setObjectName("Ghost")
+        self.btn_deep.setToolTip(
+            "让模型对选中因子做深度分析：快因子还是慢因子、适合什么品种和周期、"
+            "和谁搭组合、稳健性如何。有实测数字会一并交给它"
+        )
+        self.btn_deep.setEnabled(False)
+        self.btn_deep.clicked.connect(self._deep_factor)
+        row.addWidget(self.btn_deep)
+        lay.addLayout(row)
+
+        self.btn_handbook = QPushButton("因子手册（PDF）")
+        self.btn_handbook.setObjectName("Ghost")
+        self.btn_handbook.setToolTip(
+            "对整库因子跑一遍体检，生成一份 PDF：快慢、品种、周期、组合、稳健性。\n"
+            "约十几秒，跑完自动打开。"
+        )
+        self.btn_handbook.clicked.connect(self._make_handbook)
+        lay.addWidget(self.btn_handbook)
+
         btn = QPushButton("让模型写一个新因子")
         btn.setObjectName("Ghost")
         btn.clicked.connect(self._ask_new_factor)
@@ -966,6 +1029,10 @@ class AgentPage(QWidget):
         self.btn_del_factor.setEnabled(
             cur is not None and _is_user_factor(str(cur.data(Qt.UserRole)))
         )
+        # 审核 / 深度分析只要求「选中了某个因子」，自定义和内置都能问
+        for b in (getattr(self, "btn_audit", None), getattr(self, "btn_deep", None)):
+            if b is not None:
+                b.setEnabled(cur is not None)
         if cur is None:
             return
         d = L.factor_doc(str(cur.data(Qt.UserRole)))
@@ -1774,6 +1841,185 @@ class AgentPage(QWidget):
             "只能用 df 的 open/high/low/close/volume/amount/open_interest 列）、"
             "以及它适合什么行情。"
         )
+
+    # ---------------------------------------------------------- 因子手册 / 审核
+
+    HANDBOOK_NAME = "因子深度分析手册.pdf"
+    PROFILE_NAME = "因子分析.json"
+
+    def _handbook_path(self) -> str:
+        d = os.path.join(user_dir(), "handbook")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, self.HANDBOOK_NAME)
+
+    def _profile_path(self) -> str:
+        return os.path.join(os.path.dirname(self._handbook_path()), self.PROFILE_NAME)
+
+    def _load_profile(self) -> dict | None:
+        """读上次体检的缓存。审核 / 深度分析要拿实测数字喂给模型。"""
+        import json
+
+        try:
+            with open(self._profile_path(), encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _selected_factor_key(self) -> str:
+        it = self.lst_factor.currentItem()
+        return str(it.data(Qt.UserRole)) if it is not None else ""
+
+    def _make_handbook(self) -> None:
+        """整库体检 → PDF → 打开。已经有一份就再跑一次（数据会变）。"""
+        if getattr(self, "_prof_thread", None) is not None:
+            self._set_state("正在生成手册，稍等…", C_MUTED)
+            return
+        self.btn_handbook.setEnabled(False)
+        self._set_state("正在跑因子体检（约十几秒）…", C_MUTED)
+        self._prof_worker = ProfileWorker(years=10)
+        self._prof_thread = QThread(self)
+        self._prof_worker.moveToThread(self._prof_thread)
+        self._prof_thread.started.connect(self._prof_worker.run)
+        self._prof_worker.progress.connect(
+            lambda d, t, m: self._set_state(f"因子体检 {d}/{t} · {m}", C_MUTED)
+        )
+        self._prof_worker.done.connect(self._on_profile_done)
+        self._prof_worker.failed.connect(self._on_profile_failed)
+        self._prof_worker.done.connect(self._prof_thread.quit)
+        self._prof_worker.failed.connect(self._prof_thread.quit)
+        self._prof_thread.finished.connect(self._prof_thread_done)
+        self._prof_thread.start()
+
+    def _on_profile_done(self, res) -> None:
+        import json
+
+        try:
+            from ttrade import factor_pdf as PDF
+
+            with open(self._profile_path(), "w", encoding="utf-8") as f:
+                json.dump(res.to_dict(), f, ensure_ascii=False)
+            path = PDF.write_pdf(res, self._handbook_path())
+        except Exception as exc:  # noqa: BLE001
+            self._set_state(f"手册生成失败：{type(exc).__name__}: {exc}", C_BAD)
+            return
+        self._set_state(f"手册已生成（{len(res.factors)} 个因子）", C_OK)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _on_profile_failed(self, msg: str) -> None:
+        self._set_state(f"因子体检失败：{msg}", C_BAD)
+
+    def _prof_thread_done(self) -> None:
+        for attr in ("_prof_thread", "_prof_worker"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                obj.deleteLater()
+                setattr(self, attr, None)
+        self.btn_handbook.setEnabled(True)
+
+    def _factor_facts(self, key: str) -> str:
+        """把这个因子的实测数字拼成几行，喂给模型当事实依据。
+
+        没有缓存（还没生成过手册）就返回空串 —— 让模型自己去读代码，别编数字。
+        """
+        prof = self._load_profile()
+        if not prof:
+            return ""
+        one = next((f for f in prof.get("factors") or [] if f.get("key") == key), None)
+        if not one:
+            return ""
+
+        def _n(v, nd=4):
+            try:
+                x = float(v)
+            except (TypeError, ValueError):
+                return "—"
+            return f"{x:.{nd}f}" if x == x else "—"
+
+        if one.get("no_daily"):
+            return (f"实测：日线数据上整列为空（日内 / 时段类因子），只在 5m / 1h 上有值。"
+                    f"体检样本 {prof.get('meta', {}).get('span', ['', ''])[0]} ~ "
+                    f"{prof.get('meta', {}).get('span', ['', ''])[1]}。")
+        lines = [
+            f"实测（{len(prof.get('meta', {}).get('symbols') or [])} 个品种横截面，"
+            f"{prof.get('meta', {}).get('span', ['', ''])[0]} ~ "
+            f"{prof.get('meta', {}).get('span', ['', ''])[1]}）：",
+            f"- 横截面 IC 均值 {_n(one.get('ic_mean'))}，ICIR {_n(one.get('icir'), 3)}，"
+            f"Newey-West t {_n(one.get('t'), 2)}，方向胜率 {_n(one.get('pos'), 2)}",
+            (f"- IC 衰减半衰期 {_n(one.get('half_life'), 1)} 个交易日 → 判定为「{one.get('speed')}」，"
+             f"建议周期 {one.get('period')}"
+             if one.get("speed") != "信号弱" else
+             f"- IC 太小（{_n(one.get('ic_mean'))}），不做快慢判断；建议先看它在哪个品种上有值"),
+            f"- 换手 {_n(one.get('turnover'), 3)}，稳健分 {one.get('robust', 0):.0f}/100，"
+            f"分年一致 {_n(one.get('year_ratio'), 2)}",
+            f"- 最灵品种：{'、'.join(one.get('best_symbols') or []) or '—'}",
+        ]
+        mates = one.get("mates") or []
+        if mates:
+            lines.append("- 低相关搭子：" + "、".join(
+                f"{m['key']}（相关 {m['corr']:+.2f}）" for m in mates))
+        return "\n".join(lines)
+
+    def _audit_factor(self) -> None:
+        key = self._selected_factor_key()
+        if not key:
+            self._set_state("先在左边选一个因子", C_BAD)
+            return
+        spec = None
+        try:
+            from ttrade.factors import FACTORS
+
+            spec = FACTORS.get(key)
+        except Exception:  # noqa: BLE001
+            pass
+        head = f"`{key}`" + (f"（{spec.label}，类别 {spec.category}）" if spec else "")
+        self._prefill(
+            f"请对因子 {head} 做一次**PIT 审核**。用 "
+            f'`{{"action":"doc","topic":"factor:{key}"}}` 取它的完整实现，逐条回答：\n'
+            "1. **未来数据**：实现里有没有用到 T 时刻之后才知道的信息？重点查：居中滚动窗口、"
+            "负向 shift、全样本分位数 / 全样本均值方差、把当日收盘价用在当日盘中、"
+            "用未来的持仓量或成交额。\n"
+            "2. **数据陈旧**：它依赖的展期 / IV 是日频快照，分钟线上只能用 D-1 的值。"
+            "这个因子有没有在盘中拿当日还没落地的快照？滞后几个交易日算正常、几个算断档？\n"
+            "3. **夜盘归属**：夜盘 21:00 的 bar 属于**下一个交易日**。这个因子在同一交易日的"
+            "夜盘段和日盘段，读到的应该是同一份快照 —— 它按交易日对齐还是按自然日？\n"
+            "4. **时段边界**：如果它读的是「当日」某个统计量，在 09:00 第一根 bar 上有没有值？"
+            "会不会出现开盘半小时整列 NaN？\n"
+            "5. **过旧**：因子值长期不变（比如只有换月才变）时，回测和实盘的行为是否一致？\n\n"
+            "结论请给三档之一：**通过 / 有条件通过 / 不通过**，并写明具体是哪一行代码、"
+            "怎么改。不确定的地方直接说「不确定」，不要猜。"
+        )
+        self._send()
+
+    def _deep_factor(self) -> None:
+        key = self._selected_factor_key()
+        if not key:
+            self._set_state("先在左边选一个因子", C_BAD)
+            return
+        spec = None
+        try:
+            from ttrade.factors import FACTORS
+
+            spec = FACTORS.get(key)
+        except Exception:  # noqa: BLE001
+            pass
+        head = f"`{key}`" + (f"（{spec.label}，类别 {spec.category}）" if spec else "")
+        facts = self._factor_facts(key)
+        self._prefill(
+            f"请对因子 {head} 做一次**深度分析**。用 "
+            f'`{{"action":"doc","topic":"factor:{key}"}}` 取完整实现。\n'
+            + (facts + "\n" if facts else "")
+            + "请围绕下面五点展开，能用上面的实测数字就用，没有数字就说明是推断：\n"
+            "1. **快慢**：信号能活几天？半衰期多长？据此它该放在 5m、1h 还是日线？"
+            "如果放在分钟线上，交易成本会不会把收益吃光？\n"
+            "2. **品种**：哪些品种上更有效、为什么（产业集中度、库存周期、流动性、"
+            "是否有对应期权）？哪些品种上应该直接关掉？\n"
+            "3. **周期**：不同周期下这个因子的含义会变吗（比如 5m 上是反转、日线上是趋势）？\n"
+            "4. **组合**：它适合和哪类因子搭？为什么是互补而不是重复？给出 2~3 个具体建议。\n"
+            "5. **稳健性**：它最可能在什么情况下失效？参数敏感吗？样本外要注意什么？\n\n"
+            "最后给一句结论：这个因子值不值得进组合，进的话权重给多少、和谁一起用。"
+        )
+        self._send()
 
     def _ask_new_strategy(self) -> None:
         self.tabs.setCurrentIndex(1)

@@ -362,6 +362,56 @@ def _run() -> tuple[bool, list[str]]:
 
     check("因子评估（IC/ICIR/Newey-West）", _factor_metrics)
 
+    def _factor_profile():
+        """横截面口径的几个纯函数 + 手册 HTML。
+
+        **不跑整库体检**：那要十几秒、还要 18 个品种的日线，放进自检会让
+        每次启动慢一大截。这里只验最容易写错的三处 —— 按行的秩相关、半衰期
+        插值、速度分档，以及手册能不能拼出 HTML（少一个 key 会直接 KeyError）。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factor_pdf as PDF
+        from ttrade import factor_profile as FP
+
+        # 至少 5 列：横截面 IC 要求一天有 MIN_SYMBOLS 个品种才排名
+        idx = pd.bdate_range("2024-01-01", periods=60)
+        base = np.arange(60.0)
+        cols = {f"S{i}": base * k for i, k in enumerate((1, 2, 3, 4, 5, 6))}
+        a = pd.DataFrame(cols, index=idx)
+        b = pd.DataFrame(cols, index=idx)
+        ic = FP._row_spearman(a, b).dropna()
+        if not (ic > 0.99).all():
+            raise RuntimeError(f"完全同序的三列秩相关应为 1，实得 {ic.iloc[0]:.3f}")
+
+        # 半衰期：IC 从 0.04 线性掉到 0.02 在 h=5 → 半衰期正好 5
+        hl = FP._half_life({1: 0.04, 2: 0.035, 5: 0.02, 10: 0.01})
+        if abs(hl - 5.0) > 0.01:
+            raise RuntimeError(f"半衰期应为 5.0，实得 {hl:.2f}")
+        if FP._speed_class(2.0, 0.03)[0] != "快":
+            raise RuntimeError("半衰期 2 天应判为「快」")
+        if FP._speed_class(2.0, 0.001)[0] != "信号弱":
+            raise RuntimeError("IC 只有 0.001 时不该给速度结论")
+
+        res = FP.ProfileResult(
+            meta={"generated": "2024-01-01 00:00", "symbols": ["RB_SHFE"],
+                  "n_factors": 1, "span": ["2020-01-01", "2024-01-01"]},
+            factors=[{"key": "mom_60", "label": "动量 60 日", "category": "趋势",
+                      "desc": "测试", "formula": "ret(60)", "ic_mean": 0.02,
+                      "icir": 0.05, "t": 2.5, "pos": 0.55, "half_life": 12.0,
+                      "speed": "中", "period": "日线", "turnover": 0.05,
+                      "ts_agree": 0.6, "year_ratio": 0.7, "robust": 60.0,
+                      "best_symbols": ["RB_SHFE"], "mates": [], "win_ic": {},
+                      "no_daily": False}],
+            combos=[], redundant=[])
+        html = PDF.build_html(res)
+        if "因子库深度分析手册" not in html or "动量 60 日" not in html:
+            raise RuntimeError("手册 HTML 里没有标题或因子名")
+        return f"秩相关 {ic.iloc[0]:.2f}，半衰期 {hl:.1f} 日，手册 {len(html):,} 字符"
+
+    check("因子体检口径（横截面 / 半衰期 / 手册）", _factor_profile)
+
     def _factor_strategy():
         from ttrade import factor_strategy as FS
         from ttrade import factors as F
@@ -596,15 +646,44 @@ def _run() -> tuple[bool, list[str]]:
             and dp.chk_upd_options.isHidden() == (is_us or src_tq)
             and not dp.chk_upd_contracts.isChecked()
             and not dp.chk_upd_options.isChecked()
-            # 每日定时补充：控件在、只对期货显示、默认不勾（不能让用户
-            # 装完就被自动跑一次几十分钟的下载）
+            # 每日定时补充：两条日程（15:30 衍生 / 17:00 日线）的控件都在、
+            # 默认不勾（不能让用户装完就被自动跑一次几十分钟的下载），
+            # 区间都是「近 1 天 / 近 1 周」两档
             and hasattr(dp, "chk_auto")
             and hasattr(dp, "time_auto")
             and hasattr(dp, "cb_auto_range")
-            and dp.chk_auto.isHidden() == is_us
+            and hasattr(dp, "chk_daily")
+            and hasattr(dp, "time_daily")
+            and hasattr(dp, "cb_daily_range")
             and not dp.chk_auto.isChecked()
+            and not dp.chk_daily.isChecked()
             and dp.cb_auto_range.count() == 2
+            and dp.cb_daily_range.count() == 2
+            and dp.time_auto.time().toString("HH:mm") == "15:30"
+            and dp.time_daily.time().toString("HH:mm") == "17:00"
         )
+        # 账户透视页：多账户列表 + 三张表都要带「资金账户」列，委托/成交还要
+        # 带「时间」。这些列是逐列摆出来的，漏一列不会报错、只会让人看不出来
+        # 某一笔是哪个户做的，所以这里按表头文字验一遍。
+        tp = getattr(win, "trade_page", None)
+
+        def _heads(tbl):
+            return [tbl.horizontalHeaderItem(i).text()
+                    for i in range(tbl.columnCount())]
+
+        trade_ok = (
+            tp is not None
+            and _heads(tp.tbl_accts) == [
+                "账户", "账户平台", "资金账户", "最新权益", "当日盈亏", "净杠杆",
+                "总杠杆", "可用资金", "成交金额", "持仓保证金", "手续费"]
+            and _heads(tp.tbl_pos)[:2] == ["资金账户", "合约"]
+            and _heads(tp.tbl_orders)[:2] == ["资金账户", "时间"]
+            and _heads(tp.tbl_trades)[:2] == ["资金账户", "时间"]
+            # 默认全勾：以前是「下拉框选中谁就连谁」，现在多个账户并存
+            and tp._checked == {s.name for s in tp._accounts}
+        )
+        trade_info = (f"{tp.tbl_accts.columnCount()} 列账户表 / "
+                      f"{len(tp._accounts)} 个账户" if tp is not None else "无交易页")
         # 交易Agent 页：删除按钮在没选中东西时必须是灰的，权限开关默认关。
         # 升级权限的文件模块是**函数里 import** 的，打包漏了只会在用户勾上开关
         # 之后才炸 —— 所以在这里 import 一次，把它变成打包期就能发现的问题。
@@ -651,6 +730,12 @@ def _run() -> tuple[bool, list[str]]:
             and hasattr(ap, "btn_attach")
             and hasattr(ap, "out")
             and hasattr(ap, "btn_out_feed")
+            # 因子审核 / 深度分析 / 手册：三个按钮，前两个没选中因子时必须灰着
+            and hasattr(ap, "btn_audit")
+            and hasattr(ap, "btn_deep")
+            and hasattr(ap, "btn_handbook")
+            and not ap.btn_audit.isEnabled()
+            and not ap.btn_deep.isEnabled()
             and not ap.btn_del_factor.isEnabled()
             and not ap.btn_del_strat.isEnabled()
             and ap.cfg.allow_fs is False
@@ -788,6 +873,10 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError("主窗口未完成首次回测")
         if not has_upd:
             raise RuntimeError("数据管理页缺失或初始状态异常")
+        if not trade_ok:
+            raise RuntimeError(
+                f"账户透视页异常（{trade_info}）：账户列表 / 资金账户列 / 时间列缺失"
+            )
         if not agent_ok:
             raise RuntimeError(
                 "交易Agent 页异常：删除按钮初始状态不对，或升级权限的文件模块 / "

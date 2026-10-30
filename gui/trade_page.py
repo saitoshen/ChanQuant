@@ -209,6 +209,9 @@ class TradePage(QWidget):
         self._sig: dict[str, object] = {}     # 每张表上次画的内容，没变就不重画
         self._accounts: list[AccountSpec] = tqlive.load_accounts()
         self._build()
+        # 默认全勾：以前是「下拉框选中谁就连谁」，现在多个账户并存，全勾等于
+        # 保持原来的行为；用户想只连一个，取消其余勾选即可
+        self._checked = {s.name for s in self._accounts}
         self._reload_accounts()
         live.state.connect(self.on_state)
         live.failed.connect(self.on_failed)
@@ -240,6 +243,14 @@ class TradePage(QWidget):
             stats.addWidget(w, 1)
         root.addLayout(stats)
 
+        # 账户列表摆在资金卡和持仓之间：上面是「一共多少钱」，中间是「钱分在
+        # 哪几个户里」，下面是「这些户里有什么仓」。反过来先看持仓再找归属，
+        # 多账户时每次都要在心里做一次分组。
+        root.addWidget(self._wrap("账户", self._build_accounts(), with_btn="账户", hint=(
+            "勾选决定连接哪些账户、上面资金卡和下面三张表统计哪些账户。"
+            "双击某一行 = 只看这一个。"
+        )), 0)
+
         split = QSplitter(Qt.Horizontal)
         split.addWidget(self._wrap("持仓", self._build_positions(), with_btn=None))
         right = QSplitter(Qt.Vertical)
@@ -259,25 +270,6 @@ class TradePage(QWidget):
         lay.setContentsMargins(12, 8, 12, 8)
         lay.setSpacing(8)
 
-        lay.addWidget(QLabel("账户"))
-        self.cb_account = QComboBox()
-        self.cb_account.setMinimumWidth(200)
-        lay.addWidget(self.cb_account)
-
-        btn_add = QPushButton("＋")
-        btn_add.setObjectName("Ghost")
-        btn_add.setFixedWidth(32)
-        btn_add.setToolTip("新增账户")
-        btn_add.clicked.connect(self._add_account)
-        lay.addWidget(btn_add)
-
-        btn_del = QPushButton("－")
-        btn_del.setObjectName("Ghost")
-        btn_del.setFixedWidth(32)
-        btn_del.setToolTip("删除选中账户")
-        btn_del.clicked.connect(self._del_account)
-        lay.addWidget(btn_del)
-
         self.btn_connect = QPushButton("连接")
         self.btn_connect.clicked.connect(self._toggle_connect)
         lay.addWidget(self.btn_connect)
@@ -295,7 +287,8 @@ class TradePage(QWidget):
         lay.addWidget(self.lbl_quote)
         return card
 
-    def _wrap(self, title: str, table: QTableWidget, with_btn: str | None) -> QWidget:
+    def _wrap(self, title: str, table: QTableWidget, with_btn: str | None,
+              hint: str = "") -> QWidget:
         card = QWidget()
         card.setObjectName("Card")
         lay = QVBoxLayout(card)
@@ -305,17 +298,35 @@ class TradePage(QWidget):
         t = QLabel(title)
         t.setObjectName("SectionTitle")
         head.addWidget(t)
+        if hint:
+            lbl = QLabel(hint)
+            lbl.setObjectName("Hint")
+            head.addWidget(lbl)
         head.addStretch(1)
-        if with_btn:
+        if with_btn == "撤单":
             btn = QPushButton(with_btn)
             btn.setObjectName("Ghost")
             btn.clicked.connect(self._cancel_selected)
             head.addWidget(btn)
+        elif with_btn == "账户":
+            for text, tip, slot in (
+                ("＋", "新增账户", self._add_account),
+                ("－", "删除选中账户", self._del_account),
+                ("全选", "全部勾选", lambda: self._check_all(True)),
+                ("全不选", "全部取消勾选", lambda: self._check_all(False)),
+            ):
+                b = QPushButton(text)
+                b.setObjectName("Ghost")
+                b.setToolTip(tip)
+                if text in ("＋", "－"):
+                    b.setFixedWidth(32)
+                b.clicked.connect(slot)
+                head.addWidget(b)
         lay.addLayout(head)
         lay.addWidget(table, 1)
         return card
 
-    def _table(self, headers: list[str]) -> QTableWidget:
+    def _table(self, headers: list[str], check: bool = False) -> QTableWidget:
         t = QTableWidget(0, len(headers))
         t.setHorizontalHeaderLabels(headers)
         t.verticalHeader().setVisible(False)
@@ -325,7 +336,7 @@ class TradePage(QWidget):
         t.setShowGrid(False)
         t.setAlternatingRowColors(False)
         h = t.horizontalHeader()
-        h.setSectionResizeMode(0, QHeaderView.Stretch)
+        h.setSectionResizeMode(0, QHeaderView.Stretch if not check else QHeaderView.Interactive)
         # **不要用 `ResizeToContents`**。它对每一次 `setItem` 都重算全部行的高度
         # 与宽度，而我们是整表重建（一天几百条委托）：同样的 200 行，第一次填
         # 28ms，第二次 12 秒 —— 挂上一笔新委托正好触发第二次，界面直接冻住。
@@ -333,31 +344,58 @@ class TradePage(QWidget):
         for i in range(1, len(headers)):
             h.setSectionResizeMode(i, QHeaderView.Interactive)
             t.setColumnWidth(i, 90)
+        if check:
+            t.setColumnWidth(0, 150)
         return t
 
-    def _fit_columns(self, t: QTableWidget) -> None:
+    def _fit_columns(self, t: QTableWidget, skip: int = 1) -> None:
         """填完之后按内容定一次列宽。
 
         第 0 列是 Stretch（合约名占满剩余），不参与；其余列各算一次，
-        200 行 8 列实测 30ms 上下。
+        200 行 8 列实测 30ms 上下。带勾选框的账户表第 0 列也不是 Stretch，
+        用 `skip=0` 让它一起算。
         """
-        for j in range(1, t.columnCount()):
+        for j in range(skip, t.columnCount()):
             t.resizeColumnToContents(j)
+
+    def _build_accounts(self) -> QTableWidget:
+        self.tbl_accts = self._table(
+            ["账户", "账户平台", "资金账户", "最新权益", "当日盈亏", "净杠杆",
+             "总杠杆", "可用资金", "成交金额", "持仓保证金", "手续费"],
+            check=True,
+        )
+        self.tbl_accts.setMaximumHeight(150)
+        self.tbl_accts.setToolTip(
+            "净杠杆 = |多头市值 − 空头市值| / 权益；总杠杆 =（多头 + 空头市值）/ 权益。\n"
+            "市值按「开仓成本 × 合约乘数 + 浮盈」推算，不订阅盘口。"
+        )
+        # **勾选状态存在 Python 集合里，不存在表格里**：表格每 0.4 秒刷一次数字，
+        # 重建 item 会把勾选状态清掉，而「清掉 → itemChanged → 重算显示」正是
+        # 上次界面卡死的那个环。这里只在第一次建行时给 item 打勾，之后只改文字。
+        self._checked: set[str] = set()
+        self._filling = False
+        self.tbl_accts.itemChanged.connect(self._on_acct_check)
+        self.tbl_accts.itemDoubleClicked.connect(self._on_acct_dbl)
+        return self.tbl_accts
 
     def _build_positions(self) -> QTableWidget:
         self.tbl_pos = self._table(
-            ["合约", "净", "多", "空", "今多", "今空", "开仓均价", "浮动盈亏", "保证金"]
+            ["资金账户", "合约", "净", "多", "空", "今多", "今空",
+             "开仓均价", "浮动盈亏", "保证金"]
         )
         return self.tbl_pos
 
     def _build_orders(self) -> QTableWidget:
         self.tbl_orders = self._table(
-            ["合约", "方向", "开平", "委托", "剩余", "价格", "状态", "说明"]
+            ["资金账户", "时间", "合约", "方向", "开平", "委托", "剩余", "价格",
+             "状态", "说明"]
         )
         return self.tbl_orders
 
     def _build_trades(self) -> QTableWidget:
-        self.tbl_trades = self._table(["合约", "方向", "开平", "价格", "手数"])
+        self.tbl_trades = self._table(
+            ["资金账户", "时间", "合约", "方向", "开平", "价格", "手数"]
+        )
         return self.tbl_trades
 
     def _build_order_panel(self) -> QWidget:
@@ -416,18 +454,77 @@ class TradePage(QWidget):
 
     # ---------------------------------------------------------- 账户
     def _reload_accounts(self) -> None:
-        self.cb_account.blockSignals(True)
-        self.cb_account.clear()
-        for s in self._accounts:
-            self.cb_account.addItem(s.label(), s.name)
-        self.cb_account.blockSignals(False)
+        """按配置重建账户表。**只在配置变了时调用**，不是每个行情 tick。
+
+        每次 `on_state` 只改单元格文字（`_fill_accounts`），不重建 item ——
+        重建会把勾选状态和当前选中行一起清掉，而清掉之后的 itemChanged 又会
+        触发一次显示刷新，很容易转成一个死循环把界面卡住。
+        """
+        self._filling = True
+        t = self.tbl_accts
+        t.setRowCount(len(self._accounts))
+        for i, s in enumerate(self._accounts):
+            it = QTableWidgetItem(s.name)
+            it.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            it.setCheckState(Qt.Checked if s.name in self._checked else Qt.Unchecked)
+            it.setData(Qt.UserRole, s.name)
+            t.setItem(i, 0, it)
+            # 没连上之前先按配置把静态列填好，不至于整行空白
+            t.setItem(i, 1, QTableWidgetItem(dict(ACCOUNT_KINDS).get(s.kind, s.kind)))
+            t.setItem(i, 2, QTableWidgetItem(s.account_id or s.user or "—"))
+            for j in range(3, t.columnCount()):
+                t.setItem(i, j, QTableWidgetItem("—"))
+        self._filling = False
+        self._fit_columns(t, skip=0)
+
+    def _checked_specs(self) -> list[AccountSpec]:
+        return [s for s in self._accounts if s.name in self._checked]
 
     def _current_spec(self) -> AccountSpec | None:
-        name = self.cb_account.currentData()
-        for s in self._accounts:
-            if s.name == name:
-                return s
-        return self._accounts[0] if self._accounts else None
+        """当前行对应的账户；没有选中行时退回勾选的第一个。"""
+        row = self.tbl_accts.currentRow()
+        if 0 <= row < len(self._accounts):
+            return self._accounts[row]
+        sel = self._checked_specs()
+        return sel[0] if sel else (self._accounts[0] if self._accounts else None)
+
+    def _on_acct_check(self, item: QTableWidgetItem) -> None:
+        """勾选变化：只更新集合，不碰表格（表格由下一次 `on_state` 刷）。"""
+        if self._filling or item.column() != 0:
+            return
+        name = item.data(Qt.UserRole) or item.text()
+        if item.checkState() == Qt.Checked:
+            self._checked.add(name)
+        else:
+            self._checked.discard(name)
+        self._refresh_view()
+
+    def _on_acct_dbl(self, item: QTableWidgetItem) -> None:
+        """双击 = 只看这一个（等价于「单选」）。"""
+        name = self.tbl_accts.item(item.row(), 0).data(Qt.UserRole) or item.text()
+        self._checked = {name}
+        self._filling = True
+        for i in range(self.tbl_accts.rowCount()):
+            it = self.tbl_accts.item(i, 0)
+            if it is not None:
+                it.setCheckState(Qt.Checked if i == item.row() else Qt.Unchecked)
+        self._filling = False
+        self._refresh_view()
+
+    def _check_all(self, on: bool) -> None:
+        self._checked = {s.name for s in self._accounts} if on else set()
+        self._filling = True
+        for i in range(self.tbl_accts.rowCount()):
+            it = self.tbl_accts.item(i, 0)
+            if it is not None:
+                it.setCheckState(Qt.Checked if on else Qt.Unchecked)
+        self._filling = False
+        self._refresh_view()
+
+    def _refresh_view(self) -> None:
+        """勾选变了就地重画一次，不用等下一个 0.4 秒的行情快照。"""
+        if self._state is not None:
+            self.on_state(self._state, force=True)
 
     def _add_account(self) -> None:
         dlg = AccountDialog(parent=self)
@@ -435,11 +532,10 @@ class TradePage(QWidget):
             return
         spec = dlg.spec()
         self._accounts = [s for s in self._accounts if s.name != spec.name] + [spec]
+        self._checked.add(spec.name)        # 新加的默认勾上，省一步
         tqlive.save_accounts(self._accounts)
         self._reload_accounts()
-        idx = self.cb_account.findData(spec.name)
-        if idx >= 0:
-            self.cb_account.setCurrentIndex(idx)
+        self._select_row(spec.name)
 
     def _del_account(self) -> None:
         spec = self._current_spec()
@@ -448,23 +544,32 @@ class TradePage(QWidget):
         if QMessageBox.question(self, "删除账户", f"删除「{spec.name}」？") != QMessageBox.Yes:
             return
         self._accounts = [s for s in self._accounts if s.name != spec.name]
+        self._checked.discard(spec.name)
         tqlive.save_accounts(self._accounts)
         self._reload_accounts()
+
+    def _select_row(self, name: str) -> None:
+        for i, s in enumerate(self._accounts):
+            if s.name == name:
+                self.tbl_accts.selectRow(i)
+                return
 
     def _toggle_connect(self) -> None:
         if self.live.running:
             self.disconnect_requested.emit()
             return
-        spec = self._current_spec()
-        if spec is None:
-            self.on_failed("还没有配置交易账户，点「＋」添加一个")
+        specs = self._checked_specs()
+        if not specs:
+            self.on_failed("先勾选至少一个账户；没有账户就点「＋」添加")
             return
-        self.connect_requested.emit(spec)
+        self.connect_requested.emit(specs)
 
     def _on_started(self, key: str) -> None:
         self.btn_connect.setText("断开")
         self.lbl_dot.setStyleSheet(f"color: {C_OK}; font-size: 15px;")
-        self.lbl_conn.setText(f"已连接 · {self._current_spec().label() if self._current_spec() else ''}")
+        n = len(self._checked_specs())
+        self.lbl_conn.setText(f"已连接 · {n} 个账户" if n > 1 else
+                              f"已连接 · {self._current_spec().label() if self._current_spec() else ''}")
         self.lbl_conn.setStyleSheet(f"color: {C_OK}; font-size: 11px;")
 
     def _on_stopped(self) -> None:
@@ -472,11 +577,26 @@ class TradePage(QWidget):
         self.lbl_dot.setStyleSheet(f"color: {C_IDLE}; font-size: 15px;")
         self.lbl_conn.setText("未连接")
         self.lbl_conn.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+        # 断开后把数字清掉：留着上一次的权益和持仓，看着像还连着
+        self._sig.clear()
+        self._reload_accounts()
+        self._state = LiveState()
+        self.on_state(self._state, force=True)
 
     # ---------------------------------------------------------- 渲染
-    def on_state(self, st: LiveState) -> None:
+    def on_state(self, st: LiveState, force: bool = False) -> None:
         self._state = st
-        a = st.account or {}
+        self._fill_accounts(st.accounts or [])
+
+        # 只统计勾选的那几个账户。一个都没勾时按「全部」显示 —— 空勾选如果
+        # 就什么都不显示，用户会以为连接断了。
+        picked = self._checked
+        detail = st.by_account or {}
+        if picked and detail:
+            rows = [detail[n] for n in detail if n in picked]
+        else:
+            rows = list(detail.values())
+        a = self._sum(rows) if rows else (st.account or {})
         for key, card in self.stats.items():
             v = a.get(key)
             if key == "risk_ratio":
@@ -507,27 +627,96 @@ class TradePage(QWidget):
                 if self.sp_price.value() <= 0:
                     self.sp_price.setValue(float(last or 0))
 
+        # 按账户摊平成三张表，顺手补上账户名。快照里本来就带，但测试桩 / 老
+        # 版本快照可能没有 —— 缺了会撤单撤到「空账户」上（天勤静默忽略，单子
+        # 一直挂着），所以这里补一道。
+        pos, ords, trds = [], [], []
+        for name, d in detail.items():
+            if picked and name not in picked:
+                continue
+            for bucket, rows_out in (("positions", pos), ("orders", ords), ("trades", trds)):
+                for r in d.get(bucket) or []:
+                    if not r.get("account"):
+                        r["account"] = name
+                    rows_out.append(r)
+        pos.sort(key=lambda r: (r.get("account", ""), r.get("symbol", "")))
+        ords.sort(key=lambda r: (r.get("status") != "ALIVE", -(r.get("insert_date_time") or 0)))
+        trds.sort(key=lambda r: -(r.get("trade_date_time") or 0))
+
         # 表格每 0.4 秒重建一次，一天几百条委托时一次要几百毫秒 —— 切到本页
         # 第一帧就得摆几千个单元格，看着就是「一切过来就卡住」。内容没变就跳过。
         self._fill_if_changed(
-            "pos", st.positions, self._fill_positions,
-            tuple((r.get("symbol"), r.get("pos"), r.get("pos_long_today"),
-                   r.get("pos_short_today"), round(r.get("float_profit") or 0, 2),
-                   round(r.get("margin") or 0, 2))
-                  for r in st.positions),
+            "pos", pos, self._fill_positions,
+            tuple((r.get("account"), r.get("symbol"), r.get("pos"),
+                   r.get("pos_long_today"), r.get("pos_short_today"),
+                   round(r.get("float_profit") or 0, 2), round(r.get("margin") or 0, 2))
+                  for r in pos),
+            force,
         )
         self._fill_if_changed(
-            "ord", st.orders, self._fill_orders,
-            tuple((r.get("order_id"), r.get("status"), r.get("volume_left"),
-                   r.get("last_msg")) for r in st.orders),
+            "ord", ords, self._fill_orders,
+            tuple((r.get("account"), r.get("order_id"), r.get("status"),
+                   r.get("volume_left"), r.get("last_msg")) for r in ords),
+            force,
         )
         self._fill_if_changed(
-            "trd", st.trades, self._fill_trades,
-            tuple(r.get("trade_id") for r in st.trades),
+            "trd", trds, self._fill_trades,
+            tuple((r.get("account"), r.get("trade_id")) for r in trds),
+            force,
         )
 
-    def _fill_if_changed(self, name: str, rows: list[dict], fill, sig) -> None:
-        if self._sig.get(name) == sig:
+    def _sum(self, rows: list[dict]) -> dict:
+        """勾选账户的合计。风险度是比值，不能加，得重算。"""
+        out = {}
+        for k in ("balance", "available", "margin", "float_profit", "close_profit",
+                  "commission", "turnover", "day_profit"):
+            out[k] = sum(float((r.get("account") or {}).get(k) or 0.0) for r in rows)
+        bal = out["balance"]
+        out["risk_ratio"] = (out["margin"] / bal) if bal > 0 else 0.0
+        return out
+
+    def _fill_accounts(self, rows: list[dict]) -> None:
+        """把实时数字写进账户表。**只改文字，不重建 item**。
+
+        重建 item 会连带清掉勾选状态和当前行，而 `itemChanged` 又接着触发一次
+        重画 —— 上次委托框卡死就是这个环。这里行数变了才补行，其余全是 setText。
+        """
+        live = {r["name"]: r for r in rows}
+        if self.tbl_accts.rowCount() != len(self._accounts):
+            self._reload_accounts()
+        self._filling = True
+        for i, s in enumerate(self._accounts):
+            r = live.get(s.name)
+            if r is None:
+                continue
+            vals = [
+                (1, r.get("platform") or ""),
+                (2, r.get("account_id") or ""),
+                (3, _money(r.get("balance"))),
+                (4, _pnl(r.get("day_profit"))),
+                (5, f"{float(r.get('net_leverage') or 0):.2f}"),
+                (6, f"{float(r.get('gross_leverage') or 0):.2f}"),
+                (7, _money(r.get("available"))),
+                (8, _money(r.get("turnover"))),
+                (9, _money(r.get("margin"))),
+                (10, _money(r.get("commission"))),
+            ]
+            for j, v in vals:
+                it = self.tbl_accts.item(i, j)
+                if it is None:
+                    it = QTableWidgetItem(v)
+                    self.tbl_accts.setItem(i, j, it)
+                elif it.text() != v:
+                    it.setText(v)
+                if j in (3, 4, 5, 6, 7, 8, 9, 10):
+                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if j == 4:
+                    it.setForeground(QColor(_color(r.get("day_profit"))))
+        self._filling = False
+
+    def _fill_if_changed(self, name: str, rows: list[dict], fill, sig,
+                         force: bool = False) -> None:
+        if not force and self._sig.get(name) == sig:
             return
         self._sig[name] = sig
         fill(rows)
@@ -537,7 +726,8 @@ class TradePage(QWidget):
         t.setRowCount(len(rows))
         for i, r in enumerate(rows):
             vals = [
-                r["symbol"], str(r["pos"]), str(r["pos_long"]), str(r["pos_short"]),
+                r.get("account", ""), r["symbol"], str(r["pos"]),
+                str(r["pos_long"]), str(r["pos_short"]),
                 str(r["pos_long_today"]), str(r["pos_short_today"]),
                 _avg_price(r),
                 _pnl(r["float_profit"]),
@@ -545,18 +735,19 @@ class TradePage(QWidget):
             ]
             for j, v in enumerate(vals):
                 item = QTableWidgetItem(v)
-                if j == 7:
+                if j == 8:
                     item.setForeground(QColor(C_UP if r["float_profit"] > 0 else C_DOWN))
-                if j > 0:
+                if j > 1:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 t.setItem(i, j, item)
-        self._fit_columns(t)
+        self._fit_columns(t, skip=2)
 
     def _fill_orders(self, rows: list[dict]) -> None:
         t = self.tbl_orders
         t.setRowCount(len(rows))
         for i, r in enumerate(rows):
             vals = [
+                r.get("account", ""), r.get("time", ""),
                 r["symbol"], r["direction"], r["offset"],
                 str(r["volume_orign"]), str(r["volume_left"]),
                 f"{r['limit_price']:.2f}" if r["limit_price"] else "市价",
@@ -566,25 +757,27 @@ class TradePage(QWidget):
             for j, v in enumerate(vals):
                 item = QTableWidgetItem(v)
                 item.setData(Qt.UserRole, r["order_id"])
-                if j in (3, 4, 5):
+                item.setData(Qt.UserRole + 1, r.get("account", ""))
+                if j in (5, 6, 7):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 t.setItem(i, j, item)
-        self._fit_columns(t)
+        self._fit_columns(t, skip=2)
 
     def _fill_trades(self, rows: list[dict]) -> None:
         t = self.tbl_trades
         t.setRowCount(len(rows))
         for i, r in enumerate(rows):
             vals = [
+                r.get("account", ""), r.get("time", ""),
                 r["symbol"], r["direction"], r["offset"],
                 f"{r['price']:.2f}", str(r["volume"]),
             ]
             for j, v in enumerate(vals):
                 item = QTableWidgetItem(v)
-                if j in (3, 4):
+                if j in (5, 6):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 t.setItem(i, j, item)
-        self._fit_columns(t)
+        self._fit_columns(t, skip=2)
 
     # ---------------------------------------------------------- 操作
     def _cancel_selected(self) -> None:
@@ -598,7 +791,8 @@ class TradePage(QWidget):
         oid = item.data(Qt.UserRole)
         if not oid:
             return
-        self.live.cancel(str(oid))
+        # 多账户下撤单也要指明账户，否则天勤会静默忽略（单子一直挂着）
+        self.live.cancel(str(oid), account=str(item.data(Qt.UserRole + 1) or ""))
         self.lbl_order_msg.setText(f"已提交撤单 {oid}")
 
     def _place(self) -> None:
@@ -607,18 +801,38 @@ class TradePage(QWidget):
             self.on_failed("合约不能为空")
             return
         price = None if self.chk_market.isChecked() else self.sp_price.value()
+        acc = self._order_account()
+        if acc is None:
+            self.on_failed("多账户下先在账户列表里点一行，指定下到哪个账户")
+            return
         ok = self.live.place(
             contract,
             self.cb_dir.currentData(),
             self.cb_offset.currentData(),
             self.sp_vol.value(),
             price,
+            account=acc,
         )
         if ok:
             self.lbl_order_msg.setText(
                 f"已提交 {self.cb_dir.currentText()} {self.cb_offset.currentText()} "
                 f"{contract} {self.sp_vol.value()} 手"
+                + (f"（{acc}）" if acc else "")
             )
+
+    def _order_account(self) -> str:
+        """这一单下到哪个账户。
+
+        只勾了一个就用它；勾了多个则看表格当前选中的那一行 —— 不让人选就
+        默认下到「第一个」，是那种事后才发现的错。
+        """
+        sel = self._checked_specs()
+        if len(sel) == 1:
+            return sel[0].name
+        cur = self._current_spec()
+        if cur is not None and (not sel or cur.name in {s.name for s in sel}):
+            return cur.name
+        return sel[0].name if sel else ""
 
     def _on_order_sent(self, order_id: str) -> None:
         self.lbl_order_msg.setText(f"下单成功，委托号 {order_id}")

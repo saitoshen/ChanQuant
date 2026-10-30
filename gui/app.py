@@ -2540,10 +2540,12 @@ class MainWindow(QMainWindow):
             return None
         return sym, ex
 
-    def _on_trade_connect(self, spec) -> None:
+    def _on_trade_connect(self, specs) -> None:
         """从「账户透视和交易」页点「连接」：这是**唯一**会去连天勤的入口。
 
         沿用当前选中的品种与周期，只为了有盘口 / 持仓 / 委托可看。
+        `specs` 是账户列表里勾选的那些 —— 一个也能连，多个走天勤的多账户模式
+        （一条连接、一次登录）。
 
         **不补本地历史**。这个动作的语义是「登录账户」，用户要看的是持仓/资金/
         委托，而 `hub.start()` 之后这些东西就有了。补历史一个品种十年 5m 要几十
@@ -2558,12 +2560,15 @@ class MainWindow(QMainWindow):
         if self.market != "cn":
             self.trade_page.on_failed("交易只接了国内期货")
             return
+        if not specs:
+            self.trade_page.on_failed("先在账户列表里勾选要连接的账户")
+            return
         pair = self._current_pair()
         period = "5m" if tqdata.is_daily(self._period()) else self._period()
         if pair is None:
             self.trade_page.on_failed("先在「策略研究」页选一个品种")
             return
-        self.live.start(spec, pair[0], pair[1], period, need_history=False)
+        self.live.start(specs, pair[0], pair[1], period, need_history=False)
         self.lbl_live_msg.setText("正在连接…")
 
     def _on_live_stop(self) -> None:

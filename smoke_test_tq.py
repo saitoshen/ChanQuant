@@ -368,6 +368,10 @@ def check_live_helpers() -> None:
     # 持仓快照的合约名：`Position` 上没有 `symbol` 属性，合约代码是 get_position()
     # 返回的 dict 的 key（或 instrument_id）。取错属性会让持仓表的「合约」列整列空白，
     # 而委托/成交用的是 instrument_id 所以看着正常。
+    #
+    # 多账户之后快照一律走**账户对象**（`obj.get_position()`）：多账户模式下
+    # `api.get_position()` 必须带 account 参数，而账户对象自己那套在单账户、多账户
+    # 两种模式下都能用 —— 所以测试里只造账户对象，不碰 api。
     from types import SimpleNamespace
 
     def _pos(**kw):
@@ -378,12 +382,34 @@ def check_live_helpers() -> None:
         base.update(kw)
         return SimpleNamespace(**base)
 
-    hub._positions = {"SHFE.cu2612": _pos(instrument_id="cu2612")}
-    rows = hub._positions_snapshot()
+    class _Acct:
+        """假账户对象：只实现四个 get_*，够快照用。"""
+
+        def __init__(self, pos=None, orders=None, trades=None, acc=None):
+            self.pos = pos or {}
+            self.orders = orders or {}
+            self.trades = trades or {}
+            self.acc = acc or {}
+
+        def get_position(self):
+            return self.pos
+
+        def get_order(self):
+            return self.orders
+
+        def get_trade(self):
+            return self.trades
+
+        def get_account(self):
+            return SimpleNamespace(**self.acc) if self.acc else None
+
+    obj_a = _Acct({"SHFE.cu2612": _pos(instrument_id="cu2612")})
+    hub._accs = [(L.AccountSpec(name="模拟A"), obj_a)]
+    rows = hub._positions_snapshot(obj_a)
     check("实时⑦持仓合约名取 instrument_id", rows and rows[0]["symbol"] == "cu2612",
           repr(rows[0]["symbol"]) if rows else "空")
-    hub._positions = {"SHFE.cu2612": _pos()}
-    rows = hub._positions_snapshot()
+    obj_a.pos = {"SHFE.cu2612": _pos()}
+    rows = hub._positions_snapshot(obj_a)
     check("实时⑦没有 instrument_id 时回退到 dict 的 key",
           rows and rows[0]["symbol"] == "SHFE.cu2612",
           repr(rows[0]["symbol"]) if rows else "空")
@@ -391,6 +417,7 @@ def check_live_helpers() -> None:
           rows and rows[0]["open_price_long"] != rows[0]["open_price_long"]
           and rows[0]["open_price_short"] == 109360.0,
           f"{rows[0]['open_price_long']}")
+    check("实时⑦账户对象为空时不炸", hub._positions_snapshot(None) == [])
 
     # 委托 / 成交快照只留最近 N 条。一天被拒的废单能有几千条，全塞进
     # QTableWidget 之后，切到「账户透视和交易」第一帧就要摆几万个单元格，
@@ -402,15 +429,17 @@ def check_live_helpers() -> None:
             last_msg="平昨手数超过持仓仓量", insert_date_time=1e18 - i,
         )
 
-    hub._orders = {f"o{i}": _ord(i) for i in range(L.SNAP_ROWS * 3)}
-    rows = hub._orders_snapshot()
+    obj_a.orders = {f"o{i}": _ord(i) for i in range(L.SNAP_ROWS * 3)}
+    rows = hub._orders_snapshot(obj_a)
     check("实时⑧委托快照只留最近 N 条", len(rows) == L.SNAP_ROWS, f"{len(rows)} 条")
     check("实时⑧委托按时间倒序",
           rows[0]["insert_date_time"] > rows[-1]["insert_date_time"])
+    check("实时⑧委托带北京时间列", len(rows[0].get("time", "")) == 14,
+          repr(rows[0].get("time")))
 
-    hub._orders = {**{f"o{i}": _ord(i) for i in range(L.SNAP_ROWS * 3)},
-                   "alive": _ord(0, status="ALIVE")}
-    rows = hub._orders_snapshot()
+    obj_a.orders = {**{f"o{i}": _ord(i) for i in range(L.SNAP_ROWS * 3)},
+                    "alive": _ord(0, status="ALIVE")}
+    rows = hub._orders_snapshot(obj_a)
     check("实时⑧未成交委托不会被截掉", rows[0]["status"] == "ALIVE", rows[0]["status"])
 
     def _trd(i):
@@ -419,9 +448,60 @@ def check_live_helpers() -> None:
             offset="CLOSE", price=13112.0, volume=2, trade_date_time=1e18 - i,
         )
 
-    hub._trades = {f"t{i}": _trd(i) for i in range(L.SNAP_ROWS * 3)}
-    rows = hub._trades_snapshot()
+    obj_a.trades = {f"t{i}": _trd(i) for i in range(L.SNAP_ROWS * 3)}
+    rows = hub._trades_snapshot(obj_a)
     check("实时⑧成交快照只留最近 N 条", len(rows) == L.SNAP_ROWS, f"{len(rows)} 条")
+    check("实时⑧成交带北京时间列", len(rows[0].get("time", "")) == 14,
+          repr(rows[0].get("time")))
+
+    # 多账户：一条连接、每账户一份明细，合并那份给首屏资金卡用。
+    obj_a.acc = {"balance": 600000.0, "pre_balance": 550000.0, "margin": 120000.0,
+                 "available": 480000.0, "commission": 30.0}
+    obj_a.pos = {"SHFE.cu2612": _pos()}
+    obj_a.orders = {}
+    obj_a.trades = {}
+    obj_b = _Acct(acc={"balance": 100000.0, "pre_balance": 90000.0, "margin": 20000.0,
+                       "available": 80000.0, "commission": 12.5})
+    hub._accs = [(L.AccountSpec(name="模拟A"), obj_a),
+                 (L.AccountSpec(name="模拟B"), obj_b)]
+    st = hub.state()
+    check("实时⑩账户列表一行一个账户", len(st.accounts) == 2,
+          f"{[r['name'] for r in st.accounts]}")
+    check("实时⑩合并权益是求和",
+          abs(st.account.get("balance", 0) - 700000.0) < 1e-6,
+          f"{st.account.get('balance')}")
+    check("实时⑩合并风险度用合计保证金/合计权益重算",
+          abs(st.account.get("risk_ratio", 0) - 140000.0 / 700000.0) < 1e-9,
+          f"{st.account.get('risk_ratio')}")
+    check("实时⑩当日盈亏逐账户相加",
+          abs(st.account.get("day_profit", 0) - 60000.0) < 1e-6,
+          f"{st.account.get('day_profit')}")
+    check("实时⑩持仓行带账户名",
+          st.positions and st.positions[0].get("account") == "模拟A",
+          repr(st.positions[0].get("account")) if st.positions else "空")
+    check("实时⑩明细按账户分开存", set(st.by_account) == {"模拟A", "模拟B"},
+          str(list(st.by_account)))
+
+    try:
+        hub._acc_obj("")
+        check("实时⑩多账户不指定账户就报错", False, "没有抛异常")
+    except RuntimeError:
+        check("实时⑩多账户不指定账户就报错", True)
+    check("实时⑩按名字取到对应账户", hub._acc_obj("模拟B") is obj_b)
+    try:
+        hub._acc_obj("不存在的账户")
+        check("实时⑩账户名写错报错", False, "没有抛异常")
+    except ValueError:
+        check("实时⑩账户名写错报错", True)
+
+    # 纳秒时间戳 → 北京时间。0 / 非法值给空串，界面才不会显示 1970 年。
+    check("实时⑨时间戳 0 给空串", L._stamp(0) == "" and L._stamp("x") == "",
+          repr(L._stamp(0)))
+    check("实时⑨时间戳转北京时间",
+          L._stamp(1772000000 * 10 ** 9) == "02-25 14:13:20",
+          repr(L._stamp(1772000000 * 10 ** 9)))
+    check("实时⑨合约乘数按品种查得到", L._mult_of("SHFE.rb2610") > 1,
+          str(L._mult_of("SHFE.rb2610")))
 
     old = os.environ.get("LOCALAPPDATA")
     tmpdir = tempfile.mkdtemp(prefix="tqacct_")

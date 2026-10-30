@@ -300,7 +300,11 @@ class DataPage(QWidget):
         self._tq_worker: TqWorker | None = None
         self._tq_thread: QThread | None = None
         self._auto_run = False          # 这一轮是不是定时任务起的（决定弹不弹窗）
-        self._auto_last = ""            # 上次定时补充的日期（YYYY-MM-DD）
+        self._auto_last: dict[str, str] = {}   # 每条日程上次跑的日期（YYYY-MM-DD）
+        self._auto_queue: list[str] = []       # 定时任务还要跑的市场
+        self._auto_key = ""             # 当前跑的是哪条日程（aux / daily）
+        self._auto_range = "1d"
+        self._auto_aux = False
         self._build()
         self._apply_auto_cfg()
         # 30 秒查一次就够了：定时精度到分钟，没必要每秒唤醒
@@ -495,15 +499,23 @@ class DataPage(QWidget):
         )
         lay.addWidget(self.chk_upd_options)
 
-        # 每天盘后自动补一次。手动补很容易忘，而展期 / IV 的快照只要断一天，
+        # 每天盘后自动补两次。手动补很容易忘，而展期 / IV 的快照只要断一天，
         # 实盘就只能拿更旧的期限结构算信号。做成可关的定时器而不是常驻服务：
         # 程序关了就停，不会在用户不知情的时候跑一次几十分钟的下载。
+        #
+        # 拆成两条而不是一条，是因为它们的时间窗根本不同：
+        #   - 衍生数据（真实合约 / 期权）要等交易所结算，日盘 15:00 收盘后十几
+        #     分钟才落地，所以 15:30；
+        #   - 日线可以更晚，17:00 时美股当天的日线也收完了（美东 16:00 收盘 =
+        #     北京时间 04:00/05:00），一次把期货和美股都补掉。
         self.lbl_auto = self._section("每日自动补充")
         lay.addWidget(self.lbl_auto)
-        self.chk_auto = QCheckBox("每天定时补一次（主连 + 真实合约 + 期权）")
+
+        self.chk_auto = QCheckBox("每天 15:30 补期货衍生（主连 + 真实合约 + 期权）")
         self.chk_auto.setToolTip(
-            "只在期货市场生效。到点自动跑一遍 Tushare 更新：主力连续日线、\n"
-            "真实合约期限结构、期权隐含波动率。\n\n"
+            "到点自动跑一遍 Tushare 更新：主力连续日线、真实合约期限结构、\n"
+            "期权隐含波动率。展期 / IV 因子在分钟线上用的是 D-1 快照，\n"
+            "这份数据断了，实盘就会拿更旧的期限结构算信号。\n\n"
             "「近 1 天」日常够用（只补昨天缺的那一天）；「近 1 周」适合隔几天\n"
             "才开一次程序的情况。已经算过的交易日不会重复请求。"
         )
@@ -524,6 +536,27 @@ class DataPage(QWidget):
             self.cb_auto_range.addItem(label, key)
         row_auto.addWidget(self.cb_auto_range, 1)
         lay.addLayout(row_auto)
+
+        self.chk_daily = QCheckBox("每天 17:00 补日线（期货 + 美股）")
+        self.chk_daily.setToolTip(
+            "到点先补国内期货主力连续日线，再补美股日线。\n\n"
+            "为什么 17:00：美东 16:00 收盘折成北京时间是 04:00/05:00，17:00 时\n"
+            "两边的日线都收完了，一次跑完不用分两趟。期货那趟跑完，衍生数据\n"
+            "的交易日历也才跟着往后走（update_aux 拿日线的日期当交易日历）。"
+        )
+        lay.addWidget(self.chk_daily)
+
+        row_daily = QHBoxLayout()
+        row_daily.setSpacing(6)
+        self.time_daily = QTimeEdit()
+        self.time_daily.setDisplayFormat("HH:mm")
+        self.time_daily.setTime(QTime(17, 0))
+        row_daily.addWidget(self.time_daily)
+        self.cb_daily_range = QComboBox()
+        for key, label in (("1d", "近 1 天"), ("1w", "近 1 周")):
+            self.cb_daily_range.addItem(label, key)
+        row_daily.addWidget(self.cb_daily_range, 1)
+        lay.addLayout(row_daily)
 
         self.lbl_auto_hint = QLabel(
             "只在本程序开着时生效；到点如果正在更新，就等这一轮跑完再补。"
@@ -615,10 +648,6 @@ class DataPage(QWidget):
         self.lbl_upd_src.setVisible(not tq and not is_us)
         for w in (self.lbl_upd_aux, self.chk_upd_contracts, self.chk_upd_options):
             w.setVisible(not tq and not is_us)
-        # 定时补充只跑期货（衍生数据只对期货有意义），美股下整块藏掉
-        for w in (self.lbl_auto, self.chk_auto, self.time_auto,
-                  self.cb_auto_range, self.lbl_auto_hint):
-            w.setVisible(not is_us)
         self.lbl_tq_hint.setVisible(tq)
 
         if self.busy():
@@ -640,7 +669,12 @@ class DataPage(QWidget):
         return os.path.join(user_dir(), self.AUTO_FILE)
 
     def _apply_auto_cfg(self) -> None:
-        """把存下来的定时设置灌回控件，并把改动接上保存。"""
+        """把存下来的定时设置灌回控件，并把改动接上保存。
+
+        老版本只有一条日程，存的是扁平结构（`enabled` / `time` / `range` /
+        `last`）。读到这种就直接当成 `aux` 那条，别让升级过的用户发现自己
+        的定时设置丢了。
+        """
         cfg: dict = {}
         try:
             with open(self._auto_path(), encoding="utf-8") as f:
@@ -649,24 +683,32 @@ class DataPage(QWidget):
                 cfg = d
         except Exception:  # noqa: BLE001
             pass
-        self._auto_last = str(cfg.get("last") or "")
-        self.chk_auto.setChecked(bool(cfg.get("enabled", False)))
-        t = QTime.fromString(str(cfg.get("time") or "15:30"), "HH:mm")
-        if t.isValid():
-            self.time_auto.setTime(t)
-        i = self.cb_auto_range.findData(cfg.get("range") or "1d")
-        if i >= 0:
-            self.cb_auto_range.setCurrentIndex(i)
-        self.chk_auto.toggled.connect(self._save_auto_cfg)
-        self.time_auto.timeChanged.connect(self._save_auto_cfg)
-        self.cb_auto_range.currentIndexChanged.connect(self._save_auto_cfg)
+        if "aux" not in cfg and ("enabled" in cfg or "time" in cfg):
+            cfg = {"aux": cfg}
+        self._auto_last = {}
+        for job in self._auto_jobs():
+            one = cfg.get(job["key"]) or {}
+            self._auto_last[job["key"]] = str(one.get("last") or "")
+            job["chk"].setChecked(bool(one.get("enabled", False)))
+            t = QTime.fromString(str(one.get("time") or ""), "HH:mm")
+            if t.isValid():
+                job["time"].setTime(t)
+            i = job["range"].findData(one.get("range") or "1d")
+            if i >= 0:
+                job["range"].setCurrentIndex(i)
+            job["chk"].toggled.connect(self._save_auto_cfg)
+            job["time"].timeChanged.connect(self._save_auto_cfg)
+            job["range"].currentIndexChanged.connect(self._save_auto_cfg)
 
     def _save_auto_cfg(self, *_args) -> None:
         cfg = {
-            "enabled": self.chk_auto.isChecked(),
-            "time": self.time_auto.time().toString("HH:mm"),
-            "range": self.cb_auto_range.currentData() or "1d",
-            "last": self._auto_last,
+            job["key"]: {
+                "enabled": job["chk"].isChecked(),
+                "time": job["time"].time().toString("HH:mm"),
+                "range": job["range"].currentData() or "1d",
+                "last": self._auto_last.get(job["key"], ""),
+            }
+            for job in self._auto_jobs()
         }
         try:
             path = self._auto_path()
@@ -682,35 +724,77 @@ class DataPage(QWidget):
         """每 30 秒看一眼：到点、今天还没跑过、手上没活儿，就补一次。
 
         日期存盘而不是只放内存：半夜跑过一次之后用户重启程序，不该再补一遍。
+
+        两条日程共用这一个心跳，但各自记各自的「今天跑过了」—— 15:30 的衍生
+        数据补完不该让 17:00 的日线任务也跟着认为今天跑完了。
         """
-        if not self.chk_auto.isChecked() or self.market != "cn":
-            return
         from datetime import date
 
         today = date.today().isoformat()
-        if self._auto_last == today:
-            return
-        if QTime.currentTime() < self.time_auto.time():
-            return
-        if self.busy():
-            return              # 正在更新，下一个 30 秒再看
-        self._auto_last = today
-        self._save_auto_cfg()
-        self._log(f"—— 定时补充开始（{self.time_auto.time().toString('HH:mm')}）")
-        self._start_auto()
+        now = QTime.currentTime()
+        for job in self._auto_jobs():
+            if not job["chk"].isChecked():
+                continue
+            if self._auto_last.get(job["key"]) == today:
+                continue
+            if now < job["time"].time():
+                continue
+            if self.busy():
+                return          # 正在更新，下一个 30 秒再看（两条都不抢）
+            self._auto_last[job["key"]] = today
+            self._save_auto_cfg()
+            self._log(
+                f"—— 定时补充开始：{job['label']}"
+                f"（{job['time'].time().toString('HH:mm')}）"
+            )
+            self._start_auto(job["key"])
+            return              # 一次只起一条，另一条等下一轮心跳
 
-    def _start_auto(self) -> None:
-        """定时任务：主连 + 真实合约 + 期权，区间按用户选的那一档。
+    def _auto_jobs(self) -> list[dict]:
+        """两条日程的控件与目标市场。
 
-        和手动更新走同一个 `UpdateWorker`，区别只有两个：市场钉死期货，
+        `markets` 是这条日程要跑的市场，按顺序跑 —— 日线那条要期货和美股都补，
+        而衍生数据只有期货有。
+        """
+        return [
+            {"key": "aux", "label": "期货衍生数据",
+             "chk": self.chk_auto, "time": self.time_auto, "range": self.cb_auto_range,
+             "markets": ["cn"], "aux": True},
+            {"key": "daily", "label": "日线（期货 + 美股）",
+             "chk": self.chk_daily, "time": self.time_daily, "range": self.cb_daily_range,
+             "markets": ["cn", "us"], "aux": False},
+        ]
+
+    def _start_auto(self, key: str) -> None:
+        """定时任务入口：把这条日程要跑的市场排进队列，逐个起。
+
+        和手动更新走同一个 `UpdateWorker`，区别只有两个：市场按日程钉死、
         失败不弹模态框（半夜没人点确定，弹窗会一直挂着）。
         """
-        key = self.cb_auto_range.currentData() or "1d"
-        dir_cn = (self._markets.get("cn") or {}).get("dir") or self.market_dir
+        job = next((j for j in self._auto_jobs() if j["key"] == key), None)
+        if job is None:
+            return
         self._auto_run = True
+        self._auto_key = key
+        self._auto_queue = list(job["markets"])
+        self._auto_range = job["range"].currentData() or "1d"
+        self._auto_aux = bool(job["aux"])
+        self._start_auto_next()
+
+    def _start_auto_next(self) -> None:
+        """起队列里的下一个市场。跑完一个由 `_on_thread_done` 叫下一个。"""
+        if not self._auto_queue:
+            return
+        mk = self._auto_queue.pop(0)
+        dir_mk = (self._markets.get(mk) or {}).get("dir") or self.market_dir
+        if not dir_mk:
+            self._start_auto_next()     # 这个市场没配目录，跳过
+            return
+        label = (self._markets.get(mk) or {}).get("label") or mk
         self._upd_worker = UpdateWorker(
-            "cn", dir_cn, key, updater.SOURCE_TUSHARE, 0.0,
-            aux_contracts=True, aux_options=True,
+            mk, dir_mk, self._auto_range, updater.SOURCE_TUSHARE,
+            float(self.cb_upd_rate.currentData() or 60.0),
+            aux_contracts=self._auto_aux, aux_options=self._auto_aux,
         )
         self._upd_thread = QThread(self)
         self._upd_worker.moveToThread(self._upd_thread)
@@ -725,7 +809,9 @@ class DataPage(QWidget):
         self.prog_update.setRange(0, 0)
         self.prog_update.setVisible(True)
         self.lbl_upd.setVisible(True)
-        self.lbl_upd.setText(f"定时补充（{updater.RANGE_LABELS.get(key, key)}）…")
+        self.lbl_upd.setText(
+            f"定时补充 · {label}（{updater.RANGE_LABELS.get(self._auto_range, self._auto_range)}）…"
+        )
         self.btn_update.setText("取消")
         self.btn_update.setEnabled(True)
         self._upd_thread.start()
@@ -751,6 +837,7 @@ class DataPage(QWidget):
 
     def _start_tushare(self) -> None:
         self._auto_run = False
+        self._auto_queue = []       # 手动跑一趟就别再接着排定时的那几个市场
         mk = self.market
         key = self.cb_upd_range.currentData()
         # 期货没有第二个数据源，直接钉死 Tushare
@@ -786,6 +873,8 @@ class DataPage(QWidget):
         self._upd_thread.start()
 
     def _start_tq(self) -> None:
+        self._auto_run = False
+        self._auto_queue = []
         period = self.cb_period.currentData() or "1h"
         days = int(self.cb_tq_range.currentData() or 7300)
         contracts = self.chk_tq_contracts.isChecked()
@@ -883,10 +972,18 @@ class DataPage(QWidget):
             if w is not None:
                 w.deleteLater()
                 setattr(self, attr, None)
+        # 定时任务还有下一个市场（日线那条是期货 → 美股）：接着起，
+        # 按钮和进度条保持「忙」的样子，别让用户以为跑完了又点一次
+        if self._auto_run and self._auto_queue:
+            self._start_auto_next()
+            return
         self.btn_update.setText("开始补充")
         self.btn_update.setEnabled(True)
         self.prog_update.setVisible(False)
+        if self._auto_run:
+            self._log(f"—— 定时补充结束：{self._auto_key}")
         self._auto_run = False
+        self._auto_queue = []
 
     def shutdown(self) -> None:
         """关窗口时收尾：让后台线程别拖着进程。"""

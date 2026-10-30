@@ -191,9 +191,91 @@ def merge_live(local: pd.DataFrame, live: pd.DataFrame) -> pd.DataFrame:
 SNAP_ROWS = 200
 
 
+_MULT: dict[str, float] = {}
+_TIME: dict[int, str] = {}
+
+
+def _stamp(ns) -> str:
+    """天勤的纳秒时间戳 → 北京时间字符串。0 / 非法值返回空串。
+
+    委托表和成交表都要这一列，而快照每 0.4 秒重建一次、一次最多 200 行 ×
+    账户数 —— 逐个走 `pd.Timestamp` 太贵，按纳秒值缓存（同一批委托的纳秒
+    永远不变，缓存命中率接近 100%）。
+    """
+    try:
+        n = int(ns)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    hit = _TIME.get(n)
+    if hit is not None:
+        return hit
+    try:
+        t = pd.Timestamp(n, unit="ns", tz="UTC").tz_convert("Asia/Shanghai")
+        s = t.strftime("%m-%d %H:%M:%S")
+    except Exception:  # noqa: BLE001
+        s = ""
+    if len(_TIME) > 4000:      # 一天的委托也就这个量级，超了直接清
+        _TIME.clear()
+    _TIME[n] = s
+    return s
+
+
+def _mult_of(contract: str) -> float:
+    """合约乘数，按合约代码推品种再查本地日线。查不到返回 1.0。
+
+    账户列表要算杠杆和成交金额，都是「手 → 钱」，缺了乘数就没法算。这里不
+    订阅行情：账户页每 0.4 秒刷一次，为几十个合约建 quote 会把连接压垮，
+    而乘数是静态的，读一次本地 CSV 就够了（`ttrade.specs` 内部也做了缓存）。
+    """
+    if not contract:
+        return 1.0
+    if contract in _MULT:
+        return _MULT[contract]
+    import re
+
+    head, _, tail = contract.partition(".")
+    ex, code = (head, tail) if tail else ("", head)
+    prod = re.sub(r"\d+$", "", code).upper()
+    try:
+        from . import specs as _specs
+
+        val = float(_specs.multiplier(prod, ex))
+    except Exception:  # noqa: BLE001
+        val = 1.0
+    _MULT[contract] = val
+    return val
+
+
+def _sum_accounts(rows: list[dict]) -> dict:
+    """把多账户的资金合成一份，给「全选」时的顶部资金卡用。
+
+    风险度不能用 sum：它是比值，得拿合计保证金除以合计权益重算。
+    """
+    out = {}
+    for k in ("balance", "available", "margin", "float_profit", "close_profit",
+              "commission", "turnover", "day_profit"):
+        out[k] = float(sum(float(r.get(k) or 0.0) for r in rows))
+    bal = out["balance"]
+    out["risk_ratio"] = (out["margin"] / bal) if bal > 0 else 0.0
+    out["accounts"] = len(rows)
+    return out
+
+
 @dataclass
 class LiveState:
-    """一次快照，界面拿去直接刷控件。全是普通 dict/list，不持有天勤对象。"""
+    """一次快照，界面拿去直接刷控件。全是普通 dict/list，不持有天勤对象。
+
+    `account` / `positions` / `orders` / `trades` 是**全部账户合并**后的结果
+    （多账户时求和 / 拼接），`by_account` 里则是按账户分开的那一份：
+
+        by_account = {"账户名": {"spec": {...}, "account": {...},
+                                "positions": [...], "orders": [...], "trades": [...]}}
+
+    合并那份给「还没选账户」的首屏用，分开那份给账户列表和双击切换用。
+    两份都是拷贝，界面线程怎么折腾都碰不到天勤对象。
+    """
 
     connected: bool = False
     error: str = ""
@@ -205,6 +287,8 @@ class LiveState:
     positions: list = field(default_factory=list)
     orders: list = field(default_factory=list)
     trades: list = field(default_factory=list)
+    accounts: list = field(default_factory=list)        # 账户列表（一行一个）
+    by_account: dict = field(default_factory=dict)      # 账户名 → 该账户的明细
 
 
 class LiveHub:
@@ -212,10 +296,18 @@ class LiveHub:
 
     生命周期：`start()` → 反复 `wait()` → `close()`。`wait()` 之外的调用都只是
     读活引用，不会阻塞。所有异常都写进 `last_error`，不让界面线程炸掉。
+
+    **多账户**：`specs` 给多个账户时走天勤的 `TqMultiAccount` —— 一条连接、
+    一次登录，`insert_order(..., account=obj)` 指定落到哪个账户。多个 TqApi
+    各连各的也能跑，但要重复登录、重复订阅行情，而且撤单/持仓的实时性会互相
+    拖累，没有理由那么做。
     """
 
-    def __init__(self, spec: AccountSpec):
-        self.spec = spec
+    def __init__(self, specs):
+        if isinstance(specs, AccountSpec):
+            specs = [specs]
+        self.specs: list[AccountSpec] = list(specs)
+        self.spec = self.specs[0] if self.specs else None
         self.api = None
         self.last_error = ""
         self.key = ""            # 品种_交易所
@@ -225,15 +317,12 @@ class LiveHub:
         self.underlying = ""     # 当前真实主力合约
         self._klines = None
         self._quote = None
-        self._account = None
-        self._positions = None
-        self._orders = None
-        self._trades = None
+        self._accs: list[tuple[AccountSpec, object]] = []   # (配置, 天勤账户对象)
         self._order_book: dict = {}
         self._targets: dict = {}
         # 交易所对日内报单 / 撤单次数有硬上限。组合页的引擎和这里共用同一份
-        # 落盘计数（同一个账户、同一个进程只能有一份）
-        self.limit = daylimit.DayLimit(spec.label())
+        # 落盘计数（同一个账户、同一个进程只能有一份）。多账户各自计数。
+        self.limit = daylimit.DayLimit(self.spec.label() if self.spec else "账户")
 
     # ---- 生命周期 ----
 
@@ -241,23 +330,32 @@ class LiveHub:
         """建立连接并取好所有活引用。失败抛异常，由调用方决定怎么提示。"""
         from tqsdk import TqApi, TqAuth
 
-        if not self.spec.user or not self.spec.password:
-            raise ValueError("缺少天勤账户或密码")
-        account = self.spec.build()
-        self.api = TqApi(
-            account,
-            auth=TqAuth(self.spec.user, self.spec.password),
-            web_gui=False,
-        )
-        self._account = self.api.get_account()
-        self._positions = self.api.get_position()
-        self._orders = self.api.get_order()
-        self._trades = self.api.get_trade()
+        if not self.specs:
+            raise ValueError("没有可连接的账户")
+        for s in self.specs:
+            if not s.user or not s.password:
+                raise ValueError(f"账户「{s.name}」缺少天勤账户或密码")
+        objs = [s.build() for s in self.specs]
+        # 同一个资金账号选两次会被天勤拒绝（account_key 重复）。提前说清楚，
+        # 别让用户对着一句英文异常猜。
+        keys = [getattr(o, "_account_key", id(o)) for o in objs]
+        if len(set(keys)) != len(keys):
+            raise ValueError("同一天勤资金账号不能重复连接，请取消其中一个的勾选")
+        if len(objs) == 1:
+            self.api = TqApi(objs[0], auth=TqAuth(self.specs[0].user, self.specs[0].password),
+                             web_gui=False)
+        else:
+            from tqsdk import TqMultiAccount
+
+            self.api = TqApi(TqMultiAccount(objs),
+                             auth=TqAuth(self.specs[0].user, self.specs[0].password),
+                             web_gui=False)
+        self._accs = list(zip(self.specs, objs))
 
     def close(self) -> None:
         api, self.api = self.api, None
         self._klines = self._quote = None
-        self._account = self._positions = self._orders = self._trades = None
+        self._accs = []
         self._targets.clear()
         if api is not None:
             try:
@@ -332,11 +430,92 @@ class LiveHub:
             underlying=self.underlying,
         )
         st.quote = quote
-        st.account = self._account_snapshot()
-        st.positions = self._positions_snapshot()
-        st.orders = self._orders_snapshot()
-        st.trades = self._trades_snapshot()
+        self._fill_accounts(st)
         return st
+
+    def _fill_accounts(self, st: LiveState) -> None:
+        """按账户拷一份明细，再合并出总量。
+
+        `positions` / `orders` / `trades` 三个活引用每个账户各有一份，逐账户
+        取出来加 `account` 字段，界面就不用再猜某一行属于谁。
+        """
+        rows, detail = [], {}
+        for spec, obj in self._accs:
+            try:
+                pos = self._positions_snapshot(obj)
+                ords = self._orders_snapshot(obj)
+                trds = self._trades_snapshot(obj)
+                acc = self._account_snapshot(obj)
+            except Exception as exc:  # noqa: BLE001
+                # 单个账户查不出来不该拖垮整页：其余账户照样能看能下单
+                self.last_error = f"{spec.name}：{type(exc).__name__}: {exc}"
+                pos, ords, trds, acc = [], [], [], {}
+            for r in pos:
+                r["account"] = spec.name
+            for r in ords:
+                r["account"] = spec.name
+            for r in trds:
+                r["account"] = spec.name
+            detail[spec.name] = {
+                "spec": asdict(spec), "account": acc,
+                "positions": pos, "orders": ords, "trades": trds,
+            }
+            rows.append(self._account_row(spec, acc, pos, trds))
+
+        st.accounts = rows
+        st.by_account = detail
+        if not rows:
+            return
+        st.account = _sum_accounts([r for r in rows])
+        st.positions = sorted(
+            [r for d in detail.values() for r in d["positions"]], key=lambda r: r["symbol"]
+        )
+        st.orders = sorted(
+            [r for d in detail.values() for r in d["orders"]],
+            key=lambda r: (r["status"] != "ALIVE", -r["insert_date_time"]),
+        )[:SNAP_ROWS]
+        st.trades = sorted(
+            [r for d in detail.values() for r in d["trades"]],
+            key=lambda r: -r["trade_date_time"],
+        )[:SNAP_ROWS]
+
+    def _account_row(self, spec: AccountSpec, acc: dict, pos: list, trds: list) -> dict:
+        """账户列表的一行：资金 + 杠杆 + 今日成交额。
+
+        杠杆和成交额都要「手 → 钱」的换算，也就是合约乘数。乘数从本地日线的
+        成交额反推（`ttrade.specs`），不额外请求行情 —— 账户页每 0.4 秒刷一次，
+        在这里去订阅几十个合约的 quote 会把连接压垮。
+        """
+        mv_long = mv_short = 0.0
+        for p in pos:
+            mult = _mult_of(p["symbol"])
+            # 市值 = 开仓成本×乘数 + 浮盈。开仓成本是「价×手」，乘上乘数才是钱；
+            # 浮盈本身就是钱，直接加。持仓对象上没有 last_price，拿不到盘口价时
+            # 这个式子仍然成立（它只用开仓价与浮盈，两个都是现成的）。
+            cost_l = p.get("open_cost_long") or p["open_price_long"] * p["pos_long"]
+            cost_s = p.get("open_cost_short") or p["open_price_short"] * p["pos_short"]
+            mv_long += cost_l * mult + p["float_profit_long"]
+            mv_short += cost_s * mult + p["float_profit_short"]
+        amount = 0.0
+        for t in trds:
+            amount += t["price"] * t["volume"] * _mult_of(t["symbol"])
+        bal = float(acc.get("balance") or 0.0)
+        equity = bal if bal > 0 else 0.0
+        return {
+            "name": spec.name,
+            "platform": dict(ACCOUNT_KINDS).get(spec.kind, spec.kind),
+            "account_id": spec.account_id or spec.user or "—",
+            "balance": bal,                                   # 最新权益
+            "day_profit": bal - float(acc.get("pre_balance") or bal),   # 当日盈亏
+            "net_leverage": (abs(mv_long - mv_short) / equity) if equity else 0.0,
+            "gross_leverage": ((mv_long + mv_short) / equity) if equity else 0.0,
+            "available": float(acc.get("available") or 0.0),
+            "turnover": amount,                               # 成交金额
+            "margin": float(acc.get("margin") or 0.0),
+            "commission": float(acc.get("commission") or 0.0),
+            "positions": len(pos),
+            "orders": len(trds),
+        }
 
     def _num(self, obj, name: str, default=0.0) -> float:
         v = getattr(obj, name, None)
@@ -374,8 +553,16 @@ class LiveHub:
             "expired": bool(getattr(q, "expired", False)),
         }
 
-    def _account_snapshot(self) -> dict:
-        a = self._account
+    def _account_snapshot(self, obj=None) -> dict:
+        """单个账户的资金。`obj` 是天勤账户对象（TqKq / TqAccount / TqSim）。
+
+        多账户模式下 `api.get_account()` 必须带账户实例，而账户对象自己的
+        `get_account()` 在单账户、多账户两种模式下都能用 —— 所以这里一律走
+        账户对象，两条路径共用一套代码。
+        """
+        if obj is None:
+            return {}
+        a = obj.get_account()
         if a is None:
             return {}
         return {
@@ -388,10 +575,14 @@ class LiveHub:
             "commission": self._num(a, "commission"),
             "risk_ratio": self._num(a, "risk_ratio"),
             "market_value": self._num(a, "market_value"),
+            "pre_balance": self._num(a, "pre_balance"),    # 昨结算权益（算当日盈亏）
+            "static_balance": self._num(a, "static_balance"),
         }
 
-    def _positions_snapshot(self) -> list[dict]:
-        src = self._positions
+    def _positions_snapshot(self, obj) -> list[dict]:
+        if obj is None:
+            return []
+        src = obj.get_position()
         if src is None:
             return []
         out = []
@@ -412,16 +603,24 @@ class LiveHub:
                 "pos_short_today": int(self._num(p, "pos_short_today")),
                 "open_price_long": self._num(p, "open_price_long"),
                 "open_price_short": self._num(p, "open_price_short"),
+                "open_cost_long": self._num(p, "open_cost_long"),
+                "open_cost_short": self._num(p, "open_cost_short"),
                 "float_profit": self._num(p, "float_profit"),
+                "float_profit_long": self._num(p, "float_profit_long"),
+                "float_profit_short": self._num(p, "float_profit_short"),
                 "position_profit": self._num(p, "position_profit"),
                 "margin": self._num(p, "margin"),
+                # Position 上没有 last_price（那是 SecurityPosition 的字段），
+                # 这里留着 0 只为了列名对齐，别拿它当盘口价用
                 "last_price": self._num(p, "last_price"),
             })
         out.sort(key=lambda r: r["symbol"])
         return out
 
-    def _orders_snapshot(self) -> list[dict]:
-        src = self._orders
+    def _orders_snapshot(self, obj) -> list[dict]:
+        if obj is None:
+            return []
+        src = obj.get_order()
         if src is None:
             return []
         items = list(src.items()) if hasattr(src, "items") else []
@@ -443,11 +642,14 @@ class LiveHub:
                 "status": getattr(o, "status", ""),
                 "last_msg": getattr(o, "last_msg", ""),
                 "insert_date_time": self._num(o, "insert_date_time"),
+                "time": _stamp(getattr(o, "insert_date_time", 0)),
             })
         return out
 
-    def _trades_snapshot(self) -> list[dict]:
-        src = self._trades
+    def _trades_snapshot(self, obj) -> list[dict]:
+        if obj is None:
+            return []
+        src = obj.get_trade()
         if src is None:
             return []
         items = list(src.items()) if hasattr(src, "items") else []
@@ -463,14 +665,28 @@ class LiveHub:
                 "price": self._num(t, "price"),
                 "volume": int(self._num(t, "volume")),
                 "trade_date_time": self._num(t, "trade_date_time"),
+                "time": _stamp(getattr(t, "trade_date_time", 0)),
             })
         return out
 
     # ---- 写 ----
 
+    def _acc_obj(self, name: str = ""):
+        """按名字找天勤账户对象。名字为空时返回唯一的那个（单账户）。"""
+        if not self._accs:
+            raise RuntimeError("还没连接")
+        if not name:
+            if len(self._accs) == 1:
+                return self._accs[0][1]
+            raise RuntimeError("多账户下必须指定账户")
+        for spec, obj in self._accs:
+            if spec.name == name:
+                return obj
+        raise ValueError(f"没有名为「{name}」的账户")
+
     def place(self, symbol: str, direction: str, offset: str, volume: int,
-              limit_price: float | None = None) -> str:
-        """下单。返回客户端订单号。
+              limit_price: float | None = None, account: str = "") -> str:
+        """下单。返回客户端订单号。`account` 是多账户时的目标账户名。
 
         注意 `insert_order()` 只是**入队**，真正的报文在下一次 `wait_update()` 才发出去。
         所以调用方下完单必须继续跑 `wait()` 循环，否则单子永远不会到交易所。
@@ -487,14 +703,20 @@ class LiveHub:
         kwargs = {}
         if limit_price is not None and limit_price > 0:
             kwargs["limit_price"] = float(limit_price)
+        if len(self._accs) > 1:
+            kwargs["account"] = self._acc_obj(account)
         order = self.api.insert_order(
             symbol, direction, offset=offset, volume=int(volume), **kwargs
         )
         self._order_book[order.order_id] = order
         return order.order_id
 
-    def cancel(self, order_id: str) -> None:
-        """撤单。同样是入队，下一次 `wait_update()` 才发。"""
+    def cancel(self, order_id: str, account: str = "") -> None:
+        """撤单。同样是入队，下一次 `wait_update()` 才发。
+
+        多账户下委托号全局唯一，但天勤要求撤单也指明账户实例 —— 传错了会被
+        静默忽略（单子一直挂着），所以这里一并带上。
+        """
         if self.api is None:
             raise RuntimeError("还没连接")
         if not self.limit.cancel():
@@ -502,9 +724,12 @@ class LiveHub:
                 f"今日撤单已达 {daylimit.DAY_CANCEL_LIMIT} 次上限，"
                 "再撤会被交易所限制交易"
             )
-        self.api.cancel_order(order_id)
+        if len(self._accs) > 1:
+            self.api.cancel_order(order_id, account=self._acc_obj(account))
+        else:
+            self.api.cancel_order(order_id)
 
-    def set_target(self, symbol: str, volume: int) -> None:
+    def set_target(self, symbol: str, volume: int, account: str = "") -> None:
         """把某个合约的目标净仓设成 `volume`（正多负空，0 平掉）。
 
         用 `TargetPosTask` 而不是自己 `insert_order`：反手要「先平后开」，
@@ -515,10 +740,13 @@ class LiveHub:
         """
         if self.api is None:
             raise RuntimeError("还没连接")
-        task = self._targets.get(symbol)
+        obj = self._acc_obj(account) if len(self._accs) > 1 else None
+        key = f"{account}|{symbol}" if obj is not None else symbol
+        task = self._targets.get(key)
         if task is None:
             from tqsdk import TargetPosTask
 
-            task = TargetPosTask(self.api, symbol)
-            self._targets[symbol] = task
+            task = TargetPosTask(self.api, symbol, account=obj) if obj is not None \
+                else TargetPosTask(self.api, symbol)
+            self._targets[key] = task
         task.set_target_volume(int(volume))

@@ -42,6 +42,7 @@ class LiveWorker(QObject):
     def __init__(self, spec, symbol: str, exchange: str, period: str,
                  need_history: bool = True) -> None:
         super().__init__()
+        # `spec` 可以是一个 AccountSpec，也可以是列表（多账户）
         self.spec = spec
         self.symbol = symbol
         self.exchange = exchange
@@ -194,36 +195,37 @@ class LiveController(QObject):
     # ---- 界面操作：全部排队给 worker ----
 
     def place(self, symbol: str, direction: str, offset: str, volume: int,
-              limit_price: float | None) -> bool:
+              limit_price: float | None, account: str = "") -> bool:
         if self._worker is None:
             self.failed.emit("还没连上天勤，无法下单")
             return False
 
         def job(hub):
-            oid = hub.place(symbol, direction, offset, volume, limit_price)
+            oid = hub.place(symbol, direction, offset, volume, limit_price,
+                            account=account)
             self.order_sent.emit(oid)
 
         self._worker.submit(job)
         return True
 
-    def cancel(self, order_id: str) -> bool:
+    def cancel(self, order_id: str, account: str = "") -> bool:
         if self._worker is None:
             self.failed.emit("还没连上天勤，无法撤单")
             return False
 
         def job(hub):
-            hub.cancel(order_id)
+            hub.cancel(order_id, account=account)
 
         self._worker.submit(job)
         return True
 
-    def set_target(self, symbol: str, volume: int) -> bool:
+    def set_target(self, symbol: str, volume: int, account: str = "") -> bool:
         """把某个合约的目标净仓交给 TargetPosTask（自动交易用）。"""
         if self._worker is None:
             return False
 
         def job(hub):
-            hub.set_target(symbol, volume)
+            hub.set_target(symbol, volume, account=account)
 
         self._worker.submit(job)
         return True
