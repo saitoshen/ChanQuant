@@ -193,9 +193,12 @@ def check_intraday_aux() -> None:
               f"{out['c1_close'].notna().mean():.1%}")
         check(f"{key} 1h：行数不变", len(out) == len(df), f"{len(out)} vs {len(df)}")
 
-        # 第一根 bar 用的是「它所在交易日之前」最近一个快照
+        # 第一根 bar 用的是「它所在交易日之前」最近一个快照。
+        # 交易日取 `trading_day` 列而不是 index.normalize()：数据第一根就是夜盘
+        # 21:00 的话，自然日是前一天，会去比错一天
         curve = A.load_curve(aux_dir, sym, ex)
-        day = pd.Timestamp(out.index[0]).normalize()
+        day = (pd.Timestamp(out["trading_day"].iloc[0]) if "trading_day" in out.columns
+               else pd.Timestamp(out.index[0]).normalize())
         prev = curve.loc[curve.index < day]
         if len(prev):
             check(f"{key} 1h：用上一交易日的快照（不提前用当天收盘）",
@@ -205,10 +208,25 @@ def check_intraday_aux() -> None:
         ry = F.f_roll_yield(out)
         check(f"{key} 1h：展期收益率算得出", float(ry.notna().mean()) > 0.99,
               f"{ry.notna().mean():.1%}")
+        # 夜盘 bar 的时间戳是前一天 21:00，但属于**下一个**交易日，必须和那天
+        # 的日盘读到同一份快照。按 index.normalize() 对齐的话夜盘会取到 D-2，
+        # 同一个交易日里冒出两个值 —— 日内因子和 ML 特征里凭空多一跳
+        if "trading_day" in out.columns:
+            td = pd.to_datetime(out["trading_day"])
+            hh = out.index.strftime("%H:%M")
+            night = out[hh >= "21:00"]
+            if len(night):
+                d0 = td.loc[night.index[0]]
+                same = out.loc[td == d0, "c1_close"]
+                check(f"{key} 夜盘与次日日盘用同一份快照",
+                      same.nunique() == 1,
+                      f"交易日 {str(d0)[:10]} 有 {same.nunique()} 个不同值")
+
         # 衍生列一天一个快照，同一天里所有 bar 的「20 日变化」必须一模一样。
         # 直接 `.diff(20)` 的话，5m 上算的是 100 分钟前的差，一天内根根不同
         ch = F.f_roll_change(out).dropna()
-        grp = ch.groupby(ch.index.normalize())
+        grp = ch.groupby(pd.to_datetime(out["trading_day"]) if "trading_day" in out.columns
+                         else ch.index.normalize())
         sizes = grp.size()
         full = [d for d in sizes.index if sizes[d] >= 3]
         same_day = grp.get_group(full[-1]) if full else ch.iloc[:0]

@@ -146,6 +146,36 @@ def attach(
     return out
 
 
+def _trade_day(df: pd.DataFrame) -> pd.Series:
+    """每根 bar 属于哪个交易日。
+
+    **不能拿 `index.normalize()` 当交易日**：天勤的夜盘 bar 时间戳是 21:00
+    （自然日 D-1），但按交易所口径它属于下一个交易日 D。`tqdata.trading_days()`
+    在写入库时就算好了 `trading_day` 列，这里直接用，和 `factors_intraday._day`、
+    `factors_seasonal._day` 保持同一个口径。
+
+    按自然日对齐的后果不是前视，是**多用了一天的旧值**：夜盘那段取到的是 D-2
+    的快照（因为按 D-1 去 shift(1)），于是同一个交易日里夜盘和日盘读到两个不同
+    的展期 / IV 值 —— 在日内因子和 ML 特征里就是一条凭空出现的跳变。
+    """
+    idx = pd.DatetimeIndex(df.index)
+    if "trading_day" in df.columns:
+        d = pd.to_datetime(df["trading_day"], errors="coerce")
+        if d.notna().any():
+            # 实盘那条链路是「本地历史 + 实时 bar」拼出来的，而实时段的
+            # `bars_from_serial` 只有 OHLC / 持仓量，`trading_day` 是 NaT。
+            # 不补的话这些 bar 会落进 NaT 那一组，拿到一条来路不明的快照。
+            # 补法用同一套规则：20:00 之后算次日（落在周末也没关系，下面的
+            # ffill 会兜到上一个有快照的交易日）。
+            nat = d.isna()
+            if nat.any():
+                guess = pd.Series(idx.normalize(), index=df.index)
+                guess = guess.where(idx.hour < 20, guess + pd.Timedelta(days=1))
+                d = d.fillna(guess)
+            return d
+    return pd.Series(idx.normalize(), index=df.index)
+
+
 def attach_intraday(
     df: pd.DataFrame,
     symbol: str,
@@ -174,7 +204,15 @@ def attach_intraday(
     if df.empty or not isinstance(df.index, pd.DatetimeIndex):
         return df
 
-    day = df.index.normalize()
+    day = _trade_day(df)
+    # 补齐的交易日要写回列里。下游 `factors_intraday._day` / `_seasonal._day`
+    # 读的是这一列 —— 只在本地算 `day` 不回写的话，实盘拼出来的表（实时段
+    # trading_day 是 NaT）到因子那一层又退回自然日，夜盘归错天。
+    if "trading_day" in df.columns:
+        raw = pd.to_datetime(df["trading_day"], errors="coerce")
+        if raw.isna().any():
+            df = df.copy()
+            df["trading_day"] = day
     parts = [load_curve(aux_dir, symbol, exchange), load_opt(aux_dir, symbol, exchange)]
     out = df
     for part in parts:

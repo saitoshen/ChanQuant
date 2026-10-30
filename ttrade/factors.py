@@ -84,7 +84,28 @@ def _safe_log_ratio(a: pd.Series, b: pd.Series) -> pd.Series:
     return np.log(a.where(ok) / b.where(ok))
 
 
-def _day_diff(s: pd.Series, n: int = 20) -> pd.Series:
+def _trade_day(df: pd.DataFrame) -> pd.Series:
+    """每根 bar 属于哪个交易日。夜盘 21:00 归**下一个**交易日。
+
+    和 `factors_intraday._day` / `factors_seasonal._day` / `auxdata._trade_day`
+    必须是同一个口径，四处各写一份是因为它们分属四个模块、互相不 import。
+    """
+    idx = pd.DatetimeIndex(df.index)
+    if "trading_day" in df.columns:
+        d = pd.to_datetime(df["trading_day"], errors="coerce")
+        if d.notna().any():
+            # 实盘拼出来的「本地历史 + 实时 bar」里，实时段没有 trading_day。
+            # 不补的话它们落进 NaT 那一组，日频压平时会被 `.last()` 吃掉。
+            nat = d.isna()
+            if nat.any():
+                guess = pd.Series(idx.normalize(), index=df.index)
+                guess = guess.where(idx.hour < 20, guess + pd.Timedelta(days=1))
+                d = d.fillna(guess)
+            return d
+    return pd.Series(idx.normalize(), index=df.index)
+
+
+def _day_diff(df: pd.DataFrame, s: pd.Series, n: int = 20) -> pd.Series:
     """按**交易日**取 n 天变化。
 
     日线上 `diff(n)` 本来就是 n 天。分钟线上不是：5m 的 `diff(20)` 只是 100
@@ -93,11 +114,15 @@ def _day_diff(s: pd.Series, n: int = 20) -> pd.Series:
     每天开盘那几根再跳一下，看着像信号其实是采样伪影。
 
     这里先压成日频、diff 完再映射回每根 bar，两个周期口径就一致了。
+
+    分组键必须是**交易日**不是自然日：一个交易日横跨两个自然日（夜盘在 D-1
+    晚上），按自然日分组会把同一个交易日的夜盘和日盘拆到两组里，diff 出来
+    两个不同的值 —— 同一根日线快照被算成两天的变化。
     """
     idx = s.index
     if not isinstance(idx, pd.DatetimeIndex) or len(idx) < 2:
         return s.diff(n)
-    day = idx.normalize()
+    day = _trade_day(df)
     if len(day) == len(day.unique()):        # 一天一根，本来就是日线
         return s.diff(n)
     daily = s.groupby(day).last()
@@ -137,7 +162,7 @@ def _roll_curv(df: pd.DataFrame, pre: str = "c") -> pd.Series:
 
 
 def _roll_change(df: pd.DataFrame, pre: str = "c") -> pd.Series:
-    return _day_diff(_roll_annual(df, pre), 20)
+    return _day_diff(df, _roll_annual(df, pre), 20)
 
 
 def f_roll_yield(df: pd.DataFrame) -> pd.Series:
@@ -336,7 +361,7 @@ def f_iv_rv(df: pd.DataFrame) -> pd.Series:
 
 def f_iv_change(df: pd.DataFrame) -> pd.Series:
     """IV 的 20 日变化。衡量波动率预期的动量。"""
-    return _day_diff(_col(df, "iv_near"), 20)
+    return _day_diff(df, _col(df, "iv_near"), 20)
 
 
 def f_pcr(df: pd.DataFrame) -> pd.Series:

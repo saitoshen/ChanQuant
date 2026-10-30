@@ -224,6 +224,7 @@ class PortfolioRunner:
         # 可能已经有仓了，账本从 0 开始会把目标再开一遍 —— 见 `_adopt_if_needed`。
         self._fresh_book = not positionbook.exists()
         self._adopted: set[str] = set()
+        self._aux_warned: set[str] = set()
 
     # ---- 生命周期 ----
 
@@ -615,8 +616,7 @@ class PortfolioRunner:
         sig = out["signal"].iloc[-1]
         return 0 if pd.isna(sig) else int(sig)
 
-    @staticmethod
-    def _with_aux(st: SlotState, df: pd.DataFrame) -> pd.DataFrame:
+    def _with_aux(self, st: SlotState, df: pd.DataFrame) -> pd.DataFrame:
         """给实时序列挂上期限结构 / 期权列。
 
         天勤的 K 线只有 OHLC 和持仓量，展期、期权那十几个因子读的 `c1_close`、
@@ -626,9 +626,45 @@ class PortfolioRunner:
         try:
             from ttrade.auxdata import attach_intraday
 
-            return attach_intraday(df, st.cfg.symbol, st.cfg.exchange)
+            out = attach_intraday(df, st.cfg.symbol, st.cfg.exchange)
         except Exception:  # noqa: BLE001
             return df
+        self._check_aux_fresh(st, out)
+        return out
+
+    def _check_aux_fresh(self, st: SlotState, df: pd.DataFrame) -> None:
+        """衍生快照落后太多就提示一次。
+
+        展期 / 期权在分钟线上只能用「上一个交易日」的收盘快照，实盘也一样 ——
+        这是 PIT 的要求，不是缺陷（盘中不可能知道今天收盘后的期限结构）。
+        但如果用户几天没更新衍生数据，快照就停在几天前：因子有值、但那个值是
+        上周的期限结构，看着正常其实是死的。
+
+        判据按**交易日**数而不是日历天：正常滞后 1 个交易日，周末跨两天不算。
+        """
+        key = self._skey(st.cfg)
+        if key in self._aux_warned:
+            return
+        try:
+            s = pd.to_numeric(df["c1_close"], errors="coerce")
+            if not s.notna().any():
+                return                      # 没有衍生数据，因子本来就是空的
+            td = (pd.to_datetime(df["trading_day"]) if "trading_day" in df.columns
+                  else pd.Series(pd.DatetimeIndex(df.index).normalize(), index=df.index))
+            days = pd.DatetimeIndex(sorted(set(td.dropna())))
+            last = td[s.notna()].iloc[-1]
+            # 正常情况「最新一根 bar 的交易日」就能拿到前一天的快照，lag = 0；
+            # 缺一天就变成 1。所以只要 >= 1 就是缺，不用等两天
+            lag = int((days > last).sum())
+            if lag >= 1:
+                self._aux_warned.add(key)
+                self._log(
+                    f"{st.title()}：衍生数据只到 {str(last)[:10]}，"
+                    f"展期 / 期权因子落后 {lag} 个交易日 —— "
+                    f"去「数据管理」页补一次真实合约 / 期权"
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---- 手数 ----
 
