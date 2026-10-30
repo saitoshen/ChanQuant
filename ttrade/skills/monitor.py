@@ -174,19 +174,21 @@ def _scan(ctx, p: dict) -> SkillResult:
     else:
         head = f"{RULE_LABELS[rule]} · {period} · 窗口 {window} 根"
 
+    # 只放四列。六列（品种/名称/收盘/关键位/幅度/日期）在窄窗口里会被 Qt 压到
+    # 每列三十几像素，「2026-10-30」和「+2.17%」都会断行，看着像坏表。代号和名称
+    # 合成一格，日期移到上面的指标卡 —— 一次扫描本来就只有一天。
     if rule == "volume_spike":
-        cols = ["品种", "名称", "收盘", "量比", "当日涨跌", "数据截止"]
-        rows = [[h["key"], h["name"] or "—", _f(h["close"]),
-                 f"{h['rank']:.1f}", f"{h['dist']:+.2f}%",
-                 _dt(h["date"])] for h in shown]
+        cols = ["品种", "收盘", "量比", "涨跌"]
+        rows = [[_sym(h), _f(h["close"]), f"{h['rank']:.1f}", f"{h['dist']:+.2f}%"]
+                for h in shown]
     elif rule == "ma_cross":
-        cols = ["品种", "名称", "收盘", "信号", "均线差", "数据截止"]
-        rows = [[h["key"], h["name"] or "—", _f(h["close"]), h["kind"],
-                 f"{h['dist']:+.2f}%", _dt(h["date"])] for h in shown]
+        cols = ["品种", "收盘", "信号", "均线差"]
+        rows = [[_sym(h), _f(h["close"]), h["kind"], f"{h['dist']:+.2f}%"]
+                for h in shown]
     else:
-        cols = ["品种", "名称", "收盘", "关键位", "幅度", "数据截止"]
-        rows = [[h["key"], h["name"] or "—", _f(h["close"]), _f(h["level"]),
-                 f"{h['dist']:+.2f}%", _dt(h["date"])] for h in shown]
+        cols = ["品种", "收盘", "关键位", "幅度"]
+        rows = [[_sym(h), _f(h["close"]), _f(h["level"]), f"{h['dist']:+.2f}%"]
+                for h in shown]
 
     blocks = [
         B.block_metrics(head, [
@@ -253,6 +255,12 @@ def _f(v, nd: int = 2) -> str:
     if x != x:
         return "—"
     return f"{x:,.{nd}f}"
+
+
+def _sym(h: dict) -> str:
+    """代号 + 名称合成一格。表格只有四列，分两列会把代号挤成两行。"""
+    name = h.get("name") or ""
+    return f"{h['key']} {name}".strip()
 
 
 def _dt(ts) -> str:
