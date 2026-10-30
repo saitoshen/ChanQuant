@@ -3855,6 +3855,10 @@ def check_tq_curve() -> None:
         skip("天勤期限结构", "没有 DuckDB")
         return
     with S.connect(read_only=True) as con:
+        # 轻量库可能连 contract_bars 都没有（make_lite_db.py --no-contracts）
+        if not S._has_table(con, "contract_bars"):
+            skip("天勤期限结构", "这个库里没有真实合约")
+            return
         row = con.execute(
             "SELECT symbol, exchange, period, count(*) n FROM contract_bars"
             " GROUP BY 1,2,3 ORDER BY n DESC LIMIT 1"

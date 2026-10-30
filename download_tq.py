@@ -150,7 +150,7 @@ def main() -> int:
         return 0
 
     pairs = pick_pairs(args.symbols, args.all)
-    print(f"品种 {len(pairs)} 个，仓库 {S.db_path()}")
+    print(f"品种 {len(pairs)} 个，仓库 {S.db_path(read_only=False)}")
 
     ratio_cache: dict = {}
 

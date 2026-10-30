@@ -94,6 +94,19 @@ jobs:
       - name: 生成图标
         run: python packaging/make_icon.py
 
+      # 随包的天勤轻量库（287MB）不进 git —— GitHub 单文件上限 100MB。
+      # 放在单独的「数据包」release 里（tag 形如 data-2026-10，由 make_lite_db.py
+      # 生成后上传），构建时拉下来。拉不到就让构建失败：少这 287MB 的包看起来
+      # 一切正常，只是 5m/1h 全空 —— 那种包不该发出去。
+      - name: 取天勤轻量库
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p data_tq
+          gh release download data-2026-10 --pattern tq_lite.duckdb --dir data_tq --clobber
+          ls -lh data_tq/tq_lite.duckdb
+
       - name: 打包
         run: python build.py
 

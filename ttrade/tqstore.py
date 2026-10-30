@@ -20,6 +20,12 @@
 
 写入用 `INSERT OR REPLACE`，主键冲突就覆盖 —— 增量更新时同一根 bar 会被重下，
 这样天然幂等。
+
+**两个库**：安装包自带 `tq_lite.duckdb`（约 270MB：主连 5m/1h/1d + 真实合约日线 +
+切换表），完整库 `tq.duckdb`（约 11GB，多出 5m/1h 的真实合约明细）由用户按需下载。
+读取时**优先完整库**，没有再退到轻量库；**写入永远写完整库** —— 随包的轻量库可能
+落在只读目录（macOS 的 `.app`），也不该被增量更新改坏。轻量库缺 `contract_bars`
+的分钟级明细，所以 `stats()` / `load_contracts()` 都按「表可能不存在」来写。
 """
 
 from __future__ import annotations
@@ -34,6 +40,9 @@ import pandas as pd
 from .paths import data_dir
 
 SCHEMA_VERSION = "1"
+
+DB_NAME = "tq.duckdb"          # 完整库：主连 + 真实合约（5m/1h/1d）
+LITE_NAME = "tq_lite.duckdb"   # 随包轻量库：主连三周期 + 真实合约日线
 
 BAR_COLS = [
     "symbol", "exchange", "period", "dt", "trading_day",
@@ -100,17 +109,89 @@ DDL = [
 ]
 
 
-def db_path() -> str:
-    """仓库路径。`TRENDDESK_TQ_DB` 可以指向别处 —— 测试用临时库、或者把仓库放到
-    空间更大的盘上，都不需要改代码。"""
+def _db_dir() -> str:
+    return os.path.join(os.path.dirname(data_dir("cn").rstrip("/\\")), "data_tq")
+
+
+def db_path(read_only: bool = True) -> str:
+    """仓库路径。
+
+    `TRENDDESK_TQ_DB` 可以指向别处 —— 测试用临时库、或者把仓库放到空间更大的盘上，
+    都不需要改代码。设了它就不再走轻量库回退（指向谁就是谁）。
+
+    没设时：**写**永远落到完整库；**读**先看完整库在不在，没有才退到随包的
+    `tq_lite.duckdb`。顺序反过来会让用户下载的完整库被忽略 —— 那个文件 11GB，
+    下完却还在读 270MB 的轻量库，等于白下。
+    """
     env = os.environ.get("TRENDDESK_TQ_DB")
     if env:
         return env
-    return os.path.join(os.path.dirname(data_dir("cn").rstrip("/\\")), "data_tq", "tq.duckdb")
+    base = _db_dir()
+    full = os.path.join(base, DB_NAME)
+    if not read_only:
+        return full
+    if os.path.isfile(full):
+        return full
+    lite = os.path.join(base, LITE_NAME)
+    if os.path.isfile(lite):
+        return lite
+    return full
+
+
+def source() -> str:
+    """当前读的是哪个库：`full` 完整库 / `lite` 随包轻量库 / `none` 都没有。"""
+    p = db_path(read_only=True)
+    if not os.path.isfile(p):
+        return "none"
+    return "lite" if os.path.basename(p) == LITE_NAME else "full"
 
 
 def exists() -> bool:
     return os.path.isfile(db_path())
+
+
+def _seed_full_from_lite(full: str) -> None:
+    """第一次写完整库时，先把随包的轻量库搬过去当底子。
+
+    不搬会出事：用户装完就有十年主连（读的是轻量库），点一次「补近 1 天」会新建
+    一个只有这一天数据的 `tq.duckdb` —— 而读取优先完整库，十年历史于是凭空消失，
+    界面上只剩一根 K 线。
+
+    **不能直接拷文件**：随包的轻量库是不建主键的（带主键 1.2GB，查询还更慢），
+    而写库全靠 `INSERT OR REPLACE`，没有唯一约束直接抛 BinderException。所以这里
+    按 DDL 建一张带主键的空表再灌数据 —— 一次性约 28 秒，只在「第一次往轻量库上
+    补数据」时发生。
+
+    先写 `.seed` 再 `os.replace`：中途被打断时不会留下一个半截的 tq.duckdb 被下次
+    当成正常库打开。
+    """
+    lite = os.path.join(os.path.dirname(full), LITE_NAME)
+    if os.path.exists(full) or not os.path.isfile(lite):
+        return
+    import duckdb
+
+    tmp = full + ".seed"
+    for p in (tmp, tmp + ".wal"):
+        if os.path.exists(p):
+            os.remove(p)
+    con = duckdb.connect(tmp)
+    try:
+        con.execute(f"ATTACH '{lite}' AS lite (READ_ONLY)")
+        have = {
+            r[0] for r in con.execute(
+                "SELECT table_name FROM information_schema.tables"
+                " WHERE table_catalog = 'lite'"
+            ).fetchall()
+        }
+        for ddl in DDL:
+            con.execute(ddl)
+        for t in ("bars", "contract_bars", "switch", "meta"):
+            if t in have:
+                con.execute(f"INSERT INTO {t} SELECT * FROM lite.{t}")
+        con.execute("DETACH lite")
+    finally:
+        con.close()
+    os.replace(tmp, full)
 
 
 @contextmanager
@@ -128,8 +209,10 @@ def connect(read_only: bool = False):
     """
     import duckdb
 
-    p = db_path()
+    p = db_path(read_only=read_only)
     os.makedirs(os.path.dirname(p), exist_ok=True)
+    if not read_only and not os.environ.get("TRENDDESK_TQ_DB"):
+        _seed_full_from_lite(p)
     last = None
     for attempt in range(3 if read_only else 1):
         try:
@@ -466,6 +549,9 @@ def load_contracts(symbol: str, exchange: str, period: str,
         args.append(contract)
     sql += " ORDER BY contract, dt"
     with connect(read_only=True) as con:
+        # 轻量库只带真实合约的日线，分钟级明细要下载完整库才有
+        if not _has_table(con, "contract_bars"):
+            return pd.DataFrame()
         df = con.execute(sql, args).df()
     if not df.empty:
         df["dt"] = pd.to_datetime(df["dt"])
@@ -475,10 +561,19 @@ def load_contracts(symbol: str, exchange: str, period: str,
 # ------------------------------------------------------------------ 统计
 
 
+def _has_table(con, name: str) -> bool:
+    """表在不在。轻量库没有 `contract_bars` 的分钟级明细，不能假定它存在 ——
+    直接查会抛 `CatalogException`，而 `stats()` 是界面首屏要调的。"""
+    r = con.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = ?", [name]
+    ).fetchone()
+    return bool(r and r[0])
+
+
 def stats() -> dict:
     if not exists():
-        return {"exists": False, "path": db_path()}
-    out = {"exists": True, "path": db_path(),
+        return {"exists": False, "path": db_path(), "kind": "none"}
+    out = {"exists": True, "path": db_path(), "kind": source(),
            "size_mb": round(os.path.getsize(db_path()) / 1e6, 1)}
     with connect(read_only=True) as con:
         rows = con.execute(
@@ -491,8 +586,11 @@ def stats() -> dict:
         }
         r = con.execute("SELECT count(*), count(DISTINCT symbol) FROM switch").fetchone()
         out["switch"] = {"rows": int(r[0]), "symbols": int(r[1])}
-        r = con.execute(
-            "SELECT count(*), count(DISTINCT contract) FROM contract_bars"
-        ).fetchone()
-        out["contracts"] = {"rows": int(r[0]), "contracts": int(r[1])}
+        if _has_table(con, "contract_bars"):
+            r = con.execute(
+                "SELECT count(*), count(DISTINCT contract) FROM contract_bars"
+            ).fetchone()
+            out["contracts"] = {"rows": int(r[0]), "contracts": int(r[1])}
+        else:
+            out["contracts"] = {"rows": 0, "contracts": 0}
     return out

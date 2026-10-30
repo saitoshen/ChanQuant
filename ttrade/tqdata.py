@@ -248,7 +248,9 @@ def summary() -> dict:
     """统计天勤数据的覆盖情况，给界面和自检用。"""
     st = tqstore.stats()
     out = {"root": tq_root(), "exists": bool(st.get("exists")), "db": st.get("path"),
-           "size_mb": st.get("size_mb", 0), "periods": {}, "switch_files": 0}
+           "kind": st.get("kind", "none"),
+           "size_mb": st.get("size_mb", 0), "periods": {}, "switch_files": 0,
+           "contracts": st.get("contracts") or {}}
     if not out["exists"]:
         return out
     for p, info in (st.get("periods") or {}).items():

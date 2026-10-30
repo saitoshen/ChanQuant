@@ -387,6 +387,7 @@ class DataPage(QWidget):
         body.addWidget(self._build_form(), 0)
         body.addWidget(self._build_log(), 1)
         outer.addLayout(body, 1)
+        self._sync_db_label()
 
     def _build_form(self) -> QWidget:
         card = QFrame()
@@ -402,6 +403,13 @@ class DataPage(QWidget):
         self.cb_source.addItem("天勤 TqSdk · 日线 / 分钟线", SRC_TQ)
         self.cb_source.currentIndexChanged.connect(self._sync_controls)
         lay.addWidget(self.cb_source)
+
+        # 现在装的是哪个天勤库。轻量库只含主连，用户看不到这句就会以为
+        # 「真实合约」那项下载失败 —— 而它其实是要另外下 8GB 的完整库。
+        self.lbl_db = QLabel("")
+        self.lbl_db.setObjectName("Hint")
+        self.lbl_db.setWordWrap(True)
+        lay.addWidget(self.lbl_db)
 
         # 周期只属于天勤通道：Tushare 那边只有日线，没有可选的。
         # 标题单独存一份：控件藏起来时标题必须跟着藏，否则会留下一行
@@ -616,6 +624,39 @@ class DataPage(QWidget):
 
     def _source(self) -> str:
         return self.cb_source.currentData() or SRC_TUSHARE
+
+    def _sync_db_label(self) -> None:
+        """把「现在读的是哪个天勤库」写到界面上。
+
+        三种状态说清楚，不然用户会以为功能坏了：完整库 11GB 有真实合约的分钟明细；
+        随包轻量库 270MB 只有主连（外加真实合约的日线）；一个都没有时 5m/1h 用不了。
+        """
+        try:
+            from ttrade import tqstore as S
+
+            kind = S.source()
+            if kind == "none":
+                self.lbl_db.setText("天勤库：未安装 —— 5m / 1h 周期不可用")
+                self.lbl_db.setStyleSheet("color: #b45309;")
+                return
+            st = S.stats()
+            mb = float(st.get("size_mb") or 0)
+            size = f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+            if kind == "lite":
+                self.lbl_db.setText(
+                    f"天勤库：随包轻量库 · {size}\n"
+                    "主连 5m / 1h / 日线 + 真实合约日线。要真实合约的 5m/1h 明细，"
+                    "需要另外下载完整库（约 11 GB）。"
+                )
+                self.lbl_db.setStyleSheet("color: #b45309;")
+            else:
+                self.lbl_db.setText(
+                    f"天勤库：完整库 · {size} · 含真实合约 5m / 1h 明细"
+                )
+                self.lbl_db.setStyleSheet("color: #15803d;")
+        except Exception as exc:  # noqa: BLE001
+            self.lbl_db.setText(f"天勤库：读取失败（{type(exc).__name__}: {exc}）")
+            self.lbl_db.setStyleSheet("color: #b91c1c;")
 
     def _sync_controls(self, *_args) -> None:
         """按数据源 + 市场切换可见性。"""
@@ -980,6 +1021,8 @@ class DataPage(QWidget):
         self.btn_update.setText("开始补充")
         self.btn_update.setEnabled(True)
         self.prog_update.setVisible(False)
+        # 这一轮可能刚把轻量库换成完整库（体积、kind 都变了），重读一次
+        self._sync_db_label()
         if self._auto_run:
             self._log(f"—— 定时补充结束：{self._auto_key}")
         self._auto_run = False

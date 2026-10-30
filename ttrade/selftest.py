@@ -138,6 +138,31 @@ def _run() -> tuple[bool, list[str]]:
 
     check("天勤分钟级行情", _tq_data)
 
+    def _tq_source():
+        """轻量库 / 完整库的判定与容错。
+
+        安装包只带约 270MB 的轻量库（主连三周期 + 真实合约日线），完整库 11GB 要
+        用户自己下。判定错了两个方向都出事：下完 11GB 还在读轻量库（等于白下），
+        或者轻量库缺 `contract_bars` 的分钟明细时 `stats()` 直接抛 CatalogException
+        —— 那是数据管理页首屏要调的，抛了整页打不开。
+        """
+        from ttrade import tqstore as S
+
+        kind = S.source()
+        if kind == "none":
+            return "未安装天勤库（可选）"
+        st = S.stats()
+        if st.get("kind") != kind:
+            raise RuntimeError(f"source()={kind} 与 stats().kind={st.get('kind')} 不一致")
+        # 不存在的品种必须返回空表，不能抛（轻量库里 5m 的真实合约根本没有）
+        if len(S.load_contracts("__none__", "__none__", "5m")):
+            raise RuntimeError("load_contracts 对不存在的品种返回了数据")
+        per = "，".join(sorted(st.get("periods") or {}))
+        cb = (st.get("contracts") or {}).get("contracts", 0)
+        return f"{kind} 库 {st.get('size_mb')} MB，周期 {per}，真实合约 {cb} 个"
+
+    check("天勤库类型（完整 / 轻量）", _tq_source)
+
     def _tq_aux():
         """分钟级也要算得出展期因子。
 

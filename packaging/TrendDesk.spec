@@ -48,6 +48,14 @@ for sub in ("data", "data_futures", "data_futures_aux"):
     if os.path.isdir(src):
         DATAS.append((src, sub))
 
+# 天勤轻量库（约 270MB）：主连 5m / 1h / 日线 + 真实合约日线 + 换月表。
+# 完整库 11GB（多出 8.4GB 的真实合约分钟明细）不可能打进包，用户按需下载；
+# 读取侧 `tqstore.db_path()` 优先完整库、没有再退到这个。
+# 文件不存在就不加 —— 没跑过 make_lite_db.py 的本地构建照样能出包，只是没有分钟数据。
+LITE_DB = os.path.join(ROOT, "data_tq", "tq_lite.duckdb")
+if os.path.isfile(LITE_DB):
+    DATAS.append((LITE_DB, "data_tq"))
+
 # xgboost 的原生库是 ctypes 在**运行时**按路径找的（xgboost/libpath.py 里
 # 第一个候选就是 <包目录>/lib），PyInstaller 的静态分析看不到，也不会自动收集。
 # 少了它打包后 `import xgboost` 直接抛 XGBoostLibraryNotFound，界面上模型下拉
