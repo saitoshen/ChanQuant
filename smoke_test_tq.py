@@ -1294,6 +1294,73 @@ def check_costs() -> None:
           costs.describe("CU", "SHFE"))
 
 
+def check_cross() -> None:
+    """截面策略：横截面 Z-score + 多强空弱。
+
+    造一批「强弱恒定」的品种：A 每天涨 0.2%、F 每天跌 0.2%。动量因子在截面上
+    永远把 A 排第一、F 排最后，所以「多 A 空 F」必须赚钱 —— 这条链上任何一环
+    （因子对齐、横截面标准化、排序、权重、成本）错了，收益就会变成 0 或负数。
+    """
+    from ttrade import cross
+    from ttrade.backtest import BacktestConfig as BtConfig
+
+    idx = pd.date_range("2024-01-01", periods=240, freq="B")
+    drifts = [0.002, 0.0012, 0.0004, -0.0004, -0.0012, -0.002]
+    frames = {}
+    for i, d in enumerate(drifts):
+        px = pd.Series(100.0 * (1 + d) ** np.arange(len(idx)), index=idx)
+        frames[f"S{i}_X"] = pd.DataFrame({
+            "open": px, "high": px * 1.002, "low": px * 0.998,
+            "close": px, "volume": 1000.0,
+        })
+
+    cfg = cross.CrossConfig(mode="hedge", rebalance=5, top_pct=10,
+                            factor_mode="multi", factor_keys=["mom_20"])
+    check("截面：一边持几个（10% × 6 个 ≈ 1 个）", cfg.n_legs(6) == 1, str(cfg.n_legs(6)))
+    check("截面：品种不够时至少 1 个", cross.CrossConfig(top_pct=50).n_legs(3) == 1,
+          str(cross.CrossConfig(top_pct=50).n_legs(3)))
+
+    score = cross.score_panel(frames, ["mom_20"])
+    last = score.iloc[-1].dropna()
+    check("截面：分数把最强的排第一", last.idxmax() == "S0_X", str(last.round(2).to_dict()))
+    check("截面：分数把最弱的排最后", last.idxmin() == "S5_X", str(last.round(2).to_dict()))
+    check("截面：横截面 Z-score 均值约 0", abs(float(last.mean())) < 1e-9,
+          str(float(last.mean())))
+
+    res = cross.run(frames, cfg, BtConfig())
+    check("截面：回测能跑出净值", res.ok, res.error)
+    # 净值从「第一个算得出截面的 bar」起步：动量 20 要 20 根预热，前面那段没有
+    # 分数就没有仓位，不该凭空多出 20 个 0 收益的点
+    check("截面：净值长度对得上分数面板", len(res.equity) == len(score),
+          f"{len(res.equity)} vs {len(score)}")
+    check("截面：多强空弱是赚钱的", res.metrics["total_return"] > 0.1,
+          f"{res.metrics['total_return']:.3f}")
+    check("截面：净敞口接近 0",
+          abs(float(res.weights.iloc[-1].sum())) < 1e-9,
+          str(float(res.weights.iloc[-1].sum())))
+
+    # 只做多时不该有空头腿
+    lon = cross.run(frames, cross.CrossConfig(
+        mode="hedge", rebalance=5, top_pct=10, long_only=True,
+        factor_keys=["mom_20"]), BtConfig())
+    check("截面：只做多没有负权重", lon.ok and float(lon.weights.min().min()) >= 0,
+          "" if not lon.ok else str(float(lon.weights.min().min())))
+
+    # 品种不够要报错，不能算出一条假的曲线
+    bad = cross.run({"S0_X": frames["S0_X"], "S1_X": frames["S1_X"]}, cfg, BtConfig())
+    check("截面：品种不足直接报错", not bad.ok and "至少要" in bad.error, bad.error)
+
+    # 选品种 + 时序：先用截面挑最强，再让双均线决定多空
+    sel = cross.run(frames, cross.CrossConfig(
+        mode="select", rebalance=5, top_pct=50, factor_keys=["mom_20"],
+        timing_family="rule", timing_rule_key="ma_cross",
+        timing_rule_params={"fast": 5, "slow": 20}), BtConfig())
+    check("截面选品种+时序：能跑出净值", sel.ok, sel.error)
+    check("截面选品种+时序：只持有选中的品种",
+          float(sel.weights.abs().sum(axis=1).max()) <= 1.0 + 1e-9,
+          str(float(sel.weights.abs().sum(axis=1).max())))
+
+
 def check_strategy_runner() -> None:
     """多策略引擎：平今判断、理论/实际比对、对齐只补托管合约。"""
     from ttrade import strategy_runner as R
@@ -4177,6 +4244,7 @@ def main() -> int:
     check_main_backfill()
     check_strategy_store()
     check_costs()
+    check_cross()
     check_strategy_runner()
     check_day_limit()
     check_topup()
