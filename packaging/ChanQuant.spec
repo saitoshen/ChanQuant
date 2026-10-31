@@ -32,7 +32,7 @@ APP_NAME = "ChanQuant"
 BUNDLE_ID = "com.chanquant.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "1.8.5"
+VERSION = "1.8.6"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
@@ -75,6 +75,13 @@ if os.path.isfile(ICON_PNG):
 SKILLPACKS = os.path.join(ROOT, "ttrade", "skillpacks")
 if os.path.isdir(SKILLPACKS):
     DATAS.append((SKILLPACKS, os.path.join("ttrade", "skillpacks")))
+
+# EDB 指标清单。243 个数字 ID → 中文名 / 品种 / 分类的映射，运行时用
+# `open()` 读，PyInstaller 扫不到。少了它基本面下载直接抛 FileNotFoundError，
+# 而源码运行反而是好的 —— 和技能包是同一类坑。
+EDB_JSON = os.path.join(ROOT, "ttrade", "edb_indicators.json")
+if os.path.isfile(EDB_JSON):
+    DATAS.append((EDB_JSON, "ttrade"))
 
 # 动态导入的模块，静态分析扫不到，必须显式声明
 HIDDEN = [

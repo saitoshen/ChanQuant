@@ -150,12 +150,16 @@ class TqWorker(QObject):
 
     def __init__(self, period: str, days: int,
                  pairs: list[tuple[str, str]] | None = None,
-                 contracts: bool = True) -> None:
+                 contracts: bool = True,
+                 edb: bool = False,
+                 options: bool = False) -> None:
         super().__init__()
         self.period = period
         self.days = int(days or 7300)
         self.pairs = pairs
         self.contracts = contracts
+        self.edb = edb
+        self.options = options
         self._cancel = False
 
     def cancel(self) -> None:
@@ -182,6 +186,49 @@ class TqWorker(QObject):
                 free_mode = not TQ.can_download(api)
                 if free_mode:
                     self.progress.emit(0, 0, "免费账户：改用最近 8000 根 K 线接口")
+
+                # 基本面先跑：只要几秒，而且和 K 线完全独立。放在后面的话，
+                # 用户中途取消（或者 5m 真实合约跑两小时）就白等了
+                n_edb = 0
+                if self.edb:
+                    self.progress.emit(0, 0, "更新基本面（EDB）…")
+                    try:
+                        from ttrade import edb as EDB
+                        n_edb = EDB.update(
+                            api,
+                            progress=lambda a, b, m: self.progress.emit(a, b, m),
+                            cancel=lambda: self._cancel,
+                        )["rows"]
+                    except Exception as exc:  # noqa: BLE001
+                        # 基本面失败不该拖累行情 —— 两件事的数据源都不一样
+                        self.progress.emit(0, 0,
+                                           f"基本面（EDB）失败：{str(exc)[:60]}，继续补行情")
+                if self._cancel:
+                    self.done.emit("已取消（基本面已更新，行情未补）")
+                    return
+
+                # 期权放在行情之前：它自己会反复重建会话，混在补行情中间做
+                # 会把主连那轮的连接状态搅乱
+                n_opt = 0
+                if self.options:
+                    self.progress.emit(0, 0, "更新期权（隐含波动率）…")
+                    try:
+                        from ttrade import optfetch as OPT
+                        if not TQ.can_download(api):
+                            self.progress.emit(
+                                0, 0, "期权需要历史下载权限（tq_dl），已跳过")
+                        else:
+                            o = OPT.update(
+                                sess, periods=(self.period,),
+                                start=OPT.DEFAULT_START,
+                                progress=lambda a, b, m: self.progress.emit(a, b, m),
+                                cancel=lambda: self._cancel,
+                            ).get(self.period, {})
+                            n_opt = int(o.get("rows") or 0)
+                    except Exception as exc:      # noqa: BLE001
+                        self.progress.emit(0, 0,
+                                           f"期权更新失败：{str(exc)[:60]}，继续补行情")
+
                 self.progress.emit(0, 0, "检查主力切换表…")
                 # 补切换表要给每个品种请求几十次合约日线，78 个品种能跑半小时。
                 # 不回调的话进度条会一直停在「检查主力切换表…」，看着像卡死了
@@ -283,6 +330,10 @@ class TqWorker(QObject):
                         "都是完整的，5m 只拿得到每个合约最后约 5.5 个月。")
                 if self.period in ("5m", "15m", "30m"):
                     note += " 展期因子在早期合约上会退回日线口径。"
+            if self.edb and n_edb:
+                note += f"　【基本面】本次写入 {n_edb:,} 行（data_tq/edb.duckdb）"
+            if self.options and n_opt:
+                note += f"　【期权】本次写入 {n_opt:,} 行（data_tq/option.duckdb）"
             self.done.emit(
                 f"天勤 {period_label} {head}：{len(pairs)} 个品种，本次写入 {rows:,} 行{extra}；"
                 f"新补切换表 {n_switch} 个，校正换月日 {moved} 处，刷新复权 {touched} 个品种周期"
@@ -442,6 +493,7 @@ class DataPage(QWidget):
             "不用单独下。日线能追到二十几年，5 分钟最早约 2016 年。"
         )
         lay.addWidget(self.cb_period)
+        self.cb_period.currentIndexChanged.connect(self._sync_opt_label)
 
         # Tushare 通道叫「区间」，天勤通道叫「回溯区间」，同一个位置放一个标题
         lay.addWidget(self._section("区间 / 回溯"))
@@ -475,6 +527,31 @@ class DataPage(QWidget):
             "已经下过的合约会按最后时间增量跳过，重跑不会从头再来。"
         )
         lay.addWidget(self.chk_tq_contracts)
+
+        # 基本面指标（EDB）。和周期无关 —— 现货价 / 仓单 / 库存 / 交割量 / 加工
+        # 利润都是按品种走的，补 5m 的时候顺带刷一遍也只需要几秒，所以放在
+        # 周期选择器外面，任何周期下都能勾。
+        self.chk_tq_edb = QCheckBox("一并更新基本面（EDB：现货价 / 仓单 / 库存 / 交割量 / 利润）")
+        self.chk_tq_edb.setChecked(True)
+        self.chk_tq_edb.setToolTip(
+            "天勤 EDB 的 243 个基本面指标，写 data_tq/edb.duckdb（和行情库分开）。\n\n"
+            "全量约 26 万行、8 MB，第一次 5 秒左右；之后只补最近 30 天的重叠区。\n"
+            "频率不统一：现货价是日频，仓单 / 库存多为周频，交割量按月 —— 只存有值的\n"
+            "日子，要按日对齐在读取时做。"
+        )
+        lay.addWidget(self.chk_tq_edb)
+
+        # 期权。5m 只有中金所三个股指期权（IO/MO/HO）—— 商品期权 5m 十年
+        # 是几百 GB，而 5m 期权的用途只有股指日内，没必要全下。
+        self.chk_tq_options = QCheckBox("一并更新期权（隐含波动率）")
+        self.chk_tq_options.setToolTip(
+            "从天勤下全部期货期权的 K 线，算平值 IV / 偏度 / 曲率 / 看跌看涨比，\n"
+            "写 data_tq/option.duckdb（和行情库分开），并导出\n"
+            "data_tq/option_iv/tq_iv_<周期>.csv。\n\n"
+            "口径与 Tushare 那条不同：天勤只有收盘价、没有结算价，两套 IV 不能混用。\n"
+            "第一次全量要几小时；已经下完的合约按到期日自动跳过，重跑是续传。"
+        )
+        lay.addWidget(self.chk_tq_options)
 
         self.cb_upd_source = QComboBox()
         for key, label in updater.SOURCE_LABELS.items():
@@ -709,6 +786,20 @@ class DataPage(QWidget):
             self.lbl_db.setText(f"天勤库：读取失败（{type(exc).__name__}: {exc}）")
             self.lbl_db.setStyleSheet("color: #b91c1c;")
 
+    def _sync_opt_label(self) -> None:
+        """5m 的期权只有中金所三个股指期权，标签上直接写明。
+
+        不写的话用户会以为「勾了就等于全品种 5m 期权」，跑完发现只有 IO/MO/HO
+        会以为程序漏下了。
+        """
+        if not hasattr(self, "chk_tq_options"):
+            return
+        p = self.cb_period.currentData() if hasattr(self, "cb_period") else "1d"
+        if p == "5m":
+            self.chk_tq_options.setText("一并更新期权（隐含波动率）—— 5m 只有中金所 IO / MO / HO")
+        else:
+            self.chk_tq_options.setText("一并更新期权（隐含波动率）")
+
     def _sync_controls(self, *_args) -> None:
         """按数据源 + 市场切换可见性。"""
         if not hasattr(self, "cb_upd_range"):
@@ -735,6 +826,9 @@ class DataPage(QWidget):
         self.cb_upd_range.setVisible(not tq)
         self.cb_tq_range.setVisible(tq)
         self.chk_tq_contracts.setVisible(tq)
+        self.chk_tq_edb.setVisible(tq)
+        self.chk_tq_options.setVisible(tq)
+        self._sync_opt_label()
         self.cb_upd_source.setVisible(not tq and is_us)
         self.cb_upd_rate.setVisible(not tq and is_us)
         self.lbl_upd_src.setVisible(not tq and not is_us)
@@ -1057,7 +1151,10 @@ class DataPage(QWidget):
         period = self.cb_period.currentData() or "1h"
         days = int(self.cb_tq_range.currentData() or 7300)
         contracts = self.chk_tq_contracts.isChecked()
-        self._tq_worker = TqWorker(period, days, contracts=contracts)
+        edb = self.chk_tq_edb.isChecked()
+        options = self.chk_tq_options.isChecked()
+        self._tq_worker = TqWorker(period, days, contracts=contracts,
+                                   edb=edb, options=options)
         self._tq_thread = QThread(self)
         self._tq_worker.moveToThread(self._tq_thread)
         self._tq_thread.started.connect(self._tq_worker.run)

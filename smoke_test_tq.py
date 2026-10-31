@@ -1025,6 +1025,200 @@ def check_free_account() -> None:
           str(r.get("status")))
 
 
+def check_edb() -> None:
+    """EDB 基本面：指标清单、宽表转长表、增量起点、读写往返。
+
+    全部离线 —— 用假 api 和临时库，`TRENDDESK_EDB_DB` 指向 tempfile。
+    """
+    from ttrade import edb as E
+
+    ind = E.load_indicators()
+    check("EDB：指标清单 243 个", len(ind) == 243, f"{len(ind)} 个")
+    check("EDB：品种从键里取并归一化小写",
+          ind[6980]["variety"] == "oi" and ind[6980]["variety_raw"] == "OI",
+          str(ind.get(6980)))
+    check("EDB：分类齐全",
+          {m["category"] for m in ind.values()} ==
+          {"spot_price", "warehouse", "inventory", "delivery", "profit"},
+          str({m["category"] for m in ind.values()}))
+
+    # 日期归一化：天勤给的是字符串，也可能是 Timestamp / date
+    check("EDB：字符串日期能转", E._to_date("2026-09-04") == date(2026, 9, 4), "")
+    check("EDB：斜杠日期能转", E._to_date("2026/09/04") == date(2026, 9, 4), "")
+    check("EDB：Timestamp 能转",
+          E._to_date(pd.Timestamp("2026-09-04 00:00")) == date(2026, 9, 4), "")
+
+    class _Api:
+        """假接口：每个 ID 三行，index 是**字符串**（和真实返回一致）。"""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[list[int], date, date]] = []
+
+        def query_edb_data(self, ids, start_dt, end_dt):
+            self.calls.append((list(ids), start_dt, end_dt))
+            idx = ["2026-09-01", "2026-09-08", "2026-09-15"]
+            data = {str(i): [1.0, 2.0, 3.0] for i in ids}
+            data["999999"] = [9.0, 9.0, 9.0]      # 没要的 ID，必须被丢掉
+            return pd.DataFrame(data, index=idx)
+
+    tmp = os.path.join(tempfile.mkdtemp(prefix="edb_"), "edb.duckdb")
+    old = os.environ.get("TRENDDESK_EDB_DB")
+    os.environ["TRENDDESK_EDB_DB"] = tmp
+    try:
+        api = _Api()
+        st = E.update(api, start=date(2020, 1, 1), end=date(2026, 10, 1))
+        check("EDB：全量写入", st["rows"] == 243 * 3 and st["failed"] == 0, str(st))
+        check("EDB：全量起点是 start", api.calls[0][1] == date(2020, 1, 1),
+              str(api.calls[0][1]))
+
+        wide = E.load(ids=[6980])
+        check("EDB：宽表按 dt 排序、列是 ID",
+              list(wide.columns) == [6980] and len(wide) == 3,
+              f"{list(wide.columns)} {wide.shape}")
+        check("EDB：数值往返正确", float(wide.iloc[-1, 0]) == 3.0, str(wide.iloc[-1, 0]))
+
+        long = E.load(ids=[6980], wide=False)
+        check("EDB：长表三列", list(long.columns) == ["edb_id", "dt", "value"],
+              str(list(long.columns)))
+
+        m = E.meta()
+        check("EDB：meta 带中文分类",
+              "现货价" in set(m["category_label"]), str(set(m["category_label"])))
+        check("EDB：按品种取得到指标", len(m[m["variety"] == "rb"]) > 0, "")
+        check("EDB：varieties 是小写", "rb" in E.varieties() and "RB" not in E.varieties(),
+              str(E.varieties()[:5]))
+
+        # 增量：起点应该是「库里最早的那个最后一天 - 30 天」
+        api2 = _Api()
+        E.update(api2, start=date(2020, 1, 1), end=date(2026, 10, 1))
+        check("EDB：增量起点回看 30 天",
+              api2.calls[0][1] == date(2026, 9, 15) - pd.Timedelta(days=30).to_pytimedelta(),
+              str(api2.calls[0][1]))
+
+        s2 = E.stats()
+        check("EDB：重复写不涨行数", s2["rows"] == 243 * 3, str(s2["rows"]))
+        check("EDB：库体积合理", s2["size_mb"] < 20, f"{s2['size_mb']} MB")
+    finally:
+        if old is None:
+            os.environ.pop("TRENDDESK_EDB_DB", None)
+        else:
+            os.environ["TRENDDESK_EDB_DB"] = old
+
+
+def check_options() -> None:
+    """期权：代码解析、独立库、IV 计算。全部离线（假 api + 临时库）。"""
+    from ttrade import optfetch as OF
+    from ttrade import optstore as OPS
+
+    # 六种代码写法都要拆得对。横线式和紧凑式混用，只按 `-C-` 切会漏掉一半
+    cases = {
+        "DCE.l2607-P-7900": ("DCE.l2607", ("P", 7900.0), "l"),
+        "SHFE.br2407P16600": ("SHFE.br2407", ("P", 16600.0), "br"),
+        "CZCE.RM603C2100": ("CZCE.RM603", ("C", 2100.0), "RM"),
+        "CFFEX.IO2410-C-2800": ("CFFEX.IO2410", ("C", 2800.0), "IO"),
+        "GFEX.pd2702-P-232": ("GFEX.pd2702", ("P", 232.0), "pd"),
+        "INE.sc2311P670": ("INE.sc2311", ("P", 670.0), "sc"),
+    }
+    for c, (chain, pc, var) in cases.items():
+        check(f"期权：{c} 拆链", OF.chain_of(c) == chain, OF.chain_of(c))
+        check(f"期权：{c} 拆行权价", OF.parse_contract(c) == pc, str(OF.parse_contract(c)))
+        check(f"期权：{c} 拆品种", OF.variety_of(c) == var, OF.variety_of(c))
+
+    check("期权：5m 只做中金所三个",
+          OF._plan({"CFFEX.IO2401": ["CFFEX.IO2401-C-3000"]}, "5m", None) != {}
+          and OF._plan({"DCE.m2401": ["DCE.m2401-C-3000"]}, "5m", None) == {},
+          "5m 的品种过滤没生效")
+    check("期权：1d 不过滤品种",
+          OF._plan({"DCE.m2401": ["DCE.m2401-C-3000"]}, "1d", None) != {}, "")
+    check("期权：下载起点抬到到期前 400 天",
+          OF._chain_start(date(2016, 1, 1), date(2024, 6, 1)) == date(2023, 4, 28),
+          str(OF._chain_start(date(2016, 1, 1), date(2024, 6, 1))))
+    check("期权：起点不早于全局起点",
+          OF._chain_start(date(2024, 1, 1), date(2024, 6, 1)) == date(2024, 1, 1), "")
+
+    # 宽表 CSV → 长表
+    tmp = os.path.join(tempfile.mkdtemp(prefix="opt_"), "b.csv")
+    pd.DataFrame({
+        "datetime": ["2024-01-02 00:00:00", "2024-01-03 00:00:00"],
+        "datetime_nano": [1, 2],
+        "DCE.m2405.close": [10.0, 12.0],
+        "DCE.m2405.open": [9.0, 10.5],
+        "DCE.m2405.high": [11.0, 13.0],
+        "DCE.m2405.low": [8.5, 10.0],
+        "DCE.m2405.volume": [5, 6],
+        "DCE.m2405.open_oi": [100, 110],
+        "DCE.m2405.close_oi": [110, 120],
+        "DCE.m2405-C-3000.close": [float("nan"), 7.0],
+    }).to_csv(tmp, index=False)
+    long = OF._read_csv(tmp, ["DCE.m2405", "DCE.m2405-C-3000"], "1d")
+    check("期权：宽表转长表只留有效行", len(long) == 3, f"{len(long)} 行")
+    check("期权：长表列齐全", list(long.columns) == OPS.BAR_COLS, str(list(long.columns)))
+
+    old = os.environ.get("TRENDDESK_OPT_DB")
+    db = os.path.join(tempfile.mkdtemp(prefix="optdb_"), "o.duckdb")
+    os.environ["TRENDDESK_OPT_DB"] = db
+    try:
+        with OPS.connect() as con:
+            OPS.upsert_meta(con, pd.DataFrame([{
+                "contract": "DCE.m2405-C-3000", "variety": "m", "exchange": "DCE",
+                "opt_class": "C", "strike": 3000.0,
+                "expiry": date(2024, 5, 10), "underlying": "DCE.m2405"}]))
+            OPS.upsert_bars(con, pd.DataFrame([{
+                "contract": "DCE.m2405-C-3000", "period": "1d",
+                "dt": "2024-01-02", "open": 1.0, "high": 2.0, "low": 0.5,
+                "close": 1.5, "volume": 3, "open_oi": 10, "close_oi": 12}]))
+        check("期权：写进去读得出来",
+              len(OPS.load_bars(["DCE.m2405-C-3000"], "1d")) == 1, "")
+        check("期权：meta 有品种", OPS.varieties() == ["m"], str(OPS.varieties()))
+        check("期权：按链分组",
+              list(OPS.chains().keys()) == ["DCE.m2405"], str(OPS.chains().keys()))
+        st = OPS.stats()
+        check("期权：stats 数得对", st["contracts"] == 1 and st["bars"].get("1d") == 1,
+              str(st))
+        # 重复写不涨行数（主键冲突覆盖）
+        with OPS.connect() as con:
+            OPS.upsert_bars(con, pd.DataFrame([{
+                "contract": "DCE.m2405-C-3000", "period": "1d",
+                "dt": "2024-01-02", "open": 1.0, "high": 2.0, "low": 0.5,
+                "close": 1.5, "volume": 3, "open_oi": 10, "close_oi": 12}]))
+        check("期权：重复写不涨行数", OPS.stats()["bars"].get("1d") == 1,
+              str(OPS.stats()["bars"]))
+
+        # IV：造一条链，标的 3000、行权价铺开，看能不能解出平值
+        with OPS.connect() as con:
+            rows = []
+            for k in (2700, 2800, 2900, 3000, 3100, 3200, 3300):
+                for cp in ("C", "P"):
+                    rows.append({"contract": f"DCE.m2405-{cp}-{k}", "period": "1d",
+                                 "dt": "2024-01-02", "open": 1.0, "high": 2.0,
+                                 "low": 0.5, "close": 30.0, "volume": 1,
+                                 "open_oi": 100, "close_oi": 100})
+            OPS.upsert_bars(con, pd.DataFrame(rows))
+            OPS.upsert_meta(con, pd.DataFrame([{
+                "contract": f"DCE.m2405-{cp}-{k}", "variety": "m", "exchange": "DCE",
+                "opt_class": cp, "strike": float(k),
+                "expiry": date(2024, 5, 10), "underlying": "DCE.m2405"}
+                for k in (2700, 2800, 2900, 3000, 3100, 3200, 3300)
+                for cp in ("C", "P")]))
+            OPS.upsert_underlying(con, pd.DataFrame([{
+                "contract": "DCE.m2405", "period": "1d",
+                "dt": "2024-01-02", "close": 3000.0}]))
+        iv = OF.compute_iv("m", "1d")
+        check("期权：能算出 IV", len(iv) == 1 and pd.notna(iv["iv_near"].iloc[0]),
+              str(iv.to_dict("records")[:1]))
+        if len(iv):
+            check("期权：IV 落在合理区间",
+                  0.01 < float(iv["iv_near"].iloc[0]) < 3.0,
+                  str(iv["iv_near"].iloc[0]))
+            check("期权：剩余天数对得上", int(iv["dte_near"].iloc[0]) == 129,
+                  str(iv["dte_near"].iloc[0]))
+    finally:
+        if old is None:
+            os.environ.pop("TRENDDESK_OPT_DB", None)
+        else:
+            os.environ["TRENDDESK_OPT_DB"] = old
+
+
 def check_factor_refresh() -> None:
     """复权因子是派生数据：换月点要跟序列对齐，因子要按切换表重算。
 
@@ -5089,6 +5283,8 @@ def main() -> int:
     check_new_factors()
     check_contract_incremental()
     check_free_account()
+    check_edb()
+    check_options()
     check_live_helpers()
     check_live_worker()
     check_cli_entry()
