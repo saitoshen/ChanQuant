@@ -507,6 +507,84 @@ def _task_error(task) -> str:
 _IDLE_SEC = 60        # 单次 wait_update 最多等多久
 _STALL_SEC = 180      # 这么长时间一个合约都没落地，判定这批已死
 
+# 免费版 `get_kline_serial` 能拿到的最新 K 线根数。天勤的服务端按账户等级给
+# 历史深度，8000 是免费档的实测值；再往上要 `tq_dl`（专业版）。
+RECENT_BARS = 8000
+
+
+def can_download(api) -> bool:
+    """这个账户能不能用 `DataDownloader`（历史数据下载）。
+
+    `tq_dl` 是**专业版**功能位。免费账户建 `DataDownloader` 会直接抛
+    「您的账户不支持下载历史数据功能，需要购买后才能使用」。
+
+    关键：**和日期区间无关**。哪怕只补一天，只要走的是下载接口就会被拦下来 ——
+    这条很容易被误判成「请求的时间太长」。
+
+    读不到功能位时按「能下」处理：SDK 以后改内部结构是它的事，不该让我们
+    悄悄降级成只能补最近一段。
+    """
+    checker = getattr(getattr(api, "_auth", None), "_has_feature", None)
+    if checker is None:
+        return True
+    try:
+        return bool(checker("tq_dl"))
+    except Exception:      # noqa: BLE001
+        return True
+
+
+def fetch_recent(api, tq_symbol: str, period: str,
+                 data_length: int = RECENT_BARS) -> pd.DataFrame:
+    """用 `get_kline_serial` 取最近 N 根 K 线，返回和下载路径同形的表。
+
+    免费账户没有下载权限，但 `get_kline_serial` 不受限 —— 能拿到最新的一段
+    （日线够几十年，1h 大约五年，5m 大约半年）。这是「补不上十年、但今天这根
+    一定补得上」的那条路。
+
+    列名对齐 `_read_downloaded`：`dt` + OHLCV + 持仓量，`dt` 是北京时间 naive。
+    """
+    sec = PERIOD_SEC.get(period)
+    if sec is None:
+        return pd.DataFrame()
+    kl = api.get_kline_serial(tq_symbol, sec, data_length=int(data_length))
+    if kl is None or len(kl) == 0:
+        return pd.DataFrame()
+    out = pd.DataFrame({"dt": local_time(kl["datetime"])})
+    for col in ("open", "high", "low", "close", "volume", "open_oi", "close_oi"):
+        if col in kl.columns:
+            out[col] = pd.to_numeric(kl[col], errors="coerce").to_numpy()
+    if "close" not in out.columns:
+        return pd.DataFrame()
+    # 数据不够时天勤会在前面用 NaN 补齐，整行丢掉 —— 和下载路径口径一致
+    out = out.dropna(subset=["close"])
+    return out.sort_values("dt").drop_duplicates("dt", keep="last").reset_index(drop=True)
+
+
+def fetch_recent_many(api, jobs, period: str,
+                      errors: dict[str, str] | None = None) -> dict[str, pd.DataFrame]:
+    """`download_many` 的免费版替身：逐个 `get_kline_serial`。
+
+    不并发：这个接口内部自己等数据就绪，挂 8 个上去只会互相拖慢，它也没有
+    `DataDownloader` 那种「建任务 + wait_update 推进」的模型。日线 78 个品种
+    几十秒，比下载慢一点但能跑完。
+
+    `jobs` 里的起止日期只用来**裁剪**结果：免费接口只有「最近 N 根」这一种取法，
+    拿回来再按区间过滤，免得「补近 1 天」写成 2628 行让用户以为重下了十年。
+    空结果不算失败（已摘牌的合约本来就取不到），真异常才记进 `errors`。
+    """
+    out: dict[str, pd.DataFrame] = {}
+    for tq_sym, start, _end in jobs:
+        try:
+            df = fetch_recent(api, tq_sym, period)
+            if not df.empty and start is not None:
+                df = df[df["dt"] >= pd.Timestamp(start)]
+            out[tq_sym] = df
+        except Exception as exc:      # noqa: BLE001
+            if errors is not None:
+                errors.setdefault(tq_sym, f"{type(exc).__name__}: {exc}")
+            out[tq_sym] = pd.DataFrame()
+    return out
+
 
 def download_many(api, jobs: list[tuple[str, date, date]], period: str,
                   out_dir: str, tag: str = "", max_parallel: int = 8,
@@ -531,6 +609,12 @@ def download_many(api, jobs: list[tuple[str, date, date]], period: str,
     一行不出）。所以每拍都带 deadline，且 `_STALL_SEC` 内一个合约都没落地就把
     剩下的全部记成「等待超时」退出，交给调用方重试。
     """
+    if not can_download(api):
+        # 免费账户：没有 `tq_dl` 功能位，建 DataDownloader 会直接抛异常。
+        # 退到 `get_kline_serial` —— 只能拿最近一段，但今天这根一定拿得到。
+        # 这个分支放在 import 之前：免费路径根本不需要 DataDownloader。
+        return fetch_recent_many(api, jobs, period, errors)
+
     from tqsdk.tools import DataDownloader
 
     out: dict[str, pd.DataFrame] = {}
@@ -723,6 +807,14 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int,
     end = date.today()
     start = window_start(years, days)
 
+    if not can_download(api):
+        # 真实合约是「每个合约单独下一段历史」，免费版拿不到 —— 已摘牌的合约
+        # 用 `get_kline_serial` 只能取到空表。这里明说，别让调用方把 0 当成
+        # 「这些合约本来就没数据」。
+        return {"key": key, "period": period, "rows": 0, "contracts": 0,
+                "skipped": 0, "old": 0, "blank": 0, "failed": 0, "cancelled": False,
+                "status": "免费账户没有历史下载权限，真实合约补不了"}
+
     try:
         conts = _query_contracts(api, sym, ex)
     except Exception as exc:
@@ -839,6 +931,8 @@ def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
     period = source_period(period)
     end = date.today()
     hard_start = window_start(years, days)
+    # 免费账户只能取最近一段，补历史缺口那段会拿到同一批数据、白跑一倍请求
+    free_mode = not can_download(api)
 
     tail: list[tuple[str, date, date, str, str]] = []
     head: list[tuple[str, date, date, str, str]] = []
@@ -853,11 +947,16 @@ def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
             tail.append((tq, hard_start, end, sym, ex))
             continue
         # 尾段：往前推 3 天重叠，覆盖「上次下到一半」和节假日边界；主键冲突会覆盖
-        tail.append((tq, max(hard_start, (last - timedelta(days=3)).date()), end, sym, ex))
+        tail_start = max(hard_start, (last - timedelta(days=3)).date())
+        if free_mode:
+            # 免费路径一次就能拿 8000 根，多取不花钱：从库里最后一根接着补。
+            # 不然「近 1 天」只会写最近两天，中间断了几个月的那段空洞永远补不上。
+            tail_start = (last - timedelta(days=3)).date()
+        tail.append((tq, tail_start, end, sym, ex))
         # 头段：库里最早那根比回溯区间晚，说明前面那段从来没下过。早期版本用两年
         # 窗口跑过一轮，之后增量只看 last_dt，于是那几年永远补不上 —— RB 的 1h
         # 就这样停在 2024-10，每次日志还显示「+14 行」像正常增量。
-        if first is not None:
+        if first is not None and not free_mode:
             head_end = (first - timedelta(days=1)).date()
             if head_end > hard_start + timedelta(days=1):
                 head.append((tq, hard_start, head_end, sym, ex))

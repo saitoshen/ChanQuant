@@ -954,6 +954,64 @@ def check_contract_incremental() -> None:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def check_free_account() -> None:
+    """免费账户：不能碰 `DataDownloader`，要走 `get_kline_serial`。
+
+    真实反馈（2026-10-31）：点「天勤补齐 日线（近 1 天）」直接报
+    「您的账户不支持下载历史数据功能，需要购买后才能使用」。**这不是「回溯
+    设得太长」** —— `tq_dl` 是专业版功能位，只补一天也一样被拦。
+    """
+    from ttrade import tqfetch as D
+
+    class _FreeApi:
+        class _auth:
+            @staticmethod
+            def _has_feature(name: str) -> bool:
+                return name != "tq_dl"
+
+        def __init__(self) -> None:
+            self.asked: list[int] = []
+
+        def get_kline_serial(self, symbol, dur, data_length=200):
+            self.asked.append(int(data_length))
+            # 天勤返回的是 **UTC 纳秒**，照真实格式造，`local_time` 才转得对。
+            # 注意 pandas 2.x 的 DatetimeIndex 可能是 us 精度，`asi8` 给的不是
+            # 纳秒 —— 先显式落到 ns，否则会造出一批 1970 年的时间戳。
+            end = pd.Timestamp("2026-10-30 15:00", tz="Asia/Shanghai")
+            idx = pd.date_range(end=end, periods=5, freq="D", tz="Asia/Shanghai")
+            utc = idx.tz_convert("UTC").tz_localize(None).astype("datetime64[ns]")
+            return pd.DataFrame({
+                "datetime": utc.asi8,
+                "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5,
+                "volume": 10, "open_oi": 5, "close_oi": 6,
+            })
+
+    class _PaidApi(_FreeApi):
+        class _auth:
+            @staticmethod
+            def _has_feature(name: str) -> bool:
+                return True
+
+    api = _FreeApi()
+    check("免费账户：识别出没有下载权限", D.can_download(api) is False, "被当成能下载了")
+    check("专业账户：识别出能下载", D.can_download(_PaidApi()) is True, "被当成免费了")
+
+    df = D.fetch_recent(api, "KQ.m@SHFE.rb", "1d")
+    check("免费账户：能取到 K 线", len(df) == 5 and "close" in df.columns, f"{len(df)} 行")
+    check("免费账户：时间转成本地 naive", df["dt"].dt.tz is None, str(df["dt"].dtype))
+    check("免费账户：最后一根是北京时间当天 15:00",
+          df["dt"].iloc[-1] == pd.Timestamp("2026-10-30 15:00"), str(df["dt"].iloc[-1]))
+
+    # 起止日期只用来裁剪：免费接口只有「最近 N 根」这一种取法
+    jobs = [("KQ.m@SHFE.rb", date(2026, 10, 30), date(2026, 10, 31))]
+    got = D.download_many(api, jobs, "1d", "", "T")
+    check("免费账户：download_many 自动走免费路径",
+          len(got) == 1 and len(got["KQ.m@SHFE.rb"]) == 1,
+          str({k: len(v) for k, v in got.items()}))
+    check("免费账户：请求根数不超过上限", api.asked and max(api.asked) <= D.RECENT_BARS,
+          str(api.asked))
+
+
 def check_factor_refresh() -> None:
     """复权因子是派生数据：换月点要跟序列对齐，因子要按切换表重算。
 
@@ -5017,6 +5075,7 @@ def main() -> int:
     check_tq_curve()
     check_new_factors()
     check_contract_incremental()
+    check_free_account()
     check_live_helpers()
     check_live_worker()
     check_cli_entry()

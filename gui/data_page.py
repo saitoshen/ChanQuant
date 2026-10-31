@@ -176,6 +176,12 @@ class TqWorker(QObject):
             sess = TQ.Session()
             try:
                 api = sess.get()
+                # 免费账户没有 `tq_dl`（历史数据下载）功能位，建 DataDownloader 会
+                # 直接抛「您的账户不支持下载历史数据功能」。这跟请求的时间区间无关 ——
+                # 只补一天也一样被拦，很容易被误判成「回溯设得太长」。
+                free_mode = not TQ.can_download(api)
+                if free_mode:
+                    self.progress.emit(0, 0, "免费账户：改用最近 8000 根 K 线接口")
                 self.progress.emit(0, 0, "检查主力切换表…")
                 # 补切换表要给每个品种请求几十次合约日线，78 个品种能跑半小时。
                 # 不回调的话进度条会一直停在「检查主力切换表…」，看着像卡死了
@@ -208,7 +214,7 @@ class TqWorker(QObject):
                 n_contracts = 0
                 bad: list[str] = []
                 dead = 0
-                if self.contracts and not self._cancel:
+                if self.contracts and not self._cancel and not free_mode:
                     for i, (sym, ex) in enumerate(pairs, 1):
                         if self._cancel:
                             break
@@ -269,9 +275,14 @@ class TqWorker(QObject):
                 if bad:
                     shown = "、".join(bad[:4]) + ("…" if len(bad) > 4 else "")
                     extra += f"；{len(bad)} 个品种有合约没下全（{shown}），再点一次会续传"
+            note = ""
+            if free_mode:
+                note = ("　【免费账户】只能取最近 8000 根 K 线：主连补得上最近一段，"
+                        "真实合约与十年历史补不了。")
             self.done.emit(
                 f"天勤 {period_label} {head}：{len(pairs)} 个品种，本次写入 {rows:,} 行{extra}；"
                 f"新补切换表 {n_switch} 个，校正换月日 {moved} 处，刷新复权 {touched} 个品种周期"
+                + note
             )
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"{type(exc).__name__}: {exc}")
