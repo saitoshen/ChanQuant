@@ -894,6 +894,9 @@ class MainWindow(QMainWindow):
         self.trade_page = TradePage(self.live)
         self.pages.addWidget(self.trade_page)
         self.portfolio_page = PortfolioPage(loader=self._load_bars)
+        # 组合页就地补完数据之后，主窗口这份 DataStore 的缓存就过期了 ——
+        # 不重建的话，那边补了、这边画出来的还是补之前那份
+        self.portfolio_page.data_updated.connect(self._on_data_updated)
         self.pages.addWidget(self.portfolio_page)
         self.agent_page = AgentPage()
         # 行情库递进去：Agent 要能查 K 线、算因子值、列品种。传两个市场的
@@ -2426,7 +2429,15 @@ class MainWindow(QMainWindow):
         # 让 Agent 那边知道用户现在看的是哪个合约，省得它再问一遍
         self._publish(note, True)
 
-    def _reload_store(self, market: str) -> None:
+    def _on_data_updated(self) -> None:
+        """组合页补完数据：重建这一市场的 DataStore 并重算当前这张图。
+
+        `rerun=True` 是**故意绕过**「改参数自动回测」那个偏好的：数据刚补进来，
+        图上还是补之前那一段，不重算就是「补了跟没补一样」。
+        """
+        self._reload_store(self.market, rerun=True)
+
+    def _reload_store(self, market: str, rerun: bool = False) -> None:
         """重建该市场的 DataStore（清掉 DataFrame 缓存），保留当前选中的标的。"""
         self.stores[market] = DataStore(market)
         for i in range(self.cb_market.count()):
@@ -2445,7 +2456,10 @@ class MainWindow(QMainWindow):
             self.cb_symbol.blockSignals(True)
             self.cb_symbol.setCurrentIndex(idx)
             self.cb_symbol.blockSignals(False)
-        self._schedule(immediate=True)
+        if rerun:
+            self.run_analysis()
+        else:
+            self._schedule(immediate=True)
 
     def _on_strategy_changed(self) -> None:
         key = self.cb_strategy.currentData()

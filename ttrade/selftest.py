@@ -1122,6 +1122,8 @@ def _run() -> tuple[bool, list[str]]:
                 and pv.table.columnCount() == 2
                 and pv.res is not None
                 and "组合（2 条策略）" in text
+                # 「补数据」按钮：期权 / 展期数据过期时，这一页要能就地补
+                and hasattr(win.portfolio_page, "btn_data")
             )
             combo_info = (f"{tabs.count()} 页 / {pv.table.columnCount()} 列"
                           if tabs is not None else "未建出视图")

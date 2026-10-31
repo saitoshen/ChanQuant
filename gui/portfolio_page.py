@@ -131,6 +131,50 @@ def _int(v) -> int:
 # ------------------------------------------------------------------ 线程层
 
 
+class DataWorker(QObject):
+    """在后台补一次行情：主力连续日线 + 展期 / 期权衍生数据。
+
+    为什么不复用数据管理页那个 worker：那一页带一整套市场、周期、范围的下拉，
+    这里要的只是「把这一页用到的数据补到最新」，参数写死近一年就够 —— 两个
+    函数都只补本地缺的部分，多给日期不会重复请求。
+
+    跑在独立线程里是因为一次可能要几分钟：Tushare 限速 + 期权那张表要逐日
+    遍历。放在主线程里，整个窗口会「未响应」，用户以为死机。
+    """
+
+    log = Signal(str)
+    done = Signal(bool, str)           # (成功?, 一句话)
+
+    def __init__(self, range_key: str = "1y") -> None:
+        super().__init__()
+        self.range_key = range_key
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        from ttrade import updater
+
+        cb = lambda d, t, m: self.log.emit(f"[{d}/{t}] {m}")   # noqa: E731
+        try:
+            res = updater.update_futures(
+                None, self.range_key, progress=cb, cancel=lambda: self._cancel
+            )
+            self.log.emit(f"日线：{res.summary()}")
+            aux = updater.update_aux(
+                range_key=self.range_key, want_contracts=True, want_options=True,
+                progress=cb, cancel=lambda: self._cancel,
+            )
+            n = int(getattr(aux, "days", 0) or 0)
+            self.log.emit(f"衍生数据（展期 / 期权）：补了 {n} 个交易日" if n
+                          else "衍生数据（展期 / 期权）：已是最新")
+        except Exception as exc:       # noqa: BLE001
+            self.done.emit(False, f"{type(exc).__name__}: {exc}")
+            return
+        self.done.emit(True, "补数据完成")
+
+
 class RunnerWorker(QObject):
     """跑在天勤线程里：一条连接 + 一组策略。"""
 
@@ -547,6 +591,9 @@ class EditDialog(QDialog):
 class PortfolioPage(QWidget):
     """策略交易和组合。"""
 
+    # 补完数据要让主窗口把 DataStore 的缓存丢掉，否则这一页还在用补之前那份
+    data_updated = Signal()
+
     def __init__(self, loader=None, parent=None) -> None:
         super().__init__(parent)
         # loader(market, key, period) -> DataFrame | None。主窗口把它的 DataStore
@@ -571,6 +618,10 @@ class PortfolioPage(QWidget):
         self._live_timer = QTimer(self)
         self._live_timer.setInterval(5000)
         self._live_timer.timeout.connect(self._poll_live)
+        # 补数据的后台线程。同时只允许一个 —— 两个 update_aux 并发写同一批
+        # CSV 会互相覆盖
+        self._data_thread: QThread | None = None
+        self._data_worker = None
         self._views: dict[str, tuple[QTabWidget, ResultView]] = {}
         self.ctl = PortfolioController(self)
         self._build()
@@ -753,6 +804,17 @@ class PortfolioPage(QWidget):
         btn_lib.setObjectName("Ghost")
         btn_lib.clicked.connect(self._add_from_library)
         head.addWidget(btn_lib)
+
+        # 这一页的策略要用到展期 / 期权因子时，本地快照过期了信号就是死的。
+        # 数据管理页也能补，但那要切页、还要把市场周期对一遍 —— 就地补一次更顺
+        self.btn_data = QPushButton("补数据")
+        self.btn_data.setObjectName("Ghost")
+        self.btn_data.setToolTip(
+            "补期货主力日线 + 展期 / 期权衍生数据（近一年，只补本地缺的部分）。\n"
+            "衍生数据是期权 IV、期限结构那些因子的来源；几天没开程序，它们就停在几天前。"
+        )
+        self.btn_data.clicked.connect(self._supplement_data)
+        head.addWidget(self.btn_data)
 
         btn_edit = QPushButton("设置参数")
         btn_edit.setObjectName("Ghost")
@@ -1648,6 +1710,41 @@ class PortfolioPage(QWidget):
         self.lbl_msg.setText(msg)
         self.lbl_msg.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
 
+    # ---------------------------------------------------------- 补数据
+    def _supplement_data(self) -> None:
+        """就地补一次行情，进度写在这一页的日志条上。"""
+        if self._data_thread is not None:
+            self._on_log("补数据还在跑，等它跑完")
+            return
+        if QMessageBox.question(
+                self, "补数据",
+                "补期货主力日线 + 展期 / 期权衍生数据（近一年）。\n"
+                "只补本地缺的部分，可能要几十秒到几分钟。继续？",
+        ) != QMessageBox.Yes:
+            return
+        self.btn_data.setEnabled(False)
+        self._on_log("开始补数据…")
+        thread = QThread(self)
+        worker = DataWorker("1y")
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.log.connect(self._on_log)
+        worker.done.connect(self._on_data_done)
+        self._data_thread, self._data_worker = thread, worker
+        thread.start()
+
+    def _on_data_done(self, ok: bool, msg: str) -> None:
+        self._on_log(("✓ " if ok else "✗ ") + msg)
+        thread, worker = self._data_thread, self._data_worker
+        self._data_thread, self._data_worker = None, None
+        if thread is not None:
+            thread.quit()
+            thread.wait(3000)
+        self.btn_data.setEnabled(True)
+        if ok:
+            # 主窗口要把 DataStore 缓存丢掉 —— 否则这一页还在画补之前那份
+            self.data_updated.emit()
+
     def _on_failed(self, msg: str) -> None:
         self.lbl_msg.setText(msg)
         self.lbl_msg.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
@@ -1657,3 +1754,9 @@ class PortfolioPage(QWidget):
     def shutdown(self) -> None:
         """窗口关闭时调，等线程真的退出再返回，避免解释器退出时崩在 TqApi 上。"""
         self.ctl.stop(wait=True)
+        if self._data_thread is not None:
+            # 补数据是 HTTP + 写 CSV，杀掉线程会留半截文件。让它在后台跑完
+            # 不现实（用户已经关窗了），所以只等一小会儿，超时就放弃 ——
+            # 下次补的时候增量会把它接上
+            self._data_thread.quit()
+            self._data_thread.wait(3000)
