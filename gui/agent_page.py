@@ -1254,6 +1254,15 @@ class AgentPage(QWidget):
         lay.addWidget(self.ed_input)
 
         row = QHBoxLayout()
+        self.btn_skills = QPushButton("Skills")
+        self.btn_skills.setObjectName("Ghost")
+        self.btn_skills.setToolTip(
+            "技能（SKILL.md）：给 Agent 的「这件事该怎么做」说明。\n"
+            "内置的随版本发布；也可以自己写、从文件夹 / zip / 网址装。\n"
+            "从外面装的先进「待审查」—— 不进提示词，看过正文再信任。"
+        )
+        self.btn_skills.clicked.connect(self._open_skills)
+        row.addWidget(self.btn_skills)
         self.btn_attach = QPushButton("附件")
         self.btn_attach.setObjectName("Ghost")
         self.btn_attach.setToolTip(
@@ -1721,6 +1730,15 @@ class AgentPage(QWidget):
         self._start_worker(msgs)
 
     # ---------------------------------------------------------- 附件
+
+    def _open_skills(self) -> None:
+        """Skills 管理。关掉之后不用手动刷新提示词 —— 下一轮 `index_text()`
+        会按目录签名和信任状态重算，改完就能用上。
+        """
+        from gui.skills_dialog import SkillsDialog
+
+        dlg = SkillsDialog(self)
+        dlg.exec()
 
     def _attach_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(

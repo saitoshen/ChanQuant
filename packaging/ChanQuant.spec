@@ -32,7 +32,7 @@ APP_NAME = "ChanQuant"
 BUNDLE_ID = "com.chanquant.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "1.8.8"
+VERSION = "1.9.0"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
@@ -134,6 +134,9 @@ HIDDEN = [
     # 静态分析本来扫得到，但它们是最近才拆出来的模块，列在这里免得以后挪成
     # 函数内 import 时忘了补 —— 那时表现是「双击策略没反应」
     "gui.result_view",
+    # Skills 管理窗口：点「Skills」按钮时才 import，漏了就是点了没反应
+    "gui.skills_dialog",
+    "ttrade.skillpacks",
     "ttrade.replay",
     # 能力包注册表：`ttrade.skills` 里的每个模块靠 `__init__` 显式 import 完成
     # 注册。PyInstaller 静态扫描看不到「import 了但没被引用」，漏一个包就是

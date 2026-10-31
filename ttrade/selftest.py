@@ -853,6 +853,7 @@ def _run() -> tuple[bool, list[str]]:
             import pandas as pd
 
             from ttrade import session_files as _SF
+            from ttrade import skillpacks as _SP
             from ttrade import skills as _SK
             from ttrade import mcp_server as _MC
             from ttrade.skills import monitor as _MON
@@ -885,6 +886,11 @@ def _run() -> tuple[bool, list[str]]:
                 == "integer"
                 and "trade" not in {t.name for t in _MC.exposed(True)}
             )
+            # 技能（SKILL.md）：索引要非空、正文要读得出来。用户自己加的
+            # 技能在打包版里也应该能扫到 —— 目录走 `paths.user_dir()`
+            _sp = _SP.usable_packs()
+            sk_ok = bool(_sp) and "`" in _SP.index_text() and bool(
+                _SP.read(_sp[0].name)[0])
             skill_ok = (
                 n_tool >= 17
                 and item is not None
@@ -895,8 +901,11 @@ def _run() -> tuple[bool, list[str]]:
                 and hasattr(ap, "store")
                 and scan_ok
                 and mcp_ok
+                and sk_ok
             )
-            skill_info = (f"{n_tool} 个动作，附件读表 {'通' if res.ok else '断'}，"
+            skill_info = (f"{n_tool} 个动作，技能 {len(_sp)} 份"
+                          f"（{'可读' if sk_ok else '读不出'}），"
+                          f"附件读表 {'通' if res.ok else '断'}，"
                           f"扫描 {'通' if scan_ok else '断'}，"
                           f"MCP {'通' if mcp_ok else '断'}")
         except Exception as exc:  # noqa: BLE001
@@ -909,6 +918,8 @@ def _run() -> tuple[bool, list[str]]:
             and hasattr(ap, "btn_manual")
             # 附件与运行输出也是函数里 import / 新建的控件，缺一个功能就没了
             and hasattr(ap, "btn_attach")
+            # Skills 管理挂在附件左边，少了它技能就只能靠改文件
+            and hasattr(ap, "btn_skills")
             and hasattr(ap, "out")
             and hasattr(ap, "btn_out_feed")
             # 因子审核 / 深度分析 / 手册：三个按钮，前两个没选中因子时必须灰着
