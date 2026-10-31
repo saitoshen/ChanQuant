@@ -351,6 +351,9 @@ class ResultView(QObject):
         self.filter_active = False
         self.selected_keys: list = []
         self.outcome = None
+        # 只画 K 线（具体合约 / 期权合约）。标题里不能再写「当前状态：空仓」——
+        # 那是策略的仓位，这里根本没有策略，写上去像「策略空仓了」
+        self.bars_only = False
 
         self._pages: list[tuple[str, QWidget]] = []
         self._built = False
@@ -726,6 +729,7 @@ class ResultView(QObject):
         """
         self.df, self.raw, self.res, self.bh = df, raw, res, bh
         self.ctx = ctx
+        self.bars_only = False
         self.market = ctx.market
         self.period = ctx.period
         self.label = ctx.label
@@ -810,6 +814,48 @@ class ResultView(QObject):
                 cv.draw()
             except Exception:  # noqa: BLE001
                 pass
+
+    def show_bars(self, df, ctx: ViewCtx, note: str) -> None:
+        """**只画 K 线**：选的是具体合约 / 期权合约时走这条。
+
+        合约有到期日，一条链往往只有几个月、几百根，曲线中间还会因为换月断掉。
+        拿它跑回测，年化会被几个月的涨幅放大成天文数字，最大回撤也只在那一小段
+        里量 —— 数字不算错，但没有意义，摆出来比空着更误导。
+
+        所以这里先把绩效 / 因子 / 交易记录全部清空（`clear` 会顺手把卡片置
+        「—」、表清空），再只画 K 线。切回「主连」时走正常的 `show_result`，
+        三页会重新长出来。
+        """
+        self.clear(note)
+        if df is None or not len(df):
+            return
+        show = df if "signal" in df.columns else df.assign(signal=0)
+        self.df = show
+        self.raw = df
+        self.res = None
+        self.bh = None
+        self.ctx = ctx
+        self.bars_only = True
+        self.market = ctx.market
+        self.period = ctx.period
+        self.label = ctx.label
+        self.range_years = ctx.range_years
+        self.rule_key = ctx.rule_key
+        self.overlay = ctx.overlay
+        self.long_only = ctx.long_only
+        self.factor_cfg = ctx.factor_cfg
+        self.filter_active = ctx.filter_active
+        self.selected_keys = list(ctx.selected_keys or [])
+        self.outcome = None
+        self.trades = []
+        self._report, self._report_key = None, ""
+        self._cf_rep, self._cf_key = None, ""
+
+        self.pages()
+        if self.kind == "single":
+            self.lbl_legend.setText(ctx.legend)
+            self._draw_kline()
+        self.status.emit(note)
 
     # ---------------------------------------------------------- K 线绘制
 
@@ -1247,13 +1293,16 @@ class ResultView(QObject):
             state += "（下一根开盘" + {1: "开多", -1: "开空"}.get(pend, "平仓") + "）"
         period = self.period
         plabel = "" if tqdata.is_daily(period) else f" · {PERIOD_LABEL.get(period, period)}"
+        tail = "" if self.bars_only else f"   ·   当前状态：{state}"
         ax.set_title(
             f"{head}{plabel}   ·   {spec_label}   ·   "
             f"{view.index[0]:%Y-%m-%d %H:%M} ~ {view.index[-1]:%Y-%m-%d %H:%M}"
-            f"   ·   当前状态：{state}",
+            f"{tail}",
             fontsize=11.5, color=C_TEXT, loc="left", pad=10,
         )
-        if self.market == "us":
+        if self.bars_only:
+            source = "合约原始价（不复权，只够看图）"
+        elif self.market == "us":
             source = "东方财富后复权"
         elif period == PERIOD_1D:
             source = "Tushare 换月前复权"

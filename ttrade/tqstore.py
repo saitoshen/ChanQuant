@@ -516,6 +516,36 @@ def contract_last_dt(symbol: str, exchange: str, period: str) -> dict[str, pd.Ti
     return {r[0]: pd.Timestamp(r[1]) for r in rows if r[1] is not None}
 
 
+def list_contracts(symbol: str, exchange: str, period: str) -> pd.DataFrame:
+    """库里有哪些真实合约，各自的起止时间和根数。
+
+    界面上的「具体合约」下拉就读这个 —— 只列**库里有数据的**，没下过的合约
+    摆出来点了也是空图。列：contract / first / last / rows。
+
+    下载器正持锁时返回空表（和 `periods_of` 同一个理由：让界面显示「未下载」
+    而不是抛异常把整张图弄没）。
+    """
+    empty = pd.DataFrame(columns=["contract", "first", "last", "rows"])
+    if not exists():
+        return empty
+    try:
+        with connect(read_only=True) as con:
+            if not _has_table(con, "contract_bars"):
+                return empty
+            df = con.execute(
+                "SELECT contract, min(dt) AS first, max(dt) AS last, count(*) AS rows"
+                " FROM contract_bars WHERE symbol=? AND exchange=? AND period=?"
+                " GROUP BY contract ORDER BY contract",
+                [symbol, exchange, period],
+            ).df()
+    except Exception:      # noqa: BLE001
+        return empty
+    if not df.empty:
+        df["first"] = pd.to_datetime(df["first"])
+        df["last"] = pd.to_datetime(df["last"])
+    return df
+
+
 def meta_get(k: str, default=None):
     """读 meta 里的一个键。JSON 能解析就返回对象，否则返回原字符串。"""
     if not exists():

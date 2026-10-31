@@ -105,7 +105,7 @@ from ttrade import strategy_templates as TPL
 from gui.agent_page import AgentPage
 from gui.data_page import DataPage
 from gui.live import LiveController
-from gui.pickers import SymbolPicker
+from gui.pickers import ContractPicker, SymbolPicker
 from gui.portfolio_page import LibraryDialog, PortfolioPage
 from gui.result_view import ResultView, ViewCtx, set_tab_visible
 from gui.trade_page import TradePage
@@ -1283,6 +1283,12 @@ class MainWindow(QMainWindow):
         self.cb_symbol = QComboBox()
         self.cb_symbol.setMaxVisibleItems(18)
         cl.addWidget(self.cb_symbol)
+        # 合约层：主连 / 具体合约 / 期权合约。**品种和合约不是一回事** ——
+        # 品种是连续复权的主连，回测和截面都基于它；合约有到期日、曲线是断的，
+        # 只适合看图。这一层默认「主连」，选合约不会改变回测口径。
+        self.contract_pick = ContractPicker()
+        self.contract_pick.changed.connect(self._on_contract_changed)
+        cl.addWidget(self.contract_pick)
         # 多品种勾选：截面策略要一批品种，多品种回测也是。按钮上直接写「已选
         # N 个」，不点开就知道现在是单品种还是组合
         self.sym_pick = SymbolPicker("多品种回测")
@@ -2243,6 +2249,7 @@ class MainWindow(QMainWindow):
             return
         self.cb_period.setEnabled(True)
         self._sync_period_hint(fallback)
+        self._sync_contract_picker()
 
     def _sync_period_hint(self, fallback: bool = False) -> None:
         """在当前下拉项上标出「已下载 / 未下载」，避免选到空周期一脸问号。
@@ -2292,6 +2299,14 @@ class MainWindow(QMainWindow):
     def _on_period_changed(self) -> None:
         self._stop_study_live()
         self._sync_period_hint()
+        was_contract = bool(getattr(self, "contract_pick", None)
+                            and self.contract_pick.contract())
+        self._sync_contract_picker()
+        if was_contract:
+            # 刚才在看合约，换周期后清单重填、回到主连 —— 图必须跟着换，
+            # 不然左边写着「主连」，右边还是上一张合约的 K 线
+            self.run_analysis()
+            return
         self._schedule(immediate=True)
 
     def _on_symbol_changed(self) -> None:
@@ -2299,8 +2314,117 @@ class MainWindow(QMainWindow):
         # 每个品种下载到的周期不一样，换品种必须重标一次下拉项；
         # 新品种没有当前周期就退到日线（同启动，别让用户面对空图）
         self._sync_period_hint(fallback=True)
+        was_contract = bool(getattr(self, "contract_pick", None)
+                            and self.contract_pick.contract())
+        self._sync_contract_picker()    # 合约清单跟着品种换，并回到主连
         self._sync_cost_controls()      # tick / 手续费跟着品种走
+        if was_contract:
+            self.run_analysis()         # 同 `_on_period_changed`：图要跟着回主连
+            return
         self._schedule()
+
+    # ---------------------------------------------------- 合约层
+    def _sync_contract_picker(self) -> None:
+        """换品种 / 换周期时重填合约清单。
+
+        **必须挡信号**：`set_symbol` 会回到「主连」，那一下发 `changed` 的话
+        就地在 `_on_symbol_changed` 里又调一次 `_schedule(immediate=True)`，
+        一次换品种跑两遍回测。
+        """
+        pick = getattr(self, "contract_pick", None)
+        if pick is None:
+            return
+        # 美股没有合约层，藏起来比摆一个空下拉诚实
+        pick.setVisible(self.market == "cn")
+        if self.market != "cn":
+            return
+        sym, ex = self._key_parts(self.cb_symbol.currentData() or "")
+        pick.blockSignals(True)
+        try:
+            pick.set_symbol(sym, ex, self._period())
+        finally:
+            pick.blockSignals(False)
+
+    def _on_contract_changed(self) -> None:
+        """合约层变了。
+
+        - 主连：什么都不变，走正常那条回测
+        - 具体合约 / 期权合约：**只画 K 线**，不跑策略、不算因子、不出绩效
+        """
+        pick = getattr(self, "contract_pick", None)
+        if pick is None or getattr(self, "_booting", False):
+            return
+        if not pick.contract():
+            # 回到主连。选合约是「我要看这一条」的明确动作，回主连同样是 ——
+            # 都直接重算，不守「改参数自动回测」那个偏好，否则图会停在合约上，
+            # 左边却写着「主连」
+            self.run_analysis()
+            return
+        # 选合约是「我要看这一条」的明确动作，不该被「手动模式」拦下来
+        self._show_single_view()
+        self._stop_study_live()
+        # 合约是**一个**具体品种，谈不上组合。勾着的多品种会让按钮写着
+        # 「已选 N 个」、图上却只有一条合约，互相打架 —— 直接清掉
+        if self.sym_pick.selected():
+            self.sym_pick.blockSignals(True)
+            self.sym_pick.clear()
+            self.sym_pick.blockSignals(False)
+            if hasattr(self, "lbl_pick"):
+                self.lbl_pick.setText("")
+        self.run_analysis()
+
+    def _contract_df(self, contract: str) -> pd.DataFrame:
+        """按选中的合约取 K 线。
+
+        **不走 `DataStore` 缓存**：那个缓存只有 6 条，合约有几十万个，
+        点两下就把主连挤出去了。合约是单条查询，读一次几十毫秒。
+        """
+        period = self._period()
+        if self.contract_pick.mode() == ContractPicker.MODE_OPTION:
+            from ttrade import optfetch as OF
+
+            df = OF.load_contract(contract, period)
+        else:
+            from ttrade import tqstore as S
+
+            sym, ex = self._key_parts(self.cb_symbol.currentData() or "")
+            df = S.load_contracts(sym, ex, period, contract)
+            df = df.drop(columns=["contract"], errors="ignore")
+        if df is None or df.empty:
+            return pd.DataFrame()
+        return df.set_index("dt").sort_index()
+
+    def _show_contract(self, contract: str, df: pd.DataFrame) -> None:
+        """合约 K 线收尾：仓位/成本口径照旧，但不出策略信号。"""
+        is_opt = self.contract_pick.mode() == ContractPicker.MODE_OPTION
+        label = f"{contract}（{'期权' if is_opt else '合约'}）"
+        df = replay.window(df, self.cb_range.currentData() or 0)
+        self.cfg.bars_per_year = bars_per_year(df.index)
+        self._apply_sizing(self.cfg)
+        if self.market == "cn":
+            self._apply_cost(self.cfg)
+            item = self._current_item()
+            si = symbols_info.info(item.get("symbol", ""), item.get("exchange", ""))
+            self.cfg.multiplier = float(si.get("mult") or 0) or 1.0
+            self.cfg.margin_rate = float(si.get("margin") or 0) or 0.1
+
+        self.df_raw = df
+        self.df_sig = None
+        self.res = None
+        self.bh = None
+        self.factor_outcome = None
+        self._strategy_label = label
+
+        note = (
+            f"{contract}　{df.index[0]:%Y-%m-%d} → {df.index[-1]:%Y-%m-%d}"
+            f"（{len(df)} 根）\n"
+            "合约有到期日、曲线是断的，**只画 K 线** —— 回测、因子、绩效"
+            "都要回「主连」。"
+        )
+        self.view.show_bars(df, self._view_ctx(label), note)
+        self.lbl_status.setText(note)
+        # 让 Agent 那边知道用户现在看的是哪个合约，省得它再问一遍
+        self._publish(note, True)
 
     def _reload_store(self, market: str) -> None:
         """重建该市场的 DataStore（清掉 DataFrame 缓存），保留当前选中的标的。"""
@@ -3167,6 +3291,25 @@ class MainWindow(QMainWindow):
         # 上一批多品种还在后台跑的话先叫停：新一轮一起手它就过时了，
         # 不叫停的话它跑完还会把图抢回去
         self._drop_stale_multi()
+        # 选了具体合约 / 期权合约：整张图只画那一条 K 线，策略和回测都不跑。
+        # 放在截面 / 多品种之前 —— 合约是一个具体的到期品种，谈不上组合。
+        # 也放在 `df_override` 之前：实时只喂主连，合约不走那条路。
+        pick = getattr(self, "contract_pick", None)
+        ckey = pick.contract() if pick is not None else ""
+        if ckey:
+            self._show_single_view()
+            cdf = self._contract_df(ckey)
+            if cdf is None or cdf.empty:
+                per = PERIOD_LABEL.get(self._period(), self._period())
+                extra = ("\n5 分钟期权只下了中金所的 IO / MO / HO —— 换成日线或 1 小时看"
+                         if self._period() == "5m" and
+                         pick.mode() == ContractPicker.MODE_OPTION else
+                         "\n合约没成交过就没有 K 线 —— 换一个行权价 / 月份，"
+                         "或者去「数据管理 → 天勤」补一次")
+                self._clear_chart(f"{ckey} 在本地没有 {per} 数据" + extra)
+                return
+            self._show_contract(ckey, cdf)
+            return
         # 截面策略和多品种回测都是「一批品种 → 一条组合净值」，和单品种那条
         # K 线路径完全不是一回事，先分出去
         if self.family == FAMILY_CROSS:

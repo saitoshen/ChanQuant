@@ -573,11 +573,20 @@ def update(sess, periods: tuple[str, ...] = ("1d", "1h"),
                 continue
             dead = 0
 
-            with OS.connect() as con:
-                OS.upsert_meta(con, meta)
-                st["rows"] += OS.upsert_bars(con, bars)
-                OS.upsert_underlying(con, und)
-                OS.set_meta(con, "last_update", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            try:
+                with OS.connect() as con:
+                    OS.upsert_meta(con, meta)
+                    st["rows"] += OS.upsert_bars(con, bars)
+                    OS.upsert_underlying(con, und)
+                    OS.set_meta(
+                        con, "last_update", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    )
+            except Exception as exc:   # noqa: BLE001
+                # 界面正好在读期权库（挑合约），写锁抢不到。这条链的数据丢了，
+                # 但**不能因此把整轮下载停掉** —— 重跑时它会被重新捡起来。
+                st["failed"] += 1
+                if progress is not None:
+                    progress(n, total, f"{info['underlying']} 写库失败：{str(exc)[:50]}")
 
         # IV 在整期下完之后算一次：近月/次近月要跨链
         if progress is not None:
@@ -589,8 +598,12 @@ def update(sess, periods: tuple[str, ...] = ("1d", "1h"),
             iv = compute_iv(v, period)
             if iv.empty:
                 continue
-            with OS.connect() as con:
-                st["iv"] += OS.upsert_iv(con, iv)
+            try:
+                with OS.connect() as con:
+                    st["iv"] += OS.upsert_iv(con, iv)
+            except Exception:      # noqa: BLE001
+                # 同上面那条：抢不到写锁就算了，IV 下次重算
+                continue
 
         export_csv(period)
 

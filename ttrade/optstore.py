@@ -123,19 +123,26 @@ def connect(read_only: bool = False):
 
     p = db_path()
     os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    # DuckDB 是「一写多读」，读写**不能并存**。两个真实场景都会撞上：
+    # 界面在「期权合约」下拉里挑链（读），后台下载器正好要写；或者反过来。
+    # 读的那边一般几十毫秒就关连接，所以重试几次基本都能过去。
+    # 写锁等得更久一些：下载器跑一条链要几秒，等它写完这条就能进。
+    attempts, delay = (3, 0.4) if read_only else (6, 2.0)
     last = None
-    for attempt in range(3 if read_only else 1):
+    con = None
+    for i in range(attempts):
         try:
             con = duckdb.connect(p, read_only=read_only)
             break
         except Exception as exc:  # noqa: BLE001
             last = exc
-            if attempt < 2:
-                time.sleep(0.4)
-            else:
-                raise
-    else:  # pragma: no cover
-        raise last
+            if i < attempts - 1:
+                time.sleep(delay)
+    if con is None:
+        raise IOError(
+            f"打不开期权库（{'读' if read_only else '写'}）—— 另一个程序正占着它："
+            f"{last}"
+        ) from last
     try:
         if not read_only:
             for ddl in DDL:
@@ -311,6 +318,104 @@ def iv_wide(period: str = "1d", field: str = "iv_near") -> pd.DataFrame:
     if df.empty:
         return df
     return df.pivot_table(index="dt", columns="variety", values=field, aggfunc="last")
+
+
+def list_months(variety: str | None = None) -> pd.DataFrame | None:
+    """库里有哪几条期权链（品种 + 标的 + 到期月）。
+
+    界面上的「月份」下拉读这个。列：variety / underlying / expiry / n / first / last。
+    `expiry` 是到期日，`n` 是这条链上的合约数 —— 链长 20 和 200 的差别很大，
+    摆出来用户才知道该挑哪个月。
+
+    **一条链 = 标的 + 到期日，不是只有标的**。商品期权的标的自带月份
+    （`DCE.m2405`），两者一一对应；但中金所三个股指期权所有月份共用同一个
+    标的（`SSE.000300`），只按标的聚合会把 24 个月压成一条，行权价也跟着
+    混成两千多个 —— 挑出来的合约可能根本不在你想看的那个月。
+
+    **返回值三态**：
+
+    - `None` —— 库在，但打不开（下载器正持写锁）。界面应该说「正在下载」，
+      而不是「还没有数据」—— 后者会让人以为下失败了
+    - 空表 —— 库在、能读，但一条链都没有
+    - 有数据
+    """
+    empty = pd.DataFrame(columns=["variety", "underlying", "expiry", "n",
+                                  "first", "last"])
+    if not exists():
+        return empty
+    try:
+        with connect(read_only=True) as con:
+            # `count(*)` 会被 LEFT JOIN 的行数放大成「合约数 × 根数」，
+            # 必须数不同的合约
+            sql = ("SELECT m.variety, m.underlying, m.expiry,"
+                   " count(DISTINCT m.contract) AS n,"
+                   " min(b.dt) AS first, max(b.dt) AS last"
+                   " FROM option_meta m"
+                   " LEFT JOIN option_bars b ON b.contract = m.contract"
+                   "   AND b.period = '1d'")
+            args: list = []
+            if variety:
+                sql += " WHERE m.variety = ?"
+                args.append(variety)
+            sql += (" GROUP BY m.variety, m.underlying, m.expiry"
+                    " ORDER BY m.variety, m.expiry, m.underlying")
+            df = con.execute(sql, args).df()
+    except Exception:      # noqa: BLE001
+        return None
+    if not df.empty:
+        df["expiry"] = pd.to_datetime(df["expiry"])
+        for c in ("first", "last"):
+            df[c] = pd.to_datetime(df[c])
+    return df
+
+
+def list_strikes(variety: str, underlying: str,
+                 expiry=None) -> pd.DataFrame:
+    """一条链上的全部行权价。
+
+    列：strike / cp / contract / rows。`rows` 是日线根数 —— 用来判断这个合约
+    是不是从来没成交过（天勤会给「合约存在但没数据」的壳）。
+
+    `expiry` 一定要带：股指期权一个月里行权价就上百个，24 个月混在一起是
+    两千多个，同一个行权价会出现 24 次（对应 24 个到期日）。
+    """
+    empty = pd.DataFrame(columns=["strike", "cp", "contract", "rows"])
+    if not exists():
+        return empty
+    try:
+        with connect(read_only=True) as con:
+            sql = ("SELECT m.strike, m.opt_class AS cp, m.contract,"
+                   " count(b.dt) AS rows"
+                   " FROM option_meta m"
+                   " LEFT JOIN option_bars b ON b.contract = m.contract"
+                   "   AND b.period = '1d'"
+                   " WHERE m.variety = ? AND m.underlying = ?")
+            args: list = [variety, underlying]
+            if expiry is not None:
+                sql += " AND m.expiry = ?"
+                args.append(pd.Timestamp(expiry))
+            sql += (" GROUP BY m.strike, m.opt_class, m.contract"
+                    " ORDER BY m.strike, m.opt_class")
+            df = con.execute(sql, args).df()
+    except Exception:      # noqa: BLE001
+        return empty
+    return df
+
+
+def underlying_close(underlying: str, period: str = "1d") -> float | None:
+    """标的最新收盘价。界面拿它决定「默认落在哪个行权价」。"""
+    if not exists():
+        return None
+    try:
+        with connect(read_only=True) as con:
+            r = con.execute(
+                "SELECT close FROM option_underlying WHERE contract=? AND period=?"
+                " ORDER BY dt DESC LIMIT 1",
+                [underlying, period],
+            ).fetchone()
+    except Exception:      # noqa: BLE001
+        return None
+    return float(r[0]) if r and r[0] is not None else None
 
 
 def stats() -> dict:

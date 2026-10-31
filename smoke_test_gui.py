@@ -142,6 +142,32 @@ def main() -> int:
             win._on_pick_changed()
             app.processEvents()
 
+        # 合约层：选具体合约只画 K 线（不跑回测），回主连要把结果重新长出来。
+        # 这一层是「品种 / 合约」分开的落点：品种是主连、可回测，合约有到期日、
+        # 曲线是断的 —— 拿它跑回测年化会被几个月涨幅放大成天文数字
+        pk = win.contract_pick
+        if not pk.isVisible():
+            fails.append("期货市场下合约下拉是藏着的")
+        pk.cb_mode.setCurrentIndex(1)
+        app.processEvents()
+        if pk.cb_month.count() == 0:
+            print("skip 合约层：当前周期没有真实合约数据")
+        else:
+            if win.res is not None:
+                fails.append("选了具体合约还在出回测结果")
+            if win.view.df is None or not win.view.bars_only:
+                fails.append("选了具体合约没切到「只画 K 线」")
+            if win.view._k_total == 0:
+                fails.append("具体合约 K 线一根都没画")
+            if pk.contract() in ("", None):
+                fails.append("具体合约下拉有内容但取不到代码")
+            pk.cb_mode.setCurrentIndex(0)
+            app.processEvents()
+            if win.res is None:
+                fails.append("回到主连没有恢复回测结果")
+            if win.view.bars_only:
+                fails.append("回到主连还停在「只画 K 线」")
+
         print("saved screenshots")
         for f in fails:
             print("FAIL", f)

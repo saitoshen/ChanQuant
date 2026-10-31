@@ -195,6 +195,132 @@ def _list_symbols(ctx, p: dict) -> SkillResult:
     ])
 
 
+# ------------------------------------------------------------------ list_contracts
+
+def _split_key(key: str) -> tuple[str, str]:
+    """`RB_SHFE` → (`RB`, `SHFE`)；`rb` → (`rb`, ``)。
+
+    交易所后缀一定是大写字母（`SHFE` / `DCE` / `CZCE` / `INE` / `GFEX` / `CFFEX`），
+    品种代码本身可能是小写（`rb` / `m`）—— 用大小写判断，比维护一张交易所表稳。
+    """
+    sym, _, ex = str(key or "").strip().rpartition("_")
+    if ex and ex.isalpha() and ex.isupper():
+        return sym, ex
+    return str(key or "").strip(), ""
+
+
+def _variety_in(months: pd.DataFrame, symbol: str) -> str | None:
+    """期权库里的品种写法**跟着合约代码走**（`IO` 大写、`br` 小写），
+    而品种池里是大写（`RB_SHFE`）。按大小写不敏感匹配，返回库里那个写法。
+    """
+    for v in months["variety"].astype(str).unique():
+        if v.lower() == str(symbol).lower():
+            return v
+    return None
+
+
+def _list_contracts(ctx, p: dict) -> SkillResult:
+    """列合约。期货列真实合约；期权列链（月份），再给 `underlying` 就列行权价。
+
+    用户嘴上说的是「m2405 的认购」，落到库里是三步：品种 → 链 → 合约代码。
+    这个工具把前两步摊开，第三步交给 `query_bars`（它已经认期权合约代码了）。
+    """
+    kind = str(p.get("kind") or "futures").strip().lower()
+    sym, ex = _split_key(p.get("symbol", ""))
+    if not sym:
+        raise ValueError("要指定品种，比如 RB_SHFE / M_DCE")
+    period = str(p.get("period") or "1d").strip()
+    limit = min(int(p.get("rows") or 60), MAX_ROWS)
+
+    if kind.startswith("opt"):
+        from ttrade import optstore as OS
+
+        months = OS.list_months()
+        if months is None:
+            raise RuntimeError(
+                "期权库正在被下载占用（DuckDB 单写单读）—— 等 download_options.py "
+                "跑完再查，别当成「没有数据」"
+            )
+        if months.empty:
+            raise RuntimeError(
+                "本地还没有期权库 —— 去「数据管理 → 天勤」勾上「一并更新期权"
+                "（隐含波动率）」，或者命令行跑 download_options.py"
+            )
+        v = _variety_in(months, sym)
+        if v is None:
+            names = "、".join(sorted(months["variety"].unique())[:12])
+            raise RuntimeError(f"期权库里没有 {sym}（有的是：{names} …）")
+
+        und = str(p.get("underlying") or "").strip()
+        if und:
+            mine = months[months["variety"].astype(str) == v]
+            mine = mine[mine["underlying"].astype(str) == und]
+            if mine.empty:
+                have = "、".join(
+                    months[months["variety"].astype(str) == v]["underlying"]
+                    .astype(str).unique()[:8])
+                raise RuntimeError(f"{und} 这条链不存在（{v} 有的是：{have} …）")
+            exp = str(p.get("expiry") or "").strip()
+            if not exp and mine["expiry"].nunique() > 1:
+                # 股指期权所有月份共用一个标的（`SSE.000300`），不指明到期日
+                # 就会把 24 个月的行权价混成两千多个 —— 先把月份摊给模型挑
+                rows = [[pd.Timestamp(r["expiry"]).strftime("%Y-%m-%d"),
+                         int(r["n"])] for _, r in mine.iterrows()]
+                note = (f"{und} 有 {len(mine)} 个到期月｜"
+                        "带上 `expiry` 再查一次行权价")
+                return SkillResult(True, summary=note, feed=note, blocks=[
+                    B.block_table(["到期日", "合约数"], rows, note=note),
+                ])
+            strikes = OS.list_strikes(
+                v, und, exp or pd.Timestamp(mine["expiry"].iloc[0]))
+            if strikes.empty:
+                raise RuntimeError(f"{und} {exp} 这条链上没有合约")
+            spot = OS.underlying_close(und, "1d")
+            rows = []
+            for _, r in strikes.head(limit).iterrows():
+                rows.append([_f(r["strike"], 0), str(r["cp"]).upper(),
+                             str(r["contract"]), int(r["rows"])])
+            note = f"{und} {exp or ''} 共 {len(strikes)} 个合约".replace("  ", " ")
+            if spot:
+                note += f"，标的 {spot:g}"
+            if len(strikes) > limit:
+                note += f"｜只列前 {limit} 个"
+            return SkillResult(True, summary=note, feed=note, blocks=[
+                B.block_table(["行权价", "C/P", "合约代码", "日线根数"], rows, note=note),
+            ])
+
+        mine = months[months["variety"].astype(str) == v].copy()
+        mine = mine.sort_values(["expiry", "underlying"]).head(limit)
+        rows = []
+        for _, r in mine.iterrows():
+            exp = pd.Timestamp(r["expiry"])
+            rows.append([exp.strftime("%Y-%m-%d"), str(r["underlying"]), int(r["n"])])
+        note = (f"{v} 有 {len(months[months['variety'].astype(str) == v])} 条期权链"
+                "｜挑一条再把它的 `underlying`（必要时加 `expiry`）传回来查行权价")
+        return SkillResult(True, summary=note, feed=note, blocks=[
+            B.block_table(["到期日", "标的（链）", "合约数"], rows, note=note),
+        ])
+
+    from ttrade import tqstore as S
+
+    df = S.list_contracts(sym, ex, period)
+    if df.empty:
+        raise RuntimeError(
+            f"本地没有 {sym}_{ex} 的真实合约 {period} 数据 —— 去「数据管理 → 天勤」"
+            "勾上「一并下载真实合约」，或者换个周期（分钟级要下过才有）"
+        )
+    tail = df.sort_values("contract", ascending=False).head(limit)
+    rows = []
+    for _, r in tail.iterrows():
+        rows.append([str(r["contract"]), f"{r['first']:%Y-%m-%d}",
+                     f"{r['last']:%Y-%m-%d}", int(r["rows"])])
+    note = (f"{sym}_{ex} 共 {len(df)} 个真实合约（{period}）"
+            + (f"｜只列最近 {limit} 个" if len(df) > limit else ""))
+    return SkillResult(True, summary=note, feed=note, blocks=[
+        B.block_table(["合约", "首根", "末根", "根数"], rows, note=note),
+    ])
+
+
 # ------------------------------------------------------------------ 注册
 
 register(Tool(
@@ -260,4 +386,36 @@ register(Tool(
     },
     handler=_list_symbols,
     prompt="**列品种**：`list_symbols`。不确定代号怎么写时先查，不要猜。",
+))
+
+register(Tool(
+    name="list_contracts",
+    group="data",
+    label="列合约",
+    description="列期货真实合约，或某个品种的期权链 / 某条链的行权价",
+    risk=RISK_READ,
+    inputSchema={
+        "type": "object",
+        "required": ["symbol"],
+        "properties": {
+            "symbol": {"type": "str"},
+            "kind": {"type": "str", "default": "futures"},
+            "underlying": {"type": "str", "default": ""},
+            "expiry": {"type": "str", "default": ""},
+            "period": {"type": "str", "default": "1d"},
+            "rows": {"type": "int", "default": 60, "minimum": 1, "maximum": MAX_ROWS},
+        },
+    },
+    handler=_list_contracts,
+    prompt=(
+        "**列合约**：`list_contracts`。用户问「RB 有哪些合约」「m 的期权有哪些月份」"
+        "「m2405 有哪些行权价」时用它。\n"
+        "- 期货：`kind=futures`，`symbol=RB_SHFE`\n"
+        "- 期权链：`kind=options`，`symbol=M_DCE`（品种代号，**不是**合约代码）\n"
+        "- 行权价：`kind=options`，再带 `underlying=DCE.m2405`；股指期权所有月份"
+        "共用一个标的，这时还要带 `expiry=2026-09-18`\n"
+        "拿到合约代码之后交给 `query_bars` 查行情。合约有到期日、曲线是断的，"
+        "只能看图，不要拿它跑回测。"
+    ),
+    max_turns=3,
 ))

@@ -1212,6 +1212,28 @@ def check_options() -> None:
                   str(iv["iv_near"].iloc[0]))
             check("期权：剩余天数对得上", int(iv["dte_near"].iloc[0]) == 129,
                   str(iv["dte_near"].iloc[0]))
+
+        # 界面挑合约读的三张清单
+        months = OPS.list_months()
+        check("期权：list_months 能读", months is not None and not months.empty,
+              str(months))
+        if months is not None and not months.empty:
+            row = months.iloc[0]
+            # `count(*)` 会被 LEFT JOIN 的行数放大成「合约数 × 根数」，
+            # 所以这里数的是**不同合约**：7 个行权价 × 2 个方向 = 14
+            check("期权：list_months 一条链一行",
+                  len(months) == 1 and str(row["underlying"]) == "DCE.m2405",
+                  f"{len(months)} 行")
+            check("期权：list_months 数的是合约数", int(row["n"]) == 14,
+                  str(row["n"]))
+        strikes = OPS.list_strikes("m", "DCE.m2405", date(2024, 5, 10))
+        check("期权：list_strikes 只出这一个月的",
+              len(strikes) == 14, f"{len(strikes)} 行")
+        check("期权：list_strikes 认不出月份就不限",
+              len(OPS.list_strikes("m", "DCE.m2405")) == 14, "")
+        check("期权：平值能查标的价格",
+              abs(float(OPS.underlying_close("DCE.m2405")) - 3000.0) < 1e-9,
+              str(OPS.underlying_close("DCE.m2405")))
     finally:
         if old is None:
             os.environ.pop("TRENDDESK_OPT_DB", None)
