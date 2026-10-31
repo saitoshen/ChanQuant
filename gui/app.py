@@ -16,6 +16,7 @@ import copy
 import os
 import sys
 import time
+from dataclasses import dataclass
 
 # 直接运行 gui/app.py 时，sys.path[0] 是 gui/ 目录，需要把项目根目录补进去，
 # 否则 from ttrade.* 会报 ModuleNotFoundError（双击 bat 启动时同样受影响）。
@@ -403,6 +404,19 @@ MARKETS = {
 }
 
 
+# 五个平行大页面的序号。`_page_btns` 和 `_switch_page` 都按这个顺序排，
+# 别再写裸数字 —— 加一页要改十几处 `if idx == 3`
+PAGE_STUDY = 0
+PAGE_TRADE = 1
+PAGE_PORT = 2
+PAGE_AGENT = 3
+PAGE_DATA = 4
+
+# 启动落在哪一页。这套系统的主题是 Agent 量化：先跟它说清楚要什么，
+# 研究页是它调出来的工具页，不是入口
+DEFAULT_PAGE = PAGE_AGENT
+
+
 def load_futures_csv(key: str, data_dir: str) -> pd.DataFrame:
     """读取期货 CSV（key 形如 CU_SHFE）。不依赖 tushare，避免 GUI 启动时加载重依赖。
 
@@ -667,6 +681,104 @@ class CrossWorker(QObject):
         self.done.emit(out)
 
 
+@dataclass(frozen=True)
+class BacktestJob:
+    """一个品种的一次回测。**所有字段都是纯数据** —— 后台线程不许碰控件。
+
+    配置必须在主线程里按品种算好（成本要查 tick / 手续费，乘数查品种信息），
+    进了线程就只剩「跑策略 + 跑回测」。
+    """
+
+    key: str
+    label: str
+    df: pd.DataFrame
+    cfg: BacktestConfig
+    family: str
+    rule_key: str
+    rule_params: dict
+    factor_mode: str
+    factor_keys: tuple
+    factor_cfg: object
+    filtered: bool
+
+
+def run_backtest_job(job: BacktestJob):
+    """跑一个品种，返回 `Result`；没有信号时返回 None。
+
+    等价于原来主窗口里的 `_backtest_one`，区别只有一个：这里不读界面，
+    所以能在后台线程里跑。
+    """
+    rule_signal = None
+    base = job.df
+    label = ""
+    if job.family == FAMILY_RULE:
+        if not job.rule_key:
+            return None
+        base = run_strategy(job.df, job.rule_key, job.rule_params)
+        rule_signal = base["signal"].to_numpy(int)
+        label = STRATEGIES[job.rule_key].label
+
+    if not (job.family == FAMILY_FACTOR or job.filtered):
+        return run_backtest(base, job.cfg, label=label)
+
+    keys = list(job.factor_keys)
+    if not keys:
+        return None
+    if rule_signal is None:
+        out = fstrat.run_factor_strategy(job.df, job.factor_mode, keys, job.factor_cfg)
+    else:
+        out = fstrat.run_rule_with_filter(
+            job.df, rule_signal, job.factor_mode, keys, job.factor_cfg
+        )
+    return run_backtest(out.df, job.cfg, label=out.label)
+
+
+class MultiWorker(QObject):
+    """多品种等权回测的后台线程。
+
+    一次跑 N 个品种，5 分钟十年每个几秒，20 个品种就是十几分钟。以前只有
+    「多品种强制手动」这一道防线，可只要点了按钮，窗口就冻在那儿 —— 连
+    「停止」都点不动。现在整批扔进线程，主线程只管最后那一下画图。
+
+    每个品种之间查一次 `_cancel`：用户改主意时最多多等一个品种。
+    """
+
+    progress = Signal(int, int, str)   # done, total, label
+    done = Signal(object)              # (results, named, failed)
+    failed = Signal(str)
+
+    def __init__(self, jobs: list[BacktestJob]) -> None:
+        super().__init__()
+        self.jobs = jobs
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        results, named, failed = [], [], []
+        total = len(self.jobs)
+        try:
+            for i, job in enumerate(self.jobs):
+                if self._cancel:
+                    return
+                self.progress.emit(i, total, job.label)
+                try:
+                    res = run_backtest_job(job)
+                except Exception as exc:  # noqa: BLE001
+                    failed.append(f"{job.label}：{exc}")
+                    continue
+                if res is None:
+                    failed.append(f"{job.label}：没有产生信号")
+                    continue
+                results.append(res)
+                named.append((job.label, res))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.done.emit((results, named, failed))
+
+
 # ------------------------------------------------------------------ 主窗口
 class MainWindow(QMainWindow):
     # 回测算完了：把结论摊成纯文本推给 Agent 页右下角的「运行输出」。
@@ -700,9 +812,10 @@ class MainWindow(QMainWindow):
         self.fparam_widgets: dict[str, QWidget] = {}
         self.fparam_scales: dict[str, int] = {}
         self._pending = False
-        # 「改参数自动回测」的用户偏好。多品种会把它强制关掉，但不能改掉这份
-        # 偏好本身 —— 回到单品种时要还原成用户上次选的那样
-        self._auto_pref = True
+        # 「改参数自动回测」的用户偏好。**出厂是关的**：勾上要先弹框讲清楚
+        # 「以后每动一次界面都重跑」，不然改个滑块等三分钟会以为死机。
+        # 多品种会把它强制关掉，但不能改掉这份偏好本身 —— 回到单品种时要还原
+        self._auto_pref = False
         # 灌配置时会顺带触发好几次计算（切市场、换品种各算一遍），那些都是中间态。
         # 这段时间的输出先攒着，等最后一次算完再发 —— 否则 Agent 会拿着上一个品种
         # 的数字讨论这一笔，而且看着毫无破绽
@@ -729,6 +842,11 @@ class MainWindow(QMainWindow):
         self._c_worker: CrossWorker | None = None
         self._c_seq = 0
         self._c_applied = -1
+        # 多品种等权回测：N 个品种就是 N 遍「策略 + 回测」，同样不能放主线程
+        self._m_thread: QThread | None = None
+        self._m_worker: MultiWorker | None = None
+        self._m_seq = 0
+        self._m_applied = -1
 
         # 实时与交易
         self._live_base: pd.DataFrame | None = None   # 订阅时的本地历史，实时段接在它后面
@@ -786,6 +904,10 @@ class MainWindow(QMainWindow):
         # 标签和目录递进去，省得数据页反过来 import 主窗口造成循环依赖
         self.data_page = DataPage(MARKETS)
         self.pages.addWidget(self.data_page)
+        # 首屏是 ChanAgent（见 `DEFAULT_PAGE` 的说明）。直接设索引而不是走
+        # `_switch_page`：那一版会在启动时顺手 reload 一遍 Agent 页的三个清单，
+        # 而 `AgentPage.__init__` 已经填过了，等于开窗多读一次盘
+        self.pages.setCurrentIndex(DEFAULT_PAGE)
         outer.addWidget(self.pages, 1)
 
         # 数据补完之后标的池可能变了（新上市品种、刚补的分钟线），主窗口要重读
@@ -837,7 +959,7 @@ class MainWindow(QMainWindow):
             b.setMinimumWidth(132)
             b.clicked.connect(lambda _c=False, k=i: self._switch_page(k))
             lay.addWidget(b)
-        self.btn_page_study.setChecked(True)
+        self._page_btns[DEFAULT_PAGE].setChecked(True)
         lay.addStretch(1)
 
         self.lbl_live = QLabel("本地历史")
@@ -857,11 +979,11 @@ class MainWindow(QMainWindow):
             b.setChecked(i == idx)
         self.pages.setCurrentIndex(idx)
         # 切到组合页时重读磁盘：「策略研究」里刚存的配置要立刻能看到
-        if idx == 2:
+        if idx == PAGE_PORT:
             self.portfolio_page.reload()
-        elif idx == 3:
+        elif idx == PAGE_AGENT:
             self.agent_page.reload()
-        elif idx == 4:
+        elif idx == PAGE_DATA:
             self._sync_data_page()
 
     def _sync_data_page(self) -> None:
@@ -891,7 +1013,7 @@ class MainWindow(QMainWindow):
         态**（上一个品种、上一个策略算出来的）。这些输出先攒着，只把最后一次发
         出去 —— 不然 Agent 会拿着 AAPL 的双均线数字，一本正经地讨论螺纹。
         """
-        self._switch_page(0)
+        self._switch_page(PAGE_STUDY)
         self._pub_guard += 1
         try:
             if cfg.symbol:
@@ -918,7 +1040,7 @@ class MainWindow(QMainWindow):
         self._flush_publish()
 
     def _on_agent_portfolio(self, cfg) -> None:
-        self._switch_page(2)
+        self._switch_page(PAGE_PORT)
         self.portfolio_page.accept(cfg)
 
     def _load_bars(self, market: str, key: str, period: str):
@@ -1002,7 +1124,7 @@ class MainWindow(QMainWindow):
             # 结果落在「策略交易和组合」，**不**切到「策略研究」：那边是用户手上
             # 正在调的那套参数，模型问一句就把它冲掉说不过去。五个结果页
             # （K线 / 绩效 / 因子 / 交易记录 / 阶段分析）组合页都挂得上。
-            self._switch_page(2)
+            self._switch_page(PAGE_PORT)
             self._publish(self.portfolio_page.show_config(cfg, note="Agent 回测"), False)
             return
 
@@ -1017,7 +1139,7 @@ class MainWindow(QMainWindow):
         if cfg is None:
             self.agent_page.notify(why, bad=True)
             return
-        self._switch_page(2)
+        self._switch_page(PAGE_PORT)
         msg = self.portfolio_page.accept(cfg)
         # 回执里把**实际用上的**品种/周期/手数写全：模型可能报的是「碳酸锂
         # 动量60-5m」而模板里定的是 1h，让用户一眼看出到底跑的是哪一套
@@ -1678,12 +1800,26 @@ class MainWindow(QMainWindow):
         self.btn_run.clicked.connect(self._run_from_button)
         wl.addWidget(self.btn_run)
 
+        # 只在多品种后台回测跑着的时候露出来。十几分钟的任务没有中止手段，
+        # 用户只能杀进程 —— 这个按钮就是为那一步准备的
+        self.btn_stop = QPushButton("停止回测")
+        self.btn_stop.setToolTip(
+            "多品种回测正在后台跑：点这里叫停。\n"
+            "已经跑完的品种不画，省得半套结果看着像整套。"
+        )
+        self.btn_stop.setMinimumHeight(28)
+        self.btn_stop.clicked.connect(self._stop_backtest)
+        self.btn_stop.setVisible(False)
+        wl.addWidget(self.btn_stop)
+
         self.chk_auto = QCheckBox("改参数自动回测")
-        self.chk_auto.setChecked(True)
+        # 出厂不勾。勾上要先过一道提示（`_on_auto_run_toggled`）——
+        # 用户得先知道「勾了之后每动一次界面都会重跑」再决定
+        self.chk_auto.setChecked(bool(getattr(self, "_auto_pref", False)))
         self.chk_auto.setToolTip(
-            "勾上：改参数 / 换品种立刻重算（单品种默认）。\n"
+            "勾上：改参数 / 换品种立刻重算。单品种一次几秒，研究起来很顺手。\n"
             "不勾：只改界面，点上面的「策略回测」才算。\n"
-            "多品种一律手动 —— 一次要跑好几个品种，自动重算会把界面拖住。"
+            "多品种一律手动 —— 一次要跑 N 个品种，自动重算只会让你等更久。"
         )
         self.chk_auto.toggled.connect(self._on_auto_run_toggled)
         wl.addWidget(self.chk_auto)
@@ -2886,6 +3022,12 @@ class MainWindow(QMainWindow):
         self.run_analysis()
 
     def _on_auto_run_toggled(self, on: bool) -> None:
+        # 勾上之前先讲清楚代价：勾了之后**每动一次界面**都会重跑，单品种几秒、
+        # 多品种几分钟。用户点了「还是手动」就把勾退回去
+        if on and not getattr(self, "_booting", False) and not self._confirm_auto_run():
+            # `setChecked` 会再进来一次走关闭分支，所以这里直接返回，不碰 `_auto_pref`
+            self.chk_auto.setChecked(False)
+            return
         # 记住用户自己的选择：勾了多品种会被强制关掉，回到单品种时得还原成
         # 他上次选的那样，不能把「我本来开着自动」这个偏好一起清掉
         self._auto_pref = bool(on)
@@ -2893,6 +3035,26 @@ class MainWindow(QMainWindow):
         # 补算一次，否则要等到下次改参数才更新
         if on and not getattr(self, "_booting", False):
             self._schedule()
+
+    def _confirm_auto_run(self) -> bool:
+        """勾「改参数自动回测」时的说明。返回用户是不是真的要开。"""
+        box = QMessageBox(self)
+        box.setWindowTitle("改参数自动回测")
+        box.setIcon(QMessageBox.Question)
+        box.setText("勾上之后，这个页面每动一次都会重跑一遍回测")
+        box.setInformativeText(
+            "会触发重算的改动：参数滑块、策略、周期、回测区间、仓位、\n"
+            "品种、品种类别、市场。\n\n"
+            "单品种一次几秒以内 —— 改完直接看曲线，不用每次点「策略回测」，"
+            "做单品种研究效率很高。\n"
+            "多品种一次要跑 N 个品种，几分钟到十几分钟都正常（多品种会放到"
+            "后台跑，界面不会卡，但勾着它只会让你等得更久，所以多品种仍是手动）。"
+        )
+        yes = box.addButton("开启自动回测", QMessageBox.AcceptRole)
+        box.addButton("还是手动", QMessageBox.RejectRole)
+        box.setDefaultButton(yes)
+        box.exec()
+        return box.clickedButton() is yes
 
     @property
     def _auto_run(self) -> bool:
@@ -2904,22 +3066,22 @@ class MainWindow(QMainWindow):
     def _sync_auto_run(self) -> None:
         """多品种强制手动：勾选框置灰且不勾。
 
-        多品种一次要跑 N 个品种（截面还带机器学习的几十折），自动重算等于
-        「勾一个品种卡一次」，所以这里不给选。
+        多品种一次要跑 N 个品种，自动重算等于「改一下等十几分钟」。后台线程
+        只保证界面不卡，不会让这一批跑得更快 —— 所以这里仍然不给选。
         """
         if not hasattr(self, "chk_auto"):
             return
         multi = bool(self._multi_symbols())
-        want = False if multi else bool(getattr(self, "_auto_pref", True))
+        want = False if multi else bool(getattr(self, "_auto_pref", False))
         self.chk_auto.blockSignals(True)
         self.chk_auto.setChecked(want)
         self.chk_auto.blockSignals(False)
         self.chk_auto.setEnabled(not multi)
         self.chk_auto.setToolTip(
-            "多品种一律手动：一次要跑好几个品种，自动重算会把界面拖住。\n"
-            "点上面的「策略回测」才开始。"
+            "多品种一律手动：一次要跑 N 个品种，几分钟到十几分钟，\n"
+            "自动重算只会让你等得更久。点上面的「策略回测」才开始。"
             if multi else
-            "勾上：改参数 / 换品种立刻重算（单品种默认）。\n"
+            "勾上：改参数 / 换品种立刻重算。单品种一次几秒，研究起来很顺手。\n"
             "不勾：只改界面，点上面的「策略回测」才算。"
         )
 
@@ -3002,6 +3164,9 @@ class MainWindow(QMainWindow):
         )
 
     def run_analysis(self, df_override: pd.DataFrame | None = None) -> None:
+        # 上一批多品种还在后台跑的话先叫停：新一轮一起手它就过时了，
+        # 不叫停的话它跑完还会把图抢回去
+        self._drop_stale_multi()
         # 截面策略和多品种回测都是「一批品种 → 一条组合净值」，和单品种那条
         # K 线路径完全不是一回事，先分出去
         if self.family == FAMILY_CROSS:
@@ -3138,11 +3303,13 @@ class MainWindow(QMainWindow):
             frames[key] = replay.window(df, rng)
         return frames, missing
 
-    def _backtest_one(self, key: str, df: pd.DataFrame):
-        """单个品种按当前策略跑一遍，返回 `Result`。
+    def _backtest_job(self, key: str, df: pd.DataFrame) -> BacktestJob:
+        """把「界面上这套设置」+ 一个品种打包成一份能扔进线程的活。
 
         配置要**每个品种单独建一份**：成本按各自的 tick / 手续费算，乘数和保证金
         也各不相同。共用一份 `self.cfg` 会把上一个品种的 tick 带到下一个头上。
+
+        这里读控件是**故意**的 —— 必须在主线程读完、打包成纯数据，线程里只跑算。
         """
         cfg = copy.copy(self.cfg)
         cfg.bars_per_year = bars_per_year(df.index)
@@ -3156,35 +3323,26 @@ class MainWindow(QMainWindow):
         else:
             cfg.multiplier, cfg.margin_rate = 1.0, 1.0
 
-        rule_signal = None
-        base = df
-        label = ""
-        if self.family == FAMILY_RULE:
-            rkey = self.cb_strategy.currentData()
-            if not rkey:
-                return None
-            base = run_strategy(df, rkey, self._current_params())
-            rule_signal = base["signal"].to_numpy(int)
-            label = STRATEGIES[rkey].label
-
-        if not ((self.family == FAMILY_FACTOR) or self._filter_active()):
-            return run_backtest(base, cfg, label=label)
-
-        keys = self._selected_factor_keys()
-        if not keys:
-            return None
-        fcfg = self._factor_cfg()
-        if rule_signal is None:
-            out = fstrat.run_factor_strategy(df, self.factor_mode, keys, fcfg)
-        else:
-            out = fstrat.run_rule_with_filter(df, rule_signal, self.factor_mode, keys, fcfg)
-        return run_backtest(out.df, cfg, label=out.label)
+        rule_key = (self.cb_strategy.currentData() or "") if self.family == FAMILY_RULE else ""
+        return BacktestJob(
+            key=key, label=self._key_label(key), df=df, cfg=cfg,
+            family=self.family, rule_key=rule_key,
+            rule_params=dict(self._current_params()) if rule_key else {},
+            factor_mode=self.factor_mode,
+            factor_keys=tuple(self._selected_factor_keys()),
+            factor_cfg=self._factor_cfg(),
+            filtered=bool(self._filter_active()),
+        )
 
     def _run_multi(self, keys: list[str]) -> None:
         """多品种回测：同一套策略在每个品种上各跑一遍，净值等权平均。
 
         和截面策略不是一回事 —— 各品种之间没有任何比较，也没有多空配对，只是
         把 N 条独立回测拼成一条曲线，回答「这套参数换一批品种还灵不灵」。
+
+        整批走后台（见 `MultiWorker`）：N 个品种就是 N 遍策略 + N 遍回测，
+        5 分钟十年一个品种几秒，20 个品种十几分钟。同步跑的话窗口会冻在那儿，
+        连「停止」都点不动 —— 这也是「自动回测」以前只能单品种用的原因。
         """
         period = self._period()
         frames, missing = self._frames_for(keys, period)
@@ -3197,32 +3355,127 @@ class MainWindow(QMainWindow):
         if self.factor_mode == "ml" and (
             self.family == FAMILY_FACTOR or self._filter_active()
         ):
-            # 每折 walk-forward 都要重训，乘上品种数就是几十分钟。同步跑会卡死
-            # 界面，起线程又要 N 条并行 —— 不如直说这条不支持
+            # 每折 walk-forward 都要重训，乘上品种数就是几十分钟。串行跑要等
+            # 一晚上，并行又要 N 份内存 —— 不如直说这条不支持
             self.lbl_status.setText(
                 "机器学习多因子不支持多品种回测（每个品种都要单独重训一遍），"
                 "请改用单因子 / 多因子"
             )
             return
 
-        results, named = [], []
-        failed = [f"{m}：没有行情数据" for m in missing]
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            for key, df in frames.items():
-                try:
-                    res = self._backtest_one(key, df)
-                except Exception as exc:  # noqa: BLE001
-                    failed.append(f"{self._key_label(key)}：{exc}")
-                    continue
-                if res is None:
-                    failed.append(f"{self._key_label(key)}：没有产生信号")
-                    continue
-                results.append(res)
-                named.append((self._key_label(key), res))
-        finally:
-            QApplication.restoreOverrideCursor()
+        jobs = [self._backtest_job(key, df) for key, df in frames.items()]
+        self._start_multi_worker(jobs, missing, period)
 
+    def _start_multi_worker(self, jobs: list[BacktestJob], missing: list[str],
+                            period: str) -> None:
+        """起后台线程。已经在跑的先取消 —— 旧结果盖掉新结果比慢更糟。"""
+        self._cancel_multi_worker()
+        self._m_seq += 1
+        seq = self._m_seq
+
+        worker = MultiWorker(jobs)
+        # 收尾要用的上下文挂在 worker 上，靠 `sender()` 取回来。**不能**用
+        # `connect(lambda ...)` 把 seq 带过去：lambda 没有 QObject 接收者，
+        # PySide 会当成直连，`done` 于是在工作线程里直接跑 `_finish_multi`，
+        # 一碰控件就是 "Internal C++ object already deleted"
+        worker.seq = seq
+        worker.ctx = (missing, period)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_multi_progress)
+        worker.done.connect(self._on_multi_done)
+        worker.failed.connect(self._on_multi_failed)
+        worker.done.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+
+        self._m_worker, self._m_thread = worker, thread
+        self.btn_stop.setVisible(True)
+        self.lbl_status.setText(f"多品种回测：0 / {len(jobs)} 个品种（后台运行）…")
+        thread.start()
+
+    def _cancel_multi_worker(self) -> None:
+        """叫停多品种回测。线程最多再跑完手上那个品种就退出。"""
+        if self._m_worker is not None:
+            self._m_worker.cancel()
+            # 只断开三个界面回调，**留着 `thread.quit`**：整条 `disconnect()`
+            # 会把 quit 一起摘掉，线程的事件循环就没人叫停了，run() 返回后
+            # 还挂在那儿 —— 关窗口时 Qt 会报「Destroyed while thread is
+            # still running」
+            for sig, slot in ((self._m_worker.done, self._on_multi_done),
+                              (self._m_worker.failed, self._on_multi_failed),
+                              (self._m_worker.progress, self._on_multi_progress)):
+                try:
+                    sig.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+        thread = self._m_thread
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait(4000)
+            except RuntimeError:
+                pass
+        self._m_worker = None
+        self._m_thread = None
+
+    def _stop_backtest(self) -> None:
+        """「停止回测」按钮：只在多品种后台跑着的时候有用。"""
+        if self._m_thread is None:
+            self.btn_stop.setVisible(False)
+            return
+        self._cancel_multi_worker()
+        self.btn_stop.setVisible(False)
+        self.lbl_status.setText("已停止多品种回测")
+
+    def _drop_stale_multi(self) -> None:
+        """新一轮计算开始了：还在后台跑的那批已经过时，叫停。
+
+        不叫停的话它跑完会把图抢回去 —— 用户明明已经换了参数，看到的却是
+        上一套的结果，而且毫无破绽。
+        """
+        if self._m_thread is None:
+            return
+        self._cancel_multi_worker()
+        if hasattr(self, "btn_stop"):
+            self.btn_stop.setVisible(False)
+
+    def _on_multi_progress(self, done: int, total: int, label: str) -> None:
+        self.lbl_status.setText(
+            f"多品种回测：{done} / {total} 个品种（正在跑 {label}，后台运行）"
+        )
+
+    def _on_multi_done(self, payload) -> None:
+        # 上下文从发信号的 worker 上取（见 `_start_multi_worker` 里的说明）
+        w = self.sender()
+        seq = int(getattr(w, "seq", -1))
+        missing, period = getattr(w, "ctx", ([], ""))
+        self._m_worker = None
+        self._m_thread = None
+        self.btn_stop.setVisible(False)
+        if self._closing or seq != self._m_seq or seq == self._m_applied:
+            return
+        self._m_applied = seq
+        results, named, failed = payload
+        self._finish_multi(results, named, failed, missing, period)
+
+    def _on_multi_failed(self, msg: str) -> None:
+        w = self.sender()
+        seq = int(getattr(w, "seq", -1))
+        self._m_worker = None
+        self._m_thread = None
+        self.btn_stop.setVisible(False)
+        if self._closing or seq != self._m_seq:
+            return
+        self._show_single_view()
+        self._clear_chart(f"多品种回测失败：{msg}")
+
+    def _finish_multi(self, results: list, named: list, failed: list,
+                      missing: list[str], period: str) -> None:
+        """多品种回测收尾：拼净值、画图、把结论推给 Agent 页。"""
+        failed = list(failed) + [f"{m}：没有行情数据" for m in missing]
         if not results:
             self._show_single_view()
             self._clear_chart("多品种回测没有结果：" + "；".join(failed))
@@ -3972,6 +4225,7 @@ class MainWindow(QMainWindow):
         self.data_page.shutdown()
         self._cancel_factor_worker()
         self._cancel_cross_worker()
+        self._cancel_multi_worker()
         # 组合页每条账户连接一个 QThread，窗口关掉时线程还在跑 wait_update
         # 会让解释器退出时崩在 TqApi 上。这里等它们真的停下来再放行。
         self.portfolio_page.shutdown()

@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # 研究页不再自动连天勤（连接只在「账户透视和交易」页），所以截图不会去登录账户，
@@ -22,6 +23,8 @@ def main() -> int:
     win = MainWindow()
     win.resize(1480, 940)
     win.show()
+    # 首屏现在是 ChanAgent；这几张截图要看的是研究页，先切过去
+    win._switch_page(0)
 
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
     os.makedirs(out_dir, exist_ok=True)
@@ -91,6 +94,53 @@ def main() -> int:
         win._on_live_bars(live)
         if v._pending_draw:
             fails.append("回到研究页后实时推送没有重画 K 线")
+
+        # 「改参数自动回测」出厂不勾，勾上要先过一道提示框。这里把提示换成
+        # 一个固定答复，验的是**接线**：说「还是手动」就该把勾退回去
+        if win.chk_auto.isChecked():
+            fails.append("「改参数自动回测」出厂是勾上的")
+        win._confirm_auto_run = lambda: False
+        win.chk_auto.setChecked(True)
+        app.processEvents()
+        if win.chk_auto.isChecked():
+            fails.append("提示框里选了「还是手动」，勾没退回去")
+        win._confirm_auto_run = lambda: True
+        win.chk_auto.setChecked(True)
+        app.processEvents()
+        if not win.chk_auto.isChecked():
+            fails.append("提示框里选了「开启」，勾没打上")
+        win.chk_auto.setChecked(False)
+        app.processEvents()
+
+        # 多品种回测整批进后台：验结果真的画出来、按钮真的露出来又收回去、
+        # 线程真的退出了（不退出的话关窗会崩在 QThread 上）
+        period = win._period()
+        keys = [it["key"] for it in win.store.items
+                if win.store.get(it["key"], period) is not None
+                and not win.store.get(it["key"], period).empty][:2]
+        if len(keys) < 2:
+            fails.append(f"多品种后台回测：{period} 上凑不出 2 个品种，跳过")
+        else:
+            win.sym_pick.set_items(win.store.items, keep=keys)
+            win._on_pick_changed()
+            win._run_multi(keys)
+            app.processEvents()
+            if win.btn_stop.isHidden():
+                fails.append("多品种回测起手后没有露出「停止回测」")
+            deadline = time.time() + 120
+            while win._m_thread is not None and time.time() < deadline:
+                app.processEvents()
+                time.sleep(0.02)
+            app.processEvents()
+            if win._m_thread is not None:
+                fails.append("多品种回测 120 秒没跑完")
+            elif win.res is None or win.res.label != "多品种等权":
+                fails.append(f"多品种回测没画出结果：{getattr(win.res, 'label', None)}")
+            if not win.btn_stop.isHidden():
+                fails.append("多品种回测跑完后「停止回测」还留着")
+            win.sym_pick.set_items(win.store.items, keep=[])
+            win._on_pick_changed()
+            app.processEvents()
 
         print("saved screenshots")
         for f in fails:

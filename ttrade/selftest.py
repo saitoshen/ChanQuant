@@ -667,6 +667,12 @@ def _run() -> tuple[bool, list[str]]:
         win.resize(1280, 820)
         win.show()
         app.processEvents()
+        # 首屏该是 ChanAgent。这一条要**在切页之前**取 —— 后面几项都要看研究页
+        # 那张图，而停在不显示研究页的时候 K 线是故意不画的（只记一笔，切回来
+        # 再补），所以下面会切过去
+        first_page_agent = win.pages.currentWidget() is win.agent_page
+        win._switch_page(0)
+        app.processEvents()
         # 启动时首次回测是延后 220ms 排队的（先让窗口画出来再算）。自检里没有
         # 真的事件循环，这里直接把它跑完 —— 否则它会挑在后面测滚轮 / 组合的
         # 时候插进来重画一次，窗口被重置，滚轮那项就时好时坏。
@@ -981,11 +987,16 @@ def _run() -> tuple[bool, list[str]]:
             and win.cb_timing.count() >= 2
             and win.view_stack.count() == 2
             and win.cb_cost.count() >= 3
-            # 回测触发：一个显式按钮 + 一个「改参数自动回测」开关。多品种一次要
-            # 跑几分钟，没有手动入口就只能靠自动重算硬扛
+            # 回测触发：一个显式按钮 + 一个「改参数自动回测」开关。开关**出厂是
+            # 关的** —— 勾上要先弹框讲清楚「以后每动一次界面都重跑」，不然改个
+            # 滑块等三分钟会以为死机
             and win.btn_run.text() == "策略回测"
-            and win.chk_auto.isChecked()
+            and not win.chk_auto.isChecked()
             and win.chk_auto.isEnabled()
+            # 多品种回测在后台跑，只有跑着的时候才露出「停止回测」
+            and win.btn_stop.isHidden()
+            # 首屏是 ChanAgent，不是研究页
+            and first_page_agent
             # 资金分配默认风险平价（第一项）
             and win.cb_cross_w.itemData(0) == "risk"
         )
