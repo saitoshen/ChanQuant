@@ -799,6 +799,11 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int,
        所有合约都返回，十年前就摘牌的那些整段都不需要；另外有些远月合约从挂牌
        到摘牌一笔没成交，每次跑都会白请求一次。前者按到期月份直接过滤，后者写进
        meta，下次跳过。
+
+    免费账户也能跑：已摘牌合约的 `get_kline_serial` 照样有数据（实测 rb2101
+    日线 243 根、5m 8000 根）。差别只在单次请求上限 —— 日线一个合约一辈子
+    才 240 根，等于**完整**；5m 只拿得到最后 8000 根（约 5.5 个月），更早的
+    那段取不到，展期因子在那种合约上会退回日线口径。
     """
     key = f"{sym}_{ex}"
     # 15m/30m 归到 5m、2h/4h 归到 1h：合约明细只有 5m/1h 两种，其余周期在读取时
@@ -806,14 +811,6 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int,
     period = source_period(period)
     end = date.today()
     start = window_start(years, days)
-
-    if not can_download(api):
-        # 真实合约是「每个合约单独下一段历史」，免费版拿不到 —— 已摘牌的合约
-        # 用 `get_kline_serial` 只能取到空表。这里明说，别让调用方把 0 当成
-        # 「这些合约本来就没数据」。
-        return {"key": key, "period": period, "rows": 0, "contracts": 0,
-                "skipped": 0, "old": 0, "blank": 0, "failed": 0, "cancelled": False,
-                "status": "免费账户没有历史下载权限，真实合约补不了"}
 
     try:
         conts = _query_contracts(api, sym, ex)

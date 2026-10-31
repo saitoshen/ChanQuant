@@ -1011,6 +1011,19 @@ def check_free_account() -> None:
     check("免费账户：请求根数不超过上限", api.asked and max(api.asked) <= D.RECENT_BARS,
           str(api.asked))
 
+    # 真实合约**不能**被短路：已摘牌合约的 get_kline_serial 照样有数据
+    # （实测 rb2101 日线 243 根 = 整条命）。这里用「查合约就炸」的假 api，
+    # 只要报的是「查合约失败」就说明它确实走到了合约流程，而不是提前返回。
+    class _NoCont:
+        _auth = _FreeApi._auth
+
+        def query_quotes(self, **_kw):
+            raise RuntimeError("假的：只是想让流程走到这一步")
+
+    r = D.write_contracts(_NoCont(), "RB", "SHFE", "1d", 1)
+    check("免费账户：真实合约没有被短路", "补不了" not in str(r.get("status")),
+          str(r.get("status")))
+
 
 def check_factor_refresh() -> None:
     """复权因子是派生数据：换月点要跟序列对齐，因子要按切换表重算。

@@ -214,7 +214,7 @@ class TqWorker(QObject):
                 n_contracts = 0
                 bad: list[str] = []
                 dead = 0
-                if self.contracts and not self._cancel and not free_mode:
+                if self.contracts and not self._cancel:
                     for i, (sym, ex) in enumerate(pairs, 1):
                         if self._cancel:
                             break
@@ -246,7 +246,9 @@ class TqWorker(QObject):
                                                f"真实合约 {sym}_{ex} 未下全：{note}")
                         # 连着几个品种一行都没下到，多半是连接已经死了：重建会话再
                         # 继续。不重建的话剩下每个品种都要白等一轮看门狗（3 分钟）。
-                        if r.get("rows"):
+                        # 免费账户例外：本来就常常「无新数据」，重建会话只会白花
+                        # 十几秒的握手，78 个品种能白重建二十多次。
+                        if r.get("rows") or free_mode:
                             dead = 0
                         else:
                             dead += 1
@@ -277,8 +279,10 @@ class TqWorker(QObject):
                     extra += f"；{len(bad)} 个品种有合约没下全（{shown}），再点一次会续传"
             note = ""
             if free_mode:
-                note = ("　【免费账户】只能取最近 8000 根 K 线：主连补得上最近一段，"
-                        "真实合约与十年历史补不了。")
+                note = ("　【免费账户】单次只能取 8000 根 K 线：主连和真实合约的日线"
+                        "都是完整的，5m 只拿得到每个合约最后约 5.5 个月。")
+                if self.period in ("5m", "15m", "30m"):
+                    note += " 展期因子在早期合约上会退回日线口径。"
             self.done.emit(
                 f"天勤 {period_label} {head}：{len(pairs)} 个品种，本次写入 {rows:,} 行{extra}；"
                 f"新补切换表 {n_switch} 个，校正换月日 {moved} 处，刷新复权 {touched} 个品种周期"

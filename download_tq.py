@@ -177,8 +177,9 @@ def main() -> int:
         # 只补一天也一样被拦。提前说清楚，别让用户从「真实合约 0 个」去猜。
         free_mode = not can_download(sess.get())
         if free_mode:
-            print("  [!] 这个天勤账户没有历史下载权限（免费版）：只能取最近 8000 根 K 线，"
-                  "主连补得上最近一段，真实合约与十年历史补不了。", flush=True)
+            print("  [!] 这个天勤账户没有历史下载权限（免费版）：改用 get_kline_serial，"
+                  "单次最多 8000 根。日线够用（一个合约一辈子才 240 根），"
+                  "5m 只拿得到每个合约最后约 5.5 个月。", flush=True)
 
         # ---- 切换表 ----
         if args.switch or args.main:
@@ -244,9 +245,7 @@ def main() -> int:
                 with_retry(f"主连 {period}", job)
 
         # ---- 真实合约 ----
-        if args.contracts and free_mode:
-            print("\n[3/4] 真实合约：跳过（免费账户取不到已摘牌合约的历史）", flush=True)
-        elif args.contracts:
+        if args.contracts:
             print("\n[3/4] 真实合约")
             years = args.years or CONTRACT_YEARS
             for period in [p.strip() for p in args.contracts.split(",") if p.strip()]:
