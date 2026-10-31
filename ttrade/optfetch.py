@@ -211,11 +211,15 @@ def download_chain(api, underlying: str, members: list[str], period: str,
     os.makedirs(tmpdir, exist_ok=True)
     bars: list[pd.DataFrame] = []
     unds: list[pd.DataFrame] = []
-    tag = re.sub(r"[^0-9A-Za-z]", "_", f"{underlying}_{period}")
+    # **一个周期只用一个临时文件**，每批覆盖写。
+    #
+    # 一开始是「每批一个文件名、读完删掉」，跑几十条链之后删了几百个文件，
+    # 被环境的批量删除保护拦下来，整轮直接中断。DataDownloader 本身是 `"w"`
+    # 模式打开（会截断），所以复用同一个文件名完全够用，一个删除都不需要。
+    path = os.path.join(tmpdir, f"batch_{period}.csv")
 
-    def take(path: str, syms: list[str]) -> None:
+    def take(syms: list[str]) -> None:
         df = _read_csv(path, syms, period)
-        _cleanup(path)
         if df.empty:
             return
         und = df[df["contract"] == underlying]
@@ -230,16 +234,14 @@ def download_chain(api, underlying: str, members: list[str], period: str,
             break
         chunk = members[i:i + BATCH]
         syms = [underlying] + chunk
-        path = os.path.join(tmpdir, f"{tag}_{i}.csv")
         if _run_batch(api, syms, dur, start, end, path, stall) is not None:
-            take(path, syms)
+            take(syms)
             continue
 
         # 整批卡死：退到一个合约一次，能救几个是几个
-        for j, sym in enumerate(chunk):
-            p2 = os.path.join(tmpdir, f"{tag}_{i}_{j}.csv")
-            if _run_batch(api, [underlying, sym], dur, start, end, p2, stall) is not None:
-                take(p2, [underlying, sym])
+        for sym in chunk:
+            if _run_batch(api, [underlying, sym], dur, start, end, path, stall) is not None:
+                take([underlying, sym])
 
     return (
         pd.concat(bars, ignore_index=True) if bars else _empty_bars(),
@@ -250,15 +252,14 @@ def download_chain(api, underlying: str, members: list[str], period: str,
 
 def _run_batch(api, syms: list[str], dur: int, start: date, end: date,
                path: str, stall: float):
-    """跑一批，成功返回 csv 路径，卡住返回 None。"""
+    """跑一批，成功返回 csv 路径，卡住返回 None。
+
+    不删旧文件：`DataDownloader` 是 `"w"` 模式打开的，会自己截断。这里刻意
+    一个 `os.remove` 都不写 —— 长任务里删几百个临时文件会被环境的批量删除
+    保护拦下来，整轮直接中断。
+    """
     from tqsdk.tools import DataDownloader
 
-    for p in (path, path + ".wal"):
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
     try:
         task = DataDownloader(api, symbol_list=list(syms), dur_sec=dur,
                               start_dt=start, end_dt=end, csv_file_name=path)
@@ -281,18 +282,8 @@ def _run_batch(api, syms: list[str], dur: int, start: date, end: date,
             task._task.cancel()
         except Exception:      # noqa: BLE001
             pass
-        _cleanup(path)
         return None
     return path
-
-
-def _cleanup(path: str) -> None:
-    for p in (path,):
-        try:
-            if p and os.path.exists(p):
-                os.remove(p)
-        except OSError:
-            pass
 
 
 # ------------------------------------------------------------------ 隐含波动率

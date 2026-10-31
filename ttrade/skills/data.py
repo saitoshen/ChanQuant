@@ -29,16 +29,46 @@ def _store(ctx):
     return store
 
 
+def _looks_like_option(key: str) -> bool:
+    """`DCE.m2405-C-3000` / `SHFE.br2407P16600` 这种就是期权合约。
+
+    品种池里只有期货品种（`RB_SHFE` 这种），期权合约永远查不到 —— 但用户
+    完全可能直接问「m2405-C-3000 最近怎么样」。认出来就去期权库找。
+    """
+    from ttrade import optfetch as OF
+
+    return bool(OF.parse_contract(key)) and "." in key
+
+
 def _bars(ctx, symbol: str, period: str) -> pd.DataFrame:
     store = _store(ctx)
     key = str(symbol or "").strip()
     if not key:
         raise ValueError("要指定品种")
     df = store.get(key, str(period or "1d"))
-    if df is None or df.empty:
-        have = "、".join(store.symbols[:8])
-        raise RuntimeError(f"{key} 在 {period} 周期上没有数据（库里有：{have} …）")
-    return df
+    if df is not None and not df.empty:
+        return df
+
+    # 期权合约不在品种池里，退到期权库（`data_tq/option.duckdb`）
+    if _looks_like_option(key):
+        from ttrade import optfetch as OF
+        from ttrade import optstore as OS
+
+        if not OS.exists():
+            raise RuntimeError(
+                f"{key} 是期权合约，本地还没有期权库 —— 去「数据管理 → 天勤」"
+                "勾上「一并更新期权（隐含波动率）」"
+            )
+        opt = OF.load_contract(key, str(period or "1d"))
+        if not opt.empty:
+            return opt.set_index("dt")
+        raise RuntimeError(
+            f"{key} 在期权库里没有 {period} 数据（可能是没下过这个周期，"
+            "或者这个合约从来没成交过）"
+        )
+
+    have = "、".join(store.symbols[:8])
+    raise RuntimeError(f"{key} 在 {period} 周期上没有数据（库里有：{have} …）")
 
 
 # ------------------------------------------------------------------ query_bars
