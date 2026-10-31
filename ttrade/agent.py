@@ -457,6 +457,10 @@ SYSTEM_PROMPT = """你是「ChanQuant 禅量」里的 ChanAgent（Chan Quant Age
 
 需要让平台执行操作时，在回答**最后**单独输出一个 json 代码块，平台会弹确认框：
 
+**平台只认 json 代码块。** 不要用 XML、`<|DSML|>`、`<tool_call>`、`[TOOL_CALL]`
+这类工具调用语法 —— 那些不是这个平台的协议，写了也不会执行，用户屏幕上只会
+出现一堆尖括号。
+
 ```json
 {"action": "trade", "mode": "auto", "symbol": "RB", "exchange": "SHFE",
  "period": "1d", "strategy": "ma_cross", "params": {"fast": 50, "slow": 200},
@@ -795,6 +799,84 @@ def memory_messages(convo: list[dict], existing: str = "") -> list[dict]:
 
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
 
+# 模型自带的工具调用语法。平台从没给过 `tools` 参数，但 DeepSeek 系模型
+# 会照训练时的习惯自己吐 `<|DSML|>invoke name="scan">…`，OpenAI 系偶尔吐
+# `<tool_call>`。不认它就等于「模型想调工具、平台当没看见」，用户屏幕上
+# 只剩一堆尖括号。
+#
+# 这些标记在真实输出里被拆得很散，`>` 的位置还不固定：
+#   `<|DSML|>calls>`      —— 尖括号先闭合，再跟标签名
+#   `< | | DSML | | calls>` —— 标签名夹在两个竖线后面
+# 所以统一按「`<` + 若干竖线 + DSML + 若干竖线 + 可选 `>` + 标签名 + `>`」
+# 来认，竖线一个或多个、每段之间允许空白。宁可放宽，也别让一整段动作
+# 变成屏幕上的乱码。
+_DSML_HEAD = r"<\s*/?\s*(?:\|\s*)+DSML\s*(?:\|\s*)+>?\s*"
+
+
+def _dsml_tag(word: str) -> str:
+    return _DSML_HEAD + word + r"\s*>"
+
+
+_DSML_ANY = re.compile(_DSML_HEAD + r"[a-zA-Z_]*\s*>", re.I)
+_DSML_CALLS = re.compile(_dsml_tag("calls") + r".*?" + _dsml_tag("calls"), re.S | re.I)
+# invoke 只取名字；参数另扫 —— 模型经常漏写或写错闭合标签，靠「成对匹配」
+# 会在那种输出上整段读不出来
+_DSML_INVOKE = re.compile(r"invoke\s+name\s*=\s*[\"']([^\"']+)[\"']", re.I)
+_DSML_PARAM = re.compile(
+    r"parameter\s+name\s*=\s*[\"']([^\"']+)[\"']"
+    r"(?:\s+string\s*=\s*[\"'](true|false)[\"'])?\s*>"
+    r"(.*?)(?=" + _DSML_HEAD + r"|$)",
+    re.S | re.I,
+)
+# 清屏用：`<|end_of_sentence|>` 这类零散 token
+_BARE_TOKEN = re.compile(r"<\s*(?:\|\s*)+[^|<>]{1,40}(?:\|\s*)+>?", re.I)
+
+
+def parse_tool_markup(text: str) -> dict | None:
+    """把模型自带的工具调用语法读成 `{"action": ..., ...}`。读不出就返回 None。
+
+    只认最后一个 `invoke` —— 和 json 代码块取最后一个的道理一样。
+    `string="false"` 说明那个参数是数字/布尔，按 JSON 解析；解析失败就退回
+    字符串，宁可让校验层报「期望数字」，也别在这里悄悄塞一个 0。
+    """
+    names = _DSML_INVOKE.findall(text or "")
+    if not names:
+        return None
+    obj: dict = {"action": names[-1].strip()}
+    for key, is_str, raw in _DSML_PARAM.findall(text or ""):
+        key = key.strip()
+        if key in obj:
+            continue
+        val = raw.strip()
+        if is_str.lower() == "false":
+            try:
+                obj[key] = json.loads(val)
+                continue
+            except ValueError:
+                pass
+        obj[key] = val
+    return obj
+
+
+def strip_tool_markup(text: str) -> str:
+    """把工具调用语法从要显示/入库的文本里清掉。
+
+    动作已经由 `parse_action` 走另一条路执行了，这段标记留在气泡里只会让
+    用户以为程序坏了。清完再渲染。
+    """
+    t = text or ""
+    if "DSML" not in t and "<|" not in t:
+        return t
+    t = _DSML_CALLS.sub("", t)
+    if _DSML_ANY.search(t):
+        # 还剩下不成套的标记（模型漏写闭合、或者只吐了半段）。标记总在
+        # 一整段里，按段落切掉 —— 逐标签删会把 `invoke name="scan">` 这种
+        # 残渣留在屏幕上。
+        t = "\n\n".join(p for p in t.split("\n\n") if not _DSML_ANY.search(p))
+    t = _DSML_ANY.sub("", t)
+    t = _BARE_TOKEN.sub("", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
 
 @dataclass
 class Action:
@@ -848,7 +930,11 @@ def parse_action(text: str) -> Action:
     """
     blocks = _JSON_BLOCK.findall(text or "")
     if not blocks:
-        return Action("")
+        # 没有 json 块时再看一眼模型有没有用自带的工具语法。读出来了就
+        # 当成动作执行 —— 用户要的是「列出突破 20 日新高的品种」，不是
+        # 「看模型写了一段尖括号」。
+        obj = parse_tool_markup(text or "")
+        return Action("") if obj is None else _from_obj(obj)
     raw = blocks[-1]
     try:
         obj = json.loads(raw)
@@ -863,7 +949,15 @@ def parse_action(text: str) -> Action:
             reason="动作块不是 JSON 对象", got=type(obj).__name__,
             hint='最外层要写成 {"action": "...", ...}',
         ))
+    return _from_obj(obj)
 
+
+def _from_obj(obj: dict) -> Action:
+    """把「动作名 + 参数」的字典走完校验，产出 Action。
+
+    json 代码块和模型自带的工具语法最后都汇到这里：两条入口只有「怎么读出
+    这个字典」不同，校验、报错文案、`prepare` 补默认值必须一模一样。
+    """
     kind = str(obj.get("action") or "").strip().lower()
     tool = S.get(kind)
     if tool is None:

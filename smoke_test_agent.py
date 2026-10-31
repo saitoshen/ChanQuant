@@ -193,6 +193,60 @@ def check_action_errors() -> None:
     check(A.parse_action("就聊两句，没有动作块").error == "", "没有动作块时不该报错")
 
 
+# -------------------------------------------------- 4b. 模型自带的工具语法
+
+def check_tool_markup() -> None:
+    """DeepSeek 系模型会自己吐 `<|DSML|>invoke …`。
+
+    平台从没给过 `tools` 参数，但模型照训练时的习惯还是会写。不认它就等于
+    「模型想调工具、平台当没看见」—— 用户屏幕上只剩一堆尖括号（v1.8.1 之后
+    真实出现过一次）。三种写法都要认：紧凑的、被拆开的、漏写闭合标签的。
+    """
+    compact = (
+        '<|DSML|>calls>\n'
+        '<|DSML|>invoke name="scan">\n'
+        '<|DSML|>parameter name="rule" string="true">breakout_high<|DSML|>parameter>\n'
+        '<|DSML|>parameter name="window" string="false">20<|DSML|>parameter>\n'
+        '<|DSML|>parameter name="period" string="true">1d<|DSML|>parameter>\n'
+        '<|DSML|>invoke>\n'
+        '<|DSML|>calls>'
+    )
+    spaced = (
+        '< | | DSML | | calls>\n'
+        '< | | DSML | | invoke name="scan">\n'
+        '< | | DSML | | parameter name="rule" string="true">breakout_high'
+        '</ | | DSML | | parameter>\n'
+        '</ | | DSML | | invoke>\n'
+        '</ | | DSML | | calls>'
+    )
+    broken = (
+        '<|DSML|>invoke name="query_bars">\n'
+        '<|DSML|>parameter name="symbol" string="true">RB_SHFE<|DSML|>parameter>\n'
+        '<|DSML|>parameter name="limit" string="false">60<|DSML|>parameter>'
+    )
+
+    for label, text in (("紧凑", compact), ("拆开", spaced), ("漏闭合", broken)):
+        a = A.parse_action(text)
+        check(a.ok, f"{label}写法的工具语法没解析成动作（{a.error}）")
+        check(a.kind in ("scan", "query_bars"), f"{label}写法解析出的动作名不对（{a.kind}）")
+
+    a = A.parse_action(compact)
+    check(a.payload.get("rule") == "breakout_high", "工具语法的字符串参数没读对")
+    # string="false" 表示「不是字符串」，要按 JSON 解析成数字
+    check(a.payload.get("window") == 20, f"数字参数没转成 int（{a.payload.get('window')!r}）")
+
+    # json 代码块优先：模型两种都写时，按平台协议的那个走
+    both = ('```json\n{"action":"query_bars","symbol":"RB_SHFE","rows":5}\n```\n\n'
+            '<|DSML|>invoke name="scan"><|DSML|>invoke>')
+    check(A.parse_action(both).kind == "query_bars", "同时有两种写法时没优先用 json 代码块")
+
+    # 气泡里不能留标记
+    shown = A.strip_tool_markup("先看一下。\n\n" + compact + "\n\n完事。")
+    check("DSML" not in shown and "<|" not in shown, f"气泡里还有标记残留：{shown!r}")
+    check("先看一下" in shown and "完事" in shown, "清理时把人话一起删了")
+    check(A.strip_tool_markup("普通回答，没标记") == "普通回答，没标记", "无标记的文本被改动了")
+
+
 # ------------------------------------------------------------------ 5. 预算池
 
 def check_turn_budget() -> None:
@@ -378,6 +432,7 @@ def main() -> int:
     check_contract()
     check_budget()
     check_action_errors()
+    check_tool_markup()
     check_turn_budget()
     check_skills()
     check_memory()

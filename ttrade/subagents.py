@@ -257,7 +257,14 @@ def run(cfg, spec: Spec, task: str, ctx,
 
 
 def _strip_block(text: str) -> str:
-    """把结论里的动作块去掉 —— 回灌给主 Agent 的应该是人话，不是 JSON。"""
+    """把结论里的动作块去掉 —— 回灌给主 Agent 的应该是人话，不是 JSON。
+
+    顺带清掉模型自带的工具语法（`<|DSML|>invoke …`）：子 Agent 也会这么写，
+    不清的话主 Agent 会把一段尖括号当成「研究结论」。
+    """
     import re
 
-    return re.sub(r"```(?:json)?\s*\{.*?\}\s*```", "", text or "", flags=re.S).strip()
+    from ttrade import agent as A
+
+    body = re.sub(r"```(?:json)?\s*\{.*?\}\s*```", "", text or "", flags=re.S)
+    return A.strip_tool_markup(body).strip()

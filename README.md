@@ -227,6 +227,21 @@ type "%LOCALAPPDATA%\ChanQuant\logs\error.log"
 > 下面按时间顺序记每一版改了什么、为什么改。开头几段是项目起点时的原话 —— 留着是想说明
 > 「为什么先啃数据口径，再做策略」。
 
+### v1.8.2 —— 认模型自带的工具语法
+
+DeepSeek 系模型有时不用平台的 json 动作块，而是吐它自己训练时的格式：
+`<|DSML|>invoke name="scan"><|DSML|>parameter name="rule" …`。平台从没给过
+`tools` 参数，模型是照习惯自己写的 —— 结果用户屏幕上只剩一堆尖括号，动作一次也没执行。
+
+- **认它** —— `parse_tool_markup()` 把 `invoke` / `parameter` 读成
+  `{"action": ..., ...}`，走和 json 代码块**完全同一条**校验路径（`_from_obj`）。
+  `string="false"` 的参数按 JSON 解析成数字/布尔。三种写法都认：紧凑的、
+  被拆开的（`< | | DSML | | calls>`）、漏写闭合标签的
+- **清它** —— `strip_tool_markup()` 在渲染前把标记清掉，人话留着。**解析用原文、
+  显示用清理后的文本** —— 顺序反了就等于把动作本身也删了
+- **提示词加一句** —— 平台只认 json 代码块，别用 XML / `<|DSML|>` / `<tool_call>`
+- 子 Agent 的结论也过一遍清理，不然主 Agent 会把一段尖括号当成「研究结论」
+
 ### v1.8.1 —— ChanAgent 的 Harness 重建
 
 读了 Claude Code、Hermes Agent、DeepSeek Harness 三家的源码与设计文档，挑能用在

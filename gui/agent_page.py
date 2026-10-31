@@ -2023,17 +2023,24 @@ class AgentPage(QWidget):
         self.log.moveCursor(QTextCursor.End)
 
     def _on_done(self, text: str) -> None:
-        final = text or self._stream_buf
+        raw = text or self._stream_buf
+        # 气泡和 history 用**剥掉工具标记**的版本；解析动作必须用原文 ——
+        # 先剥再解析的话，模型用 `<|DSML|>invoke` 写的那个动作就跟着没了。
+        final = A.strip_tool_markup(raw)
+        action = A.parse_action(raw)
+
         if final.strip():
             self._render_reply(final)
         else:
             self._render_reply("")
-            self._append(f"<p style='color:{C_BAD}'>模型没有返回内容。</p>")
+            # 只给了动作块、一句人话都没写，是正常情况（模型直接动手了）。
+            # 报「没有返回内容」会让用户以为出故障了。
+            if not action.ok:
+                self._append(f"<p style='color:{C_BAD}'>模型没有返回内容。</p>")
         self._append("<p></p>")
         self._history.append({"role": "assistant", "content": final})
         ALog.log("assistant", text=final)
 
-        action = A.parse_action(final)
         if action.error:
             # 界面上给人看一行；同一段结构化说明**回灌给模型**，让它下一轮
             # 直接改对。以前只写界面，模型以为自己成功了，下一轮接着按错的
@@ -2062,7 +2069,7 @@ class AgentPage(QWidget):
         # 至少用户能看见模型说到哪儿了
         ALog.log("error", where="llm", why=msg)
         if self._msg_start is not None and self._stream_buf.strip():
-            self._render_reply(self._stream_buf)
+            self._render_reply(A.strip_tool_markup(self._stream_buf))
         self._msg_start = None
         self._append(
             f'<div style="border-left:5px solid {C_BAD};background-color:#fdeaea;'
