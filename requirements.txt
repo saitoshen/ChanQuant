@@ -44,3 +44,16 @@ joblib==1.6.0
 threadpoolctl==3.7.0
 
 # PyInstaller 不写在这里，build.py 会按需自动安装（ensure_pyinstaller）
+
+# ---- 可选依赖，故意不列进来 ----
+#
+# CTP（openctp-ctp）：只有 Windows / Linux x86-64 的 wheel，macOS 上装不了。
+# 写进这里会让 macOS 的 `pip install -r requirements.txt` 直接失败，三平台构建
+# 就废了。要接 CTP 时手动装：
+#
+#     pip install openctp-ctp          # Windows
+#
+# 没装也不影响任何其他功能 —— `ttrade/ctp_client.py` 用 try/except 导入，
+# `--selftest` 会照实报「openctp-ctp 未安装」。CI 里也是一步独立的、
+# `continue-on-error` 的 Windows 专属安装。
+

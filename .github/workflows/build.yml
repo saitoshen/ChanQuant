@@ -71,6 +71,15 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      # CTP 客户端是**可选依赖**：openctp-ctp 只有 Windows / Linux 的 wheel，
+      # macOS 上装不了。所以单独一步、只装 Windows、失败也不拦构建 ——
+      # 装不上就是包里没有 CTP（自检会照实报「未安装」），其余功能不受影响。
+      # 写进 requirements.txt 会让 macOS 打包直接挂，那条路走不通。
+      - name: 安装 CTP 客户端（可选）
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: python -m pip install openctp-ctp
+
       # xgboost 的 macOS wheel 不打包 OpenMP 运行时，libxgboost.dylib 里写的是
       # @rpath/libomp.dylib + LC_RPATH=/usr/local/opt/libomp/lib（x64）或
       # /opt/homebrew/opt/libomp/lib（arm64）。macos-latest 镜像预装了 arm64 那份，

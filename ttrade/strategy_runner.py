@@ -53,7 +53,7 @@ from ttrade import strategy_store as SStore
 from ttrade.strategies import run_strategy
 from ttrade.tqfetch import PERIOD_SEC
 from ttrade.tqlive import AccountSpec, bars_from_serial, merge_live
-from ttrade.tqsdk_symbols import main_symbol
+from ttrade.tqsdk_symbols import is_stock, trade_symbol
 
 KLINE_LEN = 3000          # 每个策略回看多少根。日线 3000 根够跑 MA200，5m 够跑一周多
 MIN_BARS = 30             # 少于这么多根不算信号
@@ -541,7 +541,7 @@ class PortfolioRunner:
         if key in self._klines:
             self._top_up(st)      # 第一次没订成源周期的话，这里接着试
             return
-        tq = main_symbol(st.cfg.symbol, st.cfg.exchange)
+        tq = trade_symbol(st.cfg.symbol, st.cfg.exchange)
         # 订**源周期**再本地合并（15m/30m 走 5m，2h/4h 走 1h），和本地历史的
         # 合并口径一致；直接订原生 15m 时间边界对不上，拼起来就是碎的
         src, n = tqdata.PERIODS.get(st.cfg.period, (st.cfg.period, 1))
@@ -562,6 +562,11 @@ class PortfolioRunner:
         没填充是常态（`ok=False`），下一 tick 再来。
         """
         if self.api is None:
+            return
+        if is_stock(st.cfg.symbol, st.cfg.exchange):
+            # 补库那条路写的是 `data_futures/*.csv`（期货 CSV 目录），A 股在
+            # `stock.duckdb` 里，写错地方会凭空造出一堆假 CSV。股票的本地历史
+            # 由 `download_stock_tq.py` / `download_stock_ts.py` 负责
             return
         src = topup.source_of(st.cfg.period)
         if src not in topup.SOURCE_PERIODS:

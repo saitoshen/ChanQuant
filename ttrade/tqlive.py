@@ -31,7 +31,7 @@ from . import daylimit
 from .paths import user_dir
 from .tqdata import PERIODS, resample, trading_days
 from .tqfetch import PERIOD_SEC, local_time
-from .tqsdk_symbols import main_symbol
+from .tqsdk_symbols import contract_key, is_stock, trade_symbol
 
 # 实时 K 线向天勤要多少根。10000 是单次上限；5m 的 10000 根约 208 个交易日，
 # 足够覆盖「界面开着放了一周」这种场景，再长的缺口应该走 update_main 补。
@@ -41,7 +41,14 @@ ACCOUNT_KINDS = [
     ("kq", "快期模拟（天勤账户自带）"),
     ("sim", "本地模拟（TqSim，仅本机）"),
     ("account", "实盘（期货公司资金账号）"),
+    ("kq_stock", "快期股票模拟（需专业版）"),
+    ("sim_stock", "本地股票模拟（TqSimStock）"),
 ]
+
+# 股票账户的两种。期货和股票在天勤里是**两套账户类**，不能混用一个连接：
+# 期货账户下单 `SHFE.rb2601`，股票账户下单 `SSE.600000`，撮合规则也不同
+# （T+1、涨跌停、100 股一手）。
+STOCK_KINDS = ("kq_stock", "sim_stock")
 
 
 # ------------------------------------------------------------------ 账户配置
@@ -68,7 +75,7 @@ class AccountSpec:
 
     def build(self):
         """构造天勤的账户对象。实盘缺参数直接报错，不要静默退化成模拟。"""
-        from tqsdk import TqAccount, TqKq, TqSim
+        from tqsdk import TqAccount, TqKq, TqKqStock, TqSim, TqSimStock
 
         if self.kind == "account":
             missing = [
@@ -80,7 +87,17 @@ class AccountSpec:
             return TqAccount(self.broker_id, self.account_id, self.account_password)
         if self.kind == "sim":
             return TqSim()
+        if self.kind == "sim_stock":
+            # 本地股票模拟：100 股一手、T+1、涨跌停都按交易所规则撮合，
+            # 和 TqSim 的期货口径完全不同 —— 拿 TqSim 跑股票会算出负股数
+            return TqSimStock()
+        if self.kind == "kq_stock":
+            return TqKqStock()
         return TqKq()
+
+    @property
+    def is_stock(self) -> bool:
+        return self.kind in STOCK_KINDS
 
     def label(self) -> str:
         kind = dict(ACCOUNT_KINDS).get(self.kind, self.kind)
@@ -415,17 +432,22 @@ class LiveHub:
         sec = PERIOD_SEC.get(src)
         if sec is None:
             raise ValueError(f"实时不支持 {period}（源周期 {src} 没有对应秒数）")
-        key = f"{symbol}_{exchange}"
+        key = contract_key(symbol, exchange)
         if key == self.key and period == self.period and self._klines is not None:
             return
-        tq_sym = main_symbol(symbol, exchange)
+        # 期货订主连（`KQ.m@SHFE.rb`），股票直接订代码本身（`SSE.600000`）——
+        # 股票没有主力合约这一说，`main_symbol()` 拼出来的 `KQ.m@SSE.600000`
+        # 是不存在的合约
+        tq_sym = trade_symbol(symbol, exchange)
         self._quote = self.api.get_quote(tq_sym)
         self._klines = self.api.get_kline_serial(
             tq_sym, sec, data_length=min(10000, KLINE_LEN * max(1, n))
         )
         self._n = n
         self.key, self.period, self.tq_symbol = key, period, tq_sym
-        self.underlying = ""
+        # 股票没有「主连 → 真实合约」这一步，订的就是能下单的那个代码
+        self.underlying = tq_sym if is_stock(symbol, exchange) else ""
+
 
     # ---- 推进 ----
 
@@ -560,7 +582,10 @@ class LiveHub:
         q = self._quote
         if q is None:
             return {}
-        # 主连的 underlying_symbol 就是当前真实主力；换月时会变
+        # 主连的 underlying_symbol 就是当前真实主力；换月时会变。
+        # A 股没有这一层：订的代码本身就能下单，`underlying` 在 subscribe 里
+        # 已经填好了，这里不能拿 quote 的 underlying_symbol 去覆盖（股票行情里
+        # 这个字段是空的，覆盖一次就再也回不来了）
         und = getattr(q, "underlying_symbol", "") or ""
         if und and und != self.underlying:
             self.underlying = und
@@ -720,6 +745,10 @@ class LiveHub:
               limit_price: float | None = None, account: str = "") -> str:
         """下单。返回客户端订单号。`account` 是多账户时的目标账户名。
 
+        **A 股的数量单位是「股」不是「手」**：天勤股票账户的 `volume` 就是股数，
+        100 股起、必须是 100 的整数倍。界面上那一栏的标题会跟着账户类型变，
+        这里不替用户乘 100 —— 悄悄放大一百倍比报错危险得多。
+
         注意 `insert_order()` 只是**入队**，真正的报文在下一次 `wait_update()` 才发出去。
         所以调用方下完单必须继续跑 `wait()` 循环，否则单子永远不会到交易所。
         """
@@ -732,6 +761,7 @@ class LiveHub:
                 f"今日报单已达 {daylimit.DAY_ORDER_LIMIT} 次上限，"
                 "再发会被交易所限制交易，明天再来"
             )
+        direction, offset = self._stock_side(symbol, direction, offset)
         kwargs = {}
         if limit_price is not None and limit_price > 0:
             kwargs["limit_price"] = float(limit_price)
@@ -742,6 +772,23 @@ class LiveHub:
         )
         self._order_book[order.order_id] = order
         return order.order_id
+
+    @staticmethod
+    def _stock_side(symbol: str, direction: str, offset: str) -> tuple[str, str]:
+        """A 股的方向 / 开平：`BUY→OPEN`、`SELL→CLOSE`，别的一律不收。
+
+        股票没有「开空 / 平空」，也没有平今（T+1 只能平昨仓）。天勤的股票账户
+        收到 `SELL + CLOSETODAY` 会直接拒单，报错信息还是一句英文 —— 不如在
+        这里挡掉，顺带把语义讲清楚。
+        """
+        if not is_stock(symbol):
+            return direction, offset
+        d = str(direction or "").upper()
+        if d not in ("BUY", "SELL"):
+            raise ValueError(f"A 股只能 BUY / SELL，收到 {direction}")
+        if d == "BUY":
+            return "BUY", "OPEN"
+        return "SELL", "CLOSE"
 
     def cancel(self, order_id: str, account: str = "") -> None:
         """撤单。同样是入队，下一次 `wait_update()` 才发。

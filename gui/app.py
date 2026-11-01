@@ -102,6 +102,7 @@ from ttrade import cross as cross_engine
 from ttrade import factor_strategy as fstrat
 from ttrade import replay
 from ttrade import strategy_store as SStore
+from ttrade.tqsdk_symbols import contract_key
 from ttrade import strategy_templates as TPL
 from gui.agent_page import AgentPage
 from gui.data_page import DataPage
@@ -441,17 +442,37 @@ MARKETS = {
 }
 
 
-# 五个平行大页面的序号。`_page_btns` 和 `_switch_page` 都按这个顺序排，
+# 六个平行大页面的序号。`_page_btns` 和 `_switch_page` 都按这个顺序排，
 # 别再写裸数字 —— 加一页要改十几处 `if idx == 3`
 PAGE_STUDY = 0
 PAGE_TRADE = 1
 PAGE_PORT = 2
 PAGE_AGENT = 3
-PAGE_DATA = 4
+PAGE_VERIFY = 4
+PAGE_DATA = 5
 
 # 启动落在哪一页。这套系统的主题是 Agent 量化：先跟它说清楚要什么，
 # 研究页是它调出来的工具页，不是入口
 DEFAULT_PAGE = PAGE_AGENT
+
+
+def split_key(key: str) -> tuple[str, str]:
+    """品种键拆成 (代号, 交易所)。
+
+    - 期货 `RB_SHFE` → (`RB`, `SHFE`)
+    - A 股 `SSE.600000` → (`SSE.600000`, `SSE`) —— 代码里自带交易所，不能再按
+      下划线拆（拆出来是 ("", "SSE.600000")）
+    - 美股 `AAPL` → (`AAPL`, ``)
+    """
+    k = str(key or "")
+    if "." in k:
+        head = k.split(".", 1)[0].upper()
+        if head in ("SSE", "SZSE", "BSE"):
+            return k, head
+    sym, _, ex = k.rpartition("_")
+    if ex and ex.isalpha() and ex.isupper():
+        return sym, ex
+    return k, ""
 
 
 def load_futures_csv(key: str, data_dir: str) -> pd.DataFrame:
@@ -696,7 +717,13 @@ class DataStore:
                 df = SS.load_one_tq(code, "1d")
             adj = SS.load_one_adj(code)
         elif period == PERIOD_1D_TQ:
+            # 「日线（天勤）」这一档优先天勤，但**必须能退回 Tushare**：
+            # 天勤股票日线要专业版，绝大多数账户根本没有这张表。以前这里没有
+            # 兜底，选中「日线（天勤）」就是一片空白 —— 参数栏摆着品种、图上
+            # 一根 K 线都没有，看起来像数据坏了
             df = SS.load_one_tq(code, "1d")
+            if df is None or df.empty:
+                df = SS.load_one_ts(code)
             adj = SS.load_one_adj(code)
         else:
             # 分钟级：天勤表
@@ -1048,6 +1075,12 @@ class MainWindow(QMainWindow):
         # store，因为它不跟当前市场走（可能在看美股、却问螺纹）
         self.agent_page.attach(self.stores)
         self.pages.addWidget(self.agent_page)
+        # 策略验证：逐根重放 + 前视偏差检测。取的是研究页当前那套配置，
+        # 所以它必须排在研究页之后、数据页之前 —— 按钮条的序号和栈索引一一对应
+        from gui.verify_page import VerifyPage
+
+        self.verify_page = VerifyPage()
+        self.pages.addWidget(self.verify_page)
         # 市场单选归数据页自己管（和本页的品种类别解耦），这里只把两个市场的
         # 标签和目录递进去，省得数据页反过来 import 主窗口造成循环依赖
         self.data_page = DataPage(MARKETS)
@@ -1096,10 +1129,15 @@ class MainWindow(QMainWindow):
             "ChanAgent · Chan Quant Agent AI\n"
             "大模型助手：自然语言生成因子 / 策略 / 研报、读附件、扫全市场、一句话下单"
         )
+        self.btn_page_verify = QPushButton("策略验证")
+        self.btn_page_verify.setToolTip(
+            "策略验证 · 逐根重放 + 前视偏差检测\n"
+            "把当前 bar 之后的数据改掉重算：信号变了就说明因子偷看了未来"
+        )
         self.btn_page_data = QPushButton("数据管理")
         self._page_btns = (
-            self.btn_page_study, self.btn_page_trade,
-            self.btn_page_port, self.btn_page_agent, self.btn_page_data,
+            self.btn_page_study, self.btn_page_trade, self.btn_page_port,
+            self.btn_page_agent, self.btn_page_verify, self.btn_page_data,
         )
         for i, b in enumerate(self._page_btns):
             b.setObjectName("PageTab")
@@ -1244,9 +1282,12 @@ class MainWindow(QMainWindow):
             cfg.note = note
             return cfg, ""
 
+        # A 股代码三种写法（`600000` / `600000.SH` / `SSE.600000`）先收敛，
+        # 否则模型说「用茅台回测双均线」会被回一句「品种不存在」
+        sym, ex = SStore.normalize_symbol(p.get("symbol", ""), p.get("exchange", ""))
         return SStore.StrategyConfig(
-            symbol=p.get("symbol", ""),
-            exchange=p.get("exchange", ""),
+            symbol=sym,
+            exchange=ex,
             period=p.get("period", "1d"),
             rule_key=key,
             rule_params=dict(p.get("params") or {}),
@@ -1269,12 +1310,19 @@ class MainWindow(QMainWindow):
             # 解析失败就直接返回了，标记挂着会让下一次用户自己点的回测莫名
             # 触发一轮对话
             self.agent_page.begin_backtest_feedback()
-            # 结果落在「策略交易和组合」，**不**切到「策略研究」：那边是用户手上
-            # 正在调的那套参数，模型问一句就把它冲掉说不过去。五个结果页
-            # （K线 / 绩效 / 因子 / 交易记录 / 阶段分析）组合页都挂得上。
-            self._switch_page(PAGE_PORT)
-            self._publish(self.portfolio_page.show_config(cfg, note="Agent 回测"), False)
+            # 结果落在**策略研究页**，并顺手把配置灌回那排控件。
+            #
+            # 早先这里是切到「策略交易和组合」再 `show_config`，理由是「研究页是
+            # 用户手上正在调的那套参数，模型问一句就把它冲掉说不过去」。但实际用
+            # 下来相反：模型跑完回测，用户十次有九次是接着在那儿改参数再跑一遍，
+            # 结果落在组合页意味着「改参数得先切页、再把配置重灌一遍」。而且组合
+            # 页只有结果，没有参数面板，看完想调一下无从下手。
+            #
+            # 灌配置期间（切市场 / 换品种 / 换策略各触发一次重算）只把最后一次
+            # 结果发出去，见 `_on_agent_study` 里的 `_pub_guard`。
+            self._on_agent_study(cfg)
             return
+
 
         if action.kind != "trade":
             return
@@ -1301,9 +1349,8 @@ class MainWindow(QMainWindow):
         合约代码必须取实时会话的 `underlying`（真实主力），不能拿品种名拼 ——
         主连 `KQ.m@` 只能看行情、不能下单。
         """
-        sym = p.get("symbol", "")
-        ex = p.get("exchange", "")
-        want = f"{sym}_{ex}" if ex else sym
+        sym, ex = SStore.normalize_symbol(p.get("symbol", ""), p.get("exchange", ""))
+        want = contract_key(sym, ex)
         if not self.live.running or self._live_state is None:
             self.agent_page.notify("还没连上天勤，先到「账户透视和交易」连上账户", bad=True)
             return
@@ -3349,6 +3396,11 @@ class MainWindow(QMainWindow):
         skey = self.cb_symbol.currentData() or ""
         if self.market == "cn":
             sym, _, ex = skey.rpartition("_")
+        elif self.market == "cn_stock":
+            # A 股的键是 `SSE.600000`：代号里自带交易所，拆出来存进 exchange，
+            # 保存 / 恢复 / 组合页都靠它判市场（见 `replay.market_of`）
+            ex = skey.split(".", 1)[0] if "." in skey else ""
+            sym = skey
         else:
             # 美股的 key 就是代码本身（AAPL），没有「交易所」这一维。
             # 不能一律 rpartition("_")：AAPL 会被拆成 ("", "", "AAPL")。
@@ -3405,15 +3457,18 @@ class MainWindow(QMainWindow):
 
         顺序不能乱：切市场会重建品种列表，所以必须先把市场切过去，再找品种。
         """
-        mk = "cn" if cfg.exchange else "us"
+        mk = cfg.market
         i = self.cb_market.findData(mk)
         if i >= 0 and i != self.cb_market.currentIndex():
             self.cb_market.setCurrentIndex(i)      # 同步触发 _on_market_changed
 
-        skey = f"{cfg.symbol}_{cfg.exchange}" if cfg.exchange else cfg.symbol
+        # 用 `cfg.key()` 而不是自己拼：A 股的代码里本来就带交易所前缀
+        # （`SSE.600000`），再拼一次 `SSE.600000_SSE` 就永远找不到
+        skey = cfg.key()
         j = self.cb_symbol.findData(skey)
         if j >= 0:
             self.cb_symbol.setCurrentIndex(j)
+
         k = self.cb_period.findData(cfg.period)
         if k >= 0:
             self.cb_period.setCurrentIndex(k)
@@ -4618,9 +4673,11 @@ class MainWindow(QMainWindow):
         item = self._current_item()
         if not item:
             return None
-        key = item["key"]
-        sym, _, ex = key.rpartition("_")
-        if not sym or not ex:
+        sym, ex = split_key(item["key"])
+        if not sym:
+            return None
+        # 美股没有交易所这一维，`(AAPL, "")` 是合法的
+        if not ex and self.market != "us":
             return None
         return sym, ex
 
@@ -4641,8 +4698,8 @@ class MainWindow(QMainWindow):
         的 K 线照样会跟着实时刷新 —— 走的是同一条 `_on_live_bars`，不用再单开
         一个连接。
         """
-        if self.market != "cn":
-            self.trade_page.on_failed("交易只接了国内期货")
+        if self.market not in ("cn", "cn_stock"):
+            self.trade_page.on_failed("交易只接了国内期货 / A 股")
             return
         if not specs:
             self.trade_page.on_failed("先在账户列表里勾选要连接的账户")
@@ -4678,8 +4735,8 @@ class MainWindow(QMainWindow):
 
     def _start_study_live(self) -> str:
         """起研究页的行情会话。返回空串表示已经发出去，否则是要显示的原因。"""
-        if self.market != "cn":
-            return "实时行情只接了国内期货"
+        if self.market not in ("cn", "cn_stock"):
+            return "实时行情只接了国内期货 / A 股"
         pair = self._current_pair()
         if pair is None:
             return "先选一个品种"
@@ -4728,7 +4785,7 @@ class MainWindow(QMainWindow):
         self._live_started_from(key, "study")
 
     def _live_started_from(self, key: str, src: str) -> None:
-        sym, _, ex = key.rpartition("_")
+        sym, _ex = split_key(key)
         self._live_key = key
         # 图归最后启动的那条会话。两条同时跑时（研究页点了实时、交易页也连着），
         # 让各自的推送都往上画会互相把 `_live_last` 顶掉，表现是「一根 bar 反复重算」。
@@ -4825,7 +4882,7 @@ class MainWindow(QMainWindow):
         if self._closing or live_df is None or live_df.empty:
             return
         pair = self._current_pair()
-        if pair is None or self._live_key != f"{pair[0]}_{pair[1]}":
+        if pair is None or self._live_key != contract_key(pair[0], pair[1]):
             return          # 推送还是上一个品种的，丢掉
         if self._live_period and self._live_period != self._period():
             return          # 品种对上了但周期不一样（交易页按 5m 连的，研究页在看日线）
@@ -4892,7 +4949,7 @@ class MainWindow(QMainWindow):
         item = self._current_item()
         sym = item.get("symbol") or item.get("key") or ""
         ex = item.get("exchange") or ""
-        head = f"{sym}_{ex}" if ex else sym
+        head = contract_key(sym, ex)
         period = self._period()
         rp = replay.Replay(
             df=self.df_sig, raw=self.df_raw, res=self.res, bh=self.bh,

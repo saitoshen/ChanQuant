@@ -41,10 +41,23 @@ MARKET_COST = {
     "cn_stock": {"fee": 0.0008, "slippage": 0.001, "allow_short": False},
 }
 
+# A 股的交易所代号。期货的交易所是 SHFE / DCE / CZCE / INE / CFFEX / GFEX，
+# 和这两个不重叠，所以「交易所名」足以判断市场，不必额外存一个 market 字段。
+STOCK_EXCHANGES = ("SSE", "SZSE")
+
 
 def market_of(cfg) -> str:
-    """配置属于哪个市场。有交易所就是期货，没有就是美股 —— 和研究页的判据一致。"""
-    return "cn" if getattr(cfg, "exchange", "") else "us"
+    """配置属于哪个市场。
+
+    A 股和期货都带交易所，靠交易所名区分：`SSE` / `SZSE` 是 A 股，其余
+    （SHFE / DCE / CZCE / INE / CFFEX / GFEX）是期货；交易所为空是美股。
+    这个判据和「策略研究」页的 `self.market` 保持一致 —— 两边不一致的话，
+    组合页会用期货的手续费去回放一条 A 股策略。
+    """
+    ex = str(getattr(cfg, "exchange", "") or "").upper()
+    if ex in STOCK_EXCHANGES:
+        return "cn_stock"
+    return "cn" if ex else "us"
 
 
 def make_bt(market: str, allow_short: bool = False,

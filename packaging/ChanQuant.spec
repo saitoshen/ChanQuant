@@ -32,7 +32,7 @@ APP_NAME = "ChanQuant"
 BUNDLE_ID = "com.chanquant.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
@@ -82,6 +82,19 @@ if os.path.isdir(SKILLPACKS):
 EDB_JSON = os.path.join(ROOT, "ttrade", "edb_indicators.json")
 if os.path.isfile(EDB_JSON):
     DATAS.append((EDB_JSON, "ttrade"))
+
+# CTP 客户端是**可选**的：openctp-ctp 只有 Windows / Linux 的 wheel，macOS 上
+# 根本装不了。装了就把它的 .pyd 一起打进去，没装就跳过 —— 不能因为「这个平台
+# 没有这个包」让整个构建失败。运行时 `ttrade.ctp_client` 用 try/except 导入，
+# 缺了只影响 CTP 那一块，自检会照实报「未安装」。
+try:
+    import openctp_ctp  # noqa: F401
+
+    DATAS += collect_data_files("openctp_ctp")
+    HIDDEN_CTP = ["openctp_ctp", "openctp_ctp.thostmduserapi",
+                  "openctp_ctp.thosttraderapi"]
+except Exception:  # noqa: BLE001 - 没装 / DLL 加载失败都走这里
+    HIDDEN_CTP = []
 
 # 动态导入的模块，静态分析扫不到，必须显式声明
 HIDDEN = [
@@ -134,6 +147,11 @@ HIDDEN = [
     # 静态分析本来扫得到，但它们是最近才拆出来的模块，列在这里免得以后挪成
     # 函数内 import 时忘了补 —— 那时表现是「双击策略没反应」
     "gui.result_view",
+    # 策略验证页：在 `_build_ui` 里函数内 import（页面栈按顺序建，顶层 import 会
+    # 变成环）。PyInstaller 的静态分析看不到函数内 import，漏了就是**启动即崩**
+    # —— 建窗口时 ImportError，自检那一步会红，而且报错还看不出是打包的问题
+    "gui.verify_page",
+    "ttrade.verify",
     # Skills 管理窗口：点「Skills」按钮时才 import，漏了就是点了没反应
     "gui.skills_dialog",
     "ttrade.skillpacks",
@@ -159,7 +177,9 @@ HIDDEN = [
     "openpyxl",
     "openpyxl.cell._writer",
     "pypdf",
-]
+    # CTP 客户端。只在装了 openctp-ctp 的平台上有（Windows），没装就是空列表
+    "ttrade.ctp_client",
+] + HIDDEN_CTP
 
 # 用不到的重量级依赖，剔掉能省 100MB 以上
 EXCLUDES = [

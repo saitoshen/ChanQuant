@@ -2,8 +2,9 @@
 
 ## 为什么 handler 是空的
 
-这两个动作要动界面的状态 —— 回测要在「策略交易和组合」页跑一遍并把五张图刷出来，
-下单要拿到实时会话的真实主力合约。`ttrade` 里做不了，也不该做。
+这两个动作要动界面的状态 —— 回测要在「策略研究」页套上配置跑一遍、把 K 线 /
+绩效 / 因子 / 交易记录 / 阶段分析刷出来（用户接着就能在那儿调参数再跑），下单
+要拿到实时会话的真实主力合约。`ttrade` 里做不了，也不该做。
 
 所以这里只负责**协议**：字段长什么样、哪些组合合法、`describe()` 怎么给人看。
 真正的执行挂在 `ui="signal"`，由界面层 `trade_requested` 信号接走。
@@ -106,7 +107,7 @@ register(Tool(
     interrupt="cancel",
     max_result_chars=12000,
     label="跑回测",
-    description="按指定品种/周期/策略跑一遍回测，结果显示在组合页",
+    description="按指定品种/周期/策略跑一遍回测，结果显示在策略研究页（可以直接接着调参数）",
     risk=RISK_READ,
     inputSchema=_BT_SCHEMA,
     prepare=prepare_backtest,

@@ -45,6 +45,11 @@ def _bars(ctx, symbol: str, period: str) -> pd.DataFrame:
     key = str(symbol or "").strip()
     if not key:
         raise ValueError("要指定品种")
+    # A 股代码三种写法（`600000` / `600000.SH` / `SSE.600000`）先收敛到品种池
+    # 里的键。模型只看得见对话和截图，不该指望它记住我们的命名规则
+    from ttrade.strategy_store import normalize_symbol
+
+    key, _ex = normalize_symbol(key)
     df = store.get(key, str(period or "1d"))
     if df is not None and not df.empty:
         return df

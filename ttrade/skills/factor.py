@@ -34,6 +34,10 @@ def _factors():
     return FACTORS
 
 
+# 市场代号 → 中文名。和界面 `MARKETS` 的 label 对齐，Agent 报给用户时要能看懂
+MARKET_CN = {"cn": "国内期货", "us": "美股", "cn_stock": "A 股"}
+
+
 def _norm(s: str) -> str:
     return str(s or "").strip().lower()
 
@@ -43,21 +47,48 @@ def _match(key: str, label: str, q: str) -> bool:
     return not q or q in key.lower() or q in label
 
 
+def _market_ok(spec, market: str) -> bool:
+    """这个因子在指定市场上可不可见（和界面的 `filter_by_market` 同一套判据）。"""
+    mk = _norm(market)
+    if not mk:
+        return True
+    marks = tuple(getattr(spec, "markets", ()) or ())
+    return not marks or mk in marks
+
+
+def _markets_text(spec) -> str:
+    marks = tuple(getattr(spec, "markets", ()) or ())
+    if not marks:
+        return "通用"
+    return "、".join(MARKET_CN.get(m, m) for m in marks)
+
+
+def _market_of_symbol(symbol: str) -> str:
+    """从品种键反推市场。和 `replay.market_of()` 同一套判据。"""
+    s = str(symbol or "")
+    if "." in s:
+        return "cn_stock" if s.split(".", 1)[0].upper() in ("SSE", "SZSE", "BSE") else "cn"
+    return "cn" if "_" in s else "us"
+
+
 # ------------------------------------------------------------------ factor_list
 
 def _factor_list(ctx, p: dict) -> SkillResult:
     factors = _factors()
     cat = str(p.get("category") or "").strip()
     q = str(p.get("query") or "").strip()
+    market = _norm(p.get("market"))
 
     rows, cats = [], {}
     for k, spec in factors.items():
+        if not _market_ok(spec, market):
+            continue
         cats[spec.category] = cats.get(spec.category, 0) + 1
         if cat and cat not in spec.category:
             continue
         if not _match(k, spec.label, q):
             continue
-        rows.append([k, spec.label, spec.category,
+        rows.append([k, spec.label, spec.category, _markets_text(spec),
                      {"1": "偏涨", "-1": "偏跌", "0": "无"}.get(str(spec.hint_dir), "无"),
                      spec.desc[:40]])
 
@@ -67,16 +98,17 @@ def _factor_list(ctx, p: dict) -> SkillResult:
 
     shown = rows[:MAX_LISTED]
     note = f"共 {len(rows)} 个" + (f"｜只列前 {MAX_LISTED} 个" if len(rows) > MAX_LISTED else "")
+    title = f"因子库 · {MARKET_CN.get(market, market)}" if market else "因子库"
     blocks = [
-        B.block_metrics("因子库", [
+        B.block_metrics(title, [
             ("总数", str(len(factors)), "flat"),
             ("类别", str(len(cats)), "flat"),
             ("本次", f"{len(shown)} 个", "flat"),
         ]),
-        B.block_table(["代号", "名称", "类别", "历史倾向", "说明"], shown, note=note),
+        B.block_table(["代号", "名称", "类别", "适用市场", "历史倾向", "说明"], shown, note=note),
     ]
     feed = (f"因子库共 {len(factors)} 个（{len(cats)} 类）。"
-            + "；".join(f"{r[0]}={r[1]}（{r[2]}）" for r in rows[:40])
+            + "；".join(f"{r[0]}={r[1]}（{r[2]}｜{r[3]}）" for r in rows[:40])
             + (f"… 还有 {len(rows) - 40} 个" if len(rows) > 40 else ""))
     return SkillResult(True, summary=f"因子库共 {len(factors)} 个，本次列出 {len(shown)} 个",
                        blocks=blocks, feed=feed)
@@ -99,6 +131,7 @@ def _factor_info(ctx, p: dict) -> SkillResult:
         B.block_metrics(spec.label, [
             ("代号", spec.key, "flat"),
             ("类别", spec.category, "flat"),
+            ("适用市场", _markets_text(spec), "flat"),
             ("历史倾向", {"1": "偏涨", "-1": "偏跌", "0": "无"}.get(str(spec.hint_dir), "无"), "flat"),
         ]),
         B.block_text(spec.desc or "（没有说明）"),
@@ -115,7 +148,7 @@ def _factor_info(ctx, p: dict) -> SkillResult:
         except Exception:  # noqa: BLE001 - 手册里没有就只给说明
             pass
 
-    feed = f"{spec.label}（{spec.key}，{spec.category}）：{spec.desc}"
+    feed = f"{spec.label}（{spec.key}，{spec.category}｜{_markets_text(spec)}）：{spec.desc}"
     if spec.formula:
         feed += f"\n公式：{spec.formula}"
     if spec.code:
@@ -131,6 +164,7 @@ def _factor_check(ctx, p: dict) -> SkillResult:
     这是写新因子时最有用的一步：注册前先试算，比注册失败再看报错快一轮。
     """
     from ttrade.skills.data import _bars
+    from ttrade.strategy_store import normalize_symbol
 
     factors = _factors()
     key = _norm(p["factor"])
@@ -138,7 +172,9 @@ def _factor_check(ctx, p: dict) -> SkillResult:
     if spec is None:
         raise RuntimeError(f"没有名为 {key} 的因子")
 
-    df = _bars(ctx, p["symbol"], p.get("period", "1d"))
+    # A 股代码三种写法先收敛（`600000` / `600000.SH` / `SSE.600000`）
+    sym, _ex = normalize_symbol(p["symbol"], p.get("exchange", ""))
+    df = _bars(ctx, sym, p.get("period", "1d"))
     try:
         series = spec.func(df)
     except Exception as exc:  # noqa: BLE001 - 试算失败就是要报给人看
@@ -157,9 +193,17 @@ def _factor_check(ctx, p: dict) -> SkillResult:
     valid = series.dropna()
     n = len(valid)
     if not n:
+        mk = _market_of_symbol(sym)
+        if not _market_ok(spec, mk):
+            raise RuntimeError(
+                f"{key} 是{_markets_text(spec)}专属因子，{sym} 属于"
+                f"{MARKET_CN.get(mk, mk)}，两边对不上 —— 整列为空是正常的，"
+                "不是数据没下。换一个同市场的品种，或换一个通用因子"
+            )
         raise RuntimeError(
-            f"{key} 在 {p['symbol']} 的 {p.get('period', '1d')} 上整列为空 —— "
-            "多半是这类因子只在分钟线上有效（日内 / 时段类）"
+            f"{key} 在 {sym} 的 {p.get('period', '1d')} 上整列为空 —— "
+            "多半是这类因子只在分钟线上有效（日内 / 时段类），"
+            "或者这个品种的辅助数据（基本面 / 资金流 / 持仓量）还没下载"
         )
 
     last = float(valid.iloc[-1])
@@ -191,11 +235,16 @@ register(Tool(
         "properties": {
             "category": {"type": "str", "default": ""},
             "query": {"type": "str", "default": ""},
+            "market": {"type": "str", "default": "",
+                       "enum": ["", "cn", "us", "cn_stock"]},
         },
     },
     handler=_factor_list,
     prompt=(
         "**查因子库**：`factor_list(category=\"趋势\")` 或 `factor_list(query=\"动量\")`。"
+        "问「A 股有哪些基本面因子」就 `factor_list(category=\"基本面\", market=\"cn_stock\")`"
+        "（market 取 cn=国内期货 / us=美股 / cn_stock=A 股，留空=全部）。"
+        "返回表里有一列「适用市场」，`通用` 表示三个市场都能算。"
         "用户问「有没有 XX 因子 / 库里都有什么」时用它，别凭印象报因子名。"
     ),
 ))
@@ -231,12 +280,14 @@ register(Tool(
         "properties": {
             "factor": {"type": "str"},
             "symbol": {"type": "str"},
+            "exchange": {"type": "str", "default": ""},
             "period": {"type": "str", "default": "1d"},
         },
     },
     handler=_factor_check,
     prompt=(
         "**试算因子**：`factor_check(factor=\"mom_20\", symbol=\"RB_SHFE\")`。"
+        "A 股写 `symbol=\"600000\"`（或 `SSE.600000`）都行，会自动收敛。"
         "写新因子前先用它验证契约（等长、PIT、不留 NaN 尾巴），比注册失败再看报错快一轮。"
     ),
 ))

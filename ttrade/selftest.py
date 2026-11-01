@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import traceback
 
 
@@ -643,6 +644,43 @@ def _run() -> tuple[bool, list[str]]:
 
     check("Qt 平台插件", _qt)
 
+    def _ctp():
+        """CTP 客户端：装没装都要能跑，装了就得能构造出正确的报单参数。
+
+        `openctp-ctp` 只有 Windows / Linux 的 wheel，macOS 上没有 —— 所以这条
+        自检**不能因为没装就红**，否则 macOS 三平台构建全挂。真正要验的是
+        「没装时优雅降级」和「装了时交易所解析 / 开平映射是对的」。
+        """
+        from ttrade import ctp_client as C
+
+        cfg = C.CtpConfig(preset="simnow_7x24").fill_preset()
+        assert cfg.md_front.startswith("tcp://"), f"预设没填上：{cfg.md_front!r}"
+        assert cfg.td_front.startswith("tcp://"), f"预设没填上：{cfg.td_front!r}"
+        # 自定义前置不能被预设覆盖
+        mine = C.CtpConfig(preset="simnow_7x24", md_front="tcp://1.2.3.4:1000").fill_preset()
+        assert mine.md_front == "tcp://1.2.3.4:1000", "手填的前置地址被预设覆盖了"
+
+        tr = C.TraderClient(cfg)
+        cases = {"rb2601": "SHFE", "TA701": "CZCE", "IF2412": "CFFEX",
+                 "sc2412": "INE", "m2501": "DCE", "si2411": "GFEX",
+                 "cu2601": "SHFE", "SR701": "CZCE"}
+        bad = {k: tr._exchange_of(k) for k, v in cases.items() if tr._exchange_of(k) != v}
+        assert not bad, f"交易所解析错了：{bad}"
+
+        # 下单参数校验：没登录就该直接报错，而不是静默返回一个空单号
+        try:
+            tr.place("rb2601", "BUY", "OPEN", 3000.0, 1)
+        except C.CtpError:
+            pass
+        else:
+            raise RuntimeError("没登录时 place() 竟然没报错")
+
+        if not C.HAS_CTP:
+            return f"openctp-ctp 未安装（CTP 不可用，其余功能不受影响）：{C.CTP_IMPORT_ERROR[:60]}"
+        return f"openctp-ctp 已装，{len(cases)} 个合约的交易所解析正确"
+
+    check("CTP 客户端（可选依赖）", _ctp)
+
     def _window():
         """真正把主窗口搭起来，验证 UI 代码在打包后也能跑通。"""
         from PySide6.QtWidgets import QApplication
@@ -724,9 +762,11 @@ def _run() -> tuple[bool, list[str]]:
 
         has_upd = (
             dp is not None
-            and win.pages.count() == 5
-            and len(win._page_btns) == 5
-            and win.pages.widget(4) is dp
+            and win.pages.count() == 6
+            and len(win._page_btns) == 6
+            and win.pages.widget(5) is dp
+            # 策略验证页排在数据页之前，序号要和按钮条对得上
+            and win.pages.widget(4) is getattr(win, "verify_page", None)
             and dp.market == win.market
             and not dp.busy()
             and dp.cb_upd_range.count() == len(_upd.RANGES)
@@ -1099,6 +1139,38 @@ def _run() -> tuple[bool, list[str]]:
         wheel_ok = w1 < w0 and w3 > w2
         wheel_info = f"{w0}→{w1}→{w3} 根"
 
+        # 策略验证页：取研究页当前策略 → 跑一遍前视检测 → 检查点表要有行，
+        # 而且结论必须是「一致」（内置策略不该有前视偏差）。这条同时验了后台
+        # 线程收尾、表格填充和重放画图 —— 三处都只在真的跑起来时才可能出错
+        verify_ok = False
+        verify_info = ""
+        try:
+            vp = getattr(win, "verify_page", None)
+            win._switch_page(4)
+            app.processEvents()
+            vp._take_from_study()
+            app.processEvents()
+            vp._start_check()
+            t0 = time.time()
+            while vp._thread is not None and time.time() - t0 < 120:
+                app.processEvents()
+                time.sleep(0.05)
+            rep = vp.report
+            verify_ok = (
+                rep is not None
+                and rep.ok
+                and len(rep.checks) >= 4
+                and vp.tbl_check.rowCount() == len(rep.checks)
+                and len(rep.df) > 0
+            )
+            verify_info = (f"{len(rep.checks)} 个检查点全一致" if rep is not None
+                           and rep.ok else (vp.lbl_verdict.text()[:80] or "没跑出结果"))
+        except Exception as exc:  # noqa: BLE001
+            verify_info = f"{type(exc).__name__}: {exc}"
+        finally:
+            win._switch_page(0)
+            app.processEvents()
+
         # 组合报告：两条策略等权。一次验三件事 —— 组合页能不能复用同一套
         # 结果视图（不能就是一片空白）、组合有没有三页（绩效/交易/阶段）、
         # 绩效表是不是只有两列（多出「买入持有」那列说明还在按单策略画）
@@ -1275,8 +1347,14 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"因子分析页只有 {n_rows} 行，应为 {n_factors}")
         if n_axes != 4:
             raise RuntimeError(f"因子分析页图轴数为 {n_axes}，应为 4")
+        if not verify_ok:
+            raise RuntimeError(
+                f"策略验证页异常（{verify_info}）：取不到当前策略、前视检测跑不出"
+                "检查点，或者检查点表没填上"
+            )
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
-                f"{factor_info}，滚轮缩放 {wheel_info}，组合 {combo_info}，"
+                f"{factor_info}，滚轮缩放 {wheel_info}，策略验证 {verify_info}，"
+                f"组合 {combo_info}，"
                 f"截面 {cross_info}，"
                 f"回测区间 {range_info}，实时开关已复位，"
                 f"数据管理页就绪，手册 {manual_info}，输出 {out_info}，"

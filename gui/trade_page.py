@@ -165,6 +165,8 @@ class AccountDialog(QDialog):
 
         self.hint = QLabel(
             "快期模拟只需要天勤账户；实盘才需要期货公司代码与资金账号。\n"
+            "股票模拟（TqSimStock / TqKqStock）用同一个天勤账户，但**数量单位是股**"
+            "（100 股起、必须整百），方向只有买入 / 卖出，T+1 当天买的当天不能卖。\n"
             "密码明文存在本机用户目录，不会进仓库。"
         )
         self.hint.setObjectName("Hint")
@@ -208,6 +210,10 @@ class TradePage(QWidget):
         self._state = LiveState()
         self._sig: dict[str, object] = {}     # 每张表上次画的内容，没变就不重画
         self._accounts: list[AccountSpec] = tqlive.load_accounts()
+        # 下单面板要不要按「股票口径」显示（股数 / 只有买卖 / 没有平今）。
+        # 判据是**勾选的账户**：全是股票账户才算，混着连的时候按期货走 ——
+        # 一单同时下到期货和股票账户本来就不成立
+        self._stock_mode = False
         self._build()
         # 默认全勾：以前是「下拉框选中谁就连谁」，现在多个账户并存，全勾等于
         # 保持原来的行为；用户想只连一个，取消其余勾选即可
@@ -424,7 +430,8 @@ class TradePage(QWidget):
             self.cb_offset.addItem(label, key)
         lay.addWidget(self.cb_offset)
 
-        lay.addWidget(QLabel("手数"))
+        self.lbl_vol = QLabel("手数")
+        lay.addWidget(self.lbl_vol)
         self.sp_vol = QSpinBox()
         self.sp_vol.setRange(1, 9999)
         lay.addWidget(self.sp_vol)
@@ -476,6 +483,38 @@ class TradePage(QWidget):
                 t.setItem(i, j, QTableWidgetItem("—"))
         self._filling = False
         self._fit_columns(t, skip=0)
+        self._sync_stock_mode()
+
+    def _sync_stock_mode(self) -> None:
+        """按勾选的账户决定下单面板是「手」还是「股」。
+
+        股票账户：数量单位是股（100 股起、整百），开平由方向决定（买=开仓、
+        卖=平仓），没有平今（T+1）。这些不是界面上的修饰，是交易所规则 ——
+        界面上写「手」而实际下的是股，用户会按 100 倍下错单。
+        """
+        sel = self._checked_specs() or self._accounts
+        stock = bool(sel) and all(s.is_stock for s in sel)
+        self._stock_mode = stock
+        if not hasattr(self, "lbl_vol"):
+            return
+        self.lbl_vol.setText("股数" if stock else "手数")
+        self.sp_vol.blockSignals(True)
+        if stock:
+            self.sp_vol.setRange(100, 9_999_900)
+            self.sp_vol.setSingleStep(100)
+            if self.sp_vol.value() < 100:
+                self.sp_vol.setValue(100)
+            self.cb_offset.setEnabled(False)
+            self.cb_offset.setToolTip(
+                "股票按方向定开平：买入=开仓、卖出=平仓。T+1，当天买的不能当天卖")
+            self.cb_contract.setToolTip("A 股代码，如 SSE.600000 / SZSE.000001")
+        else:
+            self.sp_vol.setRange(1, 9999)
+            self.sp_vol.setSingleStep(1)
+            self.cb_offset.setEnabled(True)
+            self.cb_offset.setToolTip("")
+            self.cb_contract.setToolTip("可手动输入，如 SHFE.rb2601")
+        self.sp_vol.blockSignals(False)
 
     def _checked_specs(self) -> list[AccountSpec]:
         return [s for s in self._accounts if s.name in self._checked]
@@ -497,6 +536,9 @@ class TradePage(QWidget):
             self._checked.add(name)
         else:
             self._checked.discard(name)
+        # 勾选可能把「期货 + 股票」的混合变成纯股票（或反过来），
+        # 下单面板的单位和开平要跟着变
+        self._sync_stock_mode()
         self._refresh_view()
 
     def _on_acct_dbl(self, item: QTableWidgetItem) -> None:
@@ -509,6 +551,7 @@ class TradePage(QWidget):
             if it is not None:
                 it.setCheckState(Qt.Checked if i == item.row() else Qt.Unchecked)
         self._filling = False
+        self._sync_stock_mode()
         self._refresh_view()
 
     def _check_all(self, on: bool) -> None:
@@ -814,9 +857,10 @@ class TradePage(QWidget):
             account=acc,
         )
         if ok:
+            unit = "股" if self._stock_mode else "手"
             self.lbl_order_msg.setText(
                 f"已提交 {self.cb_dir.currentText()} {self.cb_offset.currentText()} "
-                f"{contract} {self.sp_vol.value()} 手"
+                f"{contract} {self.sp_vol.value()} {unit}"
                 + (f"（{acc}）" if acc else "")
             )
 

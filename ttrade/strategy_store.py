@@ -43,6 +43,53 @@ LAST_FILE = "last_config.json"
 # 放一处免得两边慢慢走偏
 _WEIGHT_CN = {"risk": "风险平价", "equal": "等权", "score": "按分数", "tier": "分档"}
 
+# A 股的交易所代号。期货是 SHFE / DCE / CZCE / INE / CFFEX / GFEX，不重叠，
+# 所以「交易所名」足以判断市场。和 `replay.STOCK_EXCHANGES` 是同一份约定。
+_STOCK_EXCHANGES = ("SSE", "SZSE")
+
+# 交易所后缀（Tushare 写法）→ 天勤代号
+_TS_SUFFIX = {"SH": "SSE", "SZ": "SZSE", "BJ": "BSE"}
+
+
+def normalize_symbol(symbol: str, exchange: str = "") -> tuple[str, str]:
+    """把各种写法的 A 股代码收敛成「天勤代号 + 交易所」。
+
+    Agent 只看得见截图和对话，A 股代码它有三种写法：`600000`、`600000.SH`、
+    `SSE.600000`；交易所也可能是空的。三种都要认，否则模型报一次「用茅台回测
+    双均线」就会被回一句「品种不存在」，而它没有别的信息可用了。
+
+    期货（`RB` + `SHFE`）和美股（`AAPL` + 空）原样返回 —— 它们的键是拼出来的，
+    不需要在这里动。
+    """
+    sym = str(symbol or "").strip()
+    ex = str(exchange or "").strip().upper()
+    if not sym:
+        return sym, ex
+
+    # `SSE.600000` / `SZSE.000001`：代号里已经带了交易所
+    if "." in sym:
+        head, _, tail = sym.partition(".")
+        head_u = head.upper()
+        if head_u in _STOCK_EXCHANGES or head_u == "BSE":
+            return f"{head_u}.{tail}", head_u
+        # `600000.SH` 这种反过来写的
+        if head.isdigit() and tail.upper() in _TS_SUFFIX:
+            return f"{_TS_SUFFIX[tail.upper()]}.{head}", _TS_SUFFIX[tail.upper()]
+        return sym, ex
+
+    if ex in _STOCK_EXCHANGES or ex == "BSE":
+        return f"{ex}.{sym}", ex
+
+    # 纯 6 位数字：按首位判沪深（6/9 沪、0/3 深、4/8 北交所）
+    if sym.isdigit() and len(sym) == 6:
+        if sym[0] in "69":
+            return f"SSE.{sym}", "SSE"
+        if sym[0] in "03":
+            return f"SZSE.{sym}", "SZSE"
+        return f"BSE.{sym}", "BSE"
+    return sym, ex
+
+
 
 def _clamp_pct(value, dflt: float, hi: float) -> float:
     """百分比参数消毒：非数字 / NaN / 非正数退回默认，超上限就夹到上限。
@@ -190,8 +237,29 @@ class StrategyConfig:
         return self.principal * self.risk_pct / 100.0
 
     def key(self) -> str:
-        """品种键。美股的 exchange 是空的，不能拼出 `AAPL_` 这种尾巴。"""
+        """品种键，和 `DataStore` 里的键对齐。
+
+        - 美股：`AAPL`（exchange 是空的，不能拼出 `AAPL_` 这种尾巴）
+        - 期货：`RB_SHFE`
+        - A 股：`SSE.600000` —— **代码里本来就带交易所前缀**，再拼一次就成
+          `SSE.600000_SSE`，`cb_symbol.findData()` 找不到，恢复配置会静默失败
+        """
+        ex = str(self.exchange or "").upper()
+        if ex in _STOCK_EXCHANGES:
+            sym = str(self.symbol or "")
+            return sym if "." in sym else f"{ex}.{sym}"
         return f"{self.symbol}_{self.exchange}" if self.exchange else self.symbol
+
+    @property
+    def market(self) -> str:
+        """这条策略属于哪个市场（`us` / `cn` / `cn_stock`）。
+
+        判据只有交易所名，和 `replay.market_of()` 是同一套 —— 但那边是函数、
+        这边是属性，上层两边都在用，所以共用一份实现。
+        """
+        from ttrade import replay as _rp
+
+        return _rp.market_of(self)
 
     def title(self) -> str:
         """列表里显示的名字。用户没起名就用「品种 · 策略」。"""

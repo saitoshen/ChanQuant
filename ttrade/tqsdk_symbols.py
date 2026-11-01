@@ -78,6 +78,50 @@ def main_symbol(variety: str, exchange: str) -> str:
     return f"KQ.m@{TQ_EXCHANGE.get(exchange, exchange)}.{tq_product(variety, exchange)}"
 
 
+# A 股的交易所代号。股票和期货在实时链路上的差别只有一处：**股票没有主连**，
+# `SSE.600000` 本身就是可以订阅、可以直接下单的合约；期货得先拿到 `KQ.m@` 背后
+# 的真实主力才能下单。其余（订阅 K 线、下单、撤单、持仓）接口是同一套。
+STOCK_EXCHANGES = ("SSE", "SZSE", "BSE")
+
+
+def is_stock(symbol: str, exchange: str = "") -> bool:
+    """这个品种是不是 A 股。判据和 `replay.market_of()` 一致。"""
+    ex = str(exchange or "").strip().upper()
+    if ex in STOCK_EXCHANGES:
+        return True
+    sym = str(symbol or "").strip()
+    if "." in sym:
+        return sym.split(".", 1)[0].upper() in STOCK_EXCHANGES
+    return False
+
+
+def trade_symbol(symbol: str, exchange: str = "") -> str:
+    """实时订阅 / 下单用的天勤合约代码。
+
+    - 期货：主连 `KQ.m@SHFE.rb`（看行情），下单要换成 `underlying`
+    - A 股：代码本身 `SSE.600000`（既能看也能下单，没有主力合约这一说）
+    """
+    sym = str(symbol or "").strip()
+    if is_stock(sym, exchange):
+        if "." in sym:
+            return sym
+        return f"{str(exchange).upper()}.{sym}"
+    return main_symbol(sym, exchange)
+
+
+def contract_key(symbol: str, exchange: str = "") -> str:
+    """界面和库里通用的品种键。
+
+    期货拼 `RB_SHFE`，美股就是代码，A 股是 `SSE.600000` —— **代码里已经带了
+    交易所**，再拼一次会变成 `SSE.600000_SSE`，和 `DataStore` 的键对不上。
+    """
+    sym = str(symbol or "").strip()
+    if is_stock(sym, exchange):
+        return sym if "." in sym else f"{str(exchange).upper()}.{sym}"
+    ex = str(exchange or "").strip()
+    return f"{sym}_{ex}" if ex else sym
+
+
 def index_symbol(variety: str, exchange: str) -> str:
     """指数（加权）合约：`KQ.i@SHFE.rb`。"""
     return f"KQ.i@{TQ_EXCHANGE.get(exchange, exchange)}.{tq_product(variety, exchange)}"
