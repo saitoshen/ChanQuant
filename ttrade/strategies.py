@@ -92,6 +92,33 @@ def _position_state(
     return pos
 
 
+# ---------------------------------------------------------------- 基准策略
+# 买入持有 / 卖出持有是**基准**，不是 alpha 来源。它们的作用是给其它策略
+# 一个「什么都不做」的对照：一个趋势策略如果跑不赢同品种的买入持有，
+# 那它赚的是 beta 而不是择时，加杠杆只会放大回撤。
+def strat_buy_hold(df: pd.DataFrame) -> pd.DataFrame:
+    """买入持有：第一根 K 线就满仓做多，之后一直不动。
+
+    不看任何指标，也不设离场 —— 它度量的是「这个品种自己涨了多少」。
+    回测引擎在下一根开盘成交，所以第一根的 signal=1 对应第二根开盘建仓。
+    """
+    out = df.copy()
+    out["signal"] = np.ones(len(out), dtype=int)
+    return out
+
+
+def strat_sell_hold(df: pd.DataFrame) -> pd.DataFrame:
+    """卖出持有：第一根 K 线就满仓做空，之后一直不动。
+
+    商品期货天然可做空，所以「一直做空」是一个合法的基准。它等于买入持有
+    的镜像（扣掉资金成本之前，收益正好相反），用来判断一个多头策略是不是
+    只是「在下跌品种上做反了」。
+    """
+    out = df.copy()
+    out["signal"] = -np.ones(len(out), dtype=int)
+    return out
+
+
 # ---------------------------------------------------------------- 策略实现
 def strat_ma_cross(df: pd.DataFrame, fast: int = 50, slow: int = 200) -> pd.DataFrame:
     """双均线：快线在慢线上方做多，下方做空。对称反手，始终在市。"""
@@ -463,6 +490,26 @@ PARAM_LABELS = {
 
 
 STRATEGIES: dict[str, StrategySpec] = {
+    # 基准两条放最前面：策略库里第一条就是「买入持有」，用户一眼能看到
+    # 对照组的入口，不用翻到最后
+    "buy_hold": StrategySpec(
+        key="buy_hold",
+        label="买入持有（基准）",
+        func=strat_buy_hold,
+        params={},
+        param_meta={},
+        desc="第一根 K 线满仓做多、之后一直不动。不看指标，是其它策略的对照基准。",
+        bidirectional=False,
+    ),
+    "sell_hold": StrategySpec(
+        key="sell_hold",
+        label="卖出持有（基准）",
+        func=strat_sell_hold,
+        params={},
+        param_meta={},
+        desc="第一根 K 线满仓做空、之后一直不动。买入持有的镜像，用来判断多头策略是不是只是做反了。",
+        bidirectional=False,
+    ),
     "ma_cross": StrategySpec(
         key="ma_cross",
         label="双均线交叉",

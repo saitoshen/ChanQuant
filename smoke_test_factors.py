@@ -157,29 +157,44 @@ section("1. 因子库")
 # 按 47 这个硬数字量的话，用户存一条因子这条就红 —— 和策略文档那条同一个毛病
 BUILTIN = [k for k, s_ in F.FACTORS.items() if not s_.code]
 AUXISH = {k for k, s_ in F.FACTORS.items()
-          if s_.category.startswith("展期") or s_.category == "期权"}
+          if s_.category.startswith(F.AUX_CATEGORIES)}
 # 日线上整列空的：日内 6 + 时段 5。它们要分钟级行情才算得出来，这里的 DF 是
 # 合成日线，所以「算不出样本」是预期行为，不算失败（另有用例专门查这一条）
 NO_DAILY = {k for k, s_ in F.FACTORS.items() if s_.category in ("日内", "时段")}
-check("因子数量", len(BUILTIN) == 66,
+# 要外部库（EDB 基本面 / 宏观库）才有值的因子。干净检出时这两个库可能不存在，
+# 所以不参与「必须算出 100 个样本」的硬断言，另开一段按库是否在来判。
+EXT_DB = {k for k, s_ in F.FACTORS.items() if s_.category in ("基本面", "宏观")}
+# 只依赖 aux 列（真实合约 / 期权曲面）的那批，和外部库无关
+CURVE_KEYS = {k for k, s_ in F.FACTORS.items()
+              if s_.category.startswith(("展期", "期权"))}
+# A 股专属因子（markets 只有 cn_stock）：PE / 换手率 / 大单净买入 / 概念板块 /
+# 除权。这里的 DF 是合成期货日线，没有 stock.duckdb 那几张表，整列空是预期
+# 行为，不算失败 —— 它们由 smoke_test_tq.check_stock 单独验。
+STOCK_ONLY = {k for k, s_ in F.FACTORS.items() if s_.markets == ("cn_stock",)}
+check("因子数量", len(BUILTIN) == 136,
       f"内置 {len(BUILTIN)}，用户 {len(F.FACTORS) - len(BUILTIN)}")
 check("分类齐全",
       set(F.CATEGORIES) == {"趋势", "反转", "波动", "量能", "形态", "日内", "时段",
                             "展期", "展期 OI3", "展期 OI6", "期权",
-                            "季节性", "品种季节"},
+                            "季节性", "品种季节", "基本面", "板块行业", "宏观",
+                            "资金流", "概念板块", "除权"},
       str(F.CATEGORIES))
-check("展期/期权因子都登记进 AUX_KEYS",
-      set(F.AUX_KEYS) == {k for k in AUXISH if not F.FACTORS[k].code},
-      f"实际 {len(F.AUX_KEYS)} 个，应登记 {len([k for k in AUXISH if not F.FACTORS[k].code])} 个")
+check("展期/期权/基本面/宏观因子都登记进 AUX_KEYS",
+      set(F.AUX_KEYS) == AUXISH,
+      f"实际 {len(F.AUX_KEYS)} 个，应登记 {len(AUXISH)} 个")
 check("默认单因子存在", F.DEFAULT_SINGLE in F.FACTORS)
 check("默认多因子都存在", all(k in F.FACTORS for k in F.DEFAULT_MULTI))
 
 bad_calc, bad_inf, bad_pit = [], [], []
 for key in F.FACTORS:
-    if key in NO_DAILY:
+    if key in NO_DAILY or key in STOCK_ONLY:
         continue
     s = F.raw(DF_AUX, key)
-    if len(s) != len(DF_AUX) or s.notna().sum() < 100:
+    if len(s) != len(DF_AUX):
+        bad_calc.append(key)
+        continue
+    # 基本面 / 宏观要外部库，没库时整列空是正常降级
+    if key not in EXT_DB and s.notna().sum() < 100:
         bad_calc.append(key)
         continue
     if np.isinf(s.to_numpy(dtype=float)).any():
@@ -188,7 +203,7 @@ for key in F.FACTORS:
     if not same_series(s, F.raw(DF_AUX.iloc[:CUT], key), CUT):
         bad_pit.append(key)
 
-check(f"{len(F.FACTORS) - len(NO_DAILY)} 个日线因子都能算出足够样本",
+check(f"{len(F.FACTORS) - len(NO_DAILY | STOCK_ONLY)} 个日线因子都能算出足够样本",
       not bad_calc, f"异常 {bad_calc}")
 check("因子值无 inf", not bad_inf, f"含 inf {bad_inf}")
 check("因子计算不含未来信息（截断重算零差异）", not bad_pit, f"有差异 {bad_pit}")
@@ -215,11 +230,14 @@ section("1b. 展期 / 期权因子")
 # 没有衍生列时必须「优雅退化」：因子被剔除，而不是报错或算出 0
 no_aux = F.filter_available(DF, list(F.FACTORS))
 check("无衍生列时展期/期权因子被剔除",
-      all(k not in no_aux for k in F.AUX_KEYS),
-      str([k for k in F.AUX_KEYS if k in no_aux]))
-_keep = len(F.FACTORS) - len(AUXISH) - len(NO_DAILY)
-check("无衍生列时其它因子不受影响", len(no_aux) == _keep,
-      f"{len(no_aux)}/{len(F.FACTORS)}，应保留 {_keep}")
+      all(k not in no_aux for k in CURVE_KEYS),
+      str([k for k in CURVE_KEYS if k in no_aux]))
+# 断言写成「差的集合 ⊆ 展期/期权」，而不是算一个硬数字：基本面 / 宏观 / 板块
+# 能不能算出值取决于本机有没有 EDB 库、有没有行情 CSV，写死数量会在别人的
+# 机器上无缘无故变红。
+_had = set(F.filter_available(DF_AUX, list(F.FACTORS)))
+_lost = _had - set(no_aux)
+check("无衍生列时只影响展期/期权因子", _lost <= CURVE_KEYS, str(sorted(_lost)))
 check("无衍生列时展期因子返回全 NaN",
       F.raw(DF, "roll_yield").isna().all())
 
@@ -505,7 +523,9 @@ t0 = time.time()
 rep = M.factor_report(DF_AUX, list(F.FACTORS), horizon=5, window=252)
 cost = time.time() - t0
 check("全因子评估每行一个因子", len(rep) == len(F.FACTORS), str(len(rep)))
-_daily = rep[~rep["key"].isin(NO_DAILY)]
+# 基本面 / 宏观那批不参与：它们要外部库，而且月频/季频序列在 1000 根日线上
+# 本来就只有几十个观测，IC 算不出来是数据密度问题，不是代码问题
+_daily = rep[~rep["key"].isin(NO_DAILY | EXT_DB | STOCK_ONLY)]
 check("日线因子的 IC 都算得出来", _daily["ic"].notna().all(),
       str(list(_daily.loc[_daily["ic"].isna(), "key"])))
 check("评估表无 error 列", "error" not in rep.columns or rep["error"].isna().all())

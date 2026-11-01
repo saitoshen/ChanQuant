@@ -1,10 +1,14 @@
-"""抓网页正文（`web_fetch`）。
+"""抓网页正文（`web_fetch`）+ 搜网页（`web_search`）。
 
-## 只做 fetch，不做 search
+## 为什么搜索走「必应 RSS」而不是搜索 API
 
-搜索要接第三方搜索 API（Serper / Bing / Tavily），每个都要 key、都要钱，而且
-返回的是一堆链接 —— 模型还是得自己挑。真需要「找资料」时，用户直接给链接更快，
-也更可信。所以这里只做「给我一个 URL，我把正文取回来」。
+Serper / Bing / Tavily 都要 key、都要钱。必应的 `&format=rss` 是它自己公开的
+订阅输出，返回的是**直链**（不是 `bing.com/ck/a?...` 那种跳转壳），不需要
+解析 base64，也不需要为每条结果再发一次请求。缺点是条数少（十来条）、
+排序不如正式 API，但对「找一篇能引用的文章」够用。
+
+第二顺位是 DuckDuckGo 的 html 端点（`html.duckduckgo.com`），它的跳转壳里
+`uddg=` 参数就是原文 URL，一次解码即可。两家都取不到才报错。
 
 ## 出网是危险动作，四道闸
 
@@ -16,6 +20,9 @@
    公网域名 302 到内网地址是标准打法。所以关掉自动跟随，自己一跳一跳地查
 4. **限体积**。`stream=True` + 边读边数，超过 5MB 就停。没有这道闸，一个
    几 G 的日志文件能把内存吃光
+
+搜索走同一套闸：搜索引擎本身是公网域名，结果里的 URL 只**列出来**不访问，
+模型要读哪条再单独 `web_fetch`（那时才逐跳校验）。
 
 ## 抓回来的是纯文本
 
@@ -30,7 +37,7 @@ import ipaddress
 import re
 import socket
 from html import unescape
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 from ttrade import blocks as B
 from ttrade.skills.base import (
@@ -255,6 +262,236 @@ register(Tool(
         "- PDF 链接抓不了，让用户下载后当附件传进来\n"
         "- 一次最多 12000 字符，长文只能看到开头\n"
         "抓回来的内容要**给出处**（域名），别把网页上的说法当成你自己验证过的结论。"
+    ),
+    max_turns=2,
+))
+
+
+# ------------------------------------------------------------------ 搜索
+# 一次最多返回这么多条。再多模型也读不完，而且第 10 条之后基本是垃圾
+MAX_RESULTS = 20
+DEFAULT_RESULTS = 8
+SEARCH_TIMEOUT = (6, 25)
+
+
+class SearchHit:
+    __slots__ = ("title", "url", "snippet")
+
+    def __init__(self, title: str, url: str, snippet: str = "") -> None:
+        self.title = title.strip()
+        self.url = url.strip()
+        self.snippet = _SPACES.sub(" ", snippet or "").strip()
+
+
+def _get(url: str, timeout=SEARCH_TIMEOUT) -> str:
+    """搜索引擎自己的页面：走和 `_fetch` 同一套地址检查，但不限 content-type。"""
+    import requests
+
+    why = check_url(url)
+    if why:
+        raise Blocked(why)
+    try:
+        r = requests.get(url, headers={"User-Agent": UA,
+                                       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+                         timeout=timeout)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"连不上 {urlparse(url).netloc}：{exc}") from exc
+    if r.status_code >= 400:
+        raise RuntimeError(f"{urlparse(url).netloc} 返回 HTTP {r.status_code}")
+    if not r.encoding or r.encoding.lower() == "iso-8859-1":
+        try:
+            return r.content.decode("utf-8")
+        except UnicodeDecodeError:
+            return r.content.decode(r.encoding or "utf-8", "replace")
+    return r.text
+
+
+_ITEM = re.compile(r"<item>(.*?)</item>", re.S | re.I)
+_TAG_IN_ITEM = re.compile(r"<(title|link|description)>(.*?)</\1>", re.S | re.I)
+
+
+def _strip_tags(s: str) -> str:
+    return unescape(_TAG.sub("", s or "")).strip()
+
+
+def _search_bing(q: str, n: int) -> list[SearchHit]:
+    """必应 RSS。直链、无跳转壳，是几家解析成本最低的。"""
+    xml = _get(f"https://www.bing.com/search?q={quote_plus(q)}&format=rss&count={n}")
+    out: list[SearchHit] = []
+    for body in _ITEM.findall(xml):
+        got = {k.lower(): v for k, v in _TAG_IN_ITEM.findall(body)}
+        link = _strip_tags(got.get("link", ""))
+        if not link.startswith(("http://", "https://")):
+            continue
+        title = _strip_tags(got.get("title", "")) or link
+        out.append(SearchHit(title, link, _strip_tags(got.get("description", ""))))
+        if len(out) >= n:
+            break
+    return out
+
+
+_DDG_A = re.compile(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.S)
+_DDG_S = re.compile(r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>', re.S)
+
+
+def _search_ddg(q: str, n: int) -> list[SearchHit]:
+    """DuckDuckGo html 端点。跳转壳里 `uddg=` 就是原文 URL。"""
+    html = _get(f"https://html.duckduckgo.com/html/?q={quote_plus(q)}")
+    links = _DDG_A.findall(html)
+    snips = _DDG_S.findall(html)
+    out: list[SearchHit] = []
+    for i, (href, title) in enumerate(links):
+        href = unescape(href)
+        if "uddg=" in href:
+            qs = parse_qs(urlparse(href).query)
+            href = unquote((qs.get("uddg") or [""])[0]) or href
+        if not href.startswith(("http://", "https://")):
+            continue
+        snippet = _strip_tags(snips[i]) if i < len(snips) else ""
+        out.append(SearchHit(_strip_tags(title), href, snippet))
+        if len(out) >= n:
+            break
+    return out
+
+
+def _tokens(q: str) -> list[str]:
+    """查询里的「实词」。中文按空白切之后整段保留（不再分词 —— 分错了更糟），
+    英文按空白切。单字丢掉：它们几乎不带来区分度。"""
+    return [t for t in re.split(r"[\s+，,、]+", q) if len(t) >= 2]
+
+
+def _relevance(hits: list[SearchHit], q: str) -> float:
+    """结果里命中查询词的比例。0 = 一条都没沾边。
+
+    必应的中文分词对多词查询很不稳（实测「螺纹钢 库存 季节性」会退化成只搜
+    「螺纹」，返回一堆机械螺纹的百科页）。拿这个分数做**重试判据**：
+    一条都不沾边就换一种写法再搜一次，而不是把垃圾结果原样交给模型。
+    """
+    toks = _tokens(q)
+    if not toks:
+        return 1.0
+    blob = " ".join(f"{h.title} {h.snippet}" for h in hits)
+    hit = sum(1 for t in toks if t in blob)
+    return hit / len(toks)
+
+
+def _variants(q: str) -> list[str]:
+    """同一个查询的几种写法。去重、保序。"""
+    out = [q]
+    toks = _tokens(q)
+    if len(toks) >= 2:
+        out.append("".join(toks))          # 去掉空格连成一个词
+        out.append(" ".join(toks[-2:]))    # 只留后两个词（通常是品类 + 主题）
+    seen, uniq = set(), []
+    for v in out:
+        if v and v not in seen:
+            seen.add(v)
+            uniq.append(v)
+    return uniq
+
+
+def search(query: str, n: int = DEFAULT_RESULTS) -> tuple[str, list[SearchHit]]:
+    """按顺序试几家搜索引擎，返回 `(用的哪家, 结果)`。
+
+    先必应再 DuckDuckGo：必应对中文站点的覆盖更好，国内也能直连；
+    DDG 在必应被限流时兜底。
+
+    **带重试**：必应经常把多词查询截成第一个词，返回一堆不相关的结果。
+    所以每家用几种写法各搜一次，按「命中查询词的比例」挑最好的一组 ——
+    只要有一组沾边就用它，全都 0 命中才退而求其次用第一条非空结果。
+    """
+    errors = []
+    best: tuple[float, str, list[SearchHit]] | None = None
+    for name, fn in (("必应", _search_bing), ("DuckDuckGo", _search_ddg)):
+        for v in _variants(query):
+            try:
+                hits = fn(v, n)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{name}：{exc}")
+                break                      # 这家整体不通，换下一家
+            if not hits:
+                errors.append(f"{name}「{v}」：0 条")
+                continue
+            score = _relevance(hits, query)
+            if best is None or score > best[0]:
+                best = (score, name, hits)
+            if score >= 0.6:
+                return best[1], best[2]
+    if best is not None:
+        return best[1], best[2]
+    raise RuntimeError("搜索失败 —— " + "；".join(errors[:6]))
+
+
+def _web_search(ctx, p: dict) -> SkillResult:
+    q = str(p.get("query") or "").strip()
+    if not q:
+        raise RuntimeError("query 不能为空")
+    site = str(p.get("site") or "").strip()
+    if site:
+        # 只保留域名本身，防止模型把一整条 URL 塞进来
+        site = urlparse(site if "//" in site else "//" + site).hostname or ""
+        if site:
+            q = f"{q} site:{site}"
+    n = int(p.get("n") or DEFAULT_RESULTS)
+    n = max(1, min(n, MAX_RESULTS))
+
+    engine, hits = search(q, n)
+    score = _relevance(hits, q)
+
+    rows = [(h.title[:60] or "（无标题）", h.url) for h in hits]
+    blocks = [
+        B.block_metrics("搜索结果", [
+            ("关键词", q[:40], "flat"),
+            ("来源", engine, "flat"),
+            ("条数", str(len(hits)), "flat"),
+            ("命中", f"{score:.0%}", "flat"),
+        ]),
+        B.block_table(["标题", "链接"], rows) if rows else B.block_text("（没有结果）"),
+    ]
+    if score < 0.5:
+        blocks.append(B.block_warning(
+            "结果可能不相关",
+            ["搜索引擎把查询截断了 —— 换更短更具体的词，或者用 site= 限定站点",
+             "也可以试试英文关键词"],
+            "warn"))
+    lines = []
+    for i, h in enumerate(hits, 1):
+        lines.append(f"{i}. {h.title}\n   {h.url}"
+                     + (f"\n   {h.snippet}" if h.snippet else ""))
+    feed = (f"在「{engine}」搜「{q}」，{len(hits)} 条结果"
+            f"（命中率 {score:.0%}）：\n\n" + "\n".join(lines)
+            + "\n\n要看哪一条的正文，用 web_fetch 打开对应链接。"
+            "搜索结果里的说法**没经过核实**，引用前先读原文。"
+            + ("\n注意：这批结果和关键词的匹配度很低，大概率是搜索引擎截断了查询，"
+               "别硬用，换关键词重搜。" if score < 0.5 else ""))
+    return SkillResult(True, summary=f"{engine} 搜到 {len(hits)} 条（命中 {score:.0%}）",
+                       blocks=blocks, feed=feed)
+
+
+register(Tool(
+    name="web_search",
+    group="web",
+    interrupt="cancel",
+    label="搜网页",
+    description="用搜索引擎找资料，返回标题 / 链接 / 摘要。**会出网**",
+    risk=RISK_WRITE,
+    inputSchema={
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+            "query": {"type": "str"},
+            "n": {"type": "int", "default": DEFAULT_RESULTS,
+                  "minimum": 1, "maximum": MAX_RESULTS},
+            "site": {"type": "str", "default": ""},
+        },
+    },
+    handler=_web_search,
+    prompt=(
+        "**搜网页**：`web_search(query=\"螺纹钢 社会库存 季节性\")`。\n"
+        "- 只返回标题、链接、摘要，**要正文还得 `web_fetch` 打开那一条**\n"
+        "- `site=\"mysteel.com\"` 可以限定在某个站点里搜\n"
+        "- 摘要经常是断章取义的，写进研报之前必须打开原文确认\n"
+        "- 搜不到就换关键词（同义词、英文、加年份），别反复搜同一句"
     ),
     max_turns=2,
 ))

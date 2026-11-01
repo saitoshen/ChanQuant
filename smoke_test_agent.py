@@ -126,6 +126,17 @@ def check_contract() -> None:
     check(alias is None, "不存在的工具不该查出来")
     check(S.get("QUERY_BARS") is not None, "工具名应该大小写不敏感")
 
+    # 研报两个工具：`report_pack` 一次把数字算全，`chart` 单独出图。
+    # 少了任何一个，模型写研报就只能靠 `factor`/`backtest` 拼，一次要发七八轮。
+    for name in ("report_pack", "chart"):
+        check(name in S.REGISTRY, f"研报工具 {name} 没注册")
+    check(S.get("chart").inputSchema["required"] == ["kind", "symbol"],
+          "chart 的 kind/symbol 应该是必填")
+
+    # 联网：抓取之外还要能搜
+    check("web_search" in S.REGISTRY, "web_search 没注册")
+    check("web_fetch" in S.REGISTRY, "web_fetch 没注册")
+
 
 # ------------------------------------------------------------------ 3. 结果预算
 

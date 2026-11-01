@@ -22,8 +22,10 @@ from __future__ import annotations
 # 顺序按 GROUP_ORDER 排，方便对照。
 from ttrade.skills import base  # noqa: F401
 from ttrade.skills import data  # noqa: F401
+from ttrade.skills import option  # noqa: F401
 from ttrade.skills import manual  # noqa: F401
 from ttrade.skills import doc  # noqa: F401
+from ttrade.skills import report  # noqa: F401
 from ttrade.skills import factor  # noqa: F401
 from ttrade.skills import strategy  # noqa: F401
 from ttrade.skills import trade  # noqa: F401

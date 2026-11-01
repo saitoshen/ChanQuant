@@ -578,6 +578,13 @@ class FactorSpec:
     # `inspect.getsource()` 也取不到 —— `exec` 出来的函数没有对应文件。
     formula: str = ""
     code: str = ""
+    # 因子适用的大类（市场）。空元组 = 全市场通用（向后兼容）。
+    #   "cn"       → 国内期货
+    #   "us"       → 美股
+    #   "cn_stock" → A 股
+    # 展期/期权/持仓量等依赖期货衍生数据的因子只标 ("cn",)；
+    # 纯价格动量/反转/波动/量能/形态类因子标 () 即全市场可用。
+    markets: tuple[str, ...] = ()
 
 
 FACTORS: dict[str, FactorSpec] = {}
@@ -613,27 +620,27 @@ _reg(FactorSpec("vol_surge", "放量倍数", f_vol_surge, "量能", "成交量�
 _reg(FactorSpec("pv_corr", "价量相关 20", f_pv_corr, "量能", "20 日收益与成交量变化的相关性。"))
 _reg(FactorSpec("obv_slope", "OBV 斜率", f_obv_slope, "量能", "OBV 的 20 日变化 / 20 日总量。"))
 _reg(FactorSpec("illiq", "非流动性", f_illiq, "量能", "Amihud 非流动性指标，需成交额。", -1))
-_reg(FactorSpec("oi_change", "持仓量变化", f_oi_change, "量能", "20 日持仓量变化率，期货特有。"))
+_reg(FactorSpec("oi_change", "持仓量变化", f_oi_change, "量能", "20 日持仓量变化率，期货特有。", markets=("cn",)))
 
 _reg(FactorSpec("hl_range", "平均振幅", f_hl_range, "形态", "20 日平均 (高-低)/收盘。", -1))
 _reg(FactorSpec("close_pos", "收盘位置", f_close_pos, "形态", "10 日平均收盘在当日振幅中的位置。"))
 _reg(FactorSpec("gap", "跳空幅度", f_gap, "形态", "10 日平均跳空幅度。"))
 _reg(FactorSpec("macd_hist", "MACD 柱", f_macd_hist, "形态", "MACD 柱/收盘价，趋势强度的归一化表达。"))
 
-# 展期：需要真实合约（同一天不同到期日），来自 data_futures_aux
+# 展期：需要真实合约（同一天不同到期日），来自 data_futures_aux —— 期货专属
 _reg(FactorSpec("roll_yield", "展期收益率", f_roll_yield, "展期",
-                "近月/次近月价差率，现货溢价为正、期货溢价为负。"))
+                "近月/次近月价差率，现货溢价为正、期货溢价为负。", markets=("cn",)))
 _reg(FactorSpec("roll_annual", "展期年化", f_roll_annual, "展期",
-                "展期收益率按近远月间隔折算成年化，跨品种可比。"))
+                "展期收益率按近远月间隔折算成年化，跨品种可比。", markets=("cn",)))
 _reg(FactorSpec("roll_curv", "展期曲率", f_roll_curv, "展期",
-                "近端与远端年化斜率之差，刻画期限结构弯曲程度。"))
+                "近端与远端年化斜率之差，刻画期限结构弯曲程度。", markets=("cn",)))
 _reg(FactorSpec("roll_change", "展期变化", f_roll_change, "展期",
-                "年化展期收益率的 20 日变化，反映曲线陡峭度的动量。"))
+                "年化展期收益率的 20 日变化，反映曲线陡峭度的动量。", markets=("cn",)))
 _reg(FactorSpec("near_oi_share", "近月持仓占比", f_near_oi_share, "展期",
-                "近月持仓 / (近月+次近) 持仓，衡量资金是否挤在近月。"))
+                "近月持仓 / (近月+次近) 持仓，衡量资金是否挤在近月。", markets=("cn",)))
 # 日内口径的展期：需要分钟级真实合约（天勤），Tushare 那份 aux 里没有这一列
 _reg(FactorSpec("roll_intraday", "展期·日内价差漂移", f_roll_intraday, "展期",
-                "收盘价差减当日开盘价差，近月当天相对远月的强弱变化，需分钟级合约。"))
+                "收盘价差减当日开盘价差，近月当天相对远月的强弱变化，需分钟级合约。", markets=("cn",)))
 
 # 展期·OI3 / OI6：同样四个公式，但换一套选合约的口径。
 # 上面的「展期」是按到期日取最近三腿；这两类是先按持仓量取前 3 / 前 6 个活跃合约，
@@ -642,39 +649,39 @@ _reg(FactorSpec("roll_intraday", "展期·日内价差漂移", f_roll_intraday, 
 # 三套并列而不是替换：全 81 个品种上原口径的方向一致性最好（IC>0 占 79%），
 # OI 口径在流动性前 40 的品种上更强，谁合适取决于做什么品种，让用户自己比。
 _reg(FactorSpec("roll_yield_o3", "展期收益率·OI3", f_roll_yield_o3, "展期 OI3",
-                "持仓量前 3 合约中的近月/次近月价差率。"))
+                "持仓量前 3 合约中的近月/次近月价差率。", markets=("cn",)))
 _reg(FactorSpec("roll_annual_o3", "展期年化·OI3", f_roll_annual_o3, "展期 OI3",
-                "OI3 口径的展期收益率按近远月间隔年化。"))
+                "OI3 口径的展期收益率按近远月间隔年化。", markets=("cn",)))
 _reg(FactorSpec("roll_curv_o3", "展期曲率·OI3", f_roll_curv_o3, "展期 OI3",
-                "OI3 口径近端与远端年化斜率之差。"))
+                "OI3 口径近端与远端年化斜率之差。", markets=("cn",)))
 _reg(FactorSpec("roll_change_o3", "展期变化·OI3", f_roll_change_o3, "展期 OI3",
-                "OI3 口径年化展期收益率的 20 日变化。"))
+                "OI3 口径年化展期收益率的 20 日变化。", markets=("cn",)))
 _reg(FactorSpec("roll_yield_o6", "展期收益率·OI6", f_roll_yield_o6, "展期 OI6",
-                "持仓量前 6 合约中的近月/次近月价差率。"))
+                "持仓量前 6 合约中的近月/次近月价差率。", markets=("cn",)))
 _reg(FactorSpec("roll_annual_o6", "展期年化·OI6", f_roll_annual_o6, "展期 OI6",
-                "OI6 口径的展期收益率按近远月间隔年化。"))
+                "OI6 口径的展期收益率按近远月间隔年化。", markets=("cn",)))
 _reg(FactorSpec("roll_curv_o6", "展期曲率·OI6", f_roll_curv_o6, "展期 OI6",
-                "OI6 口径近端与远端年化斜率之差。"))
+                "OI6 口径近端与远端年化斜率之差。", markets=("cn",)))
 _reg(FactorSpec("roll_change_o6", "展期变化·OI6", f_roll_change_o6, "展期 OI6",
-                "OI6 口径年化展期收益率的 20 日变化。"))
+                "OI6 口径年化展期收益率的 20 日变化。", markets=("cn",)))
 # 主力/次主力：两端都按持仓量选，和上面「按到期日排三腿」是两套选合约逻辑。
 # 归在「展期」里（用户自己建的那条也在这类），但依赖 o6_ 那套列，没有时退回 o3_
 _reg(FactorSpec("roll_main_oi", "展期收益率·主力次主力（持仓量口径）", f_roll_main_oi, "展期",
-                "近端取持仓最大的腿、远端取其后持仓最大的腿，5 日均值。正值=backwardation。"))
+                "近端取持仓最大的腿、远端取其后持仓最大的腿，5 日均值。正值=backwardation。", markets=("cn",)))
 
-# 期权：需要期权日线反解出的波动率曲面，来自 data_futures_aux
+# 期权：需要期权日线反解出的波动率曲面，来自 data_futures_aux —— 期货专属
 _reg(FactorSpec("iv_atm", "平值 IV", f_iv_atm, "期权",
-                "近月平值隐含波动率，来自期权微笑的二次拟合。"))
+                "近月平值隐含波动率，来自期权微笑的二次拟合。", markets=("cn",)))
 _reg(FactorSpec("iv_term", "IV 期限结构", f_iv_term, "期权",
-                "次月与近月 IV 的月度斜率，负值代表近月恐慌。"))
+                "次月与近月 IV 的月度斜率，负值代表近月恐慌。", markets=("cn",)))
 _reg(FactorSpec("iv_skew", "IV 偏度", f_iv_skew, "期权",
-                "IV 对 ln(K/F) 的斜率，负偏＝市场更怕跌。"))
+                "IV 对 ln(K/F) 的斜率，负偏＝市场更怕跌。", markets=("cn",)))
 _reg(FactorSpec("iv_rv", "IV-RV 价差", f_iv_rv, "期权",
-                "平值 IV 减 20 日已实现波动率，即方差风险溢价。"))
+                "平值 IV 减 20 日已实现波动率，即方差风险溢价。", markets=("cn",)))
 _reg(FactorSpec("iv_change", "IV 变化", f_iv_change, "期权",
-                "平值 IV 的 20 日变化，波动率预期的动量。"))
+                "平值 IV 的 20 日变化，波动率预期的动量。", markets=("cn",)))
 _reg(FactorSpec("pcr", "看跌看涨持仓比", f_pcr, "期权",
-                "Put/Call 持仓比取对数，>0 表示情绪偏空。"))
+                "Put/Call 持仓比取对数，>0 表示情绪偏空。", markets=("cn",)))
 
 
 CATEGORIES: list[str] = [
@@ -682,17 +689,26 @@ CATEGORIES: list[str] = [
     "日内", "时段",
     "展期", "展期 OI3", "展期 OI6", "期权",
     "季节性", "品种季节",
+    "基本面", "板块行业", "宏观",
 ]
 
 DEFAULT_SINGLE = "mom_60"
 DEFAULT_MULTI = ["mom_20", "mom_60", "mom_120", "rev_5", "vol_20", "breakout_pos"]
 
-# 需要额外数据（真实合约 / 期权）才能算的因子。美股没有这些数据，
-# 界面上要把它们和「算不出来」区分开，而不是显示成一堆空行。
-# 展期三个类别（原口径 / OI3 / OI6）都读同一批 aux 列，用前缀匹配一并收进来，
-# 免得以后再加一档（比如 OI9）时忘了同步这里。
-AUX_KEYS = [k for k, s in FACTORS.items()
-            if s.category.startswith("展期") or s.category == "期权"]
+# 需要额外数据（真实合约 / 期权 / 基本面 / 宏观 / 资金流）才能算的因子。美股
+# 没有这些数据，界面上要把它们和「算不出来」区分开，而不是显示成一堆空行。
+# **必须在所有子模块注册完之后再算**：`factors_ext` 里那三个 CTA 口径的期限
+# 结构因子也归在「展期」下，提前算就漏掉了。A 股那套（资金流 / 概念板块 /
+# 除权）同理 —— 它们要 `stock.duckdb` 里另外三张表，光有 K 线算不出来。
+AUX_CATEGORIES = ("展期", "期权", "基本面", "宏观", "资金流", "概念板块", "除权")
+
+
+def _aux_keys() -> list[str]:
+    return [k for k, s in FACTORS.items() if s.category.startswith(AUX_CATEGORIES)]
+
+
+# 真正的赋值在文件末尾（子模块注册之后），这里只留一个占位，避免中途有人读
+AUX_KEYS: list[str] = []
 
 
 # ---------------------------------------------------------------- 计算
@@ -793,6 +809,27 @@ def filter_available(df: pd.DataFrame, keys: list[str], min_obs: int = 60) -> li
     return [k for k in keys if k in FACTORS and available(df, k, min_obs)]
 
 
+def filter_by_market(market: str) -> list[str]:
+    """返回在指定大类下可用的因子 key 列表。
+
+    规则：因子的 ``markets`` 为空 → 全市场通用；非空 → 必须包含当前 market。
+    界面层在切换市场时调用此函数，把不相关的因子从下拉/表格里隐掉，
+    避免用户选了一个在当前市场算不出来的因子（如 A 股选了展期收益率）。
+    """
+    out = []
+    for k, spec in FACTORS.items():
+        if not spec.markets or market in spec.markets:
+            out.append(k)
+    return out
+
+
+def categories_for_market(market: str) -> list[str]:
+    """返回在指定大类下有因子的类别列表，保持 ``CATEGORIES`` 里的原始顺序。"""
+    valid = set(filter_by_market(market))
+    return [c for c in CATEGORIES if any(FACTORS[k].category == c and k in valid
+                                         for k in FACTORS)]
+
+
 # ---------------------------------------------------------------- 用户自定义因子
 def _load_user_factors() -> int:
     """把用户目录里的自定义因子挂进来。
@@ -818,9 +855,18 @@ USER_FACTOR_COUNT = _load_user_factors()
 # 就是循环导入。
 from ttrade import factors_intraday as _FI   # noqa: E402
 from ttrade import factors_seasonal as _FS   # noqa: E402
+from ttrade import factors_ext as _FE        # noqa: E402
+from ttrade import factors_macro as _FM      # noqa: E402
+from ttrade import factors_stock as _FK      # noqa: E402
 
 _INTRA_FACTORS = _FI.register_into(FACTORS, FactorSpec)
 _SEASON_FACTORS = _FS.register_into(FACTORS, FactorSpec)
+# 移植自 future_quant 的 CTA 短周期 / RIA 选品种 / 基本面 / 板块指数
+_EXT_FACTORS = _FE.register_into(FACTORS, FactorSpec)
+# 全天候策略的 23 个宏观变量
+_MACRO_FACTORS = _FM.register_into(FACTORS, FactorSpec)
+# A 股专属：基本面 / 资金流 / 概念板块 / 除权，全部标 markets=("cn_stock",)
+_STOCK_FACTORS = _FK.register_into(FACTORS, FactorSpec)
 
 # 用户因子可能带来新类别（默认叫「自定义」）。`CATEGORIES` 是界面上分组用的
 # 静态列表，不补进去的话新因子在「策略研究」页的因子下拉里根本不出现 ——
@@ -828,3 +874,6 @@ _SEASON_FACTORS = _FS.register_into(FACTORS, FactorSpec)
 for _spec in FACTORS.values():
     if _spec.category not in CATEGORIES:
         CATEGORIES.append(_spec.category)
+
+# 到这里所有因子都注册完了，再算「哪些要额外数据」
+AUX_KEYS = _aux_keys()

@@ -1096,6 +1096,15 @@ class AgentPage(QWidget):
         lay.setContentsMargins(0, 6, 0, 0)
         lay.setSpacing(4)
 
+        # 124 个因子平铺在一列里根本找不着东西。加一个过滤框，输入「宏观」
+        # 「动量」「仓单」都能筛 —— 分类标题本身也参与匹配，输类别名就等于
+        # 只看那一类。
+        self.ed_factor = QLineEdit()
+        self.ed_factor.setPlaceholderText("过滤：名字 / 类别，比如「宏观」「动量」「仓单」")
+        self.ed_factor.setClearButtonEnabled(True)
+        self.ed_factor.textChanged.connect(lambda _t: self._fill_factors())
+        lay.addWidget(self.ed_factor)
+
         self.lst_factor = QListWidget()
         self.lst_factor.currentItemChanged.connect(self._show_factor)
         lay.addWidget(self.lst_factor, 1)
@@ -1206,9 +1215,15 @@ class AgentPage(QWidget):
         btn.setObjectName("Ghost")
         btn.clicked.connect(self._make_report)
         row.addWidget(btn)
+        self.btn_report_pdf = QPushButton("PDF")
+        self.btn_report_pdf.setObjectName("Ghost")
+        self.btn_report_pdf.setToolTip("把选中的研报导出成 PDF（图表会一起嵌进去）")
+        self.btn_report_pdf.clicked.connect(self._export_report_pdf)
+        row.addWidget(self.btn_report_pdf)
         lay.addLayout(row)
 
-        note = QLabel("还没接基本面与互联网数据，现在只能基于价格、持仓、展期和模型自身知识写。")
+        note = QLabel("研报走 `report_pack` 取数（季节性、库存仓单、基差、期限结构、"
+                      "因子 IC、策略对比、宏观分位），再用 `chart` 插图，最后导出 PDF。")
         note.setObjectName("Hint")
         note.setWordWrap(True)
         lay.addWidget(note)
@@ -1358,13 +1373,66 @@ class AgentPage(QWidget):
 
     # ---------------------------------------------------------- 列表填充
 
+    # 因子分类的一句话说明。分组标题的 tooltip 用它 —— 光看「展期 OI3」这四个
+    # 字，没人知道它和「展期」差在哪。
+    _CAT_TIP = {
+        "趋势": "涨跌幅、均线偏离、通道位置。抓单边行情。",
+        "反转": "短期超买超卖。和趋势相反，靠均值回归赚钱。",
+        "波动": "已实现波动、ATR、回撤深度。低波动因子也在这里。",
+        "量能": "成交量、持仓量、成交额、流动性。确认趋势是否有人在跟。",
+        "形态": "振幅、收盘位置、跳空、MACD。价格路径的形状。",
+        "日内": "要分钟级数据才算得出来：开盘/收盘效应、日内动量。",
+        "时段": "按交易时段切片（夜盘/早盘/午盘）。日线上整列为空。",
+        "展期": "期限结构：近远月价差、曲率、持仓占比。需要真实合约数据。",
+        "展期 OI3": "同上，但选腿口径换成「先取持仓前 3 再按到期日排」。",
+        "展期 OI6": "同上，候选池放宽到持仓前 6。",
+        "期权": "隐含波动率曲面：平值 IV、偏度、期限结构、PCR。",
+        "季节性": "过去若干年同月的平均收益与稳定性。纯价格统计。",
+        "品种季节": "产业日历（旺季/淡季窗口），来自产业常识不是拟合。",
+        "基本面": "仓单、库存、现货基差、加工利润、交割量。来自 EDB 库。",
+        "板块行业": "所属板块与全市场商品指数的动量/波动/相关性。",
+        "宏观": "全天候策略的 23 个宏观变量，值是历史扩张分位。",
+    }
+
     def _fill_factors(self) -> None:
+        """因子列表：按类别分组，和策略库一个样式。
+
+        分组标题是 `NoItemFlags` 的：看得见、选不中。没有它，124 个因子挤成
+        一列，用户根本不知道「这几个是一类、那几个是另一回事」—— 而因子库
+        的意义恰恰是**同一类里横向比较**（三个动量周期谁更稳、两套展期口径
+        谁更贴合这个品种）。
+        """
         self.lst_factor.clear()
+        q = ""
+        if hasattr(self, "ed_factor"):
+            q = self.ed_factor.text().strip().lower()
+
+        by_cat: dict[str, list] = {}
         for d in L.all_factor_docs():
-            it = QListWidgetItem(f"{d.label}　·　{d.category}")
-            it.setData(Qt.UserRole, d.key)
-            it.setToolTip(d.desc)
-            self.lst_factor.addItem(it)
+            hit = (not q) or (q in d.label.lower() or q in d.category.lower()
+                              or q in d.key.lower() or q in (d.desc or "").lower())
+            if not hit:
+                continue
+            by_cat.setdefault(d.category, []).append(d)
+
+        # 按 CATEGORIES 的固定顺序排，不在表里的（用户自定义）排最后 ——
+        # 用 `all_factor_docs()` 的返回顺序会因为注册顺序变化而抖动
+        order = [c for c in F.CATEGORIES if c in by_cat]
+        order += [c for c in by_cat if c not in order]
+
+        for cat in order:
+            items = by_cat[cat]
+            self._add_group_row(f"{cat}（{len(items)}）",
+                                self._CAT_TIP.get(cat, ""), lst=self.lst_factor)
+            for d in items:
+                it = QListWidgetItem(f"　{d.label}")
+                it.setData(Qt.UserRole, d.key)
+                it.setToolTip(d.desc)
+                self.lst_factor.addItem(it)
+
+        if not order:
+            self._add_group_row("（没有匹配的因子）", "换个关键词试试，"
+                                "或者清空过滤框。", hint=True, lst=self.lst_factor)
 
     def _fill_strategies(self) -> None:
         """策略库列表：内置模板按分组排前面，规则策略和「我的」跟在后面。
@@ -1415,8 +1483,14 @@ class AgentPage(QWidget):
             it.setToolTip(cfg.describe())
             self.lst_strat.addItem(it)
 
-    def _add_group_row(self, label: str, tip: str = "", hint: bool = False) -> None:
-        """列表里的分组标题。选不中，只是分隔和说明。"""
+    def _add_group_row(self, label: str, tip: str = "", hint: bool = False,
+                       lst: QListWidget | None = None) -> None:
+        """列表里的分组标题。选不中，只是分隔和说明。
+
+        `lst` 默认是策略库那个列表（原来只有它用）；因子库也复用同一个样式，
+        这样两个页签看起来是一套东西。
+        """
+        target = lst if lst is not None else self.lst_strat
         it = QListWidgetItem(f"　{label}" if hint else f"— {label} —")
         it.setFlags(Qt.NoItemFlags)
         it.setData(Qt.UserRole, ("head", label))
@@ -1427,7 +1501,7 @@ class AgentPage(QWidget):
         it.setFont(font)
         if not hint:
             it.setForeground(QColor(C_MUTED))
-        self.lst_strat.addItem(it)
+        target.addItem(it)
 
     def _fill_reports(self) -> None:
         self.lst_report.clear()
@@ -1633,8 +1707,13 @@ class AgentPage(QWidget):
         except OSError as exc:
             self.detail.setHtml(f"<p>读不出来：{_esc(str(exc))}</p>")
             return
-        self.detail.setHtml(f"<pre style='white-space:pre-wrap;font-size:{FS_CODE}px'>"
-                            f"{_esc(text)}</pre>")
+        # 走和对话框同一套渲染：研报里有表格和 `![说明](路径)` 图，
+        # 用 `<pre>` 原样贴出来只会看到一堆竖线和方括号。
+        try:
+            self.detail.setHtml(CR.render_text(text))
+        except Exception:  # noqa: BLE001
+            self.detail.setHtml(f"<pre style='white-space:pre-wrap;font-size:{FS_CODE}px'>"
+                                f"{_esc(text)}</pre>")
 
     # ---------------------------------------------------------- 对话
 
@@ -2964,14 +3043,51 @@ class AgentPage(QWidget):
             return
         self._pending_report = f"{sym}_{time.strftime('%Y%m%d_%H%M')}"
         self.ed_input.setPlainText(
-            f"写一份 {sym} 的品种研报，面向做趋势跟踪的交易者。要求：\n"
-            f"1. 先说明你只能基于平台已有的价格、持仓、展期数据和你的知识，"
-            f"没有基本面数据库，涉及具体库存/产量/进口数据时明确说「未接入」；\n"
-            f"2. 结构：供需与季节性（定性）、期限结构含义、波动特征、"
-            f"适合的因子与策略、当前需要注意的风险；\n"
-            f"3. 不要编造具体数字。"
+            f"写一份 {sym} 的品种研报，面向做趋势跟踪的交易者。\n"
+            f"**第一步必须调 `report_pack(symbol=\"{sym}\")`**，"
+            f"它一次把季节性、库存仓单、现货基差、期限结构、因子 IC、"
+            f"策略对比、宏观分位全算好 —— 不要自己一条条去查，也不要凭印象写数字。\n"
+            f"然后按需调 `chart(kind=..., symbol=\"{sym}\")` 出图，"
+            f"把返回路径写成独占一行的 `![说明](路径)`。\n"
+            f"结构：\n"
+            f"1. 一句话结论（方向、周期、什么条件下会推翻）；\n"
+            f"2. 价格状态与趋势/震荡属性（效率比、波动分位）；\n"
+            f"3. 季节性（哪几个月强、上涨概率多少，配 `price_seasonality` 图）；\n"
+            f"4. 基本面（仓单、库存、基差、利润、交割量，配 `inventory_seasonality` 图）；\n"
+            f"5. 期限结构与展期收益；\n"
+            f"6. 因子 IC/IR：哪些因子在这个品种上真的有效（配 `factor_ic` 图）；\n"
+            f"7. 策略对比：买入持有、双均线、唐奇安、海龟各自的年化/回撤/夏普；\n"
+            f"8. 历史波段复盘（配 `big_swings` 图），说明那几段行情的驱动；\n"
+            f"9. 未来波段推演：给条件，不要给点位预测；\n"
+            f"10. 适合的因子与策略组合，以及失效信号。\n"
+            f"数字一律来自 `report_pack` 和图表，并带上口径；"
+            f"事实包里没有的（产量、进口、政策）用 `web_search` 找，找不到就说「未接入」，"
+            f"**不要编**。"
         )
         self._send()
+
+    def _export_report_pdf(self) -> None:
+        cur = self.lst_report.currentItem()
+        if cur is None:
+            self._set_state("先选一份研报", C_BAD)
+            return
+        src = str(cur.data(Qt.UserRole))
+        try:
+            with open(src, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError as exc:
+            self._set_state(f"读不出来：{exc}", C_BAD)
+            return
+        out = os.path.splitext(src)[0] + ".pdf"
+        try:
+            from ttrade import docgen as DG
+
+            DG.write_pdf(out, markdown=text, title=os.path.basename(src)[:-3])
+        except Exception as exc:  # noqa: BLE001
+            self._set_state(f"PDF 生成失败：{type(exc).__name__}: {exc}", C_BAD)
+            return
+        self._set_state(f"已导出 {os.path.basename(out)}", C_OK)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(out))
 
     def _save_report(self, name: str, text: str) -> None:
         path = os.path.join(reports_dir(), f"{name}.md")

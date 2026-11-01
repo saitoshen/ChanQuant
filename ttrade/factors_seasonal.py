@@ -268,7 +268,9 @@ def register_into(FACTORS, FactorSpec) -> int:
          "季节窗口当门控的 20 日动量：旺季做多趋势、淡季做空趋势。"),
     ]
     n = 0
+    # 「品种季节」依赖产业日历（旺季/淡季窗口），只覆盖商品期货品种 → 标 ("cn",)
     for key, label, func, cat, desc in specs:
-        FACTORS[key] = FactorSpec(key, label, func, cat, desc)
+        mk = ("cn",) if cat == "品种季节" else ()
+        FACTORS[key] = FactorSpec(key, label, func, cat, desc, markets=mk)
         n += 1
     return n

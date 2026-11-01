@@ -41,7 +41,7 @@ LAST_FILE = "last_config.json"
 
 # 截面策略「腿内怎么分钱」的中文名。策略库表格里要显示，界面下拉也用它，
 # 放一处免得两边慢慢走偏
-_WEIGHT_CN = {"risk": "风险平价", "equal": "等权", "score": "按分数"}
+_WEIGHT_CN = {"risk": "风险平价", "equal": "等权", "score": "按分数", "tier": "分档"}
 
 
 def _clamp_pct(value, dflt: float, hi: float) -> float:
@@ -110,7 +110,18 @@ class StrategyConfig:
     cross_rebalance: int = 5            # 调仓间隔（根）
     cross_top_pct: float = 10.0         # 多头：选最强的百分比
     cross_bot_pct: float = 10.0         # 空头：选最弱的百分比（可以和上面不同）
-    cross_weight: str = "risk"          # risk / equal / score
+    cross_weight: str = "risk"          # risk / equal / score / tier
+    # 分档：weight == "tier" 时把选中的几只按分数切成 N 档，各档拿不同份数
+    cross_tiers: int = 0                # 0/1 = 不分档
+    cross_tier_units: list = field(default_factory=list)   # 空则按 4/2/1 递减
+    # 第一步选品种池（第二步才排序）。用「能不能交易」的因子筛池，
+    # 和「谁强谁弱」的排序因子分开，流动性就不会把权重带偏
+    cross_pool_mode: str = "off"        # off / single / multi / ml
+    cross_pool_keys: list = field(default_factory=list)
+    cross_pool_reverse: dict = field(default_factory=dict)
+    cross_pool_pct: float = 60.0        # 池里保留分数最高的百分之几
+    # 截面 ML 的标签口径：excess / volret / rank / volret_rank
+    cross_label_mode: str = "volret"
 
     # 「选品种 + 时序交易」里的那条时序腿。规则和因子二选一，另一个保留不删 ——
     # 用户来回切换不该丢参数。
@@ -333,8 +344,27 @@ class StrategyConfig:
         cfg.cross_bot_pct = _clamp_pct(getattr(cfg, "cross_bot_pct", 10.0), 10.0, 50.0)
         if cfg.cross_mode not in ("hedge", "select"):
             cfg.cross_mode = "hedge"
-        if cfg.cross_weight not in ("risk", "equal", "score"):
+        if cfg.cross_weight not in ("risk", "equal", "score", "tier"):
             cfg.cross_weight = "risk"
+        # 分档：档数夹到 0~6，份数只留正数。手改 JSON 写成字符串时不该让
+        # 整个配置加载失败
+        try:
+            cfg.cross_tiers = max(0, min(6, int(cfg.cross_tiers or 0)))
+        except (TypeError, ValueError):
+            cfg.cross_tiers = 0
+        if not isinstance(cfg.cross_tier_units, list):
+            cfg.cross_tier_units = []
+        cfg.cross_tier_units = [float(u) for u in cfg.cross_tier_units
+                                if isinstance(u, (int, float)) and u > 0]
+        if cfg.cross_pool_mode not in ("off", "single", "multi", "ml"):
+            cfg.cross_pool_mode = "off"
+        if not isinstance(cfg.cross_pool_keys, list):
+            cfg.cross_pool_keys = []
+        if not isinstance(cfg.cross_pool_reverse, dict):
+            cfg.cross_pool_reverse = {}
+        cfg.cross_pool_pct = _clamp_pct(cfg.cross_pool_pct, 60.0, 100.0)
+        if cfg.cross_label_mode not in ("excess", "volret", "rank", "volret_rank"):
+            cfg.cross_label_mode = "volret"
         if cfg.timing_family not in ("rule", "factor"):
             cfg.timing_family = "rule"
         return cfg

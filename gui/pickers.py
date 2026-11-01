@@ -423,6 +423,82 @@ class ContractPicker(QWidget):
     def note(self) -> str:
         return self.lbl_note.text()
 
+    def select_option(self, contract: str) -> bool:
+        """外部选中一个期权合约：把三档下拉都对齐到它，然后发 `changed`。
+
+        给「T 型报价」窗双击用 —— 那张表里点了一档，上面这排控件就该跟着
+        跳到同一个合约，否则图上画的是 `rb2701-C-3000`、控件里写着「主连」，
+        两边对不上。
+
+        返回是否成功。**失败时什么都不改**：改一半（比如模式切了、行权价没切）
+        比不改更让人困惑，宿主那边直接走「自己画图」那条路。
+        """
+        from ttrade import optstore as OS
+
+        code = str(contract or "")
+        if not code:
+            return False
+        meta = OS.load_meta()
+        if meta.empty:
+            return False
+        hit = meta[meta["contract"].astype(str) == code]
+        if hit.empty:
+            return False
+        r = hit.iloc[0]
+        und = str(r["underlying"])
+        exp = pd.Timestamp(r["expiry"])
+        strike = float(r["strike"])
+
+        self._loading = True
+        # 整段操作要**一次**发信号，而不是每个中间态发一次：从「主连」切到
+        # 「rb2701-C-3000」要经过「切模式 → 重填月份 → 重填行权价 → 选中」四步，
+        # 中间那几步的 `contract()` 是空的或者还是默认 ATM。宿主每收到一次就
+        # 重画一遍图，等于白跑四五次回测。`blockSignals` 连自定义信号一起挡，
+        # 所以最后手动 `emit` 一次。
+        self.blockSignals(True)
+        try:
+            self.cb_mode.setCurrentIndex(2)          # MODE_OPTION
+            self.row_month.setVisible(True)
+            self.row_strike.setVisible(True)
+            self.lbl_month.setText("期权链")
+            self._fill_months()
+            # 按「标的 + 到期日」找链，不按显示文本 —— 文本里有档数和「已到期」
+            # 标记，换个措辞就匹配不上了
+            i_month = -1
+            for i in range(self.cb_month.count()):
+                if str(self.cb_month.itemData(i)) != und:
+                    continue
+                tag = str(self.cb_month.itemData(i, Qt.UserRole + 1) or "")
+                if tag and tag[:10] == exp.strftime("%Y-%m-%d"):
+                    i_month = i
+                    break
+            if i_month < 0:
+                return False
+            self.cb_month.setCurrentIndex(i_month)
+            self._fill_strikes()
+            i_k = -1
+            for i in range(self.cb_strike.count()):
+                if str(self.cb_strike.itemData(i)) == code:
+                    i_k = i
+                    break
+            if i_k < 0:
+                # 认购/认沽不对：`_fill_strikes` 只填当前那一侧
+                want = "P" if str(r["opt_class"]).upper().startswith("P") else "C"
+                self.cb_cp.setCurrentIndex(1 if want == "P" else 0)
+                self._fill_strikes()
+                for i in range(self.cb_strike.count()):
+                    if str(self.cb_strike.itemData(i)) == code:
+                        i_k = i
+                        break
+            if i_k < 0:
+                return False
+            self.cb_strike.setCurrentIndex(i_k)
+        finally:
+            self._loading = False
+            self.blockSignals(False)
+        self.changed.emit()
+        return True
+
     # ---- 内部 ----
 
     def _emit(self, *_a) -> None:
@@ -430,6 +506,11 @@ class ContractPicker(QWidget):
             self.changed.emit()
 
     def _on_mode(self, *_a) -> None:
+        if self._loading:
+            # 外部正在批量改状态（`set_symbol` / `select_option`），它们自己
+            # 收尾时会 `_reload()` 一次。这里再跑一遍就是重复取数 + 多发一次
+            # `changed`，宿主那边等于白跑一次回测
+            return
         m = self.mode()
         self.row_month.setVisible(m != self.MODE_MAIN)
         self.row_strike.setVisible(m == self.MODE_OPTION)

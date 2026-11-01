@@ -58,13 +58,37 @@ class CrossConfig:
     bot_pct: float = 10.0               # 空头：选最弱的百分之几（可以和多头不同）
     long_only: bool = False
     # risk = 风险平价（按波动率倒数分配，默认）；equal = 等权；score = 按分数加权
+    # tier = 按分数分档给份数（见 tiers / tier_units）
     weight: str = "risk"
+
+    # ---- 资金分档（`weight="tier"` 时生效，参考 HL-trend 的 4/2/1 份）
+    #
+    # 选出来的几只不该一样重：排第一的比排第三的确定性高得多。做法是把选中的
+    # 那一批按分数降序切成 `tiers` 等份，第 i 份拿 `tier_units[i]` 份钱。
+    tiers: int = 0                      # 0/1 = 不分档
+    tier_units: list = field(default_factory=list)   # 空则按 2^(n-1) 递减
+
+    # ---- 第一步：选品种池（可选）
+    #
+    # 两步走的意义：**过滤**和**排序**用的不是同一套因子。金额 / 持仓这类
+    # 「能不能交易」的因子适合筛池，动量 / 基差这类「谁强谁弱」的因子适合排序。
+    # 混在一张分数里，金额大的品种会因为「金额因子 z 值高」被排到前面，
+    # 但它涨不涨是另一回事 —— 两件事搅在一起，权重就被流动性带偏了。
+    pool_mode: str = "off"              # off / single / multi / ml
+    pool_keys: list = field(default_factory=list)
+    pool_reverse: dict = field(default_factory=dict)
+    pool_top_pct: float = 60.0          # 池里保留分数最高的百分之几
+    pool_min: int = 0                   # 池子至少留几个（不够就全留）
 
     # 截面因子。三种模式和时序那边一样：single / multi / ml
     factor_mode: str = "multi"
     factor_keys: list = field(default_factory=list)
     factor_reverse: dict = field(default_factory=dict)
     factor_cfg: dict = field(default_factory=dict)   # 窗口 / 模型 / 训练窗口 …
+    # 机器学习标签：excess = 收益 − 截面均值（老口径）
+    #              volret = 收益 ÷ 波动 − 截面均值
+    #              rank / volret_rank = 再转成截面分位
+    label_mode: str = "volret"
 
     # 选品种之后怎么交易（只对 select 生效）
     timing_family: str = "rule"         # rule / factor
@@ -172,7 +196,8 @@ def _factor_cfg(cfg: "CrossConfig"):
 
 def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
                 reverse: dict | None = None, mode: str = "multi",
-                fcfg=None, progress=None, cancel=None) -> pd.DataFrame:
+                fcfg=None, progress=None, cancel=None,
+                label_mode: str = "volret") -> pd.DataFrame:
     """截面合成分数。三种模式和时序那边对齐：单因子 / 多因子 / 机器学习。
 
     - `single`：取第一个因子，横截面 Z-score
@@ -181,6 +206,8 @@ def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
 
     因子在某个品种上没数据（美股没持仓量、新品种没有展期）就留 NaN，合成分数
     会自动跳过 —— 一个品种缺一个因子不该让整组排名作废。
+
+    `label_mode` 只对 ml 生效，口径见 `ml_score_panel`。
     """
     keys = [k for k in (keys or []) if k in factors.FACTORS]
     if not keys:
@@ -188,7 +215,8 @@ def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
     rev = set(k for k, v in (reverse or {}).items() if v)
 
     if mode == "ml":
-        return ml_score_panel(frames, keys, fcfg, progress=progress, cancel=cancel)
+        return ml_score_panel(frames, keys, fcfg, progress=progress, cancel=cancel,
+                              label_mode=label_mode)
 
     parts = []
     for key in keys:
@@ -224,13 +252,22 @@ def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
 
 
 def ml_score_panel(frames: dict[str, pd.DataFrame], keys: list[str], fcfg,
-                   progress=None, cancel=None) -> pd.DataFrame:
+                   progress=None, cancel=None, label_mode: str = "volret") -> pd.DataFrame:
     """横截面机器学习打分：把所有品种的样本堆成一张长表，滚动训练。
 
     和时序 ML 的区别在**标签**。这里预测的是「同期比别的品种强多少」：每根 bar
     上先把各品种的未来收益减去当期截面均值，模型学的才是排序。用绝对收益当
     标签的话，模型会先学会「这段行情整体在涨」—— 而截面策略做多空对冲，那个
     beta 一分钱也拿不到，学得再准也没用。
+
+    `label_mode` 决定「强多少」怎么度量：
+
+    - `excess`：未来收益 − 截面均值。**老口径**，有量纲问题 —— 铁矿的日常波动
+      是玉米的两三倍，同一套权重下去，模型会不自觉地偏爱高波动品种
+    - `volret`（默认）：未来收益 ÷ 自身波动率 − 截面均值。把「涨了 3%」换算成
+      「涨了 1.2 个标准差」，高波动品种不再天然占优
+    - `rank`：未来收益的**截面分位**减 0.5。最抗极端值，代价是丢掉幅度信息
+    - `volret_rank`：先除以波动再取分位
 
     训练样本按时间正序切折，训练集只取到 `b - horizon`：第 i 行的标签要等到
     i+h 才成立，混进训练集就是未来函数。
@@ -258,12 +295,19 @@ def ml_score_panel(frames: dict[str, pd.DataFrame], keys: list[str], fcfg,
     horizon = max(1, int(fcfg.horizon or 1))
 
     blocks = []
+    lm = str(label_mode or "volret").lower()
     for sym, df in frames.items():
         fm = factors.factor_frame(df, use, window=fcfg.window, method=fcfg.method)
         if fm.empty:
             continue
         d = fm.copy()
         d["__fwd"] = forward_return(df, horizon).reindex(fm.index)
+        if lm in ("volret", "volret_rank"):
+            # 波动率用**同一根 bar 之前**的收益算，`shift` 不需要：rolling 本身就
+            # 只回头看。窗口和风险平价那条路一致，两处口径不要分叉
+            r = pd.Series(df["close"]).pct_change()
+            v = r.rolling(VOL_WINDOW, min_periods=VOL_MIN_OBS).std()
+            d["__vol"] = v.reindex(fm.index)
         d["__sym"] = sym
         blocks.append(d)
     if not blocks:
@@ -272,7 +316,21 @@ def ml_score_panel(frames: dict[str, pd.DataFrame], keys: list[str], fcfg,
     long.index = pd.MultiIndex.from_arrays([long.index, long["__sym"]])
     long = long.sort_index()
     # 截面去均值：留下的是「相对强弱」，共同的市场 beta 被减掉了
-    long["__y"] = long["__fwd"] - long.groupby(level=0)["__fwd"].transform("mean")
+    if lm in ("volret", "volret_rank"):
+        vol = long["__vol"].where(long["__vol"] > 1e-12)
+        # 波动率为 0 / 缺失的品种，用**同一根 bar 上其它品种的中位数**顶上。
+        # 直接留 NaN 会让这个品种的标签整段作废；整行都算不出来（合成数据里
+        # 恒定漂移的序列，波动率恰好是 0）时退回 1.0 —— 那等价于老口径，
+        # 是「降级」不是「猜」
+        vol = vol.fillna(vol.groupby(level=0).transform("median")).fillna(1.0)
+        long["__rel"] = long["__fwd"] / vol
+    else:
+        long["__rel"] = long["__fwd"]
+    long["__y"] = long["__rel"] - long.groupby(level=0)["__rel"].transform("mean")
+    if lm in ("rank", "volret_rank"):
+        # 分位化之后标签落在 [-0.5, 0.5]，和品种数无关。截面只有 5 个品种时
+        # 分位是 0.1 一档，信息量比原始幅度少，但不会再被一个涨停带跑
+        long["__y"] = long.groupby(level=0)["__y"].rank(pct=True) - 0.5
 
     X = long[use].to_numpy(dtype=float)
     X = np.where(np.isfinite(X), X, 0.0)
@@ -448,7 +506,8 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     try:
         score = score_panel(frames, list(cfg.factor_keys or []),
                             cfg.factor_reverse, mode=cfg.factor_mode or "multi",
-                            fcfg=_factor_cfg(cfg), progress=progress, cancel=cancel)
+                            fcfg=_factor_cfg(cfg), progress=progress, cancel=cancel,
+                            label_mode=cfg.label_mode)
     except fstrat.Cancelled:
         raise                     # 用户点的「取消」，不是回测失败
     except Exception as exc:  # noqa: BLE001
@@ -456,6 +515,27 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     if score.empty:
         return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
                            error="截面分数全空：选中的因子在这批品种上没有数据")
+
+    # ---- 第一步：选品种池（可选）
+    #
+    # 放在这里而不是「先跑一遍再过滤结果」：池外品种一旦进了 `_rank`，腿数
+    # 就会按全体品种算，多空各 10% 里有一半是流动性差的品种，等权之后它们的
+    # 权重被放大，换手和滑点全上去了。
+    if str(cfg.pool_mode or "off").lower() != "off" and cfg.pool_keys:
+        try:
+            pool = score_panel(frames, list(cfg.pool_keys), cfg.pool_reverse,
+                               mode=cfg.pool_mode, fcfg=_factor_cfg(cfg),
+                               progress=progress, cancel=cancel,
+                               label_mode=cfg.label_mode)
+        except fstrat.Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
+                               error=f"第一步选品种失败：{exc}")
+        score = _apply_pool(score, pool, cfg.pool_top_pct, cfg.pool_min)
+        if score.dropna(how="all").empty:
+            return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
+                               error="第一步筛完之后池子是空的 —— 把保留比例调大")
 
     close = close_panel(frames)
     close = close.reindex(score.index).ffill()
@@ -733,6 +813,70 @@ def _rp_share(vol_row: np.ndarray, mask: np.ndarray, total: float) -> np.ndarray
     return out
 
 
+def _tier_units(cfg: CrossConfig) -> list[float]:
+    """每档的份数。没配就按 2^(n-1) 递减：3 档是 4/2/1，4 档是 8/4/2/1。
+
+    为什么默认**指数**递减而不是等差（3/2/1）：排第一的那只和排第三的那只，
+    确定性差得不是「一倍」，是一个数量级。HL-trend 用的是 4/2/1，同一个道理。
+    """
+    units = [float(u) for u in (cfg.tier_units or []) if float(u) > 0]
+    if not units:
+        n = max(2, int(cfg.tiers or 2))
+        units = [2.0 ** (n - 1 - i) for i in range(n)]
+    return units
+
+
+def _tier_share(mat_row: np.ndarray, mask_row: np.ndarray, tiers: int,
+                units: list[float], ascending: bool = False) -> np.ndarray:
+    """把一行里选中的几只按分数切成 `tiers` 段，各段拿 `units[i]` 份，归一化到 1。
+
+    `ascending=True` 给空头用：空头要的是「最弱的那几个」，按分数升序排，
+    否则第一档会分给空头里**最强**的那只 —— 正好反了。
+    """
+    out = np.zeros(len(mat_row), dtype=float)
+    idx = np.nonzero(mask_row)[0]
+    if not len(idx):
+        return out
+    v = np.nan_to_num(mat_row[idx], nan=(np.inf if ascending else -np.inf))
+    order = idx[np.argsort(v if ascending else -v, kind="stable")]
+    chunks = np.array_split(order, min(max(1, int(tiers)), len(order)))
+    for ci, ch in enumerate(chunks):
+        if not len(ch):
+            continue
+        u = units[ci] if ci < len(units) else units[-1]
+        out[ch] = float(u)
+    total = out.sum()
+    return out / total if total > 0 else out
+
+
+def _apply_pool(score: pd.DataFrame, pool: pd.DataFrame,
+                top_pct: float, min_keep: int = 0) -> pd.DataFrame:
+    """第一步：把池外的品种打成 NaN，后面那一步就只看池内。
+
+    用**逐 bar 的横截面分位**判池，不是「整段一次算完再定池」：金额因子每天
+    都在变，拿全样本的排名定池等于用了未来信息。`rank(pct=True)` 是逐行的，
+    天然 PIT。
+
+    池因子那天整行没值（新品种上市前、数据缺口）时**不筛**，原样放行 ——
+    宁可在缺数据的那几天少一层过滤，也不要凭空整组空仓。
+    """
+    p = pool.reindex(index=score.index, columns=score.columns).ffill()
+    if p.empty or not p.notna().any().any():
+        return score
+    # **升序**排名：分数越高（越该留在池里）名次越大，1.0 是最强。
+    # 用降序的话 `rank=1.0` 会落在最弱的那只身上，`<= pct` 就变成「留下最弱的
+    # 一半」—— 金额因子下这正好是「只留最不流动的品种」，完全反了
+    r = p.rank(axis=1, ascending=True, pct=True)
+    thr = pd.Series(1.0 - float(top_pct) / 100.0, index=p.index)
+    if min_keep:
+        n = p.notna().sum(axis=1).replace(0, np.nan)
+        thr = np.minimum(thr, (1.0 - float(min_keep) / n).fillna(0.0))
+    keep = r.gt(thr, axis=0) & p.notna()
+    blank = p.notna().sum(axis=1) < MIN_CROSS
+    keep = keep | np.repeat(blank.to_numpy()[:, None], p.shape[1], axis=1)
+    return score.where(keep)
+
+
 def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig,
                    vol: pd.DataFrame | None = None) -> pd.DataFrame:
     """多强空弱。多空各占一半名义，净敞口 ≈ 0。
@@ -741,14 +885,25 @@ def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig,
     写法，但「多最强的 10%、空最弱的 20%」也讲得通（下跌时弱者更弱）。两边
     各自按自己的腿数平分 0.5 的名义额，净敞口仍然是 0。
 
-    腿内怎么分（`weight`）：等权 / 按分数 / 风险平价。风险平价是**每一腿内部**
-    按 1/σ 分 —— 波动大的品种少给钱，多空两侧各自的风险贡献才拉得平；跨腿的
-    0.5 / 0.5 不动，否则净敞口就不是 0 了。
+    腿内怎么分（`weight`）：等权 / 按分数 / 风险平价 / 分档。风险平价是**每一腿
+    内部**按 1/σ 分 —— 波动大的品种少给钱，多空两侧各自的风险贡献才拉得平；
+    跨腿的 0.5 / 0.5 不动，否则净敞口就不是 0 了。
     """
     rows, top, bot, k_long, k_short, ok = _rank(score, cfg)
     inv_l = 1.0 / np.maximum(k_long, 1)
     inv_s = 1.0 / np.maximum(k_short, 1)
-    if cfg.weight == "risk" and vol is not None:
+    if cfg.weight == "tier" and int(cfg.tiers or 0) >= 2:
+        mat = score.to_numpy(dtype=float)[rows]
+        units = _tier_units(cfg)
+        w = np.zeros(mat.shape, dtype=float)
+        for i in range(len(rows)):
+            if not ok[i]:
+                continue
+            w[i] = 0.5 * _tier_share(mat[i], top[i], int(cfg.tiers), units)
+            if not cfg.long_only:
+                w[i] -= 0.5 * _tier_share(mat[i], bot[i], int(cfg.tiers), units,
+                                          ascending=True)
+    elif cfg.weight == "risk" and vol is not None:
         vmat = vol.to_numpy(dtype=float)[rows]
         w = np.zeros(vmat.shape, dtype=float)
         for i in range(len(rows)):
@@ -836,8 +991,12 @@ def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
     时序信号在**各自的行情表**上算（`strategies.run_strategy` / 因子策略），算完
     再对齐到截面面板的索引上。这样 5 分钟周期里各品种交易时段不同也不会串。
 
-    选中的那几只之间怎么分钱看 `weight`：等权 / 按分数 / 风险平价（默认）。
+    选中的那几只之间怎么分钱看 `weight`：等权 / 按分数 / 风险平价（默认）/ 分档。
     信号是 ±1 时只决定方向，不决定大小 —— 仓位大小由这一层定。
+
+    分档（`weight="tier"`）是给「截面选品种 + 时序交易」这条路准备的：选出来
+    的 5 只里，第 1 名和第 5 名的确定性差得远，等权等于把最没把握的那只和最有
+    把握的那只当成一回事。
     """
     sigs: dict[str, pd.Series] = {}
     for sym, df in frames.items():
@@ -845,7 +1004,14 @@ def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
     sig_panel = pd.concat(sigs, axis=1).sort_index().reindex(score.index).ffill().fillna(0.0)
 
     rows, top, _bot, k_long, _k_short, ok = _rank(score, cfg)
-    if cfg.weight == "risk" and vol is not None:
+    if cfg.weight == "tier" and int(cfg.tiers or 0) >= 2:
+        mat = score.to_numpy(dtype=float)[rows]
+        units = _tier_units(cfg)
+        w = np.zeros(mat.shape, dtype=float)
+        for i in range(len(rows)):
+            if ok[i]:
+                w[i] = _tier_share(mat[i], top[i], int(cfg.tiers), units)
+    elif cfg.weight == "risk" and vol is not None:
         vmat = vol.to_numpy(dtype=float)[rows]
         w = np.zeros(vmat.shape, dtype=float)
         for i in range(len(rows)):

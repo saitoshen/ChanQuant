@@ -35,6 +35,7 @@ import pandas as pd
 import ttrade.factors as F
 import ttrade.factor_metrics as M
 import ttrade.mlmodels as ML
+from ttrade.strategies import STRATEGIES, run_strategy
 
 
 class Cancelled(Exception):
@@ -77,6 +78,29 @@ class FactorConfig:
     long_th: float = 0.0
     short_th: float = 0.0
 
+    # ---- 样本稀疏性（只对 ml 生效）
+    #
+    # 分钟线上每根 bar 都是一个样本的话，相邻样本的标签重叠 horizon 根，
+    # 等于同一段行情被数了 horizon 遍 —— 模型学到的是「这几天在涨」而不是
+    # 「这种形态之后会涨」。而且 5 分钟一年 6 万根，绝大多数是横盘噪声，
+    # 真正值得学的「突破那一刻」只占几个百分点。
+    #
+    # `trigger` 模式只在**信号触发**的 bar 上建样本：先用一组因子（或一条规则）
+    # 判断「现在值不值得学」，再按触发强度分档 —— 强突破和弱突破是两回事，
+    # 分成不同档各自成样本，标签才够丰富（趋势和反转都能覆盖到）。
+    #
+    # 触发因子**不需要**和特征因子重合，也不要求它们出现在 `keys` 里：
+    # 它们只负责「决定在哪几根建样本」，训练时用到的仍是 `keys` 全部因子。
+    sample_mode: str = "all"        # all / trigger
+    trigger_keys: list = field(default_factory=list)
+    trigger_rule: str = ""          # 规则策略 key（`STRATEGIES` 里那个）
+    trigger_params: dict = field(default_factory=dict)
+    trigger_side: str = "both"      # up / down / both
+    trigger_z: float = 1.0          # 触发阈值（触发强度的绝对值）
+    trigger_tiers: int = 0          # 分档数：0/1 = 不分档，只取触发点
+    trigger_span: float = 1.0       # 每档多宽（强度单位）
+    trigger_cool: int = 5           # 同一档的冷却根数
+
     def reversed_keys(self) -> set[str]:
         """真正打开反转的因子。顺手把非真值过滤掉，调用方不用自己判。"""
         return {k for k, v in dict(self.reverse or {}).items() if v}
@@ -92,6 +116,11 @@ class FactorConfig:
         c.train_window = int(max(200, c.train_window))
         c.step = int(max(20, c.step))
         c.min_train = int(max(120, c.min_train))
+        c.trigger_keys = [str(k) for k in (c.trigger_keys or [])]
+        c.trigger_tiers = int(max(0, c.trigger_tiers))
+        c.trigger_span = float(max(1e-6, c.trigger_span))
+        c.trigger_cool = int(max(0, c.trigger_cool))
+        c.trigger_z = float(c.trigger_z)
         return c
 
 
@@ -305,9 +334,27 @@ def build_score(
     if mode == "ml":
         if len(keys) < 2:
             raise ValueError("机器学习多因子至少需要 2 个因子")
+        mask = None
+        wstats: dict = {}
+        if str(cfg.sample_mode or "all") == "trigger":
+            st, armed, tnotes = trigger_signal(df, cfg)
+            mask, mnotes = trigger_mask(st, armed, cfg)
+            notes.extend(tnotes)
+            notes.extend(mnotes)
+            if not mask.any():
+                raise ValueError(
+                    "触发条件一根都没命中 —— 把 trigger_z 调低、换一组触发因子，"
+                    "或者把 trigger_cool 调小"
+                )
         pred, imp, n_folds = walk_forward(
-            fmat, fwd, cfg, progress=progress, cancel=cancel
+            fmat, fwd, cfg, progress=progress, cancel=cancel, sample_mask=mask,
+            stats=wstats,
         )
+        if wstats.get("fallback"):
+            notes.append(
+                f"{int(wstats['fallback'])}/{n_folds} 折的触发样本不足 40 个，"
+                "这几折退回全样本训练（触发太稀，把阈值调低或冷却调小）"
+            )
         score = _rolling_z(pred, cfg.window).rename("score")
         covered = int(pred.notna().sum())
         _bpd = _bars_per_day(fmat.index)
@@ -337,6 +384,117 @@ def build_score(
     raise ValueError(f"未知因子模式 {mode}")
 
 
+def trigger_signal(df: pd.DataFrame, cfg: FactorConfig):
+    """触发强度（带符号）与「规则刚开仓」标记。
+
+    强度 = 触发因子的时序 Z-score 均值。**不取绝对值**：符号留着，向上突破
+    和向下破位是两种样本，`trigger_side` 靠它筛。
+
+    规则那条路给的是 `armed`（信号从 0 变成 ±1 的那一根），不带强度 —— 规则
+    本身只说「该动手了」，强度由因子那一侧补。两条路都没有就是全 False。
+
+    返回 `(strength, armed, notes)`，都对齐到 `df.index`。
+    """
+    idx = df.index
+    strength = pd.Series(np.nan, index=idx, dtype=float)
+    armed = pd.Series(False, index=idx)
+    notes: list[str] = []
+
+    zs = []
+    for key in (cfg.trigger_keys or []):
+        if key not in F.FACTORS:
+            continue
+        try:
+            raw = F.raw(df, key)
+        except Exception:      # noqa: BLE001
+            continue
+        if raw is None or not len(raw):
+            continue
+        z = _rolling_z(raw.astype(float), cfg.window)
+        if z.notna().sum() >= 60:
+            zs.append(z.rename(key))
+    if zs:
+        strength = pd.concat(zs, axis=1).mean(axis=1, skipna=True)
+        notes.append("触发：因子 " + "、".join(F.FACTORS[k].label
+                                              for k in (cfg.trigger_keys or [])
+                                              if k in F.FACTORS))
+
+    if cfg.trigger_rule and cfg.trigger_rule in STRATEGIES:
+        try:
+            out = run_strategy(df, cfg.trigger_rule, dict(cfg.trigger_params or {}))
+            sig = pd.Series(out["signal"], index=idx).astype(float).fillna(0.0)
+            prev = sig.shift(1).fillna(0.0)
+            armed = ((sig != 0) & (prev == 0)) | ((sig != 0) & (np.sign(sig) != np.sign(prev)))
+            # 规则只给「该动手」的点，没有强度。因子那侧没配就用 1.0 顶上，
+            # 让分档退化成「单一档」，至少不会因为 NaN 一个样本都不建
+            if not zs:
+                strength = pd.Series(np.where(armed, 1.0, np.nan), index=idx)
+            notes.append(f"触发：规则 {STRATEGIES[cfg.trigger_rule].label}")
+        except Exception as exc:      # noqa: BLE001
+            notes.append(f"触发规则跑不起来（{exc}），只用因子触发")
+    return strength, armed, notes
+
+
+def trigger_mask(strength: pd.Series, armed: pd.Series,
+                 cfg: FactorConfig) -> tuple[np.ndarray, list[str]]:
+    """按触发强度分档，挑出要建样本的那几根 bar。
+
+    规则（逐 bar 扫一遍，**只往后看**，天然 PIT）：
+
+    1. 强度不够 `trigger_z` 就跳过；`trigger_side` 决定只做向上、只做向下、还是都做
+    2. 强度分档：`tier = floor((|s| − trigger_z) / trigger_span)`，夹在
+       `[0, trigger_tiers−1]`。**分档的意义**是「z=1.2 的突破」和「z=2.6 的
+       突破」不该混成一个样本 —— 前者往往是假突破，后者才是趋势启动
+    3. 同一档冷却 `trigger_cool` 根：一次突破持续 20 根，不该建 20 个样本
+
+    返回 `(mask, notes)`。
+    """
+    n = len(strength)
+    mask = np.zeros(n, dtype=bool)
+    tiers = int(max(1, cfg.trigger_tiers))
+    last = np.full(tiers, -(10 ** 9), dtype=int)
+    side = str(cfg.trigger_side or "both").lower()
+    z0 = float(cfg.trigger_z)
+
+    s_v = strength.to_numpy(dtype=float)
+    a_v = armed.to_numpy(dtype=bool) if armed is not None else np.zeros(n, dtype=bool)
+    n_trig = n_side = 0
+    for i in range(n):
+        s = s_v[i]
+        ok_arm = bool(a_v[i])
+        if not np.isfinite(s) and not ok_arm:
+            continue
+        mag = abs(s) if np.isfinite(s) else 0.0
+        if side == "up" and np.isfinite(s) and s <= 0:
+            n_side += 1
+            continue
+        if side == "down" and np.isfinite(s) and s >= 0:
+            n_side += 1
+            continue
+        if mag < z0 and not ok_arm:
+            continue
+        n_trig += 1
+        if cfg.trigger_tiers >= 2:
+            t = int(np.floor((mag - z0) / cfg.trigger_span))
+            t = min(max(t, 0), tiers - 1)
+        else:
+            t = 0
+        if i - last[t] < cfg.trigger_cool:
+            continue
+        last[t] = i
+        mask[i] = True
+
+    got = int(mask.sum())
+    notes = [f"稀疏采样：{n_trig:,} 根越阈值，按 {max(1, cfg.trigger_tiers)} 档"
+             f"冷却 {cfg.trigger_cool} 根后留下 {got:,} 根样本"
+             f"（占全部 {got / max(n, 1) * 100:.1f}%）"]
+    if got < 60:
+        notes.append("样本太少（< 60），把触发阈值调低、冷却调小，或者放宽分档")
+    if n_side:
+        notes.append(f"方向过滤挡掉了 {n_side:,} 根（trigger_side={side}）")
+    return mask, notes
+
+
 # ---------------------------------------------------------------- Walk-forward
 def _bars_per_day(idx) -> float:
     """平均每个交易日几根 bar。日线 1、1h 约 7~9、5m 约 48~68（含夜盘）。"""
@@ -363,6 +521,8 @@ def walk_forward(
     cfg: FactorConfig,
     progress=None,
     cancel=None,
+    sample_mask=None,
+    stats: dict | None = None,
 ) -> tuple[pd.Series, pd.Series | None, int]:
     """滚动训练 + 预测。
 
@@ -374,6 +534,13 @@ def walk_forward(
 
     训练样本只取到 `b - horizon`：第 i 行的标签 `fwd[i]` 要到 i+h 才成立，
     所以 i > b-h 的行在 b 时刻还是「未知标签」，混进训练集就是未来函数。
+
+    `sample_mask` 是**训练集的稀疏采样**（bool 数组，长度同 fmat）：只在这些
+    根上建样本。预测不受影响 —— 稀疏采样的目的是「让模型学得有重点」，不是
+    「少预测几根」。None 就是每根都当样本（老行为）。
+
+    `stats` 是可选的计数容器：某些折的稀疏样本不够训练时会退回全样本，退回
+    了几折写在 `stats["fallback"]` 里。不传就只做事不记账。
 
     返回 (预测序列, 因子重要度, 折数)。未覆盖区间为 NaN。
     """
@@ -415,8 +582,20 @@ def walk_forward(
         ok = np.isfinite(Ytr) & np.all(np.isfinite(Xtr), axis=1)
         # 因子缺失允许用 0（标准化后的中位数）补齐，但标签缺失必须丢
         Xtr = np.where(np.isfinite(Xtr), Xtr, 0.0)
-        ok &= np.isfinite(Ytr)
-        if ok.sum() < 60:
+        need = 60
+        if sample_mask is not None:
+            m = np.asarray(sample_mask[a:tr_end], dtype=bool)
+            if int((ok & m).sum()) >= 40:
+                ok = ok & m
+                # 稀疏采样之后一折里能剩几十个样本就算不错了，门槛跟着降
+                need = 40
+            elif stats is not None:
+                # 触发太稀：这一折凑不够样本。**退回全样本**而不是跳过整折 ——
+                # 日线上 400 根窗口 × 5% 触发只有 20 个点，跳过的话整条策略
+                # 一根信号都不出，看起来像「功能坏了」。退回了要记一笔，
+                # 否则用户以为稀疏采样一直在生效
+                stats["fallback"] = int(stats.get("fallback", 0)) + 1
+        if ok.sum() < need:
             continue
 
         model = ML.build(cfg.model)

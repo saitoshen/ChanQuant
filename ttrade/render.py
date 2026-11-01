@@ -125,6 +125,9 @@ _SEP_ROW = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
 _HEADING = re.compile(r"^(#{1,4})\s+(.+)$")
 _HR = re.compile(r"^\s*([-*_])\s*(?:\1\s*){2,}$")
 _BULLET = re.compile(r"^\s*([-*+]|\d+[.)])\s+(.*)$")
+# 独占一行的图片语法：`![说明](路径)`。行内的 `![]()` 不处理 —— 混在段落里
+# 排版会乱，研报里的图本来就该单独成行。
+_IMG = re.compile(r"^\s*!\[([^\]]*)\]\(\s*([^)\s]+)\s*\)\s*$")
 
 
 def _split_cells(line: str) -> list[str]:
@@ -247,6 +250,15 @@ def parse(text: str) -> list[dict]:
         if m:
             flush()
             out.append({"type": "head", "level": len(m.group(1)), "text": m.group(2)})
+            i += 1
+            continue
+
+        # 图片（独占一行）
+        m = _IMG.match(s)
+        if m:
+            flush()
+            out.append({"type": "image", "src": m.group(2), "caption": m.group(1),
+                        "width": 640})
             i += 1
             continue
 
@@ -398,9 +410,27 @@ def _render_code(b: dict) -> str:
 
 def _render_image(b: dict) -> str:
     b64 = b.get("b64") or ""
-    if not b64:
-        return ""
     mime = b.get("mime") or "image/jpeg"
+    if not b64:
+        # 本地文件路径：读出来转 base64 再内联。
+        # **不能直接写 `src="file:///..."`**：QTextDocument 在离屏/无 baseUrl 时
+        # 加载不到本地文件，PDF 里就是一张空白 —— 而且不报错。
+        src = b.get("src") or ""
+        if not src:
+            return ""
+        try:
+            import base64
+            import os
+
+            with open(os.path.expanduser(str(src)), "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            return (f'<p style="color:{C_MUTED};font-size:{SMALL_PX}px">'
+                    f'（图表读不到：{inline(str(src))}）</p>')
+        b64 = base64.b64encode(raw).decode("ascii")
+        ext = str(src).rsplit(".", 1)[-1].lower()
+        mime = {"png": "image/png", "jpg": "image/jpeg",
+                "jpeg": "image/jpeg", "gif": "image/gif"}.get(ext, "image/png")
     width = int(b.get("width") or 260)
     caption = b.get("caption") or ""
     html = f'<img src="data:{mime};base64,{b64}" width="{width}">'

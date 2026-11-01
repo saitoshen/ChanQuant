@@ -1234,6 +1234,58 @@ def check_options() -> None:
         check("期权：平值能查标的价格",
               abs(float(OPS.underlying_close("DCE.m2405")) - 3000.0) < 1e-9,
               str(OPS.underlying_close("DCE.m2405")))
+
+        # ---- 期权因子研判（option_brief）----
+        # 临时库里有 IV 数据，验证研判模块能出结论
+        from ttrade.skills.option import build_brief, _interpret_skew, _interpret_pcr
+
+        # 先往 option_iv 表写一条，否则 build_brief 拿不到数据
+        with OPS.connect() as con:
+            OPS.upsert_iv(con, pd.DataFrame([{
+                "variety": "m", "period": "1d", "dt": "2024-01-02",
+                "iv_near": 0.20, "iv_next": 0.18,
+                "dte_near": 129, "dte_next": 200,
+                "skew": -0.25, "curv": 8.0,
+                "pcr": 1.5, "n_opt": 30}]))
+        brief = build_brief("M_DCE")
+        check("期权研判：有数据时返回 has_data=True",
+              brief["has_data"], "")
+        check("期权研判：有 blocks", len(brief["blocks"]) >= 2,
+              f"{len(brief['blocks'])} 块")
+        check("期权研判：feed 非空", bool(brief["feed"]), "")
+        check("期权研判：feed 含方向倾向",
+              "方向倾向" in brief["feed"], brief["feed"][:80])
+        # 偏度 -0.25 + PCR 1.5 → 偏空
+        check("期权研判：偏度 + PCR 均偏空 → 综合偏空",
+              "偏空" in brief["feed"] and "下跌" in brief["feed"],
+              brief["feed"][:120])
+
+        # 无期权品种 → has_data=False，不报错
+        brief2 = build_brief("XX_SHFE")
+        check("期权研判：无该品种时 has_data=False",
+              not brief2["has_data"], "")
+        check("期权研判：无数据时 blocks 为空",
+              len(brief2["blocks"]) == 0, "")
+
+        # 偏度 / PCR 方向判定单测
+        s_label, _ = _interpret_skew(-0.20)
+        check("期权研判：偏度 -0.20 判为偏空", s_label == "偏空", s_label)
+        s_label, _ = _interpret_skew(0.20)
+        check("期权研判：偏度 +0.20 判为偏多", s_label == "偏多", s_label)
+        s_label, _ = _interpret_skew(0.01)
+        check("期权研判：偏度 0.01 判为中性", s_label == "中性", s_label)
+        p_label, _ = _interpret_pcr(1.5)
+        check("期权研判：PCR 1.5 判为偏空", p_label == "偏空", p_label)
+        p_label, _ = _interpret_pcr(0.5)
+        check("期权研判：PCR 0.5 判为偏多", p_label == "偏多", p_label)
+
+        # 工具注册检查
+        from ttrade import skills as SK
+        check("期权研判：option_brief 在注册表里",
+              "option_brief" in SK.names(), "")
+        t = SK.get("option_brief")
+        check("期权研判：option_brief 在 data 组",
+              t.group == "data" and t.risk == "read", f"{t.group}/{t.risk}")
     finally:
         if old is None:
             os.environ.pop("TRENDDESK_OPT_DB", None)
@@ -1917,6 +1969,75 @@ def check_cross() -> None:
     check("截面：向量化 Z-score 与逐行一致",
           np.allclose(a.fillna(-9).to_numpy(), b.fillna(-9).to_numpy()),
           str(float(np.nanmax(np.abs(a.to_numpy() - b.to_numpy())))))
+
+    # ---- 资金分档（HL-trend 的 4/2/1）
+    #
+    # 选 3 只、切 3 档，份数比必须严格是 4:2:1。写成等权也能跑出净值，肉眼看
+    # 不出来 —— 只有把权重拉出来比才知道档位有没有真的生效
+    tier = cross.run(frames, cross.CrossConfig(
+        mode="hedge", rebalance=5, top_pct=50, bot_pct=50, long_only=True,
+        weight="tier", tiers=3, factor_keys=["mom_20"]), BtConfig())
+    tw = (tier.weights[tier.weights.abs().sum(axis=1) > 0]
+          if tier.ok else pd.DataFrame())
+    last_w = tw.iloc[-1] if len(tw) else pd.Series(dtype=float)
+    long_w = last_w[last_w > 0].sort_values(ascending=False)
+    ratios_ok = (len(long_w) == 3
+                 and abs(float(long_w.iloc[0] / long_w.iloc[2]) - 4.0) < 1e-6)
+    check("截面：分档权重按 4:2:1 递减", tier.ok and ratios_ok,
+          str(long_w.round(4).to_dict()))
+    # 只做多时多头只拿 0.5：多空各半是截面策略的口径，砍掉空头不等于加杠杆
+    check("截面：分档之后多头总额仍是 0.5（不加杠杆）",
+          tier.ok and abs(float(long_w.sum()) - 0.5) < 1e-6,
+          str(round(float(long_w.sum()), 6)) if tier.ok else "回测失败")
+
+    # ---- 第一步筛池：池外品种不该拿到任何权重
+    #
+    # 只看**末尾**这一段：池因子（mom_60）前 60 根还没值，那段时间筛不了，
+    # 引擎会原样放行（宁可少一层过滤，也不要凭空整组空仓）
+    pooled = cross.run(frames, cross.CrossConfig(
+        mode="hedge", rebalance=5, top_pct=50, bot_pct=50,
+        pool_mode="single", pool_keys=["mom_60"], pool_top_pct=50,
+        factor_keys=["mom_20"]), BtConfig())
+    pw = (pooled.weights[pooled.weights.abs().sum(axis=1) > 0]
+          if pooled.ok else pd.DataFrame())
+    weakest = float(pw["S5_X"].tail(20).abs().max()) if len(pw) else -1.0
+    check("截面：第一步筛池把最弱的挡在池外", pooled.ok and weakest == 0.0,
+          f"S5 末尾最大权重 {weakest}")
+
+    # ---- 机器学习标签口径：四种都要能出分数
+    for lm in ("excess", "volret", "rank", "volret_rank"):
+        sc = cross.score_panel(frames, ["mom_20", "mom_60", "ma_gap_20"],
+                               mode="ml", fcfg=small, label_mode=lm)
+        check(f"截面：ML 标签 {lm} 能出分数",
+              not sc.empty and sc.notna().any().any(), str(sc.shape))
+
+    # ---- 稀疏采样：分档 + 同档冷却
+    from ttrade import factor_strategy as _fs
+
+    _idx = pd.date_range("2024-01-01", periods=400, freq="B")
+    _s = pd.Series(np.sin(np.arange(400) / 7.0) * 3.0, index=_idx)
+    _none = pd.Series(False, index=_idx)
+    # 不分档时冷却对**所有**触发点生效，间隔必须严格大于 cool
+    _flat, _notes = _fs.trigger_mask(_s, _none, _fs.FactorConfig(
+        trigger_z=1.0, trigger_tiers=0, trigger_cool=10))
+    _pos = np.nonzero(_flat)[0]
+    _gaps = np.diff(_pos) if len(_pos) > 1 else np.array([99])
+    check("稀疏采样：触发点确实稀疏（< 40%）", 0 < _flat.sum() < 400 * 0.4,
+          f"{int(_flat.sum())}/400")
+    check("稀疏采样：冷却生效（不分档时间隔 ≥ 10 根）", int(_gaps.min()) >= 10,
+          f"最小间隔 {int(_gaps.min())}")
+    check("稀疏采样：说明里写了留了多少样本",
+          any("稀疏采样" in n for n in _notes), str(_notes[:1]))
+    # 分档之后采样点只会更多（同一段行情里不同强度各采一次），不会更少
+    _tier, _ = _fs.trigger_mask(_s, _none, _fs.FactorConfig(
+        trigger_z=1.0, trigger_tiers=3, trigger_span=0.5, trigger_cool=10))
+    check("稀疏采样：分档之后样本更多", _tier.sum() >= _flat.sum(),
+          f"{int(_tier.sum())} vs {int(_flat.sum())}")
+    # 阈值调高，采样点必须变少 —— 反了的话说明比较写错了方向
+    _hi, _ = _fs.trigger_mask(_s, _none, _fs.FactorConfig(
+        trigger_z=2.0, trigger_tiers=3, trigger_span=0.5, trigger_cool=10))
+    check("稀疏采样：阈值越高样本越少", _hi.sum() <= _tier.sum(),
+          f"{int(_hi.sum())} vs {int(_tier.sum())}")
 
 
 def check_strategy_runner() -> None:
@@ -4105,7 +4226,8 @@ def check_skills() -> None:
                 "read_excel", "parse_pdf", "read_docx", "write_xlsx", "write_pdf",
                 "factor", "factor_list", "factor_check",
                 "strategy", "strategy_list",
-                "backtest", "trade", "fs", "scan"}
+                "backtest", "trade", "fs", "scan",
+                "option_brief"}
         check("能力包：工具都在注册表里", must <= names, str(sorted(must - names)))
         check("能力包：每个工具都挂在已知的包上",
               all(SK.get(n).group in SK.GROUPS for n in names),
@@ -5209,8 +5331,11 @@ def check_new_factors() -> None:
 
     # 只钉**内置**的数量。用户自定义因子（Agent 生成的）会挂在同一个 FACTORS 里，
     # 拿总数去断言的话，用户每加一个因子这条就红一次 —— 那不是代码坏了。
+    # 这个数字是**有意**钉住的：加因子要顺手改这里，说明你确认过新因子归到了
+    # 对的类别、也补了公式，而不是手滑注册了一条近重复的。
     n_builtin = len(F.FACTORS) - F.USER_FACTOR_COUNT
-    check(f"因子库：内置 {n_builtin} 个 / 13 类", n_builtin == 66 and len(F.CATEGORIES) == 13,
+    check(f"因子库：内置 {n_builtin} 个 / {len(F.CATEGORIES)} 类",
+          n_builtin == 136 and len(F.CATEGORIES) == 19,
           f"{n_builtin} 个内置 + {F.USER_FACTOR_COUNT} 个自定义 / {len(F.CATEGORIES)} 类")
     cats = {k: F.FACTORS[k].category for k in
             ("vwap_gap", "trend_window", "season_avg", "season_cal", "roll_intraday")}
@@ -5291,6 +5416,281 @@ def check_new_factors() -> None:
         check("PIT：09:10 拿不到 09:45-10:15 的收益",
               int(v.notna().sum()) == 0, f"非空 {int(v.notna().sum())} 个")
 
+
+def check_stock() -> None:
+    """A 股数据层：DDL、读写、元数据、因子 markets 过滤。
+
+    全部离线：用临时 DuckDB 测读写，不依赖天勤 / Tushare 联网。
+    没有真实数据时只跑结构校验，不报失败。
+    """
+    import tempfile
+
+    from ttrade import stockstore as SS
+    from ttrade import factors as F
+
+    # ---- 临时库 DDL ----
+    tmp_db = os.path.join(tempfile.mkdtemp(prefix="stock_"), "test.duckdb")
+    os.environ["TRENDDESK_STOCK_DB"] = tmp_db
+    try:
+        # 建表 + 写数据
+        with SS.connect(read_only=False) as con:
+            for ddl in SS.DDL:
+                con.execute(ddl)
+
+            # 写元数据
+            meta_df = pd.DataFrame([
+                {"ts_code": "SSE.600000", "exchange": "SSE", "name": "浦发银行",
+                 "board": "主板", "industry": "银行", "list_date": "1999-11-10",
+                 "delist_date": None},
+                {"ts_code": "SZSE.000001", "exchange": "SZSE", "name": "平安银行",
+                 "board": "主板", "industry": "银行", "list_date": "1991-04-03",
+                 "delist_date": None},
+                {"ts_code": "SZSE.300750", "exchange": "SZSE", "name": "宁德时代",
+                 "board": "创业板", "industry": "电池", "list_date": "2018-06-11",
+                 "delist_date": None},
+            ])
+            n = SS.upsert_meta(con, meta_df)
+            check("股票：写元数据 3 条", n == 3, f"写了 {n} 条")
+
+            # 写天勤 K 线
+            bars_tq = pd.DataFrame([
+                {"ts_code": "SSE.600000", "period": "1d", "dt": "2024-01-02",
+                 "open": 10.0, "high": 10.5, "low": 9.8, "close": 10.2,
+                 "volume": 100000, "amount": 1020000.0},
+                {"ts_code": "SSE.600000", "period": "1d", "dt": "2024-01-03",
+                 "open": 10.2, "high": 10.8, "low": 10.1, "close": 10.6,
+                 "volume": 120000, "amount": 1272000.0},
+            ])
+            n = SS.upsert_bars_tq(con, bars_tq)
+            check("股票：写天勤日线 2 行", n == 2, f"写了 {n} 行")
+
+            # 写 Tushare 日线
+            bars_ts = pd.DataFrame([
+                {"ts_code": "SSE.600000", "dt": "2024-01-02",
+                 "open": 10.0, "high": 10.5, "low": 9.8, "close": 10.2,
+                 "volume": 100000, "amount": 1020000.0, "pct_chg": 2.0,
+                 "change": 0.2},
+                {"ts_code": "SSE.600000", "dt": "2024-01-03",
+                 "open": 10.2, "high": 10.8, "low": 10.1, "close": 10.6,
+                 "volume": 120000, "amount": 1272000.0, "pct_chg": 3.9,
+                 "change": 0.4},
+            ])
+            n = SS.upsert_bars_ts(con, bars_ts)
+            check("股票：写 Tushare 日线 2 行", n == 2, f"写了 {n} 行")
+
+            # 写复权因子
+            adj_df = pd.DataFrame([
+                {"ts_code": "SSE.600000", "dt": "2024-01-02", "adj_factor": 1.0},
+                {"ts_code": "SSE.600000", "dt": "2024-01-03", "adj_factor": 1.05},
+            ])
+            n = SS.upsert_adj(con, adj_df)
+            check("股票：写复权因子 2 行", n == 2, f"写了 {n} 行")
+
+            # 写基本面（Tushare daily_basic）
+            basic_df = pd.DataFrame([
+                {"ts_code": "SSE.600000", "dt": "2024-01-02", "pe": 5.0, "pe_ttm": 5.0,
+                 "pb": 0.5, "ps": 1.0, "ps_ttm": 1.0, "total_mv": 1000.0,
+                 "circ_mv": 800.0, "turnover_rate": 1.0, "turnover_rate_f": 1.2,
+                 "dv_ratio": 5.0, "dv_ttm": 5.0},
+                {"ts_code": "SSE.600000", "dt": "2024-01-03", "pe": 5.2, "pe_ttm": 5.2,
+                 "pb": 0.52, "ps": 1.0, "ps_ttm": 1.0, "total_mv": 1040.0,
+                 "circ_mv": 830.0, "turnover_rate": 1.4, "turnover_rate_f": 1.5,
+                 "dv_ratio": 4.8, "dv_ttm": 4.8},
+            ])
+            n = SS.upsert_basic(con, basic_df)
+            check("股票：写基本面 2 行", n == 2, f"写了 {n} 行")
+
+            # 写资金流（Tushare moneyflow）
+            mf_df = pd.DataFrame([
+                {"ts_code": "SSE.600000", "dt": "2024-01-02",
+                 "buy_sm_vol": 100.0, "sell_sm_vol": 120.0,
+                 "buy_md_vol": 80.0, "sell_md_vol": 80.0,
+                 "buy_lg_vol": 60.0, "sell_lg_vol": 40.0,
+                 "buy_elg_vol": 40.0, "sell_elg_vol": 20.0,
+                 "net_mf_amount": 500.0},
+                {"ts_code": "SSE.600000", "dt": "2024-01-03",
+                 "buy_sm_vol": 90.0, "sell_sm_vol": 110.0,
+                 "buy_md_vol": 70.0, "sell_md_vol": 70.0,
+                 "buy_lg_vol": 70.0, "sell_lg_vol": 30.0,
+                 "buy_elg_vol": 50.0, "sell_elg_vol": 20.0,
+                 "net_mf_amount": 900.0},
+            ])
+            n = SS.upsert_moneyflow(con, mf_df)
+            check("股票：写资金流 2 行", n == 2, f"写了 {n} 行")
+
+            # 写概念板块
+            concept_df = pd.DataFrame([
+                {"concept_name": "银行", "ts_code": "SSE.600000", "in_date": "2020-01-02"},
+                {"concept_name": "沪股通", "ts_code": "SSE.600000", "in_date": "2020-01-02"},
+                {"concept_name": "银行", "ts_code": "SZSE.000001", "in_date": "2020-01-02"},
+            ])
+            n = SS.upsert_concept(con, concept_df)
+            check("股票：写概念板块 3 行", n == 3, f"写了 {n} 行")
+
+        # ---- 单只读取（GUI 便捷封装，不开 con） ----
+        # 读元数据
+        loaded = SS.load_meta()
+        check("股票：读元数据行数", len(loaded) == 3, f"{len(loaded)} 行")
+        check("股票：元数据列齐全",
+              all(c in loaded.columns for c in ("ts_code", "exchange", "name")),
+              str(list(loaded.columns)))
+
+        # ---- 单只读取（GUI 便捷封装） ----
+        df_tq = SS.load_one_tq("SSE.600000", "1d")
+        check("股票：load_one_tq 返回 2 行", len(df_tq) == 2, f"{len(df_tq)} 行")
+        check("股票：load_one_tq 列齐全",
+              all(c in df_tq.columns for c in ("dt", "open", "high", "low", "close", "volume")),
+              str(list(df_tq.columns)))
+
+        df_ts = SS.load_one_ts("SSE.600000")
+        check("股票：load_one_ts 返回 2 行", len(df_ts) == 2, f"{len(df_ts)} 行")
+        check("股票：load_one_ts 有 pct_chg", "pct_chg" in df_ts.columns, str(list(df_ts.columns)))
+
+        adj_s = SS.load_one_adj("SSE.600000")
+        check("股票：load_one_adj 返回 Series", isinstance(adj_s, pd.Series), str(type(adj_s)))
+        check("股票：复权因子 2 个点", len(adj_s) == 2, f"{len(adj_s)} 个")
+
+        # 可用周期
+        periods = SS.available_periods("SSE.600000")
+        check("股票：available_periods 含 1d", "1d" in periods, str(periods))
+
+        # ---- 前复权计算校验 ----
+        # adj_factor: [1.0, 1.05]，最后一根是 1.05
+        # ratio = adj / adj[-1] = [1.0/1.05, 1.05/1.05] = [0.952, 1.0]
+        # 前复权后第一根 close = 10.2 * 0.952 ≈ 9.714
+        # 第二根 close = 10.6 * 1.0 = 10.6
+        ratio = adj_s / adj_s.iloc[-1]
+        adj_close_0 = 10.2 * ratio.iloc[0]
+        check("股票：前复权第一根 close ≈ 9.714",
+              abs(adj_close_0 - 10.2 / 1.05) < 0.01, f"{adj_close_0:.4f}")
+
+        # ---- 统计 ----
+        st = SS.stats()
+        check("股票：stats 有 stocks", "stocks" in st, str(list(st.keys())))
+        check("股票：stats stocks = 3", st.get("stocks") == 3, str(st))
+        check("股票：stats bars_ts = 2", st.get("bars_ts") == 2, str(st))
+
+        # ---- 因子 markets 过滤 ----
+        cn_factors = F.filter_by_market("cn")
+        stock_factors = F.filter_by_market("cn_stock")
+        us_factors = F.filter_by_market("us")
+
+        check("因子：cn_stock 排除 roll_yield", "roll_yield" not in stock_factors)
+        check("因子：cn_stock 排除 iv_atm", "iv_atm" not in stock_factors)
+        check("因子：cn_stock 排除 oi_change", "oi_change" not in stock_factors)
+        check("因子：cn_stock 保留 mom_60", "mom_60" in stock_factors)
+        check("因子：cn_stock 保留 vol_20", "vol_20" in stock_factors)
+        check("因子：cn_stock 保留 rev_5", "rev_5" in stock_factors)
+        check("因子：cn_stock 保留 illiq", "illiq" in stock_factors)
+        check("因子：cn 有 roll_yield", "roll_yield" in cn_factors)
+        check("因子：cn 有 iv_atm", "iv_atm" in cn_factors)
+        check("因子：us 排除 roll_yield", "roll_yield" not in us_factors)
+        check("因子：us 保留 mom_60", "mom_60" in us_factors)
+
+        # categories
+        stock_cats = F.categories_for_market("cn_stock")
+        check("因子：cn_stock 无展期类", "展期" not in stock_cats, str(stock_cats))
+        check("因子：cn_stock 有趋势类", "趋势" in stock_cats)
+        # 「基本面」这一类两边都有：期货是仓单/基差/加工利润，股票是 PE/PB/换手率。
+        # 类别同名但因子 key 不同，界面按 market 过滤 key，所以不会串味。
+        check("因子：cn_stock 有基本面类", "基本面" in stock_cats, str(stock_cats))
+        check("因子：cn_stock 有资金流类", "资金流" in stock_cats, str(stock_cats))
+        check("因子：cn_stock 无品种季节类", "品种季节" not in stock_cats)
+
+        # ---- A 股专属因子：注册与市场归属 ----
+        stock_only = set(stock_factors) - set(cn_factors)
+        for k in ("ep_ttm", "bp", "sp_ttm", "size_log", "stock_turnover_20",
+                  "dv_ttm", "circ_ratio", "mf_net_5", "mf_lg_20", "mf_rev_5",
+                  "concept_count", "board_code", "exdiv_days"):
+            check(f"因子：{k} 只在 A 股", k in stock_only, str(sorted(stock_only)))
+        for k in ("oi_change_1", "oi_change_5", "turnover_20"):
+            check(f"因子：{k} 只在期货", k in set(cn_factors) and k not in stock_factors)
+
+        # ---- stockaux：衍生列挂载 ----
+        from ttrade import stockaux as SA
+
+        bars = SS.load_one_ts("SSE.600000").rename(columns={"dt": "date"})
+        bars["date"] = pd.to_datetime(bars["date"])
+        bars = bars.set_index("date").sort_index()
+        attached = SA.attach(bars, "SSE.600000")
+        check("股票衍生：挂上 pe_ttm", "pe_ttm" in attached.columns, str(list(attached.columns)))
+        check("股票衍生：挂上 turnover_rate", "turnover_rate" in attached.columns)
+        check("股票衍生：挂上 mf_lg_ratio", "mf_lg_ratio" in attached.columns)
+        check("股票衍生：挂上 adj_factor", "adj_factor" in attached.columns)
+        check("股票衍生：挂上 concept_count", "concept_count" in attached.columns)
+        check("股票衍生：行数不变", len(attached) == len(bars), f"{len(attached)} vs {len(bars)}")
+        check("股票衍生：概念数 = 2", float(attached["concept_count"].iloc[0]) == 2.0,
+              str(attached["concept_count"].iloc[0]))
+        check("股票衍生：板块哑变量 = 0（主板）",
+              float(attached["board_code"].iloc[0]) == 0.0,
+              str(attached["board_code"].iloc[0]))
+        # 大单净买入占比：(60+40-40-20)/(100+80+60+40+120+80+40+20) = 40/540
+        lg0 = float(attached["mf_lg_ratio"].iloc[0])
+        check("股票衍生：大单占比 = 40/540", abs(lg0 - 40 / 540) < 1e-9, f"{lg0:.6f}")
+        # 净流入占比：net_mf_amount 500 万元 = 5e6 元 / amount 1020000 元
+        net0 = float(attached["mf_net_ratio"].iloc[0])
+        check("股票衍生：净流入占比 = 5e6/1.02e6",
+              abs(net0 - 5e6 / 1020000.0) < 1e-6, f"{net0:.6f}")
+
+        # 分钟口径：快照整体后移一天，第一根 bar 拿不到 01-02 的换手率
+        intra = SA.attach(bars.iloc[[0]], "SSE.600000", intraday=True)
+        check("股票衍生：分钟口径不取当日快照",
+              pd.isna(intra["pe_ttm"].iloc[0]), str(intra["pe_ttm"].iloc[0]))
+
+        # ---- A 股因子在挂载后的数据上能算 ----
+        for k in ("ep_ttm", "bp", "size_log", "dv_ttm", "circ_ratio", "mf_lg_20"):
+            try:
+                v = F.raw(attached, k)
+                check(f"股票因子：{k} 能算", len(v) == len(attached), f"{len(v)} 行")
+            except Exception as exc:  # noqa: BLE001
+                check(f"股票因子：{k} 能算", False, f"{type(exc).__name__}: {exc}")
+        # 1/PE：PE=5 → E/P=0.2
+        ep0 = float(F.raw(attached, "ep_ttm").iloc[0])
+        check("股票因子：E/P = 1/5", abs(ep0 - 0.2) < 1e-9, f"{ep0:.6f}")
+        # 1/PB：PB=0.5 → B/P=2.0
+        bp0 = float(F.raw(attached, "bp").iloc[0])
+        check("股票因子：B/P = 1/0.5", abs(bp0 - 2.0) < 1e-9, f"{bp0:.6f}")
+        # 流通占比 800/1000
+        cr0 = float(F.raw(attached, "circ_ratio").iloc[0])
+        check("股票因子：流通占比 = 0.8", abs(cr0 - 0.8) < 1e-9, f"{cr0:.6f}")
+        # 除权天数：01-02 是第一根，还没除权 → NaN；01-03 跳了一次 → 0
+        ex = F.raw(attached, "exdiv_days")
+        check("股票因子：除权日当天 exdiv_days = 0",
+              abs(float(ex.iloc[1])) < 1e-9, str(ex.tolist()))
+
+        # ---- 纯价格因子在股票数据上能算 ----
+        df_calc = df_ts.rename(columns={"dt": "date"}).copy()
+        df_calc["date"] = pd.to_datetime(df_calc["date"])
+        df_calc = df_calc.set_index("date")
+        # 只有 2 行，算不出 20 日动量，但 raw() 不该报错
+        try:
+            v = F.raw(df_calc, "mom_20")
+            check("因子：股票数据上算 mom_20 不报错", True)
+        except Exception as exc:
+            check("因子：股票数据上算 mom_20 不报错", False, str(exc))
+
+        # ---- 代码格式转换（download_stock_ts） ----
+        try:
+            from download_stock_ts import tq_to_ts, ts_to_tq
+            check("代码转换：SSE.600000 → 600000.SH",
+                  tq_to_ts("SSE.600000") == "600000.SH",
+                  tq_to_ts("SSE.600000"))
+            check("代码转换：SZSE.000001 → 000001.SZ",
+                  tq_to_ts("SZSE.000001") == "000001.SZ",
+                  tq_to_ts("SZSE.000001"))
+            check("代码转换：600000.SH → SSE.600000",
+                  ts_to_tq("600000.SH") == "SSE.600000",
+                  ts_to_tq("600000.SH"))
+            check("代码转换：000001.SZ → SZSE.000001",
+                  ts_to_tq("000001.SZ") == "SZSE.000001",
+                  ts_to_tq("000001.SZ"))
+        except ImportError:
+            skip("代码转换", "download_stock_ts 不在 sys.path")
+
+    finally:
+        del os.environ["TRENDDESK_STOCK_DB"]
+
+
 def main() -> int:
     ks = keys()
     if not ks:
@@ -5307,6 +5707,7 @@ def main() -> int:
     check_free_account()
     check_edb()
     check_options()
+    check_stock()
     check_live_helpers()
     check_live_worker()
     check_cli_entry()

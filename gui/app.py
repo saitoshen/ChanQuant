@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -170,6 +171,23 @@ CROSS_WEIGHTS = [
     ("risk", "风险平价", "波动率越大分到的钱越少，让每条腿承担的风险差不多"),
     ("equal", "等权", "每一条腿分到同样的名义金额"),
     ("score", "按分数加权", "截面分数越高，多头腿分到的钱越多"),
+    ("tier", "分档（排名越靠前给越多）",
+     "把选中的几只按分数降序切成 N 档，第 1 档拿最多份、最后一档最少。\n"
+     "默认按 2 的幂递减：3 档是 4/2/1，4 档是 8/4/2/1。"),
+]
+
+# 截面机器学习的标签口径。默认 volret：铁矿的日常波动是玉米的两三倍，
+# 直接用收益当标签，模型会偏爱高波动品种
+CROSS_LABELS = [
+    ("volret", "收益 ÷ 波动（推荐）",
+     "未来收益先除以自身波动率，再减截面均值。\n"
+     "把「涨了 3%」换算成「涨了 1.2 个标准差」，高波动品种不再天然占优。"),
+    ("excess", "收益 − 截面均值（老口径）",
+     "未来收益直接减截面均值。有量纲问题：波动大的品种标签天然更大。"),
+    ("rank", "截面分位",
+     "未来收益的截面排名减 0.5。最抗极端值，代价是丢掉幅度信息。"),
+    ("volret_rank", "收益÷波动 再取分位",
+     "先按波动标准化再排名。抗极端值，且跨品种可比。"),
 ]
 
 # 时序策略（只对「选品种 + 时序交易」生效）
@@ -357,6 +375,12 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 # ------------------------------------------------------------------ 数据仓库
 FUT_DIR = resolve_data_dir("cn")
 AUX_DIR = resolve_data_dir("aux")
+# A 股数据走独立 DuckDB（天勤 + Tushare 两套日线分表存储），不走 CSV 目录。
+# 路径和 stockstore.db_path() 保持一致，但这里在导入期就解析好，避免 GUI 启动时
+# 才发现路径不对。TRENDDESK_STOCK_DB 环境变量可以覆盖（测试 / 换盘用）。
+_STOCK_DB = os.environ.get("TRENDDESK_STOCK_DB") or os.path.join(
+    os.path.dirname(FUT_DIR.rstrip("/\\")), "data_tq", "stock.duckdb"
+)
 
 EXCHANGE_CN = {
     "SHFE": "上期所",
@@ -398,6 +422,19 @@ MARKETS = {
             "浅蓝底色＝多头持仓　浅红底色＝空头持仓　"
             "红色虚线＝这笔交易盈利　绿色虚线＝亏损　"
             "分钟级按天勤自己的主力切换口径复权，与日线的 Tushare 口径不同　"
+            "前复权：最新一根＝真实盘面价　信号在下一根开盘成交　双击 K 线出十字光标"
+        ),
+    },
+    "cn_stock": {
+        "label": "A 股",
+        "dir": _STOCK_DB,
+        "sub": "A 股 · 日线（天勤 + Tushare 双源）· 1 小时 / 5 分钟（天勤）· 前复权",
+        "price_note": "价格（前复权）",
+        **replay.MARKET_COST["cn_stock"],
+        "legend": (
+            "▲ 紫色向上三角＝开多　▼ 紫色向下三角＝平多　"
+            "浅蓝底色＝多头持仓　红色虚线＝这笔交易盈利　绿色虚线＝亏损　"
+            "日线有两个源：天勤（1d_tq）和 Tushare（1d），价格口径略有差异　"
             "前复权：最新一根＝真实盘面价　信号在下一根开盘成交　双击 K 线出十字光标"
         ),
     },
@@ -454,11 +491,11 @@ def load_futures_csv(key: str, data_dir: str) -> pd.DataFrame:
 
 
 class DataStore:
-    """本地缓存，按需读取。支持美股 / 国内期货两个市场、多个周期。
+    """本地缓存，按需读取。支持美股 / 国内期货 / A 股三个市场、多个周期。
 
-    期货的日线走 Tushare CSV（20 年），分钟级走天勤 DuckDB（10 年）。缓存按
-    (标的, 周期) 存，并限制条目数 —— 一个品种的 5 分钟十年是十几万行、约 10 MB，
-    全市场都缓存下来会吃掉几个 G。
+    期货的日线走 Tushare CSV（20 年），分钟级走天勤 DuckDB（10 年）。A 股的
+    日线走独立 DuckDB（天勤 + Tushare 双源分表），分钟级走天勤。美股走 CSV。
+    缓存按 (标的, 周期) 存，并限制条目数。
     """
 
     CACHE_MAX = 6
@@ -477,10 +514,10 @@ class DataStore:
         return [it["key"] for it in self.items]
 
     def _scan(self) -> None:
-        if not os.path.isdir(self.data_dir):
-            return
         if self.market == "us":
             self._scan_us()
+        elif self.market == "cn_stock":
+            self._scan_stock()
         else:
             self._scan_futures()
 
@@ -533,12 +570,45 @@ class DataStore:
                  "name": r.get("name", ""), "exchange": ex}
             )
 
+    def _scan_stock(self) -> None:
+        """从 stock.duckdb 的 stock_meta 表扫描全部 A 股标的。
+
+        和期货不同：期货扫 CSV 目录，A 股扫 DuckDB 元数据表。DB 不存在或
+        表为空时 items 留空，上层会提示「请先运行 download_stock_tq.py」。
+        """
+        if not os.path.isfile(self.data_dir):
+            return
+        try:
+            from ttrade.stockstore import load_meta
+
+            df = load_meta()
+        except Exception:
+            return
+        if df is None or df.empty:
+            return
+        rows = df.to_dict("records")
+        # 按代码排序：SSE 在前、SZSE 在后，各自按数字排
+        rows.sort(key=lambda r: (r.get("exchange", ""), r.get("ts_code", "")))
+        for r in rows:
+            code = r.get("ts_code", "")     # SSE.600000 格式
+            ex = r.get("exchange", "")       # SSE / SZSE
+            name = r.get("name", "")
+            board = r.get("board", "")       # 主板 / 创业板 / 科创板
+            tag = f" · {board}" if board else ""
+            label = f"{code.replace('.', '　')}　{name}{tag}" if name else code
+            self.items.append(
+                {"key": code, "label": label, "symbol": code,
+                 "name": name, "exchange": ex}
+            )
+
     def get(self, key: str, period: str = PERIOD_1D) -> pd.DataFrame | None:
         ck = (key, period)
         if ck in self._cache:
             return self._cache[ck]
         try:
-            if self.market == "us" or period in (None, "", PERIOD_1D):
+            if self.market == "cn_stock":
+                df = self._load_stock(key, period)
+            elif self.market == "us" or period in (None, "", PERIOD_1D):
                 df = load_local(key, self.data_dir) if self.market == "us" \
                     else load_futures_csv(key, self.data_dir)
             else:
@@ -584,6 +654,17 @@ class DataStore:
 
     def has_period(self, key: str, period: str) -> bool:
         """这个标的有没有该周期的数据。按品种缓存，切换品种时只查一次库。"""
+        if self.market == "cn_stock":
+            # 日线一定有（只要元数据存在）；分钟级查天勤表
+            if period in (None, "", PERIOD_1D, PERIOD_1D_TQ):
+                return True
+            if key not in self._periods:
+                try:
+                    from ttrade.stockstore import available_periods as _ap
+                    self._periods[key] = set(_ap(key))
+                except Exception:
+                    return False
+            return period in self._periods[key]
         if self.market == "us" or period in (None, "", PERIOD_1D):
             return True
         if key not in self._periods:
@@ -593,6 +674,70 @@ class DataStore:
             except Exception:  # noqa: BLE001
                 return False      # 拿不到就返回 False，但不要把失败结果缓存住
         return period in self._periods[key]
+
+    def _load_stock(self, key: str, period: str) -> pd.DataFrame:
+        """从 stock.duckdb 加载 A 股 K 线。
+
+        - 日线有两个源：``1d_tq``（天勤）和 ``1d``（Tushare）。默认用 Tushare
+          （全历史、有复权因子），天勤日线作为备选。
+        - 分钟级（1h / 5m）走天勤表。
+        - 前复权：用 adj_factor 把 OHLC 乘以 ``adj / adj.iloc[-1]``，最后一根
+          等于真实盘面价。成交量 / 成交额不复权。
+        - 返回的 DataFrame 列名和期货 / 美股一致：date / open / high / low /
+          close / volume / amount，下游因子计算和回测不关心来源。
+        """
+        from ttrade import stockstore as SS
+
+        code = key  # SSE.600000 格式，库内主键
+        if period in (None, "", PERIOD_1D):
+            # Tushare 日线（全历史 + 复权因子），没有就退回天勤日线
+            df = SS.load_one_ts(code)
+            if df is None or df.empty:
+                df = SS.load_one_tq(code, "1d")
+            adj = SS.load_one_adj(code)
+        elif period == PERIOD_1D_TQ:
+            df = SS.load_one_tq(code, "1d")
+            adj = SS.load_one_adj(code)
+        else:
+            # 分钟级：天勤表
+            df = SS.load_one_tq(code, period)
+            adj = None
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        # 统一列名 → 和期货/美股一致
+        df = df.rename(columns={"dt": "date"})
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+        # 前复权：adj 是以日期为 index 的 Series，按 K 线日期对齐
+        if adj is not None and not adj.empty and "close" in df.columns:
+            ratio = adj.reindex(df["date"]).ffill().bfill()
+            ratio = (ratio / ratio.iloc[-1]).fillna(1.0)
+            for col in ("open", "high", "low", "close"):
+                if col in df.columns:
+                    df[col] = df[col] * ratio.values
+
+        # 剔除价格为 0 的占位行（停牌日可能返回 0）
+        px = df[["open", "high", "low", "close"]]
+        df = df[px.gt(0).all(axis=1)].reset_index(drop=True)
+
+        # 和期货 / 美股一致：返回时 date 已经是索引（下游直接 df.index 取日期）
+        df = df.set_index("date").sort_index()
+
+        # 挂衍生列（PE/PB/换手率、资金流、复权因子、概念板块数）。和期货的
+        # `auxdata.attach` 同一个套路：因子函数退化成读列，三条链路都不用改。
+        # 分钟 bar 要整体后移一个交易日 —— 上午 10 点不可能知道当天收盘后的换手率。
+        try:
+            from ttrade.stockaux import attach as attach_stock
+
+            df = attach_stock(df, code, intraday=period not in
+                              (None, "", PERIOD_1D, PERIOD_1D_TQ))
+        except Exception:  # noqa: BLE001
+            # 衍生数据缺失不该让 K 线也读不出来
+            pass
+        return df
 
 
 # ------------------------------------------------------------------ 因子计算线程
@@ -1292,6 +1437,16 @@ class MainWindow(QMainWindow):
         self.contract_pick = ContractPicker()
         self.contract_pick.changed.connect(self._on_contract_changed)
         cl.addWidget(self.contract_pick)
+        # T 型报价：合约层一次只能看一个合约，而「平值在哪、两边 IV 差多少」
+        # 是横截面问题。这一层开一张表，双击任意档回到上面那层画 K 线
+        self.btn_quote = QPushButton("期权链 / T 型报价")
+        self.btn_quote.setObjectName("Ghost")
+        self.btn_quote.setToolTip(
+            "一条期权链上所有行权价的认购/认沽并排看：最新价、涨跌、成交量、\n"
+            "持仓量、现场反解的 IV。双击左侧看认购、右侧看认沽。"
+        )
+        self.btn_quote.clicked.connect(self._open_option_quote)
+        cl.addWidget(self.btn_quote)
         # 多品种勾选：截面策略要一批品种，多品种回测也是。按钮上直接写「已选
         # N 个」，不点开就知道现在是单品种还是组合
         self.sym_pick = SymbolPicker("多品种回测")
@@ -1395,6 +1550,81 @@ class MainWindow(QMainWindow):
                 self.cb_cross_w.count() - 1, tip, Qt.ToolTipRole)
         pc.addWidget(self.cb_cross_w)
 
+        # 分档：排名越靠前拿越多。选「分档」时才显示
+        self.row_tiers = QWidget()
+        rt = QHBoxLayout(self.row_tiers)
+        rt.setContentsMargins(0, 0, 0, 0)
+        rt.setSpacing(6)
+        self.sp_tiers = QSpinBox()
+        self.sp_tiers.setRange(2, 6)
+        self.sp_tiers.setValue(3)
+        self.sp_tiers.setPrefix("分 ")
+        self.sp_tiers.setSuffix(" 档")
+        self.sp_tiers.setToolTip(
+            "把选中的那几只按截面分数降序切成 N 档。\n"
+            "档数不能超过选中的只数 —— 超了按实际只数切。"
+        )
+        self.ed_tier_units = QLineEdit()
+        self.ed_tier_units.setPlaceholderText("份数 4,2,1（留空＝按 2 的幂递减）")
+        self.ed_tier_units.setToolTip(
+            "每一档拿几份钱，逗号分隔，从第一档往后写。\n"
+            "只填 2 个而分 3 档时，最后那一档沿用最后一个数字。"
+        )
+        rt.addWidget(self.sp_tiers)
+        rt.addWidget(self.ed_tier_units, 1)
+        pc.addWidget(self.row_tiers)
+
+        # ---- 第一步：选品种池
+        self.grp_pool = QWidget()
+        gp = QVBoxLayout(self.grp_pool)
+        gp.setContentsMargins(0, 0, 0, 0)
+        gp.setSpacing(8)
+        gp.addWidget(self._section("第一步：先筛品种池（可选）"))
+        self.chk_pool = QCheckBox("先按一个简单因子筛池，第二步只在池内排序")
+        self.chk_pool.setToolTip(
+            "两步走：第一步用「能不能交易」的因子（金额、持仓）筛池，\n"
+            "第二步用「谁强谁弱」的因子（动量、基差）排序。\n\n"
+            "混在一张分数里的话，金额大的品种会因为金额因子 z 值高被排到前面，\n"
+            "但它涨不涨是另一回事 —— 流动性把权重带偏了。"
+        )
+        gp.addWidget(self.chk_pool)
+        self.row_pool = QWidget()
+        rp = QHBoxLayout(self.row_pool)
+        rp.setContentsMargins(0, 0, 0, 0)
+        rp.setSpacing(6)
+        self.cb_pool_factor = QComboBox()
+        self.cb_pool_factor.setToolTip(
+            "筛池因子。默认「成交额 20（对数）」—— 流动性差的品种信号噪声大、\n"
+            "滑点高，留在池里只会稀释排名。"
+        )
+        self._fill_factor_combo(self.cb_pool_factor, "log_amount_20")
+        self.sp_pool_pct = QDoubleSpinBox()
+        self.sp_pool_pct.setRange(10.0, 100.0)
+        self.sp_pool_pct.setDecimals(0)
+        self.sp_pool_pct.setSingleStep(5.0)
+        self.sp_pool_pct.setValue(70.0)
+        self.sp_pool_pct.setPrefix("保留 ")
+        self.sp_pool_pct.setSuffix(" %")
+        self.sp_pool_pct.setToolTip(
+            "池里留下分数最高的百分之几。70% 表示 10 个品种留 7 个。\n"
+            "留太少的话第二步的腿数会跟着少（腿数按池内品种数算）。"
+        )
+        rp.addWidget(self.cb_pool_factor, 1)
+        rp.addWidget(self.sp_pool_pct)
+        gp.addWidget(self.row_pool)
+        pc.addWidget(self.grp_pool)
+
+        # ---- 机器学习标签口径（只在因子模式=机器学习时显示）
+        self.lbl_label = QLabel("机器学习标签")
+        self.lbl_label.setObjectName("SectionTitle")
+        pc.addWidget(self.lbl_label)
+        self.cb_label = QComboBox()
+        for key, label, tip in CROSS_LABELS:
+            self.cb_label.addItem(label, key)
+            self.cb_label.setItemData(
+                self.cb_label.count() - 1, tip, Qt.ToolTipRole)
+        pc.addWidget(self.cb_label)
+
         self.lbl_cross_timing = self._section("时序策略（选品种模式用）")
         pc.addWidget(self.lbl_cross_timing)
         self.cb_timing = QComboBox()
@@ -1462,6 +1692,126 @@ class MainWindow(QMainWindow):
         self.lbl_fmode.setWordWrap(True)
         pf.addWidget(self.lbl_fmode)
         cl.addWidget(self.box_factor)
+
+        # ---------------------------------------------- 样本稀疏采样（仅 ML）
+        #
+        # 分钟线上每根 bar 都当样本的话，相邻样本的标签重叠 horizon 根 —— 同一段
+        # 行情被数了 horizon 遍。模型学到的是「这几天在涨」，不是「这种形态之后
+        # 会涨」。而且 5 分钟一年 6 万根，绝大多数是横盘噪声。
+        #
+        # 这里让用户用**一组因子或一条规则**决定「哪几根值得学」，再按触发强度
+        # 分档：强突破和弱突破分成不同档，各档都成样本 —— 标签才够丰富。
+        self.box_sparse = QFrame()
+        self.box_sparse.setObjectName("SubCard")
+        sp = QVBoxLayout(self.box_sparse)
+        sp.setContentsMargins(10, 9, 10, 9)
+        sp.setSpacing(7)
+
+        self.chk_sparse = QCheckBox("只在信号触发时建样本（稀疏采样）")
+        self.chk_sparse.setToolTip(
+            "开启后训练集只保留「触发」的那几根 bar，其余 bar 仍会预测、仍会出信号。\n\n"
+            "为什么需要：分钟线上每根 bar 都是样本的话，相邻样本的标签重叠 horizon 根，\n"
+            "等于同一段行情被数了好几遍；而真正值得学的「突破那一刻」只占几个百分点。"
+        )
+        self.chk_sparse.toggled.connect(self._on_sparse_toggled)
+        sp.addWidget(self.chk_sparse)
+
+        self.sparse_body = QWidget()
+        sb = QVBoxLayout(self.sparse_body)
+        sb.setContentsMargins(0, 0, 0, 0)
+        sb.setSpacing(6)
+
+        r1 = QHBoxLayout()
+        r1.setContentsMargins(0, 0, 0, 0)
+        r1.setSpacing(6)
+        self.cb_trig1 = QComboBox()
+        self.cb_trig1.setToolTip("触发因子一：它的时序 Z-score 越过阈值就算触发")
+        self._fill_factor_combo(self.cb_trig1, "mom_20")
+        self.cb_trig2 = QComboBox()
+        self.cb_trig2.setToolTip("触发因子二（可选）：和第一个取均值，两个都高才算强触发")
+        self._fill_factor_combo(self.cb_trig2, "vol_20")
+        self.cb_trig2.insertItem(0, "（不用第二个因子）", "")
+        r1.addWidget(self.cb_trig1, 1)
+        r1.addWidget(self.cb_trig2, 1)
+        sb.addLayout(r1)
+
+        r2 = QHBoxLayout()
+        r2.setContentsMargins(0, 0, 0, 0)
+        r2.setSpacing(6)
+        self.cb_trig_rule = QComboBox()
+        self.cb_trig_rule.setToolTip(
+            "规则触发（可选）：这条规则刚开仓的那一根也建样本。\n"
+            "和因子触发是「或」的关系 —— 任一命中就采。"
+        )
+        self.cb_trig_rule.addItem("（不用规则触发）", "")
+        for key, st in STRATEGIES.items():
+            self.cb_trig_rule.addItem(st.label, key)
+        self.cb_trig_side = QComboBox()
+        self.cb_trig_side.addItem("向上向下都采", "both")
+        self.cb_trig_side.addItem("只采向上", "up")
+        self.cb_trig_side.addItem("只采向下", "down")
+        r2.addWidget(self.cb_trig_rule, 1)
+        r2.addWidget(self.cb_trig_side, 1)
+        sb.addLayout(r2)
+
+        r3 = QHBoxLayout()
+        r3.setContentsMargins(0, 0, 0, 0)
+        r3.setSpacing(6)
+        self.sp_trig_z = QDoubleSpinBox()
+        self.sp_trig_z.setRange(0.0, 4.0)
+        self.sp_trig_z.setSingleStep(0.1)
+        self.sp_trig_z.setDecimals(1)
+        self.sp_trig_z.setValue(1.0)
+        self.sp_trig_z.setPrefix("阈值 ")
+        self.sp_trig_z.setSuffix(" σ")
+        self.sp_trig_z.setToolTip(
+            "触发强度（因子 Z-score 的绝对值）要多大才算数。\n"
+            "1.0 大约留下 5~10% 的 bar；调到 0.5 会多一倍，调到 2.0 只剩百分之几。"
+        )
+        self.sp_trig_tiers = QSpinBox()
+        self.sp_trig_tiers.setRange(0, 5)
+        self.sp_trig_tiers.setValue(3)
+        self.sp_trig_tiers.setPrefix("分 ")
+        self.sp_trig_tiers.setSuffix(" 档")
+        self.sp_trig_tiers.setToolTip(
+            "把触发强度分成几档，每档各自成一个样本。\n"
+            "0 = 不分档（所有触发点一个样）。3 档意味着「1.0~1.5σ」「1.5~2.0σ」\n"
+            "「2.0σ 以上」各采一次 —— 弱突破和强突破是两种样本。"
+        )
+        self.sp_trig_span = QDoubleSpinBox()
+        self.sp_trig_span.setRange(0.1, 3.0)
+        self.sp_trig_span.setSingleStep(0.1)
+        self.sp_trig_span.setDecimals(1)
+        self.sp_trig_span.setValue(0.5)
+        self.sp_trig_span.setPrefix("每档 ")
+        self.sp_trig_span.setSuffix(" σ")
+        r3.addWidget(self.sp_trig_z)
+        r3.addWidget(self.sp_trig_tiers)
+        r3.addWidget(self.sp_trig_span)
+        sb.addLayout(r3)
+
+        r4 = QHBoxLayout()
+        r4.setContentsMargins(0, 0, 0, 0)
+        r4.setSpacing(6)
+        self.sp_trig_cool = QSpinBox()
+        self.sp_trig_cool.setRange(0, 500)
+        self.sp_trig_cool.setValue(10)
+        self.sp_trig_cool.setPrefix("同档冷却 ")
+        self.sp_trig_cool.setSuffix(" 根")
+        self.sp_trig_cool.setToolTip(
+            "同一档在这么多根之内不重复采样。一次突破持续 20 根的话，\n"
+            "不设冷却就会建 20 个几乎一样的样本。"
+        )
+        self.lbl_sparse = QLabel("")
+        self.lbl_sparse.setObjectName("Hint")
+        self.lbl_sparse.setWordWrap(True)
+        r4.addWidget(self.sp_trig_cool)
+        r4.addWidget(self.lbl_sparse, 1)
+        sb.addLayout(r4)
+
+        sp.addWidget(self.sparse_body)
+        self.sparse_body.setVisible(False)
+        cl.addWidget(self.box_sparse)
 
         # ---------------------------------------------- 因子过滤（仅规则模式）
         self.box_filter = QFrame()
@@ -1869,6 +2219,18 @@ class MainWindow(QMainWindow):
             self.sp_cross_pct.valueChanged.connect(self._on_cross_param_changed)
             self.sp_cross_bot.valueChanged.connect(self._on_cross_param_changed)
             self.cb_cross_w.currentIndexChanged.connect(self._on_cross_param_changed)
+            self.sp_tiers.valueChanged.connect(self._on_cross_param_changed)
+            self.ed_tier_units.editingFinished.connect(self._on_cross_param_changed)
+            self.chk_pool.toggled.connect(self._on_cross_param_changed)
+            self.cb_pool_factor.currentIndexChanged.connect(self._on_cross_param_changed)
+            self.sp_pool_pct.valueChanged.connect(self._on_cross_param_changed)
+            self.cb_label.currentIndexChanged.connect(self._on_cross_param_changed)
+            for _w in (self.cb_trig1, self.cb_trig2, self.cb_trig_rule, self.cb_trig_side):
+                _w.currentIndexChanged.connect(lambda *_: self._schedule())
+            for _w in (self.sp_trig_z, self.sp_trig_span):
+                _w.valueChanged.connect(lambda *_: self._schedule())
+            for _w in (self.sp_trig_tiers, self.sp_trig_cool):
+                _w.valueChanged.connect(lambda *_: self._schedule())
             self.cb_timing.currentIndexChanged.connect(self._on_timing_changed)
             self.cb_tfactor.currentIndexChanged.connect(self._on_timing_changed)
             self.sym_pick.changed.connect(self._on_pick_changed)
@@ -1913,8 +2275,11 @@ class MainWindow(QMainWindow):
         keep = combo.currentData()
         combo.blockSignals(True)
         combo.clear()
+        # 按当前大类过滤：A 股不显示展期/期权/持仓量，美股不显示期货专属因子
+        valid = set(factors.filter_by_market(self.market))
         for cat in factors.CATEGORIES:
-            keys = [k for k, s in factors.FACTORS.items() if s.category == cat]
+            keys = [k for k, s in factors.FACTORS.items()
+                    if s.category == cat and k in valid]
             if not keys:
                 continue
             for i, k in enumerate(keys):
@@ -1988,9 +2353,10 @@ class MainWindow(QMainWindow):
         的勾选全清掉。"""
         picked = self._multi_state() if self.tbl_fmulti.rowCount() else {}
         self.tbl_fmulti.setRowCount(0)
+        valid = set(factors.filter_by_market(self.market))
         for cat in factors.CATEGORIES:
             for k, spec in factors.FACTORS.items():
-                if spec.category != cat:
+                if spec.category != cat or k not in valid:
                     continue
                 r = self.tbl_fmulti.rowCount()
                 self.tbl_fmulti.insertRow(r)
@@ -2026,17 +2392,23 @@ class MainWindow(QMainWindow):
     def _fill_symbols(self) -> None:
         self.cb_symbol.blockSignals(True)
         self.cb_symbol.clear()
-        if self.market == "cn":
-            # 按交易所分组。78 个品种平铺在一个下拉里，找「碳酸锂」得从头滚到
-            # 尾；分组的组头做成**不可选**的灰条，既当标题又不会混进选择。
+        if self.market == "cn" or self.market == "cn_stock":
+            # 按交易所分组。期货 78 个品种 / A 股 5000 只平铺在一个下拉里，
+            # 找目标品种得从头滚到尾；分组的组头做成**不可选**的灰条。
             groups: dict[str, list[dict]] = {}
             for it in self.store.items:
                 groups.setdefault(it.get("exchange") or "", []).append(it)
-            order = [k for k in symbols_info.EXCHANGES if k in groups]
-            order += [k for k in groups if k not in symbols_info.EXCHANGES]
+            if self.market == "cn":
+                order = [k for k in symbols_info.EXCHANGES if k in groups]
+                exch_names = symbols_info.EXCHANGES
+            else:
+                # A 股交易所名
+                exch_names = {"SSE": "上交所", "SZSE": "深交所"}
+                order = [k for k in ("SSE", "SZSE") if k in groups]
+            order += [k for k in groups if k not in order]
             for ex in order:
                 rows = groups[ex]
-                head = symbols_info.EXCHANGES.get(ex, ex)
+                head = exch_names.get(ex, ex)
                 self.cb_symbol.addItem(f"—— {head}（{len(rows)}）——", None)
                 item = self.cb_symbol.model().item(self.cb_symbol.count() - 1)
                 if item is not None:
@@ -2047,7 +2419,8 @@ class MainWindow(QMainWindow):
             for it in self.store.items:
                 self.cb_symbol.addItem(it["label"], it["key"])
         if self.store.items:
-            default = "AAPL" if self.market == "us" else "CU_SHFE"
+            default = "AAPL" if self.market == "us" else \
+                      "SSE.600000" if self.market == "cn_stock" else "CU_SHFE"
             idx = self.cb_symbol.findData(default)
             if idx < 0:
                 # 默认品种不在池子里（比如删了数据）：落到第一个**真品种**，
@@ -2224,10 +2597,21 @@ class MainWindow(QMainWindow):
         self.lbl_sub.setText(info["sub"])
         self._sync_data_page()
         self._fill_symbols()
+        # 切换大类后因子列表要重建：展期/期权/持仓量只在期货上有，
+        # A 股切到期货时要加回来，反之要隐掉
+        if hasattr(self, "cb_fsingle"):
+            self._fill_single_combo()
+            self._fill_tfactor_combo()
+            self._fill_multi_table()
         self._sync_period_controls()
         self._sync_cost_controls()      # 美股没有这一组，期货才显示
         if not self.store.items:
-            cmd = "python download.py" if mk == "us" else "python download_futures.py"
+            if mk == "us":
+                cmd = "python download.py"
+            elif mk == "cn_stock":
+                cmd = "python download_stock_tq.py --periods 1d"
+            else:
+                cmd = "python download_futures.py"
             self.lbl_status.setText(f"{info['label']} 本地无数据，请先运行 {cmd}")
             return
         self._schedule(immediate=True)
@@ -2376,6 +2760,38 @@ class MainWindow(QMainWindow):
                 self.lbl_pick.setText("")
         self.run_analysis()
 
+    def _open_option_quote(self) -> None:
+        """开 T 型报价窗。选中一档之后交给合约层，走它那条「只画 K 线」的路。
+
+        **不在这个函数里直接画图**：合约层是唯一知道「当前周期 / 成本口径 /
+        品种乘数」的地方，绕过它自己画，换周期、换品种之后就会有一堆状态对不上。
+        能对齐就对齐；对不齐（期权库里找不到那个合约）才自己兜底画一次。
+        """
+        if self.market != "cn":
+            self.lbl_status.setText("期权库只有国内品种")
+            return
+        from gui.option_dialog import OptionQuoteDialog
+
+        sym, _ex = self._key_parts(self.cb_symbol.currentData() or "")
+        dlg = OptionQuoteDialog(self, variety=sym)
+        dlg.picked.connect(self._on_option_picked)
+        dlg.exec()
+
+    def _on_option_picked(self, contract: str) -> None:
+        pick = getattr(self, "contract_pick", None)
+        if pick is not None and pick.select_option(str(contract)):
+            return                      # 合约层会发 changed，剩下的它自己走
+        # 对不齐（品种下拉里没有这个期权品种、或者库里缺这条链的元信息）：
+        # 图还是要给出来，不能因为界面同步失败就什么都不显示
+        from ttrade import optchain as OC
+
+        df = OC.contract_bars(str(contract), self._period())
+        if df is None or df.empty:
+            self._clear_chart(f"{contract} 在本地没有 {self._period()} 数据")
+            return
+        self._show_single_view()
+        self._show_contract(str(contract), df, is_opt=True)
+
     def _contract_df(self, contract: str) -> pd.DataFrame:
         """按选中的合约取 K 线。
 
@@ -2397,9 +2813,14 @@ class MainWindow(QMainWindow):
             return pd.DataFrame()
         return df.set_index("dt").sort_index()
 
-    def _show_contract(self, contract: str, df: pd.DataFrame) -> None:
-        """合约 K 线收尾：仓位/成本口径照旧，但不出策略信号。"""
-        is_opt = self.contract_pick.mode() == ContractPicker.MODE_OPTION
+    def _show_contract(self, contract: str, df: pd.DataFrame,
+                       is_opt: bool | None = None) -> None:
+        """合约 K 线收尾：仓位/成本口径照旧，但不出策略信号。
+
+        `is_opt` 默认从合约层读；T 型报价那条路可能对不齐控件，得自己传。
+        """
+        if is_opt is None:
+            is_opt = self.contract_pick.mode() == ContractPicker.MODE_OPTION
         label = f"{contract}（{'期权' if is_opt else '合约'}）"
         df = replay.window(df, self.cb_range.currentData() or 0)
         self.cfg.bars_per_year = bars_per_year(df.index)
@@ -2537,6 +2958,14 @@ class MainWindow(QMainWindow):
             w.setVisible(timing_factor)
         # 只做多时没有空头腿，那个百分比控件摆着只会让人以为它有用
         self.sp_cross_bot.setVisible(not self.cfg.long_only)
+        # 分档只在「资金分配＝分档」时才有意义，其余档位下摆着是个摆设
+        tier_on = (self.cb_cross_w.currentData() == "tier")
+        self.row_tiers.setVisible(tier_on)
+        # 池过滤两种模式都能用：对冲是「池内多强空弱」，选品种是「池内挑 top」
+        self.row_pool.setVisible(self.chk_pool.isChecked())
+        ml_on = self.factor_mode == "ml"
+        for w in (self.lbl_label, self.cb_label):
+            w.setVisible(ml_on)
         if self.family != FAMILY_CROSS:
             return
         n = len(sel)
@@ -2544,6 +2973,16 @@ class MainWindow(QMainWindow):
         pct_s = float(self.sp_cross_bot.value())
         legs_l = max(1, int(round(n * pct_l / 100.0))) if n else 0
         legs_s = max(1, int(round(n * pct_s / 100.0))) if n else 0
+        # 池过滤之后腿数是按**池内**品种算的，提示里要跟着缩，否则用户看到
+        # 「10 个品种多 2 个」，跑出来只有 1 个，会以为算错了
+        n_pool = n
+        pool_note = ""
+        if self.chk_pool.isChecked() and n:
+            n_pool = max(cross_engine.MIN_CROSS,
+                         int(round(n * float(self.sp_pool_pct.value()) / 100.0)))
+            legs_l = max(1, int(round(n_pool * pct_l / 100.0)))
+            legs_s = max(1, int(round(n_pool * pct_s / 100.0)))
+            pool_note = f"第一步筛完剩约 {n_pool} 个，"
         if n < cross_engine.MIN_CROSS:
             self.lbl_cross_hint.setText(
                 f"截面策略至少要 {cross_engine.MIN_CROSS} 个品种，现在选了 {n} 个。"
@@ -2551,14 +2990,15 @@ class MainWindow(QMainWindow):
             )
         elif mode == "hedge":
             self.lbl_cross_hint.setText(
-                f"{n} 个品种，每次调仓多最强的 {legs_l} 个、"
+                pool_note + f"每次调仓多最强的 {legs_l} 个、"
                 + ("只做多。" if self.cfg.long_only else f"空最弱的 {legs_s} 个。")
                 + f"腿内按{self.cb_cross_w.currentText()}分配。"
             )
         else:
             self.lbl_cross_hint.setText(
-                f"{n} 个品种，每次调仓挑出最强的 {legs_l} 个，"
+                pool_note + f"每次调仓挑出最强的 {legs_l} 个，"
                 "再由时序策略决定每个品种是多是空还是空仓。"
+                + (f"腿内按{self.cb_cross_w.currentText()}分钱。" if tier_on else "")
             )
 
     def _on_cross_mode_changed(self, *_a) -> None:
@@ -2581,6 +3021,23 @@ class MainWindow(QMainWindow):
         self._sync_factor_panel()
         self._schedule(immediate=True)
 
+    def _on_sparse_toggled(self, on: bool) -> None:
+        """稀疏采样开关：只展开/收起参数区，不立刻重算 —— 刚打开时参数还是
+        默认值，用户多半要先调阈值。真重算由参数改动触发。"""
+        if hasattr(self, "sparse_body"):
+            self.sparse_body.setVisible(bool(on))
+        if not on:
+            self._schedule(immediate=True)
+
+    def _trigger_keys(self) -> list[str]:
+        """稀疏采样的触发因子。第一个必选，第二个为空就不加。"""
+        out = []
+        for cb in (getattr(self, "cb_trig1", None), getattr(self, "cb_trig2", None)):
+            k = cb.currentData() if cb is not None else ""
+            if k and k not in out:
+                out.append(str(k))
+        return out
+
     def _on_model_changed(self) -> None:
         self._schedule(immediate=True)
 
@@ -2593,6 +3050,10 @@ class MainWindow(QMainWindow):
         if self.family == FAMILY_CROSS:
             self._sync_cross_factor_panel()
             return
+        # 稀疏采样只对**时序** ML 开放：截面那边是所有品种堆成长表，触发信号
+        # 得逐品种算再拼起来，语义还没定，先不摆出来
+        if hasattr(self, "box_sparse"):
+            self.box_sparse.setVisible(False)
         self.factor_mode = self._factor_mode()
         show = (self.family == FAMILY_FACTOR) or self._filter_active()
         self.box_fsel.setVisible(show)
@@ -2613,6 +3074,8 @@ class MainWindow(QMainWindow):
         self.cb_fmodel.setVisible(is_ml)
         # 方向口径对 ML 没意义：模型自己学方向和权重，orient 根本不参与
         self.cb_forient.setVisible(not is_ml)
+        if hasattr(self, "box_sparse"):
+            self.box_sparse.setVisible(is_ml and self.family == FAMILY_FACTOR)
 
         if is_ml and not mlmodels.available():
             self.lbl_fmode.setText("当前环境没有可用的机器学习库，请先安装依赖。")
@@ -2632,6 +3095,8 @@ class MainWindow(QMainWindow):
         表达不出来，改一个还会顺手改掉另一个。
         """
         self.factor_mode = self.cb_fmode.currentData() or "multi"
+        if hasattr(self, "box_sparse"):
+            self.box_sparse.setVisible(False)
         single = self.factor_mode == "single"
         self.box_fsel.setVisible(True)
         self.lbl_fsel.setText("截面因子")
@@ -2846,6 +3311,35 @@ class MainWindow(QMainWindow):
         return out
 
     # ---------------------------------------------------------- 策略配置存取
+    def _cross_new_params(self) -> dict:
+        """分档 / 第一步筛池 / 标签口径 —— 这两处构造截面配置都要用。
+
+        抽出来是因为「跑回测」和「保存配置」各写一遍的话，早晚有一处漏字段：
+        存下来的配置回放时少了分档，净值对不上，还查不出是哪一步丢的。
+        """
+        units: list[float] = []
+        if hasattr(self, "ed_tier_units"):
+            for tok in re.split(r"[,，\s]+", self.ed_tier_units.text().strip()):
+                if not tok:
+                    continue
+                try:
+                    v = float(tok)
+                except ValueError:
+                    continue
+                if v > 0:
+                    units.append(v)
+        pool_key = ""
+        if getattr(self, "chk_pool", None) is not None and self.chk_pool.isChecked():
+            pool_key = self.cb_pool_factor.currentData() or ""
+        return {
+            "tiers": (int(self.sp_tiers.value())
+                      if self.cb_cross_w.currentData() == "tier" else 0),
+            "units": units,
+            "pool_key": pool_key,
+            "pool_pct": float(self.sp_pool_pct.value()),
+            "label": self.cb_label.currentData() or "volret",
+        }
+
     def _current_config(self) -> SStore.StrategyConfig:
         """把界面上这一套选择收成一份可保存的配置。
 
@@ -2862,6 +3356,7 @@ class MainWindow(QMainWindow):
         is_factor = self.family == FAMILY_FACTOR
         is_cross = self.family == FAMILY_CROSS
         fc = self._factor_cfg() if (is_factor or is_cross) else None
+        _cx = self._cross_new_params()
         return SStore.StrategyConfig(
             name=self.ed_cfg_name.text().strip(),
             symbol=sym,
@@ -2890,6 +3385,12 @@ class MainWindow(QMainWindow):
             cross_top_pct=float(self.sp_cross_pct.value()),
             cross_bot_pct=float(self.sp_cross_bot.value()),
             cross_weight=self.cb_cross_w.currentData() or "risk",
+            cross_tiers=_cx["tiers"],
+            cross_tier_units=_cx["units"],
+            cross_pool_mode="single" if _cx["pool_key"] else "off",
+            cross_pool_keys=[_cx["pool_key"]] if _cx["pool_key"] else [],
+            cross_pool_pct=_cx["pool_pct"],
+            cross_label_mode=_cx["label"],
             timing_family=self._timing_family(),
             timing_rule_key=self.cb_strategy.currentData() or "",
             timing_rule_params=self._current_params(),
@@ -3286,6 +3787,7 @@ class MainWindow(QMainWindow):
                 return default
             return sld.value() / self.fparam_scales.get(name, 1)
 
+        sparse = bool(getattr(self, "chk_sparse", None) and self.chk_sparse.isChecked())
         return fstrat.FactorConfig(
             window=int(get("window", 252)),
             horizon=int(get("horizon", 5)),
@@ -3299,6 +3801,14 @@ class MainWindow(QMainWindow):
             filter_mode=self.cb_filter_when.currentData() or "entry",
             long_th=float(get("long_th", 0.0)),
             short_th=float(get("short_th", 0.0)),
+            sample_mode="trigger" if sparse else "all",
+            trigger_keys=self._trigger_keys() if sparse else [],
+            trigger_rule=(self.cb_trig_rule.currentData() or "") if sparse else "",
+            trigger_side=(self.cb_trig_side.currentData() or "both") if sparse else "both",
+            trigger_z=float(self.sp_trig_z.value()) if sparse else 1.0,
+            trigger_tiers=int(self.sp_trig_tiers.value()) if sparse else 0,
+            trigger_span=float(self.sp_trig_span.value()) if sparse else 1.0,
+            trigger_cool=int(self.sp_trig_cool.value()) if sparse else 0,
         )
 
     def run_analysis(self, df_override: pd.DataFrame | None = None) -> None:
@@ -3716,6 +4226,7 @@ class MainWindow(QMainWindow):
             fkeys = self._pick_usable_single(fkeys[0], frames)
         rev = {k: True for k in self._reversed_factor_keys()}
         fc = self._factor_cfg()
+        _cx = self._cross_new_params()
         ccfg = cross_engine.CrossConfig(
             mode=self._cross_mode(),
             rebalance=int(self.sp_cross_reb.value()),
@@ -3723,6 +4234,12 @@ class MainWindow(QMainWindow):
             bot_pct=float(self.sp_cross_bot.value()),
             long_only=self.cfg.long_only,
             weight=self.cb_cross_w.currentData() or "risk",
+            tiers=_cx["tiers"],
+            tier_units=_cx["units"],
+            pool_mode="single" if _cx["pool_key"] else "off",
+            pool_keys=[_cx["pool_key"]] if _cx["pool_key"] else [],
+            pool_top_pct=_cx["pool_pct"],
+            label_mode=_cx["label"],
             factor_mode=self.factor_mode,
             factor_keys=fkeys,
             factor_reverse=rev,
@@ -3748,6 +4265,10 @@ class MainWindow(QMainWindow):
         fcn = {"single": "单因子", "multi": "多因子", "ml": "机器学习"}.get(
             ccfg.factor_mode, ccfg.factor_mode)
         label = (f"{mode_cn} · {fcn} · {len(frames)} 品种 · 每 {ccfg.step()} 根调仓")
+        if ccfg.pool_keys:
+            label += f" · 先筛池 {ccfg.pool_top_pct:g}%"
+        if ccfg.weight == "tier" and ccfg.tiers >= 2:
+            label += f" · {ccfg.tiers} 档"
 
         if ccfg.factor_mode == "ml":
             self._start_cross_worker(frames, ccfg, bt, label, period)

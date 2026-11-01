@@ -38,6 +38,7 @@ from ttrade.strategies import STRATEGIES, available_text, run_strategy
 MARKET_COST = {
     "us": {"fee": 0.0005, "slippage": 0.0005, "allow_short": False},
     "cn": {"fee": 0.0001, "slippage": 0.0002, "allow_short": True},
+    "cn_stock": {"fee": 0.0008, "slippage": 0.001, "allow_short": False},
 }
 
 
@@ -353,6 +354,13 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
         bot_pct=float(getattr(cfg, "cross_bot_pct", 10.0) or 10.0),
         long_only=bt.long_only,
         weight=getattr(cfg, "cross_weight", "risk") or "risk",
+        tiers=int(getattr(cfg, "cross_tiers", 0) or 0),
+        tier_units=list(getattr(cfg, "cross_tier_units", []) or []),
+        pool_mode=getattr(cfg, "cross_pool_mode", "off") or "off",
+        pool_keys=list(getattr(cfg, "cross_pool_keys", []) or []),
+        pool_reverse=dict(getattr(cfg, "cross_pool_reverse", {}) or {}),
+        pool_top_pct=float(getattr(cfg, "cross_pool_pct", 60.0) or 60.0),
+        label_mode=getattr(cfg, "cross_label_mode", "volret") or "volret",
         factor_mode=getattr(cfg, "factor_mode", "multi") or "multi",
         factor_keys=list(getattr(cfg, "factor_keys", []) or []),
         factor_reverse=dict(getattr(cfg, "factor_reverse", {}) or {}),
