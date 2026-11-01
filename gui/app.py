@@ -3634,12 +3634,18 @@ class MainWindow(QMainWindow):
         """启动时恢复上次保存的配置。
 
         失败就静默留在默认状态 —— 一份配置读不出来不该挡住程序启动。
+
+        **没有存过配置（首次启动 / 换机器）时也要算一次首屏。** 以前这里直接
+        return，于是全新安装打开程序看到的是空白的 K 线区 —— 参数栏里明明摆着
+        「沪铜 · MA 双均线」，图上一根 K 线都没有，看起来像没加载出数据。默认
+        品种 + 默认策略本来就有结果可算，先算一遍再让用户去点按钮才是对的。
         """
         try:
             cfg = SStore.load_last()
         except Exception:  # noqa: BLE001
-            return
+            cfg = None
         if cfg is None or not cfg.symbol:
+            self._run_first_screen()
             return
         try:
             self._booting = True
@@ -3647,6 +3653,23 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText(f"已恢复上次配置：{cfg.title()}")
         except Exception as exc:  # noqa: BLE001
             self.lbl_status.setText(f"恢复上次配置失败：{exc}")
+        finally:
+            self._booting = False
+
+    def _run_first_screen(self) -> None:
+        """首次启动：拿默认品种 + 默认策略把首屏算出来。
+
+        和恢复配置走同一条「先画窗口再算」的路径（`_booting` 让 `_schedule` 走
+        220ms 定时器），不然同步算会让窗口等回测跑完才第一次绘制。
+        这里不看自动回测开关 —— 首屏本来就该有东西，不是「改参数触发的重算」。
+        """
+        if not self.store.symbols:
+            return
+        try:
+            self._booting = True
+            self._schedule(immediate=True, force=True)
+        except Exception as exc:  # noqa: BLE001
+            self.lbl_status.setText(f"首屏回测失败：{exc}")
         finally:
             self._booting = False
 

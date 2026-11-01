@@ -314,7 +314,20 @@ PE / PB / 换手率 / 资金流     → ("cn_stock",)  A 股才有
 当天收盘后的换手率。所以 `stockaux.attach(intraday=True)` 会把所有快照整体后移
 一个交易日。这条和期货那套 `attach_intraday` 是同一个规则。
 
-**还没做的**
+**发版自检抓到的一脚：全新安装首屏是空图**
+
+打 tag 之后三平台自检全红，本地照着 CI 的条件（把 `%LOCALAPPDATA%` 指到一个空
+目录）一跑就复现了：`canvas_k.fig.axes[0]` → `IndexError`。
+
+根因不在打包，在启动流程 —— `_restore_last_config()` 读不到
+`last_config.json` 就直接 return，而**首屏那次回测一直是靠「恢复上次配置」顺手
+触发的**。老用户机器上永远有那份文件，所以永远看不出来；换台机器 / 全新安装
+就是参数栏里摆着「沪铜 · MA 双均线」、图上一根 K 线都没有。
+
+现在没有存过配置时走 `_run_first_screen()`：默认品种 + 默认策略算一遍，和恢复
+配置同一条「先画窗口再算」的路径（`_booting` 让 `_schedule` 走 220ms 定时器）。
+自检里那处也补了一句人话，不再只报 `list index out of range`。
+
 
 - 策略验证 / 仿真页面（逐根 bar 重放、前视偏差检测）
 - 天勤股票模拟交易（需要专业版）

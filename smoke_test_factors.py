@@ -531,7 +531,10 @@ check("日线因子的 IC 都算得出来", _daily["ic"].notna().all(),
 check("评估表无 error 列", "error" not in rep.columns or rep["error"].isna().all())
 check("评估表按 |IC| 降序",
       bool((rep["ic"].abs().diff().dropna() <= 1e-12).all()))
-check("评估耗时 < 2s", cost < 2.0, f"{cost*1000:.0f}ms")
+# 门槛定在 3 秒：这条断言是拦「写成了 O(n²) / 逐行 apply」那种事故的，不是
+# 比性能。因子从 122 涨到 136 之后 5051 行跑满一轮本来就 2.1s 上下，卡 2s 会
+# 变成一条看机器心情的红灯 —— 那比没有这条更糟。
+check("评估耗时 < 3s", cost < 3.0, f"{cost*1000:.0f}ms")
 fmt = M.format_report(rep)
 check("format_report 保留行数", len(fmt) == len(rep))
 check("format_report 输出字符串", isinstance(fmt["ic"].iloc[0], str),

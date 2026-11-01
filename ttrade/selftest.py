@@ -1076,6 +1076,14 @@ def _run() -> tuple[bool, list[str]]:
         from matplotlib.backend_bases import MouseEvent
 
         def _wheel(step: int) -> tuple[int, int]:
+            if not rv.canvas_k.fig.axes:
+                # 别让 IndexError 冒出去 —— 那只会告诉人「list index out of
+                # range」，看不出是「首屏根本没画 K 线」。这条自检真栽过：
+                # 全新用户目录下没跑首屏回测，图上连轴都没有
+                raise RuntimeError(
+                    f"K 线画布没有轴（窗口 {rv._k_win}/{rv._k_total} 根，"
+                    f"待补画 {len(rv._pending_draw)} 张）：首屏没跑回测或画布被推迟"
+                )
             ax = rv.canvas_k.fig.axes[0]
             bb = ax.get_window_extent()
             before = rv._k_win
