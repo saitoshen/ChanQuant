@@ -328,10 +328,20 @@ def run(api, period: str = "1d", exchanges: list[str] | None = None,
         return {"done": 0, "skipped": 0, "errors": ["没有枚举到任何股票"]}
 
     # 元数据
-    meta = stock_meta(api, codes)
-    if not meta.empty:
-        with SS.connect() as con:
-            write_meta(con, meta)
+    #
+    # `stock_meta()` 是**逐只** `get_quote`，5577 只股票要几十分钟 —— 而
+    # Tushare 那条链路早就把名称 / 行业 / 板块 / 上市日写进同一张表了。
+    # 库里已经覆盖大部分代码时直接跳过，别为了补几个名字把下载卡在第一步。
+    try:
+        known = set(SS.stock_list())
+    except Exception:  # noqa: BLE001
+        known = set()
+    need_meta = len(known & set(codes)) < 0.9 * len(codes)
+    if need_meta:
+        meta = stock_meta(api, codes)
+        if not meta.empty:
+            with SS.connect() as con:
+                write_meta(con, meta)
 
     # 增量断点
     done = SS.done_codes_tq(period)

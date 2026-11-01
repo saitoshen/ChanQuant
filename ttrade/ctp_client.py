@@ -670,8 +670,13 @@ class TraderClient:
                         "available": _f(pTradingAccount.Available),
                         "margin": _f(pTradingAccount.CurrMargin),
                         "float_profit": _f(pTradingAccount.PositionProfit),
+                        "position_profit": _f(pTradingAccount.PositionProfit),
                         "close_profit": _f(pTradingAccount.CloseProfit),
                         "commission": _f(pTradingAccount.Commission),
+                        # 昨结算权益：界面算「当日盈亏」要用（动态权益 − 昨结算）。
+                        # CTP 的 Balance 含浮盈，不减去 PreBalance 会把这部分
+                        # 重复算进当日盈亏里
+                        "pre_balance": _f(getattr(pTradingAccount, "PreBalance", 0)),
                     }
 
             def OnRspQryInvestorPosition(self, pInvestorPosition, pRspInfo, nRequestID, bIsLast):  # noqa: N802
@@ -683,16 +688,22 @@ class TraderClient:
                 with outer._lock:
                     row = outer.positions.setdefault(
                         ins, {"instrument": ins, "long": 0, "short": 0,
-                              "long_yd": 0, "short_yd": 0, "price": 0.0,
-                              "profit": 0.0, "margin": 0.0})
+                              "long_yd": 0, "short_yd": 0,
+                              "long_today": 0, "short_today": 0,
+                              "price": 0.0, "profit": 0.0, "margin": 0.0})
                     n = int(getattr(pInvestorPosition, "Position", 0) or 0)
                     yd = int(getattr(pInvestorPosition, "YdPosition", 0) or 0)
+                    # 今仓单独记：上期所平今和平昨是两个指令，界面要能分开看
+                    td = int(getattr(pInvestorPosition, "TodayPosition", 0) or max(0, n - yd))
                     if side == "long":
                         row["long"] = n
                         row["long_yd"] = yd
+                        row["long_today"] = td
                     elif side == "short":
                         row["short"] = n
                         row["short_yd"] = yd
+                        row["short_today"] = td
+                    # OpenCost 是**总成本**（含乘数），不是单价
                     row["price"] = _f(getattr(pInvestorPosition, "OpenCost", 0)) or row["price"]
                     row["profit"] += _f(getattr(pInvestorPosition, "PositionProfit", 0))
                     row["margin"] += _f(getattr(pInvestorPosition, "UseMargin", 0))

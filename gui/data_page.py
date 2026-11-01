@@ -346,6 +346,99 @@ class TqWorker(QObject):
 # ------------------------------------------------------------------ 页面
 
 
+class StockWorker(QObject):
+    """A 股股票库（Tushare）：列表 → 日线 + 复权 → 基本面 → 资金流 → 概念。
+
+    逻辑在 `ttrade/stockdl.py`，这里只做线程包装。**不能**用 subprocess 调
+    `download_stock_ts.py`：打包后的 exe 里没有 .py 文件，那条路只在源码环境
+    下能跑，装到用户机器上就是一个静默失败。
+    """
+
+    progress = Signal(int, int, str)
+    done = Signal(object)          # {键: 结果}
+    failed = Signal(str)
+
+    def __init__(self, parts: list[str], start: str | None = None,
+                 end: str | None = None) -> None:
+        super().__init__()
+        self.parts = parts
+        self.start = start
+        self.end = end
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        try:
+            from ttrade import stockdl as DL
+
+            res = DL.run(
+                self.parts, start=self.start, end=self.end,
+                progress=lambda d, t, m: self.progress.emit(d, t, m),
+                cancel=lambda: self._cancel,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.done.emit(res)
+
+
+class StockTqWorker(QObject):
+    """A 股分钟线（天勤）。要专业版才有历史下载权限。
+
+    免费账户走 `get_kline_serial` 逐只拉，5000 多只 × 8000 根，一条 5m 跑下来
+    是小时级 —— 所以默认不跑，界面上是个显式的勾选框。
+    """
+
+    progress = Signal(int, int, str)
+    done = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, periods: list[str], start=None, end=None) -> None:
+        super().__init__()
+        self.periods = periods
+        self.start = start
+        self.end = end
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        try:
+            from ttrade import stockfetch as SF
+            from ttrade import tqfetch as TQ
+
+            sess = TQ.Session()
+            try:
+                api = sess.get()
+                total = len(self.periods)
+                for i, period in enumerate(self.periods):
+                    if self._cancel:
+                        self.done.emit("已取消")
+                        return
+                    self.progress.emit(i, total, f"天勤 {period}：枚举股票…")
+                    st = SF.run(
+                        api, period=period,
+                        start=self.start, end=self.end,
+                        cancel=lambda: self._cancel,
+                        progress=lambda a, b, m, _i=i, _p=period: self.progress.emit(
+                            _i, total, f"天勤 {_p}　{a}/{b}"),
+                    )
+                    errs = st.get("errors") or []
+                    self.progress.emit(
+                        i + 1, total,
+                        f"天勤 {period} 完成：{st.get('done', 0)} 只"
+                        + (f"，错误 {len(errs)} 条" if errs else ""))
+            finally:
+                sess.close()
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.done.emit("天勤分钟线已更新")
+
+
 class DataPage(QWidget):
     """数据管理。与「策略研究」等四个页面平级。"""
 
@@ -403,6 +496,7 @@ class DataPage(QWidget):
         self.market_dir = data_dir
         self.lbl_market.setText(f"当前市场：{label}")
         self._sync_controls()
+        self._sync_stock_card()
 
     def _on_market_radio(self, market: str) -> None:
         info = self._markets.get(market) or {}
@@ -435,7 +529,7 @@ class DataPage(QWidget):
         row.setSpacing(14)
         self._market_btns: dict[str, QRadioButton] = {}
         self._market_group = QButtonGroup(self)
-        for key, label in (("us", "美股"), ("cn", "国内期货")):
+        for key, label in (("us", "美股"), ("cn", "国内期货"), ("cn_stock", "A 股")):
             btn = QRadioButton(label)
             btn.setChecked(key == self.market)
             # 用 clicked 而不是 toggled：`setChecked()` 是程序调用，也会发 toggled，
@@ -453,10 +547,16 @@ class DataPage(QWidget):
 
         body = QHBoxLayout()
         body.setSpacing(12)
-        body.addWidget(self._build_form(), 0)
+        # 两个左栏互斥：期货/美股走「数据源 + 区间 + 补数据」，A 股走股票库面板。
+        # 两条链路的数据源、可选项、耗时完全不同，塞一张卡片里只会互相干扰
+        self.form_card = self._build_form()
+        self.stock_card = self._build_stock_card()
+        body.addWidget(self.form_card, 0)
+        body.addWidget(self.stock_card, 0)
         body.addWidget(self._build_log(), 1)
         outer.addLayout(body, 1)
         self._sync_db_label()
+        self._sync_stock_card()
 
     def _build_form(self) -> QWidget:
         card = QFrame()
@@ -730,6 +830,162 @@ class DataPage(QWidget):
         lay.addStretch(1)
         self._sync_controls()
         return card
+
+    def _build_stock_card(self) -> QWidget:
+        """A 股股票库面板。
+
+        和期货那张卡片的区别：A 股的数据源只有 Tushare（分钟线要天勤专业版），
+        下载项是「整库五个接口」而不是「按区间补某个标的」，所以这里不摆区间
+        下拉，摆的是**下载项勾选**和一份库现状。
+        """
+        card = QFrame()
+        card.setObjectName("Card")
+        card.setFixedWidth(340)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(7)
+
+        lay.addWidget(self._section("A 股股票库"))
+        self.lbl_stock_stats = QLabel("正在读取…")
+        self.lbl_stock_stats.setObjectName("Hint")
+        self.lbl_stock_stats.setWordWrap(True)
+        lay.addWidget(self.lbl_stock_stats)
+
+        lay.addWidget(self._section("下载项（Tushare）"))
+        self.stock_checks: dict[str, QCheckBox] = {}
+        for key, label in (("meta", "股票列表"), ("daily", "日线 + 复权因子"),
+                           ("basic", "基本面（PE/PB/换手/市值）"),
+                           ("moneyflow", "资金流"), ("concept", "概念板块")):
+            cb = QCheckBox(label)
+            cb.setChecked(key in ("meta", "daily", "basic", "moneyflow", "concept"))
+            self.stock_checks[key] = cb
+            lay.addWidget(cb)
+
+        self.chk_stock_tq = QCheckBox("顺带下载天勤分钟线（1h / 5m，需专业版）")
+        self.chk_stock_tq.setToolTip(
+            "天勤的历史下载权限（tq_dl）只有专业版才有。免费账户走逐只接口，"
+            "5000 多只股票跑一条 5m 是小时级，所以默认不勾。")
+        lay.addWidget(self.chk_stock_tq)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.btn_stock_run = QPushButton("更新数据")
+        self.btn_stock_run.setObjectName("Primary")
+        self.btn_stock_run.clicked.connect(self._start_stock)
+        self.btn_stock_refresh = QPushButton("刷新统计")
+        self.btn_stock_refresh.clicked.connect(self._refresh_stock_stats)
+        row.addWidget(self.btn_stock_run, 1)
+        row.addWidget(self.btn_stock_refresh, 0)
+        lay.addLayout(row)
+
+        self.prog_stock = QProgressBar()
+        self.prog_stock.setTextVisible(False)
+        self.prog_stock.setFixedHeight(6)
+        self.prog_stock.setVisible(False)
+        lay.addWidget(self.prog_stock)
+
+        self.lbl_stock_msg = QLabel("")
+        self.lbl_stock_msg.setObjectName("Hint")
+        self.lbl_stock_msg.setWordWrap(True)
+        lay.addWidget(self.lbl_stock_msg)
+
+        lay.addStretch(1)
+        return card
+
+    def _sync_stock_card(self) -> None:
+        """按市场切换左栏。A 股用股票面板，其余用期货/美股那张。"""
+        stock = self.market == "cn_stock"
+        if hasattr(self, "stock_card"):
+            self.stock_card.setVisible(stock)
+            self.form_card.setVisible(not stock)
+        if stock:
+            self._refresh_stock_stats()
+
+    def _refresh_stock_stats(self) -> None:
+        if not hasattr(self, "lbl_stock_stats"):
+            return
+        try:
+            from ttrade import stockdl as DL
+
+            self.lbl_stock_stats.setText(DL.stats_text())
+        except Exception as exc:  # noqa: BLE001
+            self.lbl_stock_stats.setText(f"读取失败：{type(exc).__name__}: {exc}")
+
+    def _start_stock(self) -> None:
+        if self.busy():
+            self._log("还有任务在跑，先等它结束或点「取消」")
+            return
+        parts = [k for k, cb in self.stock_checks.items() if cb.isChecked()]
+        want_tq = self.chk_stock_tq.isChecked()
+        if not parts and not want_tq:
+            self._log("先勾至少一个下载项")
+            return
+
+        self._log("—— 开始更新 A 股股票库")
+        self.btn_stock_run.setEnabled(False)
+        self.prog_stock.setVisible(True)
+        self.prog_stock.setRange(0, 0)
+        self.lbl_stock_msg.setText("准备中…")
+
+        if parts:
+            worker = StockWorker(parts)
+            thread = QThread(self)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.progress.connect(self._on_stock_progress)
+            worker.done.connect(self._on_stock_done)
+            worker.failed.connect(self._on_update_failed)
+            worker.failed.connect(thread.quit)
+            thread.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(self._on_thread_done)
+            self._upd_worker, self._upd_thread = worker, thread
+            thread.start()
+            self._stock_pending_tq = want_tq
+            return
+        self._stock_pending_tq = False
+        self._start_stock_tq()
+
+    def _start_stock_tq(self) -> None:
+        periods = ["1h", "5m"]
+        self._log("—— 开始下载天勤分钟线（1h / 5m）")
+        worker = StockTqWorker(periods)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_stock_progress)
+        worker.done.connect(self._on_tq_done)
+        worker.failed.connect(self._on_update_failed)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_thread_done)
+        self._tq_worker, self._tq_thread = worker, thread
+        thread.start()
+
+    def _on_stock_progress(self, done: int, total: int, msg: str) -> None:
+        if total > 0:
+            self.prog_stock.setRange(0, total)
+            self.prog_stock.setValue(done)
+        self.lbl_stock_msg.setText(msg)
+
+    def _on_stock_done(self, res) -> None:
+        from ttrade import stockdl as DL
+
+        label = dict(DL.PARTS)
+        for key, st in (res or {}).items():
+            errs = (st or {}).get("errors") or []
+            self._log(f"{label.get(key, key)}：{(st or {}).get('rows', 0):,} 行"
+                      + (f"，错误：{errs[0]}" if errs else ""))
+        self._refresh_stock_stats()
+        if getattr(self, "_stock_pending_tq", False):
+            self._stock_pending_tq = False
+            self._start_stock_tq()
+            return
+        self.prog_stock.setVisible(False)
+        self.lbl_stock_msg.setText("Tushare 部分已完成")
+        self.btn_stock_run.setEnabled(True)
+        self.data_changed.emit("cn_stock")
 
     def _build_log(self) -> QWidget:
         card = QFrame()
@@ -1103,6 +1359,8 @@ class DataPage(QWidget):
             self._upd_worker.cancel()
         if self._tq_worker is not None:
             self._tq_worker.cancel()
+        if hasattr(self, "btn_stock_run"):
+            self.btn_stock_run.setEnabled(False)
         self.btn_update.setEnabled(False)
         self.btn_update.setText("取消中")
         self.lbl_upd.setText("正在取消，等当前这一批跑完…")
@@ -1256,6 +1514,10 @@ class DataPage(QWidget):
         self.btn_update.setText("开始补充")
         self.btn_update.setEnabled(True)
         self.prog_update.setVisible(False)
+        if hasattr(self, "btn_stock_run"):
+            self.btn_stock_run.setEnabled(True)
+            self.prog_stock.setVisible(False)
+            self._refresh_stock_stats()
         # 这一轮可能刚把轻量库换成完整库（体积、kind 都变了），重读一次
         self._sync_db_label()
         if self._auto_run:

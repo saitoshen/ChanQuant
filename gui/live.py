@@ -1,17 +1,17 @@
-"""把天勤实时会话接到 Qt 上。
+"""把实时会话接到 Qt 上。
 
 分工：
 
-- `LiveWorker` 跑在**独立线程**里，独占一个 `LiveHub`（也就是一条 TqApi 连接）。
-  TqApi 不是线程安全的，所有 `get_*` / `insert_order` / `cancel_order` 都必须在
-  它自己的线程里调用。
+- `LiveWorker` 跑在**独立线程**里，独占一个 `LiveHub`（也就是一条 TqApi 连接）
+  或 `CtpHub`（一条 CTP 柜台连接）。
 - `LiveController` 活在主线程，负责起停线程、把界面操作**排队**丢给 worker，
   再把 worker 的信号转出来。
 
-为什么下单要排队而不是直接调：`insert_order()` 只是入队，真正的报文在下一次
-`wait_update()` 发出；而 `wait_update()` 正在 worker 线程里阻塞着。跨线程直接调
-`insert_order()` 会写坏 TqApi 内部的订阅状态，表现为「单子偶尔丢、偶尔重复」。
-所以界面只往队列里塞一个闭包，worker 每轮循环取出来执行。
+为什么下单要排队而不是直接调：天勤的 `insert_order()` 只是入队，真正的报文在
+下一次 `wait_update()` 发出；而 `wait_update()` 正在 worker 线程里阻塞着。跨线程
+直接调会写坏 TqApi 内部的订阅状态，表现为「单子偶尔丢、偶尔重复」。CTP 的
+`ReqOrderInsert` 倒是线程安全，但两边走同一条队列才能保证**成交回报的顺序和
+下单顺序一致**，所以 CTP 也排队。
 """
 
 from __future__ import annotations
@@ -22,6 +22,21 @@ import time
 from PySide6.QtCore import QObject, QThread, Signal
 
 from ttrade.tqlive import LiveHub, LiveState
+
+
+def _hub_of(spec):
+    """按账户类型选后端。返回 (hub 工厂, 是不是 CTP)。
+
+    `spec` 可能是 None（纯行情会话）、单个 AccountSpec，或一组。CTP 账户不走
+    天勤 —— 拿它去构造 `LiveHub` 会报「缺少天勤账户」，所以在构造之前就要分流。
+    """
+    items = [] if spec is None else (list(spec) if isinstance(spec, (list, tuple)) else [spec])
+    ctp_only = bool(items) and all(getattr(s, "is_ctp", False) for s in items)
+    if ctp_only:
+        from ttrade.ctp_live import CtpHub
+
+        return (lambda: CtpHub(items)), True
+    return (lambda: LiveHub(spec)), False
 
 
 class LiveWorker(QObject):
@@ -63,9 +78,10 @@ class LiveWorker(QObject):
     # ---- 线程内 ----
 
     def run(self) -> None:
-        hub = LiveHub(self.spec)
+        make_hub, is_ctp = _hub_of(self.spec)
+        hub = make_hub()
         try:
-            if self.need_history:
+            if self.need_history and not is_ctp:
                 # 补历史走 DataDownloader，可能要几十秒；放在线程里，界面不冻。
                 # 失败**不能**拖累连接：账户能登上去比历史补齐重要得多，而且
                 # 天勤运维窗口（19:00-19:30）里 update_main 会一直等到 19:31，
@@ -78,7 +94,7 @@ class LiveWorker(QObject):
                     self.log.emit(f"本地历史已补齐（本次写入 {n:,} 行）")
                 except Exception as exc:  # noqa: BLE001
                     self.log.emit(f"补历史失败（{type(exc).__name__}: {exc}），继续连接")
-            self.log.emit("正在连接天勤…")
+            self.log.emit("正在连接 CTP 柜台…" if is_ctp else "正在连接天勤…")
             hub.start()
             hub.subscribe(self.symbol, self.exchange, self.period)
             self.ready.emit(f"{self.symbol}_{self.exchange}")
@@ -197,7 +213,7 @@ class LiveController(QObject):
     def place(self, symbol: str, direction: str, offset: str, volume: int,
               limit_price: float | None, account: str = "") -> bool:
         if self._worker is None:
-            self.failed.emit("还没连上天勤，无法下单")
+            self.failed.emit("还没连上柜台，无法下单")
             return False
 
         def job(hub):
@@ -210,7 +226,7 @@ class LiveController(QObject):
 
     def cancel(self, order_id: str, account: str = "") -> bool:
         if self._worker is None:
-            self.failed.emit("还没连上天勤，无法撤单")
+            self.failed.emit("还没连上柜台，无法撤单")
             return False
 
         def job(hub):

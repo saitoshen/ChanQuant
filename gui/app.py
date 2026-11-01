@@ -1502,6 +1502,16 @@ class MainWindow(QMainWindow):
             "截面策略要求至少 3 个品种。"
         )
         cl.addWidget(self.sym_pick)
+        # A 股 5577 只，勾选框面板装不下（几千个 QCheckBox 会直接卡死），
+        # 所以 A 股多一条「按条件选股」的入口，筛完把结果灌进 sym_pick
+        self.btn_stock_pick = QPushButton("按条件选股…")
+        self.btn_stock_pick.setToolTip(
+            "按板块 / 行业 / 成交额 / 市值 / 关键词筛 A 股，选中的直接进品种池。\n"
+            "默认只留近 20 日日均成交额 ≥ 1 亿的，流动性太差的票回测结论不可信。"
+        )
+        self.btn_stock_pick.clicked.connect(self._open_stock_pick)
+        self.btn_stock_pick.setVisible(False)
+        cl.addWidget(self.btn_stock_pick)
         self.lbl_pick = QLabel("")
         self.lbl_pick.setObjectName("Hint")
         self.lbl_pick.setWordWrap(True)
@@ -2768,6 +2778,9 @@ class MainWindow(QMainWindow):
         pick = getattr(self, "contract_pick", None)
         if pick is None:
             return
+        # A 股的「按条件选股」入口跟着市场走：期货只有 78 个品种，勾选框就够
+        if hasattr(self, "btn_stock_pick"):
+            self.btn_stock_pick.setVisible(self.market == "cn_stock")
         # 美股没有合约层，藏起来比摆一个空下拉诚实
         pick.setVisible(self.market == "cn")
         if self.market != "cn":
@@ -2806,6 +2819,33 @@ class MainWindow(QMainWindow):
             if hasattr(self, "lbl_pick"):
                 self.lbl_pick.setText("")
         self.run_analysis()
+
+    def _open_stock_pick(self) -> None:
+        """A 股按条件选股 → 直接灌进多品种勾选。
+
+        不新造一套「品种池」状态：`sym_pick` 已经是所有下游（多品种回测、
+        截面、组合）读的唯一来源，选股结果塞进它，后面全都不用改。
+        """
+        if self.market != "cn_stock":
+            return
+        from gui.stock_picker import StockPickDialog
+
+        dlg = StockPickDialog(self.sym_pick.selected(), self)
+        if dlg.exec() != dlg.Accepted:
+            return
+        keys = dlg.selected()
+        if not keys:
+            self.lbl_status.setText("没选中任何股票")
+            return
+        # 挡信号：`set_selected` 会发 changed，那一下会触发一次完整回测，
+        # 而我们紧接着还要手动跑一次，等于跑两遍
+        self.sym_pick.blockSignals(True)
+        try:
+            self.sym_pick.set_selected(keys)
+        finally:
+            self.sym_pick.blockSignals(False)
+        self._on_pick_changed()
+        self.lbl_status.setText(f"已选 {len(keys)} 只股票进品种池")
 
     def _open_option_quote(self) -> None:
         """开 T 型报价窗。选中一档之后交给合约层，走它那条「只画 K 线」的路。
@@ -4703,6 +4743,16 @@ class MainWindow(QMainWindow):
             return
         if not specs:
             self.trade_page.on_failed("先在账户列表里勾选要连接的账户")
+            return
+        # CTP 是**另一条连接**（直连柜台，不走天勤），不能和天勤账户混在一条
+        # 会话里 —— 混着勾会走天勤分支，然后在 `AccountSpec.build()` 上报
+        # 「缺少天勤账户」，看不出真正的原因
+        ctp = [s for s in specs if getattr(s, "is_ctp", False)]
+        if ctp and len(ctp) != len(specs):
+            self.trade_page.on_failed("CTP 账户和天勤账户不能同时连，分开连")
+            return
+        if ctp and self.market != "cn":
+            self.trade_page.on_failed("CTP 只交易国内期货，请把市场切到「国内期货」")
             return
         pair = self._current_pair()
         period = "5m" if tqdata.is_daily(self._period()) else self._period()

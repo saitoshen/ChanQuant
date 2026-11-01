@@ -43,6 +43,7 @@ ACCOUNT_KINDS = [
     ("account", "实盘（期货公司资金账号）"),
     ("kq_stock", "快期股票模拟（需专业版）"),
     ("sim_stock", "本地股票模拟（TqSimStock）"),
+    ("ctp", "CTP 柜台（SimNow / 期货公司）"),
 ]
 
 # 股票账户的两种。期货和股票在天勤里是**两套账户类**，不能混用一个连接：
@@ -60,9 +61,13 @@ class AccountSpec:
 
     - `kq`：快期模拟，用天勤账户登录即可交易，账户数据与快期客户端一致；
     - `sim`：`TqSim`，纯本地撮合，重启即清空，适合试接口；
-    - `account`：实盘，需要期货公司的 broker_id + 资金账号 + 密码。
+    - `account`：实盘，需要期货公司的 broker_id + 资金账号 + 密码；
+    - `kq_stock` / `sim_stock`：股票模拟，见 `STOCK_KINDS`；
+    - `ctp`：期货公司 CTP 柜台，**不走天勤**。参数是前置地址 + BrokerID +
+      投资者账号，见 `md_front` / `td_front` / `app_id` / `auth_code`。
 
-    `user` / `password` 是天勤账户（TqAuth），三种模式都要。
+    `user` / `password` 是天勤账户（TqAuth），前五种模式都要；`ctp` 模式下
+    它们就是 CTP 的投资者账号与密码。
     """
 
     name: str = "默认"
@@ -72,6 +77,13 @@ class AccountSpec:
     broker_id: str = ""
     account_id: str = ""
     account_password: str = ""
+    # CTP 专用。留在同一个结构里而不是另开一张表：交易页只有一个账户列表，
+    # 用户不该为了换个柜台去另一个地方再配一遍
+    ctp_preset: str = "simnow_7x24"
+    md_front: str = ""
+    td_front: str = ""
+    app_id: str = ""
+    auth_code: str = ""
 
     def build(self):
         """构造天勤的账户对象。实盘缺参数直接报错，不要静默退化成模拟。"""
@@ -98,6 +110,11 @@ class AccountSpec:
     @property
     def is_stock(self) -> bool:
         return self.kind in STOCK_KINDS
+
+    @property
+    def is_ctp(self) -> bool:
+        """CTP 账户不走天勤，`LiveHub` 一构建就会报「缺天勤账户」。"""
+        return self.kind == "ctp"
 
     def label(self) -> str:
         kind = dict(ACCOUNT_KINDS).get(self.kind, self.kind)

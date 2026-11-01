@@ -32,7 +32,7 @@ APP_NAME = "ChanQuant"
 BUNDLE_ID = "com.chanquant.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "2.1.1"
+VERSION = "2.4.0"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
@@ -179,6 +179,13 @@ HIDDEN = [
     "pypdf",
     # CTP 客户端。只在装了 openctp-ctp 的平台上有（Windows），没装就是空列表
     "ttrade.ctp_client",
+    # 交易页选到 CTP 账户时才会 import（`gui.live._hub_of` 里函数内导入），
+    # 静态分析看不到，漏了就是「一切到 CTP 账户就崩」
+    "ttrade.ctp_live",
+    # A 股选股 / 股票库下载：都是按钮回调里才 import 的
+    "gui.stock_picker",
+    "ttrade.stockpick",
+    "ttrade.stockdl",
 ] + HIDDEN_CTP
 
 # 用不到的重量级依赖，剔掉能省 100MB 以上

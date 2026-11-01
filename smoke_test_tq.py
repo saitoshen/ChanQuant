@@ -5335,7 +5335,7 @@ def check_new_factors() -> None:
     # 对的类别、也补了公式，而不是手滑注册了一条近重复的。
     n_builtin = len(F.FACTORS) - F.USER_FACTOR_COUNT
     check(f"因子库：内置 {n_builtin} 个 / {len(F.CATEGORIES)} 类",
-          n_builtin == 136 and len(F.CATEGORIES) == 19,
+          n_builtin == 147 and len(F.CATEGORIES) == 21,
           f"{n_builtin} 个内置 + {F.USER_FACTOR_COUNT} 个自定义 / {len(F.CATEGORIES)} 类")
     cats = {k: F.FACTORS[k].category for k in
             ("vwap_gap", "trend_window", "season_avg", "season_cal", "roll_intraday")}

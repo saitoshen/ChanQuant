@@ -171,13 +171,13 @@ CURVE_KEYS = {k for k, s_ in F.FACTORS.items()
 # 除权。这里的 DF 是合成期货日线，没有 stock.duckdb 那几张表，整列空是预期
 # 行为，不算失败 —— 它们由 smoke_test_tq.check_stock 单独验。
 STOCK_ONLY = {k for k, s_ in F.FACTORS.items() if s_.markets == ("cn_stock",)}
-check("因子数量", len(BUILTIN) == 136,
+check("因子数量", len(BUILTIN) == 147,
       f"内置 {len(BUILTIN)}，用户 {len(F.FACTORS) - len(BUILTIN)}")
 check("分类齐全",
       set(F.CATEGORIES) == {"趋势", "反转", "波动", "量能", "形态", "日内", "时段",
                             "展期", "展期 OI3", "展期 OI6", "期权",
                             "季节性", "品种季节", "基本面", "板块行业", "宏观",
-                            "资金流", "概念板块", "除权"},
+                            "资金流", "概念板块", "除权", "量价", "估值分位"},
       str(F.CATEGORIES))
 check("展期/期权/基本面/宏观因子都登记进 AUX_KEYS",
       set(F.AUX_KEYS) == AUXISH,

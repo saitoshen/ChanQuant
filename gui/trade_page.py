@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 )
 
 from ttrade import tqlive
+from ttrade.ctp_client import PRESETS
 from ttrade.tqlive import ACCOUNT_KINDS, AccountSpec, LiveState
 
 # 与 app.py 的配色保持一致。这里不 import app 的常量：app 会 import 本模块，
@@ -155,18 +156,44 @@ class AccountDialog(QDialog):
         self.ed_acct_pwd = QLineEdit(spec.account_password if spec else "")
         self.ed_acct_pwd.setEchoMode(QLineEdit.Password)
 
+        # CTP 专用：柜台预设 + 两个前置 + 认证码
+        self.cb_preset = QComboBox()
+        for key, p in PRESETS.items():
+            self.cb_preset.addItem(p.get("label", key), key)
+        if spec and getattr(spec, "ctp_preset", ""):
+            idx = self.cb_preset.findData(spec.ctp_preset)
+            self.cb_preset.setCurrentIndex(max(idx, 0))
+        self.ed_md = QLineEdit(getattr(spec, "md_front", "") if spec else "")
+        self.ed_td = QLineEdit(getattr(spec, "td_front", "") if spec else "")
+        self.ed_appid = QLineEdit(getattr(spec, "app_id", "") if spec else "")
+        self.ed_auth = QLineEdit(getattr(spec, "auth_code", "") if spec else "")
+
         form.addRow("名称", self.ed_name)
         form.addRow("类型", self.cb_kind)
-        form.addRow("天勤账户", self.ed_user)
-        form.addRow("天勤密码", self.ed_pwd)
+        self.lbl_user = QLabel("天勤账户")
+        form.addRow(self.lbl_user, self.ed_user)
+        self.lbl_pwd = QLabel("天勤密码")
+        form.addRow(self.lbl_pwd, self.ed_pwd)
         form.addRow("期货公司代码", self.ed_broker)
         form.addRow("资金账号", self.ed_acct)
         form.addRow("资金密码", self.ed_acct_pwd)
+        self.lbl_preset = QLabel("CTP 柜台")
+        form.addRow(self.lbl_preset, self.cb_preset)
+        self.lbl_md = QLabel("行情前置")
+        form.addRow(self.lbl_md, self.ed_md)
+        self.lbl_td = QLabel("交易前置")
+        form.addRow(self.lbl_td, self.ed_td)
+        self.lbl_appid = QLabel("AppID")
+        form.addRow(self.lbl_appid, self.ed_appid)
+        self.lbl_auth = QLabel("授权码")
+        form.addRow(self.lbl_auth, self.ed_auth)
 
         self.hint = QLabel(
             "快期模拟只需要天勤账户；实盘才需要期货公司代码与资金账号。\n"
             "股票模拟（TqSimStock / TqKqStock）用同一个天勤账户，但**数量单位是股**"
             "（100 股起、必须整百），方向只有买入 / 卖出，T+1 当天买的当天不能卖。\n"
+            "CTP 柜台**不走天勤**：填柜台预设 + 投资者账号密码即可，前置地址留空就"
+            "按预设补（SimNow 7x24 可以随时连）。CTP 只收限价单，下单必须填价格。\n"
             "密码明文存在本机用户目录，不会进仓库。"
         )
         self.hint.setObjectName("Hint")
@@ -179,12 +206,43 @@ class AccountDialog(QDialog):
         form.addRow(box)
 
         self.cb_kind.currentIndexChanged.connect(self._sync)
+        self.cb_preset.currentIndexChanged.connect(self._fill_preset)
         self._sync()
 
+    def _fill_preset(self) -> None:
+        """选预设时把前置地址填进去，手填过的不覆盖（留空才填）。"""
+        key = self.cb_preset.currentData()
+        p = PRESETS.get(key) or {}
+        if not self.ed_md.text().strip():
+            self.ed_md.setText(p.get("md_front", ""))
+        if not self.ed_td.text().strip():
+            self.ed_td.setText(p.get("td_front", ""))
+        if not self.ed_appid.text().strip():
+            self.ed_appid.setText(p.get("app_id", ""))
+        if not self.ed_auth.text().strip():
+            self.ed_auth.setText(p.get("auth_code", ""))
+        if not self.ed_broker.text().strip():
+            self.ed_broker.setText(p.get("broker_id", "9999"))
+
     def _sync(self) -> None:
-        real = self.cb_kind.currentData() == "account"
+        kind = self.cb_kind.currentData()
+        real = kind == "account"
         for w in (self.ed_broker, self.ed_acct, self.ed_acct_pwd):
             w.setEnabled(real)
+        ctp = kind == "ctp"
+        for w in (self.cb_preset, self.ed_md, self.ed_td, self.ed_appid, self.ed_auth):
+            w.setVisible(ctp)
+        for w in (self.lbl_preset, self.lbl_md, self.lbl_td,
+                  self.lbl_appid, self.lbl_auth):
+            w.setVisible(ctp)
+        # CTP 的「天勤账户」其实是投资者账号，标签得跟着变，否则用户会去填
+        # 一个天勤账号然后一直登不上
+        self.lbl_user.setText("投资者账号" if ctp else "天勤账户")
+        self.lbl_pwd.setText("投资者密码" if ctp else "天勤密码")
+        self.ed_user.setPlaceholderText("SimNow 账号" if ctp else "")
+        if ctp:
+            self.ed_broker.setEnabled(True)
+            self._fill_preset()
 
     def spec(self) -> AccountSpec:
         return AccountSpec(
@@ -195,6 +253,11 @@ class AccountDialog(QDialog):
             broker_id=self.ed_broker.text().strip(),
             account_id=self.ed_acct.text().strip(),
             account_password=self.ed_acct_pwd.text(),
+            ctp_preset=self.cb_preset.currentData() or "simnow_7x24",
+            md_front=self.ed_md.text().strip(),
+            td_front=self.ed_td.text().strip(),
+            app_id=self.ed_appid.text().strip(),
+            auth_code=self.ed_auth.text().strip(),
         )
 
 
@@ -214,6 +277,7 @@ class TradePage(QWidget):
         # 判据是**勾选的账户**：全是股票账户才算，混着连的时候按期货走 ——
         # 一单同时下到期货和股票账户本来就不成立
         self._stock_mode = False
+        self._ctp_mode = False
         self._build()
         # 默认全勾：以前是「下拉框选中谁就连谁」，现在多个账户并存，全勾等于
         # 保持原来的行为；用户想只连一个，取消其余勾选即可
@@ -494,9 +558,18 @@ class TradePage(QWidget):
         """
         sel = self._checked_specs() or self._accounts
         stock = bool(sel) and all(s.is_stock for s in sel)
+        ctp = bool(sel) and all(getattr(s, "is_ctp", False) for s in sel)
         self._stock_mode = stock
+        self._ctp_mode = ctp
         if not hasattr(self, "lbl_vol"):
             return
+        # CTP 只收限价单：市价那个勾直接禁掉，别让人勾完再被柜台拒一次
+        self.chk_market.setEnabled(not ctp)
+        if ctp:
+            self.chk_market.setChecked(False)
+            self.chk_market.setToolTip("CTP 只收限价单，必须填价格")
+        else:
+            self.chk_market.setToolTip("")
         self.lbl_vol.setText("股数" if stock else "手数")
         self.sp_vol.blockSignals(True)
         if stock:
@@ -844,6 +917,9 @@ class TradePage(QWidget):
             self.on_failed("合约不能为空")
             return
         price = None if self.chk_market.isChecked() else self.sp_price.value()
+        if self._ctp_mode and (price is None or price <= 0):
+            self.on_failed("CTP 只收限价单：取消「市价」并填一个价格")
+            return
         acc = self._order_account()
         if acc is None:
             self.on_failed("多账户下先在账户列表里点一行，指定下到哪个账户")

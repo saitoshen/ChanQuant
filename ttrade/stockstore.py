@@ -532,13 +532,22 @@ def stats() -> dict:
         first, last = con.execute(
             "SELECT min(dt), max(dt) FROM stock_bars_tq"
         ).fetchone()
+        # 天勤分钟线常常是空的（要专业版），这时覆盖区间得看 Tushare 那份 ——
+        # 不然界面上「覆盖 — → —」，看着像库是空的
+        if first is None:
+            first, last = con.execute(
+                "SELECT min(dt), max(dt) FROM stock_bars_ts"
+            ).fetchone()
+        exs = [r[0] for r in con.execute(
+            "SELECT DISTINCT exchange FROM stock_meta ORDER BY 1"
+        ).fetchall() if r[0]]
     size = os.path.getsize(db_path()) / 1024 / 1024
     return {"exists": True, "stocks": int(stocks or 0),
             "bars_tq": {k: int(v) for k, v in bars_tq.items()},
             "bars_ts": int(bars_ts or 0), "adj": int(adj or 0),
             "basic": int(basic or 0), "moneyflow": int(mf or 0),
             "concept": int(concept or 0),
-            "first": first, "last": last,
+            "first": first, "last": last, "exchanges": exs,
             "size_mb": round(size, 1)}
 
 

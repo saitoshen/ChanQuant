@@ -681,6 +681,96 @@ def _run() -> tuple[bool, list[str]]:
 
     check("CTP 客户端（可选依赖）", _ctp)
 
+    def _ctp_live():
+        """CTP 会话层：合约归一 / 主力解析 / tick 聚合 / 快照映射。
+
+        这一层**不需要连柜台**就能验 —— 合约写法、主力表、tick 切 bar、资金
+        持仓的字段映射全是纯函数，真正联网的那部分在 `TraderClient` 里。
+        """
+        from ttrade import ctp_live as CL
+        from ttrade.tqlive import AccountSpec
+
+        # 合约写法：Tushare 的 `.SHF` / `.ZCE` / `.CFX` 后缀、天勤的 `SHFE.rb`、
+        # 以及纯 `RB2601` 都要收敛到 CTP 的 InstrumentID
+        got = {
+            "RB2601": CL.ctp_instrument("RB2601"),
+            "RB2601.SHF": CL.ctp_instrument("RB2601.SHF"),
+            "SHFE.rb2601": CL.ctp_instrument("SHFE.rb2601"),
+            "TA2611.ZCE": CL.ctp_instrument("TA2611.ZCE", "CZCE"),
+            "IF2611.CFX": CL.ctp_instrument("IF2611.CFX"),
+            "SC2612.INE": CL.ctp_instrument("SC2612.INE"),
+        }
+        want = {"RB2601": "rb2601", "RB2601.SHF": "rb2601", "SHFE.rb2601": "rb2601",
+                "TA2611.ZCE": "TA611", "IF2611.CFX": "IF2611", "SC2612.INE": "sc2612"}
+        bad = {k: v for k, v in got.items() if v != want[k]}
+        assert not bad, f"CTP 合约代码归一错了：{bad}（期望 {want}）"
+
+        # 主力合约：从本地 aux 表取，查不到就空串（不是抛异常）
+        main = CL.main_contract("RB", "SHFE")
+        assert main.startswith("rb") and main[2:].isdigit(), f"螺纹主力解析错了：{main!r}"
+        assert CL.main_contract("NOPE", "SHFE") == "", "不存在的品种应该返回空串"
+
+        # tick → bar：累计量必须差分，不然成交量是一条单调上升的斜线
+        b = CL._BarBuilder(period="1m")
+        for stamp, vol, px in (("20261101 14:35:01", 100, 3000),
+                               ("20261101 14:35:31", 120, 3010),
+                               ("20261101 14:36:05", 150, 3020)):
+            b.push({"datetime": stamp, "last": px, "volume": vol, "oi": 1})
+        df = b.frame()
+        assert len(df) == 2, f"1 分钟应该切出 2 根 bar，得到 {len(df)}"
+        assert float(df["close"].iloc[0]) == 3010, f"第一根收盘错了：{df['close'].iloc[0]}"
+        assert float(df["volume"].iloc[0]) == 20, (
+            f"成交量要按累计量差分，第一根应该是 20 手，得到 {df['volume'].iloc[0]}")
+        assert float(df["volume"].iloc[1]) == 30, "第二根成交量错了"
+
+        # 快照映射：字段名对齐 `LiveState`，交易页直接拿去填表
+        hub = CL.CtpHub([AccountSpec(name="ctp1", kind="ctp", user="123")])
+
+        class _FakeTrader:
+            logged_in = type("E", (), {"is_set": lambda s: True})()
+            instruments = {"rb2611": {"tick": 1.0, "multiple": 10.0, "exchange": "SHFE"}}
+
+            def snapshot(self):
+                return {
+                    "account": {"balance": 100000, "available": 80000, "margin": 20000,
+                                "float_profit": 500, "position_profit": 500,
+                                "close_profit": 0, "commission": 10, "pre_balance": 99000},
+                    "positions": {"rb2611": {"instrument": "rb2611", "long": 2, "short": 0,
+                                             "long_yd": 1, "long_today": 1, "short_yd": 0,
+                                             "short_today": 0, "price": 60000.0,
+                                             "profit": 500.0, "margin": 20000.0}},
+                    "orders": {"1": {"order_ref": "1", "order_sys_id": "", "instrument": "rb2611",
+                                     "direction": "0", "offset": "0", "price": 3000,
+                                     "volume": 1, "traded": 0, "status": "未成交", "msg": ""}},
+                    "trades": {},
+                }
+
+        hub.trader = _FakeTrader()
+        st = hub.state()
+        assert st.connected and st.accounts, "CTP 快照没生成账户行"
+        row = st.accounts[0]
+        assert row["day_profit"] == 1000.0, f"当日盈亏要减昨结算：{row['day_profit']}"
+        assert row["platform"] == "CTP", row["platform"]
+        pos = st.positions[0]
+        assert (pos["pos_long"], pos["pos_long_today"]) == (2, 1), f"持仓今昨仓错了：{pos}"
+        # 开仓均价 = OpenCost / (手数 × 乘数)。乘数取 10，漏了乘数会差一个数量级
+        assert abs(pos["open_price_long"] - 3000.0) < 1e-6, (
+            f"开仓均价错了（乘数没乘上？）：{pos['open_price_long']}")
+        assert st.orders[0]["status"] == "ALIVE", "未成交的委托要标成 ALIVE，撤单才找得到"
+        assert st.orders[0]["direction"] == "BUY" and st.orders[0]["offset"] == "OPEN"
+
+        # 没连柜台时下单要报错，而不是返回一个空单号
+        try:
+            hub.place("rb2611", "BUY", "OPEN", 1, None)
+        except Exception as exc:  # noqa: BLE001
+            assert "限价" in str(exc) or "还没连接" in str(exc), f"报错信息不对：{exc}"
+        else:
+            raise RuntimeError("没连柜台时 place() 竟然没报错")
+
+        return "合约归一 / 主力解析 / tick 切 bar / 资金持仓映射 全对"
+
+    check("CTP 会话层（交易页后端）", _ctp_live)
+
     def _window():
         """真正把主窗口搭起来，验证 UI 代码在打包后也能跑通。"""
         from PySide6.QtWidgets import QApplication
@@ -772,8 +862,14 @@ def _run() -> tuple[bool, list[str]]:
             and dp.cb_upd_range.count() == len(_upd.RANGES)
             and dp.cb_source.count() == 2
             # 市场单选归数据页自己管，启动时跟研究页一致
-            and len(dp._market_btns) == 2
+            and len(dp._market_btns) == 3
             and dp._market_btns[dp.market].isChecked()
+            # A 股股票库面板：五个下载项 + 天勤分钟线开关 + 库现状
+            and hasattr(dp, "stock_card")
+            and len(dp.stock_checks) == 5
+            and hasattr(dp, "chk_stock_tq")
+            and dp.stock_card.isHidden() == (dp.market != "cn_stock")
+            and dp.form_card.isHidden() == (dp.market == "cn_stock")
             # 周期 / 回溯区间 / 真实合约只属于天勤那一路
             and dp.cb_period.isHidden() == tq_vis
             and dp.cb_tq_range.isHidden() == tq_vis
