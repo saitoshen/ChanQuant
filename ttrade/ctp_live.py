@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 from ttrade.ctp_client import (
+    ALIVE_STATUS,
     HAS_CTP,
     CtpConfig,
     CtpError,
@@ -275,6 +276,7 @@ class CtpHub:
         self.underlying = ""
         self._builder = _BarBuilder()
         self._last_query = 0.0
+        self._query_turn = 1          # 0 = 该发持仓了，1 = 该发资金了
         self._lock = threading.Lock()
 
     # ---- 生命周期 ----
@@ -295,11 +297,18 @@ class CtpHub:
         if not trader.wait_ready(15.0):
             err = trader.last_error or "登录超时（15 秒）"
             trader.stop()
+            if "182.254.243.31" in cfg.td_front:
+                err += ("（SimNow 只在服务时段内可连：第一套 30001 跟实盘交易时段一致，"
+                        "7x24 环境 40001 是 16:00 ~ 次日 09:00；周末和收盘后 TCP 会直接被拒）")
             raise CtpError(err)
         trader.query_account()
         trader.query_positions()
-        # 合约表用来把合约映射到交易所（撤单要用），查一次就够
-        trader.query_instruments()
+        # 撤单要交易所代码，但**不查全量合约表**：SimNow 上是 1.6 万条、80 秒，
+        # 而 CTP 一个会话是串行的 —— 流没结束之前报单会一直排队，界面表现就是
+        # 「点了下单没反应」。改成用本地品种→交易所映射兜底，具体合约的
+        # 最小变动价位在订阅时按单个合约查（秒回）。
+        trader.exchange_resolver = lambda ins: variety_exchange(
+            "".join(ch for ch in str(ins) if ch.isalpha()))
         self.trader = trader
 
         # 行情是可选：只做交易不看盘也能用。连不上就只报一条日志，不影响下单
@@ -350,12 +359,24 @@ class CtpHub:
         self.key = f"{ins}_{exchange}" if exchange else ins
         if self.md is not None:
             self.md.subscribe([ins])
+        # 只查这一个合约（最小变动价位 / 合约乘数 / 交易所），秒回。
+        # 不查全量 —— 理由见 start() 里的注释。
+        if self.trader is not None:
+            try:
+                self.trader.query_instruments(ins)
+            except Exception as exc:  # noqa: BLE001
+                self.last_error = f"查合约信息失败：{exc}"
 
     def wait(self, timeout: float = 0.8) -> bool:
         """推进一步：读 tick 攒 bar，顺手每 2 秒刷一次资金和持仓。
 
-        资金/持仓是**主动查询**（CTP 没有推送账户变动），查太勤会被柜台限流，
-        2 秒一次在实盘里够用，也不会把流量打满。
+        资金/持仓是**主动查询**（CTP 没有推送账户变动）。这里有两个坑，都是
+        实测踩出来的：
+
+        1. **柜台限制「每秒最多一个查询请求」**。资金和持仓如果背靠背连着发，
+           第二个会被静默丢掉 —— 表现是「资金一直在动，持仓永远是 0」。所以
+           两个查询错开 1 秒轮流发。
+        2. 查太勤会打满流量，2 秒一轮在实盘里够用。
         """
         time.sleep(max(0.05, float(timeout)))
         if self.md is not None and self.instrument:
@@ -363,13 +384,19 @@ class CtpHub:
             if tick:
                 self._builder.push(tick)
         now = time.monotonic()
-        if self.trader is not None and now - self._last_query > 2.0:
-            self._last_query = now
-            try:
+        if self.trader is None:
+            return True
+        try:
+            # 资金和持仓交替发，中间至少隔 1 秒 —— 见上面第 1 条
+            if now - self._last_query > 2.0:
+                self._last_query = now
                 self.trader.query_account()
+                self._query_turn = 0
+            elif self._query_turn == 0 and now - self._last_query > 1.0:
+                self._query_turn = 1
                 self.trader.query_positions()
-            except Exception as exc:  # noqa: BLE001
-                self.last_error = f"查询失败：{exc}"
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"查询失败：{exc}"
         return True
 
     def bars(self) -> pd.DataFrame:
@@ -525,8 +552,10 @@ class CtpHub:
                 "volume_orign": vol,
                 "volume_left": max(0, vol - traded),
                 "limit_price": float(o.get("price") or 0.0),
-                "status": "ALIVE" if status in ("未成交", "部分成交", "未成交(未触发)") else status,
-                "last_msg": status if status not in ("ALIVE",) else str(o.get("msg") or ""),
+                "status": "ALIVE" if status in ALIVE_STATUS else status,
+                # 拒单理由全在 StatusMsg 里（「50:已撤单报单被拒绝SHFE:价格跌破跌停板」），
+                # 只给「已撤单」等于什么都没说 —— 用户没法判断是价格错了还是权限不够
+                "last_msg": str(o.get("msg") or status),
                 "insert_date_time": 0.0,
                 "time": str(o.get("msg") or ""),
             })

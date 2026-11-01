@@ -49,21 +49,31 @@ except Exception as exc:  # noqa: BLE001 - ImportError 之外还可能是 DLL �
 
 # ------------------------------------------------------------------ 配置
 
-# SimNow 的公开模拟环境。7x24 那组随时能连（周末也能），交易时段那组只在
-# 期货交易时间内可用 —— 自测时连 7x24，别拿它下真单（撮合是假的）。
+# SimNow 的公开模拟环境。地址在 2025-06-19 换过一次，老的
+# `180.168.146.187:10130/10131` 已经停了（实测连不上，超时），现在都走
+# `182.254.243.31`：
+#
+#   - 7x24 环境：交易 40001 / 行情 40011。**只在非交易时段对外服务**
+#     （交易日 16:00 ~ 次日 09:00，非交易日 16:00 ~ 次日 12:00），
+#     定位是给 CTP 接口开发联调用，撮合和结算都不完整。
+#   - 第一套环境：交易 30001 / 行情 30011（还有 30002/30012、30003/30013
+#     两组备用）。服务时间和实盘交易时段完全一致 —— **周末和收盘后连不上，
+#     TCP 直接 RST**，别当成配置错了。
+#
+# 所以自测要挑时间：白天开盘连第一套，晚上和周末连 7x24。
 PRESETS = {
     "simnow_7x24": {
-        "label": "SimNow 7x24（随时可连）",
-        "md_front": "tcp://180.168.146.187:10131",
-        "td_front": "tcp://180.168.146.187:10130",
+        "label": "SimNow 7x24（非交易时段联调）",
+        "md_front": "tcp://182.254.243.31:40011",
+        "td_front": "tcp://182.254.243.31:40001",
         "broker_id": "9999",
         "app_id": "simnow_client_test",
         "auth_code": "0000000000000000",
     },
     "simnow_day": {
-        "label": "SimNow 交易时段",
-        "md_front": "tcp://180.168.146.187:10111",
-        "td_front": "tcp://180.168.146.187:10110",
+        "label": "SimNow 第一套（交易时段）",
+        "md_front": "tcp://182.254.243.31:30011",
+        "td_front": "tcp://182.254.243.31:30001",
         "broker_id": "9999",
         "app_id": "simnow_client_test",
         "auth_code": "0000000000000000",
@@ -289,10 +299,18 @@ class MdClient:
         return _Spi()
 
     def subscribe(self, instruments) -> None:
+        """订阅行情。
+
+        第二个参数是**个数**，不是「0 表示全部」—— 传 0 时柜台照样回
+        `OnRspSubMarketData` 且 `ErrorID == 0`，然后一条 tick 都不推。这个坑
+        在 SimNow 上实测过：订阅应答全是「成功」，盘面一片空白，日志里没有
+        任何异常，只能靠「10 秒没 tick」去反推。
+        """
         if self.api is None or not instruments:
             return
+        items = [i.encode("utf-8") for i in instruments]
         try:
-            self.api.SubscribeMarketData([i.encode("utf-8") for i in instruments], 0)
+            self.api.SubscribeMarketData(items, len(items))
         except Exception as exc:  # noqa: BLE001
             self.last_error = f"订阅异常：{exc}"
 
@@ -345,6 +363,14 @@ class TraderClient:
         self.positions: dict[str, dict] = {}
         self.account: dict = {}
         self.instruments: dict[str, dict] = {}
+        # 全量合约表查完没有。SimNow 上 `ReqQryInstrument` 会回 1.6 万条，
+        # 要 80 秒左右才流完，而**流没结束时后续请求全部排队**：查资金、报单
+        # 都一声不响地卡着。所以这个事件是给调用方判断「现在能不能安全下单」
+        # 用的，别拿它当装饰。
+        self.instruments_done = threading.Event()
+        # 合约 → 交易所的兜底解析器（`CtpHub` 会塞 `variety_exchange` 进来）。
+        # 有了它就不用为了撤单去拉 1.6 万条合约表。
+        self.exchange_resolver = None
         self.front_id = 0
         self.session_id = 0
         self._lock = threading.Lock()
@@ -467,9 +493,22 @@ class TraderClient:
         req.InvestorID = self.cfg.user_id
         self.api.ReqQryInvestorPosition(req, self._next_req())
 
-    def query_instruments(self) -> None:
-        if self.api is not None:
-            self.api.ReqQryInstrument(tdapi.CThostFtdcQryInstrumentField(), self._next_req())
+    def query_instruments(self, instrument: str = "") -> None:
+        """查合约表。传 `instrument` 就只查那一个（秒回），不传就查全量。
+
+        **全量查询在 SimNow 上是 1.6 万条、80 秒**，而且 CTP 一个会话是串行的：
+        流没结束之前，后面排队的报单和查资金都不会有任何回应。界面启动时如果
+        顺手查一次全量，用户点下单就会静默卡一分钟 —— 这个坑实测踩过。
+        所以只在下单/撤单真的需要交易所时才按合约查一个。
+        """
+        if self.api is None:
+            return
+        req = tdapi.CThostFtdcQryInstrumentField()
+        if instrument:
+            req.InstrumentID = instrument
+        else:
+            self.instruments_done.clear()
+        self.api.ReqQryInstrument(req, self._next_req())
 
     # ---- 读 ----
 
@@ -492,14 +531,23 @@ class TraderClient:
         return self._req
 
     def _exchange_of(self, instrument: str) -> str:
-        """合约 → 交易所。有查询到的合约表就用表，没有就按品种前缀猜。
+        """合约 → 交易所。按「查表 → 外部解析器 → 品种前缀猜」三级兜底。
 
-        猜错会导致撤单报「合约不存在」，所以只在查表失败时兜底 —— 表是登录后
-        `query_instruments()` 拉回来的，实盘建议先查一次。
+        猜错会导致撤单报「合约不存在」。查表最准但要先拉全量（80 秒，见
+        `query_instruments` 的注释），所以正常路径是外部解析器 —— `CtpHub`
+        会把 `variety_exchange`（扫本地 `data_futures/*.csv` 得到）挂进来，
+        比写死的前缀表更可靠，新品种上市也认得。
         """
         info = self.instruments.get(instrument)
         if info and info.get("exchange"):
             return info["exchange"]
+        if self.exchange_resolver is not None:
+            try:
+                ex = self.exchange_resolver(instrument)
+            except Exception:  # noqa: BLE001 - 解析器出问题不能连累撤单
+                ex = ""
+            if ex:
+                return ex
         from ttrade.symbols_info import EXCHANGES  # noqa: F401 - 只为了保持口径一致
 
         letters = "".join(ch for ch in instrument if ch.isalpha())
@@ -709,6 +757,10 @@ class TraderClient:
                     row["margin"] += _f(getattr(pInvestorPosition, "UseMargin", 0))
 
             def OnRspQryInstrument(self, pInstrument, pRspInfo, nRequestID, bIsLast):  # noqa: N802
+                # bIsLast 一定要处理：全量查询 1.6 万条，不记「查完了」的话
+                # 调用方没有任何办法知道什么时候可以安全下单
+                if bIsLast:
+                    outer.instruments_done.set()
                 if pInstrument is None:
                     return
                 ins = _s(pInstrument.InstrumentID)
@@ -727,16 +779,22 @@ class TraderClient:
 
 # CTP 的 OrderStatus 字符 → 人话
 _STATUS = {
-    "0": "未成交",
+    # 这张表必须严格照 CTP 的 OrderStatus 枚举写。**'3' 是「未成交还在队列中」，
+    # 是活单**，不是「已撤」—— 之前这里整体错位了一格，界面上活单显示成「已撤单」、
+    # 成交单显示成「未成交」，用户会以为单子没了。SimNow 实测才发现。
+    "0": "全部成交",
     "1": "部分成交",
-    "2": "全部成交",
-    "3": "未成交(已撤)",
-    "4": "已撤单",
+    "2": "部分成交(不在队列)",
+    "3": "未成交",
+    "4": "未成交(不在队列)",
     "5": "已撤单",
     "a": "未知",
-    "b": "未成交(未触发)",
-    "c": "已撤单(未触发)",
+    "b": "未触发",
+    "c": "已触发",
 }
+
+# 还在队列里、可以撤的状态
+ALIVE_STATUS = ("未成交", "部分成交", "未触发", "已触发")
 
 
 # ------------------------------------------------------------------ 组合入口

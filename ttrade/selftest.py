@@ -767,7 +767,45 @@ def _run() -> tuple[bool, list[str]]:
         else:
             raise RuntimeError("没连柜台时 place() 竟然没报错")
 
-        return "合约归一 / 主力解析 / tick 切 bar / 资金持仓映射 全对"
+        # 委托状态表：这张表错一格，界面上活单会显示成「已撤单」、成交单显示成
+        # 「未成交」。CTP 的 '3' 是「未成交还在队列中」，是活单 —— SimNow 实测踩过
+        from ttrade.ctp_client import ALIVE_STATUS, _STATUS
+        assert _STATUS["0"] == "全部成交" and _STATUS["5"] == "已撤单", _STATUS
+        assert _STATUS["3"] == "未成交" and _STATUS["3"] in ALIVE_STATUS, (
+            f"OrderStatus '3' 是活单，映射错了：{_STATUS['3']}")
+
+        # 订阅行情：第二个参数是**个数**，传 0 柜台照样回「成功」但一条 tick 不推
+        from ttrade.ctp_client import MdClient
+
+        class _FakeApi:
+            def __init__(self):
+                self.calls = []
+
+            def SubscribeMarketData(self, items, n):
+                self.calls.append((list(items), n))
+
+        fake = MdClient.__new__(MdClient)
+        fake.api, fake.last_error = _FakeApi(), ""
+        fake.subscribe(["rb2611", "cu2612"])
+        items, n = fake.api.calls[0]
+        assert n == len(items) == 2, f"订阅个数要传实际数量，传 {n} 会静默无 tick"
+
+        # 查合约：传合约号要带上 InstrumentID（单条秒回），不传才是全量
+        from ttrade.ctp_client import TraderClient
+
+        got_req = []
+
+        class _FakeTdApi:
+            def ReqQryInstrument(self, req, rid):
+                got_req.append(req.InstrumentID)
+
+        td = TraderClient.__new__(TraderClient)
+        td.api, td._req, td.instruments_done = _FakeTdApi(), 0, __import__("threading").Event()
+        td.query_instruments("rb2611")
+        td.query_instruments()
+        assert got_req == ["rb2611", ""], f"单合约查询没带 InstrumentID：{got_req}"
+
+        return "合约归一 / 主力解析 / tick 切 bar / 资金持仓映射 / 状态表 全对"
 
     check("CTP 会话层（交易页后端）", _ctp_live)
 
