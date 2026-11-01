@@ -2450,8 +2450,8 @@ class MainWindow(QMainWindow):
                 exch_names = symbols_info.EXCHANGES
             else:
                 # A 股交易所名
-                exch_names = {"SSE": "上交所", "SZSE": "深交所"}
-                order = [k for k in ("SSE", "SZSE") if k in groups]
+                exch_names = {"SSE": "上交所", "SZSE": "深交所", "BSE": "北交所"}
+                order = [k for k in ("SSE", "SZSE", "BSE") if k in groups]
             order += [k for k in groups if k not in order]
             for ex in order:
                 rows = groups[ex]

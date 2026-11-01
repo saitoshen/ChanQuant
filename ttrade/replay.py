@@ -42,8 +42,9 @@ MARKET_COST = {
 }
 
 # A 股的交易所代号。期货的交易所是 SHFE / DCE / CZCE / INE / CFFEX / GFEX，
-# 和这两个不重叠，所以「交易所名」足以判断市场，不必额外存一个 market 字段。
-STOCK_EXCHANGES = ("SSE", "SZSE")
+# 和这三个不重叠，所以「交易所名」足以判断市场，不必额外存一个 market 字段。
+# 北交所（BSE）也是 A 股 —— 漏掉它会让 920xxx 这批票被当成期货去算手续费。
+STOCK_EXCHANGES = ("SSE", "SZSE", "BSE")
 
 
 def market_of(cfg) -> str:

@@ -61,7 +61,7 @@ def list_stocks(api, exchanges: list[str] | None = None) -> list[str]:
     返回 `["SSE.600000", "SZSE.000001", ...]`。
     不调 `query_quotes` 两次——一次拿全部，按交易所前缀过滤。
     """
-    exs = exchanges or ["SSE", "SZSE"]
+    exs = exchanges or ["SSE", "SZSE", "BSE"]
     all_codes = []
     for ex in exs:
         try:

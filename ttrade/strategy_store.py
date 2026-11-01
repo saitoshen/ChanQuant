@@ -45,7 +45,7 @@ _WEIGHT_CN = {"risk": "风险平价", "equal": "等权", "score": "按分数", "
 
 # A 股的交易所代号。期货是 SHFE / DCE / CZCE / INE / CFFEX / GFEX，不重叠，
 # 所以「交易所名」足以判断市场。和 `replay.STOCK_EXCHANGES` 是同一份约定。
-_STOCK_EXCHANGES = ("SSE", "SZSE")
+_STOCK_EXCHANGES = ("SSE", "SZSE", "BSE")
 
 # 交易所后缀（Tushare 写法）→ 天勤代号
 _TS_SUFFIX = {"SH": "SSE", "SZ": "SZSE", "BJ": "BSE"}
@@ -80,11 +80,16 @@ def normalize_symbol(symbol: str, exchange: str = "") -> tuple[str, str]:
     if ex in _STOCK_EXCHANGES or ex == "BSE":
         return f"{ex}.{sym}", ex
 
-    # 纯 6 位数字：按首位判沪深（6/9 沪、0/3 深、4/8 北交所）
+    # 纯 6 位数字：按前缀判交易所。
+    # 北交所必须排在沪市前面 —— 北交所 2024 年之后新开的代码是 `920xxx`，
+    # 按首位判会被 `9` 抢到上交所，`920185` 就变成 `SSE.920185` 查不到数据。
+    # 沪市 `9` 开头只剩 B 股 `900xxx`，深市 B 股是 `200xxx`。
     if sym.isdigit() and len(sym) == 6:
-        if sym[0] in "69":
+        if sym.startswith(("92", "43", "83", "87", "88")):
+            return f"BSE.{sym}", "BSE"
+        if sym.startswith(("90", "6", "5")):
             return f"SSE.{sym}", "SSE"
-        if sym[0] in "03":
+        if sym.startswith(("00", "30", "20", "15", "16", "12", "39")):
             return f"SZSE.{sym}", "SZSE"
         return f"BSE.{sym}", "BSE"
     return sym, ex
