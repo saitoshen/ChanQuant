@@ -790,20 +790,26 @@ def _run() -> tuple[bool, list[str]]:
         items, n = fake.api.calls[0]
         assert n == len(items) == 2, f"订阅个数要传实际数量，传 {n} 会静默无 tick"
 
-        # 查合约：传合约号要带上 InstrumentID（单条秒回），不传才是全量
-        from ttrade.ctp_client import TraderClient
+        # 查合约：传合约号要带上 InstrumentID（单条秒回），不传才是全量。
+        # 这段要构造 CTP 的请求对象，所以只能在装了 openctp-ctp 的平台上跑 ——
+        # macOS 没有这个包（只有 Win/Linux wheel），跳过而不是判失败
+        from ttrade.ctp_client import HAS_CTP, TraderClient
 
-        got_req = []
+        if HAS_CTP:
+            got_req = []
 
-        class _FakeTdApi:
-            def ReqQryInstrument(self, req, rid):
-                got_req.append(req.InstrumentID)
+            class _FakeTdApi:
+                def ReqQryInstrument(self, req, rid):
+                    got_req.append(req.InstrumentID)
 
-        td = TraderClient.__new__(TraderClient)
-        td.api, td._req, td.instruments_done = _FakeTdApi(), 0, __import__("threading").Event()
-        td.query_instruments("rb2611")
-        td.query_instruments()
-        assert got_req == ["rb2611", ""], f"单合约查询没带 InstrumentID：{got_req}"
+            import threading
+
+            td = TraderClient.__new__(TraderClient)
+            td.api, td._req = _FakeTdApi(), 0
+            td.instruments_done = threading.Event()
+            td.query_instruments("rb2611")
+            td.query_instruments()
+            assert got_req == ["rb2611", ""], f"单合约查询没带 InstrumentID：{got_req}"
 
         return "合约归一 / 主力解析 / tick 切 bar / 资金持仓映射 / 状态表 全对"
 
