@@ -364,6 +364,7 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
     ccfg = cross_engine.CrossConfig(
         mode=getattr(cfg, "cross_mode", "hedge") or "hedge",
         rebalance=max(1, int(getattr(cfg, "cross_rebalance", 5) or 5)),
+        rebalance_unit=getattr(cfg, "cross_rebalance_unit", "bar") or "bar",
         top_pct=float(getattr(cfg, "cross_top_pct", 10.0) or 10.0),
         bot_pct=float(getattr(cfg, "cross_bot_pct", 10.0) or 10.0),
         long_only=bt.long_only,
@@ -390,13 +391,14 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
     mode_cn = "截面对冲" if ccfg.mode == "hedge" else "截面选品种"
     fcn = {"single": "单因子", "multi": "多因子", "ml": "机器学习"}.get(
         ccfg.factor_mode, ccfg.factor_mode)
-    label = f"{mode_cn} · {fcn} · {len(frames)} 品种 · 每 {ccfg.step()} 根调仓"
+    label = (f"{mode_cn} · {fcn} · {len(frames)} 品种 · "
+             f"{ccfg.step_text(fstrat.bars_per_day(panel.index))}调仓")
     out = cross_engine.run(frames, ccfg, bt,
                            profile=getattr(cfg, "cost_profile", "") or None,
                            label=label)
     if not out.ok:
         return Replay(error=out.error or "截面回测没有算出净值")
-    res = cross_engine.to_result(out, label=label, step=ccfg.step(),
+    res = cross_engine.to_result(out, label=label, step=out.step,
                                  bpy=bt.bars_per_year)
     return Replay(res=res, bh=None, label=label, family="cross", period=period,
                   long_only=bt.long_only, bars_per_year=bt.bars_per_year,

@@ -1508,6 +1508,13 @@ def _run() -> tuple[bool, list[str]]:
             before = _order(side_lay)
             win.cb_family.setCurrentIndex(win.cb_family.findData("cross"))
             app.processEvents()
+            # 上次存的配置可能停在选品种模式，先钉回对冲 —— 下面那几条断言是
+            # 按「对冲 → 选品种」的顺序写的
+            win.cb_cross_mode.setCurrentIndex(win.cb_cross_mode.findData("hedge"))
+            app.processEvents()
+            # 调仓间隔的单位跟着模式走：对冲按根，选品种按天 / 月
+            reb_unit = win.cb_cross_reb_unit
+            hedge_units = [reb_unit.itemData(i) for i in range(reb_unit.count())]
             hedge_ok = (
                 win.box_fsel.parentWidget() is win.cross_factor_host
                 and win.box_factor.parentWidget() is win.cross_factor_host
@@ -1518,16 +1525,23 @@ def _run() -> tuple[bool, list[str]]:
                 and win.cross_dlg.step1_lay.count() >= 2
                 and win.cross_dlg.step2_lay.count() >= 2
                 and bool(win.lbl_cross_sum.text().strip())
+                and "bar" in hedge_units
             )
             win.cb_cross_mode.setCurrentIndex(win.cb_cross_mode.findData("select"))
             app.processEvents()
             win.cb_timing.setCurrentIndex(win.cb_timing.findData("rule"))
             app.processEvents()
+            select_units = [reb_unit.itemData(i) for i in range(reb_unit.count())]
             select_ok = (
                 not win.grp_timing.isHidden()
                 and win.box_rule.parentWidget() is win.cross_timing_host
                 # 选品种模式不需要腿数：方向由时序信号逐品种给
                 and win.grp_legs.isHidden()
+                # 选品种不能按「根」调仓（5 分钟上 5 根=25 分钟换一次），
+                # 只给交易日 / 个月
+                and "bar" not in select_units
+                and "day" in select_units and "month" in select_units
+                and "交易日" in win.lbl_cross_sum.text()
             )
             win.cb_family.setCurrentIndex(win.cb_family.findData("rule"))
             app.processEvents()

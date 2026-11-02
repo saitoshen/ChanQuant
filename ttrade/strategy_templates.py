@@ -93,7 +93,8 @@ _SCFG_DEFAULTS = {
     "sizing": "capital", "principal": 1_000_000.0, "capital_pct": 30.0,
     "risk_pct": 1.0, "stop_atr_n": 14, "stop_mult": 5.0, "volume": 1,
     "cost_profile": "", "range_years": 0.0,
-    "cross_mode": "hedge", "cross_rebalance": 5, "cross_top_pct": 10.0,
+    "cross_mode": "hedge", "cross_rebalance": 5,
+    "cross_rebalance_unit": "bar", "cross_top_pct": 10.0,
     "cross_bot_pct": 10.0, "cross_weight": "risk",
 }
 

@@ -2204,16 +2204,28 @@ class MainWindow(QMainWindow):
         p1.addWidget(self.grp_pool)
 
         p1.addWidget(self._section("调仓"))
+        # 「每 N 根」和「每 N 天/月」是两种口径，摆在一起比藏在两处好：
+        # 截面对冲按根给（多空同时换，换手天然低），选品种按天/月给（一次换
+        # 整篮子，5 分钟周期上按根给等于每半小时重下一遍，成本能把收益吃光）
+        row_reb = QWidget()
+        rb = QHBoxLayout(row_reb)
+        rb.setContentsMargins(0, 0, 0, 0)
+        rb.setSpacing(6)
         self.sp_cross_reb = QSpinBox()
         self.sp_cross_reb.setRange(1, 2000)
         self.sp_cross_reb.setValue(5)
         self.sp_cross_reb.setPrefix("每 ")
-        self.sp_cross_reb.setSuffix(" 根调一次")
-        self.sp_cross_reb.setToolTip(
-            "调仓间隔，单位是 K 线根数。5 分钟周期 48 根约一个交易日，\n"
-            "日线就是「每 5 个交易日」。间隔越短换手越高，成本吃掉的越多。"
-        )
-        p1.addWidget(self.sp_cross_reb)
+        self.cb_cross_reb_unit = QComboBox()
+        self.cb_cross_reb_unit.addItem("根", "bar")
+        self.cb_cross_reb_unit.addItem("交易日", "day")
+        self.cb_cross_reb_unit.addItem("个月", "month")
+        rb.addWidget(self.sp_cross_reb, 1)
+        rb.addWidget(self.cb_cross_reb_unit)
+        p1.addWidget(row_reb)
+        self.lbl_cross_reb = QLabel()
+        self.lbl_cross_reb.setObjectName("Hint")
+        self.lbl_cross_reb.setWordWrap(True)
+        p1.addWidget(self.lbl_cross_reb)
 
         # ---- 机器学习标签口径（只在因子模式=机器学习时显示）
         self.lbl_label = QLabel("机器学习标签")
@@ -2403,6 +2415,7 @@ class MainWindow(QMainWindow):
             self.cb_family.currentIndexChanged.connect(self._on_family_changed)
             self.cb_cross_mode.currentIndexChanged.connect(self._on_cross_mode_changed)
             self.sp_cross_reb.valueChanged.connect(self._on_cross_param_changed)
+            self.cb_cross_reb_unit.currentIndexChanged.connect(self._on_cross_param_changed)
             self.sp_cross_pct.valueChanged.connect(self._on_cross_param_changed)
             self.sp_cross_bot.valueChanged.connect(self._on_cross_param_changed)
             self.cb_cross_w.currentIndexChanged.connect(self._on_cross_param_changed)
@@ -3187,6 +3200,61 @@ class MainWindow(QMainWindow):
             return "hedge"
         return self.cb_cross_mode.currentData() or "hedge"
 
+    def _cross_reb_unit(self) -> str:
+        """调仓间隔的单位：bar / day / month。"""
+        if not hasattr(self, "cb_cross_reb_unit"):
+            return "bar"
+        return self.cb_cross_reb_unit.currentData() or "bar"
+
+    def _sync_cross_reb(self, hedge: bool) -> None:
+        """调仓间隔那一行的单位和提示。
+
+        **选品种模式不提供「根」**：那条路换一次就是整篮子重下一遍，5 分钟
+        周期上「每 5 根」等于 25 分钟重下一次，成本能把收益全吃掉。按交易日 /
+        月给，回测时再按数据密度折成根数（一天可能是 48 根也可能是 68 根，
+        写死根数在不同品种上对不齐）。对冲模式仍然按根 —— 多空两侧同时换一次，
+        换手本来就低。
+
+        换模式时把选中的单位带过去（带不过去就落到该模式的第一个），
+        中间 `blockSignals` 一下：清空 / 重填会连发好几次 `currentIndexChanged`，
+        每次都去重算摘要没必要。
+        """
+        if not hasattr(self, "lbl_cross_reb"):
+            return
+        allow_bar = bool(hedge)
+        if getattr(self, "_reb_allow_bar", None) != allow_bar:
+            self._reb_allow_bar = allow_bar
+            cur = self.cb_cross_reb_unit.currentData()
+            self.cb_cross_reb_unit.blockSignals(True)
+            self.cb_cross_reb_unit.clear()
+            if allow_bar:
+                self.cb_cross_reb_unit.addItem("根", "bar")
+            self.cb_cross_reb_unit.addItem("交易日", "day")
+            self.cb_cross_reb_unit.addItem("个月", "month")
+            idx = self.cb_cross_reb_unit.findData(cur)
+            self.cb_cross_reb_unit.setCurrentIndex(max(0, idx))
+            self.cb_cross_reb_unit.blockSignals(False)
+
+        n = int(self.sp_cross_reb.value())
+        unit = self._cross_reb_unit()
+        if unit == "month":
+            head = f"调仓间隔：每 {n} 个月。"
+            tail = "一个月按 21 个交易日折算，再按数据的实际密度换成根数。"
+        elif unit == "day":
+            head = f"调仓间隔：每 {n} 个交易日。"
+            tail = "回测时按数据的实际密度换成根数（5 分钟周期约 48 根一天）。"
+        else:
+            head = f"调仓间隔：每 {n} 根 K 线。"
+            tail = "5 分钟周期约 48 根一个交易日，48 根≈1 天。"
+        self.lbl_cross_reb.setText(head + tail)
+        self.sp_cross_reb.setToolTip(
+            "调仓间隔的**数量**，单位在右边（根 / 交易日 / 个月）。\n"
+            "间隔越短换手越高，成本吃掉的越多。")
+        self.cb_cross_reb_unit.setToolTip(
+            "根：按 K 线根数（只有截面对冲用）。\n"
+            "交易日 / 个月：按天数给，回测时按实际密度换算成根数\n"
+            "（不同品种夜盘时长不同，一天可能是 48 根也可能是 68 根）。")
+
     def _sync_cross_controls(self) -> None:
         """截面面板的提示：够不够品种、这一组参数大概持几条腿。"""
         if not hasattr(self, "cb_cross_mode"):
@@ -3213,6 +3281,7 @@ class MainWindow(QMainWindow):
         ml_on = self.factor_mode == "ml"
         for w in (self.lbl_label, self.cb_label):
             w.setVisible(ml_on)
+        self._sync_cross_reb(hedge)
         # 参数都搬进弹窗了，侧边栏这一段是唯一的「一眼看见」的地方
         if hasattr(self, "lbl_cross_sum"):
             self.lbl_cross_sum.setText(self._cross_summary())
@@ -3247,6 +3316,16 @@ class MainWindow(QMainWindow):
         self.lbl_cross_hint.setText(text)
         self.lbl_cross_preview.setText(text)
 
+    def _reb_text(self) -> str:
+        """调仓间隔的人话：「每 5 根」/「每 5 个交易日」/「每 3 个月」。"""
+        n = int(self.sp_cross_reb.value())
+        unit = self._cross_reb_unit()
+        if unit == "month":
+            return f"每 {n} 个月"
+        if unit == "day":
+            return f"每 {n} 个交易日"
+        return f"每 {n} 根"
+
     def _cross_summary(self) -> str:
         """侧边栏那段摘要：不开弹窗也知道现在配的是什么。
 
@@ -3256,7 +3335,7 @@ class MainWindow(QMainWindow):
         n = len(self._multi_symbols())
         mode = self._cross_mode()
         head = "截面对冲" if mode == "hedge" else "截面选品种 + 时序"
-        lines = [f"{head} · {n} 个品种 · 每 {self.sp_cross_reb.value()} 根调仓"]
+        lines = [f"{head} · {n} 个品种 · {self._reb_text()}调仓"]
 
         fm = self.cb_fmode.currentData() or "multi"
         if fm == "single":
@@ -3672,6 +3751,7 @@ class MainWindow(QMainWindow):
             cross_symbols=list(self.sym_pick.selected()) if hasattr(self, "sym_pick") else [],
             cross_mode=self._cross_mode(),
             cross_rebalance=int(self.sp_cross_reb.value()),
+            cross_rebalance_unit=self._cross_reb_unit(),
             cross_top_pct=float(self.sp_cross_pct.value()),
             cross_bot_pct=float(self.sp_cross_bot.value()),
             cross_weight=self.cb_cross_w.currentData() or "risk",
@@ -3753,6 +3833,12 @@ class MainWindow(QMainWindow):
             if cm >= 0:
                 self.cb_cross_mode.setCurrentIndex(cm)
             self.sp_cross_reb.setValue(max(1, int(cfg.cross_rebalance or 5)))
+            # 单位要在数量**之后**恢复：`setValue` 会触发 `_on_cross_param_changed`
+            # → 摘要重算，先设单位的话那一次算出来的是旧数量配新单位
+            ru = self.cb_cross_reb_unit.findData(
+                getattr(cfg, "cross_rebalance_unit", "bar") or "bar")
+            if ru >= 0:
+                self.cb_cross_reb_unit.setCurrentIndex(ru)
             self.sp_cross_pct.setValue(float(cfg.cross_top_pct or 10.0))
             self.sp_cross_bot.setValue(float(getattr(cfg, "cross_bot_pct", 0) or 10.0))
             cw = self.cb_cross_w.findData(cfg.cross_weight or "risk")
@@ -4546,6 +4632,7 @@ class MainWindow(QMainWindow):
         ccfg = cross_engine.CrossConfig(
             mode=self._cross_mode(),
             rebalance=int(self.sp_cross_reb.value()),
+            rebalance_unit=self._cross_reb_unit(),
             top_pct=float(self.sp_cross_pct.value()),
             bot_pct=float(self.sp_cross_bot.value()),
             long_only=self.cfg.long_only,
@@ -4580,7 +4667,11 @@ class MainWindow(QMainWindow):
         mode_cn = "截面对冲" if ccfg.mode == "hedge" else "截面选品种"
         fcn = {"single": "单因子", "multi": "多因子", "ml": "机器学习"}.get(
             ccfg.factor_mode, ccfg.factor_mode)
-        label = (f"{mode_cn} · {fcn} · {len(frames)} 品种 · 每 {ccfg.step()} 根调仓")
+        # 调仓间隔按数据的实际密度说人话：「每 5 个交易日」比「每 240 根」好懂，
+        # 但根数也一起给出来 —— 用户心里对「多少根」有个量
+        _bpd = fstrat.bars_per_day(panel.index)
+        label = (f"{mode_cn} · {fcn} · {len(frames)} 品种 · "
+                 f"{ccfg.step_text(_bpd)}调仓")
         if ccfg.pool_keys:
             label += f" · 先筛池 {ccfg.pool_top_pct:g}%"
         if ccfg.weight == "tier" and ccfg.tiers >= 2:
@@ -4611,7 +4702,8 @@ class MainWindow(QMainWindow):
             self._clear_chart(f"截面回测失败：{out.error or '没有算出净值'}")
             return
 
-        res = self._cross_result(out, label, ccfg.step(), bt.bars_per_year)
+        # 用 `out.step`（引擎按密度换算好的根数），不要自己再调一次 `ccfg.step()`
+        res = self._cross_result(out, label, out.step, bt.bars_per_year)
         ctx = ViewCtx(
             symbol="", name=f"{len(frames)} 个品种", exchange="",
             period=period, market=self.market, label=label,

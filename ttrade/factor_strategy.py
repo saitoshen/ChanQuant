@@ -496,13 +496,21 @@ def trigger_mask(strength: pd.Series, armed: pd.Series,
 
 
 # ---------------------------------------------------------------- Walk-forward
-def _bars_per_day(idx) -> float:
-    """平均每个交易日几根 bar。日线 1、1h 约 7~9、5m 约 48~68（含夜盘）。"""
+def bars_per_day(idx) -> float:
+    """平均每个交易日几根 bar。日线 1、1h 约 7~9、5m 约 48~68（含夜盘）。
+
+    截面策略的「调仓间隔」要按**天 / 月**给（选品种不能频繁换仓），落地时得靠
+    这个密度换算成根数；机器学习那边的「训练窗口（交易日）」同理。
+    """
     idx = pd.DatetimeIndex(idx)
     if len(idx) < 2:
         return 1.0
     nd = idx.normalize().nunique()
     return len(idx) / float(max(1, nd))
+
+
+# 老名字，包内和冒烟测试里都在用
+_bars_per_day = bars_per_day
 
 
 def _to_bars(days: int, bpd: float) -> int:

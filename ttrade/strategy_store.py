@@ -42,6 +42,8 @@ LAST_FILE = "last_config.json"
 # 截面策略「腿内怎么分钱」的中文名。策略库表格里要显示，界面下拉也用它，
 # 放一处免得两边慢慢走偏
 _WEIGHT_CN = {"risk": "风险平价", "equal": "等权", "score": "按分数", "tier": "分档"}
+# 调仓间隔的单位，只用在参数摘要里（「调仓=5天」比「调仓=5」好读）
+_REB_UNIT_CN = {"bar": "根", "day": "天", "month": "月"}
 
 # A 股的交易所代号。期货是 SHFE / DCE / CZCE / INE / CFFEX / GFEX，不重叠，
 # 所以「交易所名」足以判断市场。和 `replay.STOCK_EXCHANGES` 是同一份约定。
@@ -159,7 +161,12 @@ class StrategyConfig:
     # 仍然记着「当前在看的那个」，用来在列表里指代这条策略。
     cross_symbols: list = field(default_factory=list)
     cross_mode: str = "hedge"           # hedge = 截面对冲；select = 选品种 + 时序
-    cross_rebalance: int = 5            # 调仓间隔（根）
+    cross_rebalance: int = 5            # 调仓间隔（数量，单位见下一行）
+    # 调仓间隔的单位：bar / day / month。选品种模式按天 / 月（换一次等于整篮子
+    # 重下一遍，按「根」给的话 5 分钟周期上 5 根就换一次，成本能把收益吃光）；
+    # 对冲模式仍然按根。存盘时要一起存 —— 只存数量的话，选品种策略重开一次
+    # 就会从「每 5 天」变成「每 5 根」
+    cross_rebalance_unit: str = "bar"
     cross_top_pct: float = 10.0         # 多头：选最强的百分比
     cross_bot_pct: float = 10.0         # 空头：选最弱的百分比（可以和上面不同）
     cross_weight: str = "risk"          # risk / equal / score / tier
@@ -304,7 +311,7 @@ class StrategyConfig:
             mode = {"single": "单因子", "multi": "多因子", "ml": "机器学习"}.get(
                 self.factor_mode, self.factor_mode or "多因子")
             bits = [f"{mode}·{len(self.factor_keys or [])}因子",
-                    f"调仓={int(self.cross_rebalance or 1)}根",
+                    f"调仓={int(self.cross_rebalance or 1)}{_REB_UNIT_CN.get(self.cross_rebalance_unit, '根')}",
                     f"权重={_WEIGHT_CN.get(self.cross_weight, '风险平价')}"]
             if self.cross_mode == "select":
                 # 选品种模式没有腿数（池内全进时序腿），写出来是假信息
@@ -416,6 +423,10 @@ class StrategyConfig:
             cfg.cross_rebalance = max(1, int(cfg.cross_rebalance or 1))
         except (TypeError, ValueError):
             cfg.cross_rebalance = 5
+        # 单位只认三种；手改 JSON 写错 / 老配置文件里没有这个字段时，按模式
+        # 补一个合理的默认（选品种按天，对冲按根）
+        if getattr(cfg, "cross_rebalance_unit", None) not in ("bar", "day", "month"):
+            cfg.cross_rebalance_unit = "day" if cfg.cross_mode == "select" else "bar"
         cfg.cross_top_pct = _clamp_pct(cfg.cross_top_pct, 10.0, 50.0)
         cfg.cross_bot_pct = _clamp_pct(getattr(cfg, "cross_bot_pct", 10.0), 10.0, 50.0)
         if cfg.cross_mode not in ("hedge", "select"):

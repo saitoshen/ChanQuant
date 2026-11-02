@@ -59,7 +59,18 @@ class CrossConfig:
     """截面策略的配置。`mode` 决定后面哪一组字段有效，无效的保留着不删。"""
 
     mode: str = "hedge"                 # hedge / select
-    rebalance: int = 5                  # 调仓间隔，单位是**根**（5m 上 48 根约一天）
+    # 调仓间隔。`rebalance` 是**数量**，`rebalance_unit` 是单位：
+    #   bar   —— 根（对冲模式用；5m 上 48 根约一天）
+    #   day   —— 交易日
+    #   month —— 自然月（按 21 个交易日折算）
+    #
+    # 为什么选品种模式按天 / 月给：那条路是「一篮子按权重整体换仓」，换一次等于
+    # 把整篮子的仓位按新权重重下一遍，成本按换手吃。按「根」给的话 5 分钟周期上
+    # 默认 5 根 = 25 分钟换一次，换手能把收益全吃掉 —— 而选品种本来就不该频繁。
+    # 换算成根数要**按数据的实际密度**来（`bars_per_day`），不能写死 48：不同
+    # 品种的夜盘时长不同，同一周期一天可能是 48 根也可能是 68 根。
+    rebalance: int = 5
+    rebalance_unit: str = "bar"         # bar / day / month
     # 腿数**只对冲模式用**。选品种模式下池内品种全进时序腿，这两个值不参与计算
     # （界面上也不显示）—— 见模块说明里那一段
     top_pct: float = 10.0               # 多头：选最强的百分之几
@@ -116,8 +127,30 @@ class CrossConfig:
         """空头持几个品种（只对冲模式有意义）。默认和多头一样，但可以单独调。"""
         return _legs(n_valid, self.bot_pct)
 
-    def step(self) -> int:
-        return max(1, int(self.rebalance or 1))
+    def step(self, bars_per_day: float | None = None) -> int:
+        """调仓间隔换算成**根数**。
+
+        `bar` 单位直接返回；`day` / `month` 要乘「一天几根」。密度没给时按日线
+        处理（1 根/天）—— 调用方几乎都是先拿到行情面板再算，只有标签、日志这类
+        纯文字的地方可能不带密度。
+        """
+        n = max(1, int(self.rebalance or 1))
+        unit = str(self.rebalance_unit or "bar").lower()
+        if unit == "bar":
+            return n
+        days = n * (21 if unit == "month" else 1)
+        bpd = float(bars_per_day or 1.0)
+        return max(1, int(round(days * bpd)))
+
+    def step_text(self, bars_per_day: float | None = None) -> str:
+        """给人看的调仓间隔：`每 5 根` / `每 5 天` / `每 1 个月`。"""
+        n = max(1, int(self.rebalance or 1))
+        unit = str(self.rebalance_unit or "bar").lower()
+        if unit == "month":
+            return f"每 {n} 个月"
+        if unit == "day":
+            return f"每 {n} 天"
+        return f"每 {n} 根"
 
 
 def _legs(n_valid: int, pct: float) -> int:
@@ -133,6 +166,11 @@ class CrossResult:
     label: str = ""
     legs: int = 0                       # 最近一次调仓持了几个品种
     n_rebalance: int = 0
+    # 这次实际用的调仓间隔（**根数**，已按数据密度换算过）和密度。界面的绩效
+    # 表按「调仓区间」切收益，得用同一个数；自己再调一次 `cfg.step()` 会因为
+    # 拿不到密度而退回 1 根/天，区间数直接翻几十倍
+    step: int = 1
+    bars_per_day: float = 1.0
     error: str = ""
     # 逐笔交易（每腿「同向连续持仓」算一笔）。绩效页的「调仓 N 次」说的是调仓
     # 动作，交易记录说的是持仓段 —— 两个数本来就不一样
@@ -348,7 +386,7 @@ def ml_score_panel(frames: dict[str, pd.DataFrame], keys: list[str], fcfg,
     pos = np.searchsorted(ts, long.index.get_level_values(0).to_numpy())
     n = len(ts)
 
-    bpd = fstrat._bars_per_day(pd.DatetimeIndex(ts))
+    bpd = fstrat.bars_per_day(pd.DatetimeIndex(ts))
     train_bars = fstrat._to_bars(fcfg.train_window, bpd)
     step_bars = fstrat._to_bars(fcfg.step, bpd)
     min_bars = min(int(fcfg.min_train), train_bars)
@@ -554,10 +592,14 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     # 风险平价要各品种的波动率；等权 / 按分数用不上，不算它（滚动标准差在 5 分钟
     # 全历史上也要几百毫秒）
     vol = vol_panel(frames, score.index) if cfg.weight == "risk" else None
+    # 调仓间隔要换算成**根数**：选品种模式按天 / 月给，得靠数据的实际密度落地。
+    # 密度按分数面板的索引算（它就是回测的时钟），不能写死 48
+    bpd = fstrat.bars_per_day(score.index)
+    step = cfg.step(bpd)
     if cfg.mode == "select":
-        weights = _select_weights(frames, score, cfg, vol)
+        weights = _select_weights(frames, score, cfg, vol, step=step)
     else:
-        weights = _hedge_weights(score, cfg, vol)
+        weights = _hedge_weights(score, cfg, vol, step=step)
 
     # 两个权重构造器都返回**稠密**矩阵（每一根 bar 都有值）：调仓日之间保持
     # 上一组的仓位，调仓日整体换一次。不要在这里再 ffill —— 那会把「主动平掉」
@@ -570,23 +612,28 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     equity = (1.0 + net).cumprod()
     equity.iloc[0] = 1.0
     bpy = bt.bars_per_year or 252.0
-    n_reb = len(range(0, len(score), cfg.step()))
+    n_reb = len(range(0, len(score), step))
     return CrossResult(
         equity=equity, weights=weights, metrics=_metrics(equity, bpy),
         label=label, legs=int(weights.abs().gt(0).sum(axis=1).max() or 0),
         n_rebalance=n_reb,
+        step=step, bars_per_day=bpd,
         trades=trades_from_weights(weights, close),
         score=score,
     )
 
 
-def to_result(out: "CrossResult", label: str = "", step: int = 1,
+def to_result(out: "CrossResult", label: str = "", step: int = 0,
               bpy: float = 252.0):
     """把 `CrossResult` 包成 `backtest.Result`，好让现成的绩效页直接吃得下。
 
     绩效表里的「交易」还是按**调仓区间**算的（区间收益为正算赢）：截面策略的
     仓位是按权重挂着的，按成交笔数算胜率会全是 0。交易记录那一页用的是
     `trades_from_weights` 切出来的持仓段，两者口径不同，各管一处。
+
+    `step` 不给就用 `out.step` —— 那个是引擎按数据密度换算好的**根数**。
+    调用方自己拿 `cfg.step()` 传进来的话，选品种模式（按天 / 月）会因为手上
+    没有密度而退回 1 根/天，区间数凭空多出几十倍，胜率、盈亏比全跟着错。
     """
     from ttrade.backtest import Result, _metrics
 
@@ -600,7 +647,7 @@ def to_result(out: "CrossResult", label: str = "", step: int = 1,
 
     m = dict(_metrics(eq, pos, [], bpy))
     ret = eq.pct_change().fillna(0.0)
-    step = max(1, int(step or 1))
+    step = max(1, int(step or out.step or 1))
     seg: list[float] = []
     for i in range(0, len(ret), step):
         chunk = ret.iloc[i:i + step]
@@ -887,7 +934,8 @@ def _apply_pool(score: pd.DataFrame, pool: pd.DataFrame,
 
 
 def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig,
-                   vol: pd.DataFrame | None = None) -> pd.DataFrame:
+                   vol: pd.DataFrame | None = None,
+                   step: int | None = None) -> pd.DataFrame:
     """多强空弱。多空各占一半名义，净敞口 ≈ 0。
 
     多空腿数可以不一样（`top_pct` / `bot_pct`）：多 10% 空 10% 是常见的对称
@@ -898,7 +946,7 @@ def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig,
     内部**按 1/σ 分 —— 波动大的品种少给钱，多空两侧各自的风险贡献才拉得平；
     跨腿的 0.5 / 0.5 不动，否则净敞口就不是 0 了。
     """
-    rows, top, bot, k_long, k_short, ok = _rank(score, cfg)
+    rows, top, bot, k_long, k_short, ok = _rank(score, cfg, step=step)
     inv_l = 1.0 / np.maximum(k_long, 1)
     inv_s = 1.0 / np.maximum(k_short, 1)
     if cfg.weight == "tier" and int(cfg.tiers or 0) >= 2:
@@ -938,7 +986,8 @@ def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig,
     return _place(score, rows, w, ok)
 
 
-def _rank(score: pd.DataFrame, cfg: CrossConfig, all_in: bool = False):
+def _rank(score: pd.DataFrame, cfg: CrossConfig, all_in: bool = False,
+          step: int | None = None):
     """调仓日上「谁在前、谁在后」一次性排完。
 
     返回 `(行号, 多头掩码, 空头掩码, 多头几个, 空头几个, 有效行掩码)`。
@@ -953,7 +1002,7 @@ def _rank(score: pd.DataFrame, cfg: CrossConfig, all_in: bool = False):
     NaN 必须排到两端之外：多头侧按 `-inf` 参与排序，空头侧按 `+inf`，这样
     「有效品种不足」的品种永远不会被选中，和 `dropna()` 之后再排等价。
     """
-    step = cfg.step()
+    step = max(1, int(step or cfg.step()))
     rows = np.arange(0, len(score), step)
     mat = score.to_numpy(dtype=float)[rows] if len(rows) else np.zeros((0, score.shape[1]))
     n_valid = np.sum(~np.isnan(mat), axis=1)
@@ -1005,7 +1054,8 @@ def _place(score: pd.DataFrame, rows, w: np.ndarray, ok) -> pd.DataFrame:
 
 
 def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
-                    cfg: CrossConfig, vol: pd.DataFrame | None = None) -> pd.DataFrame:
+                    cfg: CrossConfig, vol: pd.DataFrame | None = None,
+                    step: int | None = None) -> pd.DataFrame:
     """选品种 + 时序：**池内每个品种**各拿一份钱，由自己的时序信号决定方向。
 
     时序信号在**各自的行情表**上算（`strategies.run_strategy` / 因子策略），算完
@@ -1029,7 +1079,8 @@ def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
         sigs[sym] = _timing_signal(df, cfg)
     sig_panel = pd.concat(sigs, axis=1).sort_index().reindex(score.index).ffill().fillna(0.0)
 
-    rows, top, _bot, k_long, _k_short, ok = _rank(score, cfg, all_in=True)
+    rows, top, _bot, k_long, _k_short, ok = _rank(score, cfg, all_in=True,
+                                                  step=step)
     if cfg.weight == "tier" and int(cfg.tiers or 0) >= 2:
         mat = score.to_numpy(dtype=float)[rows]
         units = _tier_units(cfg)

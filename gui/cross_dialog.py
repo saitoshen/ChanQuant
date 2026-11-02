@@ -52,7 +52,9 @@ class CrossSetupDialog(QDialog):
 
         head = QLabel(
             "截面策略分两步：第一步横向比强弱，决定拿哪些品种、多哪几个空哪几个；"
-            "第二步决定这些品种怎么下单。左边改第一步，右边跟着变。"
+            "第二步决定这些品种怎么下单。左边改第一步，右边跟着变。\n"
+            "两边各有一处「选因子」，管的不是同一件事：截面因子（左）只管横向排名"
+            "和分多少钱，时序因子（右，仅选品种模式）只管每只什么时候进、做多还是做空。"
         )
         head.setObjectName("Hint")
         head.setWordWrap(True)
@@ -145,6 +147,8 @@ class CrossSetupDialog(QDialog):
         select = mode == "select"
         if select:
             leg = "规则策略" if timing == "rule" else "因子策略"
+            self.lbl_step1_sub.setText(
+                "截面因子只决定谁强谁弱、每只分多少钱 —— 不决定做多还是做空")
             self.lbl_step2_sub.setText(
                 f"池内每个品种都由时序{leg}决定是多是空还是空仓，截面分数只决定分多少钱"
             )
@@ -153,6 +157,7 @@ class CrossSetupDialog(QDialog):
                 "要缩品种池请用第一步的筛池，池内剩下的品种各拿一份钱，没出信号的留现金。"
             )
         else:
+            self.lbl_step1_sub.setText("按截面因子横向排序，定下多空两端")
             self.lbl_step2_sub.setText(
                 "多空两端各占 50% 名义额，这一步定腿数和腿内怎么分钱"
             )

@@ -1610,7 +1610,8 @@ def check_strategy_store() -> None:
         cx = St.StrategyConfig(
             name="截面测试", symbol="CU", exchange="SHFE", period="5m",
             family="cross", cross_symbols=["CU_SHFE", "RB_SHFE", "M_DCE"],
-            cross_mode="select", cross_rebalance=48, cross_top_pct=25.0,
+            cross_mode="select", cross_rebalance=48, cross_rebalance_unit="day",
+            cross_top_pct=25.0,
             cross_bot_pct=20.0, cross_weight="score", factor_mode="ml",
             factor_keys=["mom_20"],
             timing_family="factor", timing_rule_key="ma_cross",
@@ -1628,6 +1629,19 @@ def check_strategy_store() -> None:
               str((cb.cross_symbols, cb.cross_mode, cb.cross_rebalance,
                    cb.cross_top_pct, cb.cross_bot_pct, cb.cross_weight,
                    cb.factor_mode, cb.timing_family)))
+        # 调仓间隔的单位必须跟着存：只存数量的话，选品种策略重开一次就从
+        # 「每 48 天」变成「每 48 根」，回测结论完全不是一回事
+        check("策略配置：调仓间隔的单位往返一致",
+              cb.cross_rebalance_unit == "day"
+              and "调仓=48天" in cb.params_text(),
+              f"{cb.cross_rebalance_unit} / {cb.params_text()}")
+        # 手改 JSON 写成乱七八糟的单位时按模式补默认值，不能让回测拿到怪单位
+        bad = St.StrategyConfig.from_dict(
+            {"family": "cross", "cross_mode": "select",
+             "cross_rebalance_unit": "weeks"})
+        check("策略配置：非法调仓单位被纠正",
+              bad.cross_rebalance_unit in ("bar", "day", "month"),
+              bad.cross_rebalance_unit)
         check("策略配置：截面的标题不写单个品种",
               "CU_SHFE" not in cb.title() and "3 个品种" in cb.strategy_label(),
               cb.title())
@@ -1784,6 +1798,70 @@ def check_cross() -> None:
     n_l = int(held.iloc[-1].gt(0).sum()) if len(held) else 0
     n_s = int(held.iloc[-1].lt(0).sum()) if len(held) else 0
     check("截面：空头腿确实比多头多", (n_l, n_s) == (1, 2), f"{n_l} 多 / {n_s} 空")
+
+    # 调仓间隔的单位：选品种按「天 / 月」给，对冲按「根」给。
+    # 换算成根数必须按**数据实际密度**来 —— 写死 48 的话，夜盘长的品种一天
+    # 68 根，「每 5 天」就变成 3.5 天了
+    check("截面：按根给不受密度影响",
+          cross.CrossConfig(rebalance=5).step(48.0) == 5,
+          str(cross.CrossConfig(rebalance=5).step(48.0)))
+    check("截面：按天给要乘一天几根",
+          cross.CrossConfig(rebalance=5, rebalance_unit="day").step(48.0) == 240,
+          str(cross.CrossConfig(rebalance=5, rebalance_unit="day").step(48.0)))
+    check("截面：按月给按 21 个交易日折算",
+          cross.CrossConfig(rebalance=2, rebalance_unit="month").step(48.0)
+          == 2 * 21 * 48,
+          str(cross.CrossConfig(rebalance=2, rebalance_unit="month").step(48.0)))
+    check("截面：调仓间隔的文案分单位",
+          (cross.CrossConfig(rebalance=5, rebalance_unit="day").step_text() == "每 5 天"
+           and cross.CrossConfig(rebalance=3, rebalance_unit="month").step_text()
+           == "每 3 个月"
+           and cross.CrossConfig(rebalance=5).step_text() == "每 5 根"),
+          cross.CrossConfig(rebalance=3, rebalance_unit="month").step_text())
+
+    # 5 分钟周期上「每天调一次」≈ 每 48 根。这条链上任何一环拿不到密度，
+    # 都会退回「1 根/天」，调仓次数直接翻几十倍。密度按**分数面板**的索引算
+    # （因子热身期会让头几天少几根），所以断言跟着 `bars_per_day` 走，
+    # 不写死 48
+    iidx = pd.DatetimeIndex(
+        [d + pd.Timedelta(minutes=5 * k)
+         for d in pd.bdate_range("2024-01-01", periods=20)
+         for k in range(48)])
+    iframes = {}
+    for i, d in enumerate(drifts):
+        px = pd.Series(100.0 * (1 + d / 48) ** np.arange(len(iidx)), index=iidx)
+        iframes[f"S{i}_X"] = pd.DataFrame({
+            "open": px, "high": px * 1.001, "low": px * 0.999,
+            "close": px, "volume": 1000.0,
+        })
+    sel_kw0 = dict(mode="select", top_pct=50, factor_mode="multi",
+                   factor_keys=["mom_20"], timing_family="rule",
+                   timing_rule_key="ma_cross")
+    day_out = cross.run(iframes, cross.CrossConfig(
+        rebalance=1, rebalance_unit="day", **sel_kw0), BtConfig())
+    check("截面：选品种按天调仓要按密度换成根数",
+          day_out.ok and day_out.step == max(1, int(round(day_out.bars_per_day)))
+          and 40.0 < day_out.bars_per_day < 60.0,
+          "" if not day_out.ok else f"step={day_out.step} "
+          f"bpd={day_out.bars_per_day:.2f}")
+    check("截面：每 1 天调一次 = 一天一次（不是一根一次）",
+          day_out.ok
+          and day_out.n_rebalance == len(range(0, len(day_out.score),
+                                              day_out.step))
+          and day_out.n_rebalance < len(day_out.score) / 10,
+          "" if not day_out.ok else
+          f"{day_out.n_rebalance} 次 / {len(day_out.score)} 根")
+    bar_out = cross.run(iframes, cross.CrossConfig(
+        rebalance=1, rebalance_unit="bar", **sel_kw0), BtConfig())
+    check("截面：每 1 根调一次要换满（对照组）",
+          bar_out.ok and bar_out.n_rebalance == len(bar_out.score),
+          "" if not bar_out.ok else str(bar_out.n_rebalance))
+    # 绩效表按「调仓区间」切收益。调用方忘了传 step 的话必须落到 `out.step`，
+    # 不能退回 1 根 —— 否则区间数 960，胜率 / 盈亏比全跟着错
+    day_res = cross.to_result(day_out, label="选品种")
+    check("截面：绩效区间默认用引擎算好的根数",
+          day_out.ok and day_res.metrics.get("avg_bars") == float(day_out.step),
+          "" if not day_out.ok else str(day_res.metrics.get("avg_bars")))
 
     score = cross.score_panel(frames, ["mom_20"])
     last = score.iloc[-1].dropna()
