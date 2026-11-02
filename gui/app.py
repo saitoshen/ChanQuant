@@ -164,7 +164,7 @@ FAMILIES = [
 CROSS_MODES = [
     ("hedge", "截面对冲", "多最强的 top X%、空最弱的 bottom X%，净敞口≈0"),
     ("select", "截面选品种 + 时序交易",
-     "先用截面因子挑 top X%，再让每个品种自己的时序策略决定多空"),
+     "池内每个品种各分一份钱，由自己的时序策略决定多空；截面分数只决定分多少钱"),
 ]
 
 # 截面策略「腿内怎么分钱」。**默认风险平价**：铜的日波动是玉米的两三倍，等权
@@ -2215,36 +2215,6 @@ class MainWindow(QMainWindow):
         )
         p1.addWidget(self.sp_cross_reb)
 
-        p1.addWidget(self._section("多空腿数"))
-        # 多空各选百分之几。早先是一个「选最强的 X%」同时管两头 —— 对称写法
-        # 常见，但「多最强的 10%、空最弱的 20%」也讲得通（下跌时弱者更弱），
-        # 而且用户看不出来空头到底选了多少
-        self.sp_cross_pct = QDoubleSpinBox()
-        self.sp_cross_pct.setRange(1.0, 50.0)
-        self.sp_cross_pct.setDecimals(1)
-        self.sp_cross_pct.setSingleStep(1.0)
-        self.sp_cross_pct.setValue(10.0)
-        self.sp_cross_pct.setPrefix("多最强的 ")
-        self.sp_cross_pct.setSuffix(" %")
-        self.sp_cross_pct.setToolTip(
-            "多头腿：选截面分数最高的 top X%。6 个品种、10% 就是 1 个；\n"
-            "品种少的时候至少算 1 个，最多不超过有效品种数的一半。"
-        )
-        p1.addWidget(self.sp_cross_pct)
-
-        self.sp_cross_bot = QDoubleSpinBox()
-        self.sp_cross_bot.setRange(1.0, 50.0)
-        self.sp_cross_bot.setDecimals(1)
-        self.sp_cross_bot.setSingleStep(1.0)
-        self.sp_cross_bot.setValue(10.0)
-        self.sp_cross_bot.setPrefix("空最弱的 ")
-        self.sp_cross_bot.setSuffix(" %")
-        self.sp_cross_bot.setToolTip(
-            "空头腿：选截面分数最低的 bottom X%。\n"
-            "多空两边各自平分 50% 的名义额，所以腿数不同也不会产生净敞口。"
-        )
-        p1.addWidget(self.sp_cross_bot)
-
         # ---- 机器学习标签口径（只在因子模式=机器学习时显示）
         self.lbl_label = QLabel("机器学习标签")
         self.lbl_label.setObjectName("SectionTitle")
@@ -2295,8 +2265,47 @@ class MainWindow(QMainWindow):
         gt.addWidget(self.cross_timing_host)
         p2.addWidget(self.grp_timing)
 
+        # ---- 多空腿数：**只有截面对冲要**。
+        #
+        # 选品种模式下池内品种全进时序腿，方向由时序信号逐品种给，「多最强的
+        # X%、空最弱的 Y%」根本不适用 —— 摆在那里只会让人以为它还在起作用
+        self.grp_legs = QWidget()
+        gleg = QVBoxLayout(self.grp_legs)
+        gleg.setContentsMargins(0, 0, 0, 0)
+        gleg.setSpacing(8)
+        gleg.addWidget(self._section("多空腿数"))
+        # 多空各选百分之几。早先是一个「选最强的 X%」同时管两头 —— 对称写法
+        # 常见，但「多最强的 10%、空最弱的 20%」也讲得通（下跌时弱者更弱），
+        # 而且用户看不出来空头到底选了多少
+        self.sp_cross_pct = QDoubleSpinBox()
+        self.sp_cross_pct.setRange(1.0, 50.0)
+        self.sp_cross_pct.setDecimals(1)
+        self.sp_cross_pct.setSingleStep(1.0)
+        self.sp_cross_pct.setValue(10.0)
+        self.sp_cross_pct.setPrefix("多最强的 ")
+        self.sp_cross_pct.setSuffix(" %")
+        self.sp_cross_pct.setToolTip(
+            "多头腿：选截面分数最高的 top X%。6 个品种、10% 就是 1 个；\n"
+            "品种少的时候至少算 1 个，最多不超过有效品种数的一半。"
+        )
+        gleg.addWidget(self.sp_cross_pct)
+
+        self.sp_cross_bot = QDoubleSpinBox()
+        self.sp_cross_bot.setRange(1.0, 50.0)
+        self.sp_cross_bot.setDecimals(1)
+        self.sp_cross_bot.setSingleStep(1.0)
+        self.sp_cross_bot.setValue(10.0)
+        self.sp_cross_bot.setPrefix("空最弱的 ")
+        self.sp_cross_bot.setSuffix(" %")
+        self.sp_cross_bot.setToolTip(
+            "空头腿：选截面分数最低的 bottom X%。\n"
+            "多空两边各自平分 50% 的名义额，所以腿数不同也不会产生净敞口。"
+        )
+        gleg.addWidget(self.sp_cross_bot)
+        p2.addWidget(self.grp_legs)
+
         # ---- 腿内分钱：两种模式都有（对冲是「多空两端各自怎么分」，
-        #      选品种是「入选的这几只怎么分」）
+        #      选品种是「池内这几只怎么分」）
         self.grp_legweight = QWidget()
         gl = QVBoxLayout(self.grp_legweight)
         gl.setContentsMargins(0, 0, 0, 0)
@@ -3184,18 +3193,22 @@ class MainWindow(QMainWindow):
             return
         sel = self._multi_symbols()
         mode = self._cross_mode()
+        hedge = mode == "hedge"
         # 「时序策略」只对选品种模式有意义，截面对冲没有单腿进出场这回事
         on = self.family == FAMILY_CROSS and mode == "select"
         self.grp_timing.setVisible(on)
         timing_factor = on and self._timing_family() == "factor"
         for w in (self.lbl_tfactor, self.cb_tfactor):
             w.setVisible(timing_factor)
+        # 多空腿数只对冲模式用：选品种模式下方向由时序信号逐品种给，
+        # 「多最强的 X%、空最弱的 Y%」不适用
+        self.grp_legs.setVisible(hedge)
         # 只做多时没有空头腿，那个百分比控件摆着只会让人以为它有用
         self.sp_cross_bot.setVisible(not self.cfg.long_only)
         # 分档只在「资金分配＝分档」时才有意义，其余档位下摆着是个摆设
         tier_on = (self.cb_cross_w.currentData() == "tier")
         self.row_tiers.setVisible(tier_on)
-        # 池过滤两种模式都能用：对冲是「池内多强空弱」，选品种是「池内挑 top」
+        # 池过滤两种模式都能用：对冲是「池内多强空弱」，选品种是「池内全进时序腿」
         self.row_pool.setVisible(self.chk_pool.isChecked())
         ml_on = self.factor_mode == "ml"
         for w in (self.lbl_label, self.cb_label):
@@ -3206,10 +3219,6 @@ class MainWindow(QMainWindow):
         if self.family != FAMILY_CROSS:
             return
         n = len(sel)
-        pct_l = float(self.sp_cross_pct.value())
-        pct_s = float(self.sp_cross_bot.value())
-        legs_l = max(1, int(round(n * pct_l / 100.0))) if n else 0
-        legs_s = max(1, int(round(n * pct_s / 100.0))) if n else 0
         # 池过滤之后腿数是按**池内**品种算的，提示里要跟着缩，否则用户看到
         # 「10 个品种多 2 个」，跑出来只有 1 个，会以为算错了
         n_pool = n
@@ -3217,20 +3226,23 @@ class MainWindow(QMainWindow):
         if self.chk_pool.isChecked() and n:
             n_pool = max(cross_engine.MIN_CROSS,
                          int(round(n * float(self.sp_pool_pct.value()) / 100.0)))
-            legs_l = max(1, int(round(n_pool * pct_l / 100.0)))
-            legs_s = max(1, int(round(n_pool * pct_s / 100.0)))
             pool_note = f"第一步筛完剩约 {n_pool} 个，"
         if n < cross_engine.MIN_CROSS:
             text = (f"截面策略至少要 {cross_engine.MIN_CROSS} 个品种，现在选了 {n} 个。"
                     "在「多品种回测」里勾一下（同一个周期、同一个市场）。")
-        elif mode == "hedge":
+        elif hedge:
+            pct_l = float(self.sp_cross_pct.value())
+            pct_s = float(self.sp_cross_bot.value())
+            legs_l = max(1, int(round(n_pool * pct_l / 100.0)))
+            legs_s = max(1, int(round(n_pool * pct_s / 100.0)))
             text = (pool_note + f"每次调仓多最强的 {legs_l} 个、"
                     + ("只做多。" if self.cfg.long_only else f"空最弱的 {legs_s} 个。")
                     + f"腿内按{self.cb_cross_w.currentText()}分配。")
         else:
-            text = (pool_note + f"每次调仓挑出最强的 {legs_l} 个，"
-                    "再由时序策略决定每个品种是多是空还是空仓。"
-                    + (f"腿内按{self.cb_cross_w.currentText()}分钱。" if tier_on else ""))
+            text = (pool_note + f"池内 {n_pool} 个品种各分 1/{n_pool}，"
+                    "由时序策略决定每个品种是多是空还是空仓。"
+                    "没出信号的那几只，那部分钱留现金（不会加到别的品种上）。"
+                    f"腿内按{self.cb_cross_w.currentText()}分钱。")
         # 侧边栏和弹窗第二步各显示一份：一个在窗里调参数时看，一个不开窗时看
         self.lbl_cross_hint.setText(text)
         self.lbl_cross_preview.setText(text)
@@ -3268,7 +3280,10 @@ class MainWindow(QMainWindow):
             leg = "规则" if self._timing_family() == "rule" else "因子"
             lines.append(f"时序腿：{leg} · 腿内{self.cb_cross_w.currentText()}")
         else:
-            lines.append(f"腿内：{self.cb_cross_w.currentText()}")
+            # 腿数只对冲模式有，摘要里得带上 —— 它已经不在第一步面板里了
+            lines.append(f"多 {self.sp_cross_pct.value():g}% / "
+                         f"空 {self.sp_cross_bot.value():g}% · "
+                         f"腿内{self.cb_cross_w.currentText()}")
         return "\n".join(lines)
 
     def _on_cross_mode_changed(self, *_a) -> None:

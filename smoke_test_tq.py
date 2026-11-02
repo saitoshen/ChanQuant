@@ -1631,12 +1631,20 @@ def check_strategy_store() -> None:
         check("策略配置：截面的标题不写单个品种",
               "CU_SHFE" not in cb.title() and "3 个品种" in cb.strategy_label(),
               cb.title())
-        check("策略配置：截面参数摘要含调仓与多空比例",
-              "调仓" in cb.params_text() and "多25%/空20%" in cb.params_text(),
-              cb.params_text())
-        # 多空两条腿的百分比各存各的：多头 25% / 空头 20% 是一种常见配置
-        check("策略配置：截面多空百分比分开记",
-              "多25%/空20%" in cb.params_text(), cb.params_text())
+        # 选品种模式**没有腿数**（池内品种全进时序腿），摘要里写「多X%/空Y%」
+        # 就是假信息 —— 那两个字段在这条路上根本不参与计算
+        check("策略配置：选品种模式摘要不写多空比例",
+              "调仓" in cb.params_text() and "多25%" not in cb.params_text()
+              and "时序=因子" in cb.params_text(), cb.params_text())
+        # 对冲模式的摘要要带腿数，而且多空两条腿各存各的
+        hx = St.StrategyConfig(
+            name="对冲测试", symbol="CU", exchange="SHFE", period="5m",
+            family="cross", cross_symbols=["CU_SHFE", "RB_SHFE", "M_DCE"],
+            cross_mode="hedge", cross_top_pct=25.0, cross_bot_pct=20.0,
+        )
+        check("策略配置：对冲摘要含调仓与多空比例（分开记）",
+              "调仓" in hx.params_text() and "多25%/空20%" in hx.params_text(),
+              hx.params_text())
         # 资金分配默认风险平价：等权会让波动最大的那个品种主导整条净值曲线
         check("策略配置：截面资金分配默认风险平价",
               St.StrategyConfig(family="cross").cross_weight == "risk",
@@ -1882,15 +1890,38 @@ def check_cross() -> None:
     bad = cross.run({"S0_X": frames["S0_X"], "S1_X": frames["S1_X"]}, cfg, BtConfig())
     check("截面：品种不足直接报错", not bad.ok and "至少要" in bad.error, bad.error)
 
-    # 选品种 + 时序：先用截面挑最强，再让双均线决定多空
-    sel = cross.run(frames, cross.CrossConfig(
-        mode="select", rebalance=5, top_pct=50, factor_keys=["mom_20"],
-        timing_family="rule", timing_rule_key="ma_cross",
-        timing_rule_params={"fast": 5, "slow": 20}), BtConfig())
+    # 选品种 + 时序：池内每个品种各分一份钱，双均线决定多空。
+    # **腿数不参与**：这条路上「多最强的 X%、空最弱的 Y%」没有意义，方向是时序
+    # 信号逐品种给的。给 50% 和给 10% 必须跑出同一条曲线
+    sel_kw = dict(mode="select", rebalance=5, factor_keys=["mom_20"],
+                  timing_family="rule", timing_rule_key="ma_cross",
+                  timing_rule_params={"fast": 5, "slow": 20})
+    sel = cross.run(frames, cross.CrossConfig(top_pct=50, **sel_kw), BtConfig())
     check("截面选品种+时序：能跑出净值", sel.ok, sel.error)
-    check("截面选品种+时序：只持有选中的品种",
+    check("截面选品种+时序：满仓时权重和不超过 1",
           float(sel.weights.abs().sum(axis=1).max()) <= 1.0 + 1e-9,
           str(float(sel.weights.abs().sum(axis=1).max())))
+    # 池内全进：6 个品种都会进时序腿（以前按 top_pct 砍到 1 个，其余根本不参与）
+    n_pos = int(sel.weights.abs().gt(0).sum(axis=1).max())
+    check("截面选品种：池内品种都进时序腿（不再按腿数砍）", n_pos >= 4,
+          f"最多同时持 {n_pos} 个 / 池内 {len(frames)} 个")
+    sel2 = cross.run(frames, cross.CrossConfig(top_pct=10, bot_pct=30, **sel_kw),
+                     BtConfig())
+    same = (sel.ok and sel2.ok
+            and float((sel.equity - sel2.equity).abs().max()) < 1e-12)
+    check("截面选品种：腿数不参与计算（改 top_pct / bot_pct 结果不变）", same,
+          "-" if not (sel.ok and sel2.ok)
+          else f"最大差 {float((sel.equity - sel2.equity).abs().max()):.2e}")
+    # 「按分数加权」在选品种模式下必须真的生效：以前这条路没有 score 分支，
+    # 悄悄退回等权 —— 界面上选了「按分数」，跑出来和等权一模一样
+    sc_eq = cross.run(frames, cross.CrossConfig(weight="equal", top_pct=50, **sel_kw),
+                      BtConfig())
+    sc_wt = cross.run(frames, cross.CrossConfig(weight="score", top_pct=50, **sel_kw),
+                      BtConfig())
+    diff = (float((sc_eq.equity - sc_wt.equity).abs().max())
+            if sc_eq.ok and sc_wt.ok else 0.0)
+    check("截面选品种：按分数加权真的生效（不再悄悄退回等权）", diff > 1e-9,
+          f"与等权的净值差 {diff:.2e}")
 
     # 包成 `Result` 之后绩效页要能直接吃：缺一个键就是 KeyError，而界面上
     # 表现成「点了截面策略整页崩掉」

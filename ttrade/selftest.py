@@ -1512,6 +1512,9 @@ def _run() -> tuple[bool, list[str]]:
                 win.box_fsel.parentWidget() is win.cross_factor_host
                 and win.box_factor.parentWidget() is win.cross_factor_host
                 and win.grp_timing.isHidden()
+                # 多空腿数只在第二步、只在截面对冲模式下出现
+                and not win.grp_legs.isHidden()
+                and win.grp_legs.parentWidget() is win.cross_step2
                 and win.cross_dlg.step1_lay.count() >= 2
                 and win.cross_dlg.step2_lay.count() >= 2
                 and bool(win.lbl_cross_sum.text().strip())
@@ -1523,6 +1526,8 @@ def _run() -> tuple[bool, list[str]]:
             select_ok = (
                 not win.grp_timing.isHidden()
                 and win.box_rule.parentWidget() is win.cross_timing_host
+                # 选品种模式不需要腿数：方向由时序信号逐品种给
+                and win.grp_legs.isHidden()
             )
             win.cb_family.setCurrentIndex(win.cb_family.findData("rule"))
             app.processEvents()

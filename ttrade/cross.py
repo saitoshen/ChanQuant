@@ -8,9 +8,15 @@
 
 - **截面对冲**（`mode="hedge"`）：按截面分数排序，多最强的 top X%、空最弱的
   bottom X%，等权，定期调仓。净敞口约等于 0，赚的是「强弱差」。
-- **截面选品种 + 时序交易**（`mode="select"`）：先用截面分数挑出 top X%，再对
-  挑中的每个品种单独跑时序策略（规则或因子），由时序信号决定这一腿是多是空
-  还是空仓。截面负责「买什么」，时序负责「什么时候」。
+- **截面选品种 + 时序交易**（`mode="select"`）：**池内所有品种**都交给各自的
+  时序策略（规则或因子），由时序信号决定这一腿是多是空还是空仓。截面不负责
+  「挑几只」—— 挑几只由第一步的筛池决定，截面分数在这里只决定**腿内谁多分点
+  钱**（`weight="score"` / `"tier"`）。时序负责「什么时候」，截面负责「分多少」。
+
+  两种模式对 `top_pct` / `bot_pct` 的用法不一样：对冲模式拿它定腿数，选品种
+  模式**根本不看** —— 时序腿是逐品种独立开平的，先按截面砍掉一半品种等于替
+  时序策略做了一半决定，而且「多最强的 X%、空最弱的 Y%」在只有一条腿的语境下
+  也说不通（谁强谁弱已经由时序信号定了方向）。
 
 分数怎么来：每个因子先算**时序**原值（复用 `factors.raw`），再在每根 bar 上做
 **横截面** Z-score —— 这就是和时序因子策略最本质的区别。时序 Z-score 是「跟
@@ -54,6 +60,8 @@ class CrossConfig:
 
     mode: str = "hedge"                 # hedge / select
     rebalance: int = 5                  # 调仓间隔，单位是**根**（5m 上 48 根约一天）
+    # 腿数**只对冲模式用**。选品种模式下池内品种全进时序腿，这两个值不参与计算
+    # （界面上也不显示）—— 见模块说明里那一段
     top_pct: float = 10.0               # 多头：选最强的百分之几
     bot_pct: float = 10.0               # 空头：选最弱的百分之几（可以和多头不同）
     long_only: bool = False
@@ -100,11 +108,12 @@ class CrossConfig:
     timing_factor_cfg: dict = field(default_factory=dict)
 
     def n_legs(self, n_valid: int) -> int:
-        """多头持几个品种。至少 1 个，最多不超过有效品种数的一半。"""
+        """多头持几个品种（**只对冲模式有意义**）。至少 1 个，最多不超过有效
+        品种数的一半。选品种模式不走这里 —— 池内品种全进时序腿。"""
         return _legs(n_valid, self.top_pct)
 
     def n_short_legs(self, n_valid: int) -> int:
-        """空头持几个品种。默认和多头一样，但可以单独调。"""
+        """空头持几个品种（只对冲模式有意义）。默认和多头一样，但可以单独调。"""
         return _legs(n_valid, self.bot_pct)
 
     def step(self) -> int:
@@ -929,12 +938,17 @@ def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig,
     return _place(score, rows, w, ok)
 
 
-def _rank(score: pd.DataFrame, cfg: CrossConfig):
+def _rank(score: pd.DataFrame, cfg: CrossConfig, all_in: bool = False):
     """调仓日上「谁在前、谁在后」一次性排完。
 
     返回 `(行号, 多头掩码, 空头掩码, 多头几个, 空头几个, 有效行掩码)`。
     逐行 `nlargest` 在 5 分钟全历史上是 4 万多次 pandas 调用、七十秒；这里按轴
     排序一次就够 —— 拖一下「调仓间隔」不至于卡住半分钟。
+
+    `all_in=True` 是给「选品种 + 时序」那条路用的：**不按 top_pct 截断**，有分数
+    的品种全进（`k_long` 直接取有效数）。选品种模式没有「多几个空几个」这回事，
+    腿数由时序信号逐品种决定；这里只负责把「有分数的」挑出来，排序仍然有用
+    （`weight="score"` / `"tier"` 要靠它分钱）。
 
     NaN 必须排到两端之外：多头侧按 `-inf` 参与排序，空头侧按 `+inf`，这样
     「有效品种不足」的品种永远不会被选中，和 `dropna()` 之后再排等价。
@@ -950,9 +964,15 @@ def _rank(score: pd.DataFrame, cfg: CrossConfig):
         k = np.maximum(1, np.minimum(k, np.maximum(1, n_valid // 2)))
         return np.where(ok, k, 0)
 
-    k_long = _n(cfg.top_pct)
-    k_short = (np.zeros(len(rows), dtype=int) if cfg.long_only
-               else _n(cfg.bot_pct))
+    if all_in:
+        # 全进：k 就是有效数，不受 `n_valid // 2` 那个上限约束（那是给对冲
+        # 留的 —— 多空各占一半名义，一边吃掉全部品种就变成单边了）
+        k_long = np.where(ok, n_valid, 0)
+        k_short = np.zeros(len(rows), dtype=int)
+    else:
+        k_long = _n(cfg.top_pct)
+        k_short = (np.zeros(len(rows), dtype=int) if cfg.long_only
+                   else _n(cfg.bot_pct))
     top = np.zeros(mat.shape, dtype=bool)
     bot = np.zeros(mat.shape, dtype=bool)
     width = int(max(k_long.max() if len(k_long) else 0,
@@ -986,24 +1006,30 @@ def _place(score: pd.DataFrame, rows, w: np.ndarray, ok) -> pd.DataFrame:
 
 def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
                     cfg: CrossConfig, vol: pd.DataFrame | None = None) -> pd.DataFrame:
-    """先选品种，再让每个品种自己的时序信号决定仓位。
+    """选品种 + 时序：**池内每个品种**各拿一份钱，由自己的时序信号决定方向。
 
     时序信号在**各自的行情表**上算（`strategies.run_strategy` / 因子策略），算完
     再对齐到截面面板的索引上。这样 5 分钟周期里各品种交易时段不同也不会串。
 
-    选中的那几只之间怎么分钱看 `weight`：等权 / 按分数 / 风险平价（默认）/ 分档。
-    信号是 ±1 时只决定方向，不决定大小 —— 仓位大小由这一层定。
+    这里**不看 `top_pct` / `bot_pct`**（`all_in=True`）：选品种模式没有「多几个
+    空几个」这回事 —— 方向由时序信号逐品种给，先按截面砍掉一半品种等于替时序
+    策略做了一半决定。要缩品种池就用第一步的筛池（`pool_top_pct`），那是按
+    「能不能交易」筛的，语义清楚得多。
 
-    分档（`weight="tier"`）是给「截面选品种 + 时序交易」这条路准备的：选出来
-    的 5 只里，第 1 名和第 5 名的确定性差得远，等权等于把最没把握的那只和最有
-    把握的那只当成一回事。
+    钱怎么分看 `weight`：等权 / 按分数 / 风险平价（默认）/ 分档。分的是**整个
+    池子**的 1.0 名义额，所以没出信号的那几只，那部分钱就空着（现金）。**不把
+    空出来的份额转给有信号的品种** —— 那样信号越稀仓位越集中，等于偷偷加杠杆，
+    回测和实盘都会对不上。
+
+    分档（`weight="tier"`）在这条路尤其对路：池里第 1 名和第 40 名的确定性差得
+    远，等权等于把最没把握的那只和最有把握的那只当成一回事。
     """
     sigs: dict[str, pd.Series] = {}
     for sym, df in frames.items():
         sigs[sym] = _timing_signal(df, cfg)
     sig_panel = pd.concat(sigs, axis=1).sort_index().reindex(score.index).ffill().fillna(0.0)
 
-    rows, top, _bot, k_long, _k_short, ok = _rank(score, cfg)
+    rows, top, _bot, k_long, _k_short, ok = _rank(score, cfg, all_in=True)
     if cfg.weight == "tier" and int(cfg.tiers or 0) >= 2:
         mat = score.to_numpy(dtype=float)[rows]
         units = _tier_units(cfg)
@@ -1017,12 +1043,30 @@ def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
         for i in range(len(rows)):
             if ok[i]:
                 w[i] = _rp_share(vmat[i], top[i], 1.0)
+    elif cfg.weight == "score":
+        # 按分数加权：只取正的分数当权重（截面 z-score 有一半是负数，负分给
+        # 负权重等于让「最弱的那只」反向占钱，那是另一个策略了）。整行都是
+        # 负分时退回等权 —— 那天没有任何一只「强」，不该因此整组空仓
+        mat = score.to_numpy(dtype=float)[rows]
+        pos = np.where(top, np.clip(np.nan_to_num(mat), 0.0, None), 0.0)
+        s = pos.sum(axis=1)
+        good = s > 0
+        share = np.zeros_like(pos)
+        share[good] = pos[good] / s[good, None]
+        inv = 1.0 / np.maximum(k_long, 1)
+        w = np.where(good[:, None], share, top * inv[:, None])
     else:
         inv = 1.0 / np.maximum(k_long, 1)
         w = top * inv[:, None]
     held = _place(score, rows, w, ok)
-    # 选中的那一段里，按时序信号决定持有方向；没选中就是 0
-    return held * sig_panel
+
+    # 选中的那一段里，按时序信号决定持有方向；没选中就是 0。
+    # 不允许做空的市场（美股）要把负信号砍掉 —— 对冲模式早就在 `_hedge_weights`
+    # 里处理了，这条路以前漏了，美股截面上照样在做空
+    sig = sig_panel.to_numpy(dtype=float)
+    if cfg.long_only:
+        sig = np.clip(sig, 0.0, None)
+    return held * pd.DataFrame(sig, index=held.index, columns=held.columns)
 
 
 def _timing_signal(df: pd.DataFrame, cfg: CrossConfig) -> pd.Series:

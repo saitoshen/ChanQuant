@@ -305,10 +305,13 @@ class StrategyConfig:
                 self.factor_mode, self.factor_mode or "多因子")
             bits = [f"{mode}·{len(self.factor_keys or [])}因子",
                     f"调仓={int(self.cross_rebalance or 1)}根",
-                    f"多{float(self.cross_top_pct or 0):g}%/空{float(self.cross_bot_pct or 0):g}%",
                     f"权重={_WEIGHT_CN.get(self.cross_weight, '风险平价')}"]
             if self.cross_mode == "select":
+                # 选品种模式没有腿数（池内全进时序腿），写出来是假信息
                 bits.append(f"时序={'规则' if self.timing_family != 'factor' else '因子'}")
+            else:
+                bits.insert(2, f"多{float(self.cross_top_pct or 0):g}%/空"
+                               f"{float(self.cross_bot_pct or 0):g}%")
             return " ".join(bits)
         cfg = self.factor_cfg or {}
         bits = [f"窗口={cfg.get('window', 252)}", f"阈值={cfg.get('entry_z', 1.0)}"]
