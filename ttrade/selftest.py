@@ -1279,6 +1279,35 @@ def _run() -> tuple[bool, list[str]]:
         wheel_ok = w1 < w0 and w3 > w2
         wheel_info = f"{w0}→{w1}→{w3} 根"
 
+        # 波幅突破两条（从 future_quant 移植）：研究页要能正常出参数滑杆，
+        # 参数个数和 `param_meta` 对不上就会少一根 —— 那种错不报异常，
+        # 只是参数悄悄调不了
+        brk_ok = False
+        brk_info = ""
+        try:
+            keep = win.cb_strategy.currentIndex()
+            counts = {}
+            for key in ("ria_break", "cta_break"):
+                i = win.cb_strategy.findData(key)
+                if i < 0:
+                    continue
+                win.cb_strategy.setCurrentIndex(i)
+                app.processEvents()
+                counts[key] = len(win.param_widgets)
+            win.cb_strategy.setCurrentIndex(keep)
+            app.processEvents()
+            brk_ok = (counts.get("ria_break") == 8
+                      and counts.get("cta_break") == 6
+                      and win.sidebar.width() >= 340)
+            brk_info = f"{counts} / 侧边栏 {win.sidebar.width()}px"
+        except Exception as exc:  # noqa: BLE001
+            brk_info = f"{type(exc).__name__}: {exc}"
+        if not brk_ok:
+            raise RuntimeError(
+                f"波幅突破策略没挂上（{brk_info}）：研究页的参数滑杆数量不对，"
+                "或者侧边栏宽度没生效"
+            )
+
         # 策略验证页：取研究页当前策略 → 跑一遍前视检测 → 检查点表要有行，
         # 而且结论必须是「一致」（内置策略不该有前视偏差）。这条同时验了后台
         # 线程收尾、表格填充和重放画图 —— 三处都只在真的跑起来时才可能出错
@@ -1570,6 +1599,7 @@ def _run() -> tuple[bool, list[str]]:
 
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
                 f"{factor_info}，滚轮缩放 {wheel_info}，策略验证 {verify_info}，"
+                f"波幅突破 {brk_info}，"
                 f"组合 {combo_info}，"
                 f"截面 {cross_info}，两步配置 {cross_dlg_info}，"
                 f"回测区间 {range_info}，实时开关已复位，"

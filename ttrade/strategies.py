@@ -459,6 +459,269 @@ def strat_im_orb(
     return out
 
 
+# ------------------------------------------------- 「波幅突破」共用的交易日切分
+def _trading_days(df: pd.DataFrame) -> np.ndarray:
+    """K 线时间 → 交易日（`datetime64` 的日期部分）。
+
+    **优先用数据里带的 `trading_day` 列**：天勤的分钟线本来就带这一列，它是
+    交易所口径的真值 —— 周五 21:00 的夜盘属于下周一，节假日顺延，这些靠时间
+    推算都会错。没有这一列（股票、手工造的日线）才退回下面的经验规则。
+
+    经验规则：整体加 6 小时再取日期。期货交易日从**夜盘 21:00** 开始，不是
+    自然日 00:00：21:30 那根属于第二天，凌晨 02:00 那根也属于第二天。
+    21:30+6h=次日 03:30，02:00+6h=当日 08:00，白天各时段都在自己那天；
+    无夜盘品种（只有 09:00-15:00）加不加都是同一天，不受影响。
+
+    切错的话「当日开盘价」和「前一日波幅」两处都会错位 —— 而这两个数正是
+    波幅突破的全部依据。
+    """
+    if "trading_day" in df.columns:
+        td = pd.to_datetime(df["trading_day"], errors="coerce")
+        if td.notna().any():
+            return td.to_numpy()
+    return (pd.DatetimeIndex(df.index) + pd.Timedelta(hours=6)).normalize().to_numpy()
+
+
+def _day_blocks(day_key: np.ndarray, high: np.ndarray, low: np.ndarray,
+                open_: np.ndarray):
+    """按交易日汇总：每日首根 open、当日最高 / 最低，以及**前一日**波幅。
+
+    返回 `(daily_open, prev_range, day_index)`：
+    - `daily_open[i]` 第 i 根所属交易日的首根 open（夜盘品种即 21:00 那根）
+    - `prev_range[i]` 该交易日的**前一交易日**全天振幅（high-low），首日 NaN
+    - `day_index[i]` 第 i 根属于第几个交易日（0 起，用来判「换日了没有」）
+
+    前一日波幅用当日 high/low 聚合后整体右移一格算，绝不拿当日的：
+    当日高低点收盘后才知道，用它当门槛就是未来函数。
+    """
+    uday, dd = np.unique(day_key, return_inverse=True)
+    dd = np.asarray(dd).reshape(-1)
+    nd = len(uday)
+    day_hi = np.full(nd, -np.inf)
+    day_lo = np.full(nd, np.inf)
+    np.maximum.at(day_hi, dd, high)
+    np.minimum.at(day_lo, dd, low)
+
+    daily_open = np.full(nd, np.nan)
+    seen = np.zeros(nd, dtype=bool)
+    for i in range(len(dd)):
+        k = dd[i]
+        if not seen[k]:
+            seen[k] = True
+            daily_open[k] = open_[i]
+
+    prev_range = np.full(nd, np.nan)
+    if nd > 1:
+        prev_range[1:] = day_hi[:-1] - day_lo[:-1]
+    return daily_open[dd], prev_range[dd], dd
+
+
+def strat_ria_break(
+    df: pd.DataFrame,
+    ratio: float = 0.40,
+    atr_n: int = 20,
+    stop_mult: float = 5.0,
+    day_start: int = 580,
+    day_end: int = 640,
+    night_start: int = 1270,
+    night_end: int = 1330,
+    hold_days: int = 20,
+) -> pd.DataFrame:
+    """RIA 波幅突破（多品种趋势突破的时序腿）。
+
+    移植自 future_quant 的 `RIABreak`，去掉选品种和资金曲线降仓，只留**时序规则**：
+
+    - 突破判据：`当前收盘 − 当日首根开盘` 的偏离，超过 `ratio` × **前一交易日振幅**
+    - 开仓窗口：日盘 09:40–10:40（默认 580–640 分钟）、夜盘 21:10–22:10
+      （1270–1330）。窗口内每根 K 线都看，**每个窗口最多开一笔**
+    - 进场：信号在 K 线收盘确认，下一根开盘成交（引擎统一处理）
+    - 出场：① 进场价 ∓ `stop_mult` × ATR（进场时的 ATR，收盘价穿线即出）
+      ② 定时 —— 日盘开的仓在当晚 21:05 平（无夜盘品种顺延到次日 09:05），
+      夜盘开的仓在次日 09:05 平 ③ 超过 `hold_days` 个交易日兜底平
+
+    为什么用「前一交易日振幅」而不是 ATR：振幅是这一品种昨天真走过的距离，
+    隔夜跳空、涨跌停、临近交割这些非常态都直接反映在里面；ATR 是平滑过的，
+    遇到突发行情会慢半拍，阈值偏小就会天天开仓。
+
+    默认参数取自 future_quant 的 60 分钟档（`small_lookback=2`、万 0.5 费率那组），
+    在本平台上要按品种重新调 —— 参数是可调的，别把默认值当结论。
+    """
+    out = df.copy()
+    n = len(out)
+    out["signal"] = 0
+    if n == 0:
+        return out
+
+    idx = pd.DatetimeIndex(out.index)
+    o = out["open"].to_numpy(dtype=float)
+    h = out["high"].to_numpy(dtype=float)
+    l = out["low"].to_numpy(dtype=float)
+    c = out["close"].to_numpy(dtype=float)
+    ms = (idx.hour * 60 + idx.minute).to_numpy()
+    a = atr(out, atr_n).to_numpy(dtype=float)
+
+    daily_open, prev_range, dd = _day_blocks(_trading_days(out), h, l, o)
+    # 有没有夜盘从数据本身判：出现过 21:00 之后的 K 线就是有夜盘
+    has_night = bool((ms >= 21 * 60).any())
+
+    d0, d1 = int(day_start), int(day_end)
+    n0, n1 = int(night_start), int(night_end)
+    stop_mult = float(stop_mult)
+    ratio = float(ratio)
+    hold_days = max(int(hold_days), 1)
+
+    sig = np.zeros(n, dtype=int)
+    pos = 0
+    entry_px = np.nan
+    entry_atr = np.nan
+    entry_day = -1
+    entry_night = False
+    last_entry = (-1, "")       # (交易日序号, "day"/"night")，一天一个窗口一笔
+
+    for i in range(n):
+        cur_day = dd[i]
+        if pos != 0:
+            hit = False
+            if entry_atr == entry_atr:
+                if pos > 0 and c[i] <= entry_px - stop_mult * entry_atr:
+                    hit = True
+                elif pos < 0 and c[i] >= entry_px + stop_mult * entry_atr:
+                    hit = True
+            # 定时平仓：日盘仓 → 当晚 21:05（无夜盘品种次日 09:05）；夜盘仓 → 次日 09:05
+            timed = False
+            if entry_night:
+                timed = 545 <= ms[i] <= 555 and cur_day > entry_day
+            elif has_night:
+                timed = 1265 <= ms[i] <= 1275 and cur_day > entry_day
+            else:
+                timed = 545 <= ms[i] <= 555 and cur_day > entry_day
+            if cur_day - entry_day >= hold_days:
+                timed = True
+            if hit or timed:
+                pos = 0
+                entry_px = entry_atr = np.nan
+                entry_day = -1
+                entry_night = False
+        if pos == 0:
+            in_day = d0 <= ms[i] <= d1
+            in_night = n0 <= ms[i] <= n1
+            if in_day or in_night:
+                win = "night" if in_night and not in_day else "day"
+                if last_entry != (cur_day, win):
+                    pr = prev_range[i]
+                    base = daily_open[i]
+                    if pr == pr and pr > 0 and base == base:
+                        dev = c[i] - base
+                        thr = ratio * pr
+                        if dev >= thr:
+                            pos = 1
+                        elif dev <= -thr:
+                            pos = -1
+                        if pos != 0:
+                            entry_px = c[i]
+                            entry_atr = a[i]
+                            entry_day = cur_day
+                            entry_night = win == "night"
+                            last_entry = (cur_day, win)
+        sig[i] = pos
+
+    out["signal"] = sig
+    return out
+
+
+def strat_cta_break(
+    df: pd.DataFrame,
+    ratio: float = 0.40,
+    check_min: int = 640,
+    atr_n: int = 20,
+    stop_mult: float = 5.0,
+    exit_min: int = 575,
+    hold_bars: int = 96,
+) -> pd.DataFrame:
+    """CTA 短周期波幅突破（检查点版）。
+
+    移植自 future_quant `cta_short/rule_day_backtest.py` 与 `rule_night_backtest.py`。
+    和 `ria_break` 是同一条判据（`收盘 − 当日开盘` 相对前一交易日振幅），区别只在
+    **什么时候看**：
+
+    - RIA 在窗口内每根都看、每个窗口最多一笔；这条一天只看**一个检查点**
+      （默认 10:40 = 640 分钟），到点那根的偏离过阈值就进
+    - 出场：`stop_mult` × ATR 止损 + 次日 `exit_min`（默认 09:35）定时平
+      + 最长持有 `hold_bars` 根
+
+    夜盘版不用另写一条策略：把 `check_min` 设成 21:30（1290）、`exit_min` 设成
+    09:05（545）就是夜盘口径 —— 两者除了时刻没有任何差别。
+
+    「一天只看一次」不是偷懒：检查点越晚，价格越接近当天方向定型，假突破越少；
+    但也越接近收盘，赚的钱不够覆盖隔夜风险。10:40 是 future_quant 扫出来的平衡点。
+    """
+    out = df.copy()
+    n = len(out)
+    out["signal"] = 0
+    if n == 0:
+        return out
+
+    idx = pd.DatetimeIndex(out.index)
+    o = out["open"].to_numpy(dtype=float)
+    h = out["high"].to_numpy(dtype=float)
+    l = out["low"].to_numpy(dtype=float)
+    c = out["close"].to_numpy(dtype=float)
+    ms = (idx.hour * 60 + idx.minute).to_numpy()
+    a = atr(out, atr_n).to_numpy(dtype=float)
+
+    daily_open, prev_range, dd = _day_blocks(_trading_days(out), h, l, o)
+
+    ck = int(check_min)
+    ex = int(exit_min)
+    stop_mult = float(stop_mult)
+    ratio = float(ratio)
+    hold_bars = max(int(hold_bars), 1)
+
+    sig = np.zeros(n, dtype=int)
+    pos = 0
+    entry_px = np.nan
+    entry_atr = np.nan
+    entry_day = -1
+    entry_i = -1
+    checked = -1                # 已经看过检查点的交易日序号
+
+    for i in range(n):
+        cur_day = dd[i]
+        if pos != 0:
+            hit = False
+            if entry_atr == entry_atr:
+                if pos > 0 and c[i] <= entry_px - stop_mult * entry_atr:
+                    hit = True
+                elif pos < 0 and c[i] >= entry_px + stop_mult * entry_atr:
+                    hit = True
+            timed = ms[i] == ex and cur_day > entry_day
+            if hit or timed or (i - entry_i) >= hold_bars:
+                pos = 0
+                entry_px = entry_atr = np.nan
+                entry_day = -1
+                entry_i = -1
+        # 检查点：当天的第一根 `ms >= check_min` 的 K 线，一天只看这一次
+        if pos == 0 and cur_day != checked and ms[i] >= ck:
+            checked = cur_day
+            pr = prev_range[i]
+            base = daily_open[i]
+            if pr == pr and pr > 0 and base == base:
+                dev = (c[i] - base) / pr
+                if dev >= ratio:
+                    pos = 1
+                elif dev <= -ratio:
+                    pos = -1
+                if pos != 0:
+                    entry_px = c[i]
+                    entry_atr = a[i]
+                    entry_day = cur_day
+                    entry_i = i
+        sig[i] = pos
+
+    out["signal"] = sig
+    return out
+
+
 # ---------------------------------------------------------------- 注册表
 @dataclass
 class StrategySpec:
@@ -486,6 +749,11 @@ PARAM_LABELS = {
     "exit_n": "离场箱体", "vol_ratio": "波幅倍数", "range_n": "参考根数",
     "stop_mult": "止损倍数",
     "entry_start": "开仓起(分)", "entry_end": "开仓止(分)", "exit_min": "平仓(分)",
+    # 波幅突破那一族（ria_break / cta_break）
+    "ratio": "波幅倍数", "check_min": "确认(分)", "hold_days": "持仓(天)",
+    "hold_bars": "持仓(根)",
+    "day_start": "日窗起(分)", "day_end": "日窗止(分)",
+    "night_start": "夜窗起(分)", "night_end": "夜窗止(分)",
 }
 
 
@@ -591,6 +859,47 @@ STRATEGIES: dict[str, StrategySpec] = {
         },
         desc="日内 09:40-10:20 触及「当日开盘 ± 0.4×昨日振幅」开仓，3×ATR 止损，"
              "次日 09:35 平；日线上自动退化为次日收盘平。",
+    ),
+    # 下面两条从 future_quant 移植：同一条判据（收盘相对当日开盘的偏离 ÷ 前一日
+    # 振幅），差别只在「什么时候看」—— 一个是窗口内每根都看，一个是一天看一次
+    "ria_break": StrategySpec(
+        key="ria_break",
+        label="RIA 波幅突破·窗口",
+        func=strat_ria_break,
+        params={"ratio": 0.40, "atr_n": 20, "stop_mult": 5.0,
+                "day_start": 580, "day_end": 640,
+                "night_start": 1270, "night_end": 1330, "hold_days": 20},
+        param_meta={
+            "ratio": (0.1, 1.5, 0.05),
+            "atr_n": (5, 60, 1),
+            "stop_mult": (2.0, 12.0, 0.5),
+            "day_start": (540, 620, 5),
+            "day_end": (580, 700, 5),
+            "night_start": (1260, 1320, 5),
+            "night_end": (1300, 1380, 5),
+            "hold_days": (1, 60, 1),
+        },
+        desc="future_quant RIABreak 的时序腿：日盘 09:40-10:40 / 夜盘 21:10-22:10 "
+             "窗口内，收盘相对当日开盘的偏离超过 0.4×前一日振幅就顺向开仓，每个窗口"
+             "最多一笔；5×ATR 止损 + 定时平（日盘仓当晚 21:05、夜盘仓次日 09:05）。",
+    ),
+    "cta_break": StrategySpec(
+        key="cta_break",
+        label="CTA 波幅突破·检查点",
+        func=strat_cta_break,
+        params={"ratio": 0.40, "check_min": 640, "atr_n": 20,
+                "stop_mult": 5.0, "exit_min": 575, "hold_bars": 96},
+        param_meta={
+            "ratio": (0.1, 1.5, 0.05),
+            "check_min": (540, 1380, 5),
+            "atr_n": (5, 60, 1),
+            "stop_mult": (2.0, 12.0, 0.5),
+            "exit_min": (540, 600, 5),
+            "hold_bars": (24, 480, 12),
+        },
+        desc="future_quant cta_short 的规则时序：一天只看一个检查点（默认 10:40），"
+             "偏离超过 0.4×前一日振幅就顺向开仓；5×ATR 止损 + 次日 09:35 定时平。"
+             "把确认时刻改成 21:30、平仓改成 09:05 就是夜盘版。",
     ),
 }
 

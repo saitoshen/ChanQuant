@@ -2149,6 +2149,111 @@ def check_cross() -> None:
           f"{int(_hi.sum())} vs {int(_tier.sum())}")
 
 
+def check_break_strategies() -> None:
+    """波幅突破两条内置策略（从 future_quant 移植）。
+
+    这两条的判据是同一个：`收盘 − 当日首根开盘` 的偏离，相对**前一交易日振幅**。
+    区别只在「什么时候看」—— `ria_break` 在日盘 / 夜盘两个窗口里每根都看，
+    `cta_break` 一天只看一个检查点。
+
+    所以检查点也分成两组：
+    1. 交易日切分（夜盘 21:00 归次日）—— 切错的话「当日开盘」和「前日振幅」
+       全错，后面所有结论都无从谈起
+    2. 造一段「前日振幅 100、今天 10:40 涨了 50」的行情，阈值 0.4 必须开多、
+       0.6 必须不开；`cta_break` 一天最多一笔，`ria_break` 一个窗口最多一笔
+    """
+    from ttrade import strategies as S
+
+    # ---- 交易日切分：有 `trading_day` 列就照它，没有才按 +6h 推
+    idx = pd.DatetimeIndex([
+        "2026-10-30 21:00", "2026-10-30 21:05",   # 周五夜盘 → 下周一
+        "2026-11-02 09:00", "2026-11-02 14:55",
+    ])
+    f_no = pd.DataFrame({"open": 1.0, "high": 1.0, "low": 1.0,
+                         "close": 1.0, "volume": 1.0}, index=idx)
+    d_no = S._trading_days(f_no)
+    check("波幅突破：没有 trading_day 列时按 +6h 推（周五夜盘落到周六）",
+          pd.Timestamp(d_no[0]) == pd.Timestamp(d_no[1])
+          and pd.Timestamp(d_no[2]) == pd.Timestamp("2026-11-02"),
+          str(d_no[:3]))
+    # 周五夜盘 +6h = 周六，和周一不是同一天 —— 这正是经验规则的局限，
+    # 所以有 trading_day 列时必须优先用它
+    check("波幅突破：有 trading_day 列时以它为准",
+          pd.Timestamp(S._trading_days(pd.DataFrame(
+              {"trading_day": ["2026-11-02"] * 2},
+              index=idx[:2]))[0]) == pd.Timestamp("2026-11-02"),
+          str(S._trading_days(pd.DataFrame(
+              {"trading_day": ["2026-11-02"] * 2}, index=idx[:2]))[:2]))
+
+    # ---- 造行情：前一日振幅 100，今日 10:40 前涨 50（=0.5×前日振幅）
+    def _make(dev: float, days: int = 3) -> pd.DataFrame:
+        rows = []
+        ts = []
+        px = 1000.0
+        for d in range(days):
+            day = pd.Timestamp("2026-10-01") + pd.Timedelta(days=d)
+            # 前一日先走出 100 的振幅
+            for k, (h, l) in enumerate([(0, 0), (100, 0), (100, 0)]):
+                t = day + pd.Timedelta(hours=9, minutes=5 * k)
+                rows.append({"open": px, "high": px + h, "low": px + l,
+                             "close": px + (h + l) / 2, "volume": 1.0})
+                ts.append(t)
+            # 当日：从 09:00 起，到 10:40 走到 dev
+            base = px
+            for k in range(0, 24):          # 09:00 → 10:55，每 5 分钟一根
+                t = day + pd.Timedelta(hours=9, minutes=5 * k)
+                frac = min(k / 20.0, 1.0)   # 10:40 = 第 20 根
+                c = base + dev * frac
+                rows.append({"open": c, "high": c, "low": c, "close": c,
+                             "volume": 1.0})
+                ts.append(t)
+            px = base + dev
+        return pd.DataFrame(rows, index=pd.DatetimeIndex(ts))
+
+    up = _make(50.0)
+    s_ria = S.run_strategy(up, "ria_break", {"ratio": 0.4})["signal"]
+    check("波幅突破：0.5×前日振幅必须开多", bool((s_ria == 1).any()),
+          f"多 {int((s_ria == 1).sum())} 根")
+    s_hi = S.run_strategy(up, "ria_break", {"ratio": 0.6})["signal"]
+    check("波幅突破：阈值调高就不该开仓", not bool((s_hi != 0).any()),
+          f"{int((s_hi != 0).sum())} 根有仓")
+    s_cta = S.run_strategy(up, "cta_break", {"ratio": 0.4})["signal"]
+    check("波幅突破：检查点版也要开多", bool((s_cta == 1).any()),
+          f"多 {int((s_cta == 1).sum())} 根")
+    # 检查点版一天最多一笔：三天里开仓次数不能超过 3
+    n_entry = int(((s_cta != 0) & (s_cta.shift(1).fillna(0) == 0)).sum())
+    check("波幅突破：检查点版一天最多一笔", n_entry <= 3, f"{n_entry} 笔")
+
+    # ---- 真实数据上跑一遍：两条都要出信号，且 RIA 只在两个窗口里开仓
+    df = T.load_main("RB", "SHFE", "5m")
+    if df is None or len(df) < 5000:
+        skip("波幅突破：真实 5m 数据", "RB 5m 不够")
+        return
+    for key in ("ria_break", "cta_break"):
+        r = S.run_strategy(df, key)
+        sig = r["signal"]
+        check(f"波幅突破：{key} 在 RB 5m 上出信号",
+              bool((sig != 0).any()) and len(sig) == len(df),
+              f"有仓 {int((sig != 0).sum())} 根 / 共 {len(sig)} 根")
+    r = S.run_strategy(df, "ria_break")
+    sig = r["signal"].to_numpy()
+    ms = (pd.DatetimeIndex(r.index).hour * 60
+          + pd.DatetimeIndex(r.index).minute).to_numpy()
+    entry = np.nonzero((sig != 0) & (np.r_[0, sig[:-1]] == 0))[0]
+    in_win = ((ms[entry] >= 580) & (ms[entry] <= 640)) | \
+             ((ms[entry] >= 1270) & (ms[entry] <= 1330))
+    check("波幅突破：RIA 只在日盘 / 夜盘窗口里开仓",
+          bool(len(entry)) and bool(in_win.all()),
+          f"{int((~in_win).sum())}/{len(entry)} 笔在窗口外")
+    # 一天一个窗口最多一笔
+    day = S._trading_days(r)
+    win_key = [f"{pd.Timestamp(day[i]).date()}-"
+               f"{'n' if ms[i] >= 1260 else 'd'}" for i in entry]
+    check("波幅突破：RIA 每个窗口最多一笔",
+          len(win_key) == len(set(win_key)),
+          f"{len(win_key) - len(set(win_key))} 个窗口重复开仓")
+
+
 def check_strategy_runner() -> None:
     """多策略引擎：平今判断、理论/实际比对、对齐只补托管合约。"""
     from ttrade import strategy_runner as R
@@ -5825,6 +5930,7 @@ def main() -> int:
     check_strategy_store()
     check_costs()
     check_cross()
+    check_break_strategies()
     check_strategy_runner()
     check_day_limit()
     check_topup()

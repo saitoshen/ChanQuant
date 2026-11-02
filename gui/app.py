@@ -1376,7 +1376,10 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
 
-        root.addWidget(self._build_sidebar())
+        # 侧边栏要够宽才放得下「日窗起(分)」这类参数名和带单位的数值。
+        # 296 那会儿一列滑杆挤成一条缝，参数一多就得靠猜
+        self.sidebar = self._build_sidebar()
+        root.addWidget(self.sidebar)
 
         # 五页结果由 `ResultView` 统一提供。「策略交易和组合」里双击一条策略
         # 打开的是同一个类 —— 一处实现两处挂载，不会出现「这边改好了那边还是
@@ -2067,7 +2070,7 @@ class MainWindow(QMainWindow):
         scroll.setObjectName("SideScroll")
         scroll.setWidget(content)
         scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(296)
+        scroll.setFixedWidth(360)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.NoFrame)
 
@@ -2125,7 +2128,7 @@ class MainWindow(QMainWindow):
             for w in (self.box_factor, self.box_fsel, self.box_rule, self.box_filter)
         }
 
-        wrap.setFixedWidth(296)
+        wrap.setFixedWidth(360)
         return wrap
 
     def _section(self, text: str) -> QLabel:
@@ -3604,7 +3607,7 @@ class MainWindow(QMainWindow):
         rl.setSpacing(6)
 
         lbl = QLabel(label)
-        lbl.setFixedWidth(62)
+        lbl.setFixedWidth(78)
         lbl.setFixedHeight(28)
         lbl.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
 
@@ -3617,7 +3620,7 @@ class MainWindow(QMainWindow):
         sld.setCursor(Qt.PointingHandCursor)
 
         val = QLabel(f"{default:g}")
-        val.setFixedWidth(36)
+        val.setFixedWidth(42)
         val.setFixedHeight(20)
         val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         val.setStyleSheet(
