@@ -1492,10 +1492,57 @@ def _run() -> tuple[bool, list[str]]:
                 f"策略验证页异常（{verify_info}）：取不到当前策略、前视检测跑不出"
                 "检查点，或者检查点表没填上"
             )
+
+        # 截面策略的两步配置：参数面板要能借进弹窗、切走能还回侧边栏且顺序不乱。
+        # 这一步放在最后 —— 它会切策略族，`_schedule` 会顺手排一次回测，前面那些
+        # 断言都已经取完数了，不会被它带偏
+        cross_dlg_ok = False
+        cross_dlg_info = ""
+        try:
+            side_lay = win._panel_slots[win.box_factor][0]
+
+            def _order(lay):
+                return [lay.itemAt(i).widget() for i in range(lay.count())
+                        if lay.itemAt(i).widget() is not None]
+
+            before = _order(side_lay)
+            win.cb_family.setCurrentIndex(win.cb_family.findData("cross"))
+            app.processEvents()
+            hedge_ok = (
+                win.box_fsel.parentWidget() is win.cross_factor_host
+                and win.box_factor.parentWidget() is win.cross_factor_host
+                and win.grp_timing.isHidden()
+                and win.cross_dlg.step1_lay.count() >= 2
+                and win.cross_dlg.step2_lay.count() >= 2
+                and bool(win.lbl_cross_sum.text().strip())
+            )
+            win.cb_cross_mode.setCurrentIndex(win.cb_cross_mode.findData("select"))
+            app.processEvents()
+            win.cb_timing.setCurrentIndex(win.cb_timing.findData("rule"))
+            app.processEvents()
+            select_ok = (
+                not win.grp_timing.isHidden()
+                and win.box_rule.parentWidget() is win.cross_timing_host
+            )
+            win.cb_family.setCurrentIndex(win.cb_family.findData("rule"))
+            app.processEvents()
+            win.cross_dlg.close()
+            back_ok = _order(side_lay) == before
+            cross_dlg_ok = hedge_ok and select_ok and back_ok
+            cross_dlg_info = (f"对冲 {hedge_ok} / 选品种 {select_ok} / "
+                              f"还回侧边栏 {back_ok}")
+        except Exception as exc:  # noqa: BLE001
+            cross_dlg_info = f"{type(exc).__name__}: {exc}"
+        if not cross_dlg_ok:
+            raise RuntimeError(
+                f"截面两步配置窗异常（{cross_dlg_info}）：参数面板借进弹窗、切走还回"
+                "侧边栏，或者侧边栏顺序被搬乱了"
+            )
+
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
                 f"{factor_info}，滚轮缩放 {wheel_info}，策略验证 {verify_info}，"
                 f"组合 {combo_info}，"
-                f"截面 {cross_info}，"
+                f"截面 {cross_info}，两步配置 {cross_dlg_info}，"
                 f"回测区间 {range_info}，实时开关已复位，"
                 f"数据管理页就绪，手册 {manual_info}，输出 {out_info}，"
                 f"对话渲染 {chat_info}，能力包 {skill_info}")

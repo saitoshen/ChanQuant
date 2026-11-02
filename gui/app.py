@@ -105,6 +105,7 @@ from ttrade import strategy_store as SStore
 from ttrade.tqsdk_symbols import contract_key
 from ttrade import strategy_templates as TPL
 from gui.agent_page import AgentPage
+from gui.cross_dialog import CrossSetupDialog
 from gui.data_page import DataPage
 from gui.live import LiveController
 from gui.pickers import ContractPicker, SymbolPicker
@@ -1541,165 +1542,36 @@ class MainWindow(QMainWindow):
             )
         cl.addWidget(self.cb_family)
 
-        # ---------------------------------------------- 截面策略页
-        # 时序策略（规则 / 因子）**复用下面的两套面板**，不再造一份参数控件：
-        # 截面只是换了个「拿哪些品种、按什么权重」的框架，单腿的进出场逻辑还是
-        # 那套规则策略 / 因子策略，复制一份参数控件只会让两边慢慢走偏。
+        # ---------------------------------------------- 截面策略（两步弹窗）
+        #
+        # 截面策略天生是**两步**：第一步决定「拿哪些品种、多哪几个空哪几个」，
+        # 第二步决定「选出来的这些品种怎么下单」。两件事竖着排在侧边栏里，一屏
+        # 放不下；更麻烦的是第二步的内容会随第一步变（截面对冲根本没有时序腿），
+        # 并排摆着会让人以为那些参数是一回事，改一个也不知道影响了哪一步。
+        #
+        # 所以侧边栏只留一个按钮 + 一段摘要，参数全在弹窗里左右并排：左边第一步，
+        # 右边第二步。格局参照期权 T 型报价。
+        self.cross_step1, self.cross_step2 = self._build_cross_panels()
+        self.cross_dlg = CrossSetupDialog(self)
+        self.cross_dlg.attach(self.cross_step1, self.cross_step2)
+
         self.box_cross = QWidget()
         pc = QVBoxLayout(self.box_cross)
         pc.setContentsMargins(0, 0, 0, 0)
         pc.setSpacing(8)
-        pc.addWidget(self._section("截面模式"))
-        self.cb_cross_mode = QComboBox()
-        for key, label, tip in CROSS_MODES:
-            self.cb_cross_mode.addItem(label, key)
-            self.cb_cross_mode.setItemData(
-                self.cb_cross_mode.count() - 1, tip, Qt.ToolTipRole)
-        pc.addWidget(self.cb_cross_mode)
-
-        pc.addWidget(self._section("调仓"))
-        self.sp_cross_reb = QSpinBox()
-        self.sp_cross_reb.setRange(1, 2000)
-        self.sp_cross_reb.setValue(5)
-        self.sp_cross_reb.setPrefix("每 ")
-        self.sp_cross_reb.setSuffix(" 根调一次")
-        self.sp_cross_reb.setToolTip(
-            "调仓间隔，单位是 K 线根数。5 分钟周期 48 根约一个交易日，\n"
-            "日线就是「每 5 个交易日」。间隔越短换手越高，成本吃掉的越多。"
+        self.btn_cross_setup = QPushButton("配置截面策略（两步）…")
+        self.btn_cross_setup.setToolTip(
+            "打开两步配置窗：左边第一步「截面选品种」（模式、截面因子、筛池、\n"
+            "调仓、多空腿数），右边第二步「策略落地」（时序腿 / 腿内分钱）。\n"
+            "截面对冲没有时序腿，右边只显示腿内分配。"
         )
-        pc.addWidget(self.sp_cross_reb)
+        self.btn_cross_setup.clicked.connect(self._open_cross_setup)
+        pc.addWidget(self.btn_cross_setup)
 
-        pc.addWidget(self._section("多空腿数"))
-        # 多空各选百分之几。早先是一个「选最强的 X%」同时管两头 —— 对称写法
-        # 常见，但「多最强的 10%、空最弱的 20%」也讲得通（下跌时弱者更弱），
-        # 而且用户看不出来空头到底选了多少
-        self.sp_cross_pct = QDoubleSpinBox()
-        self.sp_cross_pct.setRange(1.0, 50.0)
-        self.sp_cross_pct.setDecimals(1)
-        self.sp_cross_pct.setSingleStep(1.0)
-        self.sp_cross_pct.setValue(10.0)
-        self.sp_cross_pct.setPrefix("多最强的 ")
-        self.sp_cross_pct.setSuffix(" %")
-        self.sp_cross_pct.setToolTip(
-            "多头腿：选截面分数最高的 top X%。6 个品种、10% 就是 1 个；\n"
-            "品种少的时候至少算 1 个，最多不超过有效品种数的一半。"
-        )
-        pc.addWidget(self.sp_cross_pct)
-
-        self.sp_cross_bot = QDoubleSpinBox()
-        self.sp_cross_bot.setRange(1.0, 50.0)
-        self.sp_cross_bot.setDecimals(1)
-        self.sp_cross_bot.setSingleStep(1.0)
-        self.sp_cross_bot.setValue(10.0)
-        self.sp_cross_bot.setPrefix("空最弱的 ")
-        self.sp_cross_bot.setSuffix(" %")
-        self.sp_cross_bot.setToolTip(
-            "空头腿：选截面分数最低的 bottom X%。\n"
-            "多空两边各自平分 50% 的名义额，所以腿数不同也不会产生净敞口。"
-        )
-        pc.addWidget(self.sp_cross_bot)
-
-        pc.addWidget(self._section("资金分配（腿内）"))
-        self.cb_cross_w = QComboBox()
-        for key, label, tip in CROSS_WEIGHTS:
-            self.cb_cross_w.addItem(label, key)
-            self.cb_cross_w.setItemData(
-                self.cb_cross_w.count() - 1, tip, Qt.ToolTipRole)
-        pc.addWidget(self.cb_cross_w)
-
-        # 分档：排名越靠前拿越多。选「分档」时才显示
-        self.row_tiers = QWidget()
-        rt = QHBoxLayout(self.row_tiers)
-        rt.setContentsMargins(0, 0, 0, 0)
-        rt.setSpacing(6)
-        self.sp_tiers = QSpinBox()
-        self.sp_tiers.setRange(2, 6)
-        self.sp_tiers.setValue(3)
-        self.sp_tiers.setPrefix("分 ")
-        self.sp_tiers.setSuffix(" 档")
-        self.sp_tiers.setToolTip(
-            "把选中的那几只按截面分数降序切成 N 档。\n"
-            "档数不能超过选中的只数 —— 超了按实际只数切。"
-        )
-        self.ed_tier_units = QLineEdit()
-        self.ed_tier_units.setPlaceholderText("份数 4,2,1（留空＝按 2 的幂递减）")
-        self.ed_tier_units.setToolTip(
-            "每一档拿几份钱，逗号分隔，从第一档往后写。\n"
-            "只填 2 个而分 3 档时，最后那一档沿用最后一个数字。"
-        )
-        rt.addWidget(self.sp_tiers)
-        rt.addWidget(self.ed_tier_units, 1)
-        pc.addWidget(self.row_tiers)
-
-        # ---- 第一步：选品种池
-        self.grp_pool = QWidget()
-        gp = QVBoxLayout(self.grp_pool)
-        gp.setContentsMargins(0, 0, 0, 0)
-        gp.setSpacing(8)
-        gp.addWidget(self._section("第一步：先筛品种池（可选）"))
-        self.chk_pool = QCheckBox("先按一个简单因子筛池，第二步只在池内排序")
-        self.chk_pool.setToolTip(
-            "两步走：第一步用「能不能交易」的因子（金额、持仓）筛池，\n"
-            "第二步用「谁强谁弱」的因子（动量、基差）排序。\n\n"
-            "混在一张分数里的话，金额大的品种会因为金额因子 z 值高被排到前面，\n"
-            "但它涨不涨是另一回事 —— 流动性把权重带偏了。"
-        )
-        gp.addWidget(self.chk_pool)
-        self.row_pool = QWidget()
-        rp = QHBoxLayout(self.row_pool)
-        rp.setContentsMargins(0, 0, 0, 0)
-        rp.setSpacing(6)
-        self.cb_pool_factor = QComboBox()
-        self.cb_pool_factor.setToolTip(
-            "筛池因子。默认「成交额 20（对数）」—— 流动性差的品种信号噪声大、\n"
-            "滑点高，留在池里只会稀释排名。"
-        )
-        self._fill_factor_combo(self.cb_pool_factor, "log_amount_20")
-        self.sp_pool_pct = QDoubleSpinBox()
-        self.sp_pool_pct.setRange(10.0, 100.0)
-        self.sp_pool_pct.setDecimals(0)
-        self.sp_pool_pct.setSingleStep(5.0)
-        self.sp_pool_pct.setValue(70.0)
-        self.sp_pool_pct.setPrefix("保留 ")
-        self.sp_pool_pct.setSuffix(" %")
-        self.sp_pool_pct.setToolTip(
-            "池里留下分数最高的百分之几。70% 表示 10 个品种留 7 个。\n"
-            "留太少的话第二步的腿数会跟着少（腿数按池内品种数算）。"
-        )
-        rp.addWidget(self.cb_pool_factor, 1)
-        rp.addWidget(self.sp_pool_pct)
-        gp.addWidget(self.row_pool)
-        pc.addWidget(self.grp_pool)
-
-        # ---- 机器学习标签口径（只在因子模式=机器学习时显示）
-        self.lbl_label = QLabel("机器学习标签")
-        self.lbl_label.setObjectName("SectionTitle")
-        pc.addWidget(self.lbl_label)
-        self.cb_label = QComboBox()
-        for key, label, tip in CROSS_LABELS:
-            self.cb_label.addItem(label, key)
-            self.cb_label.setItemData(
-                self.cb_label.count() - 1, tip, Qt.ToolTipRole)
-        pc.addWidget(self.cb_label)
-
-        self.lbl_cross_timing = self._section("时序策略（选品种模式用）")
-        pc.addWidget(self.lbl_cross_timing)
-        self.cb_timing = QComboBox()
-        for key, label, tip in TIMING_FAMILIES:
-            self.cb_timing.addItem(label, key)
-            self.cb_timing.setItemData(
-                self.cb_timing.count() - 1, tip, Qt.ToolTipRole)
-        pc.addWidget(self.cb_timing)
-
-        # 时序腿的因子用**独立**的下拉：截面因子那边可能已经占了单因子下拉，
-        # 共用一个的话「截面用动量、时序用反转」这种配置根本表达不出来
-        self.lbl_tfactor = QLabel("时序因子")
-        self.lbl_tfactor.setObjectName("SectionTitle")
-        pc.addWidget(self.lbl_tfactor)
-        self.cb_tfactor = QComboBox()
-        self.cb_tfactor.setToolTip("这条时序腿用哪个因子决定开平（分数过阈值进出场）")
-        self._fill_tfactor_combo()
-        pc.addWidget(self.cb_tfactor)
+        self.lbl_cross_sum = QLabel("")
+        self.lbl_cross_sum.setObjectName("Hint")
+        self.lbl_cross_sum.setWordWrap(True)
+        pc.addWidget(self.lbl_cross_sum)
 
         self.lbl_cross_hint = QLabel("")
         self.lbl_cross_hint.setObjectName("Hint")
@@ -2245,6 +2117,14 @@ class MainWindow(QMainWindow):
         self.lbl_status.setWordWrap(True)
         wl.addWidget(self.lbl_status)
 
+        # 截面模式下这四块面板要「借」进弹窗（见 `_lend`）。QWidget 只能有一个
+        # 父，搬过去就得从侧边栏布局里摘掉，所以先把原位记下来 —— 还回来时插回
+        # 原处，不然来回切几次策略类型，侧边栏的顺序会乱
+        self._panel_slots = {
+            w: (cl, cl.indexOf(w))
+            for w in (self.box_factor, self.box_fsel, self.box_rule, self.box_filter)
+        }
+
         wrap.setFixedWidth(296)
         return wrap
 
@@ -2252,6 +2132,247 @@ class MainWindow(QMainWindow):
         lbl = QLabel(text)
         lbl.setObjectName("SectionTitle")
         return lbl
+
+    # ------------------------------------------------------ 截面策略的两步面板
+    def _build_cross_panels(self):
+        """造截面策略的两步面板：第一步「截面选品种」、第二步「策略落地」。
+
+        控件全部挂在这个类上（`self.sp_cross_pct` / `self.cb_timing` 等），弹窗
+        只是个摆放容器 —— 参数收集、保存配置、自检都不用知道它们现在在哪个窗口
+        里。所以这里**不新建参数控件**，只是把原来那一串竖排搬到两个竖列里。
+        """
+        # ------------------------------------------------ 第一步：截面选品种
+        step1 = QWidget()
+        p1 = QVBoxLayout(step1)
+        p1.setContentsMargins(0, 0, 0, 0)
+        p1.setSpacing(8)
+
+        p1.addWidget(self._section("截面模式"))
+        self.cb_cross_mode = QComboBox()
+        for key, label, tip in CROSS_MODES:
+            self.cb_cross_mode.addItem(label, key)
+            self.cb_cross_mode.setItemData(
+                self.cb_cross_mode.count() - 1, tip, Qt.ToolTipRole)
+        p1.addWidget(self.cb_cross_mode)
+
+        # 截面因子（模式下拉 + 因子表）本来在侧边栏里，切到截面策略时由
+        # `_sync_family_panels` 借进这个空槽 —— 见 `_lend()` 的说明
+        self.cross_factor_host = QWidget()
+        hf = QVBoxLayout(self.cross_factor_host)
+        hf.setContentsMargins(0, 0, 0, 0)
+        hf.setSpacing(8)
+        p1.addWidget(self.cross_factor_host)
+
+        # ---- 筛品种池
+        self.grp_pool = QWidget()
+        gp = QVBoxLayout(self.grp_pool)
+        gp.setContentsMargins(0, 0, 0, 0)
+        gp.setSpacing(8)
+        gp.addWidget(self._section("先筛品种池（可选）"))
+        self.chk_pool = QCheckBox("先按一个简单因子筛池，第二步只在池内排序")
+        self.chk_pool.setToolTip(
+            "两步走：第一步用「能不能交易」的因子（金额、持仓）筛池，\n"
+            "第二步用「谁强谁弱」的因子（动量、基差）排序。\n\n"
+            "混在一张分数里的话，金额大的品种会因为金额因子 z 值高被排到前面，\n"
+            "但它涨不涨是另一回事 —— 流动性把权重带偏了。"
+        )
+        gp.addWidget(self.chk_pool)
+        self.row_pool = QWidget()
+        rp = QHBoxLayout(self.row_pool)
+        rp.setContentsMargins(0, 0, 0, 0)
+        rp.setSpacing(6)
+        self.cb_pool_factor = QComboBox()
+        self.cb_pool_factor.setToolTip(
+            "筛池因子。默认「成交额 20（对数）」—— 流动性差的品种信号噪声大、\n"
+            "滑点高，留在池里只会稀释排名。"
+        )
+        self._fill_factor_combo(self.cb_pool_factor, "log_amount_20")
+        self.sp_pool_pct = QDoubleSpinBox()
+        self.sp_pool_pct.setRange(10.0, 100.0)
+        self.sp_pool_pct.setDecimals(0)
+        self.sp_pool_pct.setSingleStep(5.0)
+        self.sp_pool_pct.setValue(70.0)
+        self.sp_pool_pct.setPrefix("保留 ")
+        self.sp_pool_pct.setSuffix(" %")
+        self.sp_pool_pct.setToolTip(
+            "池里留下分数最高的百分之几。70% 表示 10 个品种留 7 个。\n"
+            "留太少的话第二步的腿数会跟着少（腿数按池内品种数算）。"
+        )
+        rp.addWidget(self.cb_pool_factor, 1)
+        rp.addWidget(self.sp_pool_pct)
+        gp.addWidget(self.row_pool)
+        p1.addWidget(self.grp_pool)
+
+        p1.addWidget(self._section("调仓"))
+        self.sp_cross_reb = QSpinBox()
+        self.sp_cross_reb.setRange(1, 2000)
+        self.sp_cross_reb.setValue(5)
+        self.sp_cross_reb.setPrefix("每 ")
+        self.sp_cross_reb.setSuffix(" 根调一次")
+        self.sp_cross_reb.setToolTip(
+            "调仓间隔，单位是 K 线根数。5 分钟周期 48 根约一个交易日，\n"
+            "日线就是「每 5 个交易日」。间隔越短换手越高，成本吃掉的越多。"
+        )
+        p1.addWidget(self.sp_cross_reb)
+
+        p1.addWidget(self._section("多空腿数"))
+        # 多空各选百分之几。早先是一个「选最强的 X%」同时管两头 —— 对称写法
+        # 常见，但「多最强的 10%、空最弱的 20%」也讲得通（下跌时弱者更弱），
+        # 而且用户看不出来空头到底选了多少
+        self.sp_cross_pct = QDoubleSpinBox()
+        self.sp_cross_pct.setRange(1.0, 50.0)
+        self.sp_cross_pct.setDecimals(1)
+        self.sp_cross_pct.setSingleStep(1.0)
+        self.sp_cross_pct.setValue(10.0)
+        self.sp_cross_pct.setPrefix("多最强的 ")
+        self.sp_cross_pct.setSuffix(" %")
+        self.sp_cross_pct.setToolTip(
+            "多头腿：选截面分数最高的 top X%。6 个品种、10% 就是 1 个；\n"
+            "品种少的时候至少算 1 个，最多不超过有效品种数的一半。"
+        )
+        p1.addWidget(self.sp_cross_pct)
+
+        self.sp_cross_bot = QDoubleSpinBox()
+        self.sp_cross_bot.setRange(1.0, 50.0)
+        self.sp_cross_bot.setDecimals(1)
+        self.sp_cross_bot.setSingleStep(1.0)
+        self.sp_cross_bot.setValue(10.0)
+        self.sp_cross_bot.setPrefix("空最弱的 ")
+        self.sp_cross_bot.setSuffix(" %")
+        self.sp_cross_bot.setToolTip(
+            "空头腿：选截面分数最低的 bottom X%。\n"
+            "多空两边各自平分 50% 的名义额，所以腿数不同也不会产生净敞口。"
+        )
+        p1.addWidget(self.sp_cross_bot)
+
+        # ---- 机器学习标签口径（只在因子模式=机器学习时显示）
+        self.lbl_label = QLabel("机器学习标签")
+        self.lbl_label.setObjectName("SectionTitle")
+        p1.addWidget(self.lbl_label)
+        self.cb_label = QComboBox()
+        for key, label, tip in CROSS_LABELS:
+            self.cb_label.addItem(label, key)
+            self.cb_label.setItemData(
+                self.cb_label.count() - 1, tip, Qt.ToolTipRole)
+        p1.addWidget(self.cb_label)
+
+        # ------------------------------------------------ 第二步：策略落地
+        step2 = QWidget()
+        p2 = QVBoxLayout(step2)
+        p2.setContentsMargins(0, 0, 0, 0)
+        p2.setSpacing(8)
+
+        # ---- 时序腿：只有「截面选品种 + 时序交易」才有
+        self.grp_timing = QWidget()
+        gt = QVBoxLayout(self.grp_timing)
+        gt.setContentsMargins(0, 0, 0, 0)
+        gt.setSpacing(8)
+        self.lbl_cross_timing = self._section("时序策略")
+        gt.addWidget(self.lbl_cross_timing)
+        self.cb_timing = QComboBox()
+        for key, label, tip in TIMING_FAMILIES:
+            self.cb_timing.addItem(label, key)
+            self.cb_timing.setItemData(
+                self.cb_timing.count() - 1, tip, Qt.ToolTipRole)
+        gt.addWidget(self.cb_timing)
+
+        # 时序腿的因子用**独立**的下拉：截面因子那边可能已经占了单因子下拉，
+        # 共用一个的话「截面用动量、时序用反转」这种配置根本表达不出来
+        self.lbl_tfactor = QLabel("时序因子")
+        self.lbl_tfactor.setObjectName("SectionTitle")
+        gt.addWidget(self.lbl_tfactor)
+        self.cb_tfactor = QComboBox()
+        self.cb_tfactor.setToolTip("这条时序腿用哪个因子决定开平（分数过阈值进出场）")
+        self._fill_tfactor_combo()
+        gt.addWidget(self.cb_tfactor)
+
+        # 时序腿选了「规则策略」时，规则面板（box_rule）借到这个槽里；
+        # 选「因子策略」则只用一个时序因子下拉，不需要额外参数
+        self.cross_timing_host = QWidget()
+        ht = QVBoxLayout(self.cross_timing_host)
+        ht.setContentsMargins(0, 0, 0, 0)
+        ht.setSpacing(8)
+        gt.addWidget(self.cross_timing_host)
+        p2.addWidget(self.grp_timing)
+
+        # ---- 腿内分钱：两种模式都有（对冲是「多空两端各自怎么分」，
+        #      选品种是「入选的这几只怎么分」）
+        self.grp_legweight = QWidget()
+        gl = QVBoxLayout(self.grp_legweight)
+        gl.setContentsMargins(0, 0, 0, 0)
+        gl.setSpacing(8)
+        gl.addWidget(self._section("资金分配（腿内）"))
+        self.cb_cross_w = QComboBox()
+        for key, label, tip in CROSS_WEIGHTS:
+            self.cb_cross_w.addItem(label, key)
+            self.cb_cross_w.setItemData(
+                self.cb_cross_w.count() - 1, tip, Qt.ToolTipRole)
+        gl.addWidget(self.cb_cross_w)
+
+        # 分档：排名越靠前拿越多。选「分档」时才显示
+        self.row_tiers = QWidget()
+        rt = QHBoxLayout(self.row_tiers)
+        rt.setContentsMargins(0, 0, 0, 0)
+        rt.setSpacing(6)
+        self.sp_tiers = QSpinBox()
+        self.sp_tiers.setRange(2, 6)
+        self.sp_tiers.setValue(3)
+        self.sp_tiers.setPrefix("分 ")
+        self.sp_tiers.setSuffix(" 档")
+        self.sp_tiers.setToolTip(
+            "把选中的那几只按截面分数降序切成 N 档。\n"
+            "档数不能超过选中的只数 —— 超了按实际只数切。"
+        )
+        self.ed_tier_units = QLineEdit()
+        self.ed_tier_units.setPlaceholderText("份数 4,2,1（留空＝按 2 的幂递减）")
+        self.ed_tier_units.setToolTip(
+            "每一档拿几份钱，逗号分隔，从第一档往后写。\n"
+            "只填 2 个而分 3 档时，最后那一档沿用最后一个数字。"
+        )
+        rt.addWidget(self.sp_tiers)
+        rt.addWidget(self.ed_tier_units, 1)
+        gl.addWidget(self.row_tiers)
+
+        # 按当前参数算出来的「大概持几条腿」。参数都在这个窗里，腿数却要回到
+        # 侧边栏才看得见的话，调腿数的时候得来回切窗口
+        self.lbl_cross_preview = QLabel("")
+        self.lbl_cross_preview.setObjectName("Hint")
+        self.lbl_cross_preview.setWordWrap(True)
+        gl.addWidget(self.lbl_cross_preview)
+        p2.addWidget(self.grp_legweight)
+        return step1, step2
+
+    def _open_cross_setup(self) -> None:
+        """打开两步配置窗。侧边栏只剩按钮和摘要，参数都在这里改。"""
+        self._sync_cross_controls()      # 开窗之前先把显隐和摘要对齐
+        self.cross_dlg.show()
+        self.cross_dlg.raise_()
+        self.cross_dlg.activateWindow()
+
+    # ------------------------------------------------- 面板借用（侧边栏 ⇄ 弹窗）
+    def _lend(self, w: QWidget, host: QWidget) -> None:
+        """把侧边栏里的一块面板借给弹窗。
+
+        QWidget 只能有一个父，所以「搬进弹窗」= 从侧边栏布局里摘掉再挂到弹窗
+        的槽上。摘的时候位置记在 `self._panel_slots` 里，还回来时插回原处 ——
+        不记的话来回切几次策略类型，侧边栏的顺序就乱了。
+        """
+        if w.parentWidget() is host:
+            return
+        lay, _idx = self._panel_slots[w]
+        lay.removeWidget(w)
+        host.layout().addWidget(w)
+        w.setVisible(True)
+
+    def _recall(self, w: QWidget) -> None:
+        """把借出去的面板还回侧边栏原位。"""
+        lay, idx = self._panel_slots[w]
+        if lay.indexOf(w) >= 0:
+            return
+        cur = w.parentWidget()
+        if cur is not None and cur.layout() is not None:
+            cur.layout().removeWidget(w)
+        lay.insertWidget(min(idx, lay.count()), w)
 
     # ---------------------------------------------------------- 数据填充
     def _populate_symbols(self) -> None:
@@ -2993,28 +3114,55 @@ class MainWindow(QMainWindow):
             # 切走之后还在后台跑的那条截面 ML 不该再把结果挂回来
             self._cancel_cross_worker()
         self._sync_family_panels()
+        # 手动切到截面就把配置窗开出来：参数都搬进窗里了，侧边栏只剩一个按钮，
+        # 不开窗的话用户面对的是「界面怎么变空了」。灌配置时不弹 —— 开机就蹦一
+        # 个窗出来会挡住首屏
+        if self.family == FAMILY_CROSS and not getattr(self, "_booting", False):
+            self._open_cross_setup()
         self._schedule(immediate=True)
 
     def _sync_family_panels(self) -> None:
-        """按策略族切换左边那几块面板。
+        """按策略族切换左边那几块面板，截面时把参数面板借进两步弹窗。
 
-        截面策略要**同时**显示截面自己的参数和「时序策略」那套面板：截面对冲只
-        用截面参数；选品种+时序还要一条时序腿，那条腿就是规则策略或因子策略，
-        直接复用下面两块，不再复制一份参数控件。
+        截面策略的参数全在弹窗里（`gui/cross_dialog.py`），侧边栏只留一个按钮和
+        一段摘要。截面**总是**要用因子（强弱靠它排），所以截面因子那一块也跟着
+        借过去；时序腿选了规则策略时，规则面板一起借到第二步。
+
+        借和还都走 `_lend` / `_recall`：QWidget 只能有一个父，搬过去就得从侧边栏
+        布局里摘掉，还回来要插回原位。
         """
         fam = self.family
         is_rule = fam == FAMILY_RULE
         is_factor = fam == FAMILY_FACTOR
         is_cross = fam == FAMILY_CROSS
-        # 时序腿只在「选品种」模式下存在。截面对冲没有单腿进出场这回事，把规则
-        # 面板一起摆出来会让人以为那些参数会影响对冲结果
-        mode = self.cb_cross_mode.currentData() if hasattr(self, "cb_cross_mode") else "hedge"
+        # 时序腿只在「选品种」模式下存在。截面对冲没有单腿进出场这回事
+        mode = self._cross_mode()
         timing = self._timing_family() if (is_cross and mode == "select") else ""
+
         self.box_cross.setVisible(is_cross)
-        self.box_rule.setVisible(is_rule or (is_cross and timing == "rule"))
-        # 截面策略**总是**要用因子（强弱靠它排），所以因子面板一直显示
-        self.box_factor.setVisible(is_factor or is_cross)
-        self.box_filter.setVisible(is_rule)
+        if is_cross:
+            self._lend(self.box_factor, self.cross_factor_host)
+            self._lend(self.box_fsel, self.cross_factor_host)
+            if timing == "rule":
+                self._lend(self.box_rule, self.cross_timing_host)
+            else:
+                # 还回侧边栏只是「放回原位」，不代表要显示 —— 对冲模式下这块
+                # 面板没有意义，留在侧边栏里会让人以为它管着对冲的进出场
+                self._recall(self.box_rule)
+                self.box_rule.setVisible(False)
+            # 因子过滤是规则策略专用，截面上没有它的位置
+            self._recall(self.box_filter)
+            self.box_filter.setVisible(False)
+        else:
+            # **按原位升序**还回去：先还 index 小的，后面的位置才对得上。
+            # 乱序还的话，插回去的位置会被前面那几次插入挤偏，侧边栏顺序就乱了
+            for w in sorted(self._panel_slots, key=lambda x: self._panel_slots[x][1]):
+                self._recall(w)
+            self.box_rule.setVisible(is_rule)
+            self.box_factor.setVisible(is_factor)
+            self.box_filter.setVisible(is_rule)
+
+        self.cross_dlg.set_mode(mode, timing)
         self._sync_cross_controls()
         self._sync_factor_panel()
 
@@ -3038,9 +3186,8 @@ class MainWindow(QMainWindow):
         mode = self._cross_mode()
         # 「时序策略」只对选品种模式有意义，截面对冲没有单腿进出场这回事
         on = self.family == FAMILY_CROSS and mode == "select"
+        self.grp_timing.setVisible(on)
         timing_factor = on and self._timing_family() == "factor"
-        for w in (self.lbl_cross_timing, self.cb_timing):
-            w.setVisible(on)
         for w in (self.lbl_tfactor, self.cb_tfactor):
             w.setVisible(timing_factor)
         # 只做多时没有空头腿，那个百分比控件摆着只会让人以为它有用
@@ -3053,6 +3200,9 @@ class MainWindow(QMainWindow):
         ml_on = self.factor_mode == "ml"
         for w in (self.lbl_label, self.cb_label):
             w.setVisible(ml_on)
+        # 参数都搬进弹窗了，侧边栏这一段是唯一的「一眼看见」的地方
+        if hasattr(self, "lbl_cross_sum"):
+            self.lbl_cross_sum.setText(self._cross_summary())
         if self.family != FAMILY_CROSS:
             return
         n = len(sel)
@@ -3071,22 +3221,55 @@ class MainWindow(QMainWindow):
             legs_s = max(1, int(round(n_pool * pct_s / 100.0)))
             pool_note = f"第一步筛完剩约 {n_pool} 个，"
         if n < cross_engine.MIN_CROSS:
-            self.lbl_cross_hint.setText(
-                f"截面策略至少要 {cross_engine.MIN_CROSS} 个品种，现在选了 {n} 个。"
-                "在「多品种回测」里勾一下（同一个周期、同一个市场）。"
-            )
+            text = (f"截面策略至少要 {cross_engine.MIN_CROSS} 个品种，现在选了 {n} 个。"
+                    "在「多品种回测」里勾一下（同一个周期、同一个市场）。")
         elif mode == "hedge":
-            self.lbl_cross_hint.setText(
-                pool_note + f"每次调仓多最强的 {legs_l} 个、"
-                + ("只做多。" if self.cfg.long_only else f"空最弱的 {legs_s} 个。")
-                + f"腿内按{self.cb_cross_w.currentText()}分配。"
-            )
+            text = (pool_note + f"每次调仓多最强的 {legs_l} 个、"
+                    + ("只做多。" if self.cfg.long_only else f"空最弱的 {legs_s} 个。")
+                    + f"腿内按{self.cb_cross_w.currentText()}分配。")
         else:
-            self.lbl_cross_hint.setText(
-                pool_note + f"每次调仓挑出最强的 {legs_l} 个，"
-                "再由时序策略决定每个品种是多是空还是空仓。"
-                + (f"腿内按{self.cb_cross_w.currentText()}分钱。" if tier_on else "")
-            )
+            text = (pool_note + f"每次调仓挑出最强的 {legs_l} 个，"
+                    "再由时序策略决定每个品种是多是空还是空仓。"
+                    + (f"腿内按{self.cb_cross_w.currentText()}分钱。" if tier_on else ""))
+        # 侧边栏和弹窗第二步各显示一份：一个在窗里调参数时看，一个不开窗时看
+        self.lbl_cross_hint.setText(text)
+        self.lbl_cross_preview.setText(text)
+
+    def _cross_summary(self) -> str:
+        """侧边栏那段摘要：不开弹窗也知道现在配的是什么。
+
+        参数全搬进弹窗之后，侧边栏只剩一个按钮 —— 不补这段的话，用户切到截面
+        策略会看到一块空白，不知道自己上次配的是什么，只能挨个开窗确认。
+        """
+        n = len(self._multi_symbols())
+        mode = self._cross_mode()
+        head = "截面对冲" if mode == "hedge" else "截面选品种 + 时序"
+        lines = [f"{head} · {n} 个品种 · 每 {self.sp_cross_reb.value()} 根调仓"]
+
+        fm = self.cb_fmode.currentData() or "multi"
+        if fm == "single":
+            fac = self.cb_fsingle.currentText()
+            if self.chk_frev.isChecked():
+                fac += "（反转）"
+        elif fm == "ml":
+            fac = f"机器学习（{self.cb_fmodel.currentText()}）"
+        else:
+            names = [factors.FACTORS[k].label for k in self.factor_keys
+                     if k in factors.FACTORS]
+            fac = "、".join(names[:3])
+            if len(names) > 3:
+                fac += f" 等 {len(names)} 个"
+        lines.append(f"截面因子：{fac or '（未选）'}")
+
+        if self.chk_pool.isChecked():
+            lines.append(f"先筛池：{self.cb_pool_factor.currentText()} 留 "
+                         f"{self.sp_pool_pct.value():.0f}%")
+        if mode == "select":
+            leg = "规则" if self._timing_family() == "rule" else "因子"
+            lines.append(f"时序腿：{leg} · 腿内{self.cb_cross_w.currentText()}")
+        else:
+            lines.append(f"腿内：{self.cb_cross_w.currentText()}")
+        return "\n".join(lines)
 
     def _on_cross_mode_changed(self, *_a) -> None:
         self._sync_family_panels()
