@@ -2150,21 +2150,27 @@ def check_cross() -> None:
 
 
 def check_break_strategies() -> None:
-    """波幅突破两条内置策略（从 future_quant 移植）。
+    """波幅突破三条内置策略（从 future_quant 移植，日盘 / 夜盘拆成两条）。
 
-    这两条的判据是同一个：`收盘 − 当日首根开盘` 的偏离，相对**前一交易日振幅**。
-    区别只在「什么时候看」—— `ria_break` 在日盘 / 夜盘两个窗口里每根都看，
-    `cta_break` 一天只看一个检查点。
+    三条的判据是同一个：`收盘 − 当日首根开盘` 的偏离，相对**前一交易日振幅**。
+    区别只在「什么时候看」—— `ria_break_day` 在日盘 09:40-10:40 窗口里每根都看、
+    `ria_break_night` 在夜盘 21:10-22:10 里每根都看、`cta_break` 一天只看一个检查点。
 
-    所以检查点也分成两组：
+    出场时刻是这次拆分的重点，全部写死、不做参数，所以逐条钉住：
+    有夜盘商品的日盘仓当晚 21:05 平、当晚没有夜盘（节前）顺延到下一个开盘日
+    09:05、无夜盘商品次日 09:05、金融期货次日 09:35、夜盘仓一律次日 09:05。
+
+    检查点分四组：
     1. 交易日切分（夜盘 21:00 归次日）—— 切错的话「当日开盘」和「前日振幅」
        全错，后面所有结论都无从谈起
-    2. 造一段「前日振幅 100、今天 10:40 涨了 50」的行情，阈值 0.4 必须开多、
-       0.6 必须不开；`cta_break` 一天最多一笔，`ria_break` 一个窗口最多一笔
+    2. 出场时刻表：`_break_exit_hit` 逐条对时刻
+    3. 金融期货的判据：只认数据（首根 09:15 / 09:30 + 无夜盘），不读品种配置
+    4. 造行情跑一遍：阈值 0.4 必须开、0.6 必须不开；日盘版和夜盘版各进各的窗口；
+       出场真的落在上面那几张时刻表上
     """
     from ttrade import strategies as S
 
-    # ---- 交易日切分：有 `trading_day` 列就照它，没有才按 +6h 推
+    # ---- 1. 交易日切分：有 `trading_day` 列就照它，没有才按 +6h 推
     idx = pd.DatetimeIndex([
         "2026-10-30 21:00", "2026-10-30 21:05",   # 周五夜盘 → 下周一
         "2026-11-02 09:00", "2026-11-02 14:55",
@@ -2185,73 +2191,189 @@ def check_break_strategies() -> None:
           str(S._trading_days(pd.DataFrame(
               {"trading_day": ["2026-11-02"] * 2}, index=idx[:2]))[:2]))
 
-    # ---- 造行情：前一日振幅 100，今日 10:40 前涨 50（=0.5×前日振幅）
-    def _make(dev: float, days: int = 3) -> pd.DataFrame:
-        rows = []
-        ts = []
-        px = 1000.0
-        for d in range(days):
-            day = pd.Timestamp("2026-10-01") + pd.Timedelta(days=d)
-            # 前一日先走出 100 的振幅
-            for k, (h, l) in enumerate([(0, 0), (100, 0), (100, 0)]):
-                t = day + pd.Timedelta(hours=9, minutes=5 * k)
-                rows.append({"open": px, "high": px + h, "low": px + l,
-                             "close": px + (h + l) / 2, "volume": 1.0})
-                ts.append(t)
-            # 当日：从 09:00 起，到 10:40 走到 dev
-            base = px
-            for k in range(0, 24):          # 09:00 → 10:55，每 5 分钟一根
-                t = day + pd.Timedelta(hours=9, minutes=5 * k)
-                frac = min(k / 20.0, 1.0)   # 10:40 = 第 20 根
-                c = base + dev * frac
-                rows.append({"open": c, "high": c, "low": c, "close": c,
-                             "volume": 1.0})
-                ts.append(t)
-            px = base + dev
-        return pd.DataFrame(rows, index=pd.DatetimeIndex(ts))
+    # ---- 2. 出场时刻表：写死的交易所作息，逐条钉住
+    d = pd.Timestamp("2026-10-12")
+    nx = pd.Timestamp("2026-10-13")
+    hit = S._break_exit_hit
+    # (kind, fin, has_night, 分钟, 这根属于第几个交易日, 进场日, 这根日历日, 进场日历日)
+    check("波幅突破：日盘仓有夜盘 → 当晚 21:05 平",
+          hit("day", False, True, 1265, 1, 0, d, d)
+          and not hit("day", False, True, 1260, 1, 0, d, d),
+          "21:00 还没到、21:05 到点")
+    check("波幅突破：当晚 21:05 只认进场那天的傍晚",
+          not hit("day", False, True, 1265, 1, 0, nx, d), "次日晚上的 21:05 不该平")
+    check("波幅突破：当晚没有夜盘 → 顺延到下一个开盘日 09:05",
+          hit("day", False, True, 545, 1, 0, nx, d)
+          and not hit("day", False, True, 540, 1, 0, nx, d),
+          "09:00 还没到、09:05 到点")
+    check("波幅突破：同一天的下午不能被当成「次日 09:05 到了」",
+          not hit("day", False, True, 780, 0, 0, d, d)
+          and not hit("day", True, False, 780, 0, 0, d, d),
+          "进场当天 13:00 不该平")
+    check("波幅突破：无夜盘商品 → 次日 09:05",
+          hit("day", False, False, 545, 1, 0, nx, d)
+          and not hit("day", False, False, 1265, 1, 0, nx, d),
+          "不会等到晚上 21:05")
+    check("波幅突破：金融期货 → 次日 09:35",
+          hit("day", True, False, 575, 1, 0, nx, d)
+          and not hit("day", True, False, 545, 1, 0, nx, d),
+          "09:05 不平、09:35 平")
+    check("波幅突破：夜盘仓 → 第一个 09:05（同一个交易日也算）",
+          hit("night", False, True, 545, 1, 1, nx, d)
+          and not hit("night", False, True, 1265, 0, 0, d, d),
+          "当晚 21:05 不平、次日 09:05 平")
 
-    up = _make(50.0)
-    s_ria = S.run_strategy(up, "ria_break", {"ratio": 0.4})["signal"]
-    check("波幅突破：0.5×前日振幅必须开多", bool((s_ria == 1).any()),
-          f"多 {int((s_ria == 1).sum())} 根")
-    s_hi = S.run_strategy(up, "ria_break", {"ratio": 0.6})["signal"]
-    check("波幅突破：阈值调高就不该开仓", not bool((s_hi != 0).any()),
-          f"{int((s_hi != 0).sum())} 根有仓")
-    s_cta = S.run_strategy(up, "cta_break", {"ratio": 0.4})["signal"]
-    check("波幅突破：检查点版也要开多", bool((s_cta == 1).any()),
-          f"多 {int((s_cta == 1).sum())} 根")
-    # 检查点版一天最多一笔：三天里开仓次数不能超过 3
-    n_entry = int(((s_cta != 0) & (s_cta.shift(1).fillna(0) == 0)).sum())
+    # ---- 3. 金融期货只从数据认：首根 09:15 / 09:30 + 整段无夜盘
+    dk = pd.to_datetime(["2026-10-12"] * 3).to_numpy()
+    fin_ok = (
+        not S._is_fin_futures(dk, np.array([540, 545, 900]), False)     # 商品 09:00
+        and not S._is_fin_futures(dk, np.array([540, 545, 1260]), True)  # 有夜盘
+        and S._is_fin_futures(dk, np.array([570, 575, 900]), False)     # 股指 09:30
+        and S._is_fin_futures(dk, np.array([555, 560, 915]), False)     # 国债 09:15
+    )
+    check("波幅突破：金融期货按首根时刻认（商品 09:00 / 股指 09:30 / 国债 09:15）",
+          fin_ok, "")
+
+    # ---- 4. 造行情
+    def _mk(spec):
+        """spec: [(时刻, 交易日, 价格, 最高, 最低), ...]"""
+        rows, ts, tds = [], [], []
+        for t_str, td, px, hi, lo in spec:
+            rows.append({"open": px, "high": hi, "low": lo, "close": px,
+                         "volume": 1.0})
+            ts.append(pd.Timestamp(t_str))
+            tds.append(td)
+        out = pd.DataFrame(rows, index=pd.DatetimeIndex(ts))
+        out["trading_day"] = pd.to_datetime(tds)
+        return out
+
+    def _amp(day, td, p0, amp, start=540):
+        """一天的振幅正好 `amp` 的三根 K 线，给「前一交易日振幅」用。"""
+        t = [(pd.Timestamp(day) + pd.Timedelta(minutes=start + 5 * k))
+             .strftime("%Y-%m-%d %H:%M") for k in range(3)]
+        return [(t[0], td, p0, p0 + amp / 2, p0),
+                (t[1], td, p0, p0, p0),
+                (t[2], td, p0, p0, p0 - amp / 2)]
+
+    def _rise(day, td, start, n, p0, step):
+        """n 根 5 分钟 K 线，价格从 p0 每根走 step。"""
+        out = []
+        for k in range(n):
+            px = p0 + step * k
+            t = (pd.Timestamp(day) + pd.Timedelta(minutes=start + 5 * k))
+            out.append((t.strftime("%Y-%m-%d %H:%M"), td, px, px, px))
+        return out
+
+    def _ms(df):
+        i = pd.DatetimeIndex(df.index)
+        return (i.hour * 60 + i.minute).to_numpy()
+
+    def _sig(df, key, params=None):
+        r = S.run_strategy(df, key, params or {})
+        return r["signal"].to_numpy(), _ms(r)
+
+    # 前一日振幅 100；当日 09:00 起每根涨 2.5，10:20 起偏离过 0.4×100=40
+    pre = _amp("2026-10-09", "2026-10-09", 1000.0, 100.0)
+    day1 = _rise("2026-10-12", "2026-10-12", 540, 24, 1000.0, 2.5)
+
+    # 4a 有夜盘商品：日盘仓当晚 21:05 平
+    eve = _rise("2026-10-12", "2026-10-13", 1260, 12, 1057.5, 0.0)
+    nxt = _rise("2026-10-13", "2026-10-13", 540, 12, 1057.5, 0.0)
+    s, ms = _sig(_mk(pre + day1 + eve + nxt), "ria_break_day")
+    i2100 = int(np.nonzero(ms == 1260)[0][0])
+    i2105 = int(np.nonzero(ms == 1265)[0][0])
+    check("波幅突破：日盘仓当晚 21:05 平（21:00 还持有）",
+          s[i2100] == 1 and s[i2105] == 0,
+          f"21:00={s[i2100]} / 21:05={s[i2105]}")
+
+    # 4b 当晚没有夜盘（节前）→ 顺延到下一个开盘日 09:05
+    eve2 = _rise("2026-10-13", "2026-10-14", 1260, 6, 1057.5, 0.0)   # 次日傍晚才有夜盘
+    s2, ms2 = _sig(_mk(pre + day1 + nxt + eve2), "ria_break_day")
+    d0900 = [k for k in np.nonzero(ms2 == 540)[0] if s2[k] != 0]
+    d0905 = [k for k in np.nonzero(ms2 == 545)[0] if s2[k] == 0]
+    check("波幅突破：当晚没有夜盘 → 顺延到次日 09:05 平",
+          bool(d0900) and bool(d0905),
+          f"09:00 有仓 {len(d0900)} 处 / 09:05 已平 {len(d0905)} 处")
+
+    # 4c 金融期货（首根 09:30、无夜盘）→ 次日 09:35 平
+    fpre = _amp("2026-10-09", "2026-10-09", 1000.0, 100.0, start=570)
+    # 窗口也跟着后移（09:40-10:40 = 第 2..14 根），每根得走快一点才够 0.4×100
+    fday = _rise("2026-10-12", "2026-10-12", 570, 24, 1000.0, 3.5)
+    fnxt = _rise("2026-10-13", "2026-10-13", 570, 12, 1080.5, 0.0)
+    s3, ms3 = _sig(_mk(fpre + fday + fnxt), "ria_break_day")
+    fin_0930 = [k for k in np.nonzero(ms3 == 570)[0] if s3[k] != 0]
+    fin_0935 = [k for k in np.nonzero(ms3 == 575)[0] if s3[k] == 0]
+    check("波幅突破：金融期货 09:35 平（09:30 还持有）",
+          bool(fin_0930) and bool(fin_0935),
+          f"09:30 有仓 {len(fin_0930)} 处 / 09:35 已平 {len(fin_0935)} 处")
+
+    # 4d 夜盘版：21:30 进场、次日 09:05 平
+    neve = _rise("2026-10-12", "2026-10-13", 1260, 12, 1057.5, 4.0)
+    nnxt = _rise("2026-10-13", "2026-10-13", 540, 12, 1101.5, 0.0)
+    s4, ms4 = _sig(_mk(pre + day1 + neve + nnxt), "ria_break_night")
+    n_ent = [k for k in np.nonzero(ms4 == 1290)[0] if s4[k] != 0]
+    n_0900 = [k for k in np.nonzero(ms4 == 540)[0] if s4[k] != 0]
+    n_0905 = [k for k in np.nonzero(ms4 == 545)[0] if s4[k] == 0]
+    check("波幅突破：夜盘仓次日 09:05 平（09:00 还持有）",
+          bool(n_ent) and bool(n_0900) and bool(n_0905),
+          f"21:30 有仓 {len(n_ent)} 处 / 09:00 有仓 {len(n_0900)} 处 / "
+          f"09:05 已平 {len(n_0905)} 处")
+
+    # 4e 两条窗口互不越界：夜盘版在没有夜盘的数据上一笔都不开
+    s5, _ = _sig(_mk(pre + day1 + nxt), "ria_break_night")
+    check("波幅突破：没有夜盘的数据上夜盘版不开仓",
+          not bool((s5 != 0).any()), f"{int((s5 != 0).sum())} 根有仓")
+
+    # 4f 阈值：0.5×前日振幅必须开、0.6 必须不开
+    s6, _ = _sig(_mk(pre + day1 + nxt), "ria_break_day", {"ratio": 0.4})
+    check("波幅突破：0.5×前日振幅必须开多", bool((s6 == 1).any()),
+          f"多 {int((s6 == 1).sum())} 根")
+    s7, _ = _sig(_mk(pre + day1 + nxt), "ria_break_day", {"ratio": 0.6})
+    check("波幅突破：阈值调高就不该开仓", not bool((s7 != 0).any()),
+          f"{int((s7 != 0).sum())} 根有仓")
+    s8, _ = _sig(_mk(pre + day1 + nxt), "cta_break", {"ratio": 0.4})
+    check("波幅突破：检查点版也要开多", bool((s8 == 1).any()),
+          f"多 {int((s8 == 1).sum())} 根")
+    n_entry = int(((s8 != 0) & (np.r_[0, s8[:-1]] == 0)).sum())
     check("波幅突破：检查点版一天最多一笔", n_entry <= 3, f"{n_entry} 笔")
 
-    # ---- 真实数据上跑一遍：两条都要出信号，且 RIA 只在两个窗口里开仓
+    # ---- 5. 真实数据上跑一遍
     df = T.load_main("RB", "SHFE", "5m")
     if df is None or len(df) < 5000:
         skip("波幅突破：真实 5m 数据", "RB 5m 不够")
         return
-    for key in ("ria_break", "cta_break"):
+    for key in ("ria_break_day", "ria_break_night", "cta_break"):
         r = S.run_strategy(df, key)
         sig = r["signal"]
         check(f"波幅突破：{key} 在 RB 5m 上出信号",
               bool((sig != 0).any()) and len(sig) == len(df),
               f"有仓 {int((sig != 0).sum())} 根 / 共 {len(sig)} 根")
-    r = S.run_strategy(df, "ria_break")
-    sig = r["signal"].to_numpy()
-    ms = (pd.DatetimeIndex(r.index).hour * 60
-          + pd.DatetimeIndex(r.index).minute).to_numpy()
-    entry = np.nonzero((sig != 0) & (np.r_[0, sig[:-1]] == 0))[0]
-    in_win = ((ms[entry] >= 580) & (ms[entry] <= 640)) | \
-             ((ms[entry] >= 1270) & (ms[entry] <= 1330))
-    check("波幅突破：RIA 只在日盘 / 夜盘窗口里开仓",
-          bool(len(entry)) and bool(in_win.all()),
-          f"{int((~in_win).sum())}/{len(entry)} 笔在窗口外")
-    # 一天一个窗口最多一笔
-    day = S._trading_days(r)
-    win_key = [f"{pd.Timestamp(day[i]).date()}-"
-               f"{'n' if ms[i] >= 1260 else 'd'}" for i in entry]
-    check("波幅突破：RIA 每个窗口最多一笔",
-          len(win_key) == len(set(win_key)),
-          f"{len(win_key) - len(set(win_key))} 个窗口重复开仓")
+
+    for key, lo, hi, cn in (("ria_break_day", 580, 640, "日盘 09:40-10:40"),
+                            ("ria_break_night", 1270, 1330, "夜盘 21:10-22:10")):
+        r = S.run_strategy(df, key)
+        sig = r["signal"].to_numpy()
+        ms = _ms(r)
+        entry = np.nonzero((sig != 0) & (np.r_[0, sig[:-1]] == 0))[0]
+        in_win = (ms[entry] >= lo) & (ms[entry] <= hi)
+        check(f"波幅突破：{key} 只在{cn}窗口里开仓",
+              bool(len(entry)) and bool(in_win.all()),
+              f"{int((~in_win).sum())}/{len(entry)} 笔在窗口外")
+        day = S._trading_days(r)
+        key_day = [str(pd.Timestamp(day[i]).date()) for i in entry]
+        check(f"波幅突破：{key} 一天最多一笔",
+              len(key_day) == len(set(key_day)),
+              f"{len(key_day) - len(set(key_day))} 天重复开仓")
+        # 出场时刻：把止损和兜底都关掉，剩下的平仓必须全是定时平。
+        # RB 有夜盘，日盘仓只可能落在 21:05 或 09:05，夜盘仓只可能 09:05
+        r2 = S.run_strategy(df, key, {"stop_mult": 999.0, "hold_days": 999})
+        s2 = r2["signal"].to_numpy()
+        m2 = _ms(r2)
+        ex = np.nonzero((s2 == 0) & (np.r_[0, s2[:-1]] != 0))[0]
+        want = {1265, 545} if key == "ria_break_day" else {545}
+        bad = sorted({int(m2[k]) for k in ex} - want)
+        check(f"波幅突破：{key} 关掉止损后只剩定时平，且只落在该落的时刻",
+              bool(len(ex)) and not bad, f"多出来的时刻 {bad}")
 
 
 def check_strategy_runner() -> None:

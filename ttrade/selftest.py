@@ -1279,7 +1279,8 @@ def _run() -> tuple[bool, list[str]]:
         wheel_ok = w1 < w0 and w3 > w2
         wheel_info = f"{w0}→{w1}→{w3} 根"
 
-        # 波幅突破两条（从 future_quant 移植）：研究页要能正常出参数滑杆，
+        # 波幅突破三条（从 future_quant 移植，日盘 / 夜盘拆成两条）：研究页要能
+        # 正常出参数滑杆，
         # 参数个数和 `param_meta` 对不上就会少一根 —— 那种错不报异常，
         # 只是参数悄悄调不了
         brk_ok = False
@@ -1287,7 +1288,7 @@ def _run() -> tuple[bool, list[str]]:
         try:
             keep = win.cb_strategy.currentIndex()
             counts = {}
-            for key in ("ria_break", "cta_break"):
+            for key in ("ria_break_day", "ria_break_night", "cta_break"):
                 i = win.cb_strategy.findData(key)
                 if i < 0:
                     continue
@@ -1296,7 +1297,8 @@ def _run() -> tuple[bool, list[str]]:
                 counts[key] = len(win.param_widgets)
             win.cb_strategy.setCurrentIndex(keep)
             app.processEvents()
-            brk_ok = (counts.get("ria_break") == 8
+            brk_ok = (counts.get("ria_break_day") == 6
+                      and counts.get("ria_break_night") == 6
                       and counts.get("cta_break") == 6
                       and win.sidebar.width() >= 340)
             brk_info = f"{counts} / 侧边栏 {win.sidebar.width()}px"
