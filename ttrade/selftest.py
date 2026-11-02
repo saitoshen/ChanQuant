@@ -1373,9 +1373,18 @@ def _run() -> tuple[bool, list[str]]:
             ccfg = _cross.CrossConfig(mode="hedge", rebalance=5, top_pct=10,
                                       bot_pct=10, factor_keys=["mom_20"])
             cbt = _Bt()
-            cout = _cross.run(cframes, ccfg, cbt)
-            win._finish_cross(cout, cout.label or "截面对冲", ccfg, cframes,
-                              win._period(), cbt, [])
+            # **走真正的后台线程**：截面回测现在整条路都在 `CrossWorker` 里跑。
+            # 以前只有机器学习那条路异步，单因子 / 多因子同步算，几十个品种的
+            # 5 分钟历史一跑窗口就假死
+            win._start_cross_worker(cframes, ccfg, cbt, "自检截面对冲",
+                                    win._period(), [])
+            started = win._c_thread is not None
+            t0 = time.time()
+            while time.time() - t0 < 60 and win._c_thread is not None:
+                app.processEvents()
+                time.sleep(0.02)
+            cout = win.res
+            cross_async_ok = started and win._c_thread is None and cout is not None
             app.processEvents()
             pv = win.view_port
             tabs = win.tabs_port
@@ -1389,14 +1398,15 @@ def _run() -> tuple[bool, list[str]]:
             visible = [tabs.tabText(i) for i in range(tabs.count())
                        if tabs.isTabVisible(i)]
             cross_ok = (
-                cout.ok
+                cross_async_ok
                 and "截面因子分析" in visible
                 and pv.tbl_cfactor.rowCount() >= 2
                 and len(pv.canvas_cf.fig.axes) == 4
                 and pv.tbl_trades.rowCount() > 0
                 and pv.tbl_trades.horizontalHeaderItem(1).text() == "品种"
             )
-            cross_info = (f"交易 {pv.tbl_trades.rowCount()} 笔 / "
+            cross_info = (f"后台线程 {cross_async_ok} / "
+                          f"交易 {pv.tbl_trades.rowCount()} 笔 / "
                           f"因子 {pv.tbl_cfactor.rowCount()} 行 / "
                           f"页签 {'、'.join(visible)}")
         except Exception as exc:  # noqa: BLE001

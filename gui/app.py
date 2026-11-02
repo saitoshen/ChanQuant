@@ -818,9 +818,9 @@ class FactorWorker(QObject):
 class CrossWorker(QObject):
     """在后台线程里跑截面回测。
 
-    单因子 / 多因子几十毫秒，同步算完就行；机器学习要跑几十折 walk-forward，
-    6 个品种 × 十年 5 分钟能跑几分钟 —— 放主线程窗口直接假死，连取消都点不动。
-    统一走线程能少一套分支。
+    **所有截面回测都走这里**，不再分同步 / 异步两条路：几十个品种的 5 分钟历史
+    上，光分数面板 + 排序 + 成本向量就不是几十毫秒的事，主线程里跑窗口会假死；
+    机器学习还要几十折 walk-forward。两条路并存的话，收尾逻辑迟早走偏。
     """
 
     progress = Signal(int, int, str)   # done, total, message
@@ -3133,7 +3133,7 @@ class MainWindow(QMainWindow):
     def _on_family_changed(self) -> None:
         self.family = self.cb_family.currentData() or FAMILY_RULE
         if self.family != FAMILY_CROSS:
-            # 切走之后还在后台跑的那条截面 ML 不该再把结果挂回来
+            # 切走之后还在后台跑的那条截面回测不该再把结果挂回来
             self._cancel_cross_worker()
         self._sync_family_panels()
         # 手动切到截面就把配置窗开出来：参数都搬进窗里了，侧边栏只剩一个按钮，
@@ -4162,9 +4162,12 @@ class MainWindow(QMainWindow):
         self._pending = True
         # 机器学习要跑几十折 walk-forward，拖滑杆时 220ms 就重算一次会把线程
         # 反复打断。给 ML 更长的防抖，让人先拖完再算。
-        delay = 600 if self.factor_mode == "ml" and (
-            self.family == FAMILY_FACTOR or self._filter_active()
-        ) else 220
+        # 截面整条路现在也在后台线程里，一次要算几十个品种的分数面板 —— 同样
+        # 给 600ms，不然拖一下滑杆会排出七八个线程
+        slow = self.family == FAMILY_CROSS or (
+            self.factor_mode == "ml"
+            and (self.family == FAMILY_FACTOR or self._filter_active()))
+        delay = 600 if slow else 220
         QTimer.singleShot(delay, self._deferred_run)
 
     def _deferred_run(self) -> None:
@@ -4677,22 +4680,11 @@ class MainWindow(QMainWindow):
         if ccfg.weight == "tier" and ccfg.tiers >= 2:
             label += f" · {ccfg.tiers} 档"
 
-        if ccfg.factor_mode == "ml":
-            self._start_cross_worker(frames, ccfg, bt, label, period)
-            return
-
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            out = cross_engine.run(frames, ccfg, bt,
-                                   profile=self.cb_cost.currentData() or None,
-                                   label=label)
-        except Exception as exc:  # noqa: BLE001
-            QApplication.restoreOverrideCursor()
-            self._show_single_view()
-            self._clear_chart(f"截面回测失败：{exc}")
-            return
-        QApplication.restoreOverrideCursor()
-        self._finish_cross(out, label, ccfg, frames, period, bt, missing)
+        # 全部走后台线程。单因子 / 多因子在几十个品种的 5 分钟历史上也不是
+        # 几十毫秒的事（分数面板 + 排序 + 成本向量都在这个量级），主线程里跑
+        # 窗口会假死，连「取消」都点不动；机器学习更要跑几十折 walk-forward。
+        # 统一走线程能少一套分支，也免得两条路的结果口径慢慢走偏
+        self._start_cross_worker(frames, ccfg, bt, label, period, missing)
 
     def _finish_cross(self, out, label: str, ccfg, frames: dict, period: str,
                       bt: BacktestConfig, missing: list[str]) -> None:
@@ -4734,8 +4726,9 @@ class MainWindow(QMainWindow):
         )
         self._publish_port(res, label, period, bt.bars_per_year)
 
-    def _start_cross_worker(self, frames, ccfg, bt, label: str, period: str) -> None:
-        """截面机器学习走后台线程。已经在跑的先取消，避免旧结果盖掉新结果。"""
+    def _start_cross_worker(self, frames, ccfg, bt, label: str, period: str,
+                            missing: list[str] | None = None) -> None:
+        """截面回测走后台线程。已经在跑的先取消，避免旧结果盖掉新结果。"""
         self._cancel_cross_worker()
         self._c_seq += 1
         seq = self._c_seq
@@ -4747,7 +4740,7 @@ class MainWindow(QMainWindow):
         # PySide 会当成直连，`done` 于是在**工作线程**里直接跑 `_finish_cross`，
         # 一碰控件就是 "Internal C++ object already deleted" / 随机崩溃
         worker.seq = seq
-        worker.ctx = (ccfg, frames, period, bt)
+        worker.ctx = (ccfg, frames, period, bt, list(missing or []))
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -4759,47 +4752,60 @@ class MainWindow(QMainWindow):
         thread.finished.connect(thread.deleteLater)
 
         self._c_worker, self._c_thread = worker, thread
-        self._show_port_view()
-        self.lbl_status.setText(
-            f"{label}：正在滚动训练（{len(frames)} 个品种，"
-            f"{ccfg.factor_cfg.get('train_window', 500)} 交易日窗口）…"
-        )
+        # 不在这里切到组合页：结果还没出来，切过去是一张空表，用户以为算完了
+        # 又没东西。状态栏给一句「正在算」，算完 `_finish_cross` 再切
+        if ccfg.factor_mode == "ml":
+            self.lbl_status.setText(
+                f"{label}：正在滚动训练（{len(frames)} 个品种，"
+                f"{ccfg.factor_cfg.get('train_window', 500)} 交易日窗口）…"
+            )
+        else:
+            self.lbl_status.setText(
+                f"{label}：正在算截面分数并回测（{len(frames)} 个品种）…")
         thread.start()
 
     def _cancel_cross_worker(self) -> None:
-        if self._c_worker is not None:
-            self._c_worker.cancel()
-            for sig in (self._c_worker.done, self._c_worker.failed,
-                        self._c_worker.progress):
+        """叫停上一轮截面回测。
+
+        只摘掉**界面的**三个槽位，**不动** `done/failed → thread.quit`：那条
+        连接要是被一起断掉，旧线程的事件循环就再也退不出来，线程会一直挂着。
+
+        也不 `wait()`：截面回测的大头（分数面板、排序）是 numpy 里一口气算完的，
+        `quit()` 打断不了它，`wait(4000)` 只会在主线程上白等四秒 —— 每拖一次
+        滑杆卡四秒，比不同步还难受。旧线程跑完会自己 quit + deleteLater，结果
+        靠 `seq` 丢掉。
+        """
+        worker = self._c_worker
+        if worker is not None:
+            worker.cancel()
+            for sig, slot in ((worker.done, self._on_cross_done),
+                              (worker.failed, self._on_cross_failed),
+                              (worker.progress, self._on_cross_progress)):
                 try:
-                    sig.disconnect()
+                    sig.disconnect(slot)
                 except (RuntimeError, TypeError):
                     pass
-        thread = self._c_thread
-        if thread is not None:
-            try:
-                if thread.isRunning():
-                    thread.quit()
-                    thread.wait(4000)
-            except RuntimeError:
-                pass
         self._c_worker = None
         self._c_thread = None
 
     def _on_cross_progress(self, done: int, total: int, msg: str) -> None:
-        self.lbl_status.setText(f"截面机器学习：{msg}（共 {total} 折）")
+        # 只有机器学习那条路会发进度（walk-forward 的折数）；单因子 / 多因子
+        # 不报进度，状态栏就停在「正在算截面分数并回测」那句上
+        self.lbl_status.setText(f"截面回测：{msg}（{done}/{total} 折）")
 
     def _on_cross_done(self, out) -> None:
         # 上下文从发信号的 worker 上取（见 `_start_cross_worker` 里的说明）
         w = self.sender()
         seq = int(getattr(w, "seq", -1))
-        ccfg, frames, period, bt = getattr(w, "ctx", (None, {}, "", None))
+        ctx = getattr(w, "ctx", (None, {}, "", None, []))
+        ccfg, frames, period, bt = ctx[:4]
+        missing = list(ctx[4]) if len(ctx) > 4 else []
         self._c_worker = None
         self._c_thread = None
         if self._closing or seq != self._c_seq or seq == self._c_applied:
             return
         self._c_applied = seq
-        self._finish_cross(out, out.label, ccfg, frames, period, bt, [])
+        self._finish_cross(out, out.label, ccfg, frames, period, bt, missing)
 
     def _on_cross_failed(self, msg: str) -> None:
         w = self.sender()
@@ -4809,7 +4815,7 @@ class MainWindow(QMainWindow):
         if self._closing or seq != self._c_seq:
             return
         self._show_single_view()
-        self._clear_chart(f"截面机器学习失败：{msg}")
+        self._clear_chart(f"截面回测失败：{msg}")
 
     def _cross_result(self, out, label: str, step: int, bpy: float):
         """把 `CrossResult` 包成 `Result`（细节在 `cross.to_result`）。"""

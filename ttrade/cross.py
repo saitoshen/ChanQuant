@@ -584,6 +584,14 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
             return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
                                error="第一步筛完之后池子是空的 —— 把保留比例调大")
 
+    # 截面回测现在整条路都在后台线程里跑（`gui.app.CrossWorker`）。用户拖一下
+    # 滑杆就会重排一次，旧的那次得能自己退出，否则几次下来几个线程抢 CPU。
+    # 分数面板那一步已经把 `cancel` 传下去了，这里只在几段「一口气算完」的
+    # 大块之间补检查点 —— 再细就得进 numpy 循环，不值得
+    def _bail() -> None:
+        if cancel is not None and cancel():
+            raise fstrat.Cancelled
+
     close = close_panel(frames)
     close = close.reindex(score.index).ffill()
     rets = close.pct_change().fillna(0.0)
@@ -592,6 +600,7 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     # 风险平价要各品种的波动率；等权 / 按分数用不上，不算它（滚动标准差在 5 分钟
     # 全历史上也要几百毫秒）
     vol = vol_panel(frames, score.index) if cfg.weight == "risk" else None
+    _bail()
     # 调仓间隔要换算成**根数**：选品种模式按天 / 月给，得靠数据的实际密度落地。
     # 密度按分数面板的索引算（它就是回测的时钟），不能写死 48
     bpd = fstrat.bars_per_day(score.index)
@@ -600,6 +609,8 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
         weights = _select_weights(frames, score, cfg, vol, step=step)
     else:
         weights = _hedge_weights(score, cfg, vol, step=step)
+
+    _bail()
 
     # 两个权重构造器都返回**稠密**矩阵（每一根 bar 都有值）：调仓日之间保持
     # 上一组的仓位，调仓日整体换一次。不要在这里再 ffill —— 那会把「主动平掉」
