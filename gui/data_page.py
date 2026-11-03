@@ -32,7 +32,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from PySide6.QtCore import QObject, QThread, QTime, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QTime, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -721,7 +721,10 @@ class DataPage(QWidget):
         self.cb_cost = QComboBox()
         self._fill_cost_combo()
         self.cb_cost.setToolTip(
-            "国内期货回测用的成本档位。单边成本 = 交易所手续费 × 倍数 + 滑点跳数 × 最小变动价位。\n"
+            "国内期货回测用的成本档位。单边成本 = 交易所手续费 × 倍数 + 滑点。\n"
+            "滑点两种口径：按跳（× 最小变动价位）或按 ‱（× 价格，不看 tick）。\n"
+            "按跳的滑点会乘当日复权因子：前复权把历史价格整体缩小过，一跳是真实世界\n"
+            "里的固定金额，不换算的话越往前成本越便宜。\n"
             "改档位之后，研究页 / 组合页 / 回放都会用新的口径重算。"
         )
         self.cb_cost.currentIndexChanged.connect(self._on_cost_pick)
@@ -730,7 +733,7 @@ class DataPage(QWidget):
         row_cost = QHBoxLayout()
         row_cost.setSpacing(6)
         self.btn_cost = QPushButton("成本参数…")
-        self.btn_cost.setToolTip("改三档的手续费倍数和滑点跳数")
+        self.btn_cost.setToolTip("改四档的手续费倍数和滑点（跳 / ‱ 两种口径）")
         self.btn_cost.clicked.connect(self._open_cost_dialog)
         row_cost.addWidget(self.btn_cost)
         self.btn_sym = QPushButton("品种信息…")
@@ -1109,8 +1112,11 @@ class DataPage(QWidget):
 
         self.cb_cost.blockSignals(True)
         self.cb_cost.clear()
-        for key, p in costs.PROFILES.items():
+        # 用 `load()` 而不是 `PROFILES`：用户改过跳数之后，下拉里的说明要跟着变
+        for key, p in costs.load()["profiles"].items():
             self.cb_cost.addItem(p["label"], key)
+            self.cb_cost.setItemData(self.cb_cost.count() - 1,
+                                     costs.short_text(p), Qt.ToolTipRole)
         i = self.cb_cost.findData(costs.current())
         self.cb_cost.setCurrentIndex(max(i, 0))
         self.cb_cost.blockSignals(False)
@@ -1123,8 +1129,8 @@ class DataPage(QWidget):
             return
         p = costs.profile(self.cb_cost.currentData() or None)
         self.lbl_cost_hint.setText(
-            f"当前用「{p['label']}」：{p['fee_mult']:g} 倍交易所手续费 + "
-            f"{p['slip_ticks']:g} 跳滑点。tick、手续费、保证金在「品种信息」里改。"
+            f"当前用「{p['label']}」：{costs.short_text(p)}。"
+            "tick、手续费、保证金在「品种信息」里改。"
         )
 
     def _on_cost_pick(self, *_a) -> None:

@@ -705,7 +705,8 @@ class PortfolioRunner:
             sig = out.df["signal"].iloc[-1]
             return 0 if pd.isna(sig) else int(sig)
 
-        out = run_strategy(df, st.cfg.rule_key, st.cfg.rule_params)
+        out = run_strategy(df, st.cfg.rule_key, st.cfg.rule_params,
+                           reverse=bool(getattr(st.cfg, "rule_reverse", False)))
         sig = out["signal"].iloc[-1]
         return 0 if pd.isna(sig) else int(sig)
 

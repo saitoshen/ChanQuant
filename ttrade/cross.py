@@ -442,6 +442,11 @@ def cost_vector(frames: dict[str, pd.DataFrame], bt: BacktestConfig,
 
     按手收的手续费要折成比例才能和权重相乘：`元/手 ÷ (价格 × 乘数)`。用中位价
     折，不用最新价 —— 最新价可能是个跳空，会把成本算歪。
+
+    滑点要按**中位复权因子**换一次（`price_scale` 列）：一跳是真实世界里的固定
+    金额，前复权价整体被缩放过，不换算的话历史越久远成本越便宜。这里只取一个
+    比例给整段用，所以取中位数 —— 权重矩阵是逐根的，成本向量是一个数，用中位数
+    和「按价格中位数折手续费」是同一个口径。
     """
     out = {}
     for sym, df in frames.items():
@@ -451,6 +456,10 @@ def cost_vector(frames: dict[str, pd.DataFrame], bt: BacktestConfig,
         c = BacktestConfig()
         costs.apply(c, sym_code, ex, profile)
         price = float(pd.Series(df["close"]).median() or 0.0)
+        scale = 1.0
+        if "price_scale" in df.columns:
+            s = pd.to_numeric(df["price_scale"], errors="coerce").median()
+            scale = float(s) if s == s and s > 0 else 1.0
         # 乘数要查品种信息：`BacktestConfig()` 的默认值是 1，拿它去折算「元/手」
         # 会把螺纹（乘数 10）的手续费算小 10 倍
         mult = float(symbols_info.info(sym_code, ex).get("mult") or 1.0)
@@ -460,7 +469,7 @@ def cost_vector(frames: dict[str, pd.DataFrame], bt: BacktestConfig,
             fee = c.fee_per_lot / (price * max(mult, 1e-9))
         else:
             fee = c.fee_rate
-        slip = c.slip_amount(price) / price
+        slip = c.slip_amount(price, scale) / price
         out[sym] = fee + slip
     return pd.Series(out, dtype=float)
 
@@ -624,8 +633,17 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     equity.iloc[0] = 1.0
     bpy = bt.bars_per_year or 252.0
     n_reb = len(range(0, len(score), step))
+    # 成本占**初始资金**的比例：`fee` 是「当根换手 × 单边成本率」，乘上换手前的
+    # 净值就是那一刻的金额。截面净值是归一化曲线，所以这里只能先记比例，
+    # 到 `to_result` 里再乘回本金
+    m = _metrics(equity, bpy)
+    m["cost_pct"] = float((fee * equity.shift(1).fillna(1.0)).sum())
+    # 成交额（同样是占初始资金的比例）：成本率 = 成本 ÷ 成交额，绩效页那一行
+    # 显示的是它。换手 Σ|Δw| 就是「这一根买卖了净值的多少倍」
+    turnover = weights.diff().abs().sum(axis=1).fillna(0.0)
+    m["notional_pct"] = float((turnover * equity.shift(1).fillna(1.0)).sum())
     return CrossResult(
-        equity=equity, weights=weights, metrics=_metrics(equity, bpy),
+        equity=equity, weights=weights, metrics=m,
         label=label, legs=int(weights.abs().gt(0).sum(axis=1).max() or 0),
         n_rebalance=n_reb,
         step=step, bars_per_day=bpd,
@@ -635,7 +653,7 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
 
 
 def to_result(out: "CrossResult", label: str = "", step: int = 0,
-              bpy: float = 252.0):
+              bpy: float = 252.0, initial_cash: float = 100_000.0):
     """把 `CrossResult` 包成 `backtest.Result`，好让现成的绩效页直接吃得下。
 
     绩效表里的「交易」还是按**调仓区间**算的（区间收益为正算赢）：截面策略的
@@ -682,6 +700,16 @@ def to_result(out: "CrossResult", label: str = "", step: int = 0,
     # 绩效表里「期末资金」这一行读的是 `final_equity`，`backtest._metrics` 不算
     # 它（那是 `run_backtest` 事后补的），这里得自己补上
     m["final_equity"] = float(eq.iloc[-1])
+    # 成本：截面净值是归一化曲线，金额只能按本金折回去。换手是逐根扣的，
+    # 所以「总成本」在这里是「如果本金是 initial_cash，这一路换了多少次手」
+    cost_pct = float(out.metrics.get("cost_pct") or 0.0)
+    m["total_cost"] = cost_pct * float(initial_cash or 0.0)
+    m["avg_cost"] = float(m["total_cost"] / n) if n else 0.0
+    # 成本率：两个比例相除，本金直接约掉（乘回金额只是为了让「成交额」这一列
+    # 和 `total_cost` 同单位，界面上真要显示也能用）
+    notional_pct = float(out.metrics.get("notional_pct") or 0.0)
+    m["notional"] = notional_pct * float(initial_cash or 0.0)
+    m["cost_rate"] = float(cost_pct / notional_pct) if notional_pct > 0 else 0.0
     return Result(equity=eq, position=pos, trades=list(out.trades),
                   metrics=m, label=label)
 

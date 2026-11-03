@@ -149,6 +149,11 @@ class StrategyConfig:
     # 规则策略
     rule_key: str = ""
     rule_params: dict = field(default_factory=dict)
+    # 反向交易：信号整体取反（多 ↔ 空）。有些规则反过来做才有 alpha —— 比如
+    # 趋势策略在震荡品种上，与其重写一条「做空版」，不如把现成的翻过来。
+    # 放在配置里而不是界面上乘一下：组合回放、实盘、存盘都必须跟着走，
+    # 否则「研究页看到的」和「实盘跑出来的」是两条相反的曲线
+    rule_reverse: bool = False
 
     # 因子策略
     factor_mode: str = ""
@@ -296,7 +301,10 @@ class StrategyConfig:
             from ttrade.strategies import STRATEGIES
 
             spec = STRATEGIES.get(self.rule_key)
-            return spec.label if spec else (self.rule_key or "未选策略")
+            name = spec.label if spec else (self.rule_key or "未选策略")
+            # 反向要写进名字里：列表里两条同名策略一条正着做一条反着做，
+            # 不标出来的话只能靠点进去看，而它们的曲线是镜像的
+            return f"{name}（反向）" if self.rule_reverse else name
         mode = {"single": "单因子", "multi": "多因子", "ml": "机器学习"}.get(
             self.factor_mode, self.factor_mode or "因子"
         )
@@ -362,6 +370,10 @@ class StrategyConfig:
         if not cfg.created:
             cfg.created = time.strftime("%Y-%m-%d %H:%M")
         # 兼容手改过的 JSON：类型不对就退回默认，别让整份配置加载失败
+        if isinstance(cfg.rule_reverse, str):
+            cfg.rule_reverse = cfg.rule_reverse.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            cfg.rule_reverse = bool(cfg.rule_reverse)
         try:
             cfg.volume = max(1, int(cfg.volume))
         except (TypeError, ValueError):

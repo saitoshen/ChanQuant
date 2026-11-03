@@ -145,6 +145,26 @@ def _num(x) -> str:
     return f"{float(x):.2f}"
 
 
+def _pct(x) -> str:
+    """百分比；None / NaN 写「—」。老结果里没有成本率这一项。"""
+    try:
+        if x is None or x != x:
+            return "—"
+    except TypeError:
+        return "—"
+    return f"{float(x) * 100:.2f}%"
+
+
+def _money(x) -> str:
+    """金额。老结果 / 还没接成本口径的路径没有这一项，写「—」。"""
+    try:
+        if x is None or x != x:
+            return "—"
+    except TypeError:
+        return "—"
+    return f"${float(x):,.0f}"
+
+
 def summary(rp: "Replay", head: str, period: str) -> str:
     """把一次回放摊成一段纯文本。
 
@@ -185,6 +205,14 @@ def summary(rp: "Replay", head: str, period: str) -> str:
         f"交易  {m['n_trades']} 笔｜胜率 {m['win_rate'] * 100:.0f}%"
         f"｜盈亏比 {m['profit_factor']:.2f}｜仓位时间 {m['exposure'] * 100:.0f}%"
         f"｜平均持仓 {hold_text(m['avg_bars'], rp.period, rp.bars_per_year)}"
+    )
+    # 成本单列：它已经从权益里扣掉了，但「花在哪」得能回答。每笔成本率用百分比
+    # （成本 ÷ 成交额）而不是金额 —— 金额随本金和手数变，比例才是成本本身，
+    # 也能直接对着成本档位看（3‱ 滑点 ≈ 0.03%）
+    lines.append(
+        f"成本  合计 {_money(m.get('total_cost'))}"
+        f"｜每笔成本率 {_pct(m.get('cost_rate'))}"
+        + (f"｜基准 {_money(b.get('total_cost'))}" if b is not None else "")
     )
     if not rp.long_only and m.get("n_short"):
         lines.append(
@@ -283,12 +311,15 @@ def run(cfg, df: pd.DataFrame | None, market: str = "",
             # 显示名或者策略库模板名。报错带上可用代号，下一轮能自己改对
             return Replay(error=(f"平台没有这个策略：{rule_key or '（空）'}。"
                                  f"可用的代号有：{available_text()}"))
+        rev = bool(getattr(cfg, "rule_reverse", False))
         try:
-            base = run_strategy(df, rule_key, dict(getattr(cfg, "rule_params", {}) or {}))
+            base = run_strategy(df, rule_key,
+                                dict(getattr(cfg, "rule_params", {}) or {}),
+                                reverse=rev)
         except Exception as exc:  # noqa: BLE001
             return Replay(error=f"策略计算失败：{exc}")
         rule_signal = base["signal"].to_numpy(int)
-        label = STRATEGIES[rule_key].label
+        label = STRATEGIES[rule_key].label + ("（反向）" if rev else "")
 
     # 规则策略 + 因子过滤：`factor_mode` 非空就说明这份配置带着过滤条件。
     # 因子策略本身当然也走这一段。
@@ -399,7 +430,8 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
     if not out.ok:
         return Replay(error=out.error or "截面回测没有算出净值")
     res = cross_engine.to_result(out, label=label, step=out.step,
-                                 bpy=bt.bars_per_year)
+                                 bpy=bt.bars_per_year,
+                                 initial_cash=bt.initial_cash)
     return Replay(res=res, bh=None, label=label, family="cross", period=period,
                   long_only=bt.long_only, bars_per_year=bt.bars_per_year,
                   cross=(frames, ccfg, out.score))

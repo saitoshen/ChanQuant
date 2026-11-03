@@ -188,6 +188,10 @@ def load_main(
 
     if n > 1:
         out = merge_bars(out, n)
+    # 复权用过的缩放系数留着：一跳是真实世界里的固定金额，回测算滑点时要按它
+    # 换回复权价口径（见 `BacktestConfig.slip_amount`）。merge_bars 的聚合表是
+    # 写死的，这一列只能合并之后再挂；因子层不看它，只是多一列元数据。
+    out["price_scale"] = pd.Series(f, index=df.index).reindex(out.index).to_numpy(float)
     # 因子层要靠它认品种（品种季节性日历、按品种的口径判断）。attrs 不走
     # 计算，只当元数据；merge_bars 里 copy 过，所以放在最后挂。
     out.attrs["symbol"] = symbol

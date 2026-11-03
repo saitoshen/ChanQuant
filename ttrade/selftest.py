@@ -472,6 +472,201 @@ def _run() -> tuple[bool, list[str]]:
 
     check("规则 + 因子过滤", _factor_filter)
 
+    def _ml_multi():
+        """机器学习多品种：每个品种各训一遍，折级进度要报上来，还得能在折间叫停。
+
+        以前多品种这条路直接把机器学习拦下来（"每个品种都要单独重训一遍"），
+        拦掉等于「这套参数换一批品种还灵不灵」永远问不了。放开之后有两个新
+        要求：进度必须细到折（否则界面几分钟不动，看着像卡死），停止必须能在
+        折之间生效（否则点完还得等整个品种训完）。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from gui import app as GUI
+        from ttrade import factor_strategy as FS
+        from ttrade.backtest import BacktestConfig
+
+        n = 700
+        idx = pd.date_range("2020-01-01", periods=n, freq="B")
+        r = (np.sin(np.arange(n) / 25.0) * 0.01
+             + np.random.default_rng(3).normal(0, 0.004, n))
+        close = pd.Series(100 * np.exp(np.cumsum(r)), index=idx)
+        # 开盘价必须和收盘价不同：前向收益是「次日开盘 / 当日收盘」，两者取同一
+        # 个数的话标签恒等于 0，模型学出来的权重全是 0，整条策略空仓 —— 而
+        # 「跑通了、只是没交易」看起来和正常结果一模一样
+        open_ = close * (1 + 0.001 * np.sin(np.arange(n) / 3.0))
+        df = pd.DataFrame({
+            "open": open_,
+            "high": np.maximum(open_, close) * 1.005,
+            "low": np.minimum(open_, close) * 0.995,
+            "close": close, "volume": 1e5,
+        })
+        fcfg = FS.FactorConfig(model="linear", window=60, horizon=1,
+                               train_window=200, step=60, min_train=120)
+        job = GUI.BacktestJob(
+            key="X", label="X", df=df, cfg=BacktestConfig(initial_cash=100_000),
+            family=GUI.FAMILY_FACTOR, rule_key="", rule_params={},
+            factor_mode="ml", factor_keys=("mom_20", "mom_60", "ma_gap_20"),
+            factor_cfg=fcfg, filtered=False,
+        )
+        seen: list[str] = []
+        res = GUI.run_backtest_job(job, progress=lambda d, t, m: seen.append(m))
+        if res is None:
+            raise RuntimeError("机器学习多品种任务没有结果")
+        if not seen:
+            raise RuntimeError("没有报出折级进度，多品种跑 ML 时界面会像卡死")
+        if not res.metrics["n_trades"]:
+            raise RuntimeError("机器学习跑完一笔没做，等于这条链没验到")
+        try:
+            GUI.run_backtest_job(job, cancel=lambda: True)
+        except FS.Cancelled:
+            pass
+        else:
+            raise RuntimeError("叫停没生效，得等整个品种训完才停")
+        return (f"{len(seen)} 次折级进度，停止即时生效，"
+                f"{res.metrics['n_trades']} 笔交易")
+
+    check("机器学习多品种任务", _ml_multi)
+
+    def _ml_trigger():
+        """触发模式（稀疏采样）的决策口径：观点 ffill、进场在触发点、出场看强度。
+
+        稀疏采样把「在哪建样本」和「在哪做决策」绑在一起之后，出场就成了问题：
+        分数在触发点之间是阶梯常值，拿它判「跌破 0.3」永远等不到，仓位会一路拖到
+        下一次触发。所以出场改成看**触发强度**（密集、每根都有值），进场仍看模型
+        分数，方向由触发给。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factor_strategy as FS
+
+        n = 900
+        idx = pd.date_range("2020-01-01", periods=n, freq="B")
+        r = (np.sin(np.arange(n) / 25.0) * 0.01
+             + np.random.default_rng(1).normal(0, 0.004, n))
+        close = pd.Series(100 * np.exp(np.cumsum(r)), index=idx)
+        # 开盘价 ≠ 收盘价，否则前向收益恒为 0、模型权重全 0（同 `_ml_multi`）
+        open_ = close * (1 + 0.001 * np.sin(np.arange(n) / 3.0))
+        df = pd.DataFrame({
+            "open": open_,
+            "high": np.maximum(open_, close) * 1.005,
+            "low": np.minimum(open_, close) * 0.995,
+            "close": close, "volume": 1e5,
+        })
+        cfg = FS.FactorConfig(model="linear", window=60, horizon=1,
+                              train_window=200, step=60, min_train=120,
+                              entry_z=1.0, exit_z=0.3, sample_mode="trigger",
+                              trigger_keys=["mom_20"], trigger_z=1.0,
+                              trigger_tiers=0, trigger_cool=3)
+        out = FS.run_factor_strategy(df, "ml", ["mom_20", "mom_60", "ma_gap_20"], cfg)
+        plan = out.pack.trigger
+        if plan is None or not plan.mask.any():
+            raise RuntimeError("触发模式下没有决策点")
+        sig = out.df["signal"].to_numpy()
+        sc = out.pack.score.to_numpy()
+        chg = np.flatnonzero(np.diff(np.r_[0, sig]) != 0)
+
+        # 1. 观点只在决策点刷新，之间是常值
+        prev, drift = np.nan, 0
+        for i in range(len(sc)):
+            if plan.mask[i]:
+                prev = sc[i]
+            elif not np.isclose(sc[i], prev, equal_nan=True):
+                drift += 1
+        if drift:
+            raise RuntimeError(f"{drift} 根没沿用上一次的观点（ffill 没生效）")
+
+        # 2. 进场只发生在决策点
+        enter = [i for i in chg if sig[i] != 0]
+        if not enter:
+            raise RuntimeError("一笔没开，这条链没验到")
+        stray = [i for i in enter if not plan.mask[i]]
+        if stray:
+            raise RuntimeError(f"{len(stray)} 次开仓不在决策点：{stray[:3]}")
+
+        # 3. 因子通道的仓位按强度出场：平仓那根，强度已回落到离场阈值以内
+        bad = []
+        for i in chg:
+            if sig[i] != 0:
+                continue
+            j = i - 1
+            while j >= 0 and sig[j] == 0:
+                j -= 1
+            if j < 0:
+                continue
+            s = plan.strength[i]
+            if not (np.isfinite(s) and (s < 0.3 if sig[j] == 1 else s > -0.3)):
+                bad.append(i)
+        if bad:
+            raise RuntimeError(f"{len(bad)} 根平仓不是按触发强度：{bad[:3]}")
+
+        # 4. 不勾稀疏采样时没有触发计划，走的还是老状态机
+        import dataclasses
+
+        plain = FS.run_factor_strategy(
+            df, "ml", ["mom_20", "mom_60", "ma_gap_20"],
+            dataclasses.replace(cfg, sample_mode="all"))
+        if plain.pack.trigger is not None:
+            raise RuntimeError("没开稀疏采样却生成了触发计划")
+
+        # 5. 反转因子：强度严格取负（样本方向、进场方向、出场判据一起翻）
+        flip = FS.run_factor_strategy(
+            df, "ml", ["mom_20", "mom_60", "ma_gap_20"],
+            dataclasses.replace(cfg, trigger_flip=True))
+        s_a = np.nan_to_num(plan.strength, nan=0.0)
+        s_b = np.nan_to_num(flip.pack.trigger.strength, nan=0.0)
+        if not np.allclose(s_a, -s_b, atol=1e-12):
+            raise RuntimeError("反转因子后触发强度不是原强度的相反数")
+        if not flip.pack.trigger.mask.any():
+            raise RuntimeError("反转因子后一个决策点都没有")
+
+        # 6. 只用规则：两个触发因子都留空，方向全由规则给、出场跟规则 signal
+        only = FS.run_factor_strategy(
+            df, "ml", ["mom_20", "mom_60", "ma_gap_20"],
+            dataclasses.replace(cfg, trigger_keys=[], trigger_rule="ma_cross",
+                                trigger_params={"fast": 3, "slow": 8}))
+        op = only.pack.trigger
+        if op is None or op.factor_channel or not op.rule_channel:
+            raise RuntimeError("只用规则时通道判定不对")
+        osig = only.df["signal"].to_numpy()
+        if not (osig != 0).any():
+            raise RuntimeError("只用规则一笔都没开")
+        # 规则通道的仓位必须始终和规则自己的方向一致（含出场）
+        bad = int(np.sum((osig != 0) & (osig != op.rule_sig)))
+        if bad:
+            raise RuntimeError(f"{bad} 根仓位和规则方向不一致")
+
+        # 7. 规则反转：rule_sig 取负，armed 是同一批
+        rflip = FS.run_factor_strategy(
+            df, "ml", ["mom_20", "mom_60", "ma_gap_20"],
+            dataclasses.replace(cfg, trigger_keys=[], trigger_rule="ma_cross",
+                                trigger_params={"fast": 3, "slow": 8},
+                                trigger_rule_flip=True))
+        rp = rflip.pack.trigger
+        if not np.allclose(op.rule_sig, -rp.rule_sig):
+            raise RuntimeError("反转规则后 rule_sig 不是相反数")
+        if not np.array_equal(op.armed, rp.armed):
+            raise RuntimeError("反转规则改变了「刚开仓」的那几根")
+
+        # 8. 一个触发源都没有：必须在源头拦住，不能跑出一条空仓净值
+        try:
+            FS.run_factor_strategy(
+                df, "ml", ["mom_20", "mom_60", "ma_gap_20"],
+                dataclasses.replace(cfg, trigger_keys=[], trigger_rule=""))
+        except ValueError as exc:
+            if "触发源" not in str(exc):
+                raise RuntimeError(f"报错文案没讲清原因：{exc}") from exc
+        else:
+            raise RuntimeError("没有任何触发源却跑通了")
+
+        return (f"{int(plan.mask.sum())} 个决策点 / {len(enter)} 次开仓，"
+                f"{len(chg) - len(enter)} 次按强度平仓；"
+                f"只用规则 {int((osig != 0).sum())} 根持仓")
+
+    check("机器学习触发模式（稀疏采样）", _ml_trigger)
+
     def _factor_reverse():
         """逐因子反转：分数严格取负，仓位严格对调。"""
         import numpy as np
@@ -1599,11 +1794,122 @@ def _run() -> tuple[bool, list[str]]:
                 "侧边栏，或者侧边栏顺序被搬乱了"
             )
 
+        # ---- 侧边栏宽度：控件不该被挤到右边看不见
+        #
+        # 横向滚动条现在是「按需」的，但那只是兜底 —— 正常状态下不该出现。这一块
+        # 出过两次事：机器学习「稀疏采样」里两个因子下拉并排，最小宽度各 290 px，
+        # 把整张卡片撑到 640 px，右边直接被裁掉；用户看到的是「很多框跑到右边
+        # 看不见了」。
+        #
+        # 量的是**面板自己**的最小宽度，不读 `content.minimumSizeHint()`：布局的
+        # 最小尺寸是逐层缓存的，研究页不在前台时，控件显隐传不回父布局，读出来会
+        # 永远停在上一个状态 —— 那就正好把要抓的 bug 漏掉
+        from PySide6.QtWidgets import QScrollArea
+
+        scroll = win.sidebar.findChild(QScrollArea, "SideScroll")
+        side_info = "侧边栏不可测"
+        if scroll is not None:
+            # 面板外面还有三层留白：内容右 6 + 卡片左右 12×2 + 子卡片左右 10×2
+            PAD = 50
+            panels = [(name, getattr(win, name, None)) for name in
+                      ("box_sparse", "box_fsel", "box_rule", "box_filter", "box_factor")]
+            panels = [(n, w) for n, w in panels if w is not None]
+
+            # 量的时候别让「改参数自动回测」插进来跑一整套（ML 要几十折）
+            was_auto = win.chk_auto.isChecked()
+            win.chk_auto.blockSignals(True)
+            win.chk_auto.setChecked(False)
+            worst: list[tuple[str, int]] = []
+            try:
+                for fam, modes in (("rule", ("",)), ("factor", ("single", "multi", "ml")),
+                                   ("cross", ("",))):
+                    win.cb_family.setCurrentIndex(win.cb_family.findData(fam))
+                    app.processEvents()
+                    for mode in modes:
+                        if mode:
+                            win.cb_fmode.setCurrentIndex(win.cb_fmode.findData(mode))
+                        # 下拉没变的时候不触发 `currentIndexChanged`，面板显隐不会
+                        # 跟着刷新（上一轮可能刚被截面模式藏起来）。直接同步一次
+                        win._sync_factor_panel()
+                        app.processEvents()
+                        if mode == "ml":
+                            # 先关再开：配置恢复时是 blockSignals 后 setChecked 的，
+                            # 直接 setChecked(True) 可能不触发 toggled，参数区不展开
+                            # 就等于没量到这一块（而它正是撑宽侧边栏的元凶）
+                            win.chk_sparse.setChecked(False)
+                            win.chk_sparse.setChecked(True)
+                            app.processEvents()
+                        for name, w in panels:
+                            if w.isHidden():
+                                continue
+                            worst.append((f"{fam}/{mode or '-'}·{name}",
+                                          int(w.minimumSizeHint().width())))
+                        if mode == "ml":
+                            win.chk_sparse.setChecked(False)
+                win.cb_family.setCurrentIndex(win.cb_family.findData("rule"))
+                app.processEvents()
+            finally:
+                win.chk_auto.setChecked(was_auto)
+                win.chk_auto.blockSignals(False)
+            vp = scroll.viewport().width()
+            if not worst:
+                raise RuntimeError("侧边栏面板一个都没量到")
+            top = max(worst, key=lambda x: x[1])
+            side_info = f"侧边栏 {vp}px / 最宽面板 {top[1]}px（{top[0]}）"
+            over = [f"{tag} {w}px" for tag, w in worst if w > vp - PAD]
+            if over:
+                raise RuntimeError(f"侧边栏放不下（可视 {vp}px，留白 {PAD}px）："
+                                   + "、".join(over))
+
+        # ---- 触发面板：两个「不用」选项 + 两个反转开关
+        #
+        # 「不用触发因子」必须在下拉自己的列表里：切市场会 clear() 重填，早先
+        # cb_trig2 那一项是在外面 insertItem 补的，切一次市场就没了 —— 用户会
+        # 莫名其妙发现「不用第二个因子」这个选项消失
+        trig_ok, trig_info = True, ""
+        try:
+            win.cb_family.setCurrentIndex(win.cb_family.findData("factor"))
+            win.cb_fmode.setCurrentIndex(win.cb_fmode.findData("ml"))
+            win._sync_factor_panel()
+            win.chk_sparse.setChecked(True)
+            app.processEvents()
+            if win.cb_trig1.itemData(0) != "" or win.cb_trig2.itemData(0) != "":
+                raise RuntimeError("两个触发因子下拉的第一项不是「不用」")
+            # 两个都选「不用」= 只用规则：因子反转该灰、规则反转该亮
+            win.cb_trig1.setCurrentIndex(0)
+            win.cb_trig2.setCurrentIndex(0)
+            win.cb_trig_rule.setCurrentIndex(1)
+            app.processEvents()
+            if win.chk_trig_flip.isEnabled():
+                raise RuntimeError("没有触发因子时「反转因子」还能勾")
+            if not win.chk_trig_rule_flip.isEnabled():
+                raise RuntimeError("选了触发规则，「反转规则」却是灰的")
+            if win._trigger_keys():
+                raise RuntimeError("两个「不用」仍然算出了触发因子")
+            # 切市场再切回来：「不用」不能丢
+            mk = win.cb_market.currentData()
+            others = [win.cb_market.itemData(i) for i in range(win.cb_market.count())]
+            others = [m for m in others if m and m != mk]
+            if others:
+                win.cb_market.setCurrentIndex(win.cb_market.findData(others[0]))
+                app.processEvents()
+                if win.cb_trig1.itemData(0) != "" or win.cb_trig2.itemData(0) != "":
+                    raise RuntimeError("切市场后「不用」这个选项丢了")
+                win.cb_market.setCurrentIndex(win.cb_market.findData(mk))
+                app.processEvents()
+            win.chk_sparse.setChecked(False)
+            trig_info = "「不用」两项都在（切市场后仍在），反转开关跟着触发源灰 / 亮"
+        except Exception as exc:      # noqa: BLE001
+            trig_ok, trig_info = False, f"{type(exc).__name__}: {exc}"
+        if not trig_ok:
+            raise RuntimeError(f"触发面板异常：{trig_info}")
+
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
                 f"{factor_info}，滚轮缩放 {wheel_info}，策略验证 {verify_info}，"
                 f"波幅突破 {brk_info}，"
                 f"组合 {combo_info}，"
                 f"截面 {cross_info}，两步配置 {cross_dlg_info}，"
+                f"{side_info}，触发 {trig_info}，"
                 f"回测区间 {range_info}，实时开关已复位，"
                 f"数据管理页就绪，手册 {manual_info}，输出 {out_info}，"
                 f"对话渲染 {chat_info}，能力包 {skill_info}")

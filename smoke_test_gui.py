@@ -134,7 +134,8 @@ def main() -> int:
             app.processEvents()
             if win._m_thread is not None:
                 fails.append("多品种回测 120 秒没跑完")
-            elif win.res is None or win.res.label != "多品种等权":
+            # 标签可能带「（反向）」后缀（规则策略勾了反向交易），按前缀比
+            elif win.res is None or not str(win.res.label).startswith("多品种等权"):
                 fails.append(f"多品种回测没画出结果：{getattr(win.res, 'label', None)}")
             if not win.btn_stop.isHidden():
                 fails.append("多品种回测跑完后「停止回测」还留着")

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -1670,6 +1671,20 @@ def check_strategy_store() -> None:
               back_w.cross_weight == "score" and "按分数" in back_w.params_text(),
               f"{back_w.cross_weight} / {back_w.params_text()}")
 
+        # 反向交易：开关要存得住，而且名字要带后缀 —— 库里两条同名策略一条正着
+        # 做一条反着做，曲线是镜像的，不标出来根本分不清
+        rv = a.clone(name="反向版", rule_reverse=True)
+        St.add_to_library(rv)
+        back_rv = next(c for c in St.load_library() if c.sid == rv.sid)
+        check("策略配置：反向交易往返一致",
+              back_rv.rule_reverse is True and "（反向）" in back_rv.strategy_label(),
+              f"{back_rv.rule_reverse} / {back_rv.strategy_label()}")
+        check("策略配置：不勾反向就不带后缀",
+              "（反向）" not in a.strategy_label(), a.strategy_label())
+        # 只差一个方向的两条配置不是重复，不能当成一条
+        check("策略配置：反向与正向不算重复",
+              not a.same_shape(a.clone(rule_reverse=True)), "被当成重复了")
+
         St.save_chase(St.ChaseConfig(enabled=True, wait_sec=3, retries=2, ticks=5))
         c = St.load_chase()
         check("追单设置：往返一致", (c.wait_sec, c.retries, c.ticks) == (3, 2, 5),
@@ -1722,13 +1737,59 @@ def check_costs() -> None:
           < p["stress"]["slip_ticks"],
           str({k: v["slip_ticks"] for k, v in p.items()}))
 
+    check("成本档位：默认 0.5 / 1 / 2 跳",
+          [p[k]["slip_ticks"] for k in ("optimistic", "neutral", "stress")]
+          == [0.5, 1.0, 2.0],
+          str({k: v["slip_ticks"] for k, v in p.items()}))
+
+    check("成本档位：四档都在（含 bp）",
+          set(costs.load()["profiles"]) == {"optimistic", "neutral", "stress", "bp"},
+          str(list(costs.load()["profiles"])))
+
+    # 「按 bp」档：不看 tick，直接按价格比例。跳数那两列必须清零，否则
+    # `slip_amount` 会走回 tick 分支 —— 界面上写着 3‱，实际收的还是跳
+    bp = costs.profile("bp")
+    check("成本档位：bp 档默认 3‱",
+          bp["mode"] == "bp" and bp["slip_bp"] == 3.0 and bp["slip_ticks"] == 0.0,
+          str(bp))
+    btb = B.BacktestConfig()
+    costs.apply(btb, "RB", "SHFE", "bp")
+    check("成本档位：bp 档不看 tick",
+          btb.tick_size == 0.0 and btb.slippage_ticks == 0.0
+          and abs(btb.slippage - 0.0003) < 1e-12 and btb.fee_rate > 0,
+          f"tick={btb.tick_size} ticks={btb.slippage_ticks} slip={btb.slippage}")
+    # 比例型成本不该被复权因子缩放：分子分母同时被 f 缩放，自己抵消
+    check("成本档位：bp 档一手滑点 = 价格 × 3‱（不随复权因子变）",
+          abs(btb.slip_amount(3000.0) - 0.9) < 1e-9
+          and abs(btb.slip_amount(3000.0, 0.6) - 0.9) < 1e-9,
+          f"{btb.slip_amount(3000.0)} / scale 0.6 → {btb.slip_amount(3000.0, 0.6)}")
+    check("成本档位：下拉与提示条分得清 bp 和跳",
+          "‱" in costs.short_text(bp) and "跳" in costs.short_text(p["neutral"])
+          and "不看 tick" in costs.describe("RB", "SHFE", "bp"),
+          f"{costs.short_text(bp)} | {costs.describe('RB', 'SHFE', 'bp')}")
+    # 两种口径各存一份数值：调过「压力 2 跳」再切到 bp 档，跳数不能被清掉
+    check("成本档位：切到 bp 档不影响跳数档的数值",
+          p["stress"]["slip_ticks"] == 2.0 and p["stress"]["slip_bp"] == 0.0,
+          str(p["stress"]))
+
     bt = B.BacktestConfig()
     costs.apply(bt, "RB", "SHFE", "optimistic")
     check("成本档位：期货按 tick 算滑点",
-          bt.tick_size == 1.0 and bt.slippage_ticks == 1.0 and bt.fee_rate > 0,
+          bt.tick_size == 1.0 and bt.slippage_ticks == 0.5 and bt.fee_rate > 0,
           f"tick={bt.tick_size} ticks={bt.slippage_ticks} fee={bt.fee_rate}")
     check("成本档位：一手滑点 = 跳数 × tick",
-          abs(bt.slip_amount(3000.0) - 1.0) < 1e-9, str(bt.slip_amount(3000.0)))
+          abs(bt.slip_amount(3000.0) - 0.5) < 1e-9, str(bt.slip_amount(3000.0)))
+    # 前复权价上要按当日因子缩放：一跳是真实世界里的固定金额，历史价格被
+    # 缩小过，不换算等于让越早的成交越便宜
+    check("成本档位：滑点按复权因子缩放",
+          abs(bt.slip_amount(3000.0, 0.6) - 0.3) < 1e-9
+          and abs(bt.slip_amount(3000.0, 1.0) - 0.5) < 1e-9,
+          f"scale 0.6 → {bt.slip_amount(3000.0, 0.6)}")
+    # 百分比口径不能被缩放：它是「占价格的比例」，分子分母同时被缩放
+    pct = B.BacktestConfig(slippage=0.001)
+    check("成本档位：百分比滑点不随复权因子变",
+          abs(pct.slip_amount(1000.0, 0.6) - pct.slip_amount(1000.0, 1.0)) < 1e-12,
+          f"{pct.slip_amount(1000.0, 0.6)} vs {pct.slip_amount(1000.0, 1.0)}")
 
     us = B.BacktestConfig()
     costs.apply(us, "AAPL", "", None, market="us")
@@ -1750,8 +1811,185 @@ def check_costs() -> None:
 
     check("回测：按手手续费真的扣钱", _eq(0) > _eq(2000),
           f"{_eq(0):.0f} vs {_eq(2000):.0f}")
+
+    # `price_scale` 列要真被回测用上：同一段行情，因子 0.5 时滑点成本减半。
+    # 平进平出（100 → 100），只有滑点在亏钱，正好能量出来
+    flat = pd.DataFrame({"open": 100.0, "high": 100.0, "low": 100.0,
+                         "close": 100.0, "signal": [1] * 20},
+                        index=pd.date_range("2024-01-01", periods=20, freq="D"))
+
+    def _slip_cost(scale: float | None) -> float:
+        d = flat.copy()
+        if scale is not None:
+            d["price_scale"] = scale
+        c = B.BacktestConfig(initial_cash=1_000_000, sizing="fixed", volume=1,
+                             multiplier=10.0, tick_size=1.0, slippage_ticks=1.0,
+                             fee_per_lot=0.0, fee_rate=0.0)
+        return 1_000_000 - float(B.run_backtest(d, c).metrics["final_equity"])
+
+    # 只开仓没平仓，所以只有一次滑点：1 跳 × 乘数 10 = 10 元
+    check("回测：price_scale 真的缩放了滑点",
+          abs(_slip_cost(1.0) - 10.0) < 1e-6 and abs(_slip_cost(0.5) - 5.0) < 1e-6
+          and abs(_slip_cost(None) - 10.0) < 1e-6,
+          f"1.0→{_slip_cost(1.0):.2f} / 0.5→{_slip_cost(0.5):.2f} / "
+          f"无列→{_slip_cost(None):.2f}")
+
+    # 数据层要把它挂上，而且要和「原始价 / 前复权价」对得上
+    from ttrade import tqdata as T
+    q = T.load_main("RB", "SHFE", "5m")
+    if "price_scale" in q.columns:
+        r = T.load_main("RB", "SHFE", "5m", adjust="none")
+        ratio = (r["close"] / q["close"]).to_numpy(float)
+        sc = q["price_scale"].to_numpy(float)
+        err = float(np.nanmax(np.abs(ratio * sc - 1.0)))
+        check("数据层：分钟线挂上 price_scale 且与复权价对得上",
+              err < 1e-6 and abs(sc[-1] - 1.0) < 1e-9,
+              f"最大相对误差 {err:.2e}，末根 {sc[-1]:.6f}")
+    else:
+        skip("数据层：分钟线挂上 price_scale", "RB 5m 没有数据")
     check("成本说明：写清这一档收多少", "跳" in costs.describe("CU", "SHFE"),
           costs.describe("CU", "SHFE"))
+
+    # ---- 绩效表上的两个成本指标 ----
+    # 成本已经从权益里扣掉了，但用户要能回答「这些钱花在哪」，所以单笔和总额
+    # 都要单列。平进平出（100 → 100）没有盈亏，只有成本在动，正好能量准；
+    # 信号做成「开-开-平-平」的循环，才有闭合的交易笔数可除
+    cost_cfg = B.BacktestConfig(initial_cash=1_000_000, sizing="fixed", volume=1,
+                                multiplier=10.0, tick_size=1.0, slippage_ticks=1.0,
+                                fee_per_lot=10.0, fee_rate=0.0)
+    cyc = pd.DataFrame({"open": 100.0, "high": 100.0, "low": 100.0,
+                        "close": 100.0, "signal": [1, 1, 0, 0] * 10},
+                       index=pd.date_range("2024-01-01", periods=40, freq="D"))
+    m = B.run_backtest(cyc, cost_cfg).metrics
+    # 一来一回：开仓 10 元手续费 + 1 跳×乘数 10，平仓同样一份 → 每笔 40 元
+    check("回测：成本指标 = 手续费 + 滑点",
+          m["n_trades"] > 0 and abs(m["total_cost"] - 40.0 * m["n_trades"]) < 1e-6,
+          f"总额 {m['total_cost']:.2f} / {m['n_trades']} 笔")
+    # 绩效页那一行显示的是**百分比**（成本 ÷ 成交额），不是金额：金额随本金和
+    # 手数一起变，两条不同资金的策略没法比。这里 1 手 × 乘数 10 × 价 100 = 1000
+    # 元一次成交，一来一回 2000 元，10 笔共 2 万元成交额，成本 400 元 → 2%
+    check("回测：每笔成本率 = 成本 ÷ 成交额",
+          abs(m["cost_rate"] - m["total_cost"] / m["notional"]) < 1e-12
+          and abs(m["cost_rate"] - 0.02) < 1e-9,
+          f"成本率 {m['cost_rate']:.4%} / 成交额 {m['notional']:.0f}")
+    check("回测：平均每笔成本（金额）仍可查",
+          m["n_trades"] > 0
+          and abs(m["avg_cost"] - m["total_cost"] / m["n_trades"]) < 1e-9,
+          f"均 {m['avg_cost']:.2f} / {m['n_trades']} 笔")
+    bh = B.buy_and_hold(flat, cost_cfg)
+    check("回测：买入持有基准也记成本", bh.metrics["total_cost"] > 0,
+          f"{bh.metrics.get('total_cost')}")
+
+    # ---- 反向交易 ----
+    # 取反必须在 `run_strategy` 里做：研究页、组合回放、实盘都调它。放在界面里
+    # 乘一下的话，研究页翻过来了、实盘还按原方向下单
+    from ttrade import strategies as S
+
+    # 缓涨 + 小波动：双均线基本一直持多，取反之后一直持空
+    n_r = 400
+    idx_r = pd.date_range("2024-01-01", periods=n_r, freq="D")
+    px_r = pd.Series(100.0 * 1.004 ** np.arange(n_r)
+                     + 2.0 * np.sin(np.arange(n_r) / 5.0), index=idx_r)
+    rdf = pd.DataFrame({"open": px_r, "high": px_r * 1.01, "low": px_r * 0.99,
+                        "close": px_r, "volume": 1e5})
+    pr = {"fast": 10, "slow": 30}
+    fwd = S.run_strategy(rdf, "ma_cross", pr)["signal"].to_numpy()
+    rev = S.run_strategy(rdf, "ma_cross", pr, reverse=True)["signal"].to_numpy()
+    check("反向交易：信号严格取反（多 ↔ 空、空仓不变）",
+          bool((fwd != 0).any()) and bool((fwd == -rev).all()),
+          f"原 多{int((fwd == 1).sum())}/空{int((fwd == -1).sum())} 根 → "
+          f"反 多{int((rev == 1).sum())}/空{int((rev == -1).sum())} 根")
+    check("反向交易：不勾就是原方向",
+          bool((S.run_strategy(rdf, "ma_cross", pr, reverse=False)["signal"]
+                .to_numpy() == fwd).all()), "默认被改掉了")
+    # 净值必须真翻过来：趋势策略赚的钱，取反之后要原样亏掉（这里不带成本，
+    # 成本两边各扣一份，不是干净的镜像）
+    free = B.BacktestConfig(initial_cash=1_000_000)
+    eq_f = B.run_backtest(rdf.assign(signal=fwd), free).metrics["total_return"]
+    eq_r = B.run_backtest(rdf.assign(signal=rev), free).metrics["total_return"]
+    check("反向交易：净值也跟着反过来", eq_f > 0 > eq_r,
+          f"原 {eq_f:+.2%} / 反 {eq_r:+.2%}")
+
+    # 多品种回测是「每个品种各跑一遍、净值等权平均」，走的是 `BacktestJob` 那条
+    # 路（后台线程，不许碰控件）。反向开关必须一起打包进任务 —— 只让界面上那个
+    # 勾选框生效的话，多品种还是按原方向跑，勾了等于没勾
+    from gui import app as GUI
+
+    def _job(rev: bool) -> "GUI.BacktestJob":
+        return GUI.BacktestJob(
+            key="X", label="X", df=rdf, cfg=B.BacktestConfig(initial_cash=100_000),
+            family=GUI.FAMILY_RULE, rule_key="ma_cross", rule_params=pr,
+            factor_mode="single", factor_keys=(), factor_cfg=None,
+            filtered=False, reverse=rev)
+
+    mf = GUI.run_backtest_job(_job(False))
+    mj = GUI.run_backtest_job(_job(True))
+    check("反向交易：多品种任务也按反向跑",
+          mf is not None and mj is not None
+          and "（反向）" not in mf.label and "（反向）" in mj.label
+          and mj.metrics["total_return"] < mf.metrics["total_return"],
+          (f"{mf.label} {mf.metrics['total_return']:+.2%} / "
+           f"{mj.label} {mj.metrics['total_return']:+.2%}")
+          if (mf is not None and mj is not None) else "没有结果")
+
+    # ---- 机器学习 + 多品种 ----
+    # 以前这条路被直接拦下（"每个品种都要单独重训一遍"）。放开之后，多品种的
+    # 每个品种都得自己训一遍 walk-forward，所以有两件配套的事必须成立：
+    # 折级进度要能报上来（否则界面几分钟不动，像卡死），停止要能在折与折之间
+    # 生效（否则点完还得等整个品种训完）
+    from ttrade import factor_strategy as fstrat
+
+    def _ml_df(seed: int, n: int = 700) -> pd.DataFrame:
+        rng = np.random.default_rng(seed)
+        idx = pd.date_range("2020-01-01", periods=n, freq="B")
+        r = np.sin(np.arange(n) / 25.0) * 0.01 + rng.normal(0, 0.004, n)
+        close = pd.Series(100 * np.exp(np.cumsum(r)), index=idx)
+        # 开盘价必须和收盘价不同：前向收益是「次日开盘 / 当日收盘」，取同一个数
+        # 的话标签恒为 0，模型权重全 0，整条策略空仓 —— 而「跑通了但没交易」
+        # 看起来和正常结果一模一样
+        open_ = close * (1 + 0.001 * np.sin(np.arange(n) / 3.0))
+        return pd.DataFrame({
+            "open": open_, "high": np.maximum(open_, close) * 1.005,
+            "low": np.minimum(open_, close) * 0.995,
+            "close": close, "volume": 1e5,
+        })
+
+    ml_fc = fstrat.FactorConfig(model="linear", window=60, horizon=1,
+                                train_window=200, step=60, min_train=120)
+
+    def _ml_job(seed: int) -> "GUI.BacktestJob":
+        return GUI.BacktestJob(
+            key=f"M{seed}", label=f"M{seed}", df=_ml_df(seed),
+            cfg=B.BacktestConfig(initial_cash=100_000),
+            family=GUI.FAMILY_FACTOR, rule_key="", rule_params={},
+            factor_mode="ml", factor_keys=("mom_20", "mom_60", "ma_gap_20"),
+            factor_cfg=ml_fc, filtered=False)
+
+    folds_seen: list[str] = []
+    ml_res = GUI.run_backtest_job(_ml_job(1),
+                                  progress=lambda d, t, m: folds_seen.append(m))
+    check("机器学习：多品种任务能跑出结果",
+          ml_res is not None and ml_res.metrics["n_trades"] > 0
+          and ml_res.label.startswith("机器学习多因子"),
+          "" if ml_res is None else
+          f"{ml_res.label} {ml_res.metrics['n_trades']} 笔")
+    check("机器学习：折级进度会回调（否则界面像卡死）",
+          len(folds_seen) >= 3 and all("折" in m for m in folds_seen),
+          f"{len(folds_seen)} 次：{folds_seen[:1]}")
+    try:
+        GUI.run_backtest_job(_ml_job(2), cancel=lambda: True)
+        stop_ok = "没有中断"
+    except fstrat.Cancelled:
+        stop_ok = ""
+    except Exception as exc:      # noqa: BLE001
+        stop_ok = f"{type(exc).__name__}: {exc}"
+    check("机器学习：停止能在折之间生效", not stop_ok, stop_ok)
+    # 每个品种各训一遍：同样的配置、不同的行情，结果必须不一样。真要是「训一次
+    # 套所有品种」，两条曲线会是同一条
+    a = GUI.run_backtest_job(_ml_job(1)).metrics["total_return"]
+    b = GUI.run_backtest_job(_ml_job(7)).metrics["total_return"]
+    check("机器学习：各品种独立训练（不是一套模型套所有）",
+          abs(a - b) > 1e-6, f"{a:+.2%} vs {b:+.2%}")
 
 
 def check_cross() -> None:
@@ -2147,6 +2385,200 @@ def check_cross() -> None:
         trigger_z=2.0, trigger_tiers=3, trigger_span=0.5, trigger_cool=10))
     check("稀疏采样：阈值越高样本越少", _hi.sum() <= _tier.sum(),
           f"{int(_hi.sum())} vs {int(_tier.sum())}")
+
+    # ---- 触发模式的决策口径：观点 ffill / 进场只在触发点 / 出场看强度
+    #
+    # 稀疏采样把「在哪建样本」和「在哪做决策」绑在一起之后，出场就成了问题：
+    # 分数在触发点之间是阶梯常值，拿它判「跌破 0.3」永远等不到，仓位会一路拖到
+    # 下一次触发。所以出场改成看**触发强度**（密集、每根都有），进场仍看模型分数。
+    _n = 900
+    _rng = np.random.default_rng(1)
+    _idx2 = pd.date_range("2020-01-01", periods=_n, freq="B")
+    _ret = np.sin(np.arange(_n) / 25.0) * 0.01 + _rng.normal(0, 0.004, _n)
+    _close = pd.Series(100 * np.exp(np.cumsum(_ret)), index=_idx2)
+    # 开盘价必须和收盘价不同，否则前向收益恒为 0、模型权重全 0（见 check_costs）
+    _open = _close * (1 + 0.001 * np.sin(np.arange(_n) / 3.0))
+    _mdf = pd.DataFrame({
+        "open": _open, "high": np.maximum(_open, _close) * 1.005,
+        "low": np.minimum(_open, _close) * 0.995,
+        "close": _close, "volume": 1e5,
+    })
+    _base = dict(model="linear", window=60, horizon=1, train_window=200,
+                 step=60, min_train=120, entry_z=1.0, exit_z=0.3,
+                 sample_mode="trigger", trigger_z=1.0, trigger_tiers=0,
+                 trigger_cool=3)
+    _keys3 = ["mom_20", "mom_60", "ma_gap_20"]
+    _tout = _fs.run_factor_strategy(
+        _mdf, "ml", _keys3, _fs.FactorConfig(trigger_keys=["mom_20"], **_base))
+    _plan = _tout.pack.trigger
+    _sig = _tout.df["signal"].to_numpy()
+    _chg = np.flatnonzero(np.diff(np.r_[0, _sig]) != 0)
+    _enter = [i for i in _chg if _sig[i] != 0]
+    check("触发模式：决策点与样本点同一批",
+          _plan is not None and int(_plan.mask.sum()) > 0
+          and _plan.mask.dtype == bool, "" if _plan is None else
+          f"{int(_plan.mask.sum())} 个决策点")
+    # 分数在触发点之间必须是常值：这就是「沿用上一次的观点」
+    _sc = _tout.pack.score.to_numpy()
+    _prev = np.nan
+    _drift = 0
+    for _i in range(len(_sc)):
+        if _plan.mask[_i]:
+            _prev = _sc[_i]
+        elif not np.isclose(_sc[_i], _prev, equal_nan=True):
+            _drift += 1
+    check("触发模式：观点只在决策点刷新（之间是常值）", _drift == 0, f"{_drift} 根没沿用")
+    check("触发模式：进场只发生在决策点",
+          bool(_enter) and all(_plan.mask[i] for i in _enter),
+          f"{len(_enter)} 次开仓")
+    # 因子通道的仓位必须按强度出场：平仓那一根，强度已经回落到离场阈值以内
+    _st = _plan.strength
+    _bad_ex = []
+    for _i in _chg:
+        if _sig[_i] != 0:
+            continue
+        _j = _i - 1
+        while _j >= 0 and _sig[_j] == 0:
+            _j -= 1
+        if _j < 0:
+            continue
+        _ok_ex = (np.isfinite(_st[_i]) and
+                  (_st[_i] < 0.3 if _sig[_j] == 1 else _st[_i] > -0.3))
+        if not _ok_ex:
+            _bad_ex.append(_i)
+    check("触发模式：出场看触发强度回落到阈值以内", not _bad_ex,
+          f"{len(_bad_ex)} 根例外：{_bad_ex[:3]}")
+
+    # 规则通道：只配规则时，仓位每根都必须和规则自己的方向一致 —— 进场方向来自
+    # 规则、出场也是规则一不持同向就平，两条都不该有例外
+    _rout = _fs.run_factor_strategy(
+        _mdf, "ml", _keys3,
+        _fs.FactorConfig(trigger_rule="ma_cross",
+                         trigger_params={"fast": 3, "slow": 8}, **_base))
+    _rsig = _rout.df["signal"].to_numpy()
+    _rule = _rout.pack.trigger.rule_sig
+    _mismatch = int(np.sum((_rsig != 0) & (_rsig != _rule)))
+    check("触发模式：规则通道的仓位跟着规则 signal 走（含出场）",
+          _rout.pack.trigger is not None
+          and not _rout.pack.trigger.factor_channel and _mismatch == 0,
+          f"方向不一致 {_mismatch} 根")
+    # 不开稀疏采样时不能有触发计划，走的还是老状态机
+    _all = _fs.run_factor_strategy(
+        _mdf, "ml", _keys3, _fs.FactorConfig(**{**_base, "sample_mode": "all"}))
+    check("触发模式：不勾稀疏采样时没有触发计划",
+          _all.pack.trigger is None, str(_all.pack.trigger))
+
+    # ---- 反转（因子 / 规则各一个开关）与「只用规则」
+    #
+    # 反转必须落在 `trigger_signal` 里，不能由消费端取负：强度同时被三处用
+    # （分档筛样本 / trigger_side 方向过滤 / 出场判据），漏一处就只反了一半。
+    _fout = _fs.run_factor_strategy(
+        _mdf, "ml", _keys3,
+        _fs.FactorConfig(trigger_keys=["mom_20"], trigger_flip=True, **_base))
+    _s0 = np.nan_to_num(_plan.strength, nan=0.0)
+    _s1 = np.nan_to_num(_fout.pack.trigger.strength, nan=0.0)
+    check("触发反转：因子强度严格取负",
+          bool(np.allclose(_s0, -_s1, atol=1e-12))
+          and bool(_fout.pack.trigger.mask.any()),
+          f"{int(_fout.pack.trigger.mask.sum())} 个决策点")
+    _rfout = _fs.run_factor_strategy(
+        _mdf, "ml", _keys3,
+        _fs.FactorConfig(trigger_rule="ma_cross",
+                         trigger_params={"fast": 3, "slow": 8},
+                         trigger_rule_flip=True, **_base))
+    check("触发反转：规则 signal 取负，「刚开仓」那几根不变",
+          bool(np.allclose(_rule, -_rfout.pack.trigger.rule_sig))
+          and bool(np.array_equal(_rout.pack.trigger.armed,
+                                  _rfout.pack.trigger.armed)),
+          "")
+    # 两个触发因子都选「不用」= 只用规则：方向全由规则给，强度是 1.0 占位
+    check("只用规则：没有因子通道，仓位仍跟着规则走",
+          not _rout.pack.trigger.factor_channel
+          and bool((_rsig != 0).any())
+          and bool(np.allclose(
+              np.nan_to_num(_rout.pack.trigger.strength, nan=0.0),
+              np.where(_rout.pack.trigger.armed, 1.0, 0.0))),
+          f"{int((_rsig != 0).sum())} 根持仓")
+    # 一个触发源都没有：必须在源头拦住，否则跑出来是一条空仓净值
+    try:
+        _fs.run_factor_strategy(
+            _mdf, "ml", _keys3,
+            _fs.FactorConfig(trigger_keys=[], trigger_rule="", **_base))
+    except ValueError as _exc:
+        check("只用规则：一个触发源都没有时明确报错", "触发源" in str(_exc), str(_exc))
+    else:
+        check("只用规则：一个触发源都没有时明确报错", False, "却跑通了")
+
+    # ---- 因子缺值不再「整行丢弃」
+    #
+    # 原来是「任何一个因子缺值就把这一行从训练集里去掉」。实测 RB 日线选 7 个
+    # 因子时，期权那两列只有最近 20% 的年份有值，一条规则把 4275 行砍到 864 行，
+    # 等于模型只看最近两三年。现在缺得少的按中位数（标准化后是 0）补，只把
+    # 「缺得太多」的行剔掉。
+    _wi = pd.date_range("2020-01-01", periods=800, freq="B")
+    _rng2 = np.random.default_rng(5)
+    _Xw = _rng2.normal(0, 1, (800, 4))
+    _Xw[:600, 3] = np.nan                    # 第 4 个因子前 600 根没值
+    _Yw = pd.Series(_rng2.normal(0, 0.01, 800), index=_wi)
+    _wcfg = _fs.FactorConfig(model="linear", window=60, horizon=1,
+                             train_window=200, step=60, min_train=120)
+    _st1: dict = {}
+    _predw, _, _foldsw = _fs.walk_forward(
+        pd.DataFrame(_Xw, index=_wi, columns=["a", "b", "c", "d"]), _Yw, _wcfg,
+        stats=_st1)
+    check("机器学习：单个因子缺值不再整行丢弃",
+          _foldsw > 0 and bool(np.isfinite(_predw.iloc[:600]).any())
+          and not _st1.get("thin"),
+          f"{_foldsw} 折 / 前 600 根有预测 "
+          f"{int(np.isfinite(_predw.iloc[:600]).sum())} / 剔除 {_st1.get('thin', 0)}")
+    # 反过来：一行里几乎一个因子都没有，补 0 就是凭空造样本，仍然要剔掉
+    _Xw2 = _Xw.copy()
+    _Xw2[:120, :] = np.nan
+    _st2: dict = {}
+    _fs.walk_forward(pd.DataFrame(_Xw2, index=_wi, columns=["a", "b", "c", "d"]),
+                     _Yw, _wcfg, stats=_st2)
+    check("机器学习：因子几乎全缺的行仍被剔除", _st2.get("thin", 0) >= 120,
+          f"剔了 {_st2.get('thin', 0)} 行")
+
+    # ---- 多品种合并训练：一个模型，各自交易
+    def _pf(seed: int) -> pd.DataFrame:
+        _n = 700
+        _rg = np.random.default_rng(seed)
+        _ix = pd.date_range("2020-01-01", periods=_n, freq="B")
+        _rr = np.sin(np.arange(_n) / 25.0) * 0.01 + _rg.normal(0, 0.004, _n)
+        _cc = pd.Series(100 * np.exp(np.cumsum(_rr)), index=_ix)
+        _oo = _cc * (1 + 0.001 * np.sin(np.arange(_n) / 3.0))
+        return pd.DataFrame({
+            "open": _oo, "high": np.maximum(_oo, _cc) * 1.005,
+            "low": np.minimum(_oo, _cc) * 0.995, "close": _cc, "volume": 1e5})
+
+    _pframes = {f"S{i}_X": _pf(i + 11) for i in range(3)}
+    _pcfg = _fs.FactorConfig(model="linear", window=60, horizon=1,
+                             train_window=200, step=60, min_train=120)
+    _pouts = _fs.run_pooled_strategy(
+        _pframes, ["mom_20", "mom_60", "ma_gap_20"], _pcfg)
+    check("合并训练：每个品种都拿到预测", len(_pouts) == 3, str(list(_pouts)))
+    # 一个模型 vs 三个模型：重要度是同一个模型算出来的，三条必须一模一样。
+    # 各自训练时三份重要度会因为样本不同而不同
+    _imps = [o.pack.importance for o in _pouts.values()]
+    check("合并训练：确实是同一个模型（重要度三条一致）",
+          all(x is not None for x in _imps)
+          and all(_imps[0].equals(x) for x in _imps[1:]),
+          "" if any(x is None for x in _imps) else str(_imps[0].round(2).to_dict()))
+    check("合并训练：标题写明品种数",
+          all("合并训练" in o.label for o in _pouts.values()),
+          str(list(_pouts.values())[0].label))
+    # 稀疏采样 + 合并：训练样本仍按各品种自己的触发点挑，合并的只是样本池
+    _p2 = _fs.run_pooled_strategy(
+        _pframes, ["mom_20", "mom_60", "ma_gap_20"],
+        dataclasses.replace(_pcfg, sample_mode="trigger",
+                            trigger_keys=["mom_20"], trigger_z=1.0,
+                            trigger_tiers=0, trigger_cool=3))
+    check("合并训练：稀疏采样下每个品种仍有自己的决策点",
+          len(_p2) == 3 and all(o.pack.trigger is not None
+                                and bool(o.pack.trigger.mask.any())
+                                for o in _p2.values()),
+          str({k: int(v.pack.trigger.mask.sum()) for k, v in _p2.items()}))
 
 
 def check_break_strategies() -> None:

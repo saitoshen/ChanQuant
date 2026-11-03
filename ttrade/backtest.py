@@ -87,10 +87,18 @@ class BacktestConfig:
     def label(self) -> str:
         return "只做多" if self.long_only else "多空双向"
 
-    def slip_amount(self, price: float) -> float:
-        """单边滑点，**价格单位**。按跳算；没有 tick 时退回百分比。"""
+    def slip_amount(self, price: float, scale: float = 1.0) -> float:
+        """单边滑点，**价格单位**。按跳算；没有 tick 时退回百分比。
+
+        `scale` 是这根 K 线的复权因子（`P_adj = P_raw × scale`）。**一跳是真实
+        世界里的固定金额**，换算到前复权价上要乘 scale：螺纹永远是 1 元/吨，
+        但复权后历史价格被整体缩小了，不乘的话五年前那段的滑点会按 0.67 倍收。
+        传 1.0（默认）就是不复权口径。
+
+        百分比口径不用乘：它是「占价格的比例」，分子分母同时被 scale 缩放。
+        """
         if self.tick_size > 0 and self.slippage_ticks > 0:
-            return float(self.tick_size) * float(self.slippage_ticks)
+            return float(self.tick_size) * float(self.slippage_ticks) * float(scale or 1.0)
         return abs(float(price)) * float(self.slippage)
 
     def fee_amount(self, lots: float, mult: float, price: float) -> float:
@@ -278,6 +286,10 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
 
     open_ = data["open"].to_numpy(dtype=float)
     close = data["close"].to_numpy(dtype=float)
+    # 复权因子：数据层把前复权用过的缩放系数挂在 `price_scale` 列上，滑点要按它
+    # 换回真实的一跳。没有这一列（不复权、美股、手工造的 df）就是 1.0
+    scale = (pd.to_numeric(data["price_scale"], errors="coerce").fillna(1.0).to_numpy(float)
+             if "price_scale" in data.columns else None)
     sig = data["signal"].fillna(0).astype(int).to_numpy()
     if cfg.long_only:
         sig = np.maximum(sig, 0)
@@ -299,6 +311,10 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     target[0] = 0
 
     cash = float(cfg.initial_cash)
+    cost_total = 0.0             # 手续费 + 滑点，**金额**，绩效表要看它
+    # 成交名义额累计。成本金额除以它才是「每笔交易被吃掉多少」，绩效页那一行
+    # 用的是这个比例而不是金额 —— 金额随本金和手数变，比例才是成本本身
+    notional_total = 0.0
     lots = 0.0                   # 正=多，负=空，0=空仓（unit 口径是份额）
     pos = 0                      # 1=多，-1=空，0=平
     pos_state = np.zeros(n, dtype=int)
@@ -331,23 +347,30 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
         if want != pos:
             # ---- 先平掉现有仓位 ----
             if pos != 0:
-                sp = cfg.slip_amount(open_[i])
+                sp = cfg.slip_amount(open_[i], scale[i] if scale is not None else 1.0)
                 price = open_[i] - sp if pos == 1 else open_[i] + sp
                 # 平仓：浮动盈亏落地，再扣平仓手续费
                 cash += lots * mult * (price - entry_price)
-                cash -= cfg.fee_amount(lots, mult, price)
+                fee = cfg.fee_amount(lots, mult, price)
+                cash -= fee
+                # 滑点按「每手多少价差 × 乘数 × 手数」折成钱，和手续费一起记
+                cost_total += fee + sp * mult * abs(lots)
+                notional_total += abs(lots) * mult * abs(price)
                 close_position(i, price, lots)
                 lots = 0.0
                 pos = 0
 
             # ---- 再按需开新仓 ----
             if want != 0:
-                sp = cfg.slip_amount(open_[i])
+                sp = cfg.slip_amount(open_[i], scale[i] if scale is not None else 1.0)
                 price = open_[i] + sp if want > 0 else open_[i] - sp
                 a = float(atr_arr[i]) if atr_arr is not None else 0.0
                 q = size_lots(cfg, price, cash, a if a == a else 0.0)
                 if q > 0:
-                    cash -= cfg.fee_amount(q, mult, price)   # 开仓手续费
+                    fee = cfg.fee_amount(q, mult, price)      # 开仓手续费
+                    cash -= fee
+                    cost_total += fee + sp * mult * q
+                    notional_total += q * mult * abs(price)
                     lots = q if want > 0 else -q
                     entry_price, entry_date, entry_bar, entry_dir = price, idx[i], i, want
                     pos = want
@@ -378,6 +401,13 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     ps = pd.Series(pos_state, index=idx, name="position")
     m = _metrics(eq, ps, trades, cfg.bars_per_year)
     m["final_equity"] = float(eq.iloc[-1])
+    # 成本单列出来：手续费和滑点已经扣进权益里了，但用户要能回答「这些钱花在哪」
+    m["total_cost"] = float(cost_total)
+    m["notional"] = float(notional_total)
+    m["avg_cost"] = float(cost_total / m["n_trades"]) if m["n_trades"] else 0.0
+    # 成本率 = 花掉的钱 ÷ 成交额。绩效页那一行显示的是它（百分比），不是金额 ——
+    # 金额随本金和手数变，比例才是「每笔交易被吃掉多少」
+    m["cost_rate"] = float(cost_total / notional_total) if notional_total > 0 else 0.0
     return Result(equity=eq, position=ps, trades=trades, metrics=m, label=label)
 
 
@@ -390,12 +420,15 @@ def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None) -> Result:
     # 首日就建仓（run_backtest 会延迟一天），用等价方式直接算
     open_ = d["open"].to_numpy(dtype=float)
     close = d["close"].to_numpy(dtype=float)
-    price = open_[0] + cfg.slip_amount(open_[0])
+    price = open_[0] + cfg.slip_amount(
+        open_[0],
+        float(d["price_scale"].iloc[0]) if "price_scale" in d.columns else 1.0)
     mult = float(cfg.multiplier or 1.0)
     # 基准要和策略用同一套仓位口径，否则「策略 vs 买入持有」是在比杠杆，
     # 不是在比策略。期货上尤其明显：策略 10 倍杠杆、基准全额，比出来毫无意义
     q = size_lots(cfg, price, cfg.initial_cash, 0.0)
-    cash = cfg.initial_cash - cfg.fee_amount(q, mult, price)
+    fee0 = cfg.fee_amount(q, mult, price)
+    cash = cfg.initial_cash - fee0
     equity = cash + q * mult * (close - price)
     eq = pd.Series(equity, index=d.index, name="equity")
     ps = pd.Series(1, index=d.index, name="position")
@@ -412,6 +445,13 @@ def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None) -> Result:
     )
     m = _metrics(eq, ps, [trade], cfg.bars_per_year)
     m["final_equity"] = float(eq.iloc[-1])
+    # 基准只有一次开仓（而且一直没平），成本就是这么一点 —— 正好当对照：
+    # 策略那条如果成本是这个数的几十倍，说明换手才是真正的敌人
+    slip0 = (price - open_[0]) * q * mult
+    m["total_cost"] = float(fee0 + abs(slip0))
+    m["avg_cost"] = float(m["total_cost"])
+    m["notional"] = float(abs(q) * mult * price)
+    m["cost_rate"] = float(m["total_cost"] / m["notional"]) if m["notional"] > 0 else 0.0
     return Result(equity=eq, position=ps, trades=[trade], metrics=m, label="买入持有")
 
 
@@ -468,6 +508,14 @@ def combine(results: list[Result], label: str = "组合",
     curves: list[pd.Series] = []
     poss: list[pd.Series] = []
     trades: list[Trade] = []
+    # 各成分的成本占自己初始权益的比例。组合曲线是「各自归一化后取均值 × 初始
+    # 资金」，每条成分在组合里占 1/n，所以它的成本也要按这个份额折 —— 直接把
+    # 金额加起来是错的：一条 10 万本金的策略和一条 100 万的，成本差十倍不代表
+    # 谁更能花
+    cost_pcts: list[float] = []
+    # 成交额也按同样的份额折一次：成本率是「成本 ÷ 成交额」，两个比例相除
+    # 正好把「每条成分占 1/n」约掉，和直接拿金额相除是同一个数
+    notional_pcts: list[float] = []
     for r in results:
         eq = _to_daily(r.equity)
         if len(eq) < 2:
@@ -475,6 +523,11 @@ def combine(results: list[Result], label: str = "组合",
         curves.append(eq / float(eq.iloc[0]))
         poss.append(_to_daily(r.position))
         trades += list(r.trades)
+        base = float(eq.iloc[0])
+        cost_pcts.append(float(r.metrics.get("total_cost") or 0.0) / base
+                         if base > 0 else 0.0)
+        notional_pcts.append(float(r.metrics.get("notional") or 0.0) / base
+                             if base > 0 else 0.0)
 
     if not curves:
         blank = pd.Series(dtype=float)
@@ -494,6 +547,13 @@ def combine(results: list[Result], label: str = "组合",
     bpy = bars_per_year(eq.index)
     m = _metrics(eq, pos, trades, bpy)
     m["final_equity"] = float(eq.iloc[-1])
+    total_cost = (sum(cost_pcts) / len(cost_pcts)) * float(initial_cash) if cost_pcts else 0.0
+    m["total_cost"] = float(total_cost)
+    m["avg_cost"] = float(total_cost / m["n_trades"]) if m["n_trades"] else 0.0
+    total_notional = (sum(notional_pcts) / len(notional_pcts)) * float(initial_cash) \
+        if notional_pcts else 0.0
+    m["notional"] = float(total_notional)
+    m["cost_rate"] = float(total_cost / total_notional) if total_notional > 0 else 0.0
     return Result(equity=eq, position=pos, trades=trades, metrics=m, label=label)
 
 

@@ -101,6 +101,16 @@ class FactorConfig:
     trigger_span: float = 1.0       # 每档多宽（强度单位）
     trigger_cool: int = 5           # 同一档的冷却根数
 
+    # 触发信号反转：把「触发」这件事本身反过来用。因子那侧是**强度取负号**
+    # （向上突破变成向下破位，样本方向、进场方向、出场判据全跟着翻），规则那侧是
+    # **signal 取负**（规则本来做多的位置做空）。两条通道各管各的，互不影响。
+    #
+    # 反的是「在哪儿学、往哪边做」，不是「涨跌」的定义：标签仍是前向收益，
+    # 模型学到的仍然是「这种形态之后会涨」。所以「因子反转」不等于把策略做成
+    # 反手策略 —— 它是「这个因子我读反了」（动量因子在震荡市里突破即回落）。
+    trigger_flip: bool = False      # 反转因子触发
+    trigger_rule_flip: bool = False  # 反转规则触发
+
     def reversed_keys(self) -> set[str]:
         """真正打开反转的因子。顺手把非真值过滤掉，调用方不用自己判。"""
         return {k for k, v in dict(self.reverse or {}).items() if v}
@@ -121,7 +131,32 @@ class FactorConfig:
         c.trigger_span = float(max(1e-6, c.trigger_span))
         c.trigger_cool = int(max(0, c.trigger_cool))
         c.trigger_z = float(c.trigger_z)
+        c.trigger_flip = bool(c.trigger_flip)
+        c.trigger_rule_flip = bool(c.trigger_rule_flip)
         return c
+
+
+@dataclass
+class TriggerPlan:
+    """触发模式下的决策素材：在哪几根做决策、方向从哪来、出场看什么。
+
+    - `mask`：**决策点**，也就是建样本的那几根 bar（稀疏采样挑出来的）
+    - `strength`：触发强度，带符号、**密集**（每根都有值），出场靠它
+    - `armed`：规则刚开仓 / 刚翻向的那几根
+    - `rule_sig`：规则自己的持仓（-1 / 0 / 1），规则通道的出场靠它
+    - `factor_channel`：有没有因子触发通道。没有就只能靠规则，强度那条路是空的
+
+    单独打包是因为「什么时候允许开仓、什么时候必须平仓」和「分数怎么算」是两套
+    东西，而这两套要的东西（强度、规则信号）都在 `build_score` 里已经算过一遍，
+    不带走就得重算。
+    """
+
+    mask: np.ndarray
+    strength: np.ndarray
+    armed: np.ndarray
+    rule_sig: np.ndarray
+    factor_channel: bool = True
+    rule_channel: bool = False
 
 
 @dataclass
@@ -137,6 +172,8 @@ class ScorePack:
     folds: int = 0
     notes: list[str] = field(default_factory=list)
     label: str = ""
+    # 触发模式（稀疏采样）才有：决策点 / 触发强度 / 规则信号，交给状态机用
+    trigger: TriggerPlan | None = None
 
 
 @dataclass
@@ -252,6 +289,79 @@ def hysteresis(
     return pos
 
 
+def trigger_hysteresis(
+    score: np.ndarray,
+    plan: TriggerPlan,
+    entry: float,
+    exit_: float,
+) -> np.ndarray:
+    """触发模式（稀疏采样）的持仓状态机。
+
+    和 `hysteresis` 的区别是**谁决定什么**：
+
+    - **进场**：只在触发点（`plan.mask`）。方向由触发给（向上突破做多、向下破位
+      做空），模型只负责「做不做」—— 分数在**触发方向那一侧**过进场阈值才进。
+      模型不认同这个方向（向上突破但模型看空）就不做，也不反手：那是另一条策略。
+    - **出场**：每根都判，看的是**触发强度**回落到离场阈值以内，不是分数。分数
+      在触发点之间是阶梯常值，拿它出场等于永远等不到「跌破」，仓位会一路拖到
+      下一次触发。
+    - **规则通道**：规则只给「刚开仓 / 刚翻向」，没有强度，所以它的仓位按规则
+      自己的 signal 出场（变 0 或翻向就平）。**哪条通道开的仓，就由哪条通道负责
+      平** —— 混着用一个口径，总有一条是错的。
+
+    强度缺失（因子那几根没值）时**不动**：没有信息就不要凭空白砍一刀。
+
+    两条通道在同一根同时说话、方向却相反时**不做**。挑一条（比如「因子优先」）
+    会做出「规则刚翻空、仓位却是多」这种谁也解释不清的仓位。
+    """
+    sc = np.asarray(score, dtype=float)
+    s_v = np.asarray(plan.strength, dtype=float)
+    r_v = np.asarray(plan.rule_sig, dtype=float)
+    m_v = np.asarray(plan.mask, dtype=bool)
+    a_v = np.asarray(plan.armed, dtype=bool)
+    n = min(len(sc), len(s_v), len(r_v), len(m_v), len(a_v))
+    pos = np.zeros(len(sc), dtype=int)
+    cur = 0
+    src = ""                      # 当前仓位是哪条通道开的：factor / rule
+
+    for i in range(n):
+        # ---- 出场：每根都判 ----
+        if cur == 1:
+            if src == "factor":
+                if np.isfinite(s_v[i]) and s_v[i] < exit_:
+                    cur = 0
+            elif not (np.isfinite(r_v[i]) and r_v[i] > 0):
+                cur = 0
+        elif cur == -1:
+            if src == "factor":
+                if np.isfinite(s_v[i]) and s_v[i] > -exit_:
+                    cur = 0
+            elif not (np.isfinite(r_v[i]) and r_v[i] < 0):
+                cur = 0
+
+        # ---- 进场：只在触发点 ----
+        if cur == 0 and m_v[i]:
+            # 两条通道各自给一个方向。同时说话但方向相反 = 信号矛盾，这一根不做 ——
+            # 悄悄挑一条（比如「因子优先」）会让图上出现「规则刚翻空、仓位却是多」
+            # 这种谁也解释不清的仓位
+            f_dir = (1 if s_v[i] > 0 else -1) if (
+                plan.factor_channel and np.isfinite(s_v[i]) and s_v[i] != 0) else 0
+            r_dir = (1 if r_v[i] > 0 else -1) if (
+                a_v[i] and np.isfinite(r_v[i]) and r_v[i] != 0) else 0
+            d, ch = 0, ""
+            if f_dir and r_dir and f_dir != r_dir:
+                d, ch = 0, ""
+            elif f_dir:
+                d, ch = f_dir, "factor"
+            elif r_dir:
+                d, ch = r_dir, "rule"
+            v = sc[i]
+            if d and np.isfinite(v) and (v > entry if d == 1 else v < -entry):
+                cur, src = d, ch
+        pos[i] = cur
+    return pos
+
+
 def _rolling_z(s: pd.Series, window: int) -> pd.Series:
     """对模型预测值再做一次 PIT 标准化，让 entry_z 在各模型间可比。"""
     return F.standardize(s, window=window, method="z")
@@ -335,9 +445,10 @@ def build_score(
         if len(keys) < 2:
             raise ValueError("机器学习多因子至少需要 2 个因子")
         mask = None
+        plan: TriggerPlan | None = None
         wstats: dict = {}
         if str(cfg.sample_mode or "all") == "trigger":
-            st, armed, tnotes = trigger_signal(df, cfg)
+            st, armed, tnotes, rule_sig = trigger_signal(df, cfg)
             mask, mnotes = trigger_mask(st, armed, cfg)
             notes.extend(tnotes)
             notes.extend(mnotes)
@@ -346,6 +457,19 @@ def build_score(
                     "触发条件一根都没命中 —— 把 trigger_z 调低、换一组触发因子，"
                     "或者把 trigger_cool 调小"
                 )
+            plan = TriggerPlan(
+                mask=np.asarray(mask, dtype=bool),
+                strength=st.to_numpy(dtype=float),
+                armed=armed.to_numpy(dtype=bool),
+                rule_sig=rule_sig.to_numpy(dtype=float),
+                # 配了触发因子、但它在当前标的上算不出值（美股没持仓量那种），
+                # 这条通道就是空的，决策只能靠规则。**不能只看有没有 NaN**：
+                # 只配规则时强度是用 1.0 顶上的，那是「占位」不是真信号，
+                # 拿它定方向会让每次触发都变成做多
+                factor_channel=(bool(cfg.trigger_keys)
+                                and bool(np.isfinite(st.to_numpy(dtype=float)).any())),
+                rule_channel=bool(cfg.trigger_rule) and cfg.trigger_rule in STRATEGIES,
+            )
         pred, imp, n_folds = walk_forward(
             fmat, fwd, cfg, progress=progress, cancel=cancel, sample_mask=mask,
             stats=wstats,
@@ -355,7 +479,47 @@ def build_score(
                 f"{int(wstats['fallback'])}/{n_folds} 折的触发样本不足 40 个，"
                 "这几折退回全样本训练（触发太稀，把阈值调低或冷却调小）"
             )
+        if wstats.get("thin"):
+            notes.append(
+                f"{int(wstats['thin']):,} 行因子缺失超过一半，已从训练集剔除"
+                "（缺得少的按中位数补，不再整行丢弃）"
+            )
         score = _rolling_z(pred, cfg.window).rename("score")
+        if plan is not None and len(plan.mask) == len(score):
+            # 观点只在触发点刷新，触发点之间沿用上一次的值。**标准化要在这之前
+            # 做**：`_rolling_z` 的窗口里得有足够观测，稀疏之后一个 252 根的窗口
+            # 只剩十几根有值，够不到 min_periods，分数会全变 NaN
+            score = score.where(plan.mask).ffill().rename("score")
+            notes.append(
+                f"观点只在触发点刷新（{int(plan.mask.sum()):,} 个决策点），"
+                "触发点之间沿用上一次的分数"
+            )
+            # 出场按通道分开说：两条通道的出场口径不一样，只报一条会让人以为
+            # 规则那条也是看强度
+            ent = (f"进场：触发方向 + 模型分数过进场阈值（{cfg.entry_z:g}）"
+                   if plan.factor_channel else
+                   f"进场：规则刚开仓 / 刚翻向 + 模型分数过进场阈值（{cfg.entry_z:g}）")
+            if plan.factor_channel and plan.rule_channel:
+                ext = (f"出场：因子触发的仓位看触发强度回落到 {cfg.exit_z:g} 以内，"
+                       "规则触发的仓位跟规则自己的 signal")
+            elif plan.factor_channel:
+                ext = f"出场：触发强度回落到 {cfg.exit_z:g} 以内，每根都判"
+            else:
+                ext = "出场：跟规则自己的 signal（规则变 0 或翻向就平）"
+            # 反转了哪条通道要写出来：同一组参数、「反转因子」勾没勾，图上仓位方向
+            # 完全相反，而两张图看起来一样正常
+            flip = [n for n, on in (("因子", cfg.trigger_flip and plan.factor_channel),
+                                    ("规则", cfg.trigger_rule_flip and plan.rule_channel))
+                    if on]
+            notes.append(f"{ent}；{ext}" + (f"；方向已反转：{'、'.join(flip)}" if flip else ""))
+            # 触发点全落在「模型还没开始预测」的前段：一个决策点都用不上，
+            # 整条策略一笔不做。不点出来的话，用户只会看到一条水平线
+            _sc = score.to_numpy(dtype=float)[np.asarray(plan.mask, dtype=bool)]
+            if not np.isfinite(_sc).any():
+                notes.append(
+                    "触发点全部落在模型还没出预测的前段（首次训练之前），"
+                    "这段一笔都不做 —— 拉长回测区间，或把训练窗口 / 首次训练根数调小"
+                )
         covered = int(pred.notna().sum())
         _bpd = _bars_per_day(fmat.index)
         notes.append(
@@ -378,27 +542,46 @@ def build_score(
         return ScorePack(
             score=score, fmat=fmat, raw=rawf, pred=pred, importance=imp,
             label=f"机器学习多因子 · {ML.MODELS.get(cfg.model, {}).get('label', cfg.model)}",
-            folds=n_folds, notes=notes,
+            folds=n_folds, notes=notes, trigger=plan,
         )
 
     raise ValueError(f"未知因子模式 {mode}")
 
 
 def trigger_signal(df: pd.DataFrame, cfg: FactorConfig):
-    """触发强度（带符号）与「规则刚开仓」标记。
+    """触发强度（带符号）、「规则刚开仓」标记，以及规则自己的持仓。
 
     强度 = 触发因子的时序 Z-score 均值。**不取绝对值**：符号留着，向上突破
-    和向下破位是两种样本，`trigger_side` 靠它筛。
+    和向下破位是两种样本，`trigger_side` 靠它筛，进场方向也靠它定。
 
-    规则那条路给的是 `armed`（信号从 0 变成 ±1 的那一根），不带强度 —— 规则
-    本身只说「该动手了」，强度由因子那一侧补。两条路都没有就是全 False。
+    规则那条路给的是 `armed`（信号从 0 变成 ±1、或从 +1 翻到 −1 的那一根），
+    不带强度 —— 规则本身只说「该动手了」，强度由因子那一侧补。两条路都没有
+    就是全 False（调用方会先拦下来，见下面的「至少要有一个触发源」）。
 
-    返回 `(strength, armed, notes)`，都对齐到 `df.index`。
+    `rule_sig` 是规则**逐根的持仓**，专门给规则通道出场用：那条通道没有强度，
+    「回落到 0.3」对它没意义，只能按规则自己的 signal 平仓。
+
+    **反转**（`trigger_flip` / `trigger_rule_flip`）在这里落地，两条通道各管各的：
+    因子那侧把强度取负（向下破位变向上突破），规则那侧把 signal 取负。放在这里
+    而不是在消费端取负，是因为强度同时被三处用 —— 分档筛样本、`trigger_side`
+    方向过滤、出场判据。任何一处忘了取负，「反转」就只反了一半。
+
+    返回 `(strength, armed, notes, rule_sig)`，都对齐到 `df.index`。
     """
     idx = df.index
     strength = pd.Series(np.nan, index=idx, dtype=float)
     armed = pd.Series(False, index=idx)
+    rule_sig = pd.Series(0.0, index=idx, dtype=float)
     notes: list[str] = []
+
+    # 一个触发源都没有：稀疏采样会建出 0 个样本，然后整条策略空仓 ——
+    # 「跑通了只是没交易」看起来和正常结果一模一样，必须在源头拦掉
+    has_rule = bool(cfg.trigger_rule) and cfg.trigger_rule in STRATEGIES
+    if not (cfg.trigger_keys or has_rule):
+        raise ValueError(
+            "稀疏采样至少要有一个触发源：选一个触发因子，或者选一条触发规则"
+            "（两个触发因子都留空也行，那就只用规则）"
+        )
 
     zs = []
     for key in (cfg.trigger_keys or []):
@@ -415,24 +598,35 @@ def trigger_signal(df: pd.DataFrame, cfg: FactorConfig):
             zs.append(z.rename(key))
     if zs:
         strength = pd.concat(zs, axis=1).mean(axis=1, skipna=True)
+        if cfg.trigger_flip:
+            strength = -strength
         notes.append("触发：因子 " + "、".join(F.FACTORS[k].label
                                               for k in (cfg.trigger_keys or [])
-                                              if k in F.FACTORS))
+                                              if k in F.FACTORS)
+                     + ("（反转）" if cfg.trigger_flip else ""))
 
-    if cfg.trigger_rule and cfg.trigger_rule in STRATEGIES:
+    if has_rule:
         try:
             out = run_strategy(df, cfg.trigger_rule, dict(cfg.trigger_params or {}))
             sig = pd.Series(out["signal"], index=idx).astype(float).fillna(0.0)
+            if cfg.trigger_rule_flip:
+                sig = -sig
+            rule_sig = sig
             prev = sig.shift(1).fillna(0.0)
             armed = ((sig != 0) & (prev == 0)) | ((sig != 0) & (np.sign(sig) != np.sign(prev)))
             # 规则只给「该动手」的点，没有强度。因子那侧没配就用 1.0 顶上，
             # 让分档退化成「单一档」，至少不会因为 NaN 一个样本都不建
             if not zs:
                 strength = pd.Series(np.where(armed, 1.0, np.nan), index=idx)
-            notes.append(f"触发：规则 {STRATEGIES[cfg.trigger_rule].label}")
+            notes.append(f"触发：规则 {STRATEGIES[cfg.trigger_rule].label}"
+                         + ("（反转）" if cfg.trigger_rule_flip else ""))
+            if not zs:
+                # 没有因子那一侧，强度是 1.0 占位，不是真信号：方向和「值不值得做」
+                # 全由规则 + 模型分数决定，阈值 / 分档这几个参数在这条路上不生效
+                notes.append("触发：只用规则（触发因子都留空），阈值与分档不参与")
         except Exception as exc:      # noqa: BLE001
             notes.append(f"触发规则跑不起来（{exc}），只用因子触发")
-    return strength, armed, notes
+    return strength, armed, notes, rule_sig
 
 
 def trigger_mask(strength: pd.Series, armed: pd.Series,
@@ -442,6 +636,7 @@ def trigger_mask(strength: pd.Series, armed: pd.Series,
     规则（逐 bar 扫一遍，**只往后看**，天然 PIT）：
 
     1. 强度不够 `trigger_z` 就跳过；`trigger_side` 决定只做向上、只做向下、还是都做
+       （**反转打开后**这里判的是反转后的符号：「只采向上」= 因子原本的向下破位）
     2. 强度分档：`tier = floor((|s| − trigger_z) / trigger_span)`，夹在
        `[0, trigger_tiers−1]`。**分档的意义**是「z=1.2 的突破」和「z=2.6 的
        突破」不该混成一个样本 —— 前者往往是假突破，后者才是趋势启动
@@ -485,11 +680,18 @@ def trigger_mask(strength: pd.Series, armed: pd.Series,
         mask[i] = True
 
     got = int(mask.sum())
-    notes = [f"稀疏采样：{n_trig:,} 根越阈值，按 {max(1, cfg.trigger_tiers)} 档"
-             f"冷却 {cfg.trigger_cool} 根后留下 {got:,} 根样本"
-             f"（占全部 {got / max(n, 1) * 100:.1f}%）"]
+    # 只用规则时强度是 1.0 占位，「越阈值」「按 N 档」这些词在那种情况下不成立 ——
+    # 参数确实不参与，说明行再写一遍阈值分档，用户会去找一个根本不起作用的旋钮
+    only_rule = not bool(cfg.trigger_keys)
+    head = (f"稀疏采样：{n_trig:,} 个规则触发点，冷却 {cfg.trigger_cool} 根后留下 "
+            if only_rule else
+            f"稀疏采样：{n_trig:,} 根越阈值，按 {max(1, cfg.trigger_tiers)} 档"
+            f"冷却 {cfg.trigger_cool} 根后留下 ")
+    notes = [head + f"{got:,} 根样本（占全部 {got / max(n, 1) * 100:.1f}%）"]
     if got < 60:
-        notes.append("样本太少（< 60），把触发阈值调低、冷却调小，或者放宽分档")
+        notes.append("样本太少（< 60），" + ("换一条开仓更频繁的触发规则、把冷却调小"
+                                            if only_rule else
+                                            "把触发阈值调低、冷却调小，或者放宽分档"))
     if n_side:
         notes.append(f"方向过滤挡掉了 {n_side:,} 根（trigger_side={side}）")
     return mask, notes
@@ -587,9 +789,18 @@ def walk_forward(
         if tr_end - a < 60:
             continue
         Xtr, Ytr = X[a:tr_end], Y[a:tr_end]
-        ok = np.isfinite(Ytr) & np.all(np.isfinite(Xtr), axis=1)
-        # 因子缺失允许用 0（标准化后的中位数）补齐，但标签缺失必须丢
-        Xtr = np.where(np.isfinite(Xtr), Xtr, 0.0)
+        fin = np.isfinite(Xtr)
+        # 缺值按 0（标准化后的中位数）补，**只把「缺得太多」的行剔掉**。
+        # 原来是「任何一个因子缺值就整行不要」，实测 RB 日线选 7 个因子时，
+        # 期权那两列（iv_atm / pcr）只有最近 20% 的年份有值 —— 一条规则就把
+        # 4275 行砍到 864 行，80% 的样本白扔，模型等于只看最近两三年
+        need_cols = max(1, int(np.ceil(len(keys) * 0.5)))
+        ok = np.isfinite(Ytr) & (fin.sum(axis=1) >= need_cols)
+        if stats is not None:
+            thin = int((np.isfinite(Ytr) & (fin.sum(axis=1) < need_cols)).sum())
+            if thin:
+                stats["thin"] = int(stats.get("thin", 0)) + thin
+        Xtr = np.where(fin, Xtr, 0.0)
         need = 60
         if sample_mask is not None:
             m = np.asarray(sample_mask[a:tr_end], dtype=bool)
@@ -654,10 +865,19 @@ def run_factor_strategy(
     progress=None,
     cancel=None,
 ) -> FactorOutcome:
-    """因子策略：分数 → 阈值信号。"""
+    """因子策略：分数 → 阈值信号。
+
+    触发模式（稀疏采样）走的是另一套状态机：进场只在触发点、方向由触发定、
+    出场看触发强度（见 `trigger_hysteresis`）。单因子 / 多因子没有触发点，
+    仍是分数过阈值那一套。
+    """
     cfg = cfg.normalized()
     pack = build_score(df, mode, keys, cfg, progress=progress, cancel=cancel)
-    sig = hysteresis(pack.score.to_numpy(), cfg.entry_z, cfg.exit_z)
+    if mode == "ml" and pack.trigger is not None:
+        sig = trigger_hysteresis(pack.score.to_numpy(), pack.trigger,
+                                 cfg.entry_z, cfg.exit_z)
+    else:
+        sig = hysteresis(pack.score.to_numpy(), cfg.entry_z, cfg.exit_z)
 
     out = df.copy()
     out["factor_score"] = pack.score
@@ -671,6 +891,242 @@ def run_factor_strategy(
         if flips:
             notes.append(f"期内方向翻转 {flips} 次（由 IC 转号触发）")
     return FactorOutcome(df=out, pack=pack, label=pack.label, notes=notes)
+
+
+# ---------------------------------------------------------------- 多品种合并训练
+def _pit_vol(df: pd.DataFrame, window: int) -> pd.Series:
+    """逐根滚动波动率，只用过去的数据。
+
+    合并训练时各品种的标签必须同尺度：铁矿一天动 2%、玉米动 0.5%，直接拿原始
+    前向收益去训，模型会几乎只拟合高波动的那几个品种。除以自己的波动率之后，
+    「涨了一个标准差」在所有品种上是同一件事。rolling 只回头看，没有未来信息。
+    """
+    r = pd.Series(pd.to_numeric(df["close"], errors="coerce")).pct_change()
+    return r.rolling(int(max(20, window)), min_periods=20).std()
+
+
+def pooled_score(
+    frames: dict[str, pd.DataFrame],
+    keys: list[str],
+    cfg: FactorConfig,
+    progress=None,
+    cancel=None,
+) -> dict[str, ScorePack]:
+    """多品种**合并**训练：N 个品种的样本堆成一张长表，训一个模型。
+
+    和 `build_score` 的区别只在训练集：那边一个品种一个模型（各学各的形态），
+    这边全池一个模型（学「这个池子的共同形态」）。预测仍然是各品种在自己的
+    bar 上做、各自跑各自的回测 —— 合起来的只是「学到的东西」，不是仓位。
+
+    两处必须对齐，否则合训会变成「高波动品种的模型」：
+
+    - 特征：`factor_frame` 本来就是**逐品种时序标准化**的，同一列在各品种上
+      含义一致，可以直接拼
+    - 标签：前向收益要除以该品种自己的滚动波动率（`_pit_vol`），换成「几个
+      标准差」。不除的话铁矿 2% 的日波动会把玉米 0.5% 的信号完全淹没
+
+    返回 `{品种: ScorePack}`，触发模式下每个 pack 都带自己的 `trigger` 计划
+    （决策点 / 强度 / 规则信号都是逐品种的，训练才是合并的）。
+    """
+    cfg = cfg.normalized()
+    keys = [k for k in (keys or []) if k in F.FACTORS]
+    if len(keys) < 2:
+        raise ValueError("机器学习多因子至少需要 2 个因子")
+
+    trigger = str(cfg.sample_mode or "all") == "trigger"
+    parts: list[pd.DataFrame] = []
+    plans: dict[str, TriggerPlan] = {}
+    info: dict[str, dict] = {}
+    dropped: list[str] = []
+
+    for sym, df in frames.items():
+        use = F.filter_available(df, keys)
+        if len(use) < 2:
+            dropped.append(sym)
+            continue
+        fmat = F.factor_frame(df, use, window=cfg.window, method=cfg.method)
+        if fmat.empty:
+            dropped.append(sym)
+            continue
+        vol = _pit_vol(df, cfg.window) * float(np.sqrt(max(1, cfg.horizon)))
+        y = M.forward_return(df, cfg.horizon) / vol.where(vol > 1e-12)
+        d = fmat.copy()
+        d["__y"] = y.reindex(fmat.index)
+        d["__sym"] = sym
+        if trigger:
+            st, armed, _tn, rule_sig = trigger_signal(df, cfg)
+            m, _mn = trigger_mask(st, armed, cfg)
+            if not m.any():
+                # 这个品种一根都没触发：合训里没有它的样本，但预测照样要给它，
+                # 否则多品种回测会凭空少掉一个品种
+                m = np.zeros(len(df), dtype=bool)
+            plans[sym] = TriggerPlan(
+                mask=np.asarray(m, dtype=bool),
+                strength=st.to_numpy(dtype=float),
+                armed=armed.to_numpy(dtype=bool),
+                rule_sig=rule_sig.to_numpy(dtype=float),
+                factor_channel=(bool(cfg.trigger_keys)
+                                and bool(np.isfinite(st.to_numpy(dtype=float)).any())),
+                rule_channel=bool(cfg.trigger_rule) and cfg.trigger_rule in STRATEGIES,
+            )
+            d["__m"] = np.asarray(m, dtype=bool)
+        else:
+            d["__m"] = True
+        info[sym] = {"fmat": fmat, "raw": F.raw_frame(df, use), "mask": plans.get(sym)}
+        parts.append(d)
+
+    if not parts:
+        raise ValueError("这批品种上都算不出 2 个因子，没法合并训练")
+    # 特征列取交集：某个品种缺这一列，整张长表就对不齐。补 0 不行 —— 标准化
+    # 之后 0 是「中位数」，等于给这个品种凭空多出一个中性观测
+    common = set(parts[0].columns) - {"__y", "__sym", "__m"}
+    for p in parts[1:]:
+        common &= set(p.columns) - {"__y", "__sym", "__m"}
+    use = [k for k in keys if k in common]
+    if len(use) < 2:
+        raise ValueError("这批品种上没有共同可用的 2 个因子（各自缺的数据不一样）")
+
+    long = pd.concat([p[use + ["__y", "__m", "__sym"]] for p in parts])
+    long.index = pd.MultiIndex.from_arrays([long.index, long["__sym"]])
+    long = long.sort_index()
+
+    X = long[use].to_numpy(dtype=float)
+    fin = np.isfinite(X)
+    Xf = np.where(fin, X, 0.0)
+    Y = long["__y"].to_numpy(dtype=float)
+    MASK = long["__m"].to_numpy(dtype=bool)
+    # 因子缺值按 0（标准化后的中位数）补，只把「缺得太多」的行剔掉
+    need_cols = max(1, int(np.ceil(len(use) * 0.5)))
+    usable = np.isfinite(Y) & (fin.sum(axis=1) >= need_cols)
+
+    ts = long.index.get_level_values(0).unique()
+    pos = np.searchsorted(ts, long.index.get_level_values(0).to_numpy())
+    n_ts = len(ts)
+    bpd = _bars_per_day(pd.DatetimeIndex(ts))
+    train_bars = _to_bars(cfg.train_window, bpd)
+    step_bars = _to_bars(cfg.step, bpd)
+    min_bars = min(int(cfg.min_train), train_bars)
+    if n_ts <= min_bars + cfg.horizon + 10:
+        raise ValueError(
+            f"样本太短：合并训练要 {min_bars:,} 根起训，这批品种只有 {n_ts:,} 根"
+        )
+
+    bounds = []
+    t = min_bars
+    while t < n_ts:
+        bounds.append((max(0, t - train_bars), t, min(n_ts, t + step_bars)))
+        t += step_bars
+
+    pred = np.full(len(long), np.nan)
+    imp_acc = np.zeros(len(use))
+    imp_n = 0
+    done = 0
+    for a, b, c in bounds:
+        if cancel and cancel():
+            raise Cancelled()
+        # 训练集只取到 b - horizon：第 i 行的标签要等到 i+h 才成立
+        rows = np.nonzero((pos >= a) & (pos < b - cfg.horizon) & usable & MASK)[0]
+        if len(rows) < 60:
+            continue
+        # 合并之后训练行数是 N 倍，抽稀一下控制耗时（和截面那条路同一个上限）
+        stride = max(1, len(rows) // 20000)
+        rows = rows[::stride]
+        model = ML.build(cfg.model)
+        try:
+            model.fit(Xf[rows], Y[rows])
+        except Exception:      # noqa: BLE001
+            continue
+        want = np.nonzero((pos >= b) & (pos < c))[0]
+        try:
+            pred[want] = model.predict(Xf[want])
+        except Exception:      # noqa: BLE001
+            continue
+        imp = model.importance()
+        if imp is not None and len(imp) == len(use):
+            imp_acc += np.asarray(imp, dtype=float)
+            imp_n += 1
+        done += 1
+        if progress:
+            progress(done, len(bounds), f"合并训练 第 {done}/{len(bounds)} 折")
+
+    if cancel and cancel():
+        raise Cancelled()
+
+    imp_ser = None
+    if imp_n:
+        v = imp_acc / imp_n
+        if v.sum() > 0:
+            v = v / v.sum()
+        imp_ser = pd.Series(v, index=use).sort_values(ascending=False)
+
+    mlabel = ML.MODELS.get(cfg.model, {}).get("label", cfg.model)
+    ser = pd.Series(pred, index=long.index, name="pred")
+    notes = [
+        f"{mlabel} · {len(parts)} 个品种合并训练，{done} 折滚动训练，"
+        f"训练窗口 {cfg.train_window} 个交易日"
+        f"（{train_bars:,} 根），训练样本 {int((usable & MASK).sum()):,} 行"
+    ]
+    if dropped:
+        notes.append(f"以下品种因子不足 2 个，没进合并训练：{'、'.join(dropped)}")
+    if trigger:
+        notes.append("稀疏采样：训练样本仍按各品种自己的触发点挑，合并的只是样本池")
+        flip = [n for n, on in (("因子", cfg.trigger_flip),
+                                ("规则", cfg.trigger_rule_flip)) if on]
+        if flip:
+            notes.append("触发方向已反转：" + "、".join(flip))
+
+    out: dict[str, ScorePack] = {}
+    for sym in info:
+        try:
+            s = ser.xs(sym, level=1)
+        except KeyError:
+            continue
+        s = s.reindex(frames[sym].index)
+        score = _rolling_z(s, cfg.window).rename("score")
+        plan = plans.get(sym)
+        if plan is not None and len(plan.mask) == len(score):
+            score = score.where(plan.mask).ffill().rename("score")
+        out[sym] = ScorePack(
+            score=score, fmat=info[sym]["fmat"][use], raw=info[sym]["raw"],
+            pred=s, importance=imp_ser, folds=done,
+            label=f"机器学习多因子 · {mlabel}（{len(parts)} 品种合并训练）",
+            notes=list(notes), trigger=plan,
+        )
+    if not out:
+        raise ValueError("合并训练没有产出任何品种的预测")
+    return out
+
+
+def run_pooled_strategy(
+    frames: dict[str, pd.DataFrame],
+    keys: list[str],
+    cfg: FactorConfig,
+    progress=None,
+    cancel=None,
+) -> dict[str, FactorOutcome]:
+    """多品种合并训练 + 各自交易。返回 `{品种: FactorOutcome}`。
+
+    训练合并、交易分开：每个品种拿到的预测是同一个模型给的，但仓位、成本、
+    回测各算各的 —— 否则「多品种等权」就变成了一个组合单。
+    """
+    cfg = cfg.normalized()
+    packs = pooled_score(frames, keys, cfg, progress=progress, cancel=cancel)
+    out: dict[str, FactorOutcome] = {}
+    for sym, pack in packs.items():
+        df = frames[sym]
+        if pack.trigger is not None:
+            sig = trigger_hysteresis(pack.score.to_numpy(), pack.trigger,
+                                     cfg.entry_z, cfg.exit_z)
+        else:
+            sig = hysteresis(pack.score.to_numpy(), cfg.entry_z, cfg.exit_z)
+        d = df.copy()
+        d["factor_score"] = pack.score
+        for c in pack.raw.columns:
+            d[f"f_{c}"] = pack.raw[c]
+        d["signal"] = sig
+        out[sym] = FactorOutcome(df=d, pack=pack, label=pack.label,
+                                 notes=list(pack.notes))
+    return out
 
 
 def apply_factor_filter(

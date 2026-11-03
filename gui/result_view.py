@@ -1202,8 +1202,12 @@ class ResultView(QObject):
             elif cfg is not None:
                 for lv, col in ((cfg.entry_z, C_LONG_SIG), (-cfg.entry_z, C_SHORT_SIG)):
                     axf.axhline(lv, color=col, lw=0.9, ls="--", alpha=0.8, zorder=3)
-                for lv in (cfg.exit_z, -cfg.exit_z):
-                    axf.axhline(lv, color=C_MUTED, lw=0.7, ls=":", alpha=0.7, zorder=2)
+                # 触发模式下离场阈值作用在**触发强度**上，不是这条分数轴 ——
+                # 在这儿画一根虚线会让人以为「分数跌破它就平仓」，而实际平仓看的是
+                # 突破强度有没有回落。宁可不画，也别画一根错的
+                if str(getattr(cfg, "sample_mode", "") or "") != "trigger":
+                    for lv in (cfg.exit_z, -cfg.exit_z):
+                        axf.axhline(lv, color=C_MUTED, lw=0.7, ls=":", alpha=0.7, zorder=2)
             axf.axhline(0.0, color="#cbd5e1", lw=0.7, zorder=2)
             axf.set_ylabel("因子分", fontsize=8, color=C_MUTED, rotation=0, labelpad=14)
             axf.grid(True, color=C_GRID, lw=0.5, alpha=0.7)
@@ -1604,11 +1608,15 @@ class ResultView(QObject):
 
         def pct(x):
             # 亏穿过之后年化波动是 NaN（见 `backtest._metrics`）：写「—」，
-            # 别让表格里出现「nan%」
-            return "—" if x != x else f"{x*100:.2f}%"
+            # 别让表格里出现「nan%」。老结果里没有的项（成本率）是 None，同理
+            return "—" if x is None or x != x else f"{x*100:.2f}%"
 
         def num(x):
             return "—" if x != x else f"{x:.2f}"
+
+        def money(x, dp=0):
+            # 老结果 / 还没接成本口径的路径（早先存的报告）没有这一项，写「—」
+            return "—" if x is None or x != x else f"${x:,.{dp}f}"
 
         rows = [
             ("年化收益 CAGR", pct(m["cagr"]), pct(b["cagr"]) if b else "—",
@@ -1628,6 +1636,16 @@ class ResultView(QObject):
             ("　其中空头", pct(m["short_exposure"]), "0.00%" if b else "—", None),
             ("交易次数", f"{m['n_trades']}", "1" if b else "—", None),
             ("　多头 / 空头", f"{m['n_long']} / {m['n_short']}", "1 / 0" if b else "—", None),
+            # 成本：手续费 + 滑点，已经扣在权益里了，这里单列出来回答「钱花在哪」。
+            # 基准那一列也填上 —— 买入持有只开一次仓，两边的倍数关系一眼能看出
+            # 换手到底吃掉了多少。
+            # 「平均每笔成本」用**百分比**（成本 ÷ 成交额）而不是金额：金额随本金
+            # 和手数一起变，两条不同资金的策略没法比；比例才是成本本身，也能直接
+            # 对着成本档位看（3‱ 滑点 ≈ 0.03%）
+            ("总成本", money(m.get("total_cost")),
+             money(b.get("total_cost")) if b else "—", None),
+            ("平均每笔成本（占成交额）", pct(m.get("cost_rate")),
+             pct(b.get("cost_rate")) if b else "—", None),
             ("胜率", pct(m["win_rate"]), "—", None),
             ("盈亏比", f"{m['profit_factor']:.2f}", "—", None),
             ("平均每笔收益", pct(m["avg_trade"]), "—", None),

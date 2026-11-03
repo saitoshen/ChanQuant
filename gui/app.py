@@ -87,6 +87,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QStackedWidget,
@@ -873,13 +874,25 @@ class BacktestJob:
     factor_keys: tuple
     factor_cfg: object
     filtered: bool
+    # 反向交易：多品种也要按同一个方向跑。这个开关属于「策略」而不是
+    # `BacktestConfig`，所以不能指望 `job.cfg.rule_reverse` —— 那个字段根本不存在
+    reverse: bool = False
 
 
-def run_backtest_job(job: BacktestJob):
+def run_backtest_job(job: BacktestJob, progress=None, cancel=None):
     """跑一个品种，返回 `Result`；没有信号时返回 None。
 
     等价于原来主窗口里的 `_backtest_one`，区别只有一个：这里不读界面，
     所以能在后台线程里跑。
+
+    `progress` / `cancel` 只有机器学习那条路用得上 —— walk-forward 一折一回调，
+    一折几秒，几十折就是一个品种几十秒到几分钟。单因子 / 多因子几十毫秒算完，
+    传进来也只是被忽略。
+
+    **机器学习在这里是「每个品种各训一遍」**：`job.df` 是这一个品种的行情，
+    walk-forward 的每一折都在它自己的历史上训练、预测自己的未来。品种之间
+    不共享模型 —— 共享等于用螺纹的形态去预测沪铜，多品种回测就变成了「同一
+    个模型套在 N 条曲线上」，回答不了「这套参数换一批品种还灵不灵」。
     """
     rule_signal = None
     base = job.df
@@ -887,9 +900,10 @@ def run_backtest_job(job: BacktestJob):
     if job.family == FAMILY_RULE:
         if not job.rule_key:
             return None
-        base = run_strategy(job.df, job.rule_key, job.rule_params)
+        base = run_strategy(job.df, job.rule_key, job.rule_params,
+                            reverse=bool(job.reverse))
         rule_signal = base["signal"].to_numpy(int)
-        label = STRATEGIES[job.rule_key].label
+        label = STRATEGIES[job.rule_key].label + ("（反向）" if job.reverse else "")
 
     if not (job.family == FAMILY_FACTOR or job.filtered):
         return run_backtest(base, job.cfg, label=label)
@@ -898,10 +912,13 @@ def run_backtest_job(job: BacktestJob):
     if not keys:
         return None
     if rule_signal is None:
-        out = fstrat.run_factor_strategy(job.df, job.factor_mode, keys, job.factor_cfg)
+        out = fstrat.run_factor_strategy(job.df, job.factor_mode, keys,
+                                         job.factor_cfg, progress=progress,
+                                         cancel=cancel)
     else:
         out = fstrat.run_rule_with_filter(
-            job.df, rule_signal, job.factor_mode, keys, job.factor_cfg
+            job.df, rule_signal, job.factor_mode, keys, job.factor_cfg,
+            progress=progress, cancel=cancel,
         )
     return run_backtest(out.df, job.cfg, label=out.label)
 
@@ -913,22 +930,29 @@ class MultiWorker(QObject):
     「多品种强制手动」这一道防线，可只要点了按钮，窗口就冻在那儿 —— 连
     「停止」都点不动。现在整批扔进线程，主线程只管最后那一下画图。
 
-    每个品种之间查一次 `_cancel`：用户改主意时最多多等一个品种。
+    每个品种之间查一次 `_cancel`；机器学习还要在每个训练折之间查（一折几秒，
+    最多多等一折）。没有这层，用户点了「停止回测」得等整个品种训完才停下。
     """
 
     progress = Signal(int, int, str)   # done, total, label
     done = Signal(object)              # (results, named, failed)
     failed = Signal(str)
 
-    def __init__(self, jobs: list[BacktestJob]) -> None:
+    def __init__(self, jobs: list[BacktestJob], pooled: bool = False) -> None:
         super().__init__()
         self.jobs = jobs
+        # 合并训练：N 个品种的样本训一个模型，再各自回测。训练是一次性的，
+        # 不能按品种拆开跑 —— 所以整批交给 `run_pooled_strategy` 一次算完
+        self.pooled = bool(pooled)
         self._cancel = False
 
     def cancel(self) -> None:
         self._cancel = True
 
     def run(self) -> None:
+        if self.pooled:
+            self._run_pooled()
+            return
         results, named, failed = [], [], []
         total = len(self.jobs)
         try:
@@ -936,8 +960,22 @@ class MultiWorker(QObject):
                 if self._cancel:
                     return
                 self.progress.emit(i, total, job.label)
+
+                # 折级进度。机器学习一个品种要训几十折，只在换品种时报一次的话，
+                # 界面会连着几分钟停在「正在跑 X」—— 和卡死没区别。折号跟在品种
+                # 名后面，一眼能看出还在动；单因子 / 多因子不回调，这里也就
+                # 只有换品种那一条
+                def _cb(done: int, tot: int, msg: str,
+                        _label: str = job.label, _i: int = i) -> None:
+                    self.progress.emit(_i, total, f"{_label} · {msg}")
+
                 try:
-                    res = run_backtest_job(job)
+                    res = run_backtest_job(job, progress=_cb,
+                                           cancel=lambda: self._cancel)
+                except fstrat.Cancelled:
+                    # 用户点了「停止回测」：手上这个品种训到一半，直接收摊。
+                    # 不能当成失败记一笔 —— 那是他自己叫停的
+                    return
                 except Exception as exc:  # noqa: BLE001
                     failed.append(f"{job.label}：{exc}")
                     continue
@@ -949,6 +987,47 @@ class MultiWorker(QObject):
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"{type(exc).__name__}: {exc}")
             return
+        self.done.emit((results, named, failed))
+
+    def _run_pooled(self) -> None:
+        """合并训练：一个模型训完，再各自回测。
+
+        训练是整批一次算完的（`run_pooled_strategy` 要同时看所有品种），所以
+        进度只能按「折」报，报不了「第几个品种」。折跑完之后才是逐个品种回测，
+        那一段很快，一条进度就过去了。
+        """
+        jobs = self.jobs
+        total = len(jobs)
+        frames = {j.key: j.df for j in jobs}
+        first = jobs[0]
+        try:
+            outs = fstrat.run_pooled_strategy(
+                frames, list(first.factor_keys), first.factor_cfg,
+                progress=lambda d, t, m: self.progress.emit(0, total, m),
+                cancel=lambda: self._cancel,
+            )
+        except fstrat.Cancelled:
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+
+        results, named, failed = [], [], []
+        for i, job in enumerate(jobs):
+            if self._cancel:
+                return
+            self.progress.emit(i, total, job.label)
+            out = outs.get(job.key)
+            if out is None:
+                failed.append(f"{job.label}：合并训练没有给出这个品种的预测")
+                continue
+            try:
+                res = run_backtest(out.df, job.cfg, label=out.label)
+            except Exception as exc:  # noqa: BLE001
+                failed.append(f"{job.label}：{exc}")
+                continue
+            results.append(res)
+            named.append((job.label, res))
         self.done.emit((results, named, failed))
 
 
@@ -1020,6 +1099,9 @@ class MainWindow(QMainWindow):
         self._m_worker: MultiWorker | None = None
         self._m_seq = 0
         self._m_applied = -1
+        # 这批多品种跑的是什么（各自训练 / 合并训练 / 普通回测）—— 进度回调
+        # 靠它决定状态栏抬头
+        self._m_head = ""
 
         # 实时与交易
         self._live_base: pd.DataFrame | None = None   # 订阅时的本地历史，实时段接在它后面
@@ -1594,6 +1676,17 @@ class MainWindow(QMainWindow):
         self._fill_strategy_combo()
         pr.addWidget(self.cb_strategy)
 
+        # 反向交易：把信号整体翻过来（多 ↔ 空）。有些规则反过来做才有 alpha ——
+        # 与其为每个方向各写一条策略，不如留一个开关。信号在 `run_strategy` 里
+        # 就翻掉，研究页 / 组合回放 / 实盘用的是同一份，不会「图上做多、实盘做空」
+        self.chk_reverse = QCheckBox("反向交易（多 ↔ 空）")
+        self.chk_reverse.setToolTip(
+            "勾上之后，原先做多的地方做空、原先做空的地方做多，空仓不变。\n"
+            "取反发生在策略算出信号之后、因子过滤和回测之前 —— 参数不用改，\n"
+            "因子过滤的方向也跟着一起翻。存进策略配置，实盘按同一个方向下单。"
+        )
+        pr.addWidget(self.chk_reverse)
+
         self.lbl_desc = QLabel("")
         self.lbl_desc.setObjectName("Hint")
         self.lbl_desc.setWordWrap(True)
@@ -1641,9 +1734,16 @@ class MainWindow(QMainWindow):
 
         self.chk_sparse = QCheckBox("只在信号触发时建样本（稀疏采样）")
         self.chk_sparse.setToolTip(
-            "开启后训练集只保留「触发」的那几根 bar，其余 bar 仍会预测、仍会出信号。\n\n"
+            "开启后训练集只保留「触发」的那几根 bar，模型的观点也只在这几根刷新，\n"
+            "触发点之间沿用上一次的分数。\n\n"
             "为什么需要：分钟线上每根 bar 都是样本的话，相邻样本的标签重叠 horizon 根，\n"
-            "等于同一段行情被数了好几遍；而真正值得学的「突破那一刻」只占几个百分点。"
+            "等于同一段行情被数了好几遍；而真正值得学的「突破那一刻」只占几个百分点。\n\n"
+            "进场：只在触发点，方向由触发给（向上突破做多、向下破位做空），\n"
+            "模型分数在那一侧过进场阈值才真的开仓。\n"
+            "出场：每根都看触发强度，回落到离场阈值以内就平 —— 分数在触发点之间是\n"
+            "阶梯常值，拿它出场等于永远等不到。规则触发的仓位跟规则自己的 signal 平。\n\n"
+            "触发因子可以都选「不用」，那就只用规则触发（方向全由规则给）。\n"
+            "「反转因子 / 反转规则」把对应那条通道的方向取反。"
         )
         self.chk_sparse.toggled.connect(self._on_sparse_toggled)
         sp.addWidget(self.chk_sparse)
@@ -1657,15 +1757,19 @@ class MainWindow(QMainWindow):
         r1.setContentsMargins(0, 0, 0, 0)
         r1.setSpacing(6)
         self.cb_trig1 = QComboBox()
-        self.cb_trig1.setToolTip("触发因子一：它的时序 Z-score 越过阈值就算触发")
-        self._fill_factor_combo(self.cb_trig1, "mom_20")
+        self.cb_trig1.setToolTip(
+            "触发因子一：它的时序 Z-score 越过阈值就算触发。\n"
+            "选「不用」表示这一侧不采样本 —— 两个因子都选「不用」时，\n"
+            "触发就只剩规则那一条路（只用规则）。"
+        )
+        self._fill_factor_combo(self.cb_trig1, "mom_20", empty="（不用触发因子）")
         self.cb_trig2 = QComboBox()
         self.cb_trig2.setToolTip("触发因子二（可选）：和第一个取均值，两个都高才算强触发")
-        self._fill_factor_combo(self.cb_trig2, "vol_20")
-        self.cb_trig2.insertItem(0, "（不用第二个因子）", "")
-        r1.addWidget(self.cb_trig1, 1)
-        r1.addWidget(self.cb_trig2, 1)
-        sb.addLayout(r1)
+        self._fill_factor_combo(self.cb_trig2, "vol_20", empty="（不用第二个因子）")
+        # 一行一个：卡片里再嵌一层之后只剩 ~300 px，两个下拉并排装不下
+        # 「趋势 · 动量 120 日」这种长名字，硬塞会把整张卡片撑宽、右边被裁掉
+        sb.addWidget(self.cb_trig1)
+        sb.addWidget(self.cb_trig2)
 
         r2 = QHBoxLayout()
         r2.setContentsMargins(0, 0, 0, 0)
@@ -1678,13 +1782,40 @@ class MainWindow(QMainWindow):
         self.cb_trig_rule.addItem("（不用规则触发）", "")
         for key, st in STRATEGIES.items():
             self.cb_trig_rule.addItem(st.label, key)
+        self._fit_width(self.cb_trig_rule)
+        sb.addWidget(self.cb_trig_rule)
+
+        # 反转：因子那侧和规则那侧各一个。反的是「往哪边算触发」，不是把策略做成
+        # 反手 —— 标签仍是前向收益，模型学到的仍是「之后会涨」，只是样本来自反方向
+        r2b = QHBoxLayout()
+        r2b.setContentsMargins(0, 0, 0, 0)
+        r2b.setSpacing(6)
+        self.chk_trig_flip = QCheckBox("反转因子")
+        self.chk_trig_flip.setToolTip(
+            "把触发因子的强度取负号：向上突破变成向下破位，向下破位变成向上突破。\n"
+            "样本方向、进场方向、「只采向上 / 只采向下」的筛法都跟着翻。\n\n"
+            "什么时候用：这个因子你读反了 —— 动量类因子在震荡市里「突破即回落」，\n"
+            "突破那根之后往往是往回走，这时该把触发方向反过来。\n\n"
+            "注意：反转的是「在哪儿学、往哪边做」，不是把策略做成反手策略。\n"
+            "标签还是前向收益，模型学的还是「之后会涨」。"
+        )
+        self.chk_trig_rule_flip = QCheckBox("反转规则")
+        self.chk_trig_rule_flip.setToolTip(
+            "把规则自己的 signal 取负号：规则本来做多的位置改做空，反之亦然。\n"
+            "规则通道的进场方向、出场（signal 变 0 或翻向就平）都跟着翻。\n\n"
+            "什么时候用：这条规则在你的品种 / 周期上方向是反的（比如均线在\n"
+            "震荡品种上「金叉即见顶」），又不想另外写一条规则。"
+        )
+        r2b.addWidget(self.chk_trig_flip)
+        r2b.addWidget(self.chk_trig_rule_flip)
+        r2b.addStretch(1)
+        sb.addLayout(r2b)
+
         self.cb_trig_side = QComboBox()
         self.cb_trig_side.addItem("向上向下都采", "both")
         self.cb_trig_side.addItem("只采向上", "up")
         self.cb_trig_side.addItem("只采向下", "down")
-        r2.addWidget(self.cb_trig_rule, 1)
-        r2.addWidget(self.cb_trig_side, 1)
-        sb.addLayout(r2)
+        sb.addWidget(self.cb_trig_side)
 
         r3 = QHBoxLayout()
         r3.setContentsMargins(0, 0, 0, 0)
@@ -1710,6 +1841,13 @@ class MainWindow(QMainWindow):
             "0 = 不分档（所有触发点一个样）。3 档意味着「1.0~1.5σ」「1.5~2.0σ」\n"
             "「2.0σ 以上」各采一次 —— 弱突破和强突破是两种样本。"
         )
+        r3.addWidget(self.sp_trig_z, 1)
+        r3.addWidget(self.sp_trig_tiers, 1)
+        sb.addLayout(r3)
+
+        r4 = QHBoxLayout()
+        r4.setContentsMargins(0, 0, 0, 0)
+        r4.setSpacing(6)
         self.sp_trig_span = QDoubleSpinBox()
         self.sp_trig_span.setRange(0.1, 3.0)
         self.sp_trig_span.setSingleStep(0.1)
@@ -1717,29 +1855,25 @@ class MainWindow(QMainWindow):
         self.sp_trig_span.setValue(0.5)
         self.sp_trig_span.setPrefix("每档 ")
         self.sp_trig_span.setSuffix(" σ")
-        r3.addWidget(self.sp_trig_z)
-        r3.addWidget(self.sp_trig_tiers)
-        r3.addWidget(self.sp_trig_span)
-        sb.addLayout(r3)
-
-        r4 = QHBoxLayout()
-        r4.setContentsMargins(0, 0, 0, 0)
-        r4.setSpacing(6)
+        self.sp_trig_span.setToolTip(
+            "相邻两档之间隔多少个 σ。0.5 表示 1.0~1.5、1.5~2.0、2.0 以上。"
+        )
         self.sp_trig_cool = QSpinBox()
         self.sp_trig_cool.setRange(0, 500)
         self.sp_trig_cool.setValue(10)
-        self.sp_trig_cool.setPrefix("同档冷却 ")
+        self.sp_trig_cool.setPrefix("冷却 ")
         self.sp_trig_cool.setSuffix(" 根")
         self.sp_trig_cool.setToolTip(
             "同一档在这么多根之内不重复采样。一次突破持续 20 根的话，\n"
             "不设冷却就会建 20 个几乎一样的样本。"
         )
-        self.lbl_sparse = QLabel("")
-        self.lbl_sparse.setObjectName("Hint")
-        self.lbl_sparse.setWordWrap(True)
-        r4.addWidget(self.sp_trig_cool)
-        r4.addWidget(self.lbl_sparse, 1)
+        r4.addWidget(self.sp_trig_span, 1)
+        r4.addWidget(self.sp_trig_cool, 1)
         sb.addLayout(r4)
+        # 这两个带前后缀的数字框，最小宽度按「每档 0.5 σ」整串文字算（各 127 px），
+        # 两个并排正好比可用宽度多 8 px。让宽度跟着布局走，文字挤了由控件自己省略
+        for w in (self.sp_trig_span, self.sp_trig_cool):
+            w.setSizePolicy(QSizePolicy.Ignored, w.sizePolicy().verticalPolicy())
 
         sp.addWidget(self.sparse_body)
         self.sparse_body.setVisible(False)
@@ -1870,6 +2004,22 @@ class MainWindow(QMainWindow):
             )
         sf.addWidget(self.cb_fmodel)
 
+        # 多品种合并训练：默认**关**。合训学的是「这个池子的共同形态」，单品种
+        # 的个性会被稀释，换池子就得重训 —— 它是「换一批品种还灵不灵」这个问题
+        # 的另一种问法，不是更准的问法
+        self.chk_pool = QCheckBox("多品种合并训练（所有品种的样本一起学）")
+        self.chk_pool.setToolTip(
+            "只在「多品种回测 + 因子策略 + 机器学习」时生效。\n\n"
+            "不勾（默认）：每个品种各训一个模型，各自学各自的形态。\n"
+            "勾上：把 N 个品种的样本堆成一张长表训一个模型，再各自交易。\n\n"
+            "合训的代价：学出来的是「这个池子的平均形态」，单品种的个性被稀释，\n"
+            "换一批品种就得重训。好处是样本量变 N 倍，稀疏采样时尤其明显 ——\n"
+            "一个品种几十个触发点不够训，N 个品种凑起来就够了。\n"
+            "标签会按各品种自己的波动率折算（涨一个标准差在所有品种上是同一件事），\n"
+            "否则铁矿 2% 的日波动会把玉米 0.5% 的信号完全淹没。"
+        )
+        sf.addWidget(self.chk_pool)
+
         self.lbl_fparam = self._section("因子参数")
         sf.addWidget(self.lbl_fparam)
 
@@ -1906,19 +2056,18 @@ class MainWindow(QMainWindow):
         self.lbl_cost = self._section("交易成本")
         cl.addWidget(self.lbl_cost)
         self.cb_cost = QComboBox()
-        for key, p in costs.PROFILES.items():
+        for key, p in costs.load()["profiles"].items():
             self.cb_cost.addItem(p["label"], key)
             self.cb_cost.setItemData(
-                self.cb_cost.count() - 1,
-                f"{p['fee_mult']:g} 倍交易所手续费 + {p['slip_ticks']:g} 跳滑点",
-                Qt.ToolTipRole,
+                self.cb_cost.count() - 1, costs.short_text(p), Qt.ToolTipRole,
             )
         i = self.cb_cost.findData(costs.current())
         self.cb_cost.setCurrentIndex(max(i, 0))
         self.cb_cost.setToolTip(
-            "国内期货的成本口径：交易所手续费 × 倍数 + 滑点跳数 × 最小变动价位。\n"
-            "乐观 / 中性 / 压力三档在「数据管理」页里可以改，品种的手续费和 tick "
-            "也在那里维护。"
+            "国内期货的成本口径：交易所手续费 × 倍数 + 滑点。\n"
+            "滑点有两种口径：按跳（× 最小变动价位）或按 ‱（× 价格，不看 tick）。\n"
+            "乐观 / 中性 / 压力 / 按 bp 四档在「数据管理」页里可以改，品种的手续费和 "
+            "tick 也在那里维护。"
         )
         cl.addWidget(self.cb_cost)
         self.lbl_cost_hint = QLabel("")
@@ -2071,7 +2220,11 @@ class MainWindow(QMainWindow):
         scroll.setWidget(content)
         scroll.setWidgetResizable(True)
         scroll.setFixedWidth(360)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 横向滚动条**按需**出现，不是永远关掉。关掉的话，某个控件的最小宽度
+        # 一旦超过侧边栏（换了系统字号 / 高 DPI / 以后又加了新控件），超出去的部分
+        # 不是变窄，是直接看不见 —— 用户只能猜右边还有什么。宁可偶尔出现一条
+        # 滚动条，也别让控件凭空消失
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setFrameShape(QFrame.NoFrame)
 
         # 状态和「策略回测」**钉在底部**，不跟着侧边栏滚：手动模式下这个按钮是
@@ -2406,6 +2559,7 @@ class MainWindow(QMainWindow):
             self.cb_symbol.currentIndexChanged.connect(self._on_symbol_changed)
             self.cb_period.currentIndexChanged.connect(self._on_period_changed)
             self.cb_strategy.currentIndexChanged.connect(self._on_strategy_changed)
+            self.chk_reverse.toggled.connect(lambda *_: self._schedule(immediate=True))
             self.cb_range.currentIndexChanged.connect(self._schedule)
             self.cb_cost.currentIndexChanged.connect(self._on_cost_changed)
             self.cb_size.currentIndexChanged.connect(self._on_size_changed)
@@ -2429,7 +2583,9 @@ class MainWindow(QMainWindow):
             self.sp_pool_pct.valueChanged.connect(self._on_cross_param_changed)
             self.cb_label.currentIndexChanged.connect(self._on_cross_param_changed)
             for _w in (self.cb_trig1, self.cb_trig2, self.cb_trig_rule, self.cb_trig_side):
-                _w.currentIndexChanged.connect(lambda *_: self._schedule())
+                _w.currentIndexChanged.connect(lambda *_: self._on_trigger_src_changed())
+            for _w in (self.chk_trig_flip, self.chk_trig_rule_flip):
+                _w.toggled.connect(lambda *_: self._schedule())
             for _w in (self.sp_trig_z, self.sp_trig_span):
                 _w.valueChanged.connect(lambda *_: self._schedule())
             for _w in (self.sp_trig_tiers, self.sp_trig_cool):
@@ -2474,10 +2630,16 @@ class MainWindow(QMainWindow):
         """重建「时序因子」下拉（截面选品种模式的那条腿）。"""
         self._fill_factor_combo(self.cb_tfactor, factors.DEFAULT_SINGLE)
 
-    def _fill_factor_combo(self, combo: QComboBox, default: str) -> None:
+    def _fill_factor_combo(self, combo: QComboBox, default: str,
+                           empty: str = "") -> None:
         keep = combo.currentData()
         combo.blockSignals(True)
         combo.clear()
+        # 「不用这个因子」必须是下拉自己的第一项，不能在外面 insertItem 补 ——
+        # 切市场时这个方法会把下拉清空重填，外面补的那一项就没了，用户会莫名其妙
+        # 发现「不用第二个因子」这个选项消失了
+        if empty:
+            combo.addItem(empty, "")
         # 按当前大类过滤：A 股不显示展期/期权/持仓量，美股不显示期货专属因子
         valid = set(factors.filter_by_market(self.market))
         for cat in factors.CATEGORIES:
@@ -2491,9 +2653,30 @@ class MainWindow(QMainWindow):
                 combo.addItem(text, k)
         target = keep if combo.findData(keep) >= 0 else default
         idx = combo.findData(target)
+        if idx < 0 and empty and combo.count() > 1:
+            # 默认因子在这个市场上没有：退回第一个真因子，而不是掉进「不用」——
+            # 静默关掉一个触发源，用户只会看到「策略突然不交易了」
+            idx = 1
         if idx >= 0:
             combo.setCurrentIndex(idx)
         combo.blockSignals(False)
+        # 因子名很长（「趋势 · 动量 120 日」），下拉的最小宽度会按最长那条算，
+        # 侧边栏只有 360 px，两个这样的下拉并排就能把整张卡片撑宽、右边被裁掉。
+        # 这里让它的宽度跟着布局走（Ignored），文字过长时由 Qt 自己省略
+        self._fit_width(combo)
+
+    @staticmethod
+    def _fit_width(w) -> None:
+        """让控件不再拿「内容宽度」去撑布局的最小宽度。
+
+        Qt 的 `minimumSizeHint` 会按最长的那条下拉项 / 带前后缀的数字算，侧边栏
+        这种 360 px 的窄容器里，两个并排就超宽 —— 而 `QScrollArea` 的横向滚动条
+        是关掉的，超出去的部分直接看不见（不是变窄，是被裁）。设成 `Ignored`
+        之后最小宽度归零，宽度完全由布局分配，放不下的文字由控件自己省略。
+        """
+        w.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        w.setMinimumContentsLength(6)
+        w.setSizePolicy(QSizePolicy.Ignored, w.sizePolicy().verticalPolicy())
 
     def _fill_strategy_combo(self) -> None:
         """重建规则策略下拉。注册了新策略之后要重来一遍，否则选不到它。
@@ -2806,6 +2989,14 @@ class MainWindow(QMainWindow):
             self._fill_single_combo()
             self._fill_tfactor_combo()
             self._fill_multi_table()
+        # 触发因子也得重填：期货上的展期 / 期权因子在美股上算不出来，留着就是
+        # 一个「选了但没数据」的触发源 —— 决策点会变成 0，看起来像策略坏了
+        if hasattr(self, "cb_trig1"):
+            self._fill_factor_combo(self.cb_trig1, "mom_20",
+                                    empty="（不用触发因子）")
+            self._fill_factor_combo(self.cb_trig2, "vol_20",
+                                    empty="（不用第二个因子）")
+            self._sync_trigger_src()
         self._sync_period_controls()
         self._sync_cost_controls()      # 美股没有这一组，期货才显示
         if not self.store.items:
@@ -3122,6 +3313,13 @@ class MainWindow(QMainWindow):
         self._rebuild_params(spec)
         self._schedule(immediate=True)
 
+    def _rule_reverse(self) -> bool:
+        """「反向交易」有没有勾上。只有规则族用得上，其它族一律 False。"""
+        if self.family != FAMILY_RULE:
+            return False
+        w = getattr(self, "chk_reverse", None)
+        return bool(w is not None and w.isChecked())
+
     # ---------------------------------------------------------- 策略族 / 因子面板
     def _filter_active(self) -> bool:
         """规则策略是否启用了因子过滤。"""
@@ -3186,6 +3384,9 @@ class MainWindow(QMainWindow):
             self.box_rule.setVisible(is_rule)
             self.box_factor.setVisible(is_factor)
             self.box_filter.setVisible(is_rule)
+            # 反向开关只对规则族有意义；规则面板借去当截面的时序腿时要藏起来 ——
+            # 那条腿没有「反向」这个配置项，露出来会让人以为勾了会生效
+            self.chk_reverse.setVisible(is_rule)
 
         self.cross_dlg.set_mode(mode, timing)
         self._sync_cross_controls()
@@ -3393,17 +3594,36 @@ class MainWindow(QMainWindow):
         默认值，用户多半要先调阈值。真重算由参数改动触发。"""
         if hasattr(self, "sparse_body"):
             self.sparse_body.setVisible(bool(on))
+            self._sync_trigger_src()
         if not on:
             self._schedule(immediate=True)
 
     def _trigger_keys(self) -> list[str]:
-        """稀疏采样的触发因子。第一个必选，第二个为空就不加。"""
+        """稀疏采样的触发因子。两个都可以留空 —— 那就只剩规则那条触发路。"""
         out = []
         for cb in (getattr(self, "cb_trig1", None), getattr(self, "cb_trig2", None)):
             k = cb.currentData() if cb is not None else ""
             if k and k not in out:
                 out.append(str(k))
         return out
+
+    def _on_trigger_src_changed(self) -> None:
+        """触发源变了：顺手把对应的「反转」勾选框灰掉。
+
+        没有因子触发时「反转因子」什么也反不了，没有规则触发时「反转规则」同理。
+        留着一个能勾但不生效的开关，比不给这个开关更让人糊涂。
+        """
+        self._sync_trigger_src()
+        self._schedule()
+
+    def _sync_trigger_src(self) -> None:
+        has_f = bool(self._trigger_keys())
+        has_r = bool(self.cb_trig_rule.currentData()) if hasattr(
+            self, "cb_trig_rule") else False
+        for w, on in ((getattr(self, "chk_trig_flip", None), has_f),
+                      (getattr(self, "chk_trig_rule_flip", None), has_r)):
+            if w is not None:
+                w.setEnabled(on)
 
     def _on_model_changed(self) -> None:
         self._schedule(immediate=True)
@@ -3439,10 +3659,19 @@ class MainWindow(QMainWindow):
         is_ml = self.factor_mode == "ml"
         self.lbl_fmodel.setVisible(is_ml)
         self.cb_fmodel.setVisible(is_ml)
+        # 合并训练只对时序多品种有意义：截面那边本来就是合并训练的（另一个口径）
+        self.chk_pool.setVisible(is_ml)
         # 方向口径对 ML 没意义：模型自己学方向和权重，orient 根本不参与
         self.cb_forient.setVisible(not is_ml)
         if hasattr(self, "box_sparse"):
             self.box_sparse.setVisible(is_ml and self.family == FAMILY_FACTOR)
+            # 参数区的显隐跟着勾选框走。恢复配置时是 blockSignals 之后 setChecked
+            # 的，不会触发 `toggled` —— 只靠 `_on_sparse_toggled` 会出现「勾上了，
+            # 但下面的因子 / 阈值一个都不展开」，看着像这个功能没生效
+            self.sparse_body.setVisible(bool(self.chk_sparse.isChecked()))
+            # 反转开关的灰 / 亮也得在恢复配置时同步一次：启动时规则下拉是空的，
+            # 但「反转规则」默认是亮的，要等用户动一下下拉才对 —— 那就是个假开关
+            self._sync_trigger_src()
 
         if is_ml and not mlmodels.available():
             self.lbl_fmode.setText("当前环境没有可用的机器学习库，请先安装依赖。")
@@ -3473,6 +3702,8 @@ class MainWindow(QMainWindow):
         is_ml = self.factor_mode == "ml"
         self.lbl_fmodel.setVisible(is_ml)
         self.cb_fmodel.setVisible(is_ml)
+        # 截面有自己的合并口径（横截面去均值），这里的复选框不适用
+        self.chk_pool.setVisible(False)
         self.cb_forient.setVisible(not is_ml)
         if single:
             self._sync_single_rev()
@@ -3737,6 +3968,7 @@ class MainWindow(QMainWindow):
             family=self.family,
             rule_key=self.cb_strategy.currentData() or "",
             rule_params=self._current_params(),
+            rule_reverse=self._rule_reverse(),
             factor_mode=self.factor_mode if (is_factor or is_cross) else "",
             factor_keys=self._selected_factor_keys() if (is_factor or is_cross) else [],
             factor_reverse={k: True for k in self._reversed_factor_keys()},
@@ -3806,6 +4038,9 @@ class MainWindow(QMainWindow):
         r = self.cb_strategy.findData(cfg.rule_key)
         if r >= 0:
             self.cb_strategy.setCurrentIndex(r)     # 重建参数控件
+        self.chk_reverse.blockSignals(True)
+        self.chk_reverse.setChecked(bool(getattr(cfg, "rule_reverse", False)))
+        self.chk_reverse.blockSignals(False)
         for name, val in (cfg.rule_params or {}).items():
             w = self.param_widgets.get(name)
             if w is not None:
@@ -4217,6 +4452,8 @@ class MainWindow(QMainWindow):
             trigger_tiers=int(self.sp_trig_tiers.value()) if sparse else 0,
             trigger_span=float(self.sp_trig_span.value()) if sparse else 1.0,
             trigger_cool=int(self.sp_trig_cool.value()) if sparse else 0,
+            trigger_flip=bool(sparse and self.chk_trig_flip.isChecked()),
+            trigger_rule_flip=bool(sparse and self.chk_trig_rule_flip.isChecked()),
         )
 
     def run_analysis(self, df_override: pd.DataFrame | None = None) -> None:
@@ -4312,7 +4549,8 @@ class MainWindow(QMainWindow):
             if not rkey:
                 return
             try:
-                base_df = run_strategy(df, rkey, self._current_params())
+                base_df = run_strategy(df, rkey, self._current_params(),
+                                       reverse=self._rule_reverse())
             except Exception as exc:  # noqa: BLE001
                 self.lbl_status.setText(f"策略计算失败：{exc}")
                 self._publish(f"策略计算失败：{exc}", True)
@@ -4321,7 +4559,9 @@ class MainWindow(QMainWindow):
 
         need_factor = (self.family == FAMILY_FACTOR) or self._filter_active()
         if not need_factor:
-            self._finish(rule_signal_df=base_df, label=STRATEGIES[self.cb_strategy.currentData()].label)
+            self._finish(rule_signal_df=base_df,
+                         label=STRATEGIES[self.cb_strategy.currentData()].label
+                         + ("（反向）" if self._rule_reverse() else ""))
             return
 
         keys = self._selected_factor_keys()
@@ -4407,6 +4647,7 @@ class MainWindow(QMainWindow):
             factor_keys=tuple(self._selected_factor_keys()),
             factor_cfg=self._factor_cfg(),
             filtered=bool(self._filter_active()),
+            reverse=self._rule_reverse(),
         )
 
     def _run_multi(self, keys: list[str]) -> None:
@@ -4418,6 +4659,12 @@ class MainWindow(QMainWindow):
         整批走后台（见 `MultiWorker`）：N 个品种就是 N 遍策略 + N 遍回测，
         5 分钟十年一个品种几秒，20 个品种十几分钟。同步跑的话窗口会冻在那儿，
         连「停止」都点不动 —— 这也是「自动回测」以前只能单品种用的原因。
+
+        机器学习**也走这条路**：每个品种在自己的历史上各训一遍 walk-forward
+        （见 `run_backtest_job` 的说明），所以耗时是单品种的 N 倍。以前这里
+        直接拦下来说「不支持」，可用户真正要的就是「这套参数换一批品种还灵不
+        灵」—— 拦掉等于这个问题永远问不了。现在放开了：折级进度会一路报上来，
+        嫌慢点「停止回测」即可，停在一折之间，不用等整个品种跑完。
         """
         period = self._period()
         frames, missing = self._frames_for(keys, period)
@@ -4427,34 +4674,46 @@ class MainWindow(QMainWindow):
                 f"勾选的品种都没有 {PERIOD_LABEL.get(period, period)} 数据"
             )
             return
+        # 机器学习至少要 2 个因子。不先拦一下的话，每个品种都会以「至少需要
+        # 2 个因子」失败一次，N 条失败信息淹掉真正的结论
         if self.factor_mode == "ml" and (
             self.family == FAMILY_FACTOR or self._filter_active()
-        ):
-            # 每折 walk-forward 都要重训，乘上品种数就是几十分钟。串行跑要等
-            # 一晚上，并行又要 N 份内存 —— 不如直说这条不支持
-            self.lbl_status.setText(
-                "机器学习多因子不支持多品种回测（每个品种都要单独重训一遍），"
-                "请改用单因子 / 多因子"
-            )
+        ) and len(self._selected_factor_keys()) < 2:
+            self.lbl_status.setText("机器学习多因子至少需要勾选 2 个因子")
             return
 
         jobs = [self._backtest_job(key, df) for key, df in frames.items()]
-        self._start_multi_worker(jobs, missing, period)
+        self._start_multi_worker(jobs, missing, period, pooled=self._pooled_ml())
+
+    def _pooled_ml(self) -> bool:
+        """多品种要不要合并训练。
+
+        只在「因子族 + 机器学习 + 勾了复选框」时生效：规则策略那条路的仓位由规则
+        决定，合并训练学出来的分数只做过滤，混在一起说不清是谁在起作用。
+        """
+        w = getattr(self, "chk_pool", None)
+        return bool(
+            w is not None and w.isChecked()
+            and self.family == FAMILY_FACTOR
+            and self.factor_mode == "ml"
+        )
 
     def _start_multi_worker(self, jobs: list[BacktestJob], missing: list[str],
-                            period: str) -> None:
+                            period: str, pooled: bool = False) -> None:
         """起后台线程。已经在跑的先取消 —— 旧结果盖掉新结果比慢更糟。"""
         self._cancel_multi_worker()
         self._m_seq += 1
         seq = self._m_seq
 
-        worker = MultiWorker(jobs)
+        worker = MultiWorker(jobs, pooled=pooled)
         # 收尾要用的上下文挂在 worker 上，靠 `sender()` 取回来。**不能**用
         # `connect(lambda ...)` 把 seq 带过去：lambda 没有 QObject 接收者，
         # PySide 会当成直连，`done` 于是在工作线程里直接跑 `_finish_multi`，
         # 一碰控件就是 "Internal C++ object already deleted"
         worker.seq = seq
-        worker.ctx = (missing, period)
+        # 反向标记一起带过去：收尾时界面上的勾选框可能已经变了，标题要按**这一批
+        # 实际怎么跑的**来写
+        worker.ctx = (missing, period, bool(jobs[0].reverse) if jobs else False)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -4467,7 +4726,25 @@ class MainWindow(QMainWindow):
 
         self._m_worker, self._m_thread = worker, thread
         self.btn_stop.setVisible(True)
-        self.lbl_status.setText(f"多品种回测：0 / {len(jobs)} 个品种（后台运行）…")
+        # 机器学习要把「每个品种单独训练」说在前面：同一批品种，多因子几秒出
+        # 结果、机器学习要好几分钟，不解释一句用户会以为卡死了。记在 `_m_head`
+        # 上是因为进度回调会不停改写状态栏，光靠开头一句撑不到第一次刷新
+        ml = bool(jobs) and jobs[0].factor_mode == "ml" and (
+            jobs[0].family == FAMILY_FACTOR or jobs[0].filtered)
+        self._m_head = ("机器学习多因子（合并训练）" if pooled else
+                        "机器学习多因子" if ml else "多品种回测")
+        if pooled:
+            self.lbl_status.setText(
+                f"机器学习多因子：{len(jobs)} 个品种合并训练，训完再各自回测"
+                f"（后台运行，可点「停止回测」）…"
+            )
+        elif ml:
+            self.lbl_status.setText(
+                f"机器学习多因子：{len(jobs)} 个品种各自训练一遍"
+                f"（0 / {len(jobs)}，后台运行，可点「停止回测」）…"
+            )
+        else:
+            self.lbl_status.setText(f"多品种回测：0 / {len(jobs)} 个品种（后台运行）…")
         thread.start()
 
     def _cancel_multi_worker(self) -> None:
@@ -4518,15 +4795,20 @@ class MainWindow(QMainWindow):
             self.btn_stop.setVisible(False)
 
     def _on_multi_progress(self, done: int, total: int, label: str) -> None:
+        # 抬头跟着这批实际跑的算法走：机器学习一个品种要训几十折，进度一直在
+        # 跳，抬头写「多品种回测」会让人以为很快就完，写清楚是在训练才对得上
+        head = getattr(self, "_m_head", "") or "多品种回测"
         self.lbl_status.setText(
-            f"多品种回测：{done} / {total} 个品种（正在跑 {label}，后台运行）"
+            f"{head}：{done} / {total} 个品种（正在跑 {label}，后台运行）"
         )
 
     def _on_multi_done(self, payload) -> None:
         # 上下文从发信号的 worker 上取（见 `_start_multi_worker` 里的说明）
         w = self.sender()
         seq = int(getattr(w, "seq", -1))
-        missing, period = getattr(w, "ctx", ([], ""))
+        ctx = getattr(w, "ctx", ([], "", False))
+        missing, period = ctx[0], ctx[1]
+        rev = bool(ctx[2]) if len(ctx) > 2 else False
         self._m_worker = None
         self._m_thread = None
         self.btn_stop.setVisible(False)
@@ -4534,7 +4816,7 @@ class MainWindow(QMainWindow):
             return
         self._m_applied = seq
         results, named, failed = payload
-        self._finish_multi(results, named, failed, missing, period)
+        self._finish_multi(results, named, failed, missing, period, rev)
 
     def _on_multi_failed(self, msg: str) -> None:
         w = self.sender()
@@ -4548,7 +4830,7 @@ class MainWindow(QMainWindow):
         self._clear_chart(f"多品种回测失败：{msg}")
 
     def _finish_multi(self, results: list, named: list, failed: list,
-                      missing: list[str], period: str) -> None:
+                      missing: list[str], period: str, reverse: bool = False) -> None:
         """多品种回测收尾：拼净值、画图、把结论推给 Agent 页。"""
         failed = list(failed) + [f"{m}：没有行情数据" for m in missing]
         if not results:
@@ -4556,12 +4838,15 @@ class MainWindow(QMainWindow):
             self._clear_chart("多品种回测没有结果：" + "；".join(failed))
             return
 
-        res = combine(results, label="多品种等权")
+        # 反向要写在标题里：同一批品种、同一套参数，正着跑和反着跑的两条曲线
+        # 是镜像的，标题不写清楚就只能靠翻交易记录猜
+        tag = "多品种等权" + ("（反向）" if reverse else "")
+        res = combine(results, label=tag)
         trades = combine_trades(named)
         bpy = bars_per_year(res.equity.index)
         ctx = ViewCtx(
             symbol="", name=f"{len(results)} 个品种", exchange="",
-            period=period, market=self.market, label="多品种等权",
+            period=period, market=self.market, label=tag,
             legend=MARKETS[self.market]["legend"], price_note="净值",
             range_years=self.cb_range.currentData() or None,
             long_only=self.cfg.long_only, bars_per_year=bpy,
@@ -4572,10 +4857,24 @@ class MainWindow(QMainWindow):
         self.view_port.show_result(None, None, res, None, ctx, trades=trades)
         self.res, self.bh, self.df_raw, self.df_sig = res, None, None, None
         self.factor_outcome = None
-        self._strategy_label = "多品种等权"
-        head = f"多品种（{len(results)} 个）"
+        self._strategy_label = tag
+        # 组合曲线的标签只有「多品种等权」一件事，看不出这批到底跑的是哪套策略
+        # —— 机器学习 / 多因子 / 规则策略在这个页面长得一模一样。把成分的策略名
+        # 补在抬头里：同一个标签下换了模型，一眼就能分辨
+        strat = next((str(getattr(r, "label", "") or "") for r in results
+                      if getattr(r, "label", "")), "")
+        head = f"多品种（{len(results)} 个）" + (f" · {strat}" if strat else "")
+        # 有品种一笔没做：机器学习最常见（历史太短、一折都训不出来），组合曲线
+        # 就只剩别的品种在动。不点出来的话，用户看到一条几乎水平的线会以为
+        # 「多品种不好使」，其实只是那几个品种没样本
+        idle = [str(lbl).split("　")[0] for lbl, r in named
+                if not int(r.metrics.get("n_trades") or 0)]
+        idle_txt = ""
+        if idle:
+            idle_txt = "　空仓：" + "、".join(idle[:4]) + ("…" if len(idle) > 4 else "")
         self.lbl_status.setText(
             f"{head} · {res.label} · 累计 {res.metrics['total_return'] * 100:+.1f}%"
+            + idle_txt
             + (f"　缺：{'、'.join(failed)}" if failed else "")
         )
         self._publish_port(res, head, period, bpy)

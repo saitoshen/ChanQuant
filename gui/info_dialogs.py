@@ -49,24 +49,33 @@ def _to_float(it: QTableWidgetItem, dflt: float = 0.0) -> float:
 
 
 class CostDialog(QDialog):
-    """三档成本的参数。改完立刻落盘，研究页 / 组合页下次重算就用新的。"""
+    """各档成本的参数。改完立刻落盘，研究页 / 组合页下次重算就用新的。
+
+    四档里有两种滑点口径（跳 / ‱），所以表里两列都摆出来，**用不上的那列置灰**。
+    只留一列再按档位改标题的话，用户切到「按 bp」会看见自己刚设的「压力 2 跳」
+    变成 0，以为被清掉了。
+    """
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("交易成本参数（国内期货）")
-        self.resize(520, 300)
+        self.resize(620, 320)
         s = costs.load()
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 12)
         lay.setSpacing(8)
 
         lay.addWidget(QLabel(
-            "单边成本 = 交易所手续费 × 倍数 + 滑点跳数 × 最小变动价位。\n"
-            "手续费按品种算（见「品种信息」），这里只调倍数和跳数。"
+            "单边成本 = 交易所手续费 × 倍数 + 滑点。\n"
+            "滑点有两种口径：按跳（× 最小变动价位）或按 ‱（× 价格），灰色那列不生效。\n"
+            "手续费按品种算（见「品种信息」），这里只调倍数和滑点。\n"
+            "跳数在回测里会乘当日复权因子：前复权把历史价格整体缩小过，而一跳是\n"
+            "真实世界里的固定金额，不换算等于让越早的成交越便宜。"
         ))
 
-        self.tbl = QTableWidget(len(s["profiles"]), 3)
-        self.tbl.setHorizontalHeaderLabels(["档位", "手续费倍数", "滑点（跳）"])
+        self.tbl = QTableWidget(len(s["profiles"]), 4)
+        self.tbl.setHorizontalHeaderLabels(
+            ["档位", "手续费倍数", "滑点（跳）", "滑点（‱）"])
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
@@ -76,15 +85,19 @@ class CostDialog(QDialog):
             name = QTableWidgetItem(p["label"])
             name.setData(Qt.UserRole, key)
             self.tbl.setItem(r, 0, name)
-            for col, field, lo, hi, step in (
-                (1, "fee_mult", 0.0, 10.0, 0.1),
-                (2, "slip_ticks", 0.0, 20.0, 0.5),
+            bp_mode = str(p.get("mode") or "tick") == "bp"
+            for col, field, lo, hi, step, on in (
+                (1, "fee_mult", 0.0, 10.0, 0.1, True),
+                (2, "slip_ticks", 0.0, 20.0, 0.5, not bp_mode),
+                (3, "slip_bp", 0.0, 200.0, 0.5, bp_mode),
             ):
                 sp = QDoubleSpinBox()
                 sp.setRange(lo, hi)
                 sp.setSingleStep(step)
                 sp.setDecimals(2)
-                sp.setValue(float(p[field]))
+                sp.setValue(float(p.get(field) or 0.0))
+                sp.setEnabled(on)
+                sp.setToolTip("" if on else "这一档用的是另一种口径，改这里不生效")
                 self.tbl.setCellWidget(r, col, sp)
         lay.addWidget(self.tbl, 1)
 
@@ -103,8 +116,10 @@ class CostDialog(QDialog):
     def _save(self) -> None:
         s = costs.load()
         for r, key in enumerate(self._keys):
-            s["profiles"][key]["fee_mult"] = float(self.tbl.cellWidget(r, 1).value())
-            s["profiles"][key]["slip_ticks"] = float(self.tbl.cellWidget(r, 2).value())
+            p = s["profiles"][key]
+            p["fee_mult"] = float(self.tbl.cellWidget(r, 1).value())
+            p["slip_ticks"] = float(self.tbl.cellWidget(r, 2).value())
+            p["slip_bp"] = float(self.tbl.cellWidget(r, 3).value())
         costs.save(s)
         self.accept()
 

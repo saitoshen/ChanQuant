@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 
+import numpy as np
 import pandas as pd
 
 from .paths import bundle_root, user_dir
@@ -488,15 +489,20 @@ def load_local(
         df = df[px.gt(0).all(axis=1)].reset_index(drop=True)
 
     mode = (adjust or "none").lower()
+    scale = np.ones(len(df), dtype=float)
     if mode in ("qfq", "hfq") and "adj_factor" in df.columns:
         f = pd.to_numeric(df["adj_factor"], errors="coerce").fillna(1.0).to_numpy(dtype=float)
         if mode == "qfq":
             base = f[-1] if len(f) and f[-1] > 0 else 1.0
             f = f / base
+        scale = f
         for col in ("open", "high", "low", "close"):
             df[col] = df[col].to_numpy(dtype=float) * f
 
     df = df.set_index("date")
+    # 复权用过的缩放系数留着：一跳是真实世界里的固定金额，回测算滑点时要按它
+    # 换回复权价口径（见 `BacktestConfig.slip_amount`）
+    df["price_scale"] = scale
     if aux_dir is None:
         aux_dir = os.path.join(os.path.dirname(data_dir.rstrip("/\\")), "data_futures_aux")
     try:

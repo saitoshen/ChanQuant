@@ -487,6 +487,18 @@ class EditDialog(QDialog):
         self.chk_short.setChecked(cfg.note == "short")
         form.addRow("", self.chk_short)
 
+        # 反向交易只在规则族上有意义：因子策略的方向由因子本身的正负决定，
+        # 要翻方向是在研究页把因子反过来，不是在这里
+        self.chk_reverse = None
+        if cfg.family == "rule":
+            self.chk_reverse = QCheckBox("反向交易（多 ↔ 空）")
+            self.chk_reverse.setChecked(bool(getattr(cfg, "rule_reverse", False)))
+            self.chk_reverse.setToolTip(
+                "信号整体取反：原先做多的地方做空、原先做空的地方做多，空仓不变。\n"
+                "和「策略研究」页那个开关是同一个字段，回测和实盘同时生效。"
+            )
+            form.addRow("", self.chk_reverse)
+
         self.cb_acct = QComboBox()
         self.cb_acct.addItem("跟随默认账户", "")
         for a in accounts:
@@ -582,6 +594,8 @@ class EditDialog(QDialog):
         cfg.account = self.cb_acct.currentData() or ""
         if self.sp_params:
             cfg.rule_params = {k: sp.value() for k, sp in self.sp_params.items()}
+        if self.chk_reverse is not None:
+            cfg.rule_reverse = self.chk_reverse.isChecked()
         cfg.range_years = float(self.cb_range.currentData() or 0.0)
 
 

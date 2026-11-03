@@ -1017,12 +1017,22 @@ STRATEGIES: dict[str, StrategySpec] = {
 }
 
 
-def run_strategy(df: pd.DataFrame, key: str, params: dict | None = None) -> pd.DataFrame:
+def run_strategy(df: pd.DataFrame, key: str, params: dict | None = None,
+                 reverse: bool = False) -> pd.DataFrame:
+    """跑一条内置规则策略，返回带 `signal` 列的 df。
+
+    `reverse=True` 把信号整体取反（多 ↔ 空、空 ↔ 多、空仓不变）。这件事必须
+    在**这里**做，不能放在界面里乘一下：研究页、组合回放、实盘三条路都要同一条
+    曲线，界面里乘的话实盘还是按原方向下单。
+    """
     spec = STRATEGIES[key]
     p = dict(spec.params)
     if params:
         p.update({k: v for k, v in params.items() if k in p})
-    return spec.func(df, **p)
+    out = spec.func(df, **p)
+    if reverse:
+        out["signal"] = -out["signal"].astype(int)
+    return out
 
 
 _MINE_TAIL = re.compile(r"\s*[·•・\-—_]\s*(我的|内置)\s*$")
