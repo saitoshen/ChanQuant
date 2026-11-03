@@ -68,6 +68,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import time
 
@@ -100,6 +101,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gui.pickers import SymbolPicker
 from gui.result_view import PERIOD_LABEL, ResultView, ViewCtx, set_tab_visible
 from ttrade import replay
 from ttrade import cross as cross_engine
@@ -173,6 +175,104 @@ class DataWorker(QObject):
             self.done.emit(False, f"{type(exc).__name__}: {exc}")
             return
         self.done.emit(True, "补数据完成")
+
+
+class TrainWorker(QObject):
+    """在后台训练机器学习模型，产出 .pkl 供实盘直接调用。
+
+    为什么要单独一个 worker：一次训练是**每个品种 30~40 秒**（65 因子 ×
+    26 万根 5m 的 48 折 walk-forward），19 个品种就是十几分钟。放主线程里
+    整个窗口会「未响应」，用户以为死机。
+
+    训练完的产物落在用户目录的 `ml_models/` 下（`ttrade/ml_artifact`）。
+    实盘启动时会自动加载它 —— 走「只预测」快路径，每根 bar 几秒，
+    不再重训。
+    """
+
+    log = Signal(str)
+    done = Signal(bool, str)           # (成功?, 一句话)
+
+    def __init__(self, cfg, symbols: list) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.symbols = list(symbols)
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        from ttrade import ml_artifact
+        from ttrade import replay
+        from ttrade import tqdata
+
+        cfg = self.cfg
+        fcfg = replay.factor_config(cfg.factor_cfg or {})
+        keys = list(cfg.factor_keys or [])
+        if len(keys) < 2:
+            self.done.emit(False, "机器学习至少要 2 个因子")
+            return
+
+        # 合并训练：所有品种的样本一起训一个模型，产物按父 sid 存一份
+        if getattr(fcfg, "pooled", False) and len(self.symbols) >= 2:
+            self.log.emit(f"合并训练 {len(self.symbols)} 个品种…")
+            try:
+                frames = {}
+                for sym, ex in self.symbols:
+                    df = tqdata.load_main(sym, ex, cfg.period, adjust="qfq")
+                    if df is not None and not df.empty:
+                        df = replay.window(df, getattr(cfg, "range_years", 0) or 0)
+                        frames[f"{sym}_{ex}"] = df
+                if len(frames) < 2:
+                    self.done.emit(False, "合并训练至少要 2 个品种有数据")
+                    return
+                art, fs = ml_artifact.train_fold_set_pooled(
+                    frames, sid=cfg.sid, cfg=fcfg, keys=keys,
+                    name=cfg.name, period=cfg.period, save=True,
+                    progress=lambda d, t, m: self.log.emit(f"    [{d}/{t}] {m}"),
+                    cancel=lambda: self._cancel,
+                )
+                self.done.emit(
+                    True, f"合并训练完成：{len(fs.folds)} 折  "
+                          f"{art.train_seconds:.1f}s  "
+                          f"（{len(frames)} 品种一个模型）")
+            except Exception as exc:  # noqa: BLE001
+                self.done.emit(False, f"合并训练失败：{type(exc).__name__}: {exc}")
+            return
+
+        # 逐品种训练
+        ok_n = 0
+        todo = list(self.symbols)
+        for i, (sym, ex) in enumerate(todo, 1):
+            if self._cancel:
+                self.done.emit(False, "已取消")
+                return
+            self.log.emit(f"[{i}/{len(todo)}] {sym}_{ex} 读历史…")
+            try:
+                df = tqdata.load_main(sym, ex, cfg.period, adjust="qfq")
+                if df is None or df.empty:
+                    self.log.emit(f"    {sym}_{ex}：没有数据，跳过")
+                    continue
+                df = replay.window(df, getattr(cfg, "range_years", 0) or 0)
+                # 产物按「父 sid#品种_交易所」命名，和引擎里子槽位的 sid 一致
+                sid = (f"{cfg.sid}#{sym}_{ex}"
+                       if len(cfg.multi_symbols or []) >= 2 else cfg.sid)
+                art, fs = ml_artifact.train_fold_set(
+                    df, sid=sid, cfg=fcfg, keys=keys, name=cfg.name,
+                    symbol=sym, exchange=ex, period=cfg.period, save=True,
+                    progress=lambda d, t, m: self.log.emit(f"    {m}"),
+                    cancel=lambda: self._cancel,
+                )
+                ok_n += 1
+                self.log.emit(f"    ✓ {sym}_{ex}  {len(fs.folds)} 折  "
+                              f"{art.train_seconds:.1f}s")
+            except Exception as exc:       # noqa: BLE001
+                self.log.emit(f"    ✗ {sym}_{ex}：{type(exc).__name__}: {exc}")
+        if ok_n:
+            self.done.emit(True, f"训练完成 {ok_n}/{len(todo)} 个品种，"
+                                 f"实盘会直接用这些模型")
+        else:
+            self.done.emit(False, "一个都没训成")
 
 
 class RunnerWorker(QObject):
@@ -388,6 +488,45 @@ def _hint(text: str) -> QLabel:
     return lbl
 
 
+def _split_key(key: str, market: str = "") -> tuple[str, str]:
+    """把 `DataStore` 的键拆回配置里的 (代号, 交易所)。
+
+    和研究页 `_current_config` 同一个口径，**不能直接用 `replay.split_key`**：
+    那边为了 `key()` 能原样拼回来，A 股把代号拆成 `600000`；而配置里的 `symbol`
+    一直是**带前缀的整键**（`SSE.600000`，`cn_name` / 天勤合约都要这个写法）。
+    """
+    k = str(key or "")
+    if market == "cn_stock":
+        return k, (k.split(".", 1)[0] if "." in k else "")
+    if market == "cn":
+        sym, _, ex = k.rpartition("_")
+        return (sym or k), ex
+    return k, ""
+
+
+def _sym_text(cfg) -> str:
+    """策略表「标的」列。
+
+    多品种 / 截面只写「N 个品种」：`key()` 是清单里的第一个，写出来会让人以为
+    这条策略只跑那一个（存盘里明明有 78 个）。
+    """
+    n = len(cfg.symbols or [])
+    if n >= 2 or (cfg.family == "cross" and n):
+        return f"{n} 个品种 {cfg.period}"
+    return f"{cfg.key()} {cfg.period}"
+
+
+def _sym_tip(cfg) -> str:
+    """「标的」列的悬停说明：多品种把清单摊开前几个。"""
+    syms = list(cfg.symbols or [])
+    if len(syms) < 2 and cfg.family != "cross":
+        return cfg.key()
+    head = "、".join(syms[:8]) + ("…" if len(syms) > 8 else "")
+    kind = ("截面品种池" if cfg.family == "cross"
+            else "多品种等权：每个品种各跑一遍再平均")
+    return f"{kind}，共 {len(syms)} 个\n{head}"
+
+
 class EditDialog(QDialog):
     """一条组合策略的全部可调项。
 
@@ -398,9 +537,14 @@ class EditDialog(QDialog):
       信号就按新参数算；
     - **回测区间**只决定「双击这条策略看哪一段历史」，实盘信号永远只用最近的
       K 线，和这个值无关。
+
+    **交易品种**这一栏是后加的：一条策略可以同时跑一批品种（等权组合）。以前
+    品种只能从「策略研究」页带过来，进了组合就再也改不了 —— 存盘里明明记着
+    78 个品种，这里显示的还是第一个，想加一个只能删掉重加。
     """
 
-    def __init__(self, cfg, accounts: list[str], parent=None) -> None:
+    def __init__(self, cfg, accounts: list[str], parent=None,
+                 universe: list[dict] | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置参数")
         self.setMinimumWidth(430)
@@ -409,6 +553,27 @@ class EditDialog(QDialog):
         self.ed_name = QLineEdit(cfg.name)
         self.ed_name.setPlaceholderText(cfg.title())
         form.addRow("名称", self.ed_name)
+
+        # ---- 交易品种 ----
+        # `pick` 为 None 表示这一条不动品种：截面族（品种池在研究页管）、
+        # 以及调用方没递品种清单（老调用、脚本）的时候
+        self.pick: SymbolPicker | None = None
+        self.lbl_pick: QLabel | None = None
+        self._mk = cfg.market
+        if cfg.family == "cross":
+            form.addRow(_hint("截面策略的品种池在「策略研究」页勾选，这里不单独设"))
+        elif universe:
+            self.pick = SymbolPicker("交易品种")
+            self.pick.set_items(list(universe), keep=cfg.symbols)
+            # 存盘里那个品种可能已经不在本地库里（换了机器、只下了一部分数据）。
+            # `set_selected` 只认清单里有的键，所以这种情况下会是「一个都没勾」，
+            # 而 `apply_to` 见空就不写 —— 不会因为开一次设置框把品种抹掉
+            self.pick.set_selected(cfg.symbols)
+            form.addRow("交易品种", self.pick)
+            self.lbl_pick = _hint("")
+            form.addRow("", self.lbl_pick)
+            self.pick.changed.connect(self._sync_pick)
+            self._sync_pick()
 
         # ---- 本金与仓位分配 ----
         # 默认不再是「1 手」：1 手螺纹和 1 手铜差 40 倍名义价值，同一条策略在两个
@@ -551,7 +716,11 @@ class EditDialog(QDialog):
         )
         form.addRow("回测区间", self.cb_range)
 
-        lab = QLabel(f"{cfg.key()} {cfg.period}｜{cfg.strategy_label()}")
+        # 多品种写「N 个品种」：`key()` 只是清单里的第一个，写出来会让人以为
+        # 这条策略只跑那一个
+        n_sym = len(cfg.symbols or [])
+        lab = QLabel((f"{n_sym} 个品种" if n_sym >= 2 and cfg.family != "cross"
+                      else cfg.key()) + f" {cfg.period}｜{cfg.strategy_label()}")
         lab.setObjectName("Hint")
         form.addRow("策略", lab)
 
@@ -579,6 +748,22 @@ class EditDialog(QDialog):
             except (TypeError, AttributeError):   # 老 Qt 没有这个重载
                 pass
 
+    def _sync_pick(self) -> None:
+        """勾选变了就改下面那行小字：一眼看出现在是单品种还是多品种。"""
+        if self.pick is None or self.lbl_pick is None:
+            return
+        picked = [k for k in self.pick.selected() if k]
+        n = len(picked)
+        if n >= 2:
+            self.lbl_pick.setText(
+                f"多品种：{n} 个，每个品种各跑一遍再等权平均。"
+                "实盘会拆成 n 个槽位，每个品种分到 1/n 的本金"
+            )
+        elif n == 1:
+            self.lbl_pick.setText(f"单品种：{picked[0]}")
+        else:
+            self.lbl_pick.setText("一个都没勾 —— 保存时品种保持不变")
+
     def apply_to(self, cfg) -> None:
         cfg.name = self.ed_name.text().strip()
         cfg.sizing = self.cb_size.currentData() or "capital"
@@ -598,6 +783,17 @@ class EditDialog(QDialog):
             cfg.rule_reverse = self.chk_reverse.isChecked()
         cfg.range_years = float(self.cb_range.currentData() or 0.0)
 
+        if self.pick is not None:
+            picked = [k for k in self.pick.selected() if k]
+            if picked:
+                # `key()` 是拼出来的，反向拆要按市场走：A 股的键自带交易所前缀
+                # （`SSE.600000`），一律按 `_` 拆会拆出一个不存在的交易所
+                sym, ex = _split_key(picked[0], self._mk)
+                cfg.symbol, cfg.exchange = sym, ex
+                # 只勾了一个就退回单品种：留着一份单元素清单的话，`symbols`
+                # 会一直返回它，之后改了 `symbol` 也不生效
+                cfg.multi_symbols = list(picked) if len(picked) >= 2 else []
+
 
 # ------------------------------------------------------------------ 页面
 
@@ -608,11 +804,14 @@ class PortfolioPage(QWidget):
     # 补完数据要让主窗口把 DataStore 的缓存丢掉，否则这一页还在用补之前那份
     data_updated = Signal()
 
-    def __init__(self, loader=None, parent=None) -> None:
+    def __init__(self, loader=None, parent=None, universe=None) -> None:
         super().__init__(parent)
         # loader(market, key, period) -> DataFrame | None。主窗口把它的 DataStore
         # 递进来 —— 这一页自己不该再扫一遍数据目录（那是几秒钟的事）。
         self._loader = loader
+        # universe(market) -> list[dict]。改品种要用：设置参数里那个勾选面板得知道
+        # 这个市场有哪些品种。和 loader 一样由主窗口递进来，这一页不自己扫盘
+        self._universe = universe
         self._items = SStore.load_portfolio()
         self._accounts = tqlive.load_accounts()
         self._chase = SStore.load_chase()
@@ -636,6 +835,10 @@ class PortfolioPage(QWidget):
         # CSV 会互相覆盖
         self._data_thread: QThread | None = None
         self._data_worker = None
+        # 训练模型的后台线程。同样只允许一个 —— 两个训练会往同一批产物
+        # 文件里写，写一半被另一个覆盖就坏掉了
+        self._train_thread: QThread | None = None
+        self._train_worker = None
         self._views: dict[str, tuple[QTabWidget, ResultView]] = {}
         self.ctl = PortfolioController(self)
         self._build()
@@ -837,6 +1040,20 @@ class PortfolioPage(QWidget):
         btn_edit.clicked.connect(self._edit_selected)
         head.addWidget(btn_edit)
 
+        # 机器学习策略：训练一次、存成 .pkl，实盘就直接用它算信号（不重训）。
+        # 没有产物也能跑，只是每根 bar 要把整段历史重走一遍（几十秒），
+        # 5 分钟周期追不上 —— 所以这一条对机器学习策略才有用
+        self.btn_train = QPushButton("训练模型")
+        self.btn_train.setObjectName("Ghost")
+        self.btn_train.setToolTip(
+            "离线训练这条机器学习策略，把模型存成 .pkl。\n"
+            "训完实盘就直接用这些模型算信号（只预测，不重训）—— "
+            "实测 65 因子 × 26 万根 5m 的策略，重训要 34 秒/品种，"
+            "用产物只要 3 秒。\n"
+            "多品种策略每个品种训一份。")
+        self.btn_train.clicked.connect(self._train_selected)
+        head.addWidget(self.btn_train)
+
         btn_toggle = QPushButton("启动 / 停止")
         btn_toggle.setObjectName("Ghost")
         btn_toggle.clicked.connect(self._toggle_selected)
@@ -868,10 +1085,48 @@ class PortfolioPage(QWidget):
 
     def _sync_buttons(self) -> None:
         """选中几条就改一次按钮：只有一条时「组合报告」没有意义。"""
-        n = len(self._selected_cfgs())
+        cfgs = self._selected_cfgs()
+        n = len(cfgs)
         self.btn_combo.setEnabled(n >= 2)
         self.btn_combo.setText(f"组合报告（{n}）" if n >= 2 else "组合报告")
         self.btn_view.setEnabled(n >= 1)
+        # 「训练模型」只对机器学习策略有意义。规则策略没有模型可训，
+        # 按钮亮着只会让人以为点一下有用
+        is_ml = bool(cfgs) and (cfgs[0].family or "") == "factor" \
+            and (cfgs[0].factor_mode or "") == "ml"
+        self.btn_train.setEnabled(is_ml and n >= 1)
+        self.btn_train.setVisible(is_ml or n == 0)
+        if is_ml:
+            n_sym = len(cfgs[0].multi_symbols or [])
+            # 已经训过的品种数标在按钮上 —— 用户一眼能看出「还差几个没训」，
+            # 不用点进去才发现
+            done = self._trained_count(cfgs[0])
+            if done and n_sym >= 2:
+                self.btn_train.setText(f"训练模型（{done}/{n_sym} 已训）")
+            elif n_sym >= 2:
+                self.btn_train.setText(f"训练模型（{n_sym} 个品种）")
+            else:
+                self.btn_train.setText("训练模型")
+
+    @staticmethod
+    def _trained_count(cfg) -> int:
+        """这条策略里已经有训练产物的品种数。"""
+        try:
+            from ttrade import ml_artifact as MLA
+
+            syms = list(cfg.multi_symbols or [])
+            if len(syms) < 2:
+                syms = [cfg.key()]
+            n = 0
+            for k in syms:
+                sym, ex = _split_key(k, cfg.market)
+                sid = (f"{cfg.sid}#{sym}_{ex}" if len(cfg.multi_symbols or []) >= 2
+                       else cfg.sid)
+                if os.path.exists(MLA.artifact_path(sid)):
+                    n += 1
+            return n
+        except Exception:  # noqa: BLE001
+            return 0
 
     def _build_monitor_card(self) -> QWidget:
         card, lay, head = self._card("监控器")
@@ -978,6 +1233,19 @@ class PortfolioPage(QWidget):
         """这条策略实际用哪个账户。空 = 跟随默认账户。"""
         return cfg.account or (self.cb_acct.currentData() or "")
 
+    def _universe_of(self, cfg) -> list[dict]:
+        """这条策略能挑的品种清单。
+
+        拿不到（没接数据源、市场还没扫完）就给空表 —— 设置框里的品种面板随之
+        不出现，品种保持原样。这里**不能**抛：开一个设置框把整页带崩是最糟的
+        """
+        if self._universe is None:
+            return []
+        try:
+            return list(self._universe(cfg.market) or [])
+        except Exception:  # noqa: BLE001
+            return []
+
     # ---------------------------------------------------------- 渲染
 
     def _fill_strategies(self) -> None:
@@ -990,7 +1258,7 @@ class PortfolioPage(QWidget):
             for i, cfg in enumerate(self._items):
                 vals = [
                     cfg.name.strip() or cfg.title(),
-                    f"{cfg.key()} {cfg.period}",
+                    _sym_text(cfg),
                     cfg.strategy_label(),
                     cfg.size_text(),
                     cfg.account or "默认",
@@ -1001,6 +1269,9 @@ class PortfolioPage(QWidget):
                     if j == 3:
                         item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                     t.setItem(i, j, item)
+                it = t.item(i, 1)
+                if it is not None:
+                    it.setToolTip(_sym_tip(cfg))
                 for j in (5, 6):
                     t.setItem(i, j, QTableWidgetItem("—"))
             if keep:
@@ -1051,16 +1322,20 @@ class PortfolioPage(QWidget):
             return None, f"{key} 没有 {cfg.period} 的行情数据"
         return df, ""
 
-    def _load_frames(self, cfg) -> tuple[dict, str]:
-        """截面策略要一批品种的行情。返回 (frames, 出错原因)。
+    def _load_frames(self, cfg, need: int = 0) -> tuple[dict, str]:
+        """一批品种的行情。返回 (frames, 出错原因)。
 
-        单品种那条路（`_load`）只认 `cfg.key()`；截面策略的品种记在
-        `cross_symbols` 里，得一个个取完再一起递进引擎。
+        截面策略要 ≥ `MIN_CROSS` 个；规则 / 因子的**多品种**要 ≥ 2 个。两条路
+        取数一样，只是下限不同 —— 以前这里写死截面，于是多品种策略在组合页
+        只会按 `cfg.key()` 取一个品种，回测出来的曲线和列表上写的不一样。
         """
-        keys = list(getattr(cfg, "cross_symbols", []) or [])
-        need = cross_engine.MIN_CROSS
+        keys = list(getattr(cfg, "symbols", None) or [])
+        need = int(need or (cross_engine.MIN_CROSS
+                            if getattr(cfg, "family", "") == "cross" else 2))
         if len(keys) < need:
-            return {}, f"只记了 {len(keys)} 个品种，截面策略至少要 {need} 个"
+            return {}, (f"只记了 {len(keys)} 个品种，"
+                        + ("截面策略" if getattr(cfg, "family", "") == "cross"
+                           else "多品种策略") + f"至少要 {need} 个")
         if self._loader is None:
             return {}, "没有接上行情数据源"
         mk = replay.market_of(cfg)
@@ -1129,6 +1404,8 @@ class PortfolioPage(QWidget):
         模型才知道算出来是什么。所以失败也要返回原因，不能只弹个红字。
         """
         is_cross = getattr(cfg, "family", "") == "cross"
+        keys = list(getattr(cfg, "symbols", None) or [])
+        is_multi = (not is_cross) and len(keys) >= 2
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             if is_cross:
@@ -1137,6 +1414,13 @@ class PortfolioPage(QWidget):
                 if not frames:
                     return f"回测失败：{why}"
                 rp = replay.run_cross(cfg, frames)
+            elif is_multi:
+                # 多品种等权：每个品种各跑一遍再平均，和研究页那条路同一个口径
+                df = None
+                frames, why = self._load_frames(cfg, need=2)
+                if not frames:
+                    return f"回测失败：{why}"
+                rp = replay.run_multi(cfg, frames)
             else:
                 df, why = self._load(cfg)
                 if df is None:
@@ -1148,20 +1432,20 @@ class PortfolioPage(QWidget):
             return f"回测失败：{rp.error}"
 
         period = PERIOD_LABEL.get(cfg.period, cfg.period)
-        if is_cross:
-            # 截面策略没有「某一条策略的 K 线」：仓位是一篮子权重，画 K 线会
-            # 误导。走组合视图那几页（绩效 / 截面因子分析 / 阶段 / 交易记录）
+        if is_cross or is_multi:
+            # 多品种 / 截面都没有「某一条策略的 K 线」：仓位是一篮子，画 K 线会
+            # 误导。走组合视图那几页（绩效 / 交易记录 / 阶段）
             self._stop_live()
             tabs, view = self._ensure_view("portfolio")
-            set_tab_visible(tabs, "截面因子分析", True)
+            set_tab_visible(tabs, "截面因子分析", is_cross)
             ctx = ViewCtx(
-                symbol="", name=f"{len(getattr(cfg, 'cross_symbols', []) or [])} 个品种",
+                symbol="", name=f"{len(keys)} 个品种",
                 exchange="", period=cfg.period, market=replay.market_of(cfg),
                 label=rp.label, price_note="净值",
                 range_years=float(cfg.range_years or 0) or None,
                 long_only=rp.long_only, bars_per_year=rp.bars_per_year,
                 overlay=False, selected_keys=[],
-                cross=getattr(rp, "cross", None),
+                cross=getattr(rp, "cross", None) if is_cross else None,
             )
             view.show_result(
                 None, None, rp.res, None, ctx,
@@ -1193,6 +1477,12 @@ class PortfolioPage(QWidget):
                 if getattr(cfg, "family", "") == "cross":
                     frames, why = self._load_frames(cfg)
                     rp = (replay.run_cross(cfg, frames) if frames
+                          else replay.Replay(error=why))
+                elif len(list(getattr(cfg, "symbols", None) or [])) >= 2:
+                    # 多品种那一条本身已经是 N 个品种的等权曲线，先合成它，
+                    # 再和别的策略等权 —— 和单策略视图同一个口径
+                    frames, why = self._load_frames(cfg, need=2)
+                    rp = (replay.run_multi(cfg, frames) if frames
                           else replay.Replay(error=why))
                 else:
                     df, why = self._load(cfg)
@@ -1326,6 +1616,7 @@ class PortfolioPage(QWidget):
             if i >= t.rowCount():
                 break
             theo = _int(slot.get("target"))
+            multi = _int(slot.get("multi"))
             # 仓位列写「口径 → 实际算出来的手数」。手数依赖价格和每手保证金，
             # 存盘时算不出来，只有引擎跑起来才知道 —— 所以两段拼在一起显示。
             lots = _int(slot.get("lots"))
@@ -1333,16 +1624,31 @@ class PortfolioPage(QWidget):
             self._set_cell(t, i, 3, size, C_TEXT)
             it3 = t.item(i, 3)
             if it3 is not None:
-                it3.setToolTip(
-                    f"每手保证金按品种自己的比例算（商品/股指约 10 倍，国债 30~50 倍）。"
-                    f"\n当前价下满仓 {lots} 手" if lots > 0 else
-                    "引擎还没算出实际手数（需要行情）"
-                )
+                if multi:
+                    it3.setToolTip(
+                        f"{multi} 个品种各按自己的保证金算手数，逐合约见右下监控器。\n"
+                        f"资金按品种数均分：每个品种 {cfg.principal / multi / 10000:g} 万"
+                    )
+                else:
+                    it3.setToolTip(
+                        f"每手保证金按品种自己的比例算（商品/股指约 10 倍，国债 30~50 倍）。"
+                        f"\n当前价下满仓 {lots} 手" if lots > 0 else
+                        "引擎还没算出实际手数（需要行情）"
+                    )
             # 「理论」只对**正在运行**的策略显示。停机（报单到顶 / 出错）不会清零
             # target，继续显示 -11 会让人以为它还在管这 -11 手；而监控器按 running
             # 汇总，那边是 0 /「未托管」—— 同一页两处就打架了。停机时显示「—」，
             # 把残值放进 tooltip。
-            if slot.get("running"):
+            if slot.get("running") and multi:
+                # 多品种没有「一个」目标仓：19 个品种各有一个，加起来是 19 个
+                # 不同合约的手数之和，没有任何意义。逐合约的去监控器看
+                self._set_cell(t, i, 5, "—", C_MUTED)
+                it5 = t.item(i, 5)
+                if it5 is not None:
+                    it5.setToolTip(
+                        f"{multi} 个品种各自的目标仓在右下监控器里逐合约列出"
+                    )
+            elif slot.get("running"):
                 self._set_cell(t, i, 5, str(theo), C_TEXT)
                 it5 = t.item(i, 5)
                 if it5 is not None:
@@ -1366,8 +1672,36 @@ class PortfolioPage(QWidget):
             # 塞进表格会把列挤成一团，横向滚动条一起来就没人看了。
             if not slot:
                 text, color, tip = "未连接", C_IDLE, "还没启动"
+            elif slot.get("error") and "暂不支持实盘" in str(slot["error"]):
+                # 截面这一类「引擎结构上跑不了」的，不该显示成红字「错误」——
+                # 那不是故障，是这一条本来就只能回测。原因留在 tooltip 里
+                text, color, tip = "仅回测", C_MUTED, slot["error"]
             elif slot.get("error"):
                 text, color, tip = "错误", C_BAD, slot["error"]
+            elif slot.get("ml_wait"):
+                # 机器学习还没出信号。这段时间**不动仓**，显示成「运行中」会让人
+                # 以为它在按 0 信号平仓。
+                #
+                # 三种等待长得一样，等待时间差 10 倍，必须分开说：
+                #   retrain —— 没有可用产物，退回后台重训（几十秒到十几分钟）
+                #   其他   —— 算不出来的**真实原因**（永远等不到）
+                #   空     —— 还在算（快路径，几秒）
+                why = str(slot.get("ml_why") or "")
+                if why == "retrain":
+                    text, color = "重训中", C_MUTED
+                    tip = ("没有可用的训练产物，正在后台重新训练模型。\n"
+                           "这一步很慢（每个品种几十秒，19 个品种十几分钟），"
+                           "算出来之前不动仓。\n"
+                           "建议先点「训练模型」把模型训好，再启动实盘。")
+                elif why:
+                    text, color = "信号异常", C_BAD
+                    tip = (f"机器学习信号算不出来：{why}\n"
+                           "算出来之前不动仓。\n"
+                           "细节看日志：%LOCALAPPDATA%\\ChanQuant\\logs\\live.log")
+                else:
+                    text, color = "计算中", C_MUTED
+                    tip = ("机器学习正在算信号（用训练好的模型，只预测不重训），"
+                           "算出来之前不动仓。\n品种多 / 历史长时第一次要等几十秒")
             elif slot.get("running"):
                 text, color = "运行中", C_OK
                 tip = slot.get("action") or ""
@@ -1568,10 +1902,12 @@ class PortfolioPage(QWidget):
         cfg = self._single_or_warn()
         if cfg is None:
             return
-        dlg = EditDialog(cfg, [s.name for s in self._accounts], self)
+        dlg = EditDialog(cfg, [s.name for s in self._accounts], self,
+                         universe=self._universe_of(cfg))
         if dlg.exec() != QDialog.Accepted:
             return
         old_acct = self._account_of(cfg)
+        old_syms = list(cfg.symbols or [])
         dlg.apply_to(cfg)
         SStore.update_portfolio(cfg)
         self._fill_strategies()
@@ -1580,9 +1916,15 @@ class PortfolioPage(QWidget):
             self._on_failed("账户已改。运行中的连接不会自动迁移，请停止后重新启动")
         else:
             if self.ctl.running:
-                # 手数改了要让引擎立刻知道，否则得等下一根 bar 才按新手数调仓
+                # 手数 / 参数 / 品种改了都要让引擎立刻知道：`update` 会按新的
+                # 品种清单重建槽位（多品种就是 N 个子槽位），不然要等重启
                 self.ctl.update_cfg(self._account_of(cfg), cfg)
-            self._on_log(f"{cfg.title()}：{cfg.size_text()}")
+                if list(cfg.symbols or []) != old_syms:
+                    self._on_log(f"{cfg.title()}：品种清单已改，引擎正在重建订阅")
+            n = len(cfg.symbols or [])
+            self._on_log(f"{cfg.title()}：{cfg.size_text()}"
+                         + (f"｜{n} 个品种等权" if n >= 2 and cfg.family != "cross"
+                            else ""))
 
     def accept(self, cfg) -> str:
         """从「ChanAgent」页送来的策略：加进组合，正在跑就直接挂上去。
@@ -1759,6 +2101,64 @@ class PortfolioPage(QWidget):
             # 主窗口要把 DataStore 缓存丢掉 —— 否则这一页还在画补之前那份
             self.data_updated.emit()
 
+    def _train_selected(self) -> None:
+        """离线训练选中的机器学习策略，把模型存成 .pkl。
+
+        实盘启动时会自动加载这些产物 —— 走「只预测」快路径，每根 bar 几秒，
+        不再重训。没有产物也能跑，只是慢到追不上 bar 周期。
+        """
+        if self._train_thread is not None:
+            self._on_log("训练还在跑，等它跑完")
+            return
+        cfgs = self._selected_cfgs()
+        if not cfgs:
+            self._on_log("先在下面选中一条策略")
+            return
+        cfg = cfgs[0]
+        if (cfg.family or "") != "factor" or (cfg.factor_mode or "") != "ml":
+            self._on_log("只有机器学习策略需要训练模型（当前这条不是）")
+            return
+
+        # 品种清单：多品种策略训全部，单品种策略就训它自己
+        syms = []
+        if len(cfg.multi_symbols or []) >= 2:
+            for k in cfg.multi_symbols:
+                sym, ex = _split_key(k, cfg.market)
+                syms.append((sym, ex))
+        else:
+            syms.append((cfg.symbol, cfg.exchange))
+
+        n = len(syms)
+        est = n * 40
+        if QMessageBox.question(
+                self, "训练模型",
+                f"训练「{cfg.name or cfg.sid}」的机器学习模型。\n\n"
+                f"品种 {n} 个，{len(cfg.factor_keys or [])} 个因子。\n"
+                f"每个品种大约 30~40 秒，全部大概 {est // 60} 分 {est % 60} 秒。\n"
+                f"训完存成 .pkl，实盘启动时直接用（只预测，不重训）。\n\n继续？",
+        ) != QMessageBox.Yes:
+            return
+
+        self.btn_train.setEnabled(False)
+        self._on_log(f"开始训练 {n} 个品种…")
+        thread = QThread(self)
+        worker = TrainWorker(cfg, syms)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.log.connect(self._on_log)
+        worker.done.connect(self._on_train_done)
+        self._train_thread, self._train_worker = thread, worker
+        thread.start()
+
+    def _on_train_done(self, ok: bool, msg: str) -> None:
+        self._on_log(("✓ " if ok else "✗ ") + msg)
+        thread, worker = self._train_thread, self._train_worker
+        self._train_thread, self._train_worker = None, None
+        if thread is not None:
+            thread.quit()
+            thread.wait(3000)
+        self.btn_train.setEnabled(True)
+
     def _on_failed(self, msg: str) -> None:
         self.lbl_msg.setText(msg)
         self.lbl_msg.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
@@ -1774,3 +2174,8 @@ class PortfolioPage(QWidget):
             # 下次补的时候增量会把它接上
             self._data_thread.quit()
             self._data_thread.wait(3000)
+        if self._train_thread is not None:
+            # 训练同理：杀掉会留半截 .pkl。不过训练产物是**先写临时文件再改名**
+            # 的，半截的那个不会顶掉好的那份
+            self._train_thread.quit()
+            self._train_thread.wait(3000)

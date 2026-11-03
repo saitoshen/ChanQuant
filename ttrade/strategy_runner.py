@@ -41,12 +41,16 @@
 from __future__ import annotations
 
 import math
+import os
+import queue
+import threading
 import time
 from dataclasses import dataclass, field
 
 import pandas as pd
 
 from ttrade import factor_strategy as fstrat
+from ttrade import ml_artifact
 from ttrade import replay
 from ttrade import daylimit, orderbook, positionbook, topup, tqdata
 from ttrade import strategy_store as SStore
@@ -59,6 +63,16 @@ KLINE_LEN = 3000          # 每个策略回看多少根。日线 3000 根够跑 
 MIN_BARS = 30             # 少于这么多根不算信号
 # 因子策略要多得多的历史：窗口 252 加上 z 分数，少于这个数算出来的分数全是 NaN
 FACTOR_MIN_BARS = 300
+
+# 多品种策略在引擎里被拆成「一个品种一个槽位」，槽位 id 用 `父 id#品种键`。
+# 界面上仍然是一条策略一行 —— 用户管的是「这条策略」，不是 19 个各自为政的
+# 槽位；拆开只是为了每个品种有自己的订阅、自己的仓位账本、自己的手数。
+GROUP_SEP = "#"
+
+# 「没有训练产物」这件事多久之内不再重试 / 不再刷日志。产物是用户手动训的，
+# 训完之后要么重启、要么下一次重试就会加载上 —— 每次 tick 都去试一遍 + 刷一行
+# 日志，日志会被冲爆。
+ML_PRED_RETRY = 60.0
 
 # 实时订阅能直接用的周期。`PERIOD_SEC` 是下载链路的口径，只有 5m/1h/1d；
 # 天勤的 `get_kline_serial` 本身支持 15m / 30m / 2h / 4h，实时段不用像本地历史
@@ -168,12 +182,229 @@ class SlotState:
     rejects: int = 0           # 连续被交易所打回的次数
     reject_ts: float = 0.0     # 最近一次被打回的时间，用于冷却
     reject_msg: str = ""       # 最近一次被打回的原因
+    # 机器学习实盘：信号在后台算，算出来之前**不许动仓**（见 `_MlSignals`）。
+    # 这里为 False 时 `tick()` 跳过调仓 —— 拿「还没算出来」当信号 0 会立刻把
+    # 上次留下的仓平掉，重启一次就白交一遍手续费
+    ml_ready: bool = True
+    ml_age: float = 0.0        # 手上这份信号是多久以前算出来的（秒）
+    # 机器学习为什么还没出信号。三种状态必须分开，界面上长得一样、
+    # 等待时间差 10 倍：
+    #   ""      —— 还在算（快路径，几秒）
+    #   "retrain" —— 没有可用产物，退回后台重训（几十秒到十几分钟）
+    #   其他文本 —— 算不出来的**真实原因**（永远等不到）
+    ml_why: str = ""
+    # 这次提交走的是快路径（有训练产物、只预测）还是慢路径（后台重训）。
+    # 慢路径没出结果时说「重训中」，快路径说「计算中」—— 两者等待时间差 10 倍
+    ml_fast: bool = False
 
     def title(self) -> str:
         return self.cfg.title()
 
 
 # ------------------------------------------------------------------ 引擎
+
+
+class LiveLog:
+    """实盘诊断日志，落盘到 `logs/live.log`。
+
+    **为什么要有这个：** 界面上只显示一行「训练中」，出问题时用户没法判断
+    到底是「还在算」、「产物没找到」、「配置对不上退回重训」还是「模型废了」。
+    这些原因在 GUI 的日志控件里（内存，关窗就没了），而且用户不会去看。
+
+    落盘的日志能回答三个问题：
+    - 走的是快路径（只预测）还是慢路径（后台重训）？慢路径 19 个品种要十几分钟，
+      界面上看和「卡住」一模一样；
+    - 产物为什么用不了（配置对不上？文件不在？）；
+    - 信号算不出来时，后台线程记下的**真实原因**是什么。
+
+    写文件必须**不抛异常** —— 日志失败绝不能把实盘带崩。
+    """
+
+    def __init__(self, path: str | None = None) -> None:
+        self._lock = threading.Lock()
+        self._path = path
+        if self._path is None:
+            try:
+                from ttrade import paths
+
+                self._path = os.path.join(paths.log_dir(), "live.log")
+            except Exception:  # noqa: BLE001
+                self._path = None
+
+    def write(self, tag: str, msg: str) -> None:
+        if not self._path:
+            return
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{tag}] {msg}\n"
+        try:
+            with self._lock:
+                # 只留最近 512KB —— 实盘一天几万行，不能把硬盘写满
+                if os.path.exists(self._path) and os.path.getsize(self._path) > 512 * 1024:
+                    try:
+                        with open(self._path, "r", encoding="utf-8") as fh:
+                            lines = fh.readlines()[-2000:]
+                        with open(self._path, "w", encoding="utf-8") as fh:
+                            fh.writelines(lines)
+                    except Exception:  # noqa: BLE001
+                        pass
+                with open(self._path, "a", encoding="utf-8") as fh:
+                    fh.write(line)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class MlSignals:
+    """机器学习实盘的信号缓存：后台算，tick 只读。
+
+    为什么不能像规则策略那样在 tick 里算：机器学习每根 bar 都要把整段历史重走
+    一遍（65 个因子 × 十几万根，实测一个品种 30~40 秒）。放进 tick 循环等于把
+    整条连接卡住 —— 一个账户的策略共享同一个 api，卡住就是全部停摆。
+
+    所以挪到一条单独的线程：
+
+    - `submit()` 只更新「这个品种最新该算哪份行情」，同一品种排队里最多一份，
+      新的直接覆盖旧的（算到一半又来了新 bar，算旧那份没有意义）；
+    - `signal()` 给 tick 线程读，还没算出来时返回 None，调用方**不许动仓**；
+    - `info()` 报出这份信号有多旧，界面上要能看出来「它其实落后了几根」。
+
+    算的是**和回测同一个函数**（`run_factor_strategy`）、同一段历史（`_signal_frame`
+    已经按 `range_years` 切过）。同源同参是硬要求：两边各写一份，「回测赚钱、
+    实盘亏钱」就永远说不清是谁的问题。代价是慢，所以用「算不过来就用上一份」
+    兜底，而不是换个近似算法。
+    """
+
+    def __init__(self, log=None, diag=None) -> None:
+        self._log = log
+        self._diag = diag            # LiveLog（落盘诊断日志），可为 None
+        self._lock = threading.Lock()
+        self._jobs: dict[str, dict] = {}     # key -> {df, keys, cfg, predictor}
+        self._out: dict[str, dict] = {}      # key -> {signal, ts, bars, cost}
+        self._err: dict[str, str] = {}       # key -> 最近一次失败的原因
+        self._q: queue.Queue = queue.Queue()
+        self._queued: set[str] = set()
+        self._stop = False
+        self._t = threading.Thread(target=self._loop, daemon=True, name="ml-live")
+        self._t.start()
+
+    # ---- 给 tick 线程 ----
+
+    def submit(self, key: str, df, cfg, keys: list, predictor=None) -> None:
+        """提交一次信号计算。
+
+        `predictor` 是 `ml_artifact.LivePredictor` —— 有它就走「只预测」快路径
+        （加载好的模型 + 续算状态，**不训练**）；没有就退回「后台重训」慢路径
+        （每根 bar 把整段历史重走一遍 walk-forward）。
+
+        两条路径算的是**同一个函数**的两条路，信号口径一致（见 `ml_artifact`）。
+        """
+        if df is None or len(df) < FACTOR_MIN_BARS:
+            return
+        with self._lock:
+            self._jobs[key] = {"df": df, "cfg": cfg, "keys": list(keys),
+                               "predictor": predictor}
+            if key in self._queued:
+                return            # 已经在排队，直接换掉内容就行
+            self._queued.add(key)
+        self._q.put(key)
+
+    def signal(self, key: str):
+        """(信号, 年龄秒)。还没算出来时返回 (None, 0)。"""
+        with self._lock:
+            hit = self._out.get(key)
+        if not hit:
+            return None, 0.0
+        return int(hit["signal"]), max(0.0, time.time() - hit["ts"])
+
+    def info(self, key: str) -> dict:
+        with self._lock:
+            return dict(self._out.get(key) or {})
+
+    def error(self, key: str) -> str:
+        """最近一次「算不出信号」的原因。
+
+        界面上不能一直显示「机器学习训练中」—— 那是在说「还在算」，但实际
+        可能是**永远算不出来**（模型训废了、历史预测不够、因子全缺）。
+        两种情况长得一样，用户只能干等。
+        """
+        with self._lock:
+            return str(self._err.get(key) or "")
+
+    def pending(self) -> int:
+        return self._q.qsize()
+
+    def stop(self) -> None:
+        self._stop = True
+        try:
+            self._q.put_nowait("")          # 叫醒阻塞在 get() 上的线程
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---- 后台线程 ----
+
+    def _loop(self) -> None:
+        while not self._stop:
+            key = self._q.get()
+            if self._stop:
+                break
+            if not key:
+                continue
+            with self._lock:
+                self._queued.discard(key)
+                job = self._jobs.get(key)
+            if job is None:
+                continue
+            t0 = time.time()
+            try:
+                predictor = job.get("predictor")
+                if predictor is not None:
+                    # ---- 快路径：加载好的模型，只预测，不训练 ----
+                    r = predictor.predict(job["df"])
+                    if not r.get("ok"):
+                        # 算不出来**不是**信号 0：不写缓存，调用方继续用上一份
+                        # 信号（或者保持不动仓）。拿「算不出来」当 0 会把上次
+                        # 留下的仓平掉，重启一次就白交一遍手续费
+                        why = str(r.get("error") or "算不出信号")
+                        with self._lock:
+                            self._err[key] = why
+                        if self._log is not None:
+                            self._log(f"机器学习信号暂不可用（{key}）：{why}")
+                        if self._diag is not None:
+                            self._diag.write("ML", f"{key} 快路径算不出来：{why}")
+                        continue
+                    sig = int(r["signal"])
+                    if self._diag is not None:
+                        self._diag.write(
+                            "ML", f"{key} 快路径 ok signal={sig} "
+                                  f"score={r.get('score'):.4f} "
+                                  f"耗时={time.time() - t0:.2f}s bar={len(job['df'])}")
+                else:
+                    # ---- 慢路径：后台重训（没有训练产物时的兜底）----
+                    if self._diag is not None:
+                        self._diag.write("ML", f"{key} 走慢路径（后台重训），"
+                                              f"bar={len(job['df'])} —— 这条要几十秒")
+                    out = fstrat.run_factor_strategy(
+                        job["df"], "ml", job["keys"],
+                        replay.factor_config(job["cfg"].factor_cfg or {}),
+                    )
+                    sig = out.df["signal"].iloc[-1]
+                    sig = 0 if pd.isna(sig) else int(sig)
+                    if self._diag is not None:
+                        self._diag.write("ML", f"{key} 慢路径完成 signal={sig} "
+                                              f"耗时={time.time() - t0:.1f}s")
+            except Exception as exc:  # noqa: BLE001
+                why = f"{type(exc).__name__}: {exc}"
+                with self._lock:
+                    self._err[key] = why
+                if self._log is not None:
+                    self._log(f"机器学习实时信号计算失败（{key}）：{why}")
+                if self._diag is not None:
+                    self._diag.write("ML", f"{key} 抛异常：{why}")
+                continue
+            with self._lock:
+                self._err.pop(key, None)
+                self._out[key] = {"signal": sig, "ts": time.time(),
+                                  "bars": int(len(job["df"])),
+                                  "cost": time.time() - t0,
+                                  "fast": predictor is not None}
 
 
 class PortfolioRunner:
@@ -188,6 +419,22 @@ class PortfolioRunner:
         self.api = None
         self.last_error = ""
         self._slots: dict[str, SlotState] = {}
+        # 多品种：父 sid -> 子 sid 列表，子 sid -> 父 sid（反查），父 sid -> 父配置。
+        # 一条 19 品种的策略在这里是 19 个槽位 + 1 条映射，界面上仍然是一行
+        self._groups: dict[str, list[str]] = {}
+        self._child_of: dict[str, str] = {}
+        self._parents: dict[str, SStore.StrategyConfig] = {}
+        # 机器学习实盘的信号缓存（后台线程，见 `MlSignals`）
+        self._diag = LiveLog()
+        self._ml = MlSignals(log=self._log, diag=self._diag)
+        # 机器学习「只预测」快路径的预测器缓存：槽位键 -> ("ok", 预测器) 或
+        # ("miss", None, 试过的时刻)。见 `_predictor_for`
+        self._ml_pred: dict[str, tuple] = {}
+        self._ml_miss: dict[str, str] = {}
+        # 上面那张缓存是**跨线程**读的（信号在 worker 线程算，快路径缓存也可能
+        # 在别处被填），要加锁。用 RLock 而不是 Lock：`_predictor_for` 里
+        # 可能间接调到别处也拿这把锁的地方，普通 Lock 会死锁。
+        self._lock = threading.RLock()
         self._klines: dict[str, object] = {}
         self._quotes: dict[str, object] = {}
         self._pos = None
@@ -374,6 +621,11 @@ class PortfolioRunner:
             st.pending.clear()
             st.retired.clear()
         self._align_slot.pending.clear()
+        # 机器学习那条后台线程也要收掉，否则关掉账户之后它还在算，白烧一个核
+        try:
+            self._ml.stop()
+        except Exception:  # noqa: BLE001
+            pass
         if api is not None:
             try:
                 api.close()
@@ -386,7 +638,31 @@ class PortfolioRunner:
 
     # ---- 槽位管理 ----
 
-    def add(self, cfg: SStore.StrategyConfig) -> SlotState:
+    def children_of(self, cfg: SStore.StrategyConfig) -> list:
+        """把一条多品种配置拆成「一个品种一份」。
+
+        单品种 / 截面族返回空表（前者本来就不用拆，后者是真的不支持 —— 截面要
+        一篮子同时按权重调仓，不是 N 个独立信号）。
+        """
+        keys = [k for k in (getattr(cfg, "symbols", None) or []) if k]
+        if getattr(cfg, "family", "") == "cross" or len(keys) < 2:
+            return []
+        n = len(keys)
+        out = []
+        for k in keys:
+            sym, ex = replay.split_key(k, cfg.market)
+            one = cfg.clone(symbol=sym, exchange=ex,
+                            multi_symbols=[], cross_symbols=[])
+            one.sid = f"{cfg.sid}{GROUP_SEP}{k}"
+            # 资金按品种数均分。组合回测里每个品种各占一份账户、再把净值等权
+            # 平均，换算到一个真实账户上就是「每个品种只分到 1/N 的钱」。
+            # 不拆的话 19 个品种各按 30% 满仓，实际敞口是配置的 19 倍
+            if (one.sizing or "capital").lower() != "fixed":
+                one.principal = float(cfg.principal or 0) / n
+            out.append(one)
+        return out
+
+    def _add_one(self, cfg: SStore.StrategyConfig) -> SlotState:
         st = SlotState(cfg=cfg)
         # 账本跟着「账户 + 策略 id」走，重启后接着记。不读回来的话，目标 -11
         # 会从头再开一遍，账户直接变 -22。
@@ -394,12 +670,34 @@ class PortfolioRunner:
         self._slots[cfg.sid] = st
         return st
 
-    def remove(self, sid: str) -> None:
+    def add(self, cfg: SStore.StrategyConfig) -> SlotState:
+        kids = self.children_of(cfg)
+        if not kids:
+            return self._add_one(cfg)
+        self._groups[cfg.sid] = [k.sid for k in kids]
+        self._parents[cfg.sid] = cfg
+        first = None
+        for k in kids:
+            self._child_of[k.sid] = cfg.sid
+            st = self._add_one(k)
+            first = first or st
+        self._log(f"{cfg.title()}：{len(kids)} 个品种各自建一个槽位"
+                  f"（每个分到 {kids[0].principal / 10000:g} 万）")
+        return first
+
+    def _remove_one(self, sid: str) -> None:
         st = self._slots.pop(sid, None)
         if st is not None:
             self._cancel_all(st)
             # 策略删了，账本也别留着 —— 同 id 再建一条会拿到别人的仓位
             positionbook.forget(self.spec.label(), sid)
+
+    def remove(self, sid: str) -> None:
+        for k in self._groups.pop(sid, []) or []:
+            self._child_of.pop(k, None)
+            self._remove_one(k)
+        self._parents.pop(sid, None)
+        self._remove_one(sid)
 
     def _save_book(self, st: SlotState) -> None:
         st.book_ts = time.time()
@@ -411,12 +709,11 @@ class PortfolioRunner:
     def slots(self) -> list[SlotState]:
         return list(self._slots.values())
 
-    def update(self, cfg: SStore.StrategyConfig) -> None:
-        """换掉一条策略的配置。
+    def group_of(self, sid: str) -> str:
+        """子槽位属于哪条多品种策略。单品种返回空串。"""
+        return self._child_of.get(sid, "")
 
-        界面改了手数 / 名称之后必须走这里：`SlotState.cfg` 是启动时那一份的引用，
-        组合文件里改完不会自动同步过来，否则「改完手数没反应」得等重启才生效。
-        """
+    def _update_one(self, cfg: SStore.StrategyConfig) -> None:
         st = self._slots.get(cfg.sid)
         if st is None:
             return
@@ -435,24 +732,56 @@ class PortfolioRunner:
         # K 线才生效 —— 用户会以为改了没用。
         st.last_bar = None
 
+    def update(self, cfg: SStore.StrategyConfig) -> None:
+        """换掉一条策略的配置。
+
+        界面改了手数 / 名称之后必须走这里：`SlotState.cfg` 是启动时那一份的引用，
+        组合文件里改完不会自动同步过来，否则「改完手数没反应」得等重启才生效。
+        """
+        kids = self._groups.get(cfg.sid)
+        if not kids:
+            self._update_one(cfg)
+            return
+        # 品种清单整个换过：槽位对不上，只能重建。重建期间要保持「原来在跑」，
+        # 否则用户在设置里加一个品种，整条策略就悄悄停了
+        want = [f"{cfg.sid}{GROUP_SEP}{k}" for k in (cfg.symbols or [])]
+        if want != kids:
+            running = any(self._slots[k].running for k in kids if k in self._slots)
+            for k in kids:
+                self._child_of.pop(k, None)
+                self._remove_one(k)
+            self._groups.pop(cfg.sid, None)
+            self.add(cfg)
+            if running:
+                self.enable(cfg.sid, True)
+            return
+        self._parents[cfg.sid] = cfg
+        for child in self.children_of(cfg):
+            self._update_one(child)
+
     def enable(self, sid: str, on: bool) -> None:
+        kids = self._groups.get(sid)
+        if kids:
+            # 一条多品种策略 = 全部子槽位一起启停。单个品种起不来（没数据、
+            # 报单到顶）不该拖住其它品种 —— 所以逐个开，失败的原因留在各自
+            # 槽位上，父那一行会汇总显示
+            for k in kids:
+                self.enable(k, on)
+            return
         st = self._slots.get(sid)
         if st is None:
             return
         if on and st.cfg.family == "cross":
-            # 截面策略要**同时**持有一篮子品种、按权重整体调仓，而实盘引擎一次
-            # 只管一个合约。硬跑会变成「只按第一个品种下单」，那是最危险的一种
-            # 错误 —— 看着在跑，实际仓位完全不是回测里那条曲线
-            st.error = ("截面策略暂不支持实盘：实盘引擎一次只挂一个合约，"
+            # 截面策略要**同时**持有一篮子品种、按权重整体调仓，而实盘引擎一个
+            # 槽位只挂一个合约（多品种策略是拆成多个独立槽位、各自按固定
+            # 比例下单，没有「按权重整体调仓」这回事）。硬跑会变成「只按第一个
+            # 品种下单」，那是最危险的一种错误 —— 看着在跑，实际仓位完全不是
+            # 回测里那条曲线
+            st.error = ("截面策略暂不支持实盘：实盘引擎每个槽位只挂一个合约，"
                         "截面要一篮子同时按权重调仓。可以先用组合页看回测")
             return
         if on and not st.cfg.rule_key and st.cfg.family == "rule":
             st.error = "这条策略没有选规则"
-            return
-        if on and st.cfg.family == "factor" and (st.cfg.factor_mode or "single") == "ml":
-            # 机器学习每根 K 线都要重训一遍（几百折），放进 tick 循环会把整个
-            # 连接卡住 —— 一个账户的策略是共享同一个 api 的，卡住就是全都停摆
-            st.error = "机器学习因子策略暂不支持实时交易（每根 K 线重训太慢），请改用单因子 / 多因子"
             return
         if on and st.cfg.family == "factor" and not st.cfg.factor_keys:
             st.error = "这条因子策略没有选中因子"
@@ -477,6 +806,11 @@ class PortfolioRunner:
         st.rejects = 0
         st.reject_msg = ""
         st.last_action = "启动" if on else "停止"
+        if on and self._is_ml(st.cfg):
+            # 机器学习要先把模型训出来才有信号。这之前**不许动仓** —— 拿
+            # 「还没算出来」当信号 0，会把上次留下的仓平掉，重启一次白交一遍手续费
+            st.ml_ready = False
+            st.last_action = "启动（机器学习训练中）"
         if not on:
             self._cancel_all(st)
         self._log(f"{st.title()}：{'启动' if on else '停止'}")
@@ -501,6 +835,10 @@ class PortfolioRunner:
                 continue
             try:
                 self._refresh_signal(st)
+                if not st.ml_ready:
+                    # 机器学习还在算第一批信号：仓位保持原样，只把在途单追完
+                    self._chase(st)
+                    continue
                 self._rebalance(st)
                 self._chase(st)
             except Exception as exc:  # noqa: BLE001
@@ -535,6 +873,60 @@ class PortfolioRunner:
         信号下单，补库还会把 5m 的 bar 写进 1h 表（图上最后一截变成五分钟一根）。
         """
         return f"{cfg.key()}@{cfg.period}"
+
+    def _predictor_for(self, st: SlotState):
+        """这个槽位能不能用「只预测」快路径。
+
+        有**训练产物**（`.pkl`）就用它：加载一次，之后每根新 bar 只是
+        「重算因子 + predict + 状态机续算」，实测 2.94 秒/品种（65 因子 ×
+        26 万根 5m），而不是重训的 34 秒。
+
+        没有产物就返回 None —— 调用方退回「后台重训」慢路径（`MlSignals`）。
+        慢路径慢，但**信号口径一致**，不会因为「有没有产物」给出两种策略。
+
+        产物和当前配置对不上（改了因子 / 阈值 / 模型类型）也退回慢路径，
+        并在日志里说明差在哪 —— 拿着旧模型跑新配置，出来的信号没有意义。
+        """
+        if not self._is_ml(st.cfg):
+            return None
+        # 缓存键用 **sid**，不是 `_skey()`（品种_交易所@周期）。
+        # `_skey` 是**订阅**的键 —— 同一个品种同一周期本来就能被多条策略共用
+        # 一份 K 线。但**训练产物是按 sid 存的**：两条策略跑同一个品种同一
+        # 周期，因子集 / 参数不同，sid 不同，产物也不同。共用 `_skey` 的话，
+        # 先来的那条把「没有产物」缓存下来，后来的那条 60 秒内直接被判死
+        # —— 明明产物在，引擎却说没有。
+        key = st.cfg.sid
+        with self._lock:
+            hit = self._ml_pred.get(key)
+            if hit is not None:
+                if hit[0] == "ok":
+                    return hit[1]
+                if hit[0] == "miss" and time.time() - hit[2] < ML_PRED_RETRY:
+                    return None       # 刚试过，别反复刷日志
+        try:
+            cfg = replay.factor_config(st.cfg.factor_cfg or {})
+            keys = list(st.cfg.factor_keys or [])
+            pred, why = ml_artifact.load_for_live(st.cfg.sid, cfg, keys, log=self._log)
+        except Exception as exc:  # noqa: BLE001
+            pred, why = None, f"{type(exc).__name__}: {exc}"
+        if pred is None:
+            with self._lock:
+                self._ml_pred[key] = ("miss", None, time.time())
+            if why and why not in self._ml_miss.get(key, ""):
+                self._ml_miss[key] = why
+                self._log(f"{st.title()}：没有可用的训练产物，"
+                          f"退回后台重训（{why}）")
+            if self._diag is not None:
+                self._diag.write("ML", f"{st.title()}（sid={key}）退回后台重训："
+                                       f"{why or '（原因不明）'}")
+            return None
+        with self._lock:
+            self._ml_pred[key] = ("ok", pred, time.time())
+        self._log(f"{st.title()}：用训练产物算信号（只预测，不重训）")
+        if self._diag is not None:
+            self._diag.write("ML", f"{st.title()}（sid={key}）用训练产物，"
+                                   f"走快路径（只预测）")
+        return pred
 
     def _subscribe(self, st: SlotState) -> None:
         key = self._skey(st.cfg)
@@ -619,7 +1011,14 @@ class PortfolioRunner:
         # `KeyError: -1`。这一行曾经让每条策略在第一个 tick 就停机。
         last = int(kl["datetime"].iloc[-1])
         if last == st.last_bar:
-            return                       # 同一根 bar 里不重算
+            # 同一根 bar 里不重算行情。**但机器学习的信号是后台线程算的** ——
+            # 算完那一刻往往还没来新 bar（收盘之后更是永远等不到下一根），
+            # 如果这里直接返回，缓存里算好的信号就没人来读，界面会一直停在
+            # 「计算中」，直到下一个交易时段。所以同一根 bar 里也留一条缝：
+            # 只读缓存，不重算行情、不重新提交。
+            if self._is_ml(st.cfg) and not st.ml_ready:
+                self._pick_ml_signal(st)
+            return
         st.last_bar = last
 
         df = self._signal_frame(st, kl)
@@ -629,11 +1028,65 @@ class PortfolioRunner:
             df = df.iloc[:-1]
         if len(df) < MIN_BARS:
             return
-        st.signal = self._signal(st, df)
+        if self._is_ml(st.cfg):
+            # 机器学习：整段历史重走一遍要几十秒，交给后台线程，这一 tick 只读缓存
+            # 有训练产物时走「只预测」快路径（几秒），没有才退回后台重训（几十秒）
+            #
+            # 手数先在这里算好：它和信号无关，只跟价格 / ATR 有关；而信号从后台
+            # 回来时**往往没有新 bar**（收盘之后更是永远等不到），那一刻现算手数
+            # 既没有 df 也没有意义
+            st.lots = self._lots(st, self._mark_price(st, df),
+                                 atr(df, st.cfg.stop_atr_n))
+            pred = self._predictor_for(st)
+            st.ml_fast = pred is not None
+            self._ml.submit(self._skey(st.cfg), self._with_aux(st, df), st.cfg,
+                            list(st.cfg.factor_keys or []), predictor=pred)
+            if not self._pick_ml_signal(st):
+                return
+        else:
+            st.signal = self._signal(st, df)
         if st.cfg.note != "short":
             st.signal = max(0, st.signal)     # 不允许做空时把空头信号裁掉
         st.lots = self._lots(st, self._mark_price(st, df), atr(df, st.cfg.stop_atr_n))
         st.target = st.signal * st.lots
+
+    def _pick_ml_signal(self, st: SlotState) -> bool:
+        """从后台缓存取一次机器学习信号；取到就落信号 / 手数，返回 True。
+
+        为什么单独抽出来：信号在后台线程算，**算完的时刻和新 bar 到达的时刻
+        无关**。只在「来了新 bar」时读缓存的话，收盘前最后一次计算就永远读不到，
+        界面会一直停在「计算中」，用户以为程序卡住了。
+
+        「还在算」和「永远算不出来」必须分开说 —— 以前一律显示「训练中」，
+        用户会一直等一个永远不会来的信号。
+        """
+        key = self._skey(st.cfg)
+        sig, age = self._ml.signal(key)
+        st.ml_age = age
+        if sig is None:
+            why = self._ml.error(key)
+            if why:
+                st.ml_why = why
+                st.last_action = f"机器学习信号算不出来：{why}"
+            elif not st.ml_fast:
+                # 没有可用产物 → 走的是**后台重训**慢路径。这个比快路径
+                # 慢一个数量级（19 个品种要十几分钟），界面必须说清楚，
+                # 否则用户以为程序卡死了。
+                st.ml_why = "retrain"
+                st.last_action = ("机器学习训练中（没有可用的训练产物，"
+                                  "后台重新训练，较慢），暂不动仓")
+            else:
+                st.ml_why = ""
+                st.last_action = "机器学习信号计算中，暂不动仓"
+            st.ml_ready = False
+            return False
+        st.ml_ready = True
+        st.ml_why = ""
+        st.signal = int(sig)
+        if st.cfg.note != "short":
+            st.signal = max(0, st.signal)
+        st.target = st.signal * st.lots
+        return True
 
     def _signal_frame(self, st: SlotState, kl) -> pd.DataFrame:
         """算信号用的行情：**本地前复权历史 + 实时 bar**。
@@ -683,6 +1136,12 @@ class PortfolioRunner:
             return live
         return merged
 
+    @staticmethod
+    def _is_ml(cfg) -> bool:
+        """这条策略是不是机器学习。ML 实盘的信号走后台线程（见 `MlSignals`）。"""
+        return (getattr(cfg, "family", "") == "factor"
+                and (getattr(cfg, "factor_mode", "") or "single") == "ml")
+
     def _signal(self, st: SlotState, df: pd.DataFrame) -> int:
         """按当前配置算出最后一根 bar 上的目标仓位（-1 / 0 / 1）。
 
@@ -690,6 +1149,9 @@ class PortfolioRunner:
         `run_factor_strategy`：同一个因子、同一组阈值，回测里是几手、实盘就是
         几手 —— 两边各写一份的话，「回测赚钱、实盘亏钱」永远说不清是策略不行
         还是实现不一致。
+
+        **机器学习不走这里**（实盘）：`_refresh_signal` 会把 ML 交给后台线程，
+        这里只留一条同步的慢路径给离线测试 / 脚本用。
 
         `orient="auto"` 在实时段有个天然缺陷：方向是按全样本 IC 的符号定的，
         样本一变就可能翻。用户要是没显式指定方向，日志里会看到它翻。
@@ -838,6 +1300,41 @@ class PortfolioRunner:
 
     # ---- 调仓 ----
 
+    @staticmethod
+    def _bar_seconds(period: str) -> float:
+        """一个周期多少秒。
+
+        `PERIODS` 记的是 (源周期, 几倍) —— `15m` 是 `("5m", 3)`，所以秒数是
+        「源周期自己的秒数 × 倍数」，不是「倍数 × 60」。按后者算会把 15m 当成
+        3 分钟，行情活性判据提前 5 倍判死，收盘前的调仓就全被拦掉了。
+        """
+        unit, n = tqdata.PERIODS.get(period, (period, 1))
+        digits = "".join(ch for ch in unit if ch.isdigit())
+        num = float(digits) if digits else 1.0
+        if unit.endswith("m"):
+            return float(n) * num * 60.0
+        if unit.endswith("h"):
+            return float(n) * num * 3600.0
+        return float(n) * num * 86400.0
+
+    def _market_alive(self, st: SlotState) -> bool:
+        """最近一根 bar 是不是刚来的 —— 判断行情还在不在走。
+
+        为什么需要：机器学习信号在后台线程算，算完那一刻 `ml_ready` 就翻成
+        True，`_rebalance` 当场就会算出新目标仓。如果这一刻已经收盘（日盘
+        15:00、夜盘 23:00 结束），单子发出去只会被打回，攒够 3 次策略就停机。
+        「多久没来新 bar」是这里唯一拿得到、又不依赖交易所日历的活性判据。
+        """
+        try:
+            bar_s = float(st.last_bar) / 1e9      # 天勤 datetime 是纳秒
+        except (TypeError, ValueError):
+            return False
+        if bar_s <= 0:
+            return False
+        # 有的品种 bar 记开盘、有的记收盘：收盘记法下 age 是负的，同样算「没过期」
+        age = time.time() - bar_s
+        return age < self._bar_seconds(st.cfg.period) * 1.1
+
     def _net_pos(self, symbol: str) -> int:
         if self._pos is None:
             return 0
@@ -892,6 +1389,12 @@ class PortfolioRunner:
             return                       # `_chase` 已经停机，这里只是兜底
         if st.rejects and time.time() - st.reject_ts < REJECT_COOL:
             return                       # 刚被打回，冷一会儿再试
+        if self._is_ml(st.cfg) and not self._market_alive(st):
+            # 行情已经停了（收盘 / 断流）。机器学习信号是后台线程算的，算完那一刻
+            # ml_ready 就翻成 True，这里当场就会算出新目标仓 —— 但收盘之后发出去
+            # 的单只会被打回，攒够 3 次策略就停机了。等下一根 bar 再说。
+            st.last_action = "行情已停（收盘或断流），等下一根 bar 再调仓"
+            return
         if delta * held < 0:
             # 要平自己那部分仓。账户明细可能还没跟上（刚成交），这时候发出去，
             # `_legs` 会把平不掉的量当成开仓 —— 反手开一笔没道理的仓。
@@ -1475,34 +1978,92 @@ class PortfolioRunner:
 
     # ---- 快照 ----
 
+    def _group_slots(self) -> list[dict]:
+        """多品种策略在列表里那一行：把 N 个子槽位汇成一条。
+
+        没有这一行，界面上就找不到这条策略（子槽位的 sid 是 `父#品种`）。
+        目标仓不汇总 —— 19 个品种各有一个目标，加起来没有意义，界面显示「—」，
+        逐合约的去监控器看。
+        """
+        out = []
+        for pid, kids in self._groups.items():
+            rows = [self._slots[k] for k in kids if k in self._slots]
+            if not rows:
+                continue
+            cfg = self._parents.get(pid) or rows[0].cfg
+            n_pos = sum(1 for r in rows if r.target)
+            n_err = sum(1 for r in rows if r.error)
+            running = any(r.running for r in rows)
+            err = next((r.error for r in rows if r.error), "")
+            action = f"{len(rows)} 个品种：{n_pos} 个有仓"
+            if n_err:
+                action += f"，{n_err} 个出错"
+            out.append({
+                "sid": pid,
+                "title": cfg.title(),
+                "key": "",
+                "period": cfg.period,
+                "strategy": cfg.strategy_label(),
+                "volume": cfg.volume,
+                "sizing": cfg.sizing,
+                "size_text": cfg.size_text(),
+                "lots": 0,
+                "running": running,
+                "signal": 0,
+                "target": None,          # 没有「一个」目标仓
+                "underlying": "",
+                # 一个都没跑起来才把错误顶到这一行；部分失败写进 action，
+                # 免得 18/19 个品种正常、界面上却是红字「错误」
+                "error": err if (n_err and not running) else "",
+                "action": action,
+                "retired": [],
+                "group": "",
+                "multi": len(rows),
+                "ml_wait": any((not r.ml_ready and r.running) for r in rows),
+                "ml_age": max((float(r.ml_age or 0) for r in rows), default=0.0),
+                # 多品种时取「最严重」的那个原因：只要有一个品种永远算不出来，
+                # 整条策略就等下去 —— 得让用户看到那个真实原因。
+                "ml_why": next((r.ml_why for r in rows
+                                if r.ml_why and r.ml_why != "retrain"), "") or (
+                    "retrain" if any((not r.ml_ready and r.running
+                                      and r.ml_why == "retrain") for r in rows) else ""),
+            })
+        return out
+
     def snapshot(self) -> dict:
         # 取一次就清掉。没清的话界面关掉 K 线之后，这份开销还每份快照都付
         want, self._want = self._want, []
+        slots = [
+            {
+                "sid": st.cfg.sid,
+                "title": st.title(),
+                "key": st.cfg.key(),
+                "period": st.cfg.period,
+                "strategy": st.cfg.strategy_label(),
+                "volume": st.cfg.volume,
+                "sizing": st.cfg.sizing,
+                "size_text": st.cfg.size_text(),
+                "lots": st.lots,
+                "running": st.running,
+                "signal": st.signal,
+                "target": st.target,
+                "underlying": st.underlying,
+                "error": st.error,
+                "action": st.last_action,
+                "retired": list(st.retired),
+                "group": self._child_of.get(st.cfg.sid, ""),
+                "ml_wait": bool(not st.ml_ready and st.running),
+                "ml_age": float(st.ml_age or 0.0),
+                "ml_why": str(st.ml_why or ""),
+            }
+            for st in self._slots.values()
+        ]
+        slots.extend(self._group_slots())
         return {
             "connected": self.alive,
             "error": self.last_error,
             "account": self.spec.label(),
-            "slots": [
-                {
-                    "sid": st.cfg.sid,
-                    "title": st.title(),
-                    "key": st.cfg.key(),
-                    "period": st.cfg.period,
-                    "strategy": st.cfg.strategy_label(),
-                    "volume": st.cfg.volume,
-                    "sizing": st.cfg.sizing,
-                    "size_text": st.cfg.size_text(),
-                    "lots": st.lots,
-                    "running": st.running,
-                    "signal": st.signal,
-                    "target": st.target,
-                    "underlying": st.underlying,
-                    "error": st.error,
-                    "action": st.last_action,
-                    "retired": list(st.retired),
-                }
-                for st in self._slots.values()
-            ],
+            "slots": slots,
             "mismatch": self.mismatch(),
             # `want_bars()` 点名的策略才带，其余时候是空字典
             "bars": {sid: self.bars_of(sid) for sid in want} if want else {},

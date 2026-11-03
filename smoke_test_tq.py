@@ -1492,6 +1492,81 @@ def check_strategy_store() -> None:
               bool(got) and got[0].sid == a.sid,
               f"{got[0].sid if got else '-'} vs {a.sid}")
 
+        # ---- 多品种清单必须跟着存
+        #
+        # 以前只存了 `symbol` / `exchange`（当前在看的那个），多品种勾选只写进了
+        # 截面专用的 `cross_symbols`。于是「存一条跑 78 个品种的规则策略」再打开
+        # 就只剩 1 个品种，曲线当然对不上
+        multi = St.StrategyConfig(
+            symbol="RB", exchange="SHFE", period="5m",
+            rule_key="sbbox_mini", multi_symbols=["RB_SHFE", "CU_SHFE", "I_DCE"],
+        )
+        St.save_library([multi])
+        back = St.load_library()[0]
+        check("多品种配置：品种清单存得下来",
+              list(back.multi_symbols) == ["RB_SHFE", "CU_SHFE", "I_DCE"],
+              str(back.multi_symbols))
+        check("多品种配置：symbols 属性优先用多品种清单",
+              back.symbols == ["RB_SHFE", "CU_SHFE", "I_DCE"], str(back.symbols))
+        check("多品种配置：标题写「N 个品种」而不是第一个品种",
+              back.title().startswith("3 个品种"), back.title())
+        # 老配置只有 cross_symbols，没有 multi_symbols
+        old = St.StrategyConfig(symbol="RB", exchange="SHFE", family="cross",
+                                cross_symbols=["RB_SHFE", "CU_SHFE"])
+        check("多品种配置：老配置退回 cross_symbols",
+              old.symbols == ["RB_SHFE", "CU_SHFE"], str(old.symbols))
+
+        # ---- 老库条目：多品种清单只躺在 `cross_symbols` 里 ----
+        #
+        # v2.5.7 之前 `cross_symbols` 是「勾选面板里选中的所有品种」唯一的落脚点，
+        # 规则 / 因子族也写它（名字带 cross，但不是截面专用）。以前只在截面族
+        # 才认这份清单，于是库里 19 个品种的因子策略一加载就变单品种，再存一遍
+        # 那 19 个就被彻底覆盖掉 —— 用户报的「存了多品种、加载回来不是多品种」
+        # 就是这条
+        legacy = {"symbol": "SR", "exchange": "CZCE", "family": "factor",
+                  "cross_symbols": ["SR_CZCE", "CF_CZCE", "TA_CZCE"],
+                  "factor_keys": ["mom_20"]}
+        lc = St.StrategyConfig.from_dict(dict(legacy))
+        check("老库条目：cross_symbols 搬进 multi_symbols",
+              lc.multi_symbols == ["SR_CZCE", "CF_CZCE", "TA_CZCE"],
+              str(lc.multi_symbols))
+        check("老库条目：symbols 认这 3 个品种",
+              len(lc.symbols) == 3, str(lc.symbols))
+        check("老库条目：标题写「3 个品种」",
+              lc.title().startswith("3 个品种"), lc.title())
+        # 只有 1 个的老条目不算多品种，不能凭空改标的
+        one = St.StrategyConfig.from_dict({
+            "symbol": "SR", "exchange": "CZCE", "family": "factor",
+            "cross_symbols": ["CF_CZCE"]})
+        check("老库条目：只勾过 1 个的不当成多品种",
+              one.multi_symbols == [] and one.symbols == ["SR_CZCE"],
+              f"{one.multi_symbols} / {one.symbols}")
+        # 已经是新字段的，老字段不覆盖它
+        both = St.StrategyConfig.from_dict({
+            "symbol": "SR", "exchange": "CZCE",
+            "multi_symbols": ["SR_CZCE", "CF_CZCE"],
+            "cross_symbols": ["SR_CZCE", "CF_CZCE", "TA_CZCE", "MA_CZCE"]})
+        check("老库条目：新字段优先，不被 cross_symbols 覆盖",
+              both.symbols == ["SR_CZCE", "CF_CZCE"], str(both.symbols))
+        # 再存一遍就写在新字段上（数据自愈，用户不用重新勾一遍）
+        St.save_library([lc])
+        healed = St.load_library()[0]
+        check("老库条目：再存一遍搬到新字段",
+              list(healed.multi_symbols) == ["SR_CZCE", "CF_CZCE", "TA_CZCE"],
+              str(healed.multi_symbols))
+        St.save_library([multi])      # 下面还要验 JSON 里有这个键
+
+        single = St.StrategyConfig(symbol="RB", exchange="SHFE")
+        check("多品种配置：单品种时 symbols 就是那一个",
+              single.symbols == ["RB_SHFE"], str(single.symbols))
+        check("多品种配置：单品种标题还是「品种 · 策略」",
+              single.title().startswith("RB_SHFE ·"), single.title())
+        # 存盘的 JSON 里必须有这个键，不能只在内存里
+        raw = St._load(St.LIB_FILE)
+        check("多品种配置：JSON 里有多品种清单",
+              bool(raw) and "multi_symbols" in (raw[0] or {}), str(raw)[:80])
+        St.save_library([])
+
         b = got[0].clone(volume=7)
         b.sid = got[0].sid
         St.update_portfolio(b)
@@ -1754,9 +1829,14 @@ def check_costs() -> None:
           str(bp))
     btb = B.BacktestConfig()
     costs.apply(btb, "RB", "SHFE", "bp")
+    # 只断言「bp 档不看 tick」这件事本身。**不要顺带断言 fee_rate > 0** ——
+    # `fee_mult` 是用户可以在设置里改的（这个用户的 bp 档就把它调成了 0），
+    # 拿用户本地设置去断言，测试结果会随谁在用而变 —— 那不是代码坏了，
+    # 是测试没隔离。手续费对不对，由上面那条「bp 档默认 3‱」和
+    # 「bp 档一手滑点 = 价格 × 3‱」负责。
     check("成本档位：bp 档不看 tick",
           btb.tick_size == 0.0 and btb.slippage_ticks == 0.0
-          and abs(btb.slippage - 0.0003) < 1e-12 and btb.fee_rate > 0,
+          and abs(btb.slippage - 0.0003) < 1e-12,
           f"tick={btb.tick_size} ticks={btb.slippage_ticks} slip={btb.slippage}")
     # 比例型成本不该被复权因子缩放：分子分母同时被 f 缩放，自己抵消
     check("成本档位：bp 档一手滑点 = 价格 × 3‱（不随复权因子变）",
@@ -2129,6 +2209,114 @@ def check_cross() -> None:
         one_factor_ml = "" if "至少" in str(exc) else str(exc)
     check("截面：机器学习至少要 2 个因子", not one_factor_ml, one_factor_ml)
 
+    # ---- 第一步用别的周期的因子（v2.5.5）
+    #
+    # 典型：5 分钟策略按「日线成交额」筛池。难点不在取数据，在**时点**：日线
+    # 那根标的是当天，收盘价要到 15:00 才知道。5 分钟策略在当天 09:35 拿「当天
+    # 的日线因子」排名，等于把收盘结果提前灌进上午的 bar，IC 会被吹起来，实盘
+    # 一上就露馅。所以对齐必须先 `shift(1)` 再 as-of 前向填充
+    p3 = pd.DataFrame({"a": [1.0, 2.0, 3.0]},
+                      index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]))
+    clock = pd.to_datetime(["2024-01-01 10:00", "2024-01-02 10:00",
+                            "2024-01-02 14:00", "2024-01-03 10:00"])
+    al = cross.align_to_clock(p3, clock)
+    av = al["a"].to_numpy(dtype=float)
+    check("跨周期：日线分数整体往后错一根再前向填充",
+          bool(np.isnan(av[0])) and np.allclose(av[1:], [1.0, 1.0, 2.0]),
+          str([None if np.isnan(v) else v for v in av]))
+    check("跨周期：对齐后索引换成策略的时钟",
+          list(al.index) == list(pd.Index(clock)), str(list(al.index)))
+    empty_al = cross.align_to_clock(pd.DataFrame(), clock)
+    check("跨周期：没有源分数时给空面板而不是崩溃",
+          empty_al.empty and len(empty_al) == len(clock), str(empty_al.shape))
+
+    # 端到端：5 分钟策略 + 日线因子。日线漂移按天摆动，保证「当天」和「前一天」
+    # 的分数确实不一样 —— 否则用哪一天都验不出来
+    _d = np.array(drifts)
+    _dd = _d[:, None] * (1.0 + 2.5 * np.sin(np.arange(90) / 2.0))[None, :]
+    didx = pd.bdate_range("2023-10-02", periods=90)
+    dframes = {}
+    for i, k in enumerate(list(iframes)):
+        s = pd.Series(100.0 * np.cumprod(1.0 + _dd[i]), index=didx)
+        dframes[k] = pd.DataFrame({"open": s, "high": s * 1.004, "low": s * 0.996,
+                                   "close": s, "volume": 1000.0})
+    xcfg = dict(mode="select", top_pct=50, rebalance=1, rebalance_unit="day",
+                factor_mode="multi", factor_keys=["mom_20"],
+                timing_family="rule", timing_rule_key="ma_cross")
+    xres = cross.run(iframes, cross.CrossConfig(step1_period="1D", **xcfg),
+                     BtConfig(), step1_frames=dframes)
+    check("跨周期：5 分钟策略 + 日线因子能跑出净值", xres.ok, xres.error)
+    if xres.ok:
+        sd = xres.score_step1
+        check("跨周期：第一步的分数留在自己的周期上（供截面因子分析）",
+              sd is not None and len(sd) <= len(didx) and not sd.empty,
+              "None" if sd is None else str(sd.shape))
+        sdv = sd.dropna(how="all")
+        # 5 分钟那批数据最后一天（日线行情比它长，不能直接取 sd 的末行）
+        last5 = pd.DatetimeIndex(
+            iframes[list(iframes)[0]].index).normalize()[-1]
+        last_day = xres.score[xres.score.index.normalize() == last5]
+        upto = sdv.loc[:last5]
+        prev, today = upto.iloc[-2], upto.iloc[-1]
+        check("跨周期：同一天的 5 分钟 bar 共用同一个日线分数（日内不跳动）",
+              len(last_day) > 1
+              and float((last_day.max() - last_day.min()).max()) < 1e-12,
+              f"{len(last_day)} 根 / 极差 "
+              f"{0.0 if not len(last_day) else float((last_day.max() - last_day.min()).max()):.2e}")
+        check("跨周期：用的是前一交易日的日线分数",
+              np.allclose(last_day.iloc[0].to_numpy(), prev.to_numpy()),
+              f"{last_day.iloc[0].round(2).tolist()} vs {prev.round(2).tolist()}")
+        check("跨周期：没有偷用当天（还没收完）的分数",
+              not np.allclose(last_day.iloc[0].to_numpy(), today.to_numpy()),
+              f"当天 {today.round(2).tolist()}")
+        check("跨周期：日线因子下最强的仍排第一",
+              last_day.iloc[0].idxmax() == list(iframes)[0],
+              str(last_day.iloc[0].round(2).to_dict()))
+    follow = cross.run(iframes, cross.CrossConfig(**xcfg), BtConfig())
+    check("跨周期：跟随策略周期时不出第二份分数（老行为不变）",
+          follow.ok and follow.score_step1 is None,
+          "" if not follow.ok else str(follow.score_step1))
+    # 配了周期但没给那份行情 → 退回策略周期，不能直接报错（界面上的降级路径）
+    fallback = cross.run(iframes, cross.CrossConfig(step1_period="1D", **xcfg),
+                         BtConfig(), step1_frames=None)
+    check("跨周期：拿不到别的周期行情时退回策略周期",
+          fallback.ok and fallback.score_step1 is None,
+          fallback.error)
+
+    # ---- 名义敞口：截面跟着「仓位」那一组控件走
+    #
+    # 截面原来恒按 1 倍名义额算（每个品种 1/N），而多品种回测按「资金分配 ÷
+    # 每手保证金」开仓（默认 30% / 10% = 3 倍）。两条路各按各的杠杆跑，用户
+    # 把截面调成「选 100% / 100 个月调仓」等于没筛，还是对不上
+    lv_unit = cross.leverage_vector(frames, BtConfig())
+    check("截面杠杆：unit 口径就是 1 倍",
+          bool((lv_unit == 1.0).all()), str(lv_unit.unique().tolist()))
+    lv_cap = cross.leverage_vector(
+        frames, BtConfig(sizing="capital", capital=30_000.0, initial_cash=100_000.0))
+    check("截面杠杆：资金分配 30% ÷ 保证金 10% = 3 倍",
+          bool((abs(lv_cap - 3.0) < 1e-9).all()), str(lv_cap.unique().tolist()))
+    lv_fix = cross.leverage_vector(frames, BtConfig(sizing="fixed", volume=1))
+    check("截面杠杆：固定手数定不出敞口，按 1 倍",
+          bool((lv_fix == 1.0).all()), str(lv_fix.unique().tolist()))
+
+    # 杠杆真的乘进权重里：同一组参数，capital 口径的换手/敞口应该是 unit 的 3 倍
+    base_cfg = dict(mode="select", top_pct=50, rebalance=5, factor_mode="multi",
+                    factor_keys=["mom_20"], timing_family="rule",
+                    timing_rule_key="ma_cross")
+    u_out = cross.run(frames, cross.CrossConfig(**base_cfg), BtConfig())
+    c_out = cross.run(frames, cross.CrossConfig(**base_cfg),
+                      BtConfig(sizing="capital", capital=30_000.0,
+                               initial_cash=100_000.0))
+    if u_out.ok and c_out.ok:
+        u_max = float(u_out.weights.abs().sum(axis=1).max())
+        c_max = float(c_out.weights.abs().sum(axis=1).max())
+        check("截面杠杆：capital 口径的敞口是 unit 的 3 倍",
+              abs(c_max - u_max * 3.0) < 1e-6, f"{u_max:.4f} → {c_max:.4f}")
+        check("截面杠杆：杠杆不会让净值转负",
+              float(c_out.equity.min()) > 0, str(float(c_out.equity.min())))
+    else:
+        check("截面杠杆：两种口径都能跑", False, u_out.error or c_out.error)
+
     # 全空因子不能把合成分数毒掉：NaN + x 还是 NaN，十几个因子里混进一个
     # 展期/期权因子（日线库没有这些列），整张分数面板就会变成空的
     one = cross.score_panel(frames, ["mom_20"], mode="multi")
@@ -2499,6 +2687,21 @@ def check_cross() -> None:
               np.nan_to_num(_rout.pack.trigger.strength, nan=0.0),
               np.where(_rout.pack.trigger.armed, 1.0, 0.0))),
           f"{int((_rsig != 0).sum())} 根持仓")
+    # 规则触发的参数：换个快慢线，样本点必须跟着变，说明行里也要写出来
+    _p5 = _fs.run_factor_strategy(
+        _mdf, "ml", _keys3,
+        _fs.FactorConfig(trigger_keys=[], trigger_rule="ma_cross",
+                         trigger_params={"fast": 5, "slow": 20}, **_base))
+    _p3 = _fs.run_factor_strategy(
+        _mdf, "ml", _keys3,
+        _fs.FactorConfig(trigger_keys=[], trigger_rule="ma_cross",
+                         trigger_params={"fast": 3, "slow": 8}, **_base))
+    _n5 = int(_p5.pack.trigger.armed.sum())
+    _n3 = int(_p3.pack.trigger.armed.sum())
+    _note5 = next((x for x in _p5.notes if "触发：规则" in x), "")
+    check("触发参数：换了参数样本点跟着变，说明行写明用的是哪一组",
+          _n5 != _n3 and "快线周期 5" in _note5 and "慢线周期 20" in _note5,
+          f"5/20 → {_n5} 个点，3/8 → {_n3} 个点；{_note5}")
     # 一个触发源都没有：必须在源头拦住，否则跑出来是一条空仓净值
     try:
         _fs.run_factor_strategy(
@@ -3753,6 +3956,43 @@ def check_no_blowup() -> None:
               f"{res.metrics['total_return']:.2f}")
         check("回测：已经没有爆仓这个指标", "n_blowup" not in res.metrics,
               str(sorted(res.metrics)[:4]))
+
+        # ---- 组合里亏穿的成分按「份额归零」算
+        #
+        # 单品种不强平（上面那几条），但等权组合是**净值曲线取平均**：一条
+        # -3.5 的曲线进去，等于说这个品种倒欠 3.5 份本金。用户报过 78 个品种
+        # 跑出 -47%、最大回撤 -133%、图上「净值 1 直接掉到 0」—— 就是这么来的。
+        from ttrade.backtest import Result, combine
+
+        idx2 = pd.date_range("2020-01-01", periods=50, freq="D")
+        good = Result(equity=pd.Series(np.linspace(1.0, 2.0, 50) * 1e5, index=idx2),
+                      position=pd.Series(1.0, index=idx2), trades=[],
+                      metrics={"total_return": 1.0}, label="好的")
+        dead = Result(equity=pd.Series(np.linspace(1.0, -3.5, 50) * 1e5, index=idx2),
+                      position=pd.Series(-1.0, index=idx2), trades=[],
+                      metrics={"total_return": -4.5}, label="亏穿的")
+        cb = combine([good, dead], label="组合")
+        check("组合：亏穿的成分按份额 0 算，不按负净值",
+              float(cb.equity.min()) > 0,
+              f"最低 {float(cb.equity.min()):,.0f}")
+        # 两条曲线：一条 1→2，一条 1→0。均值应该从 1 走到 1.0（(2+0)/2）
+        check("组合：亏穿的那条只贡献 0",
+              abs(float(cb.equity.iloc[-1]) / 1e5 - 1.0) < 1e-9,
+              f"期末 {float(cb.equity.iloc[-1]):,.0f}")
+        check("组合：最大回撤不会超过 -100%",
+              float(cb.metrics["max_dd"]) >= -1.0,
+              str(cb.metrics["max_dd"]))
+        check("组合：报出亏光的成分个数",
+              int(cb.metrics.get("n_wiped") or 0) == 1,
+              str(cb.metrics.get("n_wiped")))
+        # 亏穿之后又「赚回来」是负现金账户的假象，不能让它复活
+        bounce = pd.Series([1e5, 5e4, -1e4, 3e4, 8e4], index=idx2[:5])
+        rb = Result(equity=bounce, position=pd.Series(1.0, index=idx2[:5]),
+                    trades=[], metrics={}, label="亏穿又回来")
+        cb2 = combine([rb], label="单条")
+        got = [round(float(v) / 1e5, 4) for v in cb2.equity]
+        check("组合：亏穿之后即使净值为正也不再复活",
+              got == [1.0, 0.5, 0.0, 0.0, 0.0], str(got))
     except Exception as exc:  # noqa: BLE001
         check("回测不强平", False, f"{type(exc).__name__}: {exc}")
 
@@ -5360,8 +5600,270 @@ def check_portfolio_params() -> None:
         cfgml = cfgf.clone(factor_mode="ml")
         stml = r.add(cfgml)
         r.enable(cfgml.sid, True)
-        check("因子实时：机器学习被拒绝并说明原因",
-              not stml.running and "机器学习" in stml.error, stml.error)
+        check("机器学习实时：可以启动，但先冻结等第一批信号",
+              stml.running and not stml.error and stml.ml_ready is False,
+              f"{stml.error} / ready={stml.ml_ready}")
+        # 后台算出来的信号要能被 tick 读到；算之前一律 None（调用方不许动仓）
+        mlcfg = {"window": 60, "horizon": 5, "entry_z": 1.0, "exit_z": 0.3,
+                 "model": "linear", "train_window": 120, "step": 40,
+                 "min_train": 200}
+        stml.cfg.factor_cfg = mlcfg
+        check("机器学习实时：没算出来之前 signal 为 None",
+              r._ml.signal("nope")[0] is None)
+        r._ml.submit("mtest", live, stml.cfg, ["mom_20", "rsi_14"])
+        got_ml = None
+        for _ in range(200):
+            got_ml, _age = r._ml.signal("mtest")
+            if got_ml is not None:
+                break
+            time.sleep(0.05)
+        check("机器学习实时：后台算出信号并缓存",
+              got_ml in (-1, 0, 1), f"{got_ml} / {r._ml.info('mtest')}")
+        r._ml.stop()
+
+        # ==================================================================
+        # 训练产物（.pkl）：实盘只预测，不重训
+        #
+        # 这一段锁死的正是用户提的两条要求：
+        #   「把预先训练的每个 .pkl 落地成文件，实盘时候就滚动调用这些 .pkl」
+        #   「只要保证用到最后一个 .pkl 模型的数据出来的结果是一样的就 ok」
+        #
+        # 所以下面两件事必须被断言住，改坏了要立刻红：
+        #   1. 每一折都落成一个独立文件，实时按 bar 时间戳查到哪折就调哪折
+        #   2. 实盘快路径算出的信号 / 分数，和回测**逐位一致**
+        # ==================================================================
+        from ttrade import ml_artifact as MLA
+        from ttrade.strategy_runner import GROUP_SEP
+
+        art_sid = f"selftest_ml{GROUP_SEP}RB_SHFE"
+        mlcfg2 = {"window": 60, "horizon": 5, "entry_z": 1.0, "exit_z": 0.3,
+                  "model": "linear", "train_window": 120, "step": 40,
+                  "min_train": 200}
+        fcfg2 = replay.factor_config(mlcfg2)
+        keys2 = ["mom_20", "rsi_14"]
+        art, fset = MLA.train_fold_set(live, art_sid, fcfg2, keys2,
+                                       name="自检", symbol="RB", exchange="SHFE",
+                                       period="1h")
+        check("训练产物：至少训出几折", art.folds >= 2, f"folds={art.folds}")
+        check("训练产物：每一折落成一个独立 .pkl",
+              len(fset.folds) == art.folds
+              and all(os.path.exists(MLA.fold_path(art_sid, fa.index))
+                      for fa in fset.folds),
+              f"{len(fset.folds)} 折")
+        check("训练产物：主产物单独存一份",
+              os.path.exists(MLA.artifact_path(art_sid)),
+              os.path.basename(MLA.artifact_path(art_sid)))
+        # 子槽位 sid 里的分隔符要编码，不能直接删 —— 否则 RB_SHFE 和 RBSHFE 会撞
+        check("训练产物：文件名可逆不撞名",
+              MLA._sid_to_name(f"a{GROUP_SEP}RB_SHFE") != MLA._sid_to_name("aRBSHFE"),
+              MLA._sid_to_name(f"a{GROUP_SEP}RB_SHFE"))
+
+        # 折清单：每折记了它负责预测的时间区间，实盘按时间戳查
+        fs2 = MLA.FoldSet.load(art_sid)
+        check("训练产物：折清单能读回来",
+              len(fs2.folds) == art.folds and fs2.master is not None,
+              f"{len(fs2.folds)} 折")
+        # 每折的区间都查得到自己 —— 区间是右开的 [t_from, t_to)
+        hit_ok = all(fs2.fold_for(fa.t_from) is not None for fa in fs2.folds)
+        check("训练产物：按时间戳能查到该折", hit_ok,
+              str([(f.t_from, f.t_to) for f in fs2.folds[:3]]))
+        # 相邻折不重叠：折 N 的终点应该正好是折 N+1 的起点
+        seq_ok = all(fs2.folds[i].t_to == fs2.folds[i + 1].t_from
+                     for i in range(len(fs2.folds) - 1))
+        check("训练产物：相邻折首尾相接不重叠", seq_ok,
+              str([(f.t_from, f.t_to) for f in fs2.folds[:3]]))
+        # 末折是开口的（t_to 为空）→ 新 bar 落在末折，就是「当前最新模型」
+        last_f = fs2.last_fold()
+        future = fs2.fold_for("2999-01-01 09:00:00")
+        check("训练产物：末折开口，新 bar 落到最后一折",
+              last_f is not None and last_f.t_to == ""
+              and future is not None and future.index == last_f.index,
+              f"last={last_f.index if last_f else None} "
+              f"hit={future.index if future else None}")
+
+        # 延迟加载：清单加载时模型是 None，用到才从文件里读
+        lf = fs2.last_fold()
+        lf.model = None
+        check("训练产物：折模型能延迟加载",
+              fs2.ensure_loaded(lf) and getattr(lf, "model", None) is not None, "")
+
+        # ---- 核心：实盘只预测 vs 回测，结果必须一致 ----
+        out2 = fstrat.run_factor_strategy(live, "ml", keys2, fcfg2)
+        want_sig = int(out2.df["signal"].iloc[-1])
+        want_score = (float(out2.df["factor_score"].iloc[-1])
+                      if "factor_score" in out2.df else float("nan"))
+        pred2, why2 = MLA.load_for_live(art_sid, fcfg2, keys2)
+        check("训练产物：实盘能加载产物", pred2 is not None and why2 == "", why2)
+        if pred2 is not None:
+            got2 = pred2.predict(live)
+            check("训练产物：实盘只预测，信号与回测一致",
+                  bool(got2.get("ok")) and int(got2.get("signal", 0)) == want_sig,
+                  f"{got2.get('signal')} vs {want_sig} / {got2.get('error')}")
+            if np.isfinite(want_score):
+                check("训练产物：实盘只预测，分数与回测一致",
+                      abs(float(got2.get("score", float('nan'))) - want_score) < 1e-6,
+                      f"{got2.get('score')} vs {want_score}")
+            # 同一根 bar 再算一次，结果不能变（不能重复推进状态机）
+            got3 = pred2.predict(live)
+            check("训练产物：同一根 bar 重复预测结果不变",
+                  int(got3.get("signal", 0)) == int(got2.get("signal", 0))
+                  and abs(float(got3.get("score", 0.0))
+                          - float(got2.get("score", 0.0))) < 1e-12,
+                  f"{got3.get('score')} vs {got2.get('score')}")
+
+        # ---- 错配校验：改了配置 / 换了因子 / 换模型类型，都必须拒掉 ----
+        bad_keys = MLA.load_for_live(art_sid, fcfg2, ["mom_20", "atr_14"])
+        check("训练产物：因子集换了要拒掉",
+              bad_keys[0] is None and "因子集" in bad_keys[1], bad_keys[1])
+        bad_model = replay.factor_config({**mlcfg2, "model": "gpr"})
+        bad2 = MLA.load_for_live(art_sid, bad_model, keys2)
+        check("训练产物：模型类型换了要拒掉",
+              bad2[0] is None and "模型类型" in bad2[1], bad2[1])
+        bad_cfg = replay.factor_config({**mlcfg2, "entry_z": 2.0})
+        bad3 = MLA.load_for_live(art_sid, bad_cfg, keys2)
+        check("训练产物：配置改了要拒掉",
+              bad3[0] is None and "配置" in bad3[1], bad3[1])
+        check("训练产物：没有产物时给出原因",
+              MLA.load_for_live("根本没这个sid", fcfg2, keys2)[0] is None, "")
+
+        # 引擎能按子槽位 sid 找到产物（多品种实盘的接线点）
+        slot_sid = f"{cfgml.sid}{GROUP_SEP}RB_SHFE"
+        slot_art, _fs = MLA.train_fold_set(live, slot_sid, fcfg2, keys2,
+                                            symbol="RB", exchange="SHFE")
+        p_slot, w_slot = MLA.load_for_live(slot_sid, fcfg2, keys2)
+        check("训练产物：引擎按子槽位 sid 找得到产物",
+              p_slot is not None and w_slot == "",
+              f"{w_slot} / {os.path.basename(MLA.artifact_path(slot_sid))}")
+
+        # 引擎取预测器的路径不能抛异常。
+        # 之前这里写的是 `with self._lock:`，而 `_lock` 只存在于 `MlSignals`
+        # 身上 —— `PortfolioRunner` 没有这个属性，于是**每一次**取预测器都
+        # AttributeError，实盘一启动就炸。这条断言就是钉住它。
+        #
+        # 注意要拿**机器学习**的槽位去探：`_predictor_for` 对非 ML 策略会在
+        # 碰到 `self._lock` 之前就 return None，拿普通因子策略去探根本走不到
+        # 那行 —— 断言看着通过，其实没测到东西。
+        try:
+            pr_probe = r._predictor_for(stml)
+            pr_ok = pr_probe is None or hasattr(pr_probe, "predict")
+        except Exception as exc:  # noqa: BLE001
+            pr_ok = False
+            pr_probe = f"{type(exc).__name__}: {exc}"
+        check("训练产物：引擎取预测器不抛异常", pr_ok, str(pr_probe)[:120])
+
+        # 清理产物，别把自检文件留在用户目录里
+        MLA.FoldSet.load(art_sid).remove()
+        MLA.FoldSet.load(slot_sid).remove()
+        check("训练产物：清理干净",
+              not os.path.exists(MLA.artifact_path(art_sid))
+              and not os.path.exists(MLA.artifact_path(slot_sid)), "")
+
+        # 多品种：引擎把它拆成「一个品种一个槽位」，各自订阅、各自记账。
+        # 资金按品种数均分 —— 不拆的话 3 个品种各按 30% 满仓，敞口是配置的 3 倍
+        cfgm = cfgf.clone(multi_symbols=["RB_SHFE", "I_DCE", "CU_SHFE"])
+        stm = r.add(cfgm)
+        kids = r._groups.get(cfgm.sid) or []
+        check("多品种实时：拆成一个品种一个槽位",
+              len(kids) == 3 and all(k in r._slots for k in kids), str(kids))
+        check("多品种实时：每个品种一份本金",
+              all(abs(r._slots[k].cfg.principal - cfgm.principal / 3) < 1.0
+                  for k in kids),
+              str([round(r._slots[k].cfg.principal) for k in kids]))
+        check("多品种实时：子槽位品种各不相同",
+              len({r._slots[k].cfg.key() for k in kids}) == 3,
+              str([r._slots[k].cfg.key() for k in kids]))
+        # **子槽位的 sid 必须和产物文件名对得上** —— 这是「实盘滚动调用这些
+        # .pkl」的接线点。子槽位 sid 是 `父sid#品种_交易所`（`GROUP_SEP`），
+        # 产物文件名把它编码成 `父sid__H__品种_交易所`。两边的编码必须一致，
+        # 否则引擎永远找不到产物 —— 表现是「明明训过了，实盘还在后台重训」。
+        kid_sids = [r._slots[k].cfg.sid for k in kids]
+        check("多品种实时：子槽位 sid 用分隔符拼品种",
+              all(GROUP_SEP in s and s.startswith(cfgm.sid) for s in kid_sids),
+              str(kid_sids))
+        check("多品种实时：子槽位 sid 与产物文件名一一对应",
+              all(MLA._sid_to_name(s) + ".pkl" ==
+                  os.path.basename(MLA.artifact_path(s)) for s in kid_sids),
+              str([MLA._sid_to_name(s) for s in kid_sids]))
+        # 引擎按子槽位 sid 真能加载到产物（不是只对得上名字，是真加载得出来）
+        # 注意 **因子键要和训练时一致** —— 产物校验会比对因子集，多一个少一个
+        # 都会拒掉（那是对的：模型输入维度对不上）。
+        cfgml_m = cfgml.clone(factor_mode="ml")
+        cfgml_m.factor_cfg = mlcfg2
+        cfgml_m.factor_keys = list(keys2)
+        cfgml_m.multi_symbols = ["RB_SHFE", "I_DCE", "CU_SHFE"]
+        MLA.train_fold_set(live, f"{cfgml_m.sid}{GROUP_SEP}RB_SHFE", fcfg2,
+                           keys2, symbol="RB", exchange="SHFE")
+        stm_m = r.add(cfgml_m)
+        kids_m = r._groups.get(cfgml_m.sid) or []
+        got_pred = 0
+        why_m = ""
+        for k in kids_m:
+            try:
+                pr = r._predictor_for(r._slots[k])
+                if pr is not None:
+                    got_pred += 1
+                elif not why_m:
+                    why_m = MLA.load_for_live(
+                        r._slots[k].cfg.sid,
+                        replay.factor_config(r._slots[k].cfg.factor_cfg or {}),
+                        list(r._slots[k].cfg.factor_keys or []))[1]
+            except Exception as exc:  # noqa: BLE001
+                why_m = f"{type(exc).__name__}: {exc}"
+        check("多品种实时：引擎能给子槽位加载到产物",
+              got_pred >= 1, f"{got_pred}/{len(kids_m)} 个子槽位拿到产物 / {why_m}")
+        MLA.FoldSet.load(f"{cfgml_m.sid}{GROUP_SEP}RB_SHFE").remove()
+        r.remove(cfgml_m.sid)
+
+        # **两条 ML 策略跑同一个品种同一周期，但 sid 不同** —— 产物是按 sid 存的，
+        # 预测器缓存也必须按 sid 存。之前缓存用的是 `_skey()`（品种_交易所@周期），
+        # 于是先来的那条把「没有产物」缓存下来，后来的那条 60 秒内被判死 ——
+        # 明明产物在，引擎却说没有，只能退回后台重训。
+        # 这条断言要摆出「前一条没产物、后一条有产物」这个顺序。
+        cfgml_a = cfgml.clone(factor_mode="ml")
+        cfgml_a.factor_cfg = mlcfg2
+        cfgml_a.factor_keys = list(keys2)
+        cfgml_a.multi_symbols = []
+        cfgml_a.symbol = "RB"
+        cfgml_a.exchange = "SHFE"
+        stm_a = r.add(cfgml_a)
+        # 先探一次「没有产物」那条 —— 把 miss 缓存写进去
+        r._predictor_for(stm_a)
+        cfgml_b = cfgml.clone(factor_mode="ml")
+        cfgml_b.factor_cfg = mlcfg2
+        cfgml_b.factor_keys = list(keys2)
+        cfgml_b.multi_symbols = []
+        cfgml_b.symbol = "RB"
+        cfgml_b.exchange = "SHFE"
+        MLA.train_fold_set(live, cfgml_b.sid, fcfg2, keys2,
+                           symbol="RB", exchange="SHFE")
+        stm_b = r.add(cfgml_b)
+        pr_b = r._predictor_for(stm_b)
+        check("训练产物：同品种同周期的另一条策略不受影响",
+              pr_b is not None,
+              f"sid {cfgml_b.sid} 拿不到产物（被前一条的缓存挡住了？）")
+        MLA.FoldSet.load(cfgml_b.sid).remove()
+        r.remove(cfgml_a.sid)
+        r.remove(cfgml_b.sid)
+        r.enable(cfgm.sid, True)
+        check("多品种实时：启动时全部子槽位一起跑",
+              all(r._slots[k].running for k in kids),
+              str([r._slots[k].running for k in kids]))
+        snap = r.snapshot()
+        parent = next((s for s in snap["slots"] if s["sid"] == cfgm.sid), None)
+        check("多品种实时：快照里有一条父级汇总",
+              parent is not None and parent.get("multi") == 3, str(parent)[:80])
+        check("多品种实时：父级不汇总目标仓",
+              parent is not None and parent.get("target") is None,
+              str(parent.get("target") if parent else "-"))
+        check("多品种实时：父级状态跟着子槽位走",
+              parent is not None and parent.get("running") is True)
+        r.enable(cfgm.sid, False)
+        check("多品种实时：停止时全部子槽位一起停",
+              not any(r._slots[k].running for k in kids),
+              str([r._slots[k].running for k in kids]))
+        r.remove(cfgm.sid)
+        check("多品种实时：删掉父级会把子槽位一起清掉",
+              not any(k in r._slots for k in kids) and cfgm.sid not in r._groups)
 
         # 历史不够时不抛异常，先空仓等数据
         check("因子实时：历史不够时给 0 而不是崩",
@@ -5392,6 +5894,78 @@ def check_portfolio_params() -> None:
               cfg.rule_params == {"fast": 30, "slow": 101} and cfg.range_years == 3.0,
               f"{cfg.rule_params} / {cfg.range_years}")
         dlg.deleteLater()
+
+        # ---- 多品种设置 ----
+        # 以前品种只能在研究页定，进了组合就改不了；存盘里 78 个品种、列表里
+        # 显示的却是第一个。这几条守住「列表写 N 个品种、设置框能改、改了能存」
+        from gui.portfolio_page import _sym_text, _sym_tip
+
+        univ = [
+            {"key": "RB_SHFE", "label": "RB 螺纹钢", "symbol": "RB",
+             "name": "螺纹钢", "exchange": "SHFE"},
+            {"key": "I_DCE", "label": "I 铁矿石", "symbol": "I",
+             "name": "铁矿石", "exchange": "DCE"},
+            {"key": "CU_SHFE", "label": "CU 铜", "symbol": "CU",
+             "name": "铜", "exchange": "SHFE"},
+        ]
+        cm = St.StrategyConfig(symbol="RB", exchange="SHFE", rule_key="ma_cross",
+                               multi_symbols=["RB_SHFE", "I_DCE"])
+        check("多品种：列表写「N 个品种」而不是第一个",
+              _sym_text(cm).startswith("2 个品种"), _sym_text(cm))
+        check("多品种：悬停能看到清单",
+              "RB_SHFE" in _sym_tip(cm) and "I_DCE" in _sym_tip(cm), _sym_tip(cm))
+        check("单品种：列表还是「品种 周期」",
+              _sym_text(St.StrategyConfig(symbol="RB", exchange="SHFE")) == "RB_SHFE 1d")
+
+        dm = EditDialog(cm, ["默认"], universe=univ)
+        check("多品种：设置框回填已勾品种",
+              set(dm.pick.selected()) == {"RB_SHFE", "I_DCE"}, str(dm.pick.selected()))
+        check("多品种：小字说明写清了「实盘会拆槽位」",
+              "槽位" in dm.lbl_pick.text() and "1/n" in dm.lbl_pick.text(),
+              dm.lbl_pick.text())
+        dm.pick.set_selected(["CU_SHFE", "I_DCE", "RB_SHFE"])
+        dm._sync_pick()
+        dm.apply_to(cm)
+        check("多品种：勾选写回 multi_symbols",
+              set(cm.multi_symbols) == {"CU_SHFE", "I_DCE", "RB_SHFE"},
+              str(cm.multi_symbols))
+        dm.pick.set_selected(["CU_SHFE"])
+        dm.apply_to(cm)
+        check("多品种：只勾一个就退回单品种",
+              cm.multi_symbols == [] and cm.key() == "CU_SHFE",
+              f"{cm.multi_symbols} / {cm.key()}")
+        check("多品种：退回单品种后 symbols 跟着走",
+              cm.symbols == ["CU_SHFE"], str(cm.symbols))
+        dm.deleteLater()
+
+        # A 股的键自带交易所前缀，拆错会把 symbol 变成「600000」或
+        # exchange 变成「SSE.600000」
+        cs = St.StrategyConfig(symbol="600000", exchange="SSE", family="factor")
+        ds = EditDialog(cs, ["默认"], universe=[
+            {"key": "SSE.600000", "label": "浦发银行", "symbol": "600000",
+             "name": "浦发银行", "exchange": "SSE"}])
+        ds.apply_to(cs)
+        check("多品种：A 股改品种后 key 不变",
+              cs.key() == "SSE.600000" and cs.exchange == "SSE",
+              f"{cs.symbol} / {cs.exchange}")
+        ds.deleteLater()
+
+        # 截面族的品种池在研究页管，这里不该再给一个会打架的入口
+        cc = St.StrategyConfig(symbol="RB", exchange="SHFE", family="cross",
+                               cross_symbols=["RB_SHFE", "I_DCE", "CU_SHFE"])
+        dc = EditDialog(cc, ["默认"], universe=univ)
+        check("多品种：截面策略不显示品种勾选", dc.pick is None)
+        dc.deleteLater()
+
+        # 本地库里没有这个品种（换机器 / 只下了一部分）时，开一次设置框
+        # 不能把品种抹掉
+        cz = St.StrategyConfig(symbol="RB", exchange="SHFE",
+                               multi_symbols=["RB_SHFE", "I_DCE"])
+        dz = EditDialog(cz, ["默认"], universe=[])
+        dz.apply_to(cz)
+        check("多品种：没接品种清单时保持原样",
+              cz.symbols == ["RB_SHFE", "I_DCE"], str(cz.symbols))
+        dz.deleteLater()
     except Exception as exc:  # noqa: BLE001
         check("设置参数对话框", False, f"{type(exc).__name__}: {exc}")
 

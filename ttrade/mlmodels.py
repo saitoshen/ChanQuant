@@ -282,7 +282,34 @@ class BaseModel:
 
 # ================================================================== 树模型
 class LGBMModel(BaseModel):
-    """LightGBM。小样本上刻意压低复杂度：叶子少、叶子样本数高、强正则。"""
+    """LightGBM。小样本上刻意压低复杂度：叶子少、叶子样本数高、强正则。
+
+    ## 为什么要按标签量纲缩放正则
+
+    L1 / L2 正则对叶子权重是**绝对值**惩罚：`reg_alpha=0.1` 意味着每个叶子
+    权重都要先交 0.1 的「过路费」。但这里的标签是**前向收益**，量级只有
+    1e-3 ~ 1e-2（SA 那个折的标准差是 4.9e-3）。
+
+    于是出现了一个很荒谬的局面：**任何分裂带来的收益都交不起过路费**。
+    LightGBM 老老实实地算完，发现劈开还不如不劈，就只留一棵单叶树 ——
+    那棵树是个常数预测器。
+
+    实测（SA 最后一折，54 个触发样本，42 个因子）：
+    - `reg_alpha=0.1` → 1 棵树、0 个分裂、预测恒定
+    - `reg_alpha=0.0` → 200 棵树、200 个分裂、预测有 54 个不同取值
+    - 而且这些因子和标签的相关系数最高到 -0.39，**信号明明在**
+
+    常数预测器看着像「训好了」，实盘却会炸：预测值恒定 → 滚动 z 的标准差
+    是 0 → z 分数永远是 NaN → 报「z 分数算不出来（历史预测不够）」，
+    而且从产物文件上看不出任何异常（特征重要度还在，因为树确实存在）。
+
+    所以这里的正则按**标签标准差**缩放：量纲小的时候把正则按比例压下去，
+    让「劈开值不值」回到一个和标签同量级的比较里。样本多的时候仍用原来的
+    保守配置（标签量纲一样时缩放系数接近 1）。
+
+    `min_child_samples` 也按样本量收缩：几十个样本的折用 40 的下限，
+    父节点要 80 个才够劈成两半，必然劈不开。
+    """
 
     name = "lightgbm"
 
@@ -292,23 +319,57 @@ class LGBMModel(BaseModel):
         self._m = None
         self._imp = None
 
+    def _params(self, n_samples: int, y: np.ndarray | None = None) -> dict:
+        """按样本量和标签量纲给一组能真的分裂的参数。"""
+        # 叶子最小样本数：样本少就往下压，但至少留 5 —— 再少就全是噪声叶子
+        min_child = 40 if n_samples >= 400 else max(5, int(n_samples * 0.05))
+        # 叶子数：要能装下 min_child 的约束，`n_samples / min_child` 的一半左右
+        leaves = 15 if n_samples >= 400 else max(2, min(15, n_samples // max(min_child, 1)))
+        # ---- 正则按标签量纲缩放 ----
+        # L2（reg_lambda）是二次惩罚，权重量级小的时候它跟着变小，永远不会
+        # 把分裂掐死 —— 实测 lam 从 0 到 10 都能正常分裂。
+        # L1（reg_alpha）是**绝对值**惩罚：每个叶子权重要先交 0.1 的过路费。
+        # 标签是前向收益，量级只有 1e-3 ~ 1e-2，于是「劈开」的收益永远交不
+        # 起过路费，LightGBM 索性放弃分裂，只留一棵单叶树 —— 常数预测器。
+        #
+        # 所以 L1 的系数要压到「标签标准差的百分之几」这个量级：绝对值看着
+        # 大，但相对标签还是小的，分裂的收益就盖得过它。
+        lam_scale = 1.0
+        alpha = 0.1
+        if y is not None and len(y) > 1:
+            sd = float(np.std(np.asarray(y, dtype=float)))
+            if np.isfinite(sd) and sd > 0:
+                # L1 系数取「标签标准差的 1%」和原值里小的那个。
+                # sd=1e-2 → 1e-4（远小于 0.1，放行）；sd=5e-3 → 5e-5。
+                lam_scale = float(np.clip(sd / 1e-2, 0.02, 1.0))
+                alpha = min(0.1, sd * 0.01)
+        # 小样本不开 bagging：每棵树扔 20% 的样本，几十行的折就再也劈不开了
+        bag = 0.8 if n_samples >= 400 else 1.0
+        return {
+            "min_child_samples": int(min_child),
+            "num_leaves": int(leaves),
+            "subsample": float(bag),
+            "subsample_freq": 1 if bag < 1.0 else 0,
+            "reg_lambda": float(2.0 * lam_scale),
+            "reg_alpha": float(alpha),
+        }
+
     def fit(self, X, y):
         import lightgbm as lgb
 
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        n = int(X.shape[0]) if X.ndim == 2 else 0
+        prm = self._params(n, y)
         self._m = lgb.LGBMRegressor(
             n_estimators=self.n_estimators,
             learning_rate=0.05,
-            num_leaves=15,
             max_depth=4,
-            min_child_samples=40,
-            subsample=0.8,
-            subsample_freq=1,
             colsample_bytree=0.8,
-            reg_lambda=2.0,
-            reg_alpha=0.1,
             random_state=self.seed,
             n_jobs=1,
             verbose=-1,
+            **prm,
         )
         self._m.fit(X, y)
         self._imp = np.asarray(self._m.feature_importances_, dtype=float)
@@ -322,7 +383,12 @@ class LGBMModel(BaseModel):
 
 
 class XGBModel(BaseModel):
-    """XGBoost。与 LightGBM 同族但分裂方式不同，可做模型对比。"""
+    """XGBoost。与 LightGBM 同族但分裂方式不同，可做模型对比。
+
+    正则按**标签量纲**缩放、`min_child_weight` 按样本量收缩，理由见
+    `LGBMModel` 的说明 —— 固定值会让小样本折训出单叶树（常数预测器），
+    实盘表现为「z 分数算不出来（历史预测不够）」。
+    """
 
     name = "xgboost"
 
@@ -335,19 +401,35 @@ class XGBModel(BaseModel):
     def fit(self, X, y):
         import xgboost as xgb
 
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        n = int(X.shape[0]) if X.ndim == 2 else 0
+        # 权重下限：样本少就往下压，但至少留 1
+        min_child = 20 if n >= 400 else max(1, int(n * 0.05))
+        # 正则按标签量纲缩放（理由见 `LGBMModel`）：
+        # L2 不会掐死分裂，L1 会 —— 标签量级只有 1e-3 时绝对惩罚太大。
+        lam_scale = 1.0
+        alpha = 0.1
+        if len(y) > 1:
+            sd = float(np.std(y))
+            if np.isfinite(sd) and sd > 0:
+                lam_scale = float(np.clip(sd / 1e-2, 0.02, 1.0))
+                alpha = min(0.1, sd * 0.01)
+        # 小样本不开 row sampling，理由见 `LGBMModel` 的说明
+        sub = 0.8 if n >= 400 else 1.0
         self._m = xgb.XGBRegressor(
             n_estimators=self.n_estimators,
             learning_rate=0.05,
             max_depth=3,
-            min_child_weight=20,
-            subsample=0.8,
             colsample_bytree=0.8,
-            reg_lambda=2.0,
-            reg_alpha=0.1,
+            reg_lambda=float(2.0 * lam_scale),
+            reg_alpha=float(alpha),
             random_state=self.seed,
             n_jobs=1,
             verbosity=0,
             tree_method="hist",
+            min_child_weight=float(min_child),
+            subsample=float(sub),
         )
         self._m.fit(X, y)
         self._imp = np.asarray(self._m.feature_importances_, dtype=float)

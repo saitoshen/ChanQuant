@@ -143,6 +143,13 @@ class StrategyConfig:
     exchange: str = ""
     period: str = "1d"
 
+    # ---- 多品种回测的品种清单（规则 / 因子族用）----
+    # `symbol` / `exchange` 只记「当前在看的那个」，多品种勾选是另一件事。
+    # 以前只存了单品种，于是「存一条跑 78 个品种的策略」再打开就变回 1 个品种，
+    # 曲线当然对不上 —— 存盘必须把这批勾选一起带上。
+    # 截面族早期用的是 `cross_symbols`（同一份东西的旧名字），保留兼容。
+    multi_symbols: list = field(default_factory=list)
+
     # rule / factor
     family: str = "rule"
 
@@ -184,6 +191,10 @@ class StrategyConfig:
     cross_pool_keys: list = field(default_factory=list)
     cross_pool_reverse: dict = field(default_factory=dict)
     cross_pool_pct: float = 60.0        # 池里保留分数最高的百分之几
+    # 第一步（排名 + 筛池）用哪个周期的因子。空 = 跟随策略周期。
+    # 5 分钟策略用日线成交额筛池是常见用法，存盘必须带上 —— 只存因子不存周期，
+    # 重开一次就悄悄变回「5 分钟成交额」，同一份配置跑出两个结果
+    cross_step1_period: str = ""
     # 截面 ML 的标签口径：excess / volret / rank / volret_rank
     cross_label_mode: str = "volret"
 
@@ -286,7 +297,35 @@ class StrategyConfig:
             # 截面策略没有「一个品种」可言：`key()` 只是品种池里的第一个，
             # 拿它拼标题会让人以为这条策略只交易那一个
             return self.strategy_label()
+        n = len(self.symbols or [])
+        if n >= 2:
+            # 多品种：写「78 个品种」而不是其中某一个 —— 只写第一个会让人以为
+            # 这条策略只跑那一个，而存盘里明明有 78 个
+            return f"{n} 个品种 · {self.strategy_label()}"
         return f"{self.key()} · {self.strategy_label()}"
+
+    @property
+    def symbols(self) -> list:
+        """这条策略实际要跑的品种清单。
+
+        `multi_symbols` 优先。它之前只有 `cross_symbols` 一个字段 —— 名字叫截面，
+        但记的**不是**「截面专用的池子」，而是「勾选面板里当前选中的所有品种」
+        （`_current_config` 从 v1.7.0 起就无条件写它，哪个策略族都写）。所以对
+        规则 / 因子族的老配置，那份清单同样有效，不能当成残留丢掉 —— 丢掉的话
+        库里 19 个品种的策略一加载就变回单品种，再存一遍就把 19 个彻底覆盖掉了。
+
+        两个都是空的才是单品种，用 `key()` 那一个。
+        """
+        got = [s for s in (self.multi_symbols or []) if s]
+        if not got:
+            # 老字段只在**真的是一批品种**时才认（≥2）。只勾过一个的老条目不算
+            # 多品种 —— 拿那一个替换 `key()` 等于悄悄换了标的，宁可维持原样
+            legacy = [s for s in (self.cross_symbols or []) if s]
+            got = legacy if len(legacy) >= 2 else []
+        if got:
+            return got
+        k = self.key()
+        return [k] if k else []
 
     def strategy_label(self) -> str:
         """策略的可读名。规则策略直接查表，因子策略拼模式和因子数。"""
@@ -425,9 +464,16 @@ class StrategyConfig:
             cfg.factor_keys = []
         # 截面策略那组字段同样要消毒：手改 JSON 写成字符串 / 0 / 负数时不能让
         # 回测直接除零或者永远不调仓
-        for f in ("cross_symbols", "timing_factor_keys"):
+        for f in ("cross_symbols", "multi_symbols", "timing_factor_keys"):
             if not isinstance(getattr(cfg, f), list):
                 setattr(cfg, f, [])
+        # ---- 老配置的多品种清单搬家 ----
+        # v2.5.7 之前「多品种勾选」只有一个落脚点 `cross_symbols`（名字带 cross，
+        # 但 `_current_config` 无条件写它，规则 / 因子族也在用）。读的时候搬进
+        # `multi_symbols`：库里那些「19 个品种」的老条目一加载就是多品种，再存
+        # 一遍写在新字段上，用户不用重新勾一遍 19 个
+        if not cfg.multi_symbols and len(cfg.cross_symbols) >= 2:
+            cfg.multi_symbols = list(cfg.cross_symbols)
         for f in ("timing_rule_params", "timing_factor_reverse", "timing_factor_cfg"):
             if not isinstance(getattr(cfg, f), dict):
                 setattr(cfg, f, {})

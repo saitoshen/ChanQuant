@@ -508,6 +508,8 @@ def combine(results: list[Result], label: str = "组合",
     curves: list[pd.Series] = []
     poss: list[pd.Series] = []
     trades: list[Trade] = []
+    # 亏穿的成分个数（见下面那条 `wiped` 的处理）
+    blown = 0
     # 各成分的成本占自己初始权益的比例。组合曲线是「各自归一化后取均值 × 初始
     # 资金」，每条成分在组合里占 1/n，所以它的成本也要按这个份额折 —— 直接把
     # 金额加起来是错的：一条 10 万本金的策略和一条 100 万的，成本差十倍不代表
@@ -520,7 +522,24 @@ def combine(results: list[Result], label: str = "组合",
         eq = _to_daily(r.equity)
         if len(eq) < 2:
             continue
-        curves.append(eq / float(eq.iloc[0]))
+        curve = eq / float(eq.iloc[0])
+        # ---- 亏穿的成分按「份额归零」算，不是按负净值算
+        #
+        # 单品种回测**故意不强平**（见 `check_no_blowup`）：杠杆比实盘敢开的大，
+        # 强平掉会把后半段历史抹掉，留着负净值才能看清这条路到底怎么死的。
+        # 但那是「一个账户自己的事」。等权组合是**净值曲线取平均**，一条 -3.5 的
+        # 曲线进去，等于说这个品种倒欠 3.5 份本金 —— 现实里它到 0 就被强平了，
+        # 不可能接着亏。用户报过的现象就是这么来的：78 个品种里 20 个转负，
+        # 组合被拖到 -47%、最大回撤 -133%、夏普一起失去意义。
+        #
+        # 所以这里一次性钉死：跌破 0 那根起，这条成分的份额就是 0（本金亏光），
+        # 之后即使「负现金」又赚回来也不复活 —— 那笔钱已经不存在了
+        wiped = curve.index[curve.to_numpy() <= 0]
+        if len(wiped):
+            curve = curve.copy()
+            curve.loc[wiped[0]:] = 0.0
+            blown += 1
+        curves.append(curve)
         poss.append(_to_daily(r.position))
         trades += list(r.trades)
         base = float(eq.iloc[0])
@@ -554,6 +573,9 @@ def combine(results: list[Result], label: str = "组合",
         if notional_pcts else 0.0
     m["notional"] = float(total_notional)
     m["cost_rate"] = float(total_cost / total_notional) if total_notional > 0 else 0.0
+    # 亏光的成分个数：等权组合看到 -47% 时，用户需要知道是「20 个品种本金亏光」
+    # 还是「每个都亏一点」，这两种情况的处理方式完全不同
+    m["n_wiped"] = float(blown)
     return Result(equity=eq, position=pos, trades=trades, metrics=m, label=label)
 
 

@@ -529,6 +529,77 @@ def _run() -> tuple[bool, list[str]]:
 
     check("机器学习多品种任务", _ml_multi)
 
+    def _ml_artifact():
+        """训练产物：每一折落一个 .pkl，实盘只预测的结果和回测**一致**。
+
+        这一条是「实盘滚动调用这些 .pkl」的验收。三个要点：
+        1. 每一折真的落成独立文件（不是只存最后一个）
+        2. 实盘加载产物后算出的信号 / 分数和回测一样
+        3. 产物目录在**用户可写**目录里 —— 打包后 `bundle_root()` 是只读的，
+           落那儿等于写不进去
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factor_strategy as FS
+        from ttrade import ml_artifact as MLA
+
+        n = 700
+        idx = pd.date_range("2020-01-01", periods=n, freq="B")
+        r = (np.sin(np.arange(n) / 25.0) * 0.01
+             + np.random.default_rng(3).normal(0, 0.004, n))
+        close = pd.Series(100 * np.exp(np.cumsum(r)), index=idx)
+        open_ = close * (1 + 0.001 * np.sin(np.arange(n) / 3.0))
+        df = pd.DataFrame({
+            "open": open_,
+            "high": np.maximum(open_, close) * 1.005,
+            "low": np.minimum(open_, close) * 0.995,
+            "close": close, "volume": 1e5,
+        })
+        cfg = FS.FactorConfig(model="linear", window=60, horizon=1,
+                              train_window=200, step=60, min_train=120)
+        keys = ["mom_20", "mom_60", "ma_gap_20"]
+        sid = "__selftest_ml#RB_SHFE"
+        try:
+            art, fset = MLA.train_fold_set(df, sid, cfg, keys,
+                                           symbol="RB", exchange="SHFE")
+            if len(fset.folds) < 2:
+                raise RuntimeError(f"只训出 {len(fset.folds)} 折，没法验「滚动调用」")
+            for fa in fset.folds:
+                if not os.path.exists(MLA.fold_path(sid, fa.index)):
+                    raise RuntimeError(f"第 {fa.index} 折没落成独立文件")
+            # 产物目录必须可写（打包后 bundle_root 是只读的）
+            adir = MLA.artifact_dir()
+            if not os.path.isdir(adir) or not os.access(adir, os.W_OK):
+                raise RuntimeError(f"产物目录不可写：{adir}")
+
+            pred, why = MLA.load_for_live(sid, cfg, keys)
+            if pred is None:
+                raise RuntimeError(f"产物加载不了：{why}")
+            got = pred.predict(df)
+            if not got.get("ok"):
+                raise RuntimeError(f"实盘只预测算不出来：{got.get('error')}")
+
+            out = FS.run_factor_strategy(df, "ml", keys, cfg)
+            want_sig = int(out.df["signal"].iloc[-1])
+            want_score = float(out.df["factor_score"].iloc[-1])
+            if int(got["signal"]) != want_sig:
+                raise RuntimeError(
+                    f"实盘信号 {got['signal']} 和回测 {want_sig} 不一样")
+            if not np.isfinite(want_score) or \
+                    abs(float(got["score"]) - want_score) > 1e-6:
+                raise RuntimeError(
+                    f"实盘分数 {got['score']} 和回测 {want_score} 不一样")
+            return (f"{len(fset.folds)} 折各一个 .pkl，"
+                    f"信号 {int(got['signal'])} / 分数 {float(got['score']):.6f} 与回测一致")
+        finally:
+            try:
+                MLA.FoldSet.load(sid).remove()
+            except Exception:  # noqa: BLE001
+                pass
+
+    check("机器学习训练产物（.pkl 滚动调用）", _ml_artifact)
+
     def _ml_trigger():
         """触发模式（稀疏采样）的决策口径：观点 ffill、进场在触发点、出场看强度。
 
@@ -666,6 +737,206 @@ def _run() -> tuple[bool, list[str]]:
                 f"只用规则 {int((osig != 0).sum())} 根持仓")
 
     check("机器学习触发模式（稀疏采样）", _ml_trigger)
+
+    def _ml_degenerate():
+        """稀疏样本训出「常数模型」的兜底：不能出常数分数，也不能丢掉最后一折。
+
+        真实故障（SA / JM / PD / PT / SN / LH / BR 七个品种）：触发模式下
+        折内只剩 40~85 个样本，树模型劈不开 → 只训出一棵单叶树 → 预测恒定
+        → 滚动 z 的标准差是 0 → z 分数永远 NaN → 实盘报「z 分数算不出来
+        （历史预测不够）」，而且状态永远显示「机器学习训练中」。
+
+        真正的原因是 **L1 正则和标签量纲不匹配**：标签是前向收益（标准差
+        ~5e-3），而 `reg_alpha=0.1` 的绝对惩罚比任何分裂的收益都大，
+        LightGBM 于是放弃分裂。这里验三件事：
+
+        1. 小标签量纲 + 小样本，训出来的模型**不是**常数
+        2. walk-forward 不会因为常数模型把整折丢掉（最后一折丢了，
+           实盘那段时间就没有预测 → 还是算不出 z 分数）
+        3. 分数有方差（滚动 z 才算得出来）
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factor_strategy as FS
+        from ttrade import mlmodels as ML
+
+        # 1. 直接验模型层：小样本 + 极小量纲的标签，训出来必须有分裂
+        rng = np.random.default_rng(7)
+        Xs = rng.normal(size=(54, 42))
+        ys = Xs[:, 0] * 0.001 + rng.normal(scale=0.005, size=54)
+        mdl = ML.build("lightgbm")
+        mdl.fit(Xs, ys)
+        pr = np.asarray(mdl.predict(Xs), dtype=float)
+        if len(np.unique(np.round(pr, 12))) < 2:
+            raise RuntimeError(
+                f"小样本训出了常数模型（{len(np.unique(np.round(pr, 12)))} 个取值）")
+        if FS._is_degenerate_model(mdl, Xs[:64]):
+            raise RuntimeError("小样本模型被判成退化模型")
+
+        # 2. 走一遍 walk-forward：稀疏采样 + 小量纲标签，最后一折不能丢
+        n = 1200
+        idx = pd.date_range("2020-01-01", periods=n, freq="5min")
+        r = (np.sin(np.arange(n) / 25.0) * 0.01
+             + np.random.default_rng(11).normal(0, 0.004, n))
+        close = pd.Series(100 * np.exp(np.cumsum(r)), index=idx)
+        open_ = close * (1 + 0.001 * np.sin(np.arange(n) / 3.0))
+        df = pd.DataFrame({
+            "open": open_, "high": np.maximum(open_, close) * 1.005,
+            "low": np.minimum(open_, close) * 0.995,
+            "close": close, "volume": 1e5,
+        })
+        cfg = FS.FactorConfig(model="lightgbm", window=60, horizon=1,
+                              train_window=300, step=120, min_train=200,
+                              entry_z=1.0, exit_z=0.3, sample_mode="trigger",
+                              trigger_keys=["mom_20"], trigger_z=1.0,
+                              trigger_tiers=0, trigger_cool=3)
+        keys = ["mom_20", "mom_60", "ma_gap_20"]
+        stats: dict = {}
+        models: list = []
+        out = FS.run_factor_strategy(df, "ml", keys, cfg, collect_models=models)
+        pred = out.pack.pred.to_numpy(dtype=float)
+        fin = np.isfinite(pred)
+        if not fin.any():
+            raise RuntimeError("一个预测都没出来")
+        # 最后一折必须覆盖到最后（实盘就是在这段上跑）
+        gap = len(pred) - 1 - int(np.flatnonzero(fin)[-1])
+        if gap > 0:
+            raise RuntimeError(f"最后 {gap} 根没有预测（最后一折被丢了）")
+        # 尾部 252 根的预测不能恒定 —— 那正是实盘 z 缓冲的来源
+        tail = pred[-252:]
+        tailf = tail[np.isfinite(tail)]
+        if len(tailf) < 2 or len(np.unique(np.round(tailf, 12))) < 2:
+            raise RuntimeError("尾部预测是常数 —— 滚动 z 的标准差会是 0")
+        # 分数必须有方差
+        sc = out.pack.score.to_numpy(dtype=float)
+        scf = sc[np.isfinite(sc)]
+        if len(scf) < 2 or float(scf.std()) < 1e-6:
+            raise RuntimeError(f"分数没有方差（std={scf.std() if len(scf) else 0}）")
+
+        return (f"小样本模型 {len(np.unique(np.round(pr, 12)))} 个取值；"
+                f"{len(models)} 折，尾部预测覆盖完整，分数 std={scf.std():.3f}")
+
+    check("机器学习常数模型兜底（小样本不丢折）", _ml_degenerate)
+
+    def _ml_live_poll():
+        """机器学习实盘：信号在后台算完的那一刻，没有新 bar 也要能读到。
+
+        实盘信号走后台线程，`ml_ready` 之前 `tick()` 不动仓。而「同一根 bar 里
+        不重算」这条短路如果连**读缓存**也一起挡掉，收盘前最后一次计算就永远
+        读不到 —— 界面一直停在「计算中」，直到下一个交易时段。
+        """
+        import time as _t
+
+        import pandas as pd
+
+        from ttrade import strategy_runner as R
+        from ttrade import strategy_store as SStore
+
+        class _Ml:
+            def __init__(self):
+                self.out: dict = {}
+                self.err: dict = {}
+                self.submits: list = []
+
+            def submit(self, key, df, cfg, keys, predictor=None):
+                self.submits.append((key, predictor is not None))
+
+            def signal(self, key):
+                hit = self.out.get(key)
+                return (None, 0.0) if not hit else (int(hit), 1.0)
+
+            def error(self, key):
+                return str(self.err.get(key) or "")
+
+        idx = pd.date_range("2026-11-03 20:00", periods=320, freq="5min")
+        base = pd.Series(range(320), index=idx, dtype=float) + 3000.0
+        frame = pd.DataFrame({"open": base, "high": base + 5, "low": base - 5,
+                              "close": base, "volume": 100.0,
+                              "open_oi": 1.0, "close_oi": 1.0}, index=idx)
+
+        class _H(R.PortfolioRunner):
+            def __init__(self):
+                self._slots, self._klines, self._quotes = {}, {}, {}
+                self._qfq_base, self.api, self.fast = {}, None, True
+                self._ml = _Ml()
+                self.frame = frame
+
+            def _subscribe(self, st): pass
+            def _skey(self, cfg): return cfg.key()
+            def _signal_frame(self, st, kl): return self.frame
+            def _predictor_for(self, st):
+                return object() if self.fast else None
+            def _with_aux(self, st, df): return df
+            def _mark_price(self, st, df): return 3000.0
+            def _log(self, msg): pass
+
+        def _slot() -> R.SlotState:
+            cfg = SStore.StrategyConfig(
+                sid="sid-poll", symbol="RB", exchange="SHFE", period="5m",
+                family="factor", factor_mode="ml", factor_keys=["mom_20"],
+                sizing="fixed", volume=1, note="short",
+            )
+            st = R.SlotState(cfg=cfg)
+            st.running, st.ml_ready = True, False
+            return st
+
+        def _kl(dt):
+            return pd.DataFrame({"datetime": [int(dt.value)]})
+
+        # ---- 同一根 bar 里读到后台算好的信号 ----
+        h, st = _H(), _slot()
+        h._klines[st.cfg.key()] = _kl(pd.Timestamp("2026-11-03 23:05"))
+        for _ in range(5):
+            h._refresh_signal(st)               # 5 个 tick 都还在同一根 bar 里
+        if st.ml_ready:
+            raise RuntimeError("信号还没算出来就 ready 了")
+        if st.ml_why != "" or st.last_action != "机器学习信号计算中，暂不动仓":
+            raise RuntimeError(f"「计算中」这一态没走对：{st.last_action!r}")
+        if len(h._ml.submits) != 1:
+            raise RuntimeError(f"同一根 bar 里重复提交了 {len(h._ml.submits)} 次")
+        h._ml.out[st.cfg.key()] = -1            # 后台线程算完了
+        h._refresh_signal(st)
+        if not st.ml_ready or st.signal != -1 or st.target != -st.lots:
+            raise RuntimeError(
+                f"同一根 bar 里没读到信号：ready={st.ml_ready} "
+                f"signal={st.signal} target={st.target}")
+
+        # ---- 没有训练产物 → 「重训中」，不能混成「计算中」----
+        h2, st2 = _H(), _slot()
+        h2.fast = False
+        h2._klines[st2.cfg.key()] = _kl(pd.Timestamp("2026-11-03 23:05"))
+        h2._refresh_signal(st2)
+        if st2.ml_why != "retrain":
+            raise RuntimeError(f"慢路径应标 retrain，实际 {st2.ml_why!r}")
+
+        # ---- 永远算不出来 → 把真实原因顶到界面 ----
+        h3, st3 = _H(), _slot()
+        h3._klines[st3.cfg.key()] = _kl(pd.Timestamp("2026-11-03 23:05"))
+        h3._ml.err[st3.cfg.key()] = "z 分数算不出来（历史预测不够）"
+        h3._refresh_signal(st3)
+        if st3.ml_why != "z 分数算不出来（历史预测不够）":
+            raise RuntimeError(f"真实原因没顶上来：{st3.ml_why!r}")
+
+        # ---- 行情活性：收盘之后不许再发单 ----
+        now = _t.time()
+        st4 = _slot()
+        for bar, want in ((now, True), (now - 3600, False), (0, False),
+                          (None, False), (now + 300, True)):
+            st4.last_bar = int(bar * 1e9) if bar else (0 if bar == 0 else None)
+            if h._market_alive(st4) is not want:
+                raise RuntimeError(f"行情活性判据错：last_bar={bar} 应为 {want}")
+
+        # ---- 周期秒数：15m 是「5m × 3」= 900 秒，不是 180 ----
+        sec = R.PortfolioRunner._bar_seconds
+        for period, want in (("5m", 300.0), ("15m", 900.0), ("30m", 1800.0),
+                             ("1h", 3600.0), ("2h", 7200.0), ("4h", 14400.0)):
+            if sec(period) != want:
+                raise RuntimeError(f"{period} 应为 {want} 秒，实际 {sec(period)}")
+
+        return "同一根 bar 内读到后台信号 / 三态分开 / 收盘不发单 / 周期秒数对"
+
+    check("机器学习实盘取信号（没有新 bar 也要能读到）", _ml_live_poll)
 
     def _factor_reverse():
         """逐因子反转：分数严格取负，仓位严格对调。"""
@@ -1045,6 +1316,19 @@ def _run() -> tuple[bool, list[str]]:
         # 时候插进来重画一次，窗口被重置，滚轮那项就时好时坏。
         if getattr(win, "_pending", False):
             win._deferred_run()
+            app.processEvents()
+        # 恢复的 `last_config` 可能是「因子 + 机器学习」—— 那条首屏走后台线程，
+        # 画布要等它跑完才有东西。自检要看的是「一条规则策略的 K 线 + 绩效」，
+        # 先把在飞的任务停掉、切回规则族同步算一遍；不然这一项的结果取决于用户
+        # 上次存了什么配置（写死初始状态的教训见下面 is_us 那段）
+        if getattr(win, "res", None) is None:
+            win._cancel_factor_worker()
+            # 恢复的配置可能是多品种：启动时它**故意**不自动回测（N 条曲线要跑
+            # 几分钟），而且这一项要验的是「一条规则策略的 K 线 + 绩效」。先退回
+            # 单品种再算，别让这一项的结果取决于用户上次存了几个品种
+            win.sym_pick.clear()
+            win.cb_family.setCurrentIndex(win.cb_family.findData(FAMILY_RULE))
+            win.run_analysis()
             app.processEvents()
         n = len(win.store.symbols)
         has_res = getattr(win, "res", None) is not None
@@ -1734,6 +2018,89 @@ def _run() -> tuple[bool, list[str]]:
         # 断言都已经取完数了，不会被它带偏
         cross_dlg_ok = False
         cross_dlg_info = ""
+        # ---- 配置往返：多品种勾选必须存得下来、也恢复得回去
+        #
+        # 以前只存 `symbol` / `exchange`（当前在看的那个），规则 / 因子族的多品种
+        # 清单存盘后直接丢了 —— 「存一条跑 78 个品种的策略」再打开只剩 1 个品种。
+        # 走真正的 `_current_config()` / `apply_config()`，丢字段的 bug 恰恰出在
+        # 这两个函数的衔接上。放在最后：`apply_config` 会重排一次回测
+        multi_rt_ok = False
+        multi_rt_info = ""
+        try:
+            pool = [it["key"] for it in win.store.items][:3]
+            win.sym_pick.set_selected(pool)
+            app.processEvents()
+            before = list(win.sym_pick.selected())
+            cfg_rt = win._current_config()
+            win.sym_pick.clear()
+            app.processEvents()
+            cleared = list(win.sym_pick.selected())
+            win.apply_config(cfg_rt)
+            app.processEvents()
+            after_sel = list(win.sym_pick.selected())
+            # 标题：用户起过名就用名字，没起名才拼「N 个品种 · 策略」。
+            # 把名字清掉再验，否则验的是用户上次起的名字
+            t = cfg_rt.clone(name="") if hasattr(cfg_rt, "clone") else cfg_rt
+            title_txt = t.title()
+            multi_rt_ok = (len(before) >= 2 and not cleared
+                           and after_sel == before
+                           and list(cfg_rt.multi_symbols) == before
+                           and title_txt.startswith(f"{len(before)} 个品种"))
+            multi_rt_info = (f"存 {len(before)} 个 / 清空 {len(cleared)} 个 / "
+                             f"恢复 {len(after_sel)} 个 / 标题 {title_txt[:16]}")
+            win.sym_pick.clear()
+            app.processEvents()
+        except Exception as exc:  # noqa: BLE001
+            multi_rt_info = f"{type(exc).__name__}: {exc}"
+        if not multi_rt_ok:
+            raise RuntimeError(
+                f"多品种配置往返异常（{multi_rt_info}）：存盘只留了单品种，"
+                "或者勾选恢复不回去"
+            )
+
+        # ---- 组合页的「设置参数」也要能改品种 ----
+        #
+        # 研究页能勾一批品种，进了组合就再也改不了 —— 存盘里 78 个品种，列表上
+        # 显示的却是第一个。这条走真正的 `EditDialog` + 页面的品种清单：
+        # 勾选要回填得回来、改完要写进 `multi_symbols`、列表要写「N 个品种」
+        pdlg_ok = False
+        pdlg_info = ""
+        try:
+            from ttrade import strategy_store as _St
+            from ttrade.strategies import STRATEGIES as _S
+
+            from gui.portfolio_page import EditDialog as _ED
+            from gui.portfolio_page import _sym_text as _stext
+
+            pool = [it["key"] for it in win.store.items][:3]
+            if len(pool) < 2:
+                raise RuntimeError("本地库品种不足 2 个")
+            k0 = pool[0]
+            if win.market == "cn":
+                sym0, _, ex0 = k0.rpartition("_")
+            elif win.market == "cn_stock":
+                sym0, ex0 = k0, k0.split(".", 1)[0]
+            else:
+                sym0, ex0 = k0, ""
+            pc = _St.StrategyConfig(
+                symbol=sym0, exchange=ex0, period=win._period(),
+                rule_key="ma_cross", rule_params=dict(_S["ma_cross"].params),
+                multi_symbols=list(pool),
+            )
+            pdlg = _ED(pc, [], universe=win.portfolio_page._universe_of(pc))
+            filled = sorted(pdlg.pick.selected())
+            pdlg.pick.set_selected(pool[:2])
+            pdlg.apply_to(pc)
+            pdlg_ok = (filled == sorted(pool)
+                       and sorted(pc.multi_symbols) == sorted(pool[:2])
+                       and _stext(pc).startswith("2 个品种"))
+            pdlg_info = (f"回填 {len(filled)} 个 / 存 {len(pc.multi_symbols)} 个 / "
+                         f"列表写「{_stext(pc)}」")
+            pdlg.deleteLater()
+        except Exception as exc:  # noqa: BLE001
+            pdlg_info = f"{type(exc).__name__}: {exc}"
+        if not pdlg_ok:
+            raise RuntimeError(f"组合页设置框改品种异常（{pdlg_info}）")
         try:
             side_lay = win._panel_slots[win.box_factor][0]
 
@@ -1768,6 +2135,33 @@ def _run() -> tuple[bool, list[str]]:
             win.cb_timing.setCurrentIndex(win.cb_timing.findData("rule"))
             app.processEvents()
             select_units = [reb_unit.itemData(i) for i in range(reb_unit.count())]
+            # 第一步的因子周期：默认「跟随策略周期」，其余周期可选项里必须有日线
+            # （5 分钟策略按日线成交额筛池是主场景）。和策略周期相同的那一项要灰掉
+            # —— 选了等于没选，不灰就是骗人
+            p1cb = win.cb_step1_period
+            p1_items = [(p1cb.itemData(i), p1cb.model().item(i).isEnabled()
+                         if p1cb.model() and p1cb.model().item(i) is not None else True)
+                        for i in range(p1cb.count())]
+            p1_data = [d for d, _ in p1_items]
+            cur_p = win._period()
+            p1_ok = (p1_data and p1_data[0] in ("", None)
+                     and "1d_tq" in p1_data
+                     and not dict(p1_items).get(cur_p, False))
+            win.cb_step1_period.setCurrentIndex(p1cb.findData("1d_tq"))
+            app.processEvents()
+            p1_sum = win._cross_summary()
+            p1_pick = (win._step1_period() == "1d_tq" if cur_p != "1d_tq" else True)
+            p1_note = ("第一步因子：日线" in p1_sum) if cur_p != "1d_tq" else True
+            win.cb_step1_period.setCurrentIndex(0)
+            app.processEvents()
+            p1_back = win._step1_period() == "" and "第一步因子" not in win._cross_summary()
+            # 名义敞口：截面要跟「仓位」那一组控件走，和多品种回测同一个口径。
+            # 以前截面恒按 1 倍算，仓位面板在截面模式下等于摆设
+            lev = win._cross_leverage()
+            lev_ok = (lev is not None and abs(float(lev) - 1.0) > 0.02
+                      and "名义敞口" in win._cross_summary()
+                      ) if (win.cb_size.currentData() == "capital") else (
+                lev is not None and abs(float(lev) - 1.0) <= 0.02)
             select_ok = (
                 not win.grp_timing.isHidden()
                 and win.box_rule.parentWidget() is win.cross_timing_host
@@ -1778,6 +2172,7 @@ def _run() -> tuple[bool, list[str]]:
                 and "bar" not in select_units
                 and "day" in select_units and "month" in select_units
                 and "交易日" in win.lbl_cross_sum.text()
+                and p1_ok and p1_pick and p1_note and p1_back and lev_ok
             )
             win.cb_family.setCurrentIndex(win.cb_family.findData("rule"))
             app.processEvents()
@@ -1785,13 +2180,14 @@ def _run() -> tuple[bool, list[str]]:
             back_ok = _order(side_lay) == before
             cross_dlg_ok = hedge_ok and select_ok and back_ok
             cross_dlg_info = (f"对冲 {hedge_ok} / 选品种 {select_ok} / "
-                              f"还回侧边栏 {back_ok}")
+                              f"还回侧边栏 {back_ok} / 第一步周期 "
+                              f"{p1_ok},{p1_pick},{p1_note},{p1_back} / 杠杆 {lev_ok}")
         except Exception as exc:  # noqa: BLE001
             cross_dlg_info = f"{type(exc).__name__}: {exc}"
         if not cross_dlg_ok:
             raise RuntimeError(
                 f"截面两步配置窗异常（{cross_dlg_info}）：参数面板借进弹窗、切走还回"
-                "侧边栏，或者侧边栏顺序被搬乱了"
+                "侧边栏，或者侧边栏顺序被搬乱了，或者「第一步因子周期」选不动"
             )
 
         # ---- 侧边栏宽度：控件不该被挤到右边看不见
@@ -1878,7 +2274,9 @@ def _run() -> tuple[bool, list[str]]:
             # 两个都选「不用」= 只用规则：因子反转该灰、规则反转该亮
             win.cb_trig1.setCurrentIndex(0)
             win.cb_trig2.setCurrentIndex(0)
-            win.cb_trig_rule.setCurrentIndex(1)
+            # 挑一条**有参数**的规则：没有参数的规则，「参数」按钮本来就该是灰的
+            _ri = win.cb_trig_rule.findData("ma_cross")
+            win.cb_trig_rule.setCurrentIndex(_ri if _ri > 0 else 1)
             app.processEvents()
             if win.chk_trig_flip.isEnabled():
                 raise RuntimeError("没有触发因子时「反转因子」还能勾")
@@ -1886,6 +2284,44 @@ def _run() -> tuple[bool, list[str]]:
                 raise RuntimeError("选了触发规则，「反转规则」却是灰的")
             if win._trigger_keys():
                 raise RuntimeError("两个「不用」仍然算出了触发因子")
+            # 规则触发参数：按钮跟着有没有规则灰 / 亮，改过的参数要进 FactorConfig
+            rule_key = win.cb_trig_rule.currentData()
+            if not win.btn_trig_params.isEnabled():
+                raise RuntimeError("选了触发规则，「参数」按钮却是灰的")
+            win.trig_rule_params[rule_key] = {"fast": 5, "slow": 20}
+            win._sync_trigger_src()
+            got = win._factor_cfg().trigger_params
+            if got != {"fast": 5, "slow": 20}:
+                raise RuntimeError(f"规则触发参数没进配置：{got}")
+            if "快线周期 5" not in win.btn_trig_params.toolTip():
+                raise RuntimeError("按钮提示里看不到改过的参数")
+            # 换一条规则：参数不能串到别一条上
+            other_rule = next((win.cb_trig_rule.itemData(i)
+                               for i in range(1, win.cb_trig_rule.count())
+                               if win.cb_trig_rule.itemData(i) != rule_key), "")
+            if other_rule:
+                win.cb_trig_rule.setCurrentIndex(
+                    win.cb_trig_rule.findData(other_rule))
+                app.processEvents()
+                if win._factor_cfg().trigger_params:
+                    raise RuntimeError("换了触发规则，上一条的参数跟过来了")
+                win.cb_trig_rule.setCurrentIndex(win.cb_trig_rule.findData(rule_key))
+                app.processEvents()
+            # 参数窗本身：值能取回、恢复默认能回默认
+            from gui.info_dialogs import RuleParamsDialog
+
+            dlg = RuleParamsDialog("测试规则", [
+                ("fast", "快线周期", 2, 200, 1, 10, 25),
+                ("vol_ratio", "波幅比例", 0.1, 3.0, 0.1, 0.4, 1.5),
+            ], win)
+            vals = dlg.values()
+            if vals != {"fast": 25, "vol_ratio": 1.5}:
+                raise RuntimeError(f"参数窗取值不对：{vals}")
+            dlg._reset()
+            if dlg.values() != {"fast": 10, "vol_ratio": 0.4}:
+                raise RuntimeError(f"恢复默认没生效：{dlg.values()}")
+            dlg.deleteLater()
+            win.trig_rule_params.pop(rule_key, None)
             # 切市场再切回来：「不用」不能丢
             mk = win.cb_market.currentData()
             others = [win.cb_market.itemData(i) for i in range(win.cb_market.count())]
@@ -1898,7 +2334,8 @@ def _run() -> tuple[bool, list[str]]:
                 win.cb_market.setCurrentIndex(win.cb_market.findData(mk))
                 app.processEvents()
             win.chk_sparse.setChecked(False)
-            trig_info = "「不用」两项都在（切市场后仍在），反转开关跟着触发源灰 / 亮"
+            trig_info = ("「不用」两项都在（切市场后仍在），反转开关跟着触发源灰 / 亮，"
+                         "规则触发参数能进配置且换规则不串")
         except Exception as exc:      # noqa: BLE001
             trig_ok, trig_info = False, f"{type(exc).__name__}: {exc}"
         if not trig_ok:
@@ -1909,6 +2346,7 @@ def _run() -> tuple[bool, list[str]]:
                 f"波幅突破 {brk_info}，"
                 f"组合 {combo_info}，"
                 f"截面 {cross_info}，两步配置 {cross_dlg_info}，"
+                f"多品种往返 {multi_rt_info}，"
                 f"{side_info}，触发 {trig_info}，"
                 f"回测区间 {range_info}，实时开关已复位，"
                 f"数据管理页就绪，手册 {manual_info}，输出 {out_info}，"

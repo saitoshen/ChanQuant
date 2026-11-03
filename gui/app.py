@@ -114,8 +114,8 @@ from gui.portfolio_page import LibraryDialog, PortfolioPage
 from gui.result_view import ResultView, ViewCtx, set_tab_visible
 from gui.trade_page import TradePage
 from ttrade.backtest import (
-    BacktestConfig, bars_per_year, buy_and_hold, combine, combine_trades,
-    run_backtest,
+    BacktestConfig, _to_daily, bars_per_year, buy_and_hold, combine,
+    combine_trades, run_backtest,
 )
 from ttrade.eastmoney import load_local
 from ttrade.strategies import (
@@ -828,9 +828,11 @@ class CrossWorker(QObject):
     done = Signal(object)              # CrossResult
     failed = Signal(str)
 
-    def __init__(self, frames: dict, cfg, bt, profile: str, label: str) -> None:
+    def __init__(self, frames: dict, cfg, bt, profile: str, label: str,
+                 step1_frames: dict | None = None) -> None:
         super().__init__()
         self.frames = frames
+        self.step1_frames = step1_frames
         self.cfg = cfg
         self.bt = bt
         self.profile = profile
@@ -846,6 +848,7 @@ class CrossWorker(QObject):
             out = cross_engine.run(
                 self.frames, self.cfg, self.bt, profile=self.profile,
                 label=self.label, progress=cb, cancel=lambda: self._cancel,
+                step1_frames=self.step1_frames,
             )
         except fstrat.Cancelled:
             return
@@ -1055,6 +1058,9 @@ class MainWindow(QMainWindow):
         self.market = DEFAULT_MARKET
         self.store = self.stores[self.market]
         self.cfg = self._new_cfg(MARKETS[self.market])
+        # 规则触发用的参数：{规则 key: {参数名: 值}}。按规则分开存 —— 换成另一条
+        # 触发规则再换回来，原来调好的那套还在；合成一个 dict 的话切一次就串味了
+        self.trig_rule_params: dict[str, dict] = {}
         self.df_raw: pd.DataFrame | None = None
         self.df_sig: pd.DataFrame | None = None
         self.res = None
@@ -1064,6 +1070,9 @@ class MainWindow(QMainWindow):
         self.fparam_widgets: dict[str, QWidget] = {}
         self.fparam_scales: dict[str, int] = {}
         self._pending = False
+        # 灌配置期间掐掉回测调度。「加载策略」和启动恢复都走它 —— 有些策略
+        # 跑一遍要几分钟，用户只是想把参数摆到界面上改一改
+        self._quiet_load = False
         # 「改参数自动回测」的用户偏好。**出厂是关的**：勾上要先弹框讲清楚
         # 「以后每动一次界面都重跑」，不然改个滑块等三分钟会以为死机。
         # 多品种会把它强制关掉，但不能改掉这份偏好本身 —— 回到单品种时要还原
@@ -1148,7 +1157,13 @@ class MainWindow(QMainWindow):
         self.study_live = LiveController(self)
         self.trade_page = TradePage(self.live)
         self.pages.addWidget(self.trade_page)
-        self.portfolio_page = PortfolioPage(loader=self._load_bars)
+        self.portfolio_page = PortfolioPage(
+            loader=self._load_bars,
+            # 组合页的「设置参数」要能改品种，得知道每个市场有哪些标的。
+            # 递函数而不是快照：切页 / 补数据之后清单会变
+            universe=lambda mk: [it for it in self.stores[mk].items]
+            if mk in self.stores else [],
+        )
         # 组合页就地补完数据之后，主窗口这份 DataStore 的缓存就过期了 ——
         # 不重建的话，那边补了、这边画出来的还是补之前那份
         self.portfolio_page.data_updated.connect(self._on_data_updated)
@@ -1777,13 +1792,29 @@ class MainWindow(QMainWindow):
         self.cb_trig_rule = QComboBox()
         self.cb_trig_rule.setToolTip(
             "规则触发（可选）：这条规则刚开仓的那一根也建样本。\n"
-            "和因子触发是「或」的关系 —— 任一命中就采。"
+            "和因子触发是「或」的关系 —— 任一命中就采。\n\n"
+            "点右边「参数」改这条规则自己的参数：和主策略那组滑杆是两套，\n"
+            "改这里不会动到「策略」下拉里选的规则。按钮上带 * 表示参数已改过。"
         )
         self.cb_trig_rule.addItem("（不用规则触发）", "")
         for key, st in STRATEGIES.items():
             self.cb_trig_rule.addItem(st.label, key)
         self._fit_width(self.cb_trig_rule)
-        sb.addWidget(self.cb_trig_rule)
+        # 参数按钮就摆在选规则的地方：规则触发的参数和主策略那组滑杆是**两套**
+        # （一个决定在哪儿建样本，一个决定策略本身怎么走），放远了没人找得到
+        r2a = QHBoxLayout()
+        r2a.setContentsMargins(0, 0, 0, 0)
+        r2a.setSpacing(6)
+        r2a.addWidget(self.cb_trig_rule, 1)
+        self.btn_trig_params = QPushButton("参数")
+        # 次要按钮用 Ghost：默认样式是主操作蓝，一个调参数的辅助按钮不该抢眼
+        self.btn_trig_params.setObjectName("Ghost")
+        self.btn_trig_params.setCursor(Qt.PointingHandCursor)
+        self.btn_trig_params.setFixedHeight(26)
+        self.btn_trig_params.setToolTip("设置这条规则触发用的参数")
+        self.btn_trig_params.clicked.connect(self._on_trig_rule_params)
+        r2a.addWidget(self.btn_trig_params, 0)
+        sb.addLayout(r2a)
 
         # 反转：因子那侧和规则那侧各一个。反的是「往哪边算触发」，不是把策略做成
         # 反手 —— 标签仍是前向收益，模型学到的仍是「之后会涨」，只是样本来自反方向
@@ -2007,8 +2038,8 @@ class MainWindow(QMainWindow):
         # 多品种合并训练：默认**关**。合训学的是「这个池子的共同形态」，单品种
         # 的个性会被稀释，换池子就得重训 —— 它是「换一批品种还灵不灵」这个问题
         # 的另一种问法，不是更准的问法
-        self.chk_pool = QCheckBox("多品种合并训练（所有品种的样本一起学）")
-        self.chk_pool.setToolTip(
+        self.chk_ml_pool = QCheckBox("多品种合并训练（所有品种的样本一起学）")
+        self.chk_ml_pool.setToolTip(
             "只在「多品种回测 + 因子策略 + 机器学习」时生效。\n\n"
             "不勾（默认）：每个品种各训一个模型，各自学各自的形态。\n"
             "勾上：把 N 个品种的样本堆成一张长表训一个模型，再各自交易。\n\n"
@@ -2018,7 +2049,7 @@ class MainWindow(QMainWindow):
             "标签会按各品种自己的波动率折算（涨一个标准差在所有品种上是同一件事），\n"
             "否则铁矿 2% 的日波动会把玉米 0.5% 的信号完全淹没。"
         )
-        sf.addWidget(self.chk_pool)
+        sf.addWidget(self.chk_ml_pool)
 
         self.lbl_fparam = self._section("因子参数")
         sf.addWidget(self.lbl_fparam)
@@ -2311,6 +2342,25 @@ class MainWindow(QMainWindow):
                 self.cb_cross_mode.count() - 1, tip, Qt.ToolTipRole)
         p1.addWidget(self.cb_cross_mode)
 
+        # 第一步用哪个周期的因子。默认跟随策略周期；5 分钟策略想按「日线成交额」
+        # 选品种时切到日线 —— 流动性是几天的量级，用 5 分钟成交额排名只会被当天
+        # 的消息面带着走
+        p1.addWidget(self._section("第一步因子周期"))
+        self.cb_step1_period = QComboBox()
+        self.cb_step1_period.addItem("跟随策略周期", "")
+        for _p in GUI_PERIODS:
+            self.cb_step1_period.addItem(PERIOD_LABEL.get(_p, _p), _p)
+        self.cb_step1_period.setToolTip(
+            "截面排名和筛池用的因子，按哪个周期的行情算。\n\n"
+            "跟随策略周期（默认）：5 分钟策略就用 5 分钟因子。\n"
+            "选别的周期：比如策略跑 5 分钟、第一步用日线的「成交额 20」筛池 ——\n"
+            "流动性是几天的量级，用 5 分钟成交额排名会被当天消息面带偏。\n\n"
+            "跨周期时只用**已经收完**的那一根：日线那根要到收盘才知道，所以当天\n"
+            "所有 bar 用的都是前一交易日的值（不会把收盘结果提前灌进上午的 bar）。\n"
+            "第二步的时序腿仍然按策略周期跑。"
+        )
+        p1.addWidget(self.cb_step1_period)
+
         # 截面因子（模式下拉 + 因子表）本来在侧边栏里，切到截面策略时由
         # `_sync_family_panels` 借进这个空槽 —— 见 `_lend()` 的说明
         self.cross_factor_host = QWidget()
@@ -2566,11 +2616,15 @@ class MainWindow(QMainWindow):
             for w in (self.sp_principal, self.sp_capital, self.sp_risk, self.sp_atr,
                       self.sp_stop, self.sp_vol):
                 w.valueChanged.connect(lambda *_: self._schedule())
+            # 本金 / 资金分配改了，截面摘要里的「名义敞口 ×N」要跟着变
+            for w in (self.sp_principal, self.sp_capital):
+                w.valueChanged.connect(lambda *_: self._refresh_cross_summary())
             self.chk_ma.currentIndexChanged.connect(self._schedule)
             self.chk_short.toggled.connect(self._on_short_toggled)
 
             self.cb_family.currentIndexChanged.connect(self._on_family_changed)
             self.cb_cross_mode.currentIndexChanged.connect(self._on_cross_mode_changed)
+            self.cb_step1_period.currentIndexChanged.connect(self._on_cross_param_changed)
             self.sp_cross_reb.valueChanged.connect(self._on_cross_param_changed)
             self.cb_cross_reb_unit.currentIndexChanged.connect(self._on_cross_param_changed)
             self.sp_cross_pct.valueChanged.connect(self._on_cross_param_changed)
@@ -2916,7 +2970,14 @@ class MainWindow(QMainWindow):
     def _on_size_changed(self, *_a) -> None:
         self._sync_size()
         self._apply_sizing(self.cfg)
+        # 截面的名义敞口是从这一组控件推出来的，摘要要跟着变
+        self._refresh_cross_summary()
         self._schedule()
+
+    def _refresh_cross_summary(self) -> None:
+        """只重画侧边栏那段摘要（本金 / 资金分配改了要跟着变）。"""
+        if hasattr(self, "lbl_cross_sum"):
+            self.lbl_cross_sum.setText(self._cross_summary())
 
     def _on_short_toggled(self, _checked: bool) -> None:
         self.cfg = self._new_cfg(MARKETS[self.market])
@@ -3020,6 +3081,8 @@ class MainWindow(QMainWindow):
         """美股没有分钟数据，周期锁在日线；期货按品种实际下载情况标注。"""
         if not hasattr(self, "cb_period"):
             return
+        # 策略周期一改，「第一步因子周期」里和它相同的那一项就要跟着灰/亮
+        self._sync_step1_period_items()
         if self.market == "us":
             self.cb_period.blockSignals(True)
             idx = self.cb_period.findData(PERIOD_1D)
@@ -3410,6 +3473,37 @@ class MainWindow(QMainWindow):
             return "bar"
         return self.cb_cross_reb_unit.currentData() or "bar"
 
+    def _sync_step1_period_items(self) -> None:
+        """把「和策略周期一样」的那一项灰掉。
+
+        选了等于没选（`_run_cross` 里 `p1 != period` 才另取数据），灰掉比让用户
+        选完发现结果没变要诚实。策略周期改了之后原来那项也可能变成同周期，这时
+        顺手退回「跟随策略周期」，免得界面上写着「日线」、实际按 5 分钟在算。
+        """
+        cb = getattr(self, "cb_step1_period", None)
+        if cb is None:
+            return
+        cur = self._period()
+        model = cb.model()
+        if model is not None:
+            for i in range(cb.count()):
+                it = model.item(i)
+                if it is None:
+                    continue
+                data = cb.itemData(i)
+                # 第 0 项是「跟随策略周期」，永远可用
+                it.setEnabled(not data or data != cur)
+        if (cb.currentData() or "") == cur:
+            cb.blockSignals(True)
+            cb.setCurrentIndex(0)
+            cb.blockSignals(False)
+
+    def _step1_period(self) -> str:
+        """第一步（截面排名 + 筛池）用哪个周期的因子。空串 = 跟随策略周期。"""
+        if not hasattr(self, "cb_step1_period"):
+            return ""
+        return self.cb_step1_period.currentData() or ""
+
     def _sync_cross_reb(self, hedge: bool) -> None:
         """调仓间隔那一行的单位和提示。
 
@@ -3459,6 +3553,30 @@ class MainWindow(QMainWindow):
             "交易日 / 个月：按天数给，回测时按实际密度换算成根数\n"
             "（不同品种夜盘时长不同，一天可能是 48 根也可能是 68 根）。")
 
+    def _cross_leverage(self) -> float | None:
+        """截面组合的名义敞口倍数（按「仓位」那一组控件算）。
+
+        `unit` 就是 1 倍；`capital` 是「资金分配比例 ÷ 保证金率」，取池子里
+        各品种保证金率的中位数；`fixed` / `risk` 定不出「占权益多少」，返回
+        None（引擎那边也按 1 倍算）。
+        """
+        mode = (self.cb_size.currentData() if hasattr(self, "cb_size") else "unit") or "unit"
+        if mode != "capital":
+            return 1.0
+        pct = float(self.sp_capital.value()) / 100.0
+        margins = []
+        for key in (self._multi_symbols() or []):
+            sym, _, ex = key.rpartition("_")
+            try:
+                m = float(symbols_info.info(sym, ex).get("margin") or 0.0)
+            except Exception:  # noqa: BLE001
+                m = 0.0
+            margins.append(m if m > 0 else 0.1)
+        if not margins:
+            return pct / 0.1
+        margins.sort()
+        return pct / margins[len(margins) // 2]
+
     def _sync_cross_controls(self) -> None:
         """截面面板的提示：够不够品种、这一组参数大概持几条腿。"""
         if not hasattr(self, "cb_cross_mode"):
@@ -3486,6 +3604,7 @@ class MainWindow(QMainWindow):
         for w in (self.lbl_label, self.cb_label):
             w.setVisible(ml_on)
         self._sync_cross_reb(hedge)
+        self._sync_step1_period_items()
         # 参数都搬进弹窗了，侧边栏这一段是唯一的「一眼看见」的地方
         if hasattr(self, "lbl_cross_sum"):
             self.lbl_cross_sum.setText(self._cross_summary())
@@ -3515,7 +3634,11 @@ class MainWindow(QMainWindow):
             text = (pool_note + f"池内 {n_pool} 个品种各分 1/{n_pool}，"
                     "由时序策略决定每个品种是多是空还是空仓。"
                     "没出信号的那几只，那部分钱留现金（不会加到别的品种上）。"
-                    f"腿内按{self.cb_cross_w.currentText()}分钱。")
+                    f"腿内按{self.cb_cross_w.currentText()}分钱。"
+                    "\n截面是**一个**账户：权重每根都拉回目标，个别品种亏光不会"
+                    "把组合亏穿。「多品种回测」是 N 个独立账户各 10 万再取平均，"
+                    "个别品种亏光就少一份本金 —— 同样的品种、同样的时序策略，"
+                    "两条曲线本来就不会一样。")
         # 侧边栏和弹窗第二步各显示一份：一个在窗里调参数时看，一个不开窗时看
         self.lbl_cross_hint.setText(text)
         self.lbl_cross_preview.setText(text)
@@ -3559,6 +3682,17 @@ class MainWindow(QMainWindow):
         if self.chk_pool.isChecked():
             lines.append(f"先筛池：{self.cb_pool_factor.currentText()} 留 "
                          f"{self.sp_pool_pct.value():.0f}%")
+        # 跨周期是「同一组参数、两套数据」，不写出来就没法解释两次结果为什么不同
+        p1 = self._step1_period()
+        if p1:
+            lines.append(f"第一步因子：{PERIOD_LABEL.get(p1, p1)}"
+                         f"（策略 {PERIOD_LABEL.get(self._period(), self._period())}）")
+        # 杠杆：截面原来恒按 1 倍名义额算，和多品种回测（按资金分配 ÷ 保证金）
+        # 对不上。现在统一了，摘要里得写出来 —— 不然用户还是不知道为什么
+        # 「选 100% 等于没选」时两条曲线不一样
+        lev = self._cross_leverage()
+        if lev is not None and abs(lev - 1.0) > 0.02:
+            lines.append(f"名义敞口：×{lev:.1f}（{self.cb_size.currentText()}）")
         if mode == "select":
             leg = "规则" if self._timing_family() == "rule" else "因子"
             lines.append(f"时序腿：{leg} · 腿内{self.cb_cross_w.currentText()}")
@@ -3624,6 +3758,57 @@ class MainWindow(QMainWindow):
                       (getattr(self, "chk_trig_rule_flip", None), has_r)):
             if w is not None:
                 w.setEnabled(on)
+        btn = getattr(self, "btn_trig_params", None)
+        if btn is not None:
+            key = self.cb_trig_rule.currentData() or ""
+            spec = STRATEGIES.get(key) if key else None
+            cur = dict(self.trig_rule_params.get(key) or {}) if spec else {}
+            btn.setEnabled(bool(spec is not None and spec.params))
+            # 改过参数就在按钮上留个记号：跑出来的样本点跟默认参数不一样，
+            # 而提示要悬停才看得见，多数人不会去悬停
+            btn.setText("参数 *" if cur else "参数")
+            if spec is None:
+                btn.setToolTip("先在「规则触发」里选一条规则")
+            elif not spec.params:
+                btn.setToolTip(f"{spec.label} 没有可调参数")
+            elif cur:
+                txt = "、".join(f"{PARAM_LABELS.get(k, k)} {v:g}"
+                                for k, v in cur.items())
+                btn.setToolTip(f"{spec.label} 用的是改过的参数：{txt}\n点这里再改")
+            else:
+                btn.setToolTip(f"设置 {spec.label} 的参数（现在是默认值）")
+
+    def _on_trig_rule_params(self) -> None:
+        """规则触发的参数。按规则 key 各存一份，和主策略那组滑杆互不影响。"""
+        from gui.info_dialogs import RuleParamsDialog
+
+        key = self.cb_trig_rule.currentData() or ""
+        spec = STRATEGIES.get(key) if key else None
+        if spec is None:
+            self.lbl_status.setText("先在「规则触发」里选一条规则，再设置它的参数")
+            return
+        if not spec.params:
+            self.lbl_status.setText(f"{spec.label} 没有可调参数")
+            return
+        cur = dict(self.trig_rule_params.get(key) or {})
+        rows = []
+        for name, dflt in spec.params.items():
+            lo, hi, step = spec.param_meta.get(name, (1, 100, 1))
+            rows.append((name, PARAM_LABELS.get(name, name), lo, hi, step, dflt,
+                         cur.get(name, dflt)))
+        dlg = RuleParamsDialog(spec.label, rows, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        vals = dlg.values()
+        # 全都改回默认值：把这一项删掉，而不是存一份「和默认一样」的快照 ——
+        # 存下来之后升级改了默认值，它不会跟着走（品种信息那边同一个道理）
+        if all(abs(float(vals[k]) - float(v)) < 1e-9
+               for k, v in spec.params.items() if k in vals):
+            self.trig_rule_params.pop(key, None)
+        else:
+            self.trig_rule_params[key] = vals
+        self._sync_trigger_src()
+        self._schedule(immediate=True)
 
     def _on_model_changed(self) -> None:
         self._schedule(immediate=True)
@@ -3660,7 +3845,7 @@ class MainWindow(QMainWindow):
         self.lbl_fmodel.setVisible(is_ml)
         self.cb_fmodel.setVisible(is_ml)
         # 合并训练只对时序多品种有意义：截面那边本来就是合并训练的（另一个口径）
-        self.chk_pool.setVisible(is_ml)
+        self.chk_ml_pool.setVisible(is_ml)
         # 方向口径对 ML 没意义：模型自己学方向和权重，orient 根本不参与
         self.cb_forient.setVisible(not is_ml)
         if hasattr(self, "box_sparse"):
@@ -3703,7 +3888,7 @@ class MainWindow(QMainWindow):
         self.lbl_fmodel.setVisible(is_ml)
         self.cb_fmodel.setVisible(is_ml)
         # 截面有自己的合并口径（横截面去均值），这里的复选框不适用
-        self.chk_pool.setVisible(False)
+        self.chk_ml_pool.setVisible(False)
         self.cb_forient.setVisible(not is_ml)
         if single:
             self._sync_single_rev()
@@ -3983,6 +4168,10 @@ class MainWindow(QMainWindow):
             note="short" if self.chk_short.isChecked() else "",
             range_years=float(self.cb_range.currentData() or 0),
             cost_profile=(self.cb_cost.currentData() or "") if self.market == "cn" else "",
+            # 多品种勾选：不管当前是哪个策略族都要存。以前只有截面存了
+            # （`cross_symbols`），规则 / 因子族的多品种清单存盘后直接丢了，
+            # 重开一份 78 个品种的策略只剩 1 个品种
+            multi_symbols=list(self.sym_pick.selected()) if hasattr(self, "sym_pick") else [],
             cross_symbols=list(self.sym_pick.selected()) if hasattr(self, "sym_pick") else [],
             cross_mode=self._cross_mode(),
             cross_rebalance=int(self.sp_cross_reb.value()),
@@ -3995,6 +4184,7 @@ class MainWindow(QMainWindow):
             cross_pool_mode="single" if _cx["pool_key"] else "off",
             cross_pool_keys=[_cx["pool_key"]] if _cx["pool_key"] else [],
             cross_pool_pct=_cx["pool_pct"],
+            cross_step1_period=self._step1_period(),
             cross_label_mode=_cx["label"],
             timing_family=self._timing_family(),
             timing_rule_key=self.cb_strategy.currentData() or "",
@@ -4035,6 +4225,17 @@ class MainWindow(QMainWindow):
         f = self.cb_family.findData(cfg.family)
         if f >= 0:
             self.cb_family.setCurrentIndex(f)
+        # 品种勾选要在任何按族分支之前恢复：截面要按勾选数算腿数，规则 / 因子族
+        # 的多品种回测也靠它。老配置只有 `cross_symbols`，`symbols` 属性兜住
+        syms = [s for s in (cfg.symbols or [])
+                if s in {it.get("key") for it in self.store.items}]
+        if syms and hasattr(self, "sym_pick"):
+            self.sym_pick.set_selected(syms)
+            if hasattr(self, "lbl_pick"):
+                self.lbl_pick.setText(
+                    f"多品种：{len(syms)} 个，每个品种各跑一遍再等权平均"
+                    if len(syms) >= 2 else ""
+                )
         r = self.cb_strategy.findData(cfg.rule_key)
         if r >= 0:
             self.cb_strategy.setCurrentIndex(r)     # 重建参数控件
@@ -4057,16 +4258,8 @@ class MainWindow(QMainWindow):
             self._apply_factor_cfg(cfg.factor_cfg)
 
         if cfg.family == FAMILY_CROSS:
-            # 品种勾选要**在截面参数之前**恢复：`_sync_cross_controls` 要按选中
-            # 数量算「这一组参数持几条腿」，勾选没到位提示就是错的
-            syms = [s for s in (cfg.cross_symbols or [])
-                    if s in {it.get("key") for it in self.store.items}]
-            self.sym_pick.set_selected(syms)
-            if hasattr(self, "lbl_pick"):
-                self.lbl_pick.setText(
-                    f"多品种：{len(syms)} 个，每个品种各跑一遍再等权平均"
-                    if len(syms) >= 2 else ""
-                )
+            # 品种勾选已经在上面统一恢复过了（`cfg.symbols`），这里只处理截面
+            # 自己的参数
             cm = self.cb_cross_mode.findData(cfg.cross_mode or "hedge")
             if cm >= 0:
                 self.cb_cross_mode.setCurrentIndex(cm)
@@ -4077,6 +4270,12 @@ class MainWindow(QMainWindow):
                 getattr(cfg, "cross_rebalance_unit", "bar") or "bar")
             if ru >= 0:
                 self.cb_cross_reb_unit.setCurrentIndex(ru)
+            # 第一步因子周期。老配置里没有这个字段，findData("") 会落到「跟随
+            # 策略周期」那一项，正好是原来的行为
+            sp1 = self.cb_step1_period.findData(
+                getattr(cfg, "cross_step1_period", "") or "")
+            if sp1 >= 0:
+                self.cb_step1_period.setCurrentIndex(sp1)
             self.sp_cross_pct.setValue(float(cfg.cross_top_pct or 10.0))
             self.sp_cross_bot.setValue(float(getattr(cfg, "cross_bot_pct", 0) or 10.0))
             cw = self.cb_cross_w.findData(cfg.cross_weight or "risk")
@@ -4181,6 +4380,17 @@ class MainWindow(QMainWindow):
                 i = cb.findData(v)
                 if i >= 0:
                     cb.setCurrentIndex(i)
+        # 合并训练的勾选框：之前没存进配置，导致回测走合训、训练和实盘走
+        # 逐品种，三者不一致。现在从 `factor_cfg` 里恢复
+        if hasattr(self, "chk_ml_pool"):
+            self.chk_ml_pool.setChecked(bool(cfg.get("pooled", False)))
+        # 规则触发的参数：`factor_cfg` 里只存了**当时那条规则**那一份（配置是
+        # 一份，不是一张表），所以按它自己的 `trigger_rule` 归位
+        tp = cfg.get("trigger_params") or {}
+        tr = str(cfg.get("trigger_rule") or "")
+        if isinstance(tp, dict) and tp and tr:
+            self.trig_rule_params[tr] = {k: v for k, v in tp.items()}
+            self._sync_trigger_src()
 
     def _on_load_library(self) -> None:
         """从策略库挑一条，把它的品种 / 周期 / 策略 / 参数灌回界面。
@@ -4205,11 +4415,21 @@ class MainWindow(QMainWindow):
         if cfg is None:
             return
         try:
+            # **加载不自动回测**：有些策略跑一遍要几分钟，用户只是想把参数摆到
+            # 界面上改一改。灌配置期间把 `_schedule` 关掉，灌完由他自己点
+            # 「策略回测」
+            self._quiet_load = True
             self.apply_config(cfg)
         except Exception as exc:  # noqa: BLE001
             self.lbl_status.setText(f"加载失败：{exc}")
             return
-        self.lbl_status.setText(f"已加载「{cfg.title()}」。改完想留住就点「保存配置」")
+        finally:
+            self._quiet_load = False
+            self._pending = False
+        self.lbl_status.setText(
+            f"已加载「{cfg.title()}」。参数已摆好，点「策略回测」跑一遍"
+            "（改完想留住就点「保存配置」）"
+        )
 
     def _on_save_config(self) -> None:
         cfg = self._current_config()
@@ -4264,14 +4484,31 @@ class MainWindow(QMainWindow):
         if cfg is None or not cfg.symbol:
             self._run_first_screen()
             return
+        # 多品种一跑就是 N 条曲线（78 个品种的 5 分钟能跑几分钟）。启动时不该
+        # 悄悄占住界面 —— 参数照样摆好，等用户自己点「策略回测」
+        multi = len(cfg.symbols or []) >= 2
         try:
             self._booting = True
+            if multi:
+                self._quiet_load = True
             self.apply_config(cfg)
-            self.lbl_status.setText(f"已恢复上次配置：{cfg.title()}")
+            if multi:
+                # 首屏不能是一片空白：图区写一句话说清「为什么没跑」，而不是让
+                # 人对着空画布怀疑数据没加载出来
+                self.view.clear(
+                    f"已恢复多品种配置（{len(cfg.symbols)} 个品种 · {cfg.period}）。\n"
+                    "启动时不自动回测 —— 点「策略回测」看等权组合的净值曲线。"
+                )
+            self.lbl_status.setText(
+                f"已恢复上次配置：{cfg.title()}"
+                + ("。多品种不自动回测，点「策略回测」跑一遍" if multi else "")
+            )
         except Exception as exc:  # noqa: BLE001
             self.lbl_status.setText(f"恢复上次配置失败：{exc}")
         finally:
             self._booting = False
+            self._quiet_load = False
+            self._pending = False
 
     def _run_first_screen(self) -> None:
         """首次启动：拿默认品种 + 默认策略把首屏算出来。
@@ -4372,6 +4609,12 @@ class MainWindow(QMainWindow):
     def _schedule(self, *_, immediate: bool = False, force: bool = False) -> None:
         if not self.store.symbols:
             return
+        if getattr(self, "_quiet_load", False):
+            # 正在灌一份配置（加载策略 / Agent 换配置）。中间会触发几十次
+            # `currentIndexChanged`，每一次都排一次回测的话，一条 78 品种的策略
+            # 光「加载」就要跑好几分钟。灌完由调用方决定要不要算
+            self._pending = False
+            return
         if immediate:
             # 立刻算这一下已经把「等会儿要算」的那次抵掉了。不清掉 `_pending`，
             # 220ms 后那个定时器还会再跑一遍 —— 恢复上次配置时启动就白白多算
@@ -4447,6 +4690,11 @@ class MainWindow(QMainWindow):
             sample_mode="trigger" if sparse else "all",
             trigger_keys=self._trigger_keys() if sparse else [],
             trigger_rule=(self.cb_trig_rule.currentData() or "") if sparse else "",
+            # 参数跟着选中的那条规则走：换规则就换一套，别把上一条规则的参数
+            # 塞给这一条（`run_strategy` 会忽略多余键，但「参数明明调过却没用上」
+            # 这种错更难查）
+            trigger_params=(dict(self.trig_rule_params.get(
+                self.cb_trig_rule.currentData() or "") or {}) if sparse else {}),
             trigger_side=(self.cb_trig_side.currentData() or "both") if sparse else "both",
             trigger_z=float(self.sp_trig_z.value()) if sparse else 1.0,
             trigger_tiers=int(self.sp_trig_tiers.value()) if sparse else 0,
@@ -4454,6 +4702,10 @@ class MainWindow(QMainWindow):
             trigger_cool=int(self.sp_trig_cool.value()) if sparse else 0,
             trigger_flip=bool(sparse and self.chk_trig_flip.isChecked()),
             trigger_rule_flip=bool(sparse and self.chk_trig_rule_flip.isChecked()),
+            pooled=bool(getattr(self, "chk_ml_pool", None)
+                        and self.chk_ml_pool.isChecked()
+                        and self.family == FAMILY_FACTOR
+                        and self.factor_mode == "ml"),
         )
 
     def run_analysis(self, df_override: pd.DataFrame | None = None) -> None:
@@ -4691,7 +4943,7 @@ class MainWindow(QMainWindow):
         只在「因子族 + 机器学习 + 勾了复选框」时生效：规则策略那条路的仓位由规则
         决定，合并训练学出来的分数只做过滤，混在一起说不清是谁在起作用。
         """
-        w = getattr(self, "chk_pool", None)
+        w = getattr(self, "chk_ml_pool", None)
         return bool(
             w is not None and w.isChecked()
             and self.family == FAMILY_FACTOR
@@ -4872,9 +5124,20 @@ class MainWindow(QMainWindow):
         idle_txt = ""
         if idle:
             idle_txt = "　空仓：" + "、".join(idle[:4]) + ("…" if len(idle) > 4 else "")
+        # 本金亏光的品种必须点名：等权组合被拖到 -47% 时，用户看到每个品种
+        # 单独跑都没这么差，会以为是组合算错了。真相往往是「20 个品种在杠杆下
+        # 亏光了」，而这 20 个在组合里各占 1/N，加起来就是那几十个点。
+        # 判定和 `combine` 里一致：日频净值跌破 0 就算亏光（组合里按份额 0 算）
+        blown = [str(lbl).split("　")[0] for lbl, r in named
+                 if len(r.equity.dropna())
+                 and float(_to_daily(r.equity).min()) <= 0]
+        blown_txt = ""
+        if blown:
+            blown_txt = (f"　本金亏光 {len(blown)} 个："
+                         + "、".join(blown[:4]) + ("…" if len(blown) > 4 else ""))
         self.lbl_status.setText(
             f"{head} · {res.label} · 累计 {res.metrics['total_return'] * 100:+.1f}%"
-            + idle_txt
+            + idle_txt + blown_txt
             + (f"　缺：{'、'.join(failed)}" if failed else "")
         )
         self._publish_port(res, head, period, bpy)
@@ -4934,10 +5197,26 @@ class MainWindow(QMainWindow):
         rev = {k: True for k in self._reversed_factor_keys()}
         fc = self._factor_cfg()
         _cx = self._cross_new_params()
+        # 第一步的行情：配了别的周期就另取一份（典型：5 分钟策略用日线成交额
+        # 筛池）。取不到就退回策略周期，并在状态栏说清楚 —— 悄悄降级比报错更糟
+        p1 = self._step1_period()
+        step1_frames = None
+        if p1 and p1 != period:
+            step1_frames, miss1 = self._frames_for(keys, p1)
+            if len(step1_frames) < cross_engine.MIN_CROSS:
+                self._show_single_view()
+                self._clear_chart(
+                    f"第一步因子要用 {PERIOD_LABEL.get(p1, p1)} 行情，"
+                    f"但这批品种只有 {len(step1_frames)} 个有该周期数据"
+                    + (f"（缺：{'、'.join(miss1[:6])}）" if miss1 else "")
+                    + "\n换成「跟随策略周期」，或者先去「数据管理 → 天勤」补这个周期"
+                )
+                return
         ccfg = cross_engine.CrossConfig(
             mode=self._cross_mode(),
             rebalance=int(self.sp_cross_reb.value()),
             rebalance_unit=self._cross_reb_unit(),
+            step1_period=p1 if step1_frames is not None else "",
             top_pct=float(self.sp_cross_pct.value()),
             bot_pct=float(self.sp_cross_bot.value()),
             long_only=self.cfg.long_only,
@@ -4979,17 +5258,28 @@ class MainWindow(QMainWindow):
                  f"{ccfg.step_text(_bpd)}调仓")
         if ccfg.pool_keys:
             label += f" · 先筛池 {ccfg.pool_top_pct:g}%"
+        if ccfg.step1_period:
+            # 跨周期是「同一组参数、两套数据」，不写出来就没法解释两次结果为什么
+            # 不一样
+            label += f" · 第一步因子用{PERIOD_LABEL.get(ccfg.step1_period, ccfg.step1_period)}"
         if ccfg.weight == "tier" and ccfg.tiers >= 2:
             label += f" · {ccfg.tiers} 档"
+        # 杠杆：截面的名义敞口跟着「仓位」那一组控件走，和多品种回测同一个口径。
+        # 不写出来就没法解释「同样的品种、同样的时序策略，两条曲线差一倍」
+        _lev = float(cross_engine.leverage_vector(frames, bt).mean() or 1.0)
+        if abs(_lev - 1.0) > 1e-9:
+            label += f" · ×{_lev:.1f} 杠杆"
 
         # 全部走后台线程。单因子 / 多因子在几十个品种的 5 分钟历史上也不是
         # 几十毫秒的事（分数面板 + 排序 + 成本向量都在这个量级），主线程里跑
         # 窗口会假死，连「取消」都点不动；机器学习更要跑几十折 walk-forward。
         # 统一走线程能少一套分支，也免得两条路的结果口径慢慢走偏
-        self._start_cross_worker(frames, ccfg, bt, label, period, missing)
+        self._start_cross_worker(frames, ccfg, bt, label, period, missing,
+                                 step1_frames=step1_frames)
 
     def _finish_cross(self, out, label: str, ccfg, frames: dict, period: str,
-                      bt: BacktestConfig, missing: list[str]) -> None:
+                      bt: BacktestConfig, missing: list[str],
+                      step1_frames: dict | None = None) -> None:
         """截面回测收尾：包成 `Result` 挂到组合视图上。同步和线程两条路共用。"""
         if not out.ok:
             self._show_single_view()
@@ -5005,8 +5295,12 @@ class MainWindow(QMainWindow):
             range_years=self.cb_range.currentData() or None,
             long_only=ccfg.long_only, bars_per_year=bt.bars_per_year,
             overlay=False, selected_keys=[],
-            # 「截面因子分析」要拿品种池重算一遍横截面 IC，光有净值画不出来
-            cross=(frames, ccfg, out.score),
+            # 「截面因子分析」要拿品种池重算一遍横截面 IC，光有净值画不出来。
+            # 跨周期时用**第一步自己的**那份行情和分数：把日线分数铺到每根 5 分钟
+            # bar 上再算 IC，等于同一个观测重复几十遍，t 值会被吹起来
+            cross=((step1_frames or frames), ccfg,
+                   (out.score_step1 if getattr(out, "score_step1", None)
+                    is not None else out.score)),
         )
         self._show_port_view()
         self._set_cross_factor_tab_visible(True)
@@ -5020,29 +5314,35 @@ class MainWindow(QMainWindow):
         self.factor_outcome = None
         self._strategy_label = label
         m = res.metrics
+        # 杠杆下净值可能被亏穿。钉在 0 之后曲线还在，但那已经不是「回撤」而是
+        # 「本金没了」—— 不说清楚，用户只会看到一条贴地的线
+        blown_txt = "　已爆仓（净值归零）" if float(out.equity.min()) <= 0 else ""
         self.lbl_status.setText(
             f"{label} · 累计 {m['total_return'] * 100:+.1f}%"
             f" · 年化 {m['cagr'] * 100:+.2f}% · 回撤 {m['max_dd'] * 100:.1f}%"
             f" · 调仓 {m['n_trades']} 次"
+            + blown_txt
             + (f"　缺：{'、'.join(missing)}" if missing else "")
         )
         self._publish_port(res, label, period, bt.bars_per_year)
 
     def _start_cross_worker(self, frames, ccfg, bt, label: str, period: str,
-                            missing: list[str] | None = None) -> None:
+                            missing: list[str] | None = None,
+                            step1_frames: dict | None = None) -> None:
         """截面回测走后台线程。已经在跑的先取消，避免旧结果盖掉新结果。"""
         self._cancel_cross_worker()
         self._c_seq += 1
         seq = self._c_seq
 
         worker = CrossWorker(frames, ccfg, bt,
-                             self.cb_cost.currentData() or None, label)
+                             self.cb_cost.currentData() or None, label,
+                             step1_frames=step1_frames)
         # 收尾要用的上下文挂在 worker 上，靠 `sender()` 取回来。**不能**用
         # `connect(lambda ...)` 把 seq/上下文带过去：lambda 没有 QObject 接收者，
         # PySide 会当成直连，`done` 于是在**工作线程**里直接跑 `_finish_cross`，
         # 一碰控件就是 "Internal C++ object already deleted" / 随机崩溃
         worker.seq = seq
-        worker.ctx = (ccfg, frames, period, bt, list(missing or []))
+        worker.ctx = (ccfg, frames, period, bt, list(missing or []), step1_frames)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -5102,12 +5402,14 @@ class MainWindow(QMainWindow):
         ctx = getattr(w, "ctx", (None, {}, "", None, []))
         ccfg, frames, period, bt = ctx[:4]
         missing = list(ctx[4]) if len(ctx) > 4 else []
+        step1_frames = ctx[5] if len(ctx) > 5 else None
         self._c_worker = None
         self._c_thread = None
         if self._closing or seq != self._c_seq or seq == self._c_applied:
             return
         self._c_applied = seq
-        self._finish_cross(out, out.label, ccfg, frames, period, bt, missing)
+        self._finish_cross(out, out.label, ccfg, frames, period, bt, missing,
+                           step1_frames=step1_frames)
 
     def _on_cross_failed(self, msg: str) -> None:
         w = self.sender()

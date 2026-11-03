@@ -99,6 +99,16 @@ class CrossConfig:
     pool_top_pct: float = 60.0          # 池里保留分数最高的百分之几
     pool_min: int = 0                   # 池子至少留几个（不够就全留）
 
+    # 第一步（截面排名 + 筛池）用**哪个周期**的因子算。空 = 跟随策略周期。
+    #
+    # 为什么需要：5 分钟策略选品种，靠的往往是「日线成交额」这种慢变量 ——
+    # 流动性是几天、几周的量级，用 5 分钟成交额去排名只会被当天的消息面带着
+    # 走。反过来，5 分钟因子做排名等于让噪声决定买谁。
+    #
+    # 对齐规则见 `align_to_clock()`：源周期的分数整体 `shift(1)` 再 as-of 前向
+    # 填充，**绝不让当天还没收完的那根参与排名**。
+    step1_period: str = ""
+
     # 截面因子。三种模式和时序那边一样：single / multi / ml
     factor_mode: str = "multi"
     factor_keys: list = field(default_factory=list)
@@ -178,6 +188,10 @@ class CrossResult:
     # 截面分数面板。画「截面因子分析」要用，`score_panel` 已经算过一遍，丢掉
     # 就得重算十几秒
     score: pd.DataFrame | None = None
+    # 第一步用**别的周期**时，那份还没搬到策略时钟上的分数（原周期）。因子分析
+    # 要在它自己的周期上算 —— 把日线分数铺到 5 分钟每根 bar 上再算 IC，等于把
+    # 同一个观测重复几十遍，t 值会被吹起来
+    score_step1: pd.DataFrame | None = None
 
     @property
     def ok(self) -> bool:
@@ -200,6 +214,27 @@ def open_panel(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     if not cols:
         return pd.DataFrame()
     return pd.concat(cols, axis=1).sort_index().ffill()
+
+
+def align_to_clock(panel: pd.DataFrame, index) -> pd.DataFrame:
+    """把**别的周期**算出来的面板搬到策略的时钟上，只用已经收完的那一根。
+
+    为什么不直接 `reindex(method="ffill")`：日线那根 K 线标的是**当天**，它的
+    收盘价要到 15:00 才知道。5 分钟策略在当天 09:35 拿「当天的日线因子」排名，
+    等于把收盘结果提前灌进上午的 bar —— IC 会被吹起来，实盘一上就露馅。
+
+    所以先整体 `shift(1)`（丢掉当前这根，它还没收完），再按时间 as-of 前向填充。
+    源周期比目标周期细的时候这条规则同样成立：1 小时 bar 标 10:00、11:00 才收完，
+    10:35 那根 5 分钟 bar 只能看到 09:00 那根的结果。代价是窗口最前面一段没有
+    分数（源周期第一根之前），那几根不参与排名，属于正常损耗。
+    """
+    if panel is None or panel.empty:
+        return pd.DataFrame(index=pd.Index(index))
+    p = panel.sort_index()
+    idx = pd.DatetimeIndex(index)
+    out = p.shift(1).reindex(idx, method="ffill")
+    out.index = pd.Index(index)
+    return out
 
 
 def _row_z(row: pd.Series) -> pd.Series:
@@ -436,6 +471,34 @@ def ml_score_panel(frames: dict[str, pd.DataFrame], keys: list[str], fcfg,
     return _cross_z(panel).dropna(how="all")
 
 
+def leverage_vector(frames: dict[str, pd.DataFrame], bt: BacktestConfig) -> pd.Series:
+    """每个品种的名义敞口是权益的几倍 —— 和单品种那条路用**同一个仓位口径**。
+
+    截面组合原来恒按 1 倍名义额算（每个品种 1/N），而「多品种回测」按
+    「资金分配 ÷ 每手保证金」开仓：资金分配 30%、保证金 10% 就是 3 倍名义额。
+    两条路各按各的杠杆跑，结果差一大截，界面上却一个字都没提 —— 用户把截面
+    的「选 100% / 100 个月调仓」调成等于没选，还是对不上，就是这个原因。
+
+    `unit`（名义敞口 = 权益）就是 1 倍；`capital` 是「资金分配比例 ÷ 保证金率」；
+    `fixed` / `risk` 定不出「占权益多少」（手数取决于 ATR / 固定值），按 1 倍算。
+    """
+    keys = list(frames)
+    mode = str(getattr(bt, "sizing", "unit") or "unit").lower()
+    if mode != "capital":
+        return pd.Series(1.0, index=keys, dtype=float)
+    base = float(getattr(bt, "initial_cash", 0.0) or 0.0)
+    budget = float(getattr(bt, "capital", 0.0) or 0.0) or base
+    if base <= 0 or budget <= 0:
+        return pd.Series(1.0, index=keys, dtype=float)
+    pct = budget / base
+    out = {}
+    for key in keys:
+        sym, _, ex = key.rpartition("_")
+        margin = float(symbols_info.info(sym, ex).get("margin") or 0.0) or 0.1
+        out[key] = pct / margin
+    return pd.Series(out, dtype=float)
+
+
 def cost_vector(frames: dict[str, pd.DataFrame], bt: BacktestConfig,
                 profile: str | None = None) -> pd.Series:
     """每个品种「单边成本占名义额的比例」，用来乘换手。
@@ -550,25 +613,32 @@ def trades_from_weights(weights: pd.DataFrame,
 
 def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
         profile: str | None = None, label: str = "",
-        progress=None, cancel=None) -> CrossResult:
+        progress=None, cancel=None,
+        step1_frames: dict[str, pd.DataFrame] | None = None) -> CrossResult:
     """跑一遍截面策略。出错写进 `CrossResult.error`，不抛异常。
 
     `progress` / `cancel` 只给机器学习模式用：walk-forward 要跑几十折，界面
     那边靠它显示进度、也靠它中途叫停。
+
+    `step1_frames` 是**第一步（排名 + 筛池）专用的行情**，周期可以和策略不同
+    （典型：5 分钟策略用日线成交额筛池）。它的分数会按 `align_to_clock()` 搬到
+    策略的时钟上，只用已经收完的那一根。传 None 就是「跟随策略周期」，老行为。
     """
     if not frames or len(frames) < MIN_CROSS:
         return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
                            error=f"截面策略至少要 {MIN_CROSS} 个品种，现在只有 {len(frames)} 个")
+    # 第一步用哪份行情：配了周期且真的拿到了另一份才换，否则还是自己的
+    src = step1_frames if (cfg.step1_period and step1_frames) else frames
     try:
-        score = score_panel(frames, list(cfg.factor_keys or []),
-                            cfg.factor_reverse, mode=cfg.factor_mode or "multi",
-                            fcfg=_factor_cfg(cfg), progress=progress, cancel=cancel,
-                            label_mode=cfg.label_mode)
+        score_src = score_panel(src, list(cfg.factor_keys or []),
+                                cfg.factor_reverse, mode=cfg.factor_mode or "multi",
+                                fcfg=_factor_cfg(cfg), progress=progress, cancel=cancel,
+                                label_mode=cfg.label_mode)
     except fstrat.Cancelled:
         raise                     # 用户点的「取消」，不是回测失败
     except Exception as exc:  # noqa: BLE001
         return CrossResult(pd.Series(dtype=float), pd.DataFrame(), error=str(exc))
-    if score.empty:
+    if score_src.empty:
         return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
                            error="截面分数全空：选中的因子在这批品种上没有数据")
 
@@ -579,19 +649,28 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     # 权重被放大，换手和滑点全上去了。
     if str(cfg.pool_mode or "off").lower() != "off" and cfg.pool_keys:
         try:
-            pool = score_panel(frames, list(cfg.pool_keys), cfg.pool_reverse,
-                               mode=cfg.pool_mode, fcfg=_factor_cfg(cfg),
-                               progress=progress, cancel=cancel,
-                               label_mode=cfg.label_mode)
+            pool_src = score_panel(src, list(cfg.pool_keys), cfg.pool_reverse,
+                                   mode=cfg.pool_mode, fcfg=_factor_cfg(cfg),
+                                   progress=progress, cancel=cancel,
+                                   label_mode=cfg.label_mode)
         except fstrat.Cancelled:
             raise
         except Exception as exc:  # noqa: BLE001
             return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
                                error=f"第一步选品种失败：{exc}")
-        score = _apply_pool(score, pool, cfg.pool_top_pct, cfg.pool_min)
-        if score.dropna(how="all").empty:
+        score_src = _apply_pool(score_src, pool_src, cfg.pool_top_pct, cfg.pool_min)
+        if score_src.dropna(how="all").empty:
             return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
                                error="第一步筛完之后池子是空的 —— 把保留比例调大")
+
+    # 分数从第一步的时钟搬到策略的时钟。**同周期不搬** —— `align_to_clock` 会
+    # 整体 shift(1)，同一份数据上那样做等于凭空多滞后一根
+    close = close_panel(frames)
+    score = score_src if src is frames else align_to_clock(score_src, close.index)
+    score = score.dropna(how="all")
+    if score.empty:
+        return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
+                           error="第一步的分数搬不到策略的时钟上（两边日期不重叠？）")
 
     # 截面回测现在整条路都在后台线程里跑（`gui.app.CrossWorker`）。用户拖一下
     # 滑杆就会重排一次，旧的那次得能自己退出，否则几次下来几个线程抢 CPU。
@@ -601,7 +680,6 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
         if cancel is not None and cancel():
             raise fstrat.Cancelled
 
-    close = close_panel(frames)
     close = close.reindex(score.index).ffill()
     rets = close.pct_change().fillna(0.0)
     cvec = cost_vector(frames, bt, profile).reindex(score.columns).fillna(0.0)
@@ -625,11 +703,19 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     # 上一组的仓位，调仓日整体换一次。不要在这里再 ffill —— 那会把「主动平掉」
     # 和「还没调仓」混成同一个 NaN。
     weights = weights.reindex(columns=score.columns).fillna(0.0)
+    # 杠杆：和单品种那条路同一个仓位口径。截面原来恒按 1 倍名义额算，
+    # 而「多品种回测」按「资金分配 ÷ 保证金」开仓（默认 30% / 10% = 3 倍），
+    # 两条路因此天然差一大截。放在这里统一乘，权重、换手、成本一起跟着走
+    lev = leverage_vector(frames, bt).reindex(weights.columns).fillna(1.0)
+    if float(lev.min()) != 1.0 or float(lev.max()) != 1.0:
+        weights = weights * lev
     port_ret = (weights.shift(1) * rets).sum(axis=1)
     fee = (weights.diff().abs() * cvec).sum(axis=1).fillna(0.0)
     net = port_ret - fee
 
-    equity = (1.0 + net).cumprod()
+    # 单根亏 100% 以上就是爆仓，净值钉在 0 —— 负数净值没有意义，而且会把
+    # 「最大回撤 / 夏普」这些比例型指标一起算崩（`combine` 平均时更糟）
+    equity = (1.0 + net.clip(lower=-1.0)).cumprod()
     equity.iloc[0] = 1.0
     bpy = bt.bars_per_year or 252.0
     n_reb = len(range(0, len(score), step))
@@ -649,6 +735,7 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
         step=step, bars_per_day=bpd,
         trades=trades_from_weights(weights, close),
         score=score,
+        score_step1=(score_src if src is not frames else None),
     )
 
 

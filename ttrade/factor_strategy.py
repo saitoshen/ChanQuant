@@ -35,11 +35,41 @@ import pandas as pd
 import ttrade.factors as F
 import ttrade.factor_metrics as M
 import ttrade.mlmodels as ML
-from ttrade.strategies import STRATEGIES, run_strategy
+from ttrade.strategies import PARAM_LABELS, STRATEGIES, run_strategy
 
 
 class Cancelled(Exception):
     """训练/预测过程中被用户取消。"""
+
+
+def _is_degenerate_model(model, X_probe: np.ndarray) -> bool:
+    """这个模型是不是「训废了」（只输出常数）。
+
+    稀疏采样 + 小样本会让树模型训出**单叶树**：那棵树没有任何分裂，
+    预测值恒等于训练集均值。特征重要度还在（树确实存在），所以从产物
+    文件上看不出任何异常 —— 但实盘会炸：预测恒定 → 滚动 z 的标准差是 0
+    → z 分数永远是 NaN → 报「z 分数算不出来（历史预测不够）」。
+
+    这里拿几行真实特征探一下，看预测值是不是只有一个取值。
+
+    `X_probe` 要给**多行**：只给一行的话，恒定模型和一棵刚好在这行上
+    落同一个叶子的树看起来一样，判不出来。
+    """
+    try:
+        Xp = np.asarray(X_probe, dtype=float)
+        if Xp.ndim != 2 or Xp.shape[0] < 2:
+            return False
+        p = np.asarray(model.predict(Xp), dtype=float)
+    except Exception:  # noqa: BLE001
+        return False
+    p = p[np.isfinite(p)]
+    if len(p) < 2:
+        return False
+    # 相对标准差：预测值本身量纲很小（前向收益大概 1e-3），必须相对比较
+    scale = float(np.max(np.abs(p)))
+    if scale <= 0:
+        return True
+    return float(np.std(p)) <= 1e-9 * max(1.0, scale)
 
 
 # ---------------------------------------------------------------- 配置
@@ -110,6 +140,12 @@ class FactorConfig:
     # 反手策略 —— 它是「这个因子我读反了」（动量因子在震荡市里突破即回落）。
     trigger_flip: bool = False      # 反转因子触发
     trigger_rule_flip: bool = False  # 反转规则触发
+
+    # 多品种合并训练：把 N 个品种的样本堆成一张长表训一个模型，再各自交易。
+    # 回测里界面上有个勾选框（`chk_ml_pool`），以前**没存进配置** —— 导致
+    # 回测走合训、离线训练和实盘走逐品种，三者不一致。现在存进来，训练脚本
+    # 和实盘就能和回测对齐。
+    pooled: bool = False
 
     def reversed_keys(self) -> set[str]:
         """真正打开反转的因子。顺手把非真值过滤掉，调用方不用自己判。"""
@@ -375,8 +411,13 @@ def build_score(
     cfg: FactorConfig,
     progress=None,
     cancel=None,
+    collect_models: list | None = None,
 ) -> ScorePack:
-    """三种模式共用的分数构建。返回的 `score` 已是 PIT 标准化值。"""
+    """三种模式共用的分数构建。返回的 `score` 已是 PIT 标准化值。
+
+    `collect_models` 传了就往里塞每一折的模型（见 `walk_forward`）——
+    给「离线训练、实盘只预测」用。
+    """
     cfg = cfg.normalized()
     keys = [k for k in keys if k in F.FACTORS]
     if not keys:
@@ -472,12 +513,23 @@ def build_score(
             )
         pred, imp, n_folds = walk_forward(
             fmat, fwd, cfg, progress=progress, cancel=cancel, sample_mask=mask,
-            stats=wstats,
+            stats=wstats, collect_models=collect_models,
         )
         if wstats.get("fallback"):
             notes.append(
                 f"{int(wstats['fallback'])}/{n_folds} 折的触发样本不足 40 个，"
                 "这几折退回全样本训练（触发太稀，把阈值调低或冷却调小）"
+            )
+        if wstats.get("degenerate_fold"):
+            notes.append(
+                f"{int(wstats['degenerate_fold'])}/{n_folds} 折的触发样本太少，"
+                "训出来的模型只会输出常数（连全样本退回也救不回来），"
+                "这几折留空不出信号（触发样本这么少，模型学不出东西）"
+            )
+        if wstats.get("degenerate"):
+            notes.append(
+                f"{int(wstats['degenerate'])}/{n_folds} 折的触发样本训出了常数模型，"
+                "已退回全样本重训（触发点太稀，把阈值调低或冷却调小）"
             )
         if wstats.get("thin"):
             notes.append(
@@ -618,7 +670,13 @@ def trigger_signal(df: pd.DataFrame, cfg: FactorConfig):
             # 让分档退化成「单一档」，至少不会因为 NaN 一个样本都不建
             if not zs:
                 strength = pd.Series(np.where(armed, 1.0, np.nan), index=idx)
-            notes.append(f"触发：规则 {STRATEGIES[cfg.trigger_rule].label}"
+            # 参数非默认时要写出来：同一句「触发：规则 双均线交叉」，5/20 和
+            # 10/60 的样本点差一倍，图上却看不出区别
+            prm = {k: v for k, v in dict(cfg.trigger_params or {}).items()
+                   if k in STRATEGIES[cfg.trigger_rule].params}
+            ptxt = ("（" + "、".join(f"{PARAM_LABELS.get(k, k)} {v:g}"
+                                    for k, v in prm.items()) + "）") if prm else ""
+            notes.append(f"触发：规则 {STRATEGIES[cfg.trigger_rule].label}{ptxt}"
                          + ("（反转）" if cfg.trigger_rule_flip else ""))
             if not zs:
                 # 没有因子那一侧，强度是 1.0 占位，不是真信号：方向和「值不值得做」
@@ -733,6 +791,7 @@ def walk_forward(
     cancel=None,
     sample_mask=None,
     stats: dict | None = None,
+    collect_models: list | None = None,
 ) -> tuple[pd.Series, pd.Series | None, int]:
     """滚动训练 + 预测。
 
@@ -751,6 +810,11 @@ def walk_forward(
 
     `stats` 是可选的计数容器：某些折的稀疏样本不够训练时会退回全样本，退回
     了几折写在 `stats["fallback"]` 里。不传就只做事不记账。
+
+    `collect_models` 是可选的列表：传了就往里塞每一折训出来的模型和它的
+    预测区间 `[(model, b, c), ...]`。这是给「离线训练、实盘只预测」用的 ——
+    把每一折都存成 .pkl，实盘按 bar 落在哪一折就调用哪一折的模型，
+    得到的预测序列和回测**逐根一致**。不传就一个都不留（老行为，不占内存）。
 
     返回 (预测序列, 因子重要度, 折数)。未覆盖区间为 NaN。
     """
@@ -824,6 +888,35 @@ def walk_forward(
             # 单折失败不该让整条策略崩掉，跳过该折继续
             continue
 
+        # ---- 稀疏样本训出「常数模型」的兜底 ----
+        # 几十个样本 + 树的最小叶子样本数 / L1 正则，劈不开 → 只留一棵单叶树
+        # → 预测恒定 → 实盘滚动 z 的标准差是 0 → z 分数永远是 NaN。这种模型
+        # 在产物文件里看不出异常（重要度还在），但实盘会一直卡在「训练中」。
+        # 这里探测到就退回全样本重训一次。
+        if _is_degenerate_model(model, Xtr[ok][:64]):
+            ok_full = np.isfinite(Ytr) & (fin.sum(axis=1) >= need_cols)
+            if ok_full.sum() >= need:
+                m2 = ML.build(cfg.model)
+                try:
+                    m2.fit(Xtr[ok_full], Ytr[ok_full])
+                except Exception:  # noqa: BLE001
+                    m2 = None
+                if m2 is not None and not _is_degenerate_model(m2, Xtr[ok_full][:64]):
+                    model = m2
+                    if stats is not None:
+                        stats["degenerate"] = int(stats.get("degenerate", 0)) + 1
+                else:
+                    model = None
+            else:
+                model = None
+            if model is None:
+                # 稀疏样本和全样本都救不回来：这一折只能出常数预测。
+                # 宁可这折整段留 NaN，也不要一个恒定的分数 —— 恒定分数在
+                # 滚动 z 里会把标准差抹成 0，后面每一根都跟着算不出来。
+                if stats is not None:
+                    stats["degenerate_fold"] = int(stats.get("degenerate_fold", 0)) + 1
+                continue
+
         lb = int(getattr(model, "lookback", 0) or 0)
         ctx_start = max(a, b - lb) if lb else b
         ctx = X[ctx_start:c]
@@ -839,6 +932,12 @@ def walk_forward(
         if imp is not None and len(imp) == len(keys):
             imp_acc += np.asarray(imp, dtype=float)
             imp_n += 1
+
+        if collect_models is not None:
+            # 把这一折的模型留下：`(模型, 预测区间起, 预测区间止)`。
+            # 区间是**bar 位置**（相对 `fmat.index`），实盘那边靠它判断
+            # 「当前这根该用哪一折的模型」
+            collect_models.append((model, int(b), int(c)))
 
         done += 1
         if progress:
@@ -864,15 +963,20 @@ def run_factor_strategy(
     cfg: FactorConfig,
     progress=None,
     cancel=None,
+    collect_models: list | None = None,
 ) -> FactorOutcome:
     """因子策略：分数 → 阈值信号。
 
     触发模式（稀疏采样）走的是另一套状态机：进场只在触发点、方向由触发定、
     出场看触发强度（见 `trigger_hysteresis`）。单因子 / 多因子没有触发点，
     仍是分数过阈值那一套。
+
+    `collect_models` 传了就收集每一折的模型（见 `walk_forward`）——
+    给「离线训练、实盘只预测」用。
     """
     cfg = cfg.normalized()
-    pack = build_score(df, mode, keys, cfg, progress=progress, cancel=cancel)
+    pack = build_score(df, mode, keys, cfg, progress=progress, cancel=cancel,
+                       collect_models=collect_models)
     if mode == "ml" and pack.trigger is not None:
         sig = trigger_hysteresis(pack.score.to_numpy(), pack.trigger,
                                  cfg.entry_z, cfg.exit_z)
@@ -911,6 +1015,7 @@ def pooled_score(
     cfg: FactorConfig,
     progress=None,
     cancel=None,
+    collect_models: list | None = None,
 ) -> dict[str, ScorePack]:
     """多品种**合并**训练：N 个品种的样本堆成一张长表，训一个模型。
 
@@ -1041,6 +1146,8 @@ def pooled_score(
             pred[want] = model.predict(Xf[want])
         except Exception:      # noqa: BLE001
             continue
+        if collect_models is not None:
+            collect_models.append((model, int(b), int(c)))
         imp = model.importance()
         if imp is not None and len(imp) == len(use):
             imp_acc += np.asarray(imp, dtype=float)
@@ -1103,6 +1210,7 @@ def run_pooled_strategy(
     cfg: FactorConfig,
     progress=None,
     cancel=None,
+    collect_models: list | None = None,
 ) -> dict[str, FactorOutcome]:
     """多品种合并训练 + 各自交易。返回 `{品种: FactorOutcome}`。
 
@@ -1110,7 +1218,8 @@ def run_pooled_strategy(
     回测各算各的 —— 否则「多品种等权」就变成了一个组合单。
     """
     cfg = cfg.normalized()
-    packs = pooled_score(frames, keys, cfg, progress=progress, cancel=cancel)
+    packs = pooled_score(frames, keys, cfg, progress=progress, cancel=cancel,
+                         collect_models=collect_models)
     out: dict[str, FactorOutcome] = {}
     for sym, pack in packs.items():
         df = frames[sym]

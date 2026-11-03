@@ -18,11 +18,13 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFormLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -280,3 +282,79 @@ class SymbolInfoDialog(QDialog):
             symbols_info.reset_override(it.get("symbol", ""), it.get("exchange", ""))
         self._fill()
         self.lbl.setText(f"已恢复 {len(rows)} 行")
+
+
+class RuleParamsDialog(QDialog):
+    """一条规则策略的参数（稀疏采样里「规则触发」用的那一份）。
+
+    和组合页「设置参数」里那段是同一套做法（整数用 QSpinBox、小数用
+    QDoubleSpinBox，上下限来自 `spec.param_meta`），但**值是独立一份**：
+    主面板那组滑杆属于「策略 = 这条规则」，这里属于「机器学习 + 规则触发」。
+    两条路各调各的 —— 触发用双均线 5/20、主策略用 10/60 是完全正常的用法，
+    共用一个 dict 只会互相盖。
+
+    `rows` 是 `(key, 中文名, 下限, 上限, 步长, 默认值, 当前值)`。传默认值是为了
+    「恢复默认」这个按钮 —— 没有它，用户把参数调乱了只能靠记忆改回去。
+    """
+
+    def __init__(self, label: str, rows, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"规则触发参数 · {label}")
+        self.setMinimumWidth(360)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+
+        tip = QLabel(
+            "这条规则只负责「什么时候建样本、往哪边做」，不参与训练特征。\n"
+            "参数和主策略那组滑杆是两套：改这里不会动到「策略」下拉里选的规则。"
+        )
+        tip.setStyleSheet(_HINT)
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        form = QFormLayout()
+        form.setSpacing(6)
+        self.sp: dict[str, QWidget] = {}
+        self._defaults: dict[str, float] = {}
+        for key, text, lo, hi, step, dflt, cur in rows:
+            self._defaults[key] = dflt
+            if isinstance(dflt, float):
+                w = QDoubleSpinBox()
+                w.setDecimals(2)
+                w.setRange(float(lo), float(hi))
+                w.setSingleStep(float(step))
+            else:
+                # 整数参数的上下限必须按 int 给：QSpinBox 拿到 (0.1, 1.5) 会夹成
+                # (0, 1)，用户什么都没改，门槛就变 0 了（组合页踩过同一个坑）
+                w = QSpinBox()
+                w.setRange(int(lo), int(hi))
+                w.setSingleStep(max(1, int(step)))
+            try:
+                w.setValue(float(cur) if isinstance(dflt, float) else int(cur))
+            except (TypeError, ValueError):
+                w.setValue(dflt)
+            self.sp[key] = w
+            form.addRow(text, w)
+        lay.addLayout(form)
+
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+                               | QDialogButtonBox.Reset)
+        box.button(QDialogButtonBox.Ok).setText("确定")
+        box.button(QDialogButtonBox.Cancel).setText("取消")
+        box.button(QDialogButtonBox.Reset).setText("恢复默认")
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        box.button(QDialogButtonBox.Reset).clicked.connect(self._reset)
+        lay.addWidget(box)
+
+    def _reset(self) -> None:
+        for key, dflt in self._defaults.items():
+            self.sp[key].setValue(dflt)
+
+    def values(self) -> dict:
+        out = {}
+        for key, w in self.sp.items():
+            v = w.value()
+            out[key] = float(v) if isinstance(w, QDoubleSpinBox) else int(v)
+        return out

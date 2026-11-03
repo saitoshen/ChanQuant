@@ -61,6 +61,26 @@ def market_of(cfg) -> str:
     return "cn" if ex else "us"
 
 
+def split_key(key: str, market: str = "") -> tuple[str, str]:
+    """`StrategyConfig.key()` 的逆运算：把 `RB_SHFE` / `SSE.600000` / `AAPL`
+    拆回 (代号, 交易所)。
+
+    多品种配置里存的是**键**（`DataStore` 用的那个），要跑单品种回放就得拆开
+    再拼一份只跑这一个品种的配置。A 股的键自带交易所前缀、美股根本没有交易所，
+    一律按 `_` 拆会把 `SSE.600000` 拆成 ("SSE.600000", "")。
+    """
+    k = str(key or "")
+    mk = market or ("cn_stock" if "." in k and k.split(".", 1)[0].upper()
+                    in STOCK_EXCHANGES else "cn")
+    if mk == "cn_stock":
+        head, _, tail = k.partition(".")
+        return (tail, head.upper()) if tail else (k, "")
+    if mk == "us":
+        return k, ""
+    sym, _, ex = k.rpartition("_")
+    return (sym, ex) if sym else (k, "")
+
+
 def make_bt(market: str, allow_short: bool = False,
             cfg=None) -> BacktestConfig:
     """按市场成本建一份回测配置。`allow_short` 来自配置里的 `note == "short"`。
@@ -364,6 +384,46 @@ def run(cfg, df: pd.DataFrame | None, market: str = "",
         rule_key=rule_key, period=period, factor_cfg=fc, outcome=out, keys=keys,
         filter_active=filter_active, long_only=bt.long_only, bars_per_year=bpy,
     )
+
+
+def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
+    """多品种等权回放的离线版本。组合页双击一条多品种策略走这里。
+
+    和研究页的「多品种回测」是同一个口径：**每个品种各跑一遍**（各自的成本、
+    乘数、保证金），再把归一化后的净值曲线取平均（`backtest.combine`）。
+    不是「一个账户里按权重持有一篮子」—— 那是截面策略，两者别混。
+
+    返回的 `Replay` 里 `df` / `raw` 是空的：多品种没有「某一条策略的 K 线」，
+    画 K 线会误导。视图那边用组合视图（绩效 / 交易记录 / 阶段）。
+    """
+    from ttrade.backtest import combine
+
+    keys = [k for k in (frames or {}) if frames[k] is not None and len(frames[k]) > 1]
+    if len(keys) < 2:
+        return Replay(error=f"多品种至少要 2 个品种的行情，现在只有 {len(keys)} 个")
+    mk = market or market_of(cfg)
+    results, named, failed = [], [], []
+    for key in keys:
+        sym, ex = split_key(key, mk)
+        # 每个品种单独一份配置：成本、乘数、保证金都按它自己的算。共用一份会把
+        # 上一个品种的 tick 带到下一个头上（研究页那边踩过同一个坑）
+        one = cfg.clone(symbol=sym, exchange=ex, multi_symbols=[], cross_symbols=[])
+        rp = run(one, frames[key], market=market, with_bh=False)
+        if not rp.ok:
+            failed.append(f"{key}：{rp.error}")
+            continue
+        results.append(rp.res)
+        named.append((key, rp.res))
+    if not results:
+        return Replay(error="多品种一个都没跑出来：" + "；".join(failed[:4]))
+    res = combine(results, label=f"多品种等权 · {len(results)} 个")
+    period = getattr(cfg, "period", "") or "1d"
+    bpy = bars_per_year(res.equity.index)
+    return Replay(res=res, bh=None, label=res.label,
+                  family=getattr(cfg, "family", "rule"),
+                  period=period,
+                  long_only=make_bt(mk, getattr(cfg, "note", "") == "short", cfg).long_only,
+                  bars_per_year=bpy, keys=keys)
 
 
 def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
