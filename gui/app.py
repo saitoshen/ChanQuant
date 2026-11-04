@@ -502,14 +502,22 @@ def load_futures_csv(key: str, data_dir: str) -> pd.DataFrame:
             df[col] = df[col].to_numpy(dtype=float) * f
 
     df = df.set_index("date")
-    # 并入期限结构 / 期权波动率列（展期因子、期权因子要用）。缺文件时静默跳过。
     sym, _, ex = key.rpartition("_")
+    # 品种要挂在 attrs 上：`factors_ext._symbol()` 靠它认品种，基本面（EDB
+    # 仓单 / 库存 / 现货 / 交割 / 利润）、板块、季节性这几片因子都从这儿取。
+    # 以前只有 `tqdata.load_main()` 挂，走 CSV 的日线没挂 —— 于是日线图上
+    # 基本面因子整列 NaN，因子分析页一律显示「无数据」，其实数据是有的。
+    df.attrs["symbol"] = sym
+    df.attrs["exchange"] = ex
+    # 并入期限结构 / 期权波动率列（展期因子、期权因子要用）。缺文件时静默跳过。
     try:
         from ttrade.auxdata import attach as attach_aux
 
         df = attach_aux(df, sym, ex, AUX_DIR)
     except Exception:
         pass
+    df.attrs["symbol"] = sym
+    df.attrs["exchange"] = ex
     return df
 
 

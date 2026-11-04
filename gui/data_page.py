@@ -37,9 +37,12 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -439,6 +442,63 @@ class StockTqWorker(QObject):
         self.done.emit("天勤分钟线已更新")
 
 
+class _CredDialog(QDialog):
+    """填凭据的小弹窗：Tushare 一个 token，天勤是用户名 + 密码。
+
+    共用一个类而不是写两个：字段数由 `fields` 决定，布局只有一份，改样式时
+    不会只改到一半。
+    """
+
+    def __init__(self, title: str, fields: list[tuple], hint: str = "",
+                 parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(460)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 12)
+        lay.setSpacing(10)
+
+        if hint:
+            lb = QLabel(hint)
+            lb.setObjectName("Hint")
+            lb.setWordWrap(True)
+            lay.addWidget(lb)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        self._edits: dict[str, QLineEdit] = {}
+        for key, label, placeholder, secret in fields:
+            ed = QLineEdit()
+            ed.setPlaceholderText(placeholder)
+            if secret:
+                # 密码框：能改不能看。token 也用密码框 —— 旁边会提示「已配置」
+                ed.setEchoMode(QLineEdit.Password)
+            form.addRow(label, ed)
+            self._edits[key] = ed
+        lay.addLayout(form)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok = QPushButton("保存")
+        btn_ok.setObjectName("Primary")
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(self.accept)
+        row.addWidget(btn_cancel)
+        row.addWidget(btn_ok)
+        lay.addLayout(row)
+
+    def set_values(self, values: dict) -> None:
+        for key, val in (values or {}).items():
+            ed = self._edits.get(key)
+            if ed is not None:
+                ed.setText(str(val or ""))
+
+    def values(self) -> dict[str, str]:
+        return {k: e.text().strip() for k, e in self._edits.items()}
+
+
 class DataPage(QWidget):
     """数据管理。与「策略研究」等四个页面平级。"""
 
@@ -545,23 +605,96 @@ class DataPage(QWidget):
         self.lbl_market.setObjectName("AppSub")
         outer.addWidget(self.lbl_market)
 
+        # 账号 / 密钥单独一条横条，横跨整页：A 股那条路走的是股票库面板，
+        # 数据源卡是藏起来的 —— 凭据要是跟着数据源卡一起藏，下 A 股的时候
+        # 就找不到「配置 Tushare token」了，而那正是它最需要的场景。
+        outer.addWidget(self._build_cred_bar())
+
         body = QHBoxLayout()
         body.setSpacing(12)
-        # 两个左栏互斥：期货/美股走「数据源 + 区间 + 补数据」，A 股走股票库面板。
-        # 两条链路的数据源、可选项、耗时完全不同，塞一张卡片里只会互相干扰
+        # 三栏并列：数据源 / 参数（成本 + 定时）/ 日志。
+        # 以前是「数据源 + 日志」两栏，成本和定时全塞在数据源那张卡的下半截，
+        # 于是「开始补充」按钮夹在定时设置和成本设置中间 —— 看着像它们的一部分。
+        # 现在下载相关（含按钮）全在左栏，成本与定时单独一张卡，日志靠右。
+        # 日志不再吃满剩余宽度：它只需要看几行字，撑到 1000 多像素纯属浪费，
+        # 反而把左边那些下拉挤窄。三栏等分，日志自然短一截。
         self.form_card = self._build_form()
         self.stock_card = self._build_stock_card()
-        body.addWidget(self.form_card, 0)
-        body.addWidget(self.stock_card, 0)
-        body.addWidget(self._build_log(), 1)
+        self.cfg_card = self._build_config_card()
+        self.log_card = self._build_log()
+        body.addWidget(self.form_card, 1)
+        body.addWidget(self.stock_card, 1)
+        body.addWidget(self.cfg_card, 1)
+        body.addWidget(self.log_card, 1)
         outer.addLayout(body, 1)
         self._sync_db_label()
         self._sync_stock_card()
 
+    def _build_cred_bar(self) -> QWidget:
+        """账号 / 密钥横条：两条通道各一行状态 + 一个配置按钮。
+
+        以前只能手写 `token.txt` / `tq_account.txt`，界面上只有一句「去项目根
+        建个文件」。做成一条横条而不是塞进数据源卡，是因为它在三个市场下都得
+        在：A 股那条路的数据源卡是藏着的，而下 A 股恰恰最需要 Tushare token。
+        """
+        bar = QFrame()
+        bar.setObjectName("Card")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(10)
+
+        title = QLabel("账号 / 密钥")
+        title.setObjectName("SectionTitle")
+        lay.addWidget(title)
+
+        self.lbl_token = QLabel("Tushare token：读取中…")
+        self.lbl_token.setObjectName("Hint")
+        self.lbl_token.setToolTip(
+            "Tushare 的接口凭据。日线 / 复权因子 / 美股 / A 股股票库都要它，\n"
+            "缺了就只能用本地已有的数据。\n"
+            "获取地址：https://tushare.pro/user/token"
+        )
+        lay.addWidget(self.lbl_token)
+        self.btn_token = QPushButton("配置…")
+        self.btn_token.setFixedWidth(72)
+        self.btn_token.setToolTip(
+            "写入用户配置目录的 token.txt，不写进项目、不进 git。\n"
+            "环境变量 TUSHARE_TOKEN 优先级更高，设了就以它为准。"
+        )
+        self.btn_token.clicked.connect(self._open_token_dialog)
+        lay.addWidget(self.btn_token)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setObjectName("VSep")
+        lay.addWidget(sep)
+
+        self.lbl_tq_acct = QLabel("天勤账号：读取中…")
+        self.lbl_tq_acct.setObjectName("Hint")
+        self.lbl_tq_acct.setToolTip(
+            "天勤（快期）行情账号。分钟线下载、真实合约、EDB、期权、\n"
+            "以及实盘行情都要它。"
+        )
+        lay.addWidget(self.lbl_tq_acct)
+        self.btn_tq_acct = QPushButton("配置…")
+        self.btn_tq_acct.setFixedWidth(72)
+        self.btn_tq_acct.setToolTip(
+            "写入用户配置目录的 tq_account.txt（明文两行：用户名、密码）。\n"
+            "环境变量 TQ_USER / TQ_PASS 优先级更高。"
+        )
+        self.btn_tq_acct.clicked.connect(self._open_tq_account_dialog)
+        lay.addWidget(self.btn_tq_acct)
+        # 全部靠左，剩余宽度甩到右边：`stretch` 加在标签上会把两个按钮推到
+        # 屏幕两端，按钮离自己的状态文字一臂远，看着像两个不相干的开关
+        lay.addStretch(1)
+
+        self._sync_cred_labels()
+        return bar
+
     def _build_form(self) -> QWidget:
         card = QFrame()
         card.setObjectName("Card")
-        card.setFixedWidth(320)
+        card.setMinimumWidth(320)
         lay = QVBoxLayout(card)
         lay.setContentsMargins(12, 10, 12, 10)
         lay.setSpacing(7)
@@ -702,15 +835,43 @@ class DataPage(QWidget):
         )
         lay.addWidget(self.chk_upd_options)
 
-        # 每天盘后自动补两次。手动补很容易忘，而展期 / IV 的快照只要断一天，
-        # 实盘就只能拿更旧的期限结构算信号。做成可关的定时器而不是常驻服务：
-        # 程序关了就停，不会在用户不知情的时候跑一次几十分钟的下载。
-        #
-        # 拆成两条而不是一条，是因为它们的时间窗根本不同：
-        #   - 衍生数据（真实合约 / 期权）要等交易所结算，日盘 15:00 收盘后十几
-        #     分钟才落地，所以 15:30；
-        #   - 日线可以更晚，17:00 时美股当天的日线也收完了（美东 16:00 收盘 =
-        #     北京时间 04:00/05:00），一次把期货和美股都补掉。
+        # 「开始补充」紧跟在下载项后面，和成本 / 定时彻底分开。
+        # 以前它在整张卡的最底下，上面压着「每日自动补充」和「交易成本」两段，
+        # 看着像是「把定时和成本一起提交」，点下去却只补数据。
+        lay.addSpacing(4)
+        self.btn_update = QPushButton("开始补充")
+        self.btn_update.clicked.connect(self._on_clicked)
+        lay.addWidget(self.btn_update)
+
+        self.prog_update = QProgressBar()
+        self.prog_update.setTextVisible(False)
+        self.prog_update.setFixedHeight(6)
+        self.prog_update.setVisible(False)
+        lay.addWidget(self.prog_update)
+
+        self.lbl_upd = QLabel("")
+        self.lbl_upd.setObjectName("Hint")
+        self.lbl_upd.setWordWrap(True)
+        self.lbl_upd.setVisible(False)
+        lay.addWidget(self.lbl_upd)
+
+        lay.addStretch(1)
+        self._sync_controls()
+        return card
+
+    def _build_config_card(self) -> QWidget:
+        """参数卡：交易成本与品种信息 + 每日自动补充。
+
+        这两块和「补数据」没有关系，只是恰好也放在这一页 —— 单独一张卡，
+        就不会和左边的下载按钮混在一起。
+        """
+        card = QFrame()
+        card.setObjectName("Card")
+        card.setMinimumWidth(300)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(7)
+
         # ---- 交易成本 / 品种信息 ----
         # 这两块是**回测口径**，不是补数据。放在这一页是因为「成本、tick、乘数、
         # 保证金、交易时段」都属于「这个市场长什么样」，和行情库放在一起比塞进
@@ -746,7 +907,20 @@ class DataPage(QWidget):
         self.lbl_cost_hint.setObjectName("Hint")
         self.lbl_cost_hint.setWordWrap(True)
         lay.addWidget(self.lbl_cost_hint)
+        # `_fill_cost_combo()` 在上面就已经跑过一次，那时这个标签还不存在，
+        # `_sync_cost_hint()` 直接返回了 —— 不补这一句的话开机是空行
+        self._sync_cost_hint()
 
+        # ---- 每日自动补充 ----
+        # 每天盘后自动补两次。手动补很容易忘，而展期 / IV 的快照只要断一天，
+        # 实盘就只能拿更旧的期限结构算信号。做成可关的定时器而不是常驻服务：
+        # 程序关了就停，不会在用户不知情的时候跑一次几十分钟的下载。
+        #
+        # 拆成两条而不是一条，是因为它们的时间窗根本不同：
+        #   - 衍生数据（真实合约 / 期权）要等交易所结算，日盘 15:00 收盘后十几
+        #     分钟才落地，所以 15:30；
+        #   - 日线可以更晚，17:00 时美股当天的日线也收完了（美东 16:00 收盘 =
+        #     北京时间 04:00/05:00），一次把期货和美股都补掉。
         self.lbl_auto = self._section("每日自动补充")
         lay.addWidget(self.lbl_auto)
 
@@ -804,33 +978,9 @@ class DataPage(QWidget):
         self.lbl_auto_hint.setWordWrap(True)
         lay.addWidget(self.lbl_auto_hint)
 
-        self.lbl_tq_hint = QLabel(
-            "天勤需要行情账号：项目根目录或用户目录下的 tq_account.txt（两行：用户名、密码）。\n"
-            "19:00–19:30 是天勤运维窗口，这段时间会自动等待。"
-        )
-        self.lbl_tq_hint.setObjectName("Hint")
-        self.lbl_tq_hint.setWordWrap(True)
-        self.lbl_tq_hint.setVisible(False)
-        lay.addWidget(self.lbl_tq_hint)
-
-        lay.addSpacing(4)
-        self.btn_update = QPushButton("开始补充")
-        self.btn_update.clicked.connect(self._on_clicked)
-        lay.addWidget(self.btn_update)
-
-        self.prog_update = QProgressBar()
-        self.prog_update.setTextVisible(False)
-        self.prog_update.setFixedHeight(6)
-        self.prog_update.setVisible(False)
-        lay.addWidget(self.prog_update)
-
-        self.lbl_upd = QLabel("")
-        self.lbl_upd.setObjectName("Hint")
-        self.lbl_upd.setWordWrap(True)
-        self.lbl_upd.setVisible(False)
-        lay.addWidget(self.lbl_upd)
-
         lay.addStretch(1)
+        # 成本那几行是按市场显隐的，而 `_build_form()` 里那次 `_sync_controls()`
+        # 跑的时候它们还不存在。这里补一次，别等主窗口调 `set_market` 才对齐。
         self._sync_controls()
         return card
 
@@ -843,7 +993,7 @@ class DataPage(QWidget):
         """
         card = QFrame()
         card.setObjectName("Card")
-        card.setFixedWidth(340)
+        card.setMinimumWidth(340)
         lay = QVBoxLayout(card)
         lay.setContentsMargins(12, 10, 12, 10)
         lay.setSpacing(7)
@@ -993,6 +1143,9 @@ class DataPage(QWidget):
     def _build_log(self) -> QWidget:
         card = QFrame()
         card.setObjectName("Card")
+        # 定一个下限就够：日志只用来扫几行进度，宽度给到 300 已经能看全
+        # 「品种 12/78 已补 340 根」这种行。剩下由布局等分，不再吃满右半边。
+        card.setMinimumWidth(300)
         lay = QVBoxLayout(card)
         lay.setContentsMargins(12, 10, 12, 10)
         lay.setSpacing(6)
@@ -1045,6 +1198,117 @@ class DataPage(QWidget):
             self.lbl_db.setText(f"天勤库：读取失败（{type(exc).__name__}: {exc}）")
             self.lbl_db.setStyleSheet("color: #b91c1c;")
 
+    # ---- 账号 / 密钥 ----
+
+    def _sync_cred_labels(self) -> None:
+        """把「有没有凭据」写在界面上。
+
+        以前只能看日志里那句「未找到 Tushare token」，或者跑一次才知道缺。
+        现在启动时就说清楚，而且区分「文件里配的」和「环境变量给的」——
+        环境变量优先级最高，用户改完文件发现没生效，多半是环境变量盖着。
+        """
+        if not hasattr(self, "lbl_token"):
+            return
+        from ttrade import futures as FU
+
+        env = os.environ.get(FU.TOKEN_ENV, "").strip()
+        try:
+            tok = FU.read_token()
+        except Exception:  # noqa: BLE001
+            tok = ""
+        if env:
+            self.lbl_token.setText(
+                f"Tushare token：已配置（环境变量 {FU.TOKEN_ENV}，…{env[-4:]}）"
+            )
+            self.lbl_token.setStyleSheet("color: #15803d;")
+        elif tok:
+            self.lbl_token.setText(f"Tushare token：已配置（…{tok[-4:]}）")
+            self.lbl_token.setStyleSheet("color: #15803d;")
+        else:
+            self.lbl_token.setText("Tushare token：未配置（日线 / 美股 / A 股都下不了）")
+            self.lbl_token.setStyleSheet("color: #b45309;")
+
+        from ttrade import tqsdk_symbols as TS
+
+        env_u = os.environ.get("TQ_USER", "").strip()
+        try:
+            user, _pwd = TS.read_account()
+        except Exception:  # noqa: BLE001
+            user = ""
+        if env_u:
+            self.lbl_tq_acct.setText(f"天勤账号：{env_u}（环境变量 TQ_USER）")
+            self.lbl_tq_acct.setStyleSheet("color: #15803d;")
+        elif user:
+            self.lbl_tq_acct.setText(f"天勤账号：{user}")
+            self.lbl_tq_acct.setStyleSheet("color: #15803d;")
+        else:
+            self.lbl_tq_acct.setText("天勤账号：未配置（分钟线 / 实时行情下不了）")
+            self.lbl_tq_acct.setStyleSheet("color: #b45309;")
+
+    def _open_token_dialog(self) -> None:
+        from ttrade import futures as FU
+
+        try:
+            cur = FU.read_token()
+        except Exception:  # noqa: BLE001
+            cur = ""
+        dlg = _CredDialog(
+            "配置 Tushare token",
+            [("token", "Token", "粘贴 tushare.pro 用户页里的 token", True)],
+            hint=(
+                "写入：%s\n"
+                "获取地址：https://tushare.pro/user/token\n"
+                "如果设了环境变量 %s，它会盖掉这里的值。"
+                % (FU.token_path(), FU.TOKEN_ENV)
+            ),
+            parent=self,
+        )
+        dlg.set_values({"token": cur})
+        if dlg.exec() != QDialog.Accepted:
+            return
+        tok = dlg.values().get("token", "")
+        try:
+            path = FU.save_token(tok)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "保存失败", f"{type(exc).__name__}: {exc}")
+            return
+        self._sync_cred_labels()
+        self._log(f"—— Tushare token 已保存到 {path}")
+        self._log("下一轮下载会用新的 token；已经在跑的不会换。")
+
+    def _open_tq_account_dialog(self) -> None:
+        from ttrade import tqsdk_symbols as TS
+
+        try:
+            user, pwd = TS.read_account()
+        except Exception:  # noqa: BLE001
+            user, pwd = "", ""
+        dlg = _CredDialog(
+            "配置天勤行情账号",
+            [("user", "用户名", "快期 / 天勤账号", False),
+             ("pass", "密码", "", True)],
+            hint=(
+                "写入：%s（明文两行；类 Unix 下权限 600）\n"
+                "这是天勤（快期）的行情账号，不是 Tushare 的。\n"
+                "分钟线下载、真实合约、EDB、期权、实时行情都用它。\n"
+                "19:00–19:30 是天勤运维窗口，这段时间会自动等待。"
+                % TS.account_path()
+            ),
+            parent=self,
+        )
+        dlg.set_values({"user": user, "pass": pwd})
+        if dlg.exec() != QDialog.Accepted:
+            return
+        vals = dlg.values()
+        try:
+            path = TS.save_account(vals.get("user", ""), vals.get("pass", ""))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "保存失败", f"{type(exc).__name__}: {exc}")
+            return
+        self._sync_cred_labels()
+        self._log(f"—— 天勤账号已保存到 {path}")
+        self._log("下一轮下载会用新账号；已经在跑的不会换。")
+
     def _sync_opt_label(self) -> None:
         """5m 的期权只有中金所三个股指期权，标签上直接写明。
 
@@ -1094,12 +1358,13 @@ class DataPage(QWidget):
         for w in (self.lbl_upd_aux, self.chk_upd_contracts, self.chk_upd_options):
             w.setVisible(not tq and not is_us)
         # 成本 / 品种信息只对国内期货有意义：美股没有交易所手续费、没有最小
-        # 变动价位、也没有保证金这一说
+        # 变动价位、也没有保证金这一说；A 股那套回测口径里也没有这些项。
+        # 这三块现在住在右边那张参数卡里，藏起来之后那张卡只剩定时补充。
         if hasattr(self, "lbl_cost"):
+            show_cost = self.market == "cn"
             for w in (self.lbl_cost, self.cb_cost, self.btn_cost, self.btn_sym,
                       self.lbl_cost_hint):
-                w.setVisible(not is_us)
-        self.lbl_tq_hint.setVisible(tq)
+                w.setVisible(show_cost)
 
         if self.busy():
             return

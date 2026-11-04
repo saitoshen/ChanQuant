@@ -226,20 +226,72 @@ type "%LOCALAPPDATA%\ChanQuant\logs\error.log"
 > `*.bat text eol=crlf`，但 git 只在**检出时**转换，不会回头修工作区里已存在的 LF 文件，
 > 所以遇到这种情况直接重写文件为 CRLF 即可，别指望 `git checkout` 能救。
 
-### Tushare token 配置
+### Tushare token / 天勤账号配置
 
-代码库里**不存 token**，`ttrade/futures.py::read_token()` 按以下优先级查找：
+代码库里**不存凭据**。界面「数据管理 → 账号 / 密钥」可以直接填，写入用户配置目录
+（Windows `%LOCALAPPDATA%\ChanQuant`，macOS `~/Library/Application Support/ChanQuant`）。
+
+`ttrade/futures.py::read_token()` 的查找顺序：
 
 1. 环境变量 `TUSHARE_TOKEN`（CI 或临时会话）
-2. 项目根目录 `token.txt`
-3. 用户配置目录 `token.txt`（Windows `%LOCALAPPDATA%\ChanQuant`，macOS `~/Library/Application Support/ChanQuant`）
+2. 用户配置目录 `token.txt`（界面写的就是这份）
+3. 项目根目录 `token.txt`（本机开发时手放的，已在 `.gitignore` 里）
 
-三处都没有时抛出的错误里会直接写出这三条路径。仓库里只提交 `token.example.txt`。
+`ttrade/tqsdk_symbols.py::read_account()` 同理：`TQ_USER` / `TQ_PASS` → 用户目录
+`tq_account.txt` → 项目根同名文件。
+
+**用户目录排在项目根前面**：界面写的是用户目录，顺序反了就会出现「界面上保存了
+却没生效」—— 项目根那份把它盖住了。仓库里只提交 `token.example.txt`。
 
 ## 版本演进
 
 > 下面按时间顺序记每一版改了什么、为什么改。开头几段是项目起点时的原话 —— 留着是想说明
 > 「为什么先啃数据口径，再做策略」。
+
+### v2.6.2 —— 基本面因子在图上一直「无数据」+ 数据管理页重排
+
+**一、白银日线的「基差」显示无数据，其实数据是有的**
+
+**症状：** 因子分析页上，仓单 / 现货 / 基差 / 加工 / 库存 / 交割 / 板块一片
+「无数据」。但同一条品种走批量回测时这些因子都算得出来。
+
+**根因：品种标记（`df.attrs["symbol"]`）在 GUI 的加载路径上丢了。**
+
+`factors_ext._symbol()` 只认 `df.attrs["symbol"]`，认不出来就返回空串 ——
+基本面（EDB）、板块、品种季节这一整片因子全部退化成 NaN。三条路径只有一条是对的：
+
+| 路径 | 挂 attrs | 结果 |
+|---|---|---|
+| `tqdata.load_main()`（批量回测 / 组合 / 实盘） | ✅ | 有值 |
+| `gui/app.py:load_futures_csv()`（GUI 日线） | ❌ 从没挂过 | 整列空 |
+| `auxdata.attach()` / `attach_intraday()` | 用 `join` 并衍生列 | pandas 的 merge 系列不传播 attrs，挂好的被抹掉 |
+
+于是同一个品种「回测有值、看图没值」，分钟线和实盘（走 attach_intraday）同样中招 ——
+实盘用 1h/5m 时基本面因子和回测不一致，也是这个原因。
+
+**修法：** `load_futures_csv()` 在合并衍生列前后各挂一次 `symbol / exchange`；
+两个 attach 末尾 `out.attrs = dict(df.attrs)` 把 attrs 还原。
+
+**验证**（AG 日线 3519 根）：现货基差 3518 根有值（IC +0.0020，t=2.04）、
+仓单持仓比 3482（−0.0512，t=−9.68）、库存变化 5 日 3463（−0.0484，t=−9.48）、
+交割量变化 30 日 2590（+0.0030，t=2.10）。加工利润仍是空 —— AG 在 EDB 里确实
+没有 profit 序列，源头没有，不是没下。
+
+顺带把「无数据」的悬浮说明按大类分流：先判市场（A 股因子在期货上说「A 股专属」），
+再分展期 / 期权 / 基本面 / 宏观 —— 以前一律写「没有真实合约 / 期权数据」，
+基本面缺 EDB 覆盖时也这么写，排查方向完全跑偏。
+
+**二、数据管理页重排 + 账号密钥进界面**
+
+- 原来「数据源 + 日志」两栏，成本和定时全塞在数据源卡的下半截，「开始补充」
+  按钮夹在定时设置和成本设置中间 —— 看着像它们的一部分。现在四段并列：
+  **数据源 / 交易成本与品种信息 + 每日自动补充 / 日志**。日志从吃满右半边
+  （约 1240px）收到 1/3（约 450px）。
+- 「开始补充」紧跟「一并更新期权」之后。天勤通道下 `chk_upd_*` 是隐藏的，
+  所以它会自然落在 `chk_tq_options` 后面，两个通道都对。
+- 页顶新增一条「账号 / 密钥」横条：Tushare token 与天勤账号各一个「配置…」。
+  **不放数据源卡里** —— A 股那页数据源卡是隐藏的，而下 A 股恰恰最需要 token。
+- 成本那三行只在「国内期货」显示（原来 A 股也显示，但 A 股回测不用这套口径）。
 
 ### v2.6.1 —— 合并训练持久化 + 实盘状态三态 + 实盘取信号 + L1 正则修复
 

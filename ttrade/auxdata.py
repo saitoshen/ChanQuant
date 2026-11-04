@@ -143,6 +143,11 @@ def attach(
         if not cols:
             continue
         out = out.join(part[cols], how="left")
+    # `join` 会丢掉 attrs（pandas 的 merge 系列不传播 attrs），而 `symbol` 就
+    # 挂在 attrs 上 —— 丢了之后 `factors_ext._symbol()` 返回空串，基本面（EDB
+    # 仓单 / 库存 / 现货 / 交割 / 利润）、板块这一整片因子全部退化成全 NaN，
+    # 因子分析页上写着「无数据」，看起来像数据没下。手动挂回去。
+    out.attrs = dict(df.attrs)
     return out
 
 
@@ -232,6 +237,8 @@ def attach_intraday(
             snap.to_numpy()[pd.Index(day.unique()).get_indexer(day)],
             index=out.index, columns=cols,
         ))
+    # 同上：join 丢 attrs，`symbol` 一丢基本面 / 板块因子整列 NaN
+    out.attrs = dict(df.attrs)
     return out
 
 

@@ -202,6 +202,63 @@ def _run() -> tuple[bool, list[str]]:
 
     check("分钟级衍生列", _tq_aux)
 
+    def _fund_attrs():
+        """期货日线要挂品种标记，否则基本面因子整列「无数据」。
+
+        `factors_ext._symbol()` 只认 `df.attrs["symbol"]`，认不出来就返回空串，
+        仓单 / 库存 / 现货 / 基差 / 交割 / 板块这一整片因子全退化成 NaN。两条
+        路径都会丢这个标记：GUI 的日线走 `load_futures_csv()`，它压根没挂；
+        `auxdata.attach()` 用 `join` 并衍生列，pandas 的 merge 系列不传播
+        attrs，挂过的也会被抹掉。批量回测走 `futures.load()`，它在 attach 之后
+        才挂，所以一直是好的 —— 于是同一个品种「回测有值、看图没值」。
+        """
+        import os
+
+        from ttrade import auxdata as A
+        from ttrade import edb as E
+        from ttrade import factors as F
+        from ttrade.paths import data_dir as _dd
+
+        try:
+            from gui.app import load_futures_csv
+        except Exception as exc:  # noqa: BLE001
+            return f"跳过（GUI 导入失败：{exc}）"
+        try:
+            m = E.meta()
+        except Exception:  # noqa: BLE001
+            return "未下载 EDB（可选）"
+        if m is None or len(m) == 0:
+            return "未下载 EDB（可选）"
+        wh = {str(v).lower() for v in m[m["category"] == "warehouse"]["variety"]}
+        d = _dd("cn")
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".csv") or fn.startswith("_"):
+                continue
+            key = fn[:-4]
+            sym, _, ex = key.rpartition("_")
+            if sym.lower() not in wh:
+                continue
+            df = load_futures_csv(key, d)
+            if df is None or len(df) < 300:
+                continue
+            if df.attrs.get("symbol") != sym:
+                raise RuntimeError(
+                    f"{key} 加载后 attrs['symbol'] 为空 —— 基本面因子会整列 NaN"
+                )
+            # attach 之后再验一次：join 抹 attrs 的话这里就红
+            out = A.attach(df, sym, ex)
+            if out.attrs.get("symbol") != sym:
+                raise RuntimeError(
+                    f"{key} 并衍生列之后 attrs['symbol'] 被抹掉了（join 丢 attrs）"
+                )
+            r = float(F.raw(df, "war_oi").notna().mean())
+            if r < 0.5:
+                raise RuntimeError(f"{key} 仓单持仓比只有 {r:.0%} 有值")
+            return f"{key} 品种标记 {sym}，仓单持仓比 {r:.0%} 有值"
+        return "没有同时具备 EDB 仓单和日线 CSV 的品种（可选）"
+
+    check("期货日线品种标记（基本面因子）", _fund_attrs)
+
     def _qfq_tail():
         """前复权之后，最后一根必须等于真实盘面价。
 
@@ -1347,6 +1404,39 @@ def _run() -> tuple[bool, list[str]]:
         src_tq = dp is not None and dp.cb_source.currentData() == "tq"
         tq_vis = is_us or not src_tq
 
+        def _form_order_ok(d) -> bool:
+            """「开始补充」必须紧跟在下载项之后，成本和定时不许混进来。
+
+            以前它压在「每日自动补充」和「交易成本」两段下面，看着像「把定时
+            和成本一起提交」，点下去却只补数据。这条断言防的就是它被搬回去。
+            """
+            lay = d.form_card.layout()
+            idx = {}
+            for i in range(lay.count()):
+                w = lay.itemAt(i).widget()
+                if w is not None:
+                    idx[w] = i
+            if d.btn_update not in idx:
+                return False
+            i_btn = idx[d.btn_update]
+            # 期权勾选必须在按钮前面（同一张卡里）
+            if idx.get(d.chk_upd_options, 10 ** 6) > i_btn:
+                return False
+            # 成本 / 定时一个都不许留在数据源卡里
+            for w in (d.chk_auto, d.chk_daily, d.cb_cost, d.lbl_cost):
+                if w in idx:
+                    return False
+            # 凭据横条也不许回到数据源卡里 —— A 股那页数据源卡是藏着的，
+            # 藏进去就配不了 Tushare token，而 A 股股票库恰恰只能靠它
+            if d.btn_token in idx or d.btn_tq_acct in idx:
+                return False
+            # 它们得在参数卡里，而且「开始补充」不在那张卡里
+            clay = d.cfg_card.layout()
+            for w in (d.chk_auto, d.chk_daily, d.cb_cost):
+                if clay.indexOf(w) < 0:
+                    return False
+            return clay.indexOf(d.btn_update) < 0
+
         def _sched_ok(d) -> bool:
             """两条每日补充日程要和**存盘的那份**一致。
 
@@ -1413,6 +1503,17 @@ def _run() -> tuple[bool, list[str]]:
             and dp.cb_auto_range.count() == 2
             and dp.cb_daily_range.count() == 2
             and _sched_ok(dp)
+            # 三栏并列：数据源 / 参数（成本 + 定时）/ 日志。成本和定时不许
+            # 再回到数据源卡里 —— 回到一起，「开始补充」就又夹在它们中间了
+            and hasattr(dp, "cfg_card")
+            and hasattr(dp, "log_card")
+            and _form_order_ok(dp)
+            # 两条通道各自的凭据入口（Tushare token / 天勤账号）
+            and hasattr(dp, "btn_token")
+            and hasattr(dp, "btn_tq_acct")
+            and hasattr(dp, "lbl_token")
+            and hasattr(dp, "lbl_tq_acct")
+            and "token" in dp.lbl_token.text()
         )
         # 账户透视页：多账户列表 + 三张表都要带「资金账户」列，委托/成交还要
         # 带「时间」。这些列是逐列摆出来的，漏一列不会报错、只会让人看不出来

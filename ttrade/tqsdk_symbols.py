@@ -211,8 +211,11 @@ def month_digits(tq_code: str) -> int:
 def read_account(prefix: str = "") -> tuple[str, str]:
     """读天勤账户，返回 (用户名, 密码)。
 
-    优先级：环境变量 → 项目根 `tq_account.txt` → 用户配置目录同名文件。
+    优先级：环境变量 → 用户配置目录 `tq_account.txt` → 项目根同名文件。
     文件格式是两行（用户名、密码），允许 `#` 注释和空行。
+
+    用户目录排在项目根前面：界面里「配置天勤行情账号」写的是用户目录，
+    顺序反了就会出现「保存了但没生效」—— 项目根那份把它盖住了。
 
     `prefix` 用于多账户场景（比如实时行情用 `RT_` 前缀的环境变量）。
     """
@@ -224,8 +227,8 @@ def read_account(prefix: str = "") -> tuple[str, str]:
         return env_user, env_pass
 
     for path in (
-        os.path.join(bundle_root(), "tq_account.txt"),
         os.path.join(user_dir(), "tq_account.txt"),
+        os.path.join(bundle_root(), "tq_account.txt"),
     ):
         if not os.path.isfile(path):
             continue
@@ -237,6 +240,39 @@ def read_account(prefix: str = "") -> tuple[str, str]:
         if len(lines) >= 2:
             return lines[0], lines[1]
     raise RuntimeError(
-        "找不到天勤账户。请设置环境变量 TQ_USER / TQ_PASS，"
-        "或在项目根目录建 tq_account.txt（两行：用户名、密码，已在 .gitignore 里）。"
+        "找不到天勤账户。任选一种配置方式：界面「数据管理 → 配置天勤行情账号」、"
+        "设置环境变量 TQ_USER / TQ_PASS、或在用户配置目录建 tq_account.txt"
+        "（两行：用户名、密码）。"
     )
+
+
+def account_path() -> str:
+    """天勤账户落盘位置（用户配置目录）。
+
+    读的时候项目根优先，写只写用户目录 —— 打包之后项目根在程序目录里，
+    那里往往不可写（Program Files）。
+    """
+    from .paths import user_dir
+
+    return os.path.join(user_dir(), "tq_account.txt")
+
+
+def save_account(user: str, password: str) -> str:
+    """写天勤账户（两行：用户名、密码）。空值直接拒绝，别把文件写成半截。"""
+    user = (user or "").strip()
+    password = (password or "").strip()
+    if not user or not password:
+        raise ValueError("用户名和密码都要填")
+    if "\n" in user or "\n" in password:
+        raise ValueError("用户名 / 密码里不能有换行")
+    path = account_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(f"{user}\n{password}\n")
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)      # 密码是明文，至少别让别人读
+    except OSError:
+        pass
+    return path

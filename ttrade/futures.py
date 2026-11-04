@@ -75,8 +75,12 @@ def read_token() -> str:
     """按优先级取 Tushare token：
 
     1. 环境变量 `TUSHARE_TOKEN`（CI / 临时会话用）
-    2. 项目根目录 `token.txt`（本机开发用，已在 .gitignore 里）
-    3. 用户配置目录 `ChanQuant/token.txt`（打包后或不想放项目里时用）
+    2. 用户配置目录 `ChanQuant/token.txt`（界面里「配置 Tushare token」写的就是它）
+    3. 项目根目录 `token.txt`（本机开发时手放的，已在 .gitignore 里）
+
+    用户目录优先于项目根：界面写的是用户目录，如果项目根盖在前面，用户在
+    界面上改完 token 会发现「明明保存了却没生效」—— 这个顺序反了就会出这种
+    静默失效。
 
     都找不到就抛错，并把怎么配置写清楚，而不是留一个空字符串让接口
     返回一句「请指定正确的接口名」这种无关的报错。
@@ -86,8 +90,8 @@ def read_token() -> str:
         return env
 
     for path in (
-        os.path.join(bundle_root(), "token.txt"),
         os.path.join(user_dir(), "token.txt"),
+        os.path.join(bundle_root(), "token.txt"),
     ):
         try:
             with open(path, "r", encoding="utf-8") as fh:
@@ -98,10 +102,10 @@ def read_token() -> str:
             return tok
 
     raise RuntimeError(
-        "未找到 Tushare token。三种配置方式任选其一：\n"
-        f"  1) 设置环境变量 {TOKEN_ENV}\n"
-        "  2) 在项目根目录新建 token.txt，内容只有一行 token\n"
-        "  3) 在用户配置目录下新建 token.txt（Windows: "
+        "未找到 Tushare token。任选一种配置方式：\n"
+        f"  1) 界面「数据管理 → 配置 Tushare token」（推荐）\n"
+        f"  2) 设置环境变量 {TOKEN_ENV}\n"
+        "  3) 在用户配置目录下新建 token.txt，内容只有一行 token（Windows: "
         "%LOCALAPPDATA%\\ChanQuant；macOS: ~/Library/Application Support/ChanQuant）\n"
         "token 获取地址：https://tushare.pro/user/token"
     )
@@ -116,6 +120,35 @@ def get_pro():
         ts.set_token(read_token())
         _pro = ts.pro_api()
     return _pro
+
+
+def token_path() -> str:
+    """token 落盘的位置（用户配置目录）。
+
+    读的时候项目根 `token.txt` 优先，写**只写用户目录** —— 项目根那个是开发时
+    手放的、在 .gitignore 里，程序去改它容易把开发者的文件覆盖掉。
+    """
+    return os.path.join(user_dir(), "token.txt")
+
+
+def save_token(tok: str) -> str:
+    """写 token 并清掉缓存的 pro 客户端（否则这一轮还在用旧 token）。"""
+    tok = (tok or "").strip()
+    if not tok:
+        raise ValueError("token 不能为空")
+    path = token_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(tok + "\n")
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)      # 凭据文件别让别人读
+    except OSError:
+        pass
+    global _pro
+    _pro = None
+    return path
 
 
 @dataclass

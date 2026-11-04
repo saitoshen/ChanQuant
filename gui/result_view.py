@@ -93,6 +93,43 @@ PERIOD_1D = "1d"
 PERIOD_LABEL = dict(tqdata.PERIOD_LABEL, **{PERIOD_1D: "日线Tushare"})
 
 
+def _aux_missing_tip(key: str, category: str, market: str = "") -> str:
+    """「无数据」那一格的悬浮说明。按因子大类说清楚**缺的是哪种数据**。
+
+    这几类都要额外数据，缺了整列 NaN，但缺的东西完全不同：展期/期权缺的是
+    真实合约与期权链，基本面缺的是 EDB 覆盖（同一品种也可能只有仓单没利润），
+    宏观缺的是数据源，A 股那几片在期货上根本没有对应表。一句通用文案会把人
+    引到错的排查方向 —— 明明 EDB 有数据却显示「没有期权数据」时，最容易被
+    当成 bug 反复查。
+    """
+    # 先看「市场对不对」：A 股的基本面因子也归在「基本面」大类下，但它们要
+    # stock.duckdb 里的表，跟 EDB 一点关系都没有。不先分流就会指错方向。
+    spec = factors.FACTORS.get(key)
+    mk = tuple(getattr(spec, "markets", ()) or ())
+    if mk and market and market not in mk:
+        cn = {"cn_stock": "A 股", "us": "美股", "cn": "国内期货"}
+        want = " / ".join(cn.get(m, m) for m in mk)
+        have = cn.get(market, market)
+        return f"这是 {want} 专属因子，当前是 {have} 标的，没有对应的数据表。"
+    c = str(category or "")
+    if c.startswith("展期"):
+        return ("这个因子要真实合约的期限结构（近月 / 远月同时有报价）。\n"
+                "先跑：python download_tq.py --aux --all")
+    if c == "期权":
+        return ("这个因子要期权链（隐含波动率、持仓、成交）。\n"
+                "先跑：python download_tq.py --aux --all")
+    if c == "基本面":
+        return ("这个因子要 EDB 基本面数据（仓单 / 库存 / 现货价 / 交割量 / 利润），\n"
+                "当前品种这一类没有覆盖 —— 不是数据没下，是源头就没有这条序列。\n"
+                "看覆盖情况：「数据管理 → EDB」。")
+    if c == "宏观":
+        return ("这个宏观指标本地没有数据源（例如 LPR 的上游接口已下线）。\n"
+                "不是没下载，是拿不到。")
+    if c in ("资金流", "概念板块", "除权"):
+        return "这是 A 股专属因子（要 stock.duckdb 的基本面 / 资金流 / 概念表），期货上没有。"
+    return "这个因子在当前标的上算不出值（缺数据或样本不足）。"
+
+
 def _extract_trades(sig) -> list[tuple[int, int, int]]:
     """把 signal 序列拆成一笔笔持仓：返回 [(开仓下标, 平仓下标, 方向)]。
 
@@ -1906,10 +1943,14 @@ class ResultView(QObject):
                 ic_color = "#1d4ed8" if ic > 0 else "#b91c1c"
                 self.tbl_factor.setItem(i, 1, cell(f"{ic:+.4f}", True, on, ic_color))
             elif r.get("key") in factors.AUX_KEYS:
-                # 展期 / 期权因子在美股、以及没下过衍生数据的期货品种上是空的。
-                # 留白会让人以为「算出来是 0」，写清楚是没数据。
+                # 展期 / 期权 / 基本面 / 宏观这几片因子要额外数据，缺了就整列空。
+                # 留白会让人以为「算出来是 0」，写清楚是没数据 —— 而且要说清是
+                # **哪一类**没数据：以前一律写「没有真实合约 / 期权数据」，
+                # 基本面因子缺 EDB 覆盖时也这么写，查起来完全跑偏。
                 it = cell("无数据", True, False, "#94a3b8")
-                it.setToolTip("该标的没有真实合约 / 期权数据，这个因子无法计算")
+                it.setToolTip(_aux_missing_tip(str(r.get("key") or ""),
+                                               str(r.get("category") or ""),
+                                               self.market))
                 self.tbl_factor.setItem(i, 1, it)
             else:
                 self.tbl_factor.setItem(i, 1, cell("", True, on))
