@@ -2102,10 +2102,13 @@ def _run() -> tuple[bool, list[str]]:
                 "启动时自动接了实时（live 已在跑）：研究页不该连账户，"
                 "账户连接只在「账户透视和交易」页"
             )
-        # 因子分析页列出**全部**因子（算不出的显示「无数据」），所以行数应等于
-        # 因子库大小。用 `n_factors` 而不是写死数字：加因子时这里不用改。
-        if n_rows < n_factors:
-            raise RuntimeError(f"因子分析页只有 {n_rows} 行，应为 {n_factors}")
+        # 因子分析页只列**当前市场能用**的因子（A 股专属的盈利收益率 / 换手率 /
+        # 概念板块在期货标的上永远算不出来，列着就是一片「无数据」）。所以行数
+        # 应该正好等于该市场的因子数，也就是单因子下拉的条目数 —— 两边都走
+        # `factors.filter_by_market()`，对不上说明有一边漏了过滤。
+        if n_rows != n_factors:
+            raise RuntimeError(
+                f"因子分析页有 {n_rows} 行，当前市场应有 {n_factors} 个因子")
         if n_axes != 4:
             raise RuntimeError(f"因子分析页图轴数为 {n_axes}，应为 4")
         if not verify_ok:
@@ -2434,9 +2437,63 @@ def _run() -> tuple[bool, list[str]]:
                     raise RuntimeError("切市场后「不用」这个选项丢了")
                 win.cb_market.setCurrentIndex(win.cb_market.findData(mk))
                 app.processEvents()
+
+            # ---- 稀疏采样要能存进策略库、也要能从库里读回来 ----
+            #
+            # `_factor_cfg()` 一直把 `sample_mode` / `trigger_*` 写进配置，但
+            # `_apply_factor_cfg()` 一个都没恢复：存进库再载入，勾是空的、档位
+            # 回到默认，用户看到的是「策略库里没有这一项」。这里走真正的
+            # `_current_config()` / `apply_config()`，先把界面拨到「全不一样」
+            # 再载回来，逐个字段比对。
+            win.chk_sparse.setChecked(True)
+            app.processEvents()
+            fkey = win.cb_trig1.itemData(1) or ""
+            win.cb_trig1.setCurrentIndex(1 if fkey else 0)
+            win.cb_trig_side.setCurrentIndex(win.cb_trig_side.findData("up"))
+            win.sp_trig_z.setValue(1.8)
+            win.sp_trig_tiers.setValue(4)
+            win.sp_trig_span.setValue(0.8)
+            win.sp_trig_cool.setValue(23)
+            win.chk_trig_flip.setChecked(True)
+            app.processEvents()
+            want = win._factor_cfg()
+            cfg_sp = win._current_config()
+            if str((cfg_sp.factor_cfg or {}).get("sample_mode") or "") != "trigger":
+                raise RuntimeError("稀疏采样没写进 StrategyConfig.factor_cfg")
+            # 拨到「全不一样」：勾去掉、档位清空、方向回默认、反转取消
+            win.sp_trig_z.setValue(1.0)
+            win.sp_trig_tiers.setValue(0)
+            win.sp_trig_span.setValue(0.3)
+            win.sp_trig_cool.setValue(0)
+            win.cb_trig_side.setCurrentIndex(0)
+            win.chk_trig_flip.setChecked(False)
+            win.cb_trig1.setCurrentIndex(0)
+            win.chk_sparse.setChecked(False)
+            app.processEvents()
+            win.apply_config(cfg_sp)
+            app.processEvents()
+            got = win._factor_cfg()
+            if not (win.chk_sparse.isChecked() and not win.sparse_body.isHidden()
+                    and got.sample_mode == "trigger"
+                    and list(got.trigger_keys) == list(want.trigger_keys)
+                    and got.trigger_rule == want.trigger_rule
+                    and got.trigger_side == "up"
+                    and abs(got.trigger_z - 1.8) < 1e-9
+                    and got.trigger_tiers == 4
+                    and abs(got.trigger_span - 0.8) < 1e-9
+                    and got.trigger_cool == 23
+                    and got.trigger_flip):
+                raise RuntimeError(
+                    "稀疏采样没能从策略库里载回来（勾="
+                    f"{win.chk_sparse.isChecked()} / {got.sample_mode} / "
+                    f"档 {got.trigger_tiers}·{got.trigger_span}σ·冷却 "
+                    f"{got.trigger_cool} / 阈值 {got.trigger_z} / "
+                    f"方向 {got.trigger_side} / 触发 {got.trigger_keys} / "
+                    f"反转 {got.trigger_flip}）")
             win.chk_sparse.setChecked(False)
             trig_info = ("「不用」两项都在（切市场后仍在），反转开关跟着触发源灰 / 亮，"
-                         "规则触发参数能进配置且换规则不串")
+                         "规则触发参数能进配置且换规则不串，"
+                         "稀疏采样存得进策略库也载得回来")
         except Exception as exc:      # noqa: BLE001
             trig_ok, trig_info = False, f"{type(exc).__name__}: {exc}"
         if not trig_ok:

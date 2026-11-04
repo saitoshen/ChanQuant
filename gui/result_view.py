@@ -1874,9 +1874,14 @@ class ResultView(QObject):
     # ---------------------------------------------------------- 因子分析页
 
     def _ensure_report(self) -> pd.DataFrame:
-        """当前标的的全因子评估表。按「市场+标的」缓存，切参数不用重算。
+        """当前标的的因子评估表（**只含当前市场能用的因子**）。
 
-        47 个因子约 0.5 秒，每次拖滑杆都重算会明显拖慢交互，所以缓存住。
+        按「市场+标的」缓存，切参数不用重算 —— 一百多个因子各算一遍 IC，每次
+        拖滑杆都重来会明显拖慢交互。
+
+        为什么按市场过滤：这张表原来列的是**全库**因子，期货标的上会跟着列出
+        「盈利收益率 E/P」「所属概念数」这些 A 股专属因子，整列「无数据」。
+        它们在这条标的上永远算不出来，列着只是噪音，还容易被当成 bug 反复查。
         """
         key = f"{self.market}:{self.ctx.symbol}"
         if self._report is not None and self._report_key == key:
@@ -1887,7 +1892,7 @@ class ResultView(QObject):
         cfg = self.factor_cfg
         try:
             rep = factor_metrics.factor_report(
-                df, list(factors.FACTORS), horizon=cfg.horizon,
+                df, factors.filter_by_market(self.market), horizon=cfg.horizon,
                 window=cfg.window, method=cfg.method,
             )
         except Exception:  # noqa: BLE001
@@ -1897,7 +1902,7 @@ class ResultView(QObject):
         return rep
 
     def _refresh_factor_tab(self) -> None:
-        """刷新因子分析页：表格 + 四格图。没有因子在用时也显示全因子一览。"""
+        """刷新因子分析页：表格 + 四格图。没有因子在用时也列出全市场因子一览。"""
         df = self.raw
         if df is None or df.empty:
             return

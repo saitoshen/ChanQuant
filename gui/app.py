@@ -3053,11 +3053,16 @@ class MainWindow(QMainWindow):
         self._sync_data_page()
         self._fill_symbols()
         # 切换大类后因子列表要重建：展期/期权/持仓量只在期货上有，
-        # A 股切到期货时要加回来，反之要隐掉
+        # A 股切到期货时要加回来，反之要隐掉。
+        # **一个都不能漏**：漏掉的那个会留着上一个市场的因子，用户看到的
+        # 就是「期货里能选 A 股因子」—— 截面策略的「先筛品种池」下拉就是
+        # 这么漏过一次。
         if hasattr(self, "cb_fsingle"):
             self._fill_single_combo()
             self._fill_tfactor_combo()
             self._fill_multi_table()
+        if hasattr(self, "cb_pool_factor"):
+            self._fill_factor_combo(self.cb_pool_factor, "log_amount_20")
         # 触发因子也得重填：期货上的展期 / 期权因子在美股上算不出来，留着就是
         # 一个「选了但没数据」的触发源 —— 决策点会变成 0，看起来像策略坏了
         if hasattr(self, "cb_trig1"):
@@ -4392,13 +4397,78 @@ class MainWindow(QMainWindow):
         # 逐品种，三者不一致。现在从 `factor_cfg` 里恢复
         if hasattr(self, "chk_ml_pool"):
             self.chk_ml_pool.setChecked(bool(cfg.get("pooled", False)))
+        # ---- 稀疏采样（只在信号触发时建样本）----
+        #
+        # `_factor_cfg()` 一直把 `sample_mode` / `trigger_*` 写进 `factor_cfg`，
+        # 但这里一个都没读回来 —— 存进策略库再从库里载入，勾是空的、档位全是
+        # 默认值。用户看到的是「策略库里没有这一项」，实际是存了没恢复。
+        #
+        # 只在 `sample_mode == "trigger"` 时动那组触发控件：老配置（非稀疏）
+        # 里存的是占位默认值（档数 0、每档 1.0σ、冷却 0），无条件灌回去会把
+        # 用户调好的 3 档 / 0.5σ / 10 根悄悄改成 0 / 1.0 / 0。
+        sparse = str(cfg.get("sample_mode") or "all") == "trigger"
+        if hasattr(self, "chk_sparse"):
+            self.chk_sparse.blockSignals(True)
+            self.chk_sparse.setChecked(sparse)
+            self.chk_sparse.blockSignals(False)
+            # 参数区跟着展开：`_on_sparse_toggled` 会顺手排一次回测，这里只要
+            # 显隐（`apply_config` 末尾自己会算一遍）
+            if hasattr(self, "sparse_body"):
+                self.sparse_body.setVisible(sparse)
+        if sparse:
+            self._apply_trigger_cfg(cfg)
         # 规则触发的参数：`factor_cfg` 里只存了**当时那条规则**那一份（配置是
         # 一份，不是一张表），所以按它自己的 `trigger_rule` 归位
         tp = cfg.get("trigger_params") or {}
         tr = str(cfg.get("trigger_rule") or "")
         if isinstance(tp, dict) and tp and tr:
             self.trig_rule_params[tr] = {k: v for k, v in tp.items()}
-            self._sync_trigger_src()
+        self._sync_trigger_src()
+
+    def _apply_trigger_cfg(self, cfg: dict) -> None:
+        """把 `factor_cfg` 里那组触发参数灌回控件（只在稀疏采样开启时调）。"""
+        keys = [str(k) for k in (cfg.get("trigger_keys") or []) if k]
+        for cb, key in ((getattr(self, "cb_trig1", None), keys[0] if keys else ""),
+                        (getattr(self, "cb_trig2", None),
+                         keys[1] if len(keys) > 1 else "")):
+            if cb is None:
+                continue
+            i = cb.findData(key) if key else 0
+            cb.blockSignals(True)
+            cb.setCurrentIndex(i if i >= 0 else 0)
+            cb.blockSignals(False)
+        rule = str(cfg.get("trigger_rule") or "")
+        if hasattr(self, "cb_trig_rule"):
+            i = self.cb_trig_rule.findData(rule) if rule else 0
+            self.cb_trig_rule.blockSignals(True)
+            self.cb_trig_rule.setCurrentIndex(i if i >= 0 else 0)
+            self.cb_trig_rule.blockSignals(False)
+        if hasattr(self, "cb_trig_side"):
+            i = self.cb_trig_side.findData(str(cfg.get("trigger_side") or "both"))
+            self.cb_trig_side.blockSignals(True)
+            self.cb_trig_side.setCurrentIndex(i if i >= 0 else 0)
+            self.cb_trig_side.blockSignals(False)
+        for name, val, is_int in (("sp_trig_z", cfg.get("trigger_z"), False),
+                                  ("sp_trig_tiers", cfg.get("trigger_tiers"), True),
+                                  ("sp_trig_span", cfg.get("trigger_span"), False),
+                                  ("sp_trig_cool", cfg.get("trigger_cool"), True)):
+            wdg = getattr(self, name, None)
+            if wdg is None or val is None:
+                continue
+            try:
+                wdg.blockSignals(True)
+                wdg.setValue(int(val) if is_int else float(val))
+            except (TypeError, ValueError):
+                pass
+            finally:
+                wdg.blockSignals(False)
+        for name, key in (("chk_trig_flip", "trigger_flip"),
+                          ("chk_trig_rule_flip", "trigger_rule_flip")):
+            wdg = getattr(self, name, None)
+            if wdg is not None:
+                wdg.blockSignals(True)
+                wdg.setChecked(bool(cfg.get(key, False)))
+                wdg.blockSignals(False)
 
     def _on_load_library(self) -> None:
         """从策略库挑一条，把它的品种 / 周期 / 策略 / 参数灌回界面。

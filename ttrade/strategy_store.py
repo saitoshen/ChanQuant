@@ -366,11 +366,26 @@ class StrategyConfig:
             else:
                 bits.insert(2, f"多{float(self.cross_top_pct or 0):g}%/空"
                                f"{float(self.cross_bot_pct or 0):g}%")
+            # 机器学习那一套（稀疏采样 / 合训）也会跟着 `factor_cfg` 走，
+            # 截面 ML 一样受影响，摘要里一并写出来
+            if self.factor_mode == "ml":
+                _mc = self.factor_cfg or {}
+                if str(_mc.get("sample_mode") or "all") == "trigger":
+                    bits.append("稀疏触发")
+                if _mc.get("pooled"):
+                    bits.append("合训")
             return " ".join(bits)
         cfg = self.factor_cfg or {}
         bits = [f"窗口={cfg.get('window', 252)}", f"阈值={cfg.get('entry_z', 1.0)}"]
         if self.factor_mode == "ml":
             bits.append(f"模型={cfg.get('model', '')}")
+            # 稀疏采样 / 合并训练都不在「窗口 / 阈值」里体现，而它们对结果的影响
+            # 比窗口大得多：同一条 ML 策略开了稀疏是「只在突破那几根学」，不开是
+            # 「每根都学」，两条完全不是一回事。列表上不写出来，用户会以为是重复项
+            if str(cfg.get("sample_mode") or "all") == "trigger":
+                bits.append("稀疏触发")
+            if cfg.get("pooled"):
+                bits.append("合训")
         return " ".join(bits)
 
     def size_text(self) -> str:
