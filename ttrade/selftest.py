@@ -2397,6 +2397,50 @@ def _run() -> tuple[bool, list[str]]:
                 "侧边栏，或者侧边栏顺序被搬乱了，或者「第一步因子周期」选不动"
             )
 
+        # ---- 组合页「查看回测」必须在后台线程跑 ----
+        #
+        # 多品种一次是 N 遍策略计算，机器学习还要各训几十折（19 品种 / 5m 十年
+        # 实测十几分钟）。同步跑的话整个窗口「未响应」，连「停止」都点不动。
+        # 这里验的是「点下去立刻返回」：`_start_view` 之后线程已经在跑，主线程
+        # 还在，等它自己算完再出图。
+        view_ok, view_info = False, ""
+        try:
+            from ttrade import strategy_store as _St2
+            from ttrade.strategies import STRATEGIES as _S2
+
+            pp = win.portfolio_page
+            key0 = win.store.items[0]["key"]
+            if win.market == "cn":
+                _sym, _, _ex = key0.rpartition("_")
+            elif win.market == "cn_stock":
+                _sym, _ex = key0, key0.split(".", 1)[0]
+            else:
+                _sym, _ex = key0, ""
+            # 规则策略最便宜：这条验的是「跑在哪个线程」，不是「算得对不对」
+            vcfg = _St2.StrategyConfig(
+                symbol=_sym, exchange=_ex, period="1d", family="rule",
+                rule_key="ma_cross", rule_params=dict(_S2["ma_cross"].params),
+                sizing="capital", principal=1_000_000.0, capital_pct=30.0,
+            )
+            pp._start_view([vcfg], "single")
+            threaded = pp._view_thread is not None
+            deadline = time.time() + 60
+            while time.time() < deadline and pp._view_thread is not None:
+                app.processEvents()
+                time.sleep(0.02)
+            done = pp._view_thread is None
+            on_view = pp.stack.currentIndex() == 1
+            view_ok = threaded and done and on_view
+            view_info = (f"起线程={threaded} 算完={done} 切到结果页={on_view}")
+            pp.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            view_info = f"{type(exc).__name__}: {exc}"
+        if not view_ok:
+            raise RuntimeError(
+                f"组合页「查看回测」没跑在后台（{view_info}）：点下去应该立刻返回、"
+                "线程在后台算，算完自己切到结果页"
+            )
+
         # ---- 侧边栏宽度：控件不该被挤到右边看不见
         #
         # 横向滚动条现在是「按需」的，但那只是兜底 —— 正常状态下不该出现。这一块
@@ -2618,6 +2662,7 @@ def _run() -> tuple[bool, list[str]]:
                 f"组合 {combo_info}，"
                 f"截面 {cross_info}，两步配置 {cross_dlg_info}，"
                 f"多品种往返 {multi_rt_info}，"
+                f"组合页回测 {view_info}，"
                 f"{side_info}，触发 {trig_info}，"
                 f"回测区间 {range_info}，实时开关已复位，"
                 f"数据管理页就绪，手册 {manual_info}，输出 {out_info}，"

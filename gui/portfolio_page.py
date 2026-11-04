@@ -133,6 +133,51 @@ def _int(v) -> int:
 # ------------------------------------------------------------------ 线程层
 
 
+def run_replay_job(cfg, kind: str, payload, with_bh: bool = True):
+    """跑一份**已经取好数**的回放。纯计算，可以在后台线程里跑。
+
+    `kind` 是取数方式（`cross` / `multi` / `single`），`payload` 是对应的行情。
+    取数留在主线程是有意的：`DataStore` 是主线程的缓存，后台线程同时读同一个
+    DuckDB 连接不安全（研究页那条多品种也是先取数再进线程的）。
+    """
+    if kind == "cross":
+        return replay.run_cross(cfg, payload)
+    if kind == "multi":
+        return replay.run_multi(cfg, payload)
+    return replay.run(cfg, payload, with_bh=with_bh)
+
+
+class ReplayWorker(QObject):
+    """在后台跑「查看回测 / 组合报告」。
+
+    多品种一次是 N 遍策略计算，机器学习还要各训几十折 —— 组合页那条 19 品种 /
+    5m 十年的策略实测十几分钟。同步跑的话整个窗口「未响应」，连「停止」都点
+    不动，用户只能强杀进程。
+
+    进度报不了折（`replay` 那层没接回调），所以这里只报「第几条 / 共几条」：
+    组合报告几条策略时至少知道还在动。
+    """
+
+    done = Signal(object)      # [(cfg, Replay), ...]
+    failed = Signal(str)
+    progress = Signal(int, int, str)
+
+    def __init__(self, jobs: list) -> None:
+        super().__init__()
+        self.jobs = list(jobs)
+
+    def run(self) -> None:
+        out = []
+        try:
+            for i, (cfg, kind, payload) in enumerate(self.jobs, 1):
+                self.progress.emit(i, len(self.jobs), cfg.title())
+                out.append((cfg, run_replay_job(cfg, kind, payload)))
+        except Exception as exc:  # noqa: BLE001 - 错误要回到界面上说清楚
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.done.emit(out)
+
+
 class DataWorker(QObject):
     """在后台补一次行情：主力连续日线 + 展期 / 期权衍生数据。
 
@@ -839,6 +884,13 @@ class PortfolioPage(QWidget):
         # 文件里写，写一半被另一个覆盖就坏掉了
         self._train_thread: QThread | None = None
         self._train_worker = None
+        # 「查看回测 / 组合报告」的后台线程。多品种一次是 N 遍策略计算，
+        # 机器学习还要各训几十折，同步跑窗口会「未响应」
+        self._view_thread: QThread | None = None
+        self._view_worker = None
+        self._view_mode = ""          # single / combo，回来时决定怎么出图
+        self._view_missing: list[str] = []
+        self._view_payload = None     # 单品种：原始行情，出图时当实时段的底
         self._views: dict[str, tuple[QTabWidget, ResultView]] = {}
         self.ctl = PortfolioController(self)
         self._build()
@@ -1388,63 +1440,169 @@ class PortfolioPage(QWidget):
             return
         if len(cfgs) > 1:
             self._on_log(f"选中了 {len(cfgs)} 条，先显示第一条；要看整体请点「组合报告」")
-        self.show_config(cfgs[0])
+        self._start_view(cfgs[:1], "single")
 
     def _open_combo(self) -> None:
         cfgs = self._selected_cfgs()
         if len(cfgs) < 2:
             self._on_failed("按住 Ctrl 至少选两条策略，才谈得上组合")
             return
-        self.show_combo(cfgs)
+        self._start_view(cfgs, "combo")
 
-    def show_config(self, cfg, note: str = "") -> str:
-        """回放一份配置并展示。返回一段纯文本结论（失败时是原因）。
+    # ---- 回放：取数在主线程，计算在后台线程 ----
+    #
+    # 多品种 / 截面回放一次是 N 个品种的策略计算，机器学习还要各训几十折 ——
+    # 19 个品种 / 5m 十年实测十几分钟。以前整段同步跑，窗口「未响应」，连
+    # 「停止」都点不动，用户只能强杀进程。
+    #
+    # 取数留在主线程：`DataStore` 是主线程的缓存，后台线程同时读同一个 DuckDB
+    # 连接不安全（研究页那条多品种也是先取数再进线程的）。
+    #
+    # `show_config` / `show_combo` 保留同步版本（脚本、自检、Agent 用得上），
+    # 和按钮那条路共用 `_prepare` / `run_replay_job` / `_present_*`，不会跑出
+    # 两套口径。
 
-        「ChanAgent」发起的 backtest 走这里：跑完把文本推回 Agent 页的输出框，
-        模型才知道算出来是什么。所以失败也要返回原因，不能只弹个红字。
-        """
+    def _prepare(self, cfg) -> tuple[str, object, str]:
+        """主线程取数。返回 (kind, payload, 出错原因)。"""
         is_cross = getattr(cfg, "family", "") == "cross"
         keys = list(getattr(cfg, "symbols", None) or [])
-        is_multi = (not is_cross) and len(keys) >= 2
-        # 多品种机器学习是**同步**跑的（这条路径没有后台线程），一次可能几十秒到
-        # 几分钟。先把话说在前面并让标签真的刷出来，否则窗口一动不动、连个
-        # 「在跑」都看不见，只能当成卡死
-        if is_multi:
-            _fc = getattr(cfg, "factor_cfg", {}) or {}
-            _ml = ((getattr(cfg, "family", "") or "") == "factor"
-                   and (getattr(cfg, "factor_mode", "") or "") == "ml")
-            if _ml:
-                self._on_log(
-                    f"正在回测 {len(keys)} 个品种"
-                    + ("（合并训练：一个模型训完再各自回测）"
-                       if _fc.get("pooled") else "（每个品种各训一遍）")
-                    + "…机器学习要训几十折，可能要一两分钟")
-                QApplication.processEvents()
+        if is_cross:
+            frames, why = self._load_frames(cfg)
+            return ("cross", frames, why) if frames else ("cross", None, why)
+        if len(keys) >= 2:
+            frames, why = self._load_frames(cfg, need=2)
+            return ("multi", frames, why) if frames else ("multi", None, why)
+        df, why = self._load(cfg)
+        return ("single", df, why) if df is not None else ("single", None, why)
+
+    def _view_hint(self, jobs: list, mode: str) -> str:
+        """点下去立刻显示的那句话。用户得知道「在跑、跑什么、要多久」。"""
+        if mode == "combo":
+            return (f"正在回测 {len(jobs)} 条策略并合成组合…"
+                    f"（后台运行，界面可以继续用）")
+        cfg, kind, payload = jobs[0]
+        if kind == "cross":
+            return f"正在回测截面策略（{len(payload)} 个品种）…（后台运行）"
+        if kind == "multi":
+            fc = getattr(cfg, "factor_cfg", {}) or {}
+            ml = ((getattr(cfg, "family", "") or "") == "factor"
+                  and (getattr(cfg, "factor_mode", "") or "") == "ml")
+            if ml:
+                return (f"正在回测 {len(payload)} 个品种"
+                        + ("（合并训练：一个模型训完再各自回测）"
+                           if fc.get("pooled") else "（每个品种各训一遍）")
+                        + "…机器学习要训几十折，可能要一两分钟"
+                          "（后台运行，可以接着看别的）")
+            return f"正在回测 {len(payload)} 个品种…（后台运行）"
+        return f"正在回测 {cfg.title()}…（后台运行）"
+
+    def _start_view(self, cfgs: list, mode: str) -> None:
+        if self._view_thread is not None:
+            self._on_log("上一次回测还在跑，等它算完再来")
+            return
+        jobs, missing = [], []
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            if is_cross:
-                df = None
-                frames, why = self._load_frames(cfg)
-                if not frames:
-                    return f"回测失败：{why}"
-                rp = replay.run_cross(cfg, frames)
-            elif is_multi:
-                # 多品种等权：每个品种各跑一遍再平均，和研究页那条路同一个口径
-                df = None
-                frames, why = self._load_frames(cfg, need=2)
-                if not frames:
-                    return f"回测失败：{why}"
-                rp = replay.run_multi(cfg, frames)
-            else:
-                df, why = self._load(cfg)
-                if df is None:
-                    return f"回测失败：{why}"
-                rp = replay.run(cfg, df)
+            for i, cfg in enumerate(cfgs, 1):
+                if len(cfgs) > 1:
+                    # 取数本身也要几十秒（19 个品种 × 5m 十年），一条条报出来，
+                    # 不然点完「组合报告」还是什么都没发生
+                    self._on_log(f"读取行情 {i}/{len(cfgs)}：{cfg.title()}")
+                    QApplication.processEvents()
+                kind, payload, why = self._prepare(cfg)
+                if payload is None:
+                    missing.append(f"{cfg.title()}：{why}")
+                    continue
+                jobs.append((cfg, kind, payload))
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not jobs:
+            self._on_failed("回测失败：" + "；".join(missing or ["没有可用的行情"]))
+            return
+
+        self._view_mode, self._view_missing = mode, missing
+        # 单品种那条路出图时要用这份原始行情当「实时段往上拼」的底
+        self._view_payload = jobs[0][2] if mode == "single" else None
+        self.btn_view.setEnabled(False)
+        self.btn_combo.setEnabled(False)
+        self._on_log(self._view_hint(jobs, mode))
+        QApplication.processEvents()
+
+        thread = QThread(self)
+        worker = ReplayWorker(jobs)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_view_progress)
+        worker.done.connect(self._on_view_done)
+        worker.failed.connect(self._on_view_failed)
+        worker.done.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+        self._view_thread, self._view_worker = thread, worker
+        thread.start()
+
+    def _on_view_progress(self, done: int, total: int, label: str) -> None:
+        if total > 1:
+            self._on_log(f"正在回测 {done}/{total}：{label}…")
+
+    def _finish_view(self) -> None:
+        self._view_thread = None
+        self._view_worker = None
+        self._view_mode = ""
+        self._view_missing = []
+        self._view_payload = None
+        self._sync_buttons()
+
+    def _on_view_done(self, pairs) -> None:
+        mode, missing = self._view_mode, list(self._view_missing)
+        raw = self._view_payload
+        self._finish_view()
+        try:
+            if mode == "combo":
+                self._present_combo(pairs, missing)
+                return
+            cfg, rp = pairs[0]
+            if not rp.ok:
+                self._on_failed(f"回测失败：{rp.error}")
+                return
+            # 单品种要留着这份原始行情做「实时段往上拼」的底（见 `_present_single`）
+            self._present_single(cfg, rp, "", raw=raw)
+        except Exception as exc:  # noqa: BLE001 - 出图炸了也要说清楚
+            self._on_failed(f"出图失败：{type(exc).__name__}: {exc}")
+
+    def _on_view_failed(self, msg: str) -> None:
+        self._finish_view()
+        self._on_failed(f"回测失败：{msg}")
+
+    def show_config(self, cfg, note: str = "") -> str:
+        """回放一份配置并展示（同步）。返回一段纯文本结论（失败时是原因）。
+
+        按钮那条路走 `_start_view`（后台线程）；这个同步版本留给脚本 / 自检 /
+        需要「跑完拿字符串」的调用方。失败也要返回原因，不能只弹个红字。
+        """
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            kind, payload, why = self._prepare(cfg)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if payload is None:
+            return f"回测失败：{why}"
+        self._on_log(self._view_hint([(cfg, kind, payload)], "single"))
+        QApplication.processEvents()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            rp = run_replay_job(cfg, kind, payload)
         finally:
             QApplication.restoreOverrideCursor()
         if not rp.ok:
             return f"回测失败：{rp.error}"
+        return self._present_single(cfg, rp, note, raw=payload)
 
+    def _present_single(self, cfg, rp, note: str = "", raw=None) -> str:
+        """把一份回放结果画出来。返回一段纯文本结论。"""
+        is_cross = getattr(cfg, "family", "") == "cross"
+        keys = list(getattr(cfg, "symbols", None) or [])
+        is_multi = (not is_cross) and len(keys) >= 2
         period = PERIOD_LABEL.get(cfg.period, cfg.period)
         if is_cross or is_multi:
             # 多品种 / 截面都没有「某一条策略的 K 线」：仓位是一篮子，画 K 线会
@@ -1475,7 +1633,7 @@ class PortfolioPage(QWidget):
         view.show_result(rp.df, rp.raw, rp.res, rp.bh, self._ctx(cfg, rp))
         # 记下本地历史这份「底」，实时段每 5 秒往上拼一次。存 df 而不是重读库：
         # 库里那份要解码几万行，5 秒重读一次等于白烧
-        self._live_cfg, self._live_base, self._live_sid = cfg, df, cfg.sid
+        self._live_cfg, self._live_base, self._live_sid = cfg, raw, cfg.sid
         self._live_busy = False
         self._live_timer.start()
         # cfg.title() 已经含「品种 · 策略」，别再拼一遍 key 和策略名
@@ -1484,34 +1642,36 @@ class PortfolioPage(QWidget):
         return replay.summary(rp, cfg.key(), period)
 
     def show_combo(self, cfgs: list) -> str:
-        """多策略等权组合报告。返回结论文本（失败时是原因）。"""
+        """多策略等权组合报告（同步）。返回结论文本（失败时是原因）。"""
         reps: list = []
         missing: list[str] = []
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             for cfg in cfgs:
-                if getattr(cfg, "family", "") == "cross":
-                    frames, why = self._load_frames(cfg)
-                    rp = (replay.run_cross(cfg, frames) if frames
-                          else replay.Replay(error=why))
-                elif len(list(getattr(cfg, "symbols", None) or [])) >= 2:
-                    # 多品种那一条本身已经是 N 个品种的等权曲线，先合成它，
-                    # 再和别的策略等权 —— 和单策略视图同一个口径
-                    frames, why = self._load_frames(cfg, need=2)
-                    rp = (replay.run_multi(cfg, frames) if frames
-                          else replay.Replay(error=why))
-                else:
-                    df, why = self._load(cfg)
-                    if df is None:
-                        missing.append(why)
-                        continue
-                    rp = replay.run(cfg, df, with_bh=False)
+                kind, payload, why = self._prepare(cfg)
+                if payload is None:
+                    missing.append(f"{cfg.title()}：{why}")
+                    continue
+                rp = run_replay_job(cfg, kind, payload, with_bh=False)
                 if not rp.ok:
                     missing.append(f"{cfg.title()}：{rp.error}")
                     continue
                 reps.append((cfg, rp))
         finally:
             QApplication.restoreOverrideCursor()
+        return self._present_combo(reps, missing)
+
+    def _present_combo(self, reps: list, missing: list) -> str:
+        """把几条策略的等权组合画出来。`reps` 是 [(cfg, Replay), ...]。"""
+        missing = list(missing or [])
+        # 后台那条路把失败的也一起递回来了（失败原因要写进结论），这里筛掉
+        ok = []
+        for cfg, rp in reps:
+            if rp.ok:
+                ok.append((cfg, rp))
+            else:
+                missing.append(f"{cfg.title()}：{rp.error}")
+        reps = ok
 
         if not reps:
             return "组合报告失败：" + "；".join(missing or ["没有可用的策略"])
@@ -2195,3 +2355,9 @@ class PortfolioPage(QWidget):
             # 的，半截的那个不会顶掉好的那份
             self._train_thread.quit()
             self._train_thread.wait(3000)
+        if self._view_thread is not None:
+            # 回放是纯计算，杀掉不留垃圾。但线程还活着时窗口析构，Qt 会报
+            # "QThread: Destroyed while thread is still running" 然后进程崩在
+            # 退出码上 —— 和 v2.6.3 那次自检翻车同一个坑
+            self._view_thread.quit()
+            self._view_thread.wait(3000)
