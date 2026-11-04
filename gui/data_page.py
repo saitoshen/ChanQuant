@@ -789,9 +789,17 @@ class DataPage(QWidget):
         self.cb_upd_source = QComboBox()
         for key, label in updater.SOURCE_LABELS.items():
             self.cb_upd_source.addItem(label, key)
+        # 默认就选「仅东方财富」而不是「自动」。自动的兜底是 Tushare 的未复权价，
+        # 一旦某只票东财临时取不到，它就会整段重下成未复权 —— 文件本身自洽，
+        # 但和别的票差几十倍基准（AAPL 就这么被换过一次口径）。
+        # 宁可这一只更新失败、下次再补，也不要悄悄混进来一批不同基准的价格。
+        _i = self.cb_upd_source.findData(updater.SOURCE_EASTMONEY)
+        if _i >= 0:
+            self.cb_upd_source.setCurrentIndex(_i)
         self.cb_upd_source.setToolTip(
             "仅对美股生效。东财给的是后复权价，与本地历史同口径；\n"
-            "Tushare us_daily 是未复权且额度极紧，只作兜底。"
+            "Tushare us_daily 是未复权且额度极紧 —— 选「自动」时它只作兜底，\n"
+            "兜底成功会把该标的整段重下成未复权，和其它票的基准差几十倍。"
         )
         lay.addWidget(self.cb_upd_source)
 
