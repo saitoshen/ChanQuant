@@ -1406,6 +1406,20 @@ class PortfolioPage(QWidget):
         is_cross = getattr(cfg, "family", "") == "cross"
         keys = list(getattr(cfg, "symbols", None) or [])
         is_multi = (not is_cross) and len(keys) >= 2
+        # 多品种机器学习是**同步**跑的（这条路径没有后台线程），一次可能几十秒到
+        # 几分钟。先把话说在前面并让标签真的刷出来，否则窗口一动不动、连个
+        # 「在跑」都看不见，只能当成卡死
+        if is_multi:
+            _fc = getattr(cfg, "factor_cfg", {}) or {}
+            _ml = ((getattr(cfg, "family", "") or "") == "factor"
+                   and (getattr(cfg, "factor_mode", "") or "") == "ml")
+            if _ml:
+                self._on_log(
+                    f"正在回测 {len(keys)} 个品种"
+                    + ("（合并训练：一个模型训完再各自回测）"
+                       if _fc.get("pooled") else "（每个品种各训一遍）")
+                    + "…机器学习要训几十折，可能要一两分钟")
+                QApplication.processEvents()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             if is_cross:
@@ -1453,6 +1467,8 @@ class PortfolioPage(QWidget):
             )
             self._show_view("portfolio", f"{cfg.title()}｜{period}"
                                          + (f"｜{note}" if note else ""))
+            if is_multi:
+                self._on_log(f"回测完成：{len(keys)} 个品种 · {rp.label}")
             return replay.summary(rp, cfg.title(), period)
 
         _tabs, view = self._ensure_view("single")

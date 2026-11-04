@@ -393,6 +393,11 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
     乘数、保证金），再把归一化后的净值曲线取平均（`backtest.combine`）。
     不是「一个账户里按权重持有一篮子」—— 那是截面策略，两者别混。
 
+    机器学习多一个分岔：配置里勾了「合并训练」（`factor_cfg["pooled"]`）时，
+    和研究页一样**只训一个模型**（`run_pooled_strategy`），再拿同一个模型给
+    每个品种出分数。以前这里不看 `pooled`，一律逐品种各训一遍 —— 于是同一份
+    配置在两个页面跑出两条不同的净值，而且 19 个品种要多训 18 遍。
+
     返回的 `Replay` 里 `df` / `raw` 是空的：多品种没有「某一条策略的 K 线」，
     画 K 线会误导。视图那边用组合视图（绩效 / 交易记录 / 阶段）。
     """
@@ -402,22 +407,62 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
     if len(keys) < 2:
         return Replay(error=f"多品种至少要 2 个品种的行情，现在只有 {len(keys)} 个")
     mk = market or market_of(cfg)
+    period = getattr(cfg, "period", "") or "1d"
+    fc = factor_config(getattr(cfg, "factor_cfg", {}) or {})
+    fkeys = [str(k) for k in (getattr(cfg, "factor_keys", []) or []) if k]
+    pooled = (
+        str(getattr(cfg, "family", "") or "") == "factor"
+        and (getattr(cfg, "factor_mode", "") or "") == "ml"
+        and bool(getattr(fc, "pooled", False))
+        and len(fkeys) >= 2
+    )
     results, named, failed = [], [], []
-    for key in keys:
-        sym, ex = split_key(key, mk)
-        # 每个品种单独一份配置：成本、乘数、保证金都按它自己的算。共用一份会把
-        # 上一个品种的 tick 带到下一个头上（研究页那边踩过同一个坑）
-        one = cfg.clone(symbol=sym, exchange=ex, multi_symbols=[], cross_symbols=[])
-        rp = run(one, frames[key], market=market, with_bh=False)
-        if not rp.ok:
-            failed.append(f"{key}：{rp.error}")
-            continue
-        results.append(rp.res)
-        named.append((key, rp.res))
+    if pooled:
+        # 区间要先裁：`run_pooled_strategy` 不认 `range_years`，喂进去多少就学
+        # 多少。逐品种那条路是 `run()` 里裁的，这里得自己来
+        years = getattr(cfg, "range_years", 0) or 0
+        win = {}
+        for key in keys:
+            w = window(frames[key], years)
+            if w is not None and len(w) > 1:
+                win[key] = w
+        if len(win) < 2:
+            return Replay(error="多品种在所选区间里没有足够的行情")
+        try:
+            outs = fstrat.run_pooled_strategy(win, fkeys, fc)
+        except Exception as exc:  # noqa: BLE001 - 和 `run()` 一样，错误进 Replay
+            return Replay(error=f"合并训练失败：{exc}")
+        for key, df in win.items():
+            out = outs.get(key)
+            if out is None:
+                failed.append(f"{key}：合并训练没有给出这个品种的预测")
+                continue
+            sym, ex = split_key(key, mk)
+            one = cfg.clone(symbol=sym, exchange=ex, multi_symbols=[],
+                            cross_symbols=[])
+            bt = make_bt(mk, getattr(cfg, "note", "") == "short", one)
+            bt.bars_per_year = bars_per_year(out.df.index)
+            try:
+                results.append(run_backtest(out.df, bt, label=out.label))
+                named.append((key, results[-1]))
+            except Exception as exc:  # noqa: BLE001
+                failed.append(f"{key}：{exc}")
+    else:
+        for key in keys:
+            sym, ex = split_key(key, mk)
+            # 每个品种单独一份配置：成本、乘数、保证金都按它自己的算。共用一份会把
+            # 上一个品种的 tick 带到下一个头上（研究页那边踩过同一个坑）
+            one = cfg.clone(symbol=sym, exchange=ex, multi_symbols=[],
+                            cross_symbols=[])
+            rp = run(one, frames[key], market=market, with_bh=False)
+            if not rp.ok:
+                failed.append(f"{key}：{rp.error}")
+                continue
+            results.append(rp.res)
+            named.append((key, rp.res))
     if not results:
         return Replay(error="多品种一个都没跑出来：" + "；".join(failed[:4]))
     res = combine(results, label=f"多品种等权 · {len(results)} 个")
-    period = getattr(cfg, "period", "") or "1d"
     bpy = bars_per_year(res.equity.index)
     return Replay(res=res, bh=None, label=res.label,
                   family=getattr(cfg, "family", "rule"),

@@ -586,6 +586,109 @@ def _run() -> tuple[bool, list[str]]:
 
     check("机器学习多品种任务", _ml_multi)
 
+    def _multi_pooled():
+        """组合页的多品种回放要认「合并训练」。
+
+        研究页勾了「合并训练」是「一个模型训完，再各自回测」；组合页走的是
+        `replay.run_multi`，以前它根本不看 `pooled`，一律逐品种各训一遍。
+        后果有两个：同一份配置在两个页面跑出**两条不同的净值**，而且 N 个品种
+        要多训 N-1 遍（实测 65 因子 / 5m 十年 57 秒/品种，19 个品种就是 18 分钟
+        对 1 分半）。
+
+        这里不打桩看「有没有调那个函数」，而是直接比两条曲线：合并训练与逐品种
+        必须**不一样**（真按 pooled 走了），且合并训练那条要和手工调
+        `run_pooled_strategy` 算出来的一致。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factor_strategy as FS
+        from ttrade import replay as RP
+        from ttrade import strategy_store as SStore
+        from ttrade.backtest import combine, run_backtest
+
+        def _mk(seed):
+            n = 700
+            idx = pd.date_range("2020-01-01", periods=n, freq="B")
+            r = (np.sin(np.arange(n) / 25.0) * 0.01
+                 + np.random.default_rng(seed).normal(0, 0.004, n))
+            close = pd.Series(100 * np.exp(np.cumsum(r)), index=idx)
+            open_ = close * (1 + 0.001 * np.sin(np.arange(n) / 3.0))
+            return pd.DataFrame({
+                "open": open_,
+                "high": np.maximum(open_, close) * 1.005,
+                "low": np.minimum(open_, close) * 0.995,
+                "close": close, "volume": 1e5,
+            })
+
+        frames = {"A_SHFE": _mk(1), "B_SHFE": _mk(2)}
+        keys = ["mom_20", "mom_60", "ma_gap_20"]
+        fc = FS.FactorConfig(model="linear", window=60, horizon=1,
+                             train_window=200, step=60, min_train=120,
+                             pooled=True)
+        cfg = SStore.StrategyConfig(
+            symbol="A", exchange="SHFE", period="1d", family="factor",
+            rule_key="", factor_mode="ml", factor_keys=keys,
+            factor_cfg=dict(vars(fc)), sizing="capital",
+            principal=100_000.0, capital_pct=100.0,
+            multi_symbols=list(frames),
+        )
+
+        # 打桩数一下有没有走合并训练那条路
+        hits: list[int] = []
+        orig = FS.run_pooled_strategy
+
+        def _spy(*a, **kw):
+            hits.append(1)
+            return orig(*a, **kw)
+
+        FS.run_pooled_strategy = _spy
+        try:
+            rp_pool = RP.run_multi(cfg, frames)
+        finally:
+            FS.run_pooled_strategy = orig
+        if not rp_pool.ok:
+            raise RuntimeError(f"合并训练回放失败：{rp_pool.error}")
+        if not hits:
+            raise RuntimeError("配置里 pooled=True，组合页回放却没走合并训练")
+
+        # 逐品种那条路：曲线必须不一样，否则说明 pooled 只是个摆设
+        off = cfg.clone()
+        off.factor_cfg = dict(off.factor_cfg, pooled=False)
+        rp_one = RP.run_multi(off, frames)
+        if not rp_one.ok:
+            raise RuntimeError(f"逐品种回放失败：{rp_one.error}")
+        a, b = rp_pool.res.equity, rp_one.res.equity
+        j = a.index.intersection(b.index)
+        if len(j) < 10:
+            raise RuntimeError("合并训练与逐品种没有共同交易日，没法比对")
+        na = a.loc[j] / a.loc[j].iloc[0]
+        nb = b.loc[j] / b.loc[j].iloc[0]
+        gap = float((na - nb).abs().max())
+        if gap < 1e-9:
+            raise RuntimeError("合并训练和逐品种跑出一模一样的曲线：pooled 没生效")
+
+        # 和手工调的合并训练对齐（同一条路，逐位一致）
+        outs = orig(frames, keys, fc)
+        manual = []
+        for key, out in outs.items():
+            one = cfg.clone(symbol=key.split("_")[0], exchange="SHFE",
+                            multi_symbols=[], cross_symbols=[])
+            bt = RP.make_bt("cn", False, one)
+            bt.bars_per_year = RP.bars_per_year(out.df.index)
+            manual.append(run_backtest(out.df, bt, label=out.label))
+        res = combine(manual, label="多品种等权")
+        m = res.equity
+        j2 = a.index.intersection(m.index)
+        dev = float((a.loc[j2] / a.loc[j2].iloc[0]
+                     - m.loc[j2] / m.loc[j2].iloc[0]).abs().max())
+        if dev > 1e-9:
+            raise RuntimeError(f"组合页的合并训练与手工调的结果不一致（{dev:.2e}）")
+        return (f"pooled 走了合并训练，与逐品种最大偏差 {gap:.4f}，"
+                f"与手工口径偏差 {dev:.1e}")
+
+    check("多品种回放认「合并训练」", _multi_pooled)
+
     def _ml_artifact():
         """训练产物：每一折落一个 .pkl，实盘只预测的结果和回测**一致**。
 
