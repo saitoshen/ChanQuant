@@ -2491,6 +2491,16 @@ def _run() -> tuple[bool, list[str]]:
                     f"方向 {got.trigger_side} / 触发 {got.trigger_keys} / "
                     f"反转 {got.trigger_flip}）")
             win.chk_sparse.setChecked(False)
+            # 载入一份 ML 配置会顺手起后台线程（因子分析页重算 IC）。自检到这里
+            # 就结束了，线程还在跑的话窗口析构时 Qt 报
+            # `QThread: Destroyed while thread is still running`，进程以非零码
+            # 退出 —— CI 上表现成「30 条检查全 OK，job 却红」，特别费解。
+            for _cancel in (win._cancel_factor_worker, win._cancel_multi_worker,
+                            win._cancel_cross_worker):
+                try:
+                    _cancel()
+                except Exception:      # noqa: BLE001 - 收尾失败不该影响断言
+                    pass
             trig_info = ("「不用」两项都在（切市场后仍在），反转开关跟着触发源灰 / 亮，"
                          "规则触发参数能进配置且换规则不串，"
                          "稀疏采样存得进策略库也载得回来")
