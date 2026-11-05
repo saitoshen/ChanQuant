@@ -2046,6 +2046,7 @@ def _run() -> tuple[bool, list[str]]:
         from PySide6.QtWidgets import QApplication
 
         from gui.app import (
+            COL_PERIOD,
             FAMILY_RULE,
             STYLE_SHEET,
             MainWindow,
@@ -2442,6 +2443,33 @@ def _run() -> tuple[bool, list[str]]:
         n_models = win.cb_fmodel.count()
         n_rows_f = win.tbl_fmulti.rowCount()
         n_cols_f = win.tbl_fmulti.columnCount()
+        # 「周期」列必须**点得开**：`InstantPopup` 只负责「点一下弹菜单」，菜单
+        # 本身要 `setMenu()` 挂上去。漏了那一句，按钮长得完全正常、点下去一点
+        # 反应都没有，而别的自动检查全是绿的 —— v2.6.11 就是这么漏出去的。
+        # 这里只验「菜单挂着 + 勾选能连勾两档」，不碰窗口里的真实勾选（会排一次
+        # 回测，把后面几项读数带偏）
+        period_ok = False
+        period_info = ""
+        try:
+            _btn = win.tbl_fmulti.cellWidget(0, COL_PERIOD)
+            _menu = _btn.menu()
+            _n_act = len(_menu.actions())
+            _tmp = type(_btn)()          # 另建一个，不动窗口里的状态
+            _t = _tmp.menu().actions()
+            _t[1].trigger()
+            _t[2].trigger()
+            _two = len(_tmp.periods())
+            _t[1].trigger()              # 再点一次 = 取消勾选
+            _one = len(_tmp.periods())
+            period_ok = (_menu is not None
+                         and _n_act == win.cb_fperiod.count()
+                         and all(a.isCheckable() for a in _menu.actions())
+                         and _two == 3 and _one == 2)
+            period_info = (f"{type(_btn).__name__} 菜单 {_n_act} 项，"
+                           f"连勾两档 {_two} 档 / 取消后 {_one} 档")
+        except Exception as exc:  # noqa: BLE001
+            period_info = f"{type(exc).__name__}: {exc}"
+
         factor_ok = (
             fams == {"rule", "factor", "cross"}
             and modes == {"single", "multi", "ml"}
@@ -2455,6 +2483,7 @@ def _run() -> tuple[bool, list[str]]:
             # 列就没法跨周期引用
             and n_rows_f >= 47
             and n_cols_f == 5
+            and period_ok
             and win.chk_frev is not None
             # 权重口径三档（等权 / 不等权 / 滚动 IC）+ 打分范围说明 + 出场规则入口
             and {win.cb_fweight.itemData(i) for i in range(win.cb_fweight.count())}
@@ -2849,7 +2878,8 @@ def _run() -> tuple[bool, list[str]]:
         if not md_ok:
             raise RuntimeError(f"2 日 / 周线在界面上没接上（{md_info}）")
         if not factor_ok:
-            raise RuntimeError(f"因子面板控件缺失：{factor_info}")
+            raise RuntimeError(f"因子面板控件缺失：{factor_info}"
+                               + (f"（周期列：{period_info}）" if not period_ok else ""))
         if not live_off:
             raise RuntimeError(
                 "启动时自动接了实时（live 已在跑）：研究页不该连账户，"

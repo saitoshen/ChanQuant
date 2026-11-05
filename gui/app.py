@@ -218,6 +218,9 @@ class PeriodButton(QToolButton):
         self._menu = _StayOpenMenu(self)
         self._acts: list = []
         self._quiet = False
+        # `InstantPopup` 只是「点一下就把菜单弹出来」，菜单本身得挂上去 ——
+        # 忘了这一句按钮就是个纯装饰，点了什么都不发生（而且不报错）
+        self.setMenu(self._menu)
         self._add("本周期", "")
         for p in GUI_PERIODS:
             self._add(PERIOD_LABEL.get(p, p), p)
