@@ -6158,7 +6158,8 @@ class MainWindow(QMainWindow):
             return
 
         # 用 `out.step`（引擎按密度换算好的根数），不要自己再调一次 `ccfg.step()`
-        res = self._cross_result(out, label, out.step, bt.bars_per_year)
+        res = self._cross_result(out, label, out.step, bt.bars_per_year,
+                                 initial_cash=bt.initial_cash)
         ctx = ViewCtx(
             symbol="", name=f"{len(frames)} 个品种", exchange="",
             period=period, market=self.market, label=label,
@@ -6296,9 +6297,15 @@ class MainWindow(QMainWindow):
         self._show_single_view()
         self._clear_chart(f"截面回测失败：{msg}")
 
-    def _cross_result(self, out, label: str, step: int, bpy: float):
-        """把 `CrossResult` 包成 `Result`（细节在 `cross.to_result`）。"""
-        return cross_engine.to_result(out, label=label, step=step, bpy=bpy)
+    def _cross_result(self, out, label: str, step: int, bpy: float,
+                      initial_cash: float = 100_000.0):
+        """把 `CrossResult` 包成 `Result`（细节在 `cross.to_result`）。
+
+        `initial_cash` 一定要传真的本金：截面净值是归一化曲线，逐笔金额和
+        「期末资金」都要靠它折回钱，用默认的 10 万会和实际仓位对不上。
+        """
+        return cross_engine.to_result(out, label=label, step=step, bpy=bpy,
+                                      initial_cash=initial_cash)
 
     def _publish_port(self, res, head: str, period: str, bpy: float) -> None:
         """组合类结果（多品种 / 截面）没有基准也没有原始行情，单独摊一段文本。

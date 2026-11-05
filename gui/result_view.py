@@ -160,6 +160,17 @@ def set_tab_visible(tabs, title: str, on: bool) -> None:
             return
 
 
+def _money_unit(market) -> tuple[str, str]:
+    """(单位词, 金额前缀)。美股 `$`，国内（期货 / A 股）`元` / `¥`。
+
+    绩效页原来一律写 `$`：国内期货账户上那行「总成本 $111,825」其实是一万一千
+    块人民币 —— 符号错了比不写更糟，而且不会有任何地方报错。
+    """
+    if str(market or "").lower() == "us":
+        return "$", "$"
+    return "元", "¥"
+
+
 def _lots_text(v: float) -> str:
     """手数的可读写法。
 
@@ -171,21 +182,22 @@ def _lots_text(v: float) -> str:
     return f"{v:,.0f}" if abs(v - round(v)) < 1e-6 else f"{v:,.2f}"
 
 
-def cumulative_returns(trades) -> list[float]:
-    """逐笔的累计收益率：按行序复利（每笔收益连乘）。
+def cumulative_pnl(trades) -> list[float]:
+    """逐笔的累计盈亏，**金额**，按行序累加。
 
-    逐笔列表里的「累计」只能这么定义 —— 把百分比直接相加等于假设每笔都押
-    同样的本金，而手数是按风险定额算的，两边对不上；连乘至少和「一直满仓
-    复投」的直觉一致，也和绩效页的「累计收益」是同一个算法。
+    原来是「按笔复利」（每笔收益连乘）。改成累加是因为交易记录页的三列现在
+    都是钱：收益、成本、累计盈亏。复利连乘在金额列里没有意义 —— 每笔的手数
+    是按当时权益算的，赚到的钱本来就是一单一单加上去的，连乘等于假设每笔都
+    把全部身家重新押一遍。
 
-    持仓中那一笔的 `ret` 是浮动的（按最后一根收盘估值），照算 —— 那一行的
+    持仓中那一笔的 `pnl` 是浮动的（按最后一根收盘估值），照算 —— 那一行的
     累计写的就是「现在平掉会是多少」。
     """
-    cum = 1.0
+    total = 0.0
     out: list[float] = []
     for t in trades:
-        cum *= 1.0 + float(t.ret)
-        out.append(cum - 1.0)
+        total += float(getattr(t, "pnl", 0.0) or 0.0)
+        out.append(total)
     return out
 
 
@@ -719,8 +731,16 @@ class ResultView(QObject):
         self.lbl_trades.setWordWrap(True)
         lay.addWidget(self.lbl_trades)
 
+        # 「收益 / 成本 / 累计盈亏」三列都是**金额**。百分比说不出「这笔亏了
+        # 3200 块」，成本更只有折成钱才看得见疼 —— 一笔毛赚 0.05%、成本 0.1%
+        # 的交易，写成百分比是「+0.05%」（像赚的），写成钱才是「+40 / 成本 80」。
+        # 毛收益率还留在备注的悬停提示里，要横向比不同品种时看它。
+        #
+        # 表头不写「(元)」：视图对象建一次就复用，市场从美股切到期货时表头
+        # 不会重建，带单位的表头会让「按名字找列」直接抛 ValueError。单位改由
+        # 上面那行提示说明，切市场时它会跟着刷新
         cols = ["#", "策略", "方向", "开仓", "开仓价", "平仓", "平仓价", "手数",
-                "收益", "持仓", "累计盈亏", "备注"]
+                "收益", "成本", "累计盈亏", "持仓", "备注"]
         if self.kind == "portfolio":
             cols[1] = "策略"
         else:
@@ -1705,9 +1725,22 @@ class ResultView(QObject):
         def num(x):
             return "—" if x != x else f"{x:.2f}"
 
+        def ratio(x):
+            """盈利因子 / 平均盈亏比这类「倍数」。
+
+            一条亏损都没有时，`_metrics` 里给的是 999（哨兵值，用来表示
+            「除数为 0」）。表里写 999.00 会被当成真算出来的倍数，写 ∞ 才对
+            """
+            if x is None or x != x:
+                return "—"
+            return "∞" if float(x) >= 999 else f"{float(x):.2f}"
+
+        # 金额符号跟着市场走（美股 $ / 国内 ¥），见 `_money_unit`
+        cur = _money_unit(self.market)[1]
+
         def money(x, dp=0):
             # 老结果 / 还没接成本口径的路径（早先存的报告）没有这一项，写「—」
-            return "—" if x is None or x != x else f"${x:,.{dp}f}"
+            return "—" if x is None or x != x else f"{cur}{x:,.{dp}f}"
 
         rows = [
             ("年化收益 CAGR", pct(m["cagr"]), pct(b["cagr"]) if b else "—",
@@ -1738,13 +1771,19 @@ class ResultView(QObject):
             ("平均每笔成本（占成交额）", pct(m.get("cost_rate")),
              pct(b.get("cost_rate")) if b else "—", None),
             ("胜率", pct(m["win_rate"]), "—", None),
-            ("盈亏比", f"{m['profit_factor']:.2f}", "—", None),
+            # 「盈利因子」= 总盈利 ÷ 总亏损（Profit Factor）。原来这一行标的是
+            # 「盈亏比」，但那不是盈亏比 —— 盈亏比（payoff）是「平均赚一笔 ÷
+            # 平均亏一笔」，两者差一个胜率/败率。名字错了会让人按错的口径调参
+            ("盈利因子（总盈利/总亏损）", ratio(m.get("profit_factor")), "—", None),
+            # 补上平均盈亏比：盈利因子 = 胜率/(1−胜率) × 平均盈亏比，只看前一个
+            # 分不清「六成胜率小赚」和「三成大赚」
+            ("平均盈亏比（平均盈利/平均亏损）", ratio(m.get("payoff")), "—", None),
             ("平均每笔收益", pct(m["avg_trade"]), "—", None),
             ("平均持仓", hold_text(m["avg_bars"], self.period, self.ctx.bars_per_year), "—", None),
             ("最佳单笔", pct(m["best_trade"]), "—", None),
             ("最差单笔", pct(m["worst_trade"]), "—", None),
-            ("期末资金", f"${m['final_equity']:,.0f}",
-             f"${b['final_equity']:,.0f}" if b else "—",
+            ("期末资金", f"{cur}{m['final_equity']:,.0f}",
+             f"{cur}{b['final_equity']:,.0f}" if b else "—",
              None if b is None else m["final_equity"] >= b["final_equity"]),
         ]
 
@@ -1781,6 +1820,16 @@ class ResultView(QObject):
         tbl = getattr(self, "tbl_trades", None)
         if tbl is None:
             return
+
+        def money(x) -> str:
+            """金额的写法：带符号、千分位、不写小数。
+
+            逐笔金额从几十块到几百万都有，两位小数在窄列里只是噪音；要精确
+            到分，把鼠标放到「收益」上，提示里给的是元、毛/净都有
+            """
+            v = float(x or 0.0)
+            return "—" if v != v else f"{v:+,.0f}"
+
         # 按开仓时间排。单策略的 `res.trades` 是「平仓顺序」（平一笔追加一笔），
         # 组合的是 `combine_trades` 混排过的 —— 两边的行号对不上同一条时间轴，
         # 对着资金曲线查的时候很容易看串行。这里统一按开仓时间排。
@@ -1797,18 +1846,21 @@ class ResultView(QObject):
         avg_win = float(np.mean(wins)) if wins else 0.0
         avg_loss = float(np.mean(losses)) if losses else 0.0
 
-        # 累计盈亏：按笔复利（每笔收益连乘），口径见 `cumulative_returns`
-        cums = cumulative_returns([t for _n, t in rows])
+        # 累计盈亏：逐笔金额累加，口径见 `cumulative_pnl`
+        cums = cumulative_pnl([t for _n, t in rows])
 
         if not rows:
             self.lbl_trades.setText("这次回测没有产生交易（信号全程为空仓，或者样本太短）")
             tbl.setRowCount(0)
             return
+        cost_sum = sum(float(t.cost or 0.0) for _n, t in rows)
+        unit = _money_unit(self.market)[0]
         self.lbl_trades.setText(
             f"共 {len(rows)} 笔（已平 {n_closed} 笔，持仓中 {n_open} 笔）"
             f" · 盈利 {len(wins)} 笔 / 亏损 {len(losses)} 笔"
             f" · 平均盈利 {avg_win*100:+.2f}% / 平均亏损 {avg_loss*100:+.2f}%"
-            f" · 累计盈亏 {cums[-1]*100:+.2f}%（按笔复利，含持仓中那笔的浮动）"
+            f" · 累计盈亏 {cums[-1]:+,.0f} {unit}"
+            f" · 成本合计 {cost_sum:,.0f} {unit}（双边计，含持仓中那笔的浮动）"
             + ("　（组合：按策略分别平仓，不合并对冲）"
                if with_name and not getattr(self.ctx, "cross", None) else
                "　（截面：一笔 = 某品种一段连续同向持仓，权重变化不算新的一笔）"
@@ -1820,6 +1872,7 @@ class ResultView(QObject):
         head = [tbl.horizontalHeaderItem(j).text() if tbl.horizontalHeaderItem(j) else ""
                 for j in range(tbl.columnCount())]
         c_ret = head.index("收益")
+        c_cost = head.index("成本")
         c_cum = head.index("累计盈亏")
         c_note = head.index("备注")
 
@@ -1846,9 +1899,10 @@ class ResultView(QObject):
                 else f"{t.exit_date:%Y-%m-%d}",
                 f"{t.exit_price:,.2f}",
                 _lots_text(t.lots),
-                f"{t.ret*100:+.2f}%",
+                money(t.pnl),
+                money(t.cost),
+                money(cums[i]),
                 f"{t.bars}",
-                f"{cums[i]*100:+.2f}%",
                 " ｜ ".join(note),
             ]
             for j, v in enumerate(vals):
@@ -1856,7 +1910,16 @@ class ResultView(QObject):
                 if j >= 3 and j != c_note:
                     it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 if j == c_ret:
-                    it.setForeground(QColor(C_UP if t.ret >= 0 else C_DOWN))
+                    it.setForeground(QColor(C_UP if t.pnl >= 0 else C_DOWN))
+                    it.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))
+                    # 百分比没删，只是让位给钱：悬停能看见毛盈亏拆成「赚了多少
+                    # / 花了多少」，横向比不同品种的时候还是得看百分比。
+                    # `ret` 是按**成交价**（含滑点）算的，所以它介于毛和净之间
+                    it.setToolTip(
+                        f"毛盈亏 {t.gross:+,.0f} {unit} ｜ 成本 {t.cost:,.0f} {unit}"
+                        f" ｜ 净 {t.pnl:+,.0f} {unit}\n收益率（按成交价）{t.ret*100:+.2f}%")
+                elif j == c_cost:
+                    it.setForeground(QColor("#b45309"))
                 elif j == c_cum:
                     it.setForeground(QColor(C_UP if cums[i] >= 0 else C_DOWN))
                     it.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))

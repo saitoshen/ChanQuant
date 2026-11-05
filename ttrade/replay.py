@@ -155,14 +155,19 @@ def hold_text(bars: float, period: str, bars_per_year: float = 252.0) -> str:
 
 
 def _num(x) -> str:
-    """两位小数；NaN 写「—」。权益被亏穿时夏普 / 卡玛是 NaN（见
-    `backtest._metrics`），直接格式化会写出「nan」，模型读到也莫名其妙。"""
+    """两位小数；NaN / 缺失写「—」，除数为 0 的哨兵值（999）写「∞」。
+
+    权益被亏穿时夏普 / 卡玛是 NaN（见 `backtest._metrics`），直接格式化会写出
+    「nan」，模型读到也莫名其妙。盈利因子 / 平均盈亏比在没有亏损笔时给的是
+    999，写 999.00 会被当成真算出来的倍数。
+    """
     try:
-        if x != x:
+        if x is None or x != x:
             return "—"
-    except TypeError:
+        v = float(x)
+    except (TypeError, ValueError):
         return "—"
-    return f"{float(x):.2f}"
+    return "∞" if v >= 999 else f"{v:.2f}"
 
 
 def _pct(x) -> str:
@@ -223,7 +228,9 @@ def summary(rp: "Replay", head: str, period: str) -> str:
         lines.append(f"超额  {(m['cagr'] - b['cagr']) * 100:+.2f}%/年")
     lines.append(
         f"交易  {m['n_trades']} 笔｜胜率 {m['win_rate'] * 100:.0f}%"
-        f"｜盈亏比 {m['profit_factor']:.2f}｜仓位时间 {m['exposure'] * 100:.0f}%"
+        f"｜盈利因子 {_num(m.get('profit_factor'))}"
+        f"｜平均盈亏比 {_num(m.get('payoff'))}"
+        f"｜仓位时间 {m['exposure'] * 100:.0f}%"
         f"｜平均持仓 {hold_text(m['avg_bars'], rp.period, rp.bars_per_year)}"
     )
     # 成本单列：它已经从权益里扣掉了，但「花在哪」得能回答。每笔成本率用百分比

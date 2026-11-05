@@ -416,7 +416,7 @@ def _run() -> tuple[bool, list[str]]:
         - 引擎的兜底原因（策略名 / 信号离场 / 信号反向）
         - 策略写进 df 的逐根原因，必须按**决策根**取（差一根就把原因安到
           另一根上，界面上看不出错，只会觉得「这次平得莫名其妙」）
-        - 累计盈亏是复利连乘，不是百分比相加
+        - 累计盈亏是逐笔金额累加（不是百分比连乘，也不是百分比相加）
         """
         from ttrade.backtest import BacktestConfig, run_backtest
         import numpy as np
@@ -488,18 +488,18 @@ def _run() -> tuple[bool, list[str]]:
         if "分档浮盈回撤" not in str(ext.iloc[0]):
             raise RuntimeError(f"出场原因没写清口径：{ext.iloc[0]!r}")
 
-        # 累计盈亏：复利连乘。两笔 +10% / −10% 连乘是 −1%，相加是 0%
+        # 累计盈亏：逐笔金额累加（不是百分比连乘、也不是百分比相加）
         class _T:
-            def __init__(self, ret):
-                self.ret = ret
+            def __init__(self, pnl):
+                self.pnl = pnl
 
-        from gui.result_view import cumulative_returns
+        from gui.result_view import cumulative_pnl
 
-        cc = cumulative_returns([_T(0.10), _T(-0.10)])
-        if abs(cc[0] - 0.10) > 1e-12 or abs(cc[1] + 0.01) > 1e-12:
-            raise RuntimeError(f"累计盈亏不是复利连乘：{cc}")
+        cc = cumulative_pnl([_T(120.0), _T(-60.0)])
+        if abs(cc[0] - 120.0) > 1e-9 or abs(cc[1] - 60.0) > 1e-9:
+            raise RuntimeError(f"累计盈亏不是逐笔金额累加：{cc}")
         return (f"兜底 {t0.entry_note}/{t0.exit_note}、反向 {rf.trades[0].exit_note}、"
-                f"决策根对齐、因子写入口径、累计按笔复利")
+                f"决策根对齐、因子写入口径、累计按金额累加")
 
     def _us_df():
         """自检里反复要用的一份行情，按需加载一次就缓存。"""
@@ -514,6 +514,138 @@ def _run() -> tuple[bool, list[str]]:
 
     # 放在 `_us_df` 之后：`check()` 是立即执行的，定义在前会拿不到这个闭包
     check("交易记录备注与累计盈亏", _trade_notes)
+
+    def _trade_cost():
+        """成本必须**双边**收，逐笔成本加起来要等于绩效页的「总成本」。
+
+        「单边成本」是**每次成交**的口径（一买、一卖各收一次），不是「一开一平
+        只收一次」。真收成一次的话，净值会凭空好看一半，而且不报错 —— 只有
+        对着手算的数字才发现。所以这里把一笔完整交易的成本拆开对一遍：
+
+            cost = 开仓手续费 + 开仓滑点 + 平仓手续费 + 平仓滑点
+            pnl  = 毛盈亏 − cost
+            Σpnl = 期末资金 − 初始资金
+
+        最后一条是总账：逐笔金额必须能一路加回账户变化，否则「收益」那一列
+        只是好看的数字，对不上钱。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade.backtest import BacktestConfig, run_backtest
+
+        idx = pd.date_range("2021-01-01", periods=60, freq="D")
+        # 两段持仓：先涨后跌。必须**有赚有亏**，否则胜率是 100%，盈利因子和
+        # 平均盈亏比都退化成哨兵值，那条恒等式就验不到了
+        px = np.r_[np.full(6, 100.0), np.linspace(100, 120, 20), np.full(5, 120.0),
+                   np.linspace(120, 95, 20), np.full(9, 95.0)]
+        sig = np.zeros(60, dtype=int)
+        sig[6:26] = 1
+        sig[31:51] = 1
+        df = pd.DataFrame({"open": px, "high": px + 1, "low": px - 1, "close": px,
+                           "signal": sig}, index=idx)
+        # 滑点 0、只留比例手续费：这样两侧成本都是「手数 × 乘数 × 价 × 费率」，
+        # 能拿价格和手数直接手算
+        cfg = BacktestConfig(fee_rate=0.001, slippage=0.0)
+        r = run_backtest(df, cfg)
+        if not r.trades:
+            raise RuntimeError("样本没产生交易，这一项失去意义")
+        t = r.trades[0]
+        fee_in = t.lots * t.entry_price * 0.001
+        fee_out = t.lots * t.exit_price * 0.001
+        if abs(t.cost - (fee_in + fee_out)) > 1e-6:
+            raise RuntimeError(
+                f"逐笔成本不是双边：{t.cost:.4f}，手算 {fee_in + fee_out:.4f}")
+        if abs(t.pnl - (t.gross - t.cost)) > 1e-9:
+            raise RuntimeError(f"净盈亏不是「毛 − 成本」：{t.pnl:.4f}")
+        total = sum(x.cost for x in r.trades)
+        if abs(total - r.metrics["total_cost"]) > 1e-6:
+            raise RuntimeError(
+                f"逐笔成本合计 {total:.4f} ≠ 绩效页总成本 {r.metrics['total_cost']:.4f}")
+        if abs(sum(x.pnl for x in r.trades)
+               - (r.metrics["final_equity"] - cfg.initial_cash)) > 1e-6:
+            raise RuntimeError("逐笔金额加不回账户变化（Σpnl ≠ 期末 − 初始）")
+
+        # 带滑点再跑一遍。这一遍专门抓「毛盈亏用成交价（已含滑点）算」的错 ——
+        # 那样滑点会被扣两遍，Σpnl 会比账户变化少「总滑点」那么多，而且不报错。
+        # 上面那一遍滑点是 0，正好漏掉这个错
+        cfg_s = BacktestConfig(fee_rate=0.001, slippage=0.002)
+        rs = run_backtest(df, cfg_s)
+        if not rs.trades:
+            raise RuntimeError("带滑点的样本没产生交易")
+        slip_gap = abs(sum(x.pnl for x in rs.trades)
+                       - (rs.metrics["final_equity"] - cfg_s.initial_cash))
+        if slip_gap > 1e-6:
+            raise RuntimeError(
+                f"带滑点时逐笔金额对不上账户变化，差 {slip_gap:.4f}"
+                f"（总成本 {rs.metrics['total_cost']:.4f}）—— 滑点被算了两遍？")
+        if abs(sum(x.cost for x in rs.trades) - rs.metrics["total_cost"]) > 1e-6:
+            raise RuntimeError("带滑点时逐笔成本合计 ≠ 总成本")
+
+        # 盈利因子 = 胜率/(1−胜率) × 平均盈亏比。两条公式必须自洽，否则界面上
+        # 那两个数摆在一起会互相矛盾
+        m = r.metrics
+        if m["n_trades"] and 0 < m["win_rate"] < 1 and 0 < m["payoff"] < 999:
+            lhs = m["profit_factor"]
+            rhs = (m["win_rate"] / (1 - m["win_rate"])) * m["payoff"]
+            if abs(lhs - rhs) > 1e-6 * max(1.0, abs(lhs)):
+                raise RuntimeError(
+                    f"盈利因子 {lhs:.4f} ≠ 胜率/(1−胜率)×平均盈亏比 {rhs:.4f}")
+        return (f"双边 {t.cost:.2f}（手算 {fee_in + fee_out:.2f}）、"
+                f"Σ成本=总成本、Σ净额=账户变化（含滑点也对得上）、盈利因子自洽")
+
+    check("交易成本双边与金额口径", _trade_cost)
+
+    def _cross_trade_money():
+        """截面策略的逐笔金额也要能加回净值变化。
+
+        截面没有「一手」的概念，仓位是按权重挂着的，所以金额只能从
+        「上根净值 × 上根权重 × 这根收益」累出来，成本按换手拆。这里最容易
+        错的是换手怎么分：反手那一根 `|Δw|` 是两倍持仓，一半平旧仓、一半开
+        新仓 —— 用 `0.5 × |Δw|` 图省事的话，空仓开仓 / 平回空仓时对面没有段，
+        逐笔成本合计会只剩总成本的一半，而且没有任何地方会报错。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import cross as CX
+        from ttrade.backtest import BacktestConfig
+
+        rng = np.random.default_rng(7)
+        idx = pd.date_range("2023-01-02", periods=260, freq="B")
+        frames = {}
+        for k in range(6):
+            r = rng.normal(0.0002, 0.012, len(idx))
+            px = 100 * np.exp(np.cumsum(r))
+            frames[f"S{k}_SHFE"] = pd.DataFrame(
+                {"open": px * (1 + rng.normal(0, 0.001, len(idx))),
+                 "high": px * 1.01, "low": px * 0.99, "close": px,
+                 "volume": rng.integers(1e4, 1e5, len(idx)).astype(float),
+                 "open_interest": rng.integers(1e4, 1e5, len(idx)).astype(float)},
+                index=idx)
+        cfg = CX.CrossConfig(mode="hedge", factor_mode="single",
+                             factor_keys=["mom_20"], top_pct=30.0, bot_pct=30.0,
+                             weight="equal", rebalance=5)
+        bt = BacktestConfig(initial_cash=500_000.0, fee_rate=0.0003, slippage=0.0)
+        out = CX.run(frames, cfg, bt)
+        if not out.ok:
+            raise RuntimeError(f"截面回测没跑通：{out.error}")
+        res = CX.to_result(out, label="截面", step=out.step, bpy=252.0,
+                           initial_cash=bt.initial_cash)
+        if not res.trades:
+            raise RuntimeError("截面回测没产生交易")
+        cost_gap = abs(sum(t.cost for t in res.trades) - res.metrics["total_cost"])
+        pnl_gap = abs(sum(t.pnl for t in res.trades)
+                      - (res.metrics["final_equity"] - bt.initial_cash))
+        if cost_gap > 1e-3:
+            raise RuntimeError(
+                f"截面逐笔成本合计对不上总成本，差 {cost_gap:.4f}")
+        if pnl_gap > 1e-3:
+            raise RuntimeError(
+                f"截面逐笔净额对不上净值变化，差 {pnl_gap:.4f}")
+        return f"{len(res.trades)} 笔，Σ成本=总成本、Σ净额=净值变化"
+
+    check("截面逐笔金额口径", _cross_trade_money)
 
     def _lib_name_rules():
         """策略库存入时的两种重名。

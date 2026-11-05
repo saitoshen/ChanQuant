@@ -124,6 +124,21 @@ class Trade:
     direction: int = 1            # 1=多头，-1=空头
     open_position: bool = False
     lots: float = 0.0             # 这笔实际下了多少手（unit 口径是份额，小数）
+    # ---- 金额口径 ----
+    # `gross` 是**按盘口价**算的价差盈亏（带符号手数 × 乘数 × 未含滑点的价差），
+    # `cost` 是**这一笔自己吃掉的双边成本**（开仓 + 平仓的手续费与滑点），
+    # `pnl` 是两者之差。
+    #
+    # `gross` 一定要用**不含滑点**的价格：滑点已经单列进 `cost` 了，用成交价
+    # （已含滑点）去算毛盈亏，滑点就被扣了两遍 —— 逐笔金额加起来会比账户实际
+    # 变化少「总滑点」那么多，而且不报错。`gross − cost = 账户变化` 是这一对
+    # 字段唯一说得通的验收标准。
+    #
+    # 为什么逐笔也要记成本：绩效页只有一个「总成本」，回答不了「这笔到底被
+    # 吃掉多少」。而百分比收益（`ret`）是纯价差、不含成本 —— 一笔毛赚 0.05%、
+    # 成本 0.1% 的交易在表里是「+0.05%」，看着是赚的，钱其实少了
+    gross: float = 0.0
+    cost: float = 0.0
     # 截面策略一笔只对应一个品种，但同一个 `Result` 里混着好几个品种的交易；
     # 单策略回测只有一只标的，留空即可
     symbol: str = ""
@@ -133,6 +148,16 @@ class Trade:
     # 止损」这类信息只有因子策略自己知道，引擎不该假装懂
     entry_note: str = ""
     exit_note: str = ""
+
+    @property
+    def pnl(self) -> float:
+        """这一笔的净盈亏（**金额**，已扣双边成本）。
+
+        交易记录页的「收益」「累计盈亏」两列读它，绩效页的胜率 / 盈利因子还是
+        读 `ret`（纯价差百分比）—— 两个口径各管一处：百分比说「这段行情走了
+        多少」，金额说「钱到底多了还是少了」。
+        """
+        return float(self.gross) - float(self.cost)
 
 
 @dataclass
@@ -148,7 +173,7 @@ _METRIC_KEYS = (
     "total_return", "cagr", "ann_vol", "sharpe", "max_dd", "calmar",
     "exposure", "long_exposure", "short_exposure",
     "n_trades", "n_long", "n_short",
-    "win_rate", "avg_trade", "profit_factor",
+    "win_rate", "avg_trade", "profit_factor", "payoff", "avg_win", "avg_loss",
     "avg_bars", "best_trade", "worst_trade",
 )
 
@@ -207,10 +232,23 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
         gross_win = wins.sum() if len(wins) else 0.0
         gross_loss = abs(losses.sum()) if len(losses) else 0.0
         profit_factor = float(gross_win / gross_loss) if gross_loss > 0 else (999.0 if gross_win > 0 else 0.0)
+        # 平均盈亏比（payoff）= 平均盈利 ÷ 平均亏损。它和盈利因子是**一对**：
+        #
+        #     盈利因子 = 总盈利 ÷ 总亏损
+        #             = (盈利笔数 × 平均盈利) ÷ (亏损笔数 × 平均亏损)
+        #             = 胜率 / (1 − 胜率) × 平均盈亏比
+        #
+        # 只看盈利因子，看不出这 2.0 是「六成胜率、每次小赚」还是「三成胜率、
+        # 一次赚三倍」，两种打法要盯的东西完全不同（前者怕胜率掉，后者怕单笔
+        # 尾部）。补上这一项才拆得开
+        avg_win = float(wins.mean()) if len(wins) else 0.0
+        avg_loss = float(losses.mean()) if len(losses) else 0.0
+        payoff = (avg_win / abs(avg_loss)) if avg_loss < 0 else (999.0 if avg_win > 0 else 0.0)
         avg_bars = float(np.mean([t.bars for t in closed]))
         best, worst = float(rets.max()), float(rets.min())
     else:
         win_rate = avg_trade = profit_factor = avg_bars = best = worst = 0.0
+        avg_win = avg_loss = payoff = 0.0
 
     return {
         "total_return": float(total),
@@ -228,6 +266,9 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
         "win_rate": float(win_rate),
         "avg_trade": avg_trade,
         "profit_factor": profit_factor,
+        "payoff": payoff,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
         "avg_bars": avg_bars,
         "best_trade": best,
         "worst_trade": worst,
@@ -341,6 +382,13 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     notional_total = 0.0
     lots = 0.0                   # 正=多，负=空，0=空仓（unit 口径是份额）
     pos = 0                      # 1=多，-1=空，0=平
+    # 这一笔**开仓时**花掉的成本（手续费 + 滑点，金额）。平仓时要把它和
+    # 平仓那一侧的成本合起来记进同一笔交易，否则「这笔交易的成本」只剩一半，
+    # 看上去像只收了单边
+    entry_cost = 0.0
+    # 开仓时的**盘口价**（不含滑点）。毛盈亏要用它算，不能用 `entry_price`
+    # —— 那个已经含了滑点，两边一起算会把滑点扣两遍
+    entry_raw = 0.0
     pos_state = np.zeros(n, dtype=int)
     equity = np.zeros(n, dtype=float)
     trades: list[Trade] = []
@@ -348,10 +396,13 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     entry_bar = 0
     entry_dir = 1
 
-    def close_position(i: int, price: float, held: float, why: str = "") -> None:
+    def close_position(i: int, price: float, held: float, why: str = "",
+                       cost: float = 0.0, raw_price: float | None = None) -> None:
         nonlocal entry_price, entry_date
         if entry_price is None:
             return
+        # 毛盈亏按**不含滑点**的盘口价算：滑点在 `cost` 里已经算过一次了
+        raw_exit = float(price if raw_price is None else raw_price)
         trades.append(
             Trade(
                 entry_date=entry_date,
@@ -362,6 +413,9 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
                 bars=i - entry_bar,
                 direction=entry_dir,
                 lots=abs(float(held)),
+                gross=float(held) * mult * (raw_exit - float(entry_raw)),
+                # 开仓那一侧的 `entry_cost` + 平仓这一侧的 `cost` = 双边
+                cost=float(entry_cost) + float(cost),
                 entry_note=entry_why,
                 exit_note=why,
             )
@@ -386,13 +440,16 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
                 fee = cfg.fee_amount(lots, mult, price)
                 cash -= fee
                 # 滑点按「每手多少价差 × 乘数 × 手数」折成钱，和手续费一起记
-                cost_total += fee + sp * mult * abs(lots)
+                close_cost = fee + sp * mult * abs(lots)
+                cost_total += close_cost
                 notional_total += abs(lots) * mult * abs(price)
                 why = (note_out[dec] if note_out is not None else "") or (
                     "信号反向" if want == -pos else "信号离场")
-                close_position(i, price, lots, why)
+                close_position(i, price, lots, why, cost=close_cost,
+                               raw_price=open_[i])
                 lots = 0.0
                 pos = 0
+                entry_cost = 0.0
 
             # ---- 再按需开新仓 ----
             if want != 0:
@@ -403,10 +460,13 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
                 if q > 0:
                     fee = cfg.fee_amount(q, mult, price)      # 开仓手续费
                     cash -= fee
-                    cost_total += fee + sp * mult * q
+                    # 开仓这一侧的成本先记着，等平仓时并进同一笔交易
+                    entry_cost = fee + sp * mult * q
+                    cost_total += entry_cost
                     notional_total += q * mult * abs(price)
                     lots = q if want > 0 else -q
                     entry_price, entry_date, entry_bar, entry_dir = price, idx[i], i, want
+                    entry_raw = float(open_[i])
                     entry_why = (note_in[dec] if note_in is not None else "") or label
                     pos = want
 
@@ -429,6 +489,10 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
                 direction=entry_dir,
                 open_position=True,
                 lots=abs(float(lots)),
+                # 没平仓 = 只付了开仓那一侧的成本。别按「双边」估，那会把还没
+                # 发生的钱先记成花掉了。估值用最后一根收盘（盘口价，不含滑点）
+                gross=float(lots) * mult * (float(last) - float(entry_raw)),
+                cost=float(entry_cost),
                 entry_note=entry_why,
                 exit_note="样本结束，仍持仓",
             )
@@ -479,6 +543,10 @@ def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None) -> Result:
         direction=1,
         open_position=True,
         lots=float(q),
+        # 基准只开了仓、一直没平，所以成本只有开仓那一侧（手续费 + 滑点）。
+        # 毛盈亏用**盘口价**（`open_[0]`，不含滑点），滑点在成本里已经算过
+        gross=float(q) * mult * (float(close[-1]) - float(open_[0])),
+        cost=float(fee0) + abs(float(price - open_[0]) * q * mult),
     )
     m = _metrics(eq, ps, [trade], cfg.bars_per_year)
     m["final_equity"] = float(eq.iloc[-1])

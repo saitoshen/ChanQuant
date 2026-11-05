@@ -30,7 +30,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pandas as pd
@@ -629,7 +629,10 @@ def _metrics(equity: pd.Series, bpy: float) -> dict:
 
 
 def trades_from_weights(weights: pd.DataFrame,
-                        close: pd.DataFrame) -> list[Trade]:
+                        close: pd.DataFrame,
+                        rets: pd.DataFrame | None = None,
+                        cvec: pd.Series | None = None,
+                        eq_prev: pd.Series | None = None) -> list[Trade]:
     """把权重矩阵翻成逐笔交易：每个品种「同向连续持仓」算一笔。
 
     截面策略没有「一次开一手、一次平一手」的成交，仓位是按权重挂着的。要给出
@@ -642,17 +645,38 @@ def trades_from_weights(weights: pd.DataFrame,
 
     权重**大小**变了不算新的一笔：风险平价每次调仓都会改大小，按大小切会把一笔
     三年的多头拆成上百笔，那不是交易记录，那是调仓日志。
+
+    `rets` / `cvec` / `eq_prev` 三个一起给，才会填出**金额**（`gross` / `cost`）：
+
+        gross = Σ 上根净值 × 上根权重 × 这根收益
+        cost  = Σ 换手 |Δw| × 单边成本率 × 当时净值
+
+    截面净值是「归一化到 1.0」的曲线，所以这里算出来的是**占初始本金的比例**，
+    由 `to_result` 乘回本金。不给这三个参数（老调用）就是全 0，界面上写「—」。
+
+    段首 / 段尾那一根的换手费要按「谁开的、谁平的」拆：`|Δw|` 里平旧仓那
+    一半归上一段，开新仓那一半归这一段。所以这里记的是 `|w[i]|`（开仓）和
+    `|w[j]|`（平仓），不是 `0.5 × |Δw|` —— 空仓开仓、平回空仓时对面没有段，
+    取一半的话逐笔成本合计会只有总成本的一半。
     """
     out: list[Trade] = []
     if weights is None or weights.empty:
         return out
     idx = weights.index
     n = len(idx)
+    money = rets is not None and cvec is not None and eq_prev is not None
     for sym in weights.columns:
         if sym not in close:
             continue
         w = weights[sym].to_numpy(dtype=float)
         px = close[sym].to_numpy(dtype=float)
+        if money:
+            r = (rets[sym].to_numpy(dtype=float) if sym in rets
+                 else np.zeros(n, dtype=float))
+            e = eq_prev.to_numpy(dtype=float)
+            cv = float(cvec.get(sym, 0.0) or 0.0)
+            # 每一根的换手：w[t] − w[t−1]，第一根的上一根当 0
+            dw = np.abs(np.diff(w, prepend=0.0))
         sign = np.where(np.isfinite(w), np.sign(w), 0.0)
         i = 0
         while i < n:
@@ -669,6 +693,26 @@ def trades_from_weights(weights: pd.DataFrame,
             k = min(end, n - 1)
             p0, p1 = float(px[i]), float(px[k])
             ret = (p1 / p0 - 1.0) * s if p0 > 0 else 0.0
+            gross = cost = 0.0
+            if money:
+                for t in range(i + 1, k + 1):
+                    if np.isfinite(e[t]) and np.isfinite(r[t]):
+                        gross += e[t] * w[t - 1] * r[t]
+                # 成本按「这一根的换手」拆成两半：平旧仓那一半归上一段，
+                # 开新仓那一半归这一段。直接对 |Δw| 取 0.5 是错的 —— 空仓
+                # 开仓 / 平回空仓时对面没有段，那一半就丢了，逐笔成本合计会
+                # 只有总成本的一半。
+                #
+                # 第一根除外：`run()` 里 `weights.diff()` 在第一行是 NaN（当作
+                # 0 换手），而且 `equity.iloc[0]` 被钉成 1.0，那一根本来就没扣
+                # 钱。这里跟着不记，逐笔合计才对得上「总成本」
+                if i > 0 and np.isfinite(e[i]):
+                    cost += abs(w[i]) * e[i] * cv          # 开仓
+                for t in range(i + 1, min(end, n)):
+                    if np.isfinite(e[t]):
+                        cost += dw[t] * e[t] * cv          # 段内调仓
+                if end < n and np.isfinite(e[end]):
+                    cost += abs(w[j]) * e[end] * cv        # 平仓
             # 备注列：进场看权重多大，出场看权重是归零还是反向。截面策略没有
             # ATR 出场规则，这两种就是全部的离场方式
             w0 = float(w[i]) if np.isfinite(w[i]) else 0.0
@@ -683,6 +727,7 @@ def trades_from_weights(weights: pd.DataFrame,
                 entry_price=p0, exit_price=p1, ret=float(ret),
                 bars=int(k - i), direction=int(s), open_position=bool(opened),
                 lots=0.0,          # 截面是权重不是手数，界面上显示「—」
+                gross=float(gross), cost=float(cost),
                 symbol=str(sym),
                 entry_note=f"截面权重 {w0:+.2f} 进场",
                 exit_note=why,
@@ -832,7 +877,8 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
         label=label, legs=int(weights.abs().gt(0).sum(axis=1).max() or 0),
         n_rebalance=n_reb,
         step=step, bars_per_day=bpd,
-        trades=trades_from_weights(weights, close),
+        trades=trades_from_weights(weights, close, rets=rets, cvec=cvec,
+                                   eq_prev=equity.shift(1).fillna(1.0)),
         score=score,
         score_step1=(score_src if src is not frames else None),
     )
@@ -880,12 +926,20 @@ def to_result(out: "CrossResult", label: str = "", step: int = 0,
     m["avg_trade"] = (sum(seg) / n) if n else 0.0
     m["profit_factor"] = ((gross_win / gross_loss) if gross_loss > 0
                           else (999.0 if gross_win > 0 else 0.0))
+    # 平均盈亏比：和 `backtest._metrics` 同一个口径（平均盈利 ÷ 平均亏损），
+    # 盈利因子 = 胜率/(1−胜率) × 它。截面这里「一笔」= 一个调仓区间
+    m["avg_win"] = (sum(wins) / len(wins)) if wins else 0.0
+    m["avg_loss"] = (sum(losses) / len(losses)) if losses else 0.0
+    m["payoff"] = ((m["avg_win"] / abs(m["avg_loss"])) if m["avg_loss"] < 0
+                   else (999.0 if m["avg_win"] > 0 else 0.0))
     m["avg_bars"] = float(step)
     m["best_trade"] = max(seg) if seg else 0.0
     m["worst_trade"] = min(seg) if seg else 0.0
     # 绩效表里「期末资金」这一行读的是 `final_equity`，`backtest._metrics` 不算
-    # 它（那是 `run_backtest` 事后补的），这里得自己补上
-    m["final_equity"] = float(eq.iloc[-1])
+    # 它（那是 `run_backtest` 事后补的），这里得自己补上。
+    # **要乘回本金**：截面净值是「归一化到 1.0」的曲线，`eq.iloc[-1]` 是倍数
+    # （2.5 倍），直接写进去绩效表就成了「期末资金 $2」
+    m["final_equity"] = float(eq.iloc[-1]) * float(initial_cash or 0.0)
     # 成本：截面净值是归一化曲线，金额只能按本金折回去。换手是逐根扣的，
     # 所以「总成本」在这里是「如果本金是 initial_cash，这一路换了多少次手」
     cost_pct = float(out.metrics.get("cost_pct") or 0.0)
@@ -896,7 +950,13 @@ def to_result(out: "CrossResult", label: str = "", step: int = 0,
     notional_pct = float(out.metrics.get("notional_pct") or 0.0)
     m["notional"] = notional_pct * float(initial_cash or 0.0)
     m["cost_rate"] = float(cost_pct / notional_pct) if notional_pct > 0 else 0.0
-    return Result(equity=eq, position=pos, trades=list(out.trades),
+    # 逐笔金额：`trades_from_weights` 算出来的是「占初始本金的比例」，这里乘回
+    # 本金。用 `replace` 生成新对象，别原地改 `out.trades` —— 同一个 `CrossResult`
+    # 被包两次（主窗口 + 组合页）时，原地改会乘两遍本金
+    cash = float(initial_cash or 0.0)
+    trades = [replace(t, gross=float(t.gross) * cash, cost=float(t.cost) * cash)
+              for t in out.trades]
+    return Result(equity=eq, position=pos, trades=trades,
                   metrics=m, label=label)
 
 
