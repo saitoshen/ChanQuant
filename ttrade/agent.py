@@ -565,8 +565,11 @@ def _factor_brief(cfg) -> str:
         FACTORS = {}
     names = []
     for k in (cfg.factor_keys or [])[:4]:
-        spec = FACTORS.get(k)
-        names.append(f"{spec.label}({k})" if spec is not None else str(k))
+        # 因子实例 `mom_60@1w`：名字取纯键，周期跟在后面写出来
+        base, _, p = str(k).partition("@")
+        spec = FACTORS.get(base)
+        lab = f"{spec.label}({base})" if spec is not None else str(k)
+        names.append(f"{lab}[{p}]" if p else lab)
     fcfg = cfg.factor_cfg or {}
     tail = []
     if fcfg.get("window"):

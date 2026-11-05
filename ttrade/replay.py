@@ -481,7 +481,8 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
 
 
 def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "",
-              timing_extra: dict[str, dict] | None = None) -> Replay:
+              timing_extra: dict[str, dict] | None = None,
+              factor_extra: dict[str, dict] | None = None) -> Replay:
     """截面策略的离线回放。组合页双击一条截面策略走这里。
 
     截面要的是**一批**品种的行情，调用方按 `cfg.cross_symbols` 各自取好再递进来
@@ -542,7 +543,8 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "",
              f"{ccfg.step_text(fstrat.bars_per_day(panel.index))}调仓")
     out = cross_engine.run(frames, ccfg, bt,
                            profile=getattr(cfg, "cost_profile", "") or None,
-                           label=label, timing_extra=timing_extra)
+                           label=label, timing_extra=timing_extra,
+                           factor_extra=factor_extra)
     if not out.ok:
         return Replay(error=out.error or "截面回测没有算出净值")
     res = cross_engine.to_result(out, label=label, step=out.step,

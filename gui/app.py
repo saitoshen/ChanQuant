@@ -84,6 +84,7 @@ from PySide6.QtWidgets import (
     QLayout,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -94,6 +95,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -161,6 +163,117 @@ FAMILY_CROSS = "cross"
 # 多因子表格的列号。**一律用常量**：这张表从 4 列扩到 5 列时（加了「周期」），
 # 散在各处的 `item(r, 2)` 全是「反」还是「用」这种问题，靠肉眼是查不出来的
 COL_NAME, COL_PERIOD, COL_USE, COL_REV, COL_W = 0, 1, 2, 3, 4
+
+
+class _StayOpenMenu(QMenu):
+    """点了勾选项不收起，能连着勾好几档周期。
+
+    QMenu 默认点一下就关。周期要「本周期 + 日线 + 周线」三档时，关一次就得
+    重新展开一次 —— 一屏八行、每行都要这么点，没人受得了。这里只对**可勾选**
+    的项拦一道：点它等于翻状态，菜单留着；点空白或别的项还是正常关闭。
+    """
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 - Qt 的命名
+        act = self.actionAt(event.position().toPoint())
+        if act is not None and act.isCheckable():
+            act.trigger()
+            return
+        super().mouseReleaseEvent(event)
+
+
+# 周期短名：表格那一列只有 84px，全称拼起来会被省略号截掉。单档时用全称
+# （「本周期」「周线」都放得下），多档时用这套短名 + 加号（「本+日+周」）
+_PERIOD_SHORT = {"": "本", "1d_tq": "日", "1d": "日T", "2d": "2日", "1w": "周"}
+
+
+def _short_period(p: str) -> str:
+    p = str(p or "")
+    return _PERIOD_SHORT.get(p, p)
+
+
+class PeriodButton(QToolButton):
+    """周期选择：同一个因子可以同时勾几档周期。
+
+    做成「按钮 + 勾选菜单」而不是 QComboBox：Qt 的下拉单击就收起，勾第二档
+    得重新展开一次。按钮上的字是这个因子当前用到的周期，一行里就能看出
+    「本+日+周」这种组合。
+    """
+
+    changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setPopupMode(QToolButton.InstantPopup)
+        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        # 行高只有 21px，全局样式里的 padding / min-height 会把控件撑到 30px
+        # 压到下一行去，这里单独压扁
+        self.setStyleSheet(
+            "QToolButton{border:1px solid #3b4353; border-radius:3px;"
+            " padding:0 1px; font-size:11px; background:transparent;}"
+            "QToolButton::menu-indicator{width:0px; height:0px;}"
+            "QToolButton:hover{border-color:#5a6478;}"
+        )
+        self.setFixedHeight(19)
+        self.setCursor(Qt.PointingHandCursor)
+        self._menu = _StayOpenMenu(self)
+        self._acts: list = []
+        self._quiet = False
+        self._add("本周期", "")
+        for p in GUI_PERIODS:
+            self._add(PERIOD_LABEL.get(p, p), p)
+        self.setPeriods([""])
+
+    def _add(self, text: str, data: str) -> None:
+        act = self._menu.addAction(text)
+        act.setCheckable(True)
+        act.setData(data)
+        act.triggered.connect(lambda _checked=False, a=act: self._on_pick(a))
+        self._acts.append(act)
+
+    # ---- 读写
+    def periods(self) -> list[str]:
+        """勾中的周期，空串表示「跟策略周期走」。"""
+        return [str(a.data() or "") for a in self._acts if a.isChecked()]
+
+    def setPeriods(self, periods) -> None:
+        want = [str(p or "") for p in (periods or [])] or [""]
+        self._quiet = True
+        for a in self._acts:
+            a.setChecked(str(a.data() or "") in want)
+        self._quiet = False
+        self._refresh()
+
+    # ---- 交互
+    def _on_pick(self, act) -> None:
+        # 至少留一档：一档都不勾等于「这个因子不参与合成」，那件事该由「用」列
+        # 表达。两处都能表达同一件事，出问题时查不出是谁干的
+        if not self.periods():
+            act.setChecked(True)
+        self._refresh()
+        if not self._quiet:
+            self.changed.emit()
+
+    def _refresh(self) -> None:
+        ps = self.periods() or [""]
+        # 列宽只有 84px：「本周期+日线+周线」这种全称会被省略号截掉，反而看不出
+        # 勾了什么。多档时用短名拼（本+日+周），单档「本周期」保留全称
+        if ps == [""]:
+            txt = "本周期"
+        else:
+            txt = "+".join(_short_period(p) for p in ps)
+        self.setText(txt)
+        names = [PERIOD_LABEL.get(p, p) for p in ps if p]
+        self.setToolTip(
+            "这个因子在哪些周期上各算一份。\n\n"
+            "「本周期」= 跟策略的周期走。勾了别的周期就是跨周期引用，"
+            "同一个因子可以在几个周期上同时用 —— 比如日线动量 + 周线动量"
+            "各占一列一起合成。\n\n"
+            "大周期的 bar 只在**收完之后**才允许被小周期看到，"
+            "所以不会用到未来数据。\n\n"
+            "当前：" + "、".join(["本周期"] + names if "" in ps else names)
+        )
+
+
 FAMILIES = [
     (FAMILY_RULE, "规则策略", "经典技术指标，阈值/交叉直接产生信号"),
     (FAMILY_FACTOR, "因子策略", "因子分数过阈值进出场，可单因子/多因子/机器学习"),
@@ -884,12 +997,15 @@ class CrossWorker(QObject):
 
     def __init__(self, frames: dict, cfg, bt, profile: str, label: str,
                  step1_frames: dict | None = None,
-                 timing_extra: dict | None = None) -> None:
+                 timing_extra: dict | None = None,
+                 factor_extra: dict | None = None) -> None:
         super().__init__()
         self.frames = frames
         self.step1_frames = step1_frames
-        # 时序腿的跨周期因子行情：{品种: {周期: 行情}}，主线程读好再进线程
+        # 跨周期因子行情：{品种: {周期: 行情}}，主线程读好再进线程。
+        # 两条腿各一份 —— 截面腿和时序腿的因子可以指到不同周期上
         self.timing_extra = dict(timing_extra or {})
+        self.factor_extra = dict(factor_extra or {})
         self.cfg = cfg
         self.bt = bt
         self.profile = profile
@@ -907,6 +1023,7 @@ class CrossWorker(QObject):
                 label=self.label, progress=cb, cancel=lambda: self._cancel,
                 step1_frames=self.step1_frames,
                 timing_extra=self.timing_extra,
+                factor_extra=self.factor_extra,
             )
         except fstrat.Cancelled:
             return
@@ -2071,6 +2188,8 @@ class MainWindow(QMainWindow):
             "在哪个周期上算这个因子。\n\n"
             "「本周期」= 跟策略的周期走（老口径）。选别的周期就是跨周期引用 ——\n"
             "比如周线策略调日线因子：大方向按周线，具体动手看日线有没有走坏。\n\n"
+            "单因子模式只取一档；想让同一个因子在几个周期上**各算一份**，\n"
+            "切到「多因子组合」，表格里的「周期」列可以勾好几档。\n\n"
             "大周期的 bar 只在**收完之后**才允许被小周期看到，所以不会用到未来数据。"
         )
         self.cb_fperiod.currentIndexChanged.connect(self._on_single_period_changed)
@@ -2081,6 +2200,8 @@ class MainWindow(QMainWindow):
         # （参与合成、反向使用、权重），QListWidget 只有一列勾选框，塞不下。
         # 「权重」列只在「不等权」时露出来 —— 等权模式下摆一列全 1，
         # 只会让人以为调它有用。
+        # 「周期」列是**多选**（`PeriodButton`）：一个因子勾几档周期就是几个
+        # 因子实例（`mom_60` / `mom_60@1w`），各占一列一起进合成
         self.tbl_fmulti = QTableWidget(0, 5)
         self.tbl_fmulti.setObjectName("FactorTable")
         self.tbl_fmulti.setFixedHeight(176)
@@ -2101,7 +2222,7 @@ class MainWindow(QMainWindow):
         for _c in (COL_PERIOD, COL_USE, COL_REV, COL_W):
             hh.setSectionResizeMode(_c, QHeaderView.Fixed)
         hh.setFixedHeight(22)
-        self.tbl_fmulti.setColumnWidth(COL_PERIOD, 66)
+        self.tbl_fmulti.setColumnWidth(COL_PERIOD, 84)
         self.tbl_fmulti.setColumnWidth(COL_USE, 30)
         self.tbl_fmulti.setColumnWidth(COL_REV, 30)
         self.tbl_fmulti.setColumnWidth(COL_W, 46)
@@ -2970,38 +3091,54 @@ class MainWindow(QMainWindow):
             cb.addItem(PERIOD_LABEL.get(p, p), p)
         cb.blockSignals(False)
 
-    def _row_period(self, key: str) -> str:
-        """某个因子选中的周期（空串 = 跟策略周期走）。"""
+    def _row_periods(self, key: str) -> list[str]:
+        """某个因子勾中的周期（空串 = 跟策略周期走）。"""
         r = self._row_of_factor(key)
         if r < 0:
-            return ""
+            return [""]
         w = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
-        return str(w.currentData() or "") if isinstance(w, QComboBox) else ""
+        ps = w.periods() if isinstance(w, PeriodButton) else [""]
+        return ps or [""]
+
+    def _set_row_periods(self, key: str, periods) -> None:
+        r = self._row_of_factor(key)
+        if r < 0:
+            return
+        w = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
+        if isinstance(w, PeriodButton):
+            w.setPeriods(periods)
+
+    def _row_period(self, key: str) -> str:
+        """某个因子选中的**第一档**周期（空串 = 跟策略周期走）。
+
+        单因子模式那一行下拉只放得下一档，所以取第一档；多因子表格里每行可以
+        勾好几档，真正的周期集合见 `_row_periods`。
+        """
+        ps = self._row_periods(key)
+        return "" if "" in ps else ps[0]
 
     def _set_row_period(self, key: str, period: str) -> None:
-        r = self._row_of_factor(key)
-        if r < 0:
-            return
-        w = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
-        if not isinstance(w, QComboBox):
-            return
-        i = w.findData(period or "")
-        if i >= 0 and i != w.currentIndex():
-            w.blockSignals(True)
-            w.setCurrentIndex(i)
-            w.blockSignals(False)
+        """单因子模式的下拉只有一档 —— 改它就是把这一行的周期集合换成这一档。"""
+        self._set_row_periods(key, [period])
 
     def _factor_periods(self) -> dict[str, str]:
-        """`{因子键: 周期}`，只收非「本周期」的那些。"""
+        """`{因子实例: 周期}`，只收非「本周期」的那些。
+
+        实例 id 里本来就带着周期（`mom_60@1d_tq`），这份映射是给**老配置**和
+        那些只认 `factor_periods` 的地方（产物拦截、策略摘要）留的备份。
+        """
         out: dict[str, str] = {}
         for r in range(self.tbl_fmulti.rowCount()):
             item = self.tbl_fmulti.item(r, COL_NAME)
             if item is None:
                 continue
+            k = str(item.data(Qt.UserRole))
             w = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
-            p = str(w.currentData() or "") if isinstance(w, QComboBox) else ""
-            if p:
-                out[str(item.data(Qt.UserRole))] = p
+            if not isinstance(w, PeriodButton):
+                continue
+            for p in w.periods():
+                if p:
+                    out[factors.make_spec(k, p)] = p
         return out
 
     def _sync_single_period(self) -> None:
@@ -3020,8 +3157,8 @@ class MainWindow(QMainWindow):
         self._schedule(immediate=True)
 
     def _multi_state(self) -> dict:
-        """每个因子的 (参与合成, 反转, 权重, 周期)。重建时用它保住勾选。"""
-        out: dict[str, tuple[bool, bool, str, str]] = {}
+        """每个因子的 (参与合成, 反转, 权重, 周期列表)。重建时用它保住勾选。"""
+        out: dict[str, tuple[bool, bool, str, list[str]]] = {}
         for r in range(self.tbl_fmulti.rowCount()):
             item = self.tbl_fmulti.item(r, COL_NAME)
             if item is None:
@@ -3031,11 +3168,12 @@ class MainWindow(QMainWindow):
             rev = self.tbl_fmulti.item(r, COL_REV)
             wt = self.tbl_fmulti.item(r, COL_W)
             pcell = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
+            ps = pcell.periods() if isinstance(pcell, PeriodButton) else [""]
             out[k] = (
                 bool(use is not None and use.checkState() == Qt.Checked),
                 bool(rev is not None and rev.checkState() == Qt.Checked),
                 ((wt.text().strip() if wt is not None else "") or "1"),
-                str(pcell.currentData() or "") if isinstance(pcell, QComboBox) else "",
+                list(ps or [""]),
             )
         return out
 
@@ -3081,27 +3219,12 @@ class MainWindow(QMainWindow):
                 # 名字列默认是可编辑的，不改的话双击就能把因子名改乱
                 name.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 self.tbl_fmulti.setItem(r, COL_NAME, name)
-                use_on, rev_on, wt, per = picked.get(
-                    k, (k in factors.DEFAULT_MULTI, False, "1", ""))
-                cb = QComboBox()
-                self._fill_period_combo(cb)
-                # 表格行高只有 21px，全局样式给 QComboBox 的 `min-height: 22px`
-                # + 上下 padding 会让它撑到 30px，压到下一行上去。这里单独压扁
-                cb.setStyleSheet(
-                    "QComboBox{padding:0 2px; min-height:0px; font-size:11px;}"
-                    "QComboBox::drop-down{width:12px;}")
-                cb.setFixedHeight(19)
-                i = cb.findData(per)
-                cb.setCurrentIndex(i if i >= 0 else 0)
-                cb.setToolTip(
-                    "这个因子在哪个周期上算。\n\n"
-                    "「本周期」= 跟策略的周期走。选别的周期就是跨周期引用，\n"
-                    "比如周线策略调日线因子、日线策略调周线过滤。\n\n"
-                    "大周期的 bar 只有在**收完之后**才允许被小周期看到 ——\n"
-                    "周线因子在周五收盘前用的都是上一周的值，不会用到未来数据。"
-                )
-                cb.currentIndexChanged.connect(self._on_factor_selection)
-                self.tbl_fmulti.setCellWidget(r, COL_PERIOD, cb)
+                use_on, rev_on, wt, pers = picked.get(
+                    k, (k in factors.DEFAULT_MULTI, False, "1", [""]))
+                btn = PeriodButton()
+                btn.setPeriods(pers)
+                btn.changed.connect(self._on_factor_selection)
+                self.tbl_fmulti.setCellWidget(r, COL_PERIOD, btn)
                 for col, tip, default in (
                     (COL_USE, "勾上表示参与合成", use_on),
                     (COL_REV, "勾上表示这个因子反向使用（取负号）", rev_on),
@@ -3986,8 +4109,7 @@ class MainWindow(QMainWindow):
         elif fm == "ml":
             fac = f"机器学习（{self.cb_fmodel.currentText()}）"
         else:
-            names = [factors.FACTORS[k].label for k in self.factor_keys
-                     if k in factors.FACTORS]
+            names = [factors.spec_label(k) for k in self._selected_factor_keys()]
             fac = "、".join(names[:3])
             if len(names) > 3:
                 fac += f" 等 {len(names)} 个"
@@ -4207,6 +4329,10 @@ class MainWindow(QMainWindow):
         self.box_fbtns.setVisible(not single)
         if single:
             self._sync_single_rev()
+            # 周期也要跟着刷：多因子表格里每行可以勾好几档，单因子那个下拉只
+            # 放得下一档。不刷的话切过来看到的还是上次那一档，而实际用的是这行
+            # 现在的第一档 —— 界面和结果对不上
+            self._sync_single_period()
         # 权重口径只对「多因子组合」有意义
         if hasattr(self, "box_fweight"):
             self.box_fweight.setVisible(self.factor_mode == "multi")
@@ -4279,6 +4405,7 @@ class MainWindow(QMainWindow):
         self.cb_forient.setVisible(not is_ml)
         if single:
             self._sync_single_rev()
+            self._sync_single_period()
         self._rebuild_fparams()
         if is_ml and not mlmodels.available():
             self.lbl_fmode.setText("当前环境没有可用的机器学习库，请先安装依赖。")
@@ -4377,17 +4504,33 @@ class MainWindow(QMainWindow):
         self._schedule()
 
     def _selected_factor_keys(self) -> list[str]:
-        """当前选中的因子。单因子取下拉，多因子/ML 取勾选项（保持库内顺序）。"""
+        """当前选中的因子**实例**（`mom_60` / `mom_60@1d_tq`），保持库内顺序。
+
+        同一个因子勾了几档周期就是几个实例 —— 它们各自是一列，一起进合成。
+        行序就是库内顺序（表格是按类别 + 库序建的），所以直接按行取即可。
+        """
         if self.factor_mode == "single":
             k = self.cb_fsingle.currentData()
-            return [k] if k else []
-        picked = set()
+            if not k:
+                return []
+            return [factors.make_spec(k, str(self.cb_fperiod.currentData() or ""))]
+        out: list[str] = []
+        seen: set[str] = set()
         for r in range(self.tbl_fmulti.rowCount()):
             name = self.tbl_fmulti.item(r, COL_NAME)
             use = self.tbl_fmulti.item(r, COL_USE)
-            if name is not None and use is not None and use.checkState() == Qt.Checked:
-                picked.add(name.data(Qt.UserRole))
-        return [k for k in factors.FACTORS if k in picked]
+            if name is None or use is None or use.checkState() != Qt.Checked:
+                continue
+            k = str(name.data(Qt.UserRole))
+            w = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
+            ps = w.periods() if isinstance(w, PeriodButton) else [""]
+            for p in (ps or [""]):
+                spec = factors.make_spec(k, p)
+                if spec in seen:
+                    continue
+                seen.add(spec)
+                out.append(spec)
+        return out
 
     # ---------------------------------------------------------- 参数滑块
     def _clear_param_box(self, box, widgets: dict, scales: dict) -> None:
@@ -4764,12 +4907,28 @@ class MainWindow(QMainWindow):
         self._schedule(immediate=True, force=True)
 
     def _apply_factor_keys(self, keys, reverse, periods=None) -> None:
-        """恢复因子选择：单因子设下拉，多因子勾表格，反向勾「反」列。"""
-        picked = set(keys or [])
+        """恢复因子选择：单因子设下拉，多因子勾表格，反向勾「反」列。
+
+        `keys` 里可能是**实例**（`mom_60@1d_tq`，新写法），也可能是纯键 + 另一份
+        `periods` 映射（老配置）。两种都读，老策略读回来一个字都不用改。
+        """
+        keys = [str(k) for k in (keys or [])]
+        # 每个因子行要用到的周期集合：实例 id 自带周期，纯键去 periods 里查
+        want: dict[str, list[str]] = {}
+        for k in keys:
+            base, p = factors.split_spec(k)
+            p = p or str((periods or {}).get(k) or "")
+            want.setdefault(base, [])
+            if p not in want[base]:
+                want[base].append(p or "")
+        if not want:
+            want = {}
+        picked = set(want)
         if picked:
-            i = self.cb_fsingle.findData(sorted(picked)[0])
-            if i < 0:  # 保持配置里的顺序，优先第一项
-                i = self.cb_fsingle.findData(list(keys)[0])
+            first = keys[0] if keys else ""
+            i = self.cb_fsingle.findData(factors.split_spec(first)[0])
+            if i < 0:
+                i = self.cb_fsingle.findData(sorted(picked)[0])
             if i >= 0:
                 self.cb_fsingle.setCurrentIndex(i)
         # 逐行 setCheckState 会逐行触发 itemChanged，每行都排一次重算 ——
@@ -4788,13 +4947,10 @@ class MainWindow(QMainWindow):
                 if rev is not None:
                     on = bool((reverse or {}).get(k))
                     rev.setCheckState(Qt.Checked if on else Qt.Unchecked)
-                # 跨周期：配置里带回来的 {因子: 周期}，没配就是「本周期」
+                # 跨周期：勾中的周期集合，没配就是「本周期」
                 pcell = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
-                if isinstance(pcell, QComboBox):
-                    i = pcell.findData(str((periods or {}).get(k) or ""))
-                    pcell.blockSignals(True)
-                    pcell.setCurrentIndex(i if i >= 0 else 0)
-                    pcell.blockSignals(False)
+                if isinstance(pcell, PeriodButton):
+                    pcell.setPeriods(want.get(k, [""]))
         finally:
             self.tbl_fmulti.blockSignals(False)
         self._sync_single_period()
@@ -5549,8 +5705,11 @@ class MainWindow(QMainWindow):
         裁到「近一年」的话周线只剩五十来根，因子全成 NaN。对齐时只用得上
         基准 bar 之前的那些值，多给的部分不会被看到（见 `align_to_base`）。
         """
-        if not getattr(cfg, "factor_periods", None) or not key:
+        if not key:
             return {}
+        # 不能拿 `cfg.factor_periods` 当闸门：周期已经编进因子实例 id
+        # （`mom_60@1d_tq`），那个映射在新配置里是空的。要哪些周期由
+        # `period_frames` 从 keys 里算，没有跨周期时它自然返回空 dict
         return fstrat.period_frames(
             cfg, list(keys), base_period,
             lambda p: self.store.get(key, p),
@@ -5797,25 +5956,36 @@ class MainWindow(QMainWindow):
         )
         self._publish_port(res, head, period, bpy)
 
-    def _pick_usable_single(self, key: str, frames: dict) -> list[str]:
+    def _pick_usable_single(self, key: str, frames: dict,
+                            extra: dict | None = None,
+                            base_period: str = "") -> list[str]:
         """单因子模式：选中的因子在这批品种上算不出数，就换一个能算的。
 
         日内因子放到日线上、展期/期权因子放到没有这些列的品种上，结果全是 NaN。
         单因子只取一个，碰上这种就只剩一句「这些因子都没有数据」，用户还得从四
         十个因子里猜哪个能用 —— 直接换成第一个算得出来的，下拉里同步过去。
+
+        `key` 可能是因子实例（`mom_60@1d_tq`）：判可用性要拿它自己那一档周期
+        的行情判，判完还得把周期带回去 —— 换掉周期等于换了另一个因子。
         """
-        if key and any(factors.available(df, key) for df in frames.values()):
+        base, p = factors.split_spec(key)
+        srcs = [((extra or {}).get(p) if p and p != str(base_period or "") else None)
+                or df for df in frames.values()]
+        if key and any(factors.available(df, base) for df in srcs):
             return [key]
         alt = next((k for k in factors.FACTORS
                     if any(factors.available(df, k) for df in frames.values())), "")
         if not alt:
             return [key] if key else []
-        old = factors.FACTORS[key].label if key in factors.FACTORS else key
+        old = factors.spec_label(key) if key else ""
         self.cb_fsingle.blockSignals(True)
         idx = self.cb_fsingle.findData(alt)
         if idx >= 0:
             self.cb_fsingle.setCurrentIndex(idx)
         self.cb_fsingle.blockSignals(False)
+        # 换了因子，周期也跟着回到「本周期」：新因子未必有那一档数据
+        self._set_row_period(alt, "")
+        self._sync_single_period()
         self.lbl_status.setText(
             f"单因子「{old}」在这个周期上没有数据，已改用「{factors.FACTORS[alt].label}」")
         return [alt]
@@ -5847,10 +6017,17 @@ class MainWindow(QMainWindow):
         if self.factor_mode == "ml" and len(fkeys) < 2:
             self.lbl_status.setText("机器学习截面至少需要勾选 2 个因子")
             return
-        if self.factor_mode == "single":
-            fkeys = self._pick_usable_single(fkeys[0], frames)
         rev = {k: True for k in self._reversed_factor_keys()}
         fc = self._factor_cfg()
+        # 截面因子腿的跨周期行情：逐品种在主线程里读好，线程里只算。
+        # 用**策略周期**当基准 —— `frames` 就是那一档
+        factor_extra = {}
+        for _k in frames:
+            _ex = self._extra_periods(fc, list(fkeys), period, _k)
+            if _ex:
+                factor_extra[_k] = _ex
+        if self.factor_mode == "single":
+            fkeys = self._pick_usable_single(fkeys[0], frames, factor_extra, period)
         _cx = self._cross_new_params()
         # 第一步的行情：配了别的周期就另取一份（典型：5 分钟策略用日线成交额
         # 筛池）。取不到就退回策略周期，并在状态栏说清楚 —— 悄悄降级比报错更糟
@@ -5932,7 +6109,7 @@ class MainWindow(QMainWindow):
         # 统一走线程能少一套分支，也免得两条路的结果口径慢慢走偏
         # 时序腿的跨周期因子：逐个品种把它要的别的周期行情读出来（主线程）
         timing_extra = {}
-        if ccfg.timing_family == "factor" and ccfg.timing_factor_keys                 and fc.factor_periods:
+        if ccfg.timing_family == "factor" and ccfg.timing_factor_keys:
             for _k in frames:
                 ex = self._extra_periods(fc, list(ccfg.timing_factor_keys),
                                          period, _k)
@@ -5940,7 +6117,8 @@ class MainWindow(QMainWindow):
                     timing_extra[_k] = ex
         self._start_cross_worker(frames, ccfg, bt, label, period, missing,
                                  step1_frames=step1_frames,
-                                 timing_extra=timing_extra)
+                                 timing_extra=timing_extra,
+                                 factor_extra=factor_extra)
 
     def _finish_cross(self, out, label: str, ccfg, frames: dict, period: str,
                       bt: BacktestConfig, missing: list[str],
@@ -5994,7 +6172,8 @@ class MainWindow(QMainWindow):
     def _start_cross_worker(self, frames, ccfg, bt, label: str, period: str,
                             missing: list[str] | None = None,
                             step1_frames: dict | None = None,
-                            timing_extra: dict | None = None) -> None:
+                            timing_extra: dict | None = None,
+                            factor_extra: dict | None = None) -> None:
         """截面回测走后台线程。已经在跑的先取消，避免旧结果盖掉新结果。"""
         self._cancel_cross_worker()
         self._c_seq += 1
@@ -6003,7 +6182,8 @@ class MainWindow(QMainWindow):
         worker = CrossWorker(frames, ccfg, bt,
                              self.cb_cost.currentData() or None, label,
                              step1_frames=step1_frames,
-                             timing_extra=timing_extra)
+                             timing_extra=timing_extra,
+                             factor_extra=factor_extra)
         # 收尾要用的上下文挂在 worker 上，靠 `sender()` 取回来。**不能**用
         # `connect(lambda ...)` 把 seq/上下文带过去：lambda 没有 QObject 接收者，
         # PySide 会当成直连，`done` 于是在**工作线程**里直接跑 `_finish_cross`，

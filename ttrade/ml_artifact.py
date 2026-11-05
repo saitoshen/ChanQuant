@@ -543,15 +543,23 @@ def _cfg_digest(cfg: "fstrat.FactorConfig") -> dict:
 
 
 # ================================================================== 训练
-def _no_cross_periods(cfg) -> None:
+def _no_cross_periods(cfg, keys=None) -> None:
     """产物这条路还不支持跨周期因子 —— 拦住，而不是算出一份对不上的特征。
 
     产物里的模型是「按基准周期的行情算出来的特征」训出来的；实盘 `predict`
     只拿得到基准周期的行情。跨周期因子要成立，得把别的周期的行情也塞进产物
     （或者让实盘自己去读），那是另一件事。在训练这一步就报错，好过实盘上
     「模型突然不灵了」—— 后者要查很久。
+
+    两种写法都要认：老配置的 `factor_periods` 映射，和新配置里带 `@周期` 的
+    因子实例 id（见 `factors.split_spec`）。
     """
-    if dict(getattr(cfg, "factor_periods", None) or {}):
+    hit = dict(getattr(cfg, "factor_periods", None) or {})
+    for k in (keys or []):
+        p = F.split_spec(k)[1]
+        if p:
+            hit[str(k)] = p
+    if hit:
         raise ValueError(
             "跨周期因子的机器学习暂不支持「离线训练产物」："
             "回测和实盘实时重算（后台训练）都能用，"
@@ -588,13 +596,12 @@ def train_artifact(
     """
     t0 = time.time()
     cfg = _normalized(cfg)
-    keys = [k for k in (keys or []) if k in F.FACTORS]
+    keys = [k for k in (keys or []) if F.is_factor(k)]
     if len(keys) < 2:
         raise ValueError("机器学习多因子至少需要 2 个因子")
     if df is None or len(df) < 200:
         raise ValueError(f"数据太少（{0 if df is None else len(df)} 根），训不了模型")
-    _no_cross_periods(cfg)
-    _no_cross_periods(cfg)
+    _no_cross_periods(cfg, keys)
 
     # ---- 因子矩阵 + 标签（和 build_score 里一样）----
     use = F.filter_available(df, keys)
@@ -1364,12 +1371,12 @@ def train_fold_set(
     """
     t0 = time.time()
     cfg = _normalized(cfg)
-    keys = [k for k in (keys or []) if k in F.FACTORS]
+    keys = [k for k in (keys or []) if F.is_factor(k)]
     if len(keys) < 2:
         raise ValueError("机器学习多因子至少需要 2 个因子")
     if df is None or len(df) < 200:
         raise ValueError(f"数据太少（{0 if df is None else len(df)} 根），训不了模型")
-    _no_cross_periods(cfg)
+    _no_cross_periods(cfg, keys)
 
     use = F.filter_available(df, keys)
     if not use:
@@ -1480,11 +1487,12 @@ def train_fold_set_pooled(
     """
     t0 = time.time()
     cfg = _normalized(cfg)
-    keys = [k for k in (keys or []) if k in F.FACTORS]
+    keys = [k for k in (keys or []) if F.is_factor(k)]
     if len(keys) < 2:
         raise ValueError("机器学习多因子至少需要 2 个因子")
     if not frames or len(frames) < 2:
         raise ValueError("合并训练至少要 2 个品种")
+    _no_cross_periods(cfg, keys)
 
     collected: list = []
     outs = fstrat.run_pooled_strategy(

@@ -281,10 +281,33 @@ def _factor_cfg(cfg: "CrossConfig"):
     )
 
 
+def _rev_of(spec, rev) -> bool:
+    """这个因子实例要不要反着用。
+
+    「反」是按因子行勾的，存的是纯键；实例 id（`mom_60@1w`）是同一个因子的
+    另一份。两处都认，才不会出现「勾了反转但周线那一份没反」。
+    """
+    return str(spec) in rev or factors.split_spec(spec)[0] in rev
+
+
+def _inst_period(spec: str, fcfg) -> str:
+    """因子实例的周期。实例 id 里带了就用它，否则查老配置的 `factor_periods`。"""
+    _b, p = factors.split_spec(spec)
+    if p:
+        return p
+    if isinstance(fcfg, dict):
+        d = fcfg
+    else:
+        d = dict(getattr(fcfg, "factor_periods", None) or {})
+    return str((d or {}).get(str(spec), "") or "")
+
+
 def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
                 reverse: dict | None = None, mode: str = "multi",
                 fcfg=None, progress=None, cancel=None,
-                label_mode: str = "volret") -> pd.DataFrame:
+                label_mode: str = "volret",
+                factor_extra: dict[str, dict] | None = None,
+                base_period: str = "") -> pd.DataFrame:
     """截面合成分数。三种模式和时序那边对齐：单因子 / 多因子 / 机器学习。
 
     - `single`：取第一个因子，横截面 Z-score
@@ -295,24 +318,66 @@ def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
     会自动跳过 —— 一个品种缺一个因子不该让整组排名作废。
 
     `label_mode` 只对 ml 生效，口径见 `ml_score_panel`。
+
+    `keys` 可以是因子实例（`mom_60@1w`）：同一个因子在几个周期上各算一份、
+    各占一列。`factor_extra` 是这些实例要用的别的周期行情
+    `{品种: {周期: 行情}}`，`base_period` 是 `frames` 是哪一档 —— 两者都不给
+    时按「时间戳就是决策时刻」处理，和以前一样。
     """
-    keys = [k for k in (keys or []) if k in factors.FACTORS]
+    keys = [k for k in (keys or []) if factors.is_factor(k)]
     if not keys:
         raise ValueError("没有选中任何可用因子")
     rev = set(k for k, v in (reverse or {}).items() if v)
 
     if mode == "ml":
+        # 截面 ML 的特征矩阵要逐品种同构，跨周期实例得给每个品种各配一套行情
+        # 再拼列名，那是另一件事。拦住，别让它按基准周期悄悄算一份对不上的特征
+        bp = str(base_period or "")
+        cross = [k for k in keys if _inst_period(k, fcfg) not in ("", bp)]
+        if cross:
+            raise ValueError(
+                "截面机器学习暂不支持跨周期因子（"
+                + "、".join(factors.spec_label(k) for k in cross)
+                + "）：把周期改回「本周期」，或者用单因子 / 多因子"
+            )
         return ml_score_panel(frames, keys, fcfg, progress=progress, cancel=cancel,
                               label_mode=label_mode)
 
     parts = []
-    for key in keys:
+    # 跨周期实例要用的行情没给全时**报缺行情**，不要退化成「这些因子都没有
+    # 数据」—— 后者会让人去换因子，而真正缺的是另一档周期的行情
+    lack: list[str] = []
+    for spec in keys:
+        p = _inst_period(spec, fcfg)
+        if not p or p == str(base_period or ""):
+            continue
+        got = sum(1 for sym in frames
+                  if (((factor_extra or {}).get(sym) or {}).get(p) is not None))
+        if got < MIN_CROSS:
+            lack.append(f"{factors.spec_label(spec)}（{got} 个品种有该周期）")
+    if lack:
+        raise ValueError("跨周期因子缺行情：" + "、".join(lack)
+                         + " —— 换成已有周期，或者先去「数据管理」补一次")
+    for spec in keys:
+        base, p = factors.split_spec(spec)
+        p = p or _inst_period(spec, fcfg)
+        cross = bool(p) and p != str(base_period or "")
         raw = {}
         for sym, df in frames.items():
+            src = df
+            if cross:
+                src = ((factor_extra or {}).get(sym) or {}).get(p)
+                if src is None or src.empty:
+                    continue
             try:
-                raw[sym] = factors.raw(df, key)
+                s = factors.raw(src, base)
             except Exception:  # noqa: BLE001
                 continue
+            if cross:
+                # 大周期的 bar 只在收完之后才允许被小周期看到；多给的尾巴不会
+                # 被用到（见 `factor_strategy.align_to_base`）
+                s = fstrat.align_to_base(s, df.index, base_period, p)
+            raw[sym] = s
         if len(raw) < MIN_CROSS:
             continue
         panel = pd.concat(raw, axis=1).sort_index().ffill()
@@ -322,7 +387,7 @@ def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
             # 全空，合成分数就全空，界面上显示「截面分数全空」却查不出是谁
             continue
         z = _cross_z(panel)
-        if key in rev:
+        if _rev_of(spec, rev):
             z = -z
         parts.append(z)
         if mode == "single":
@@ -363,7 +428,7 @@ def ml_score_panel(frames: dict[str, pd.DataFrame], keys: list[str], fcfg,
     from ttrade import mlmodels as ML
     from ttrade.factor_metrics import forward_return
 
-    keys = [k for k in (keys or []) if k in factors.FACTORS]
+    keys = [k for k in (keys or []) if factors.is_factor(k)]
     if len(keys) < 2:
         raise ValueError("机器学习至少需要 2 个因子")
 
@@ -631,7 +696,8 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
         profile: str | None = None, label: str = "",
         progress=None, cancel=None,
         step1_frames: dict[str, pd.DataFrame] | None = None,
-        timing_extra: dict[str, dict] | None = None) -> CrossResult:
+        timing_extra: dict[str, dict] | None = None,
+        factor_extra: dict[str, dict] | None = None) -> CrossResult:
     """跑一遍截面策略。出错写进 `CrossResult.error`，不抛异常。
 
     `progress` / `cancel` 只给机器学习模式用：walk-forward 要跑几十折，界面
@@ -642,19 +708,30 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     策略的时钟上，只用已经收完的那一根。传 None 就是「跟随策略周期」，老行为。
 
     `timing_extra` 是时序腿的**跨周期因子行情**：`{品种: {周期: 行情}}`，
-    由调用方在主线程里读好（见 `factor_strategy.period_frames`）。时序腿的
-    因子可以被指到别的周期上，截面那条腿（`factor_keys`）暂时还不支持。
+    由调用方在主线程里读好（见 `factor_strategy.period_frames`）。
+
+    `factor_extra` 是**截面因子腿**的同款行情：`{品种: {周期: 行情}}`。因子
+    实例（`mom_60@1w`）要用的别的周期，从这里取。
     """
     if not frames or len(frames) < MIN_CROSS:
         return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
                            error=f"截面策略至少要 {MIN_CROSS} 个品种，现在只有 {len(frames)} 个")
     # 第一步用哪份行情：配了周期且真的拿到了另一份才换，否则还是自己的
     src = step1_frames if (cfg.step1_period and step1_frames) else frames
+    # 因子实例的周期是相对 `frames`（策略周期）说的。第一步换成了另一档行情时，
+    # 「周线因子」到底相对谁算就说不清了 —— 与其猜，不如让它报错
+    if src is not frames and any(factors.split_spec(k)[1]
+                                 for k in (cfg.factor_keys or [])):
+        return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
+                           error="第一步（选品种）换了周期时，截面因子不能再各自"
+                                 "指定周期 —— 把因子周期改回「本周期」，"
+                                 "或者把第一步也改回「跟随策略周期」")
     try:
         score_src = score_panel(src, list(cfg.factor_keys or []),
                                 cfg.factor_reverse, mode=cfg.factor_mode or "multi",
                                 fcfg=_factor_cfg(cfg), progress=progress, cancel=cancel,
-                                label_mode=cfg.label_mode)
+                                label_mode=cfg.label_mode,
+                                factor_extra=factor_extra, base_period=cfg.period)
     except fstrat.Cancelled:
         raise                     # 用户点的「取消」，不是回测失败
     except Exception as exc:  # noqa: BLE001
@@ -882,7 +959,9 @@ def _rel_fwd(frames: dict[str, pd.DataFrame], index, horizon: int) -> pd.DataFra
 
 def factor_report(frames: dict[str, pd.DataFrame], keys: list[str],
                   score: pd.DataFrame, fcfg=None, reverse: dict | None = None,
-                  quantiles: int = 5) -> CrossReport:
+                  quantiles: int = 5,
+                  factor_extra: dict[str, dict] | None = None,
+                  base_period: str = "") -> CrossReport:
     """截面因子分析：每个因子在这批品种上「排得准不准」。
 
     和时序那套因子分析的差别就在**口径**：时序算的是「这个因子跟自己历史比，
@@ -909,25 +988,38 @@ def factor_report(frames: dict[str, pd.DataFrame], keys: list[str],
 
     rows = []
     panels: dict[str, pd.DataFrame] = {}
-    for key in keys or []:
-        if key not in factors.FACTORS:
+    for spec in keys or []:
+        if not factors.is_factor(spec):
             continue
+        base, p = factors.split_spec(spec)
+        p = p or _inst_period(spec, fcfg)
+        cross = bool(p) and p != str(base_period or "")
         raw = {}
         for sym, df in frames.items():
+            src = df
+            if cross:
+                # 评估表用的是 `frames`（基准周期）+ 调用方给的别的周期行情。
+                # 没给就跳过这一行 —— 按基准周期算一份、标上「周线」，比缺一行更糟
+                src = ((factor_extra or {}).get(sym) or {}).get(p)
+                if src is None or src.empty:
+                    continue
             try:
-                raw[sym] = factors.raw(df, key)
+                s = factors.raw(src, base)
             except Exception:  # noqa: BLE001
                 continue
+            if cross:
+                s = fstrat.align_to_base(s, df.index, base_period, p)
+            raw[sym] = s
         if len(raw) < MIN_CROSS:
             continue
         panel = pd.concat(raw, axis=1).sort_index().ffill().reindex(index)
         if not panel.notna().any().any():
             continue
         z = _cross_z(panel)
-        if key in rev:
+        if _rev_of(spec, rev):
             z = -z
-        panels[key] = z
-        rows.append((key, factors.FACTORS[key].label, z))
+        panels[spec] = z
+        rows.append((spec, factors.spec_label(spec), z))
 
     # 合成分数也占一行：它是「这一堆因子合起来」的实际排序依据
     rows.append(("__score__", "合成分数（实际用于排序）", score))
@@ -1281,7 +1373,7 @@ def _timing_signal(df: pd.DataFrame, cfg: CrossConfig,
             return pd.Series(out["signal"], index=df.index).astype(float).fillna(0.0)
         except Exception:  # noqa: BLE001
             return pd.Series(0.0, index=df.index)
-    keys = [k for k in (cfg.timing_factor_keys or []) if k in factors.FACTORS]
+    keys = [k for k in (cfg.timing_factor_keys or []) if factors.is_factor(k)]
     if not keys:
         return pd.Series(0.0, index=df.index)
     try:

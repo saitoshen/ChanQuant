@@ -1192,8 +1192,8 @@ class PortfolioRunner:
         回测的日线因子必须是同一份数，否则「回测赚钱、实盘亏钱」又要从头查。
         没配跨周期因子时返回空 dict，一次多余的读都不做。
         """
-        if not getattr(fc, "factor_periods", None):
-            return {}
+        # 闸门不能是 `fc.factor_periods`：周期编在因子实例 id 里
+        # （`mom_60@1d_tq`），新配置下那个映射是空的
         keys = list(st.cfg.factor_keys or [])
         sym, ex = st.cfg.symbol, st.cfg.exchange
         return fstrat.period_frames(

@@ -2148,7 +2148,7 @@ class ResultView(QObject):
         imp = out.pack.importance if out is not None else None
         if imp is not None and len(imp):
             top = imp.head(10)[::-1]
-            names = [factors.FACTORS[k].label if k in factors.FACTORS else k for k in top.index]
+            names = [factors.spec_label(k) for k in top.index]
             a_last.barh(np.arange(len(top)), top.to_numpy(), color=C_FACTOR, alpha=0.85)
             a_last.set_yticks(np.arange(len(top)))
             a_last.set_yticklabels(names, fontsize=8)

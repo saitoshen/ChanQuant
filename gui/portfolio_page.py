@@ -146,7 +146,9 @@ def run_replay_job(cfg, kind: str, payload, with_bh: bool = True):
     if isinstance(payload, tuple):
         payload, extra = payload
     if kind == "cross":
-        return replay.run_cross(cfg, payload, timing_extra=extra)
+        # 两份都是 `{品种: {周期: 行情}}`，同一份就够 —— 截面腿和时序腿可以指到
+        # 不同周期上，但读的都是这几个品种的那几档行情
+        return replay.run_cross(cfg, payload, timing_extra=extra, factor_extra=extra)
     if kind == "multi":
         return replay.run_multi(cfg, payload, extras=extra)
     return replay.run(cfg, payload, with_bh=with_bh, extra=extra)
@@ -1493,7 +1495,9 @@ class PortfolioPage(QWidget):
         没必要各写一套。没配跨周期因子时返回空 dict，一次多余的读都不做。
         """
         fc = replay.factor_config(getattr(cfg, "factor_cfg", {}) or {})
-        if not fc.factor_periods or self._loader is None:
+        # 不能拿 `fc.factor_periods` 当闸门：周期编在因子实例 id 里
+        # （`mom_60@1d_tq`），那个映射在新配置里是空的
+        if self._loader is None:
             return {}
         from ttrade import factor_strategy as fstrat
 
@@ -1513,7 +1517,7 @@ class PortfolioPage(QWidget):
         按「第一个品种能读到什么」决定其余品种怎么算。
         """
         fc = replay.factor_config(getattr(cfg, "factor_cfg", {}) or {})
-        if not fc.factor_periods or self._loader is None:
+        if self._loader is None:
             return {}
         from ttrade import factor_strategy as fstrat
 

@@ -3207,7 +3207,10 @@ def _refs_of_factor(key: str) -> int:
     """有多少份配置在用这个因子。删之前得让用户知道会牵动什么。"""
     n = 0
     for cfg in SStore.load_portfolio() + SStore.load_library():
-        if cfg.family == "factor" and key in (cfg.factor_keys or []):
+        # 因子实例（`mom_60@1w`）也算用了这个因子 —— 只比纯键的话，
+        # 「所有用到它的配置都勾了周线」时会显示成 0，删起来毫无顾忌
+        if cfg.family == "factor" and any(
+                str(k).split("@")[0] == key for k in (cfg.factor_keys or [])):
             n += 1
     return n
 
@@ -3251,15 +3254,26 @@ def _factor_mix(cfg) -> str:
     keys = list(cfg.factor_keys or [])
     if not keys:
         return "—"
+    from ttrade import factors as _F
+
     rev = {k for k, v in ((cfg.factor_cfg or {}).get("reverse") or {}).items() if v}
     parts = []
+    n_rev = 0
     for k in keys:
-        d = L.factor_doc(k)
-        name = _esc(d.label if d else k)
-        if k in rev:
+        base, p = _F.split_spec(k)
+        d = L.factor_doc(base)
+        name = _esc(d.label if d else base)
+        # 周期编在实例 id 里（`mom_60@1w`）：不写出来，「两个周期各一份」和
+        # 「同一个因子列了两遍」在列表上长得一样
+        if p:
+            from ttrade import tqdata as _TQ
+
+            name += (f"<span style='color:{C_MUTED}'>（"
+                     f"{_esc(_TQ.PERIOD_LABEL.get(p, p))}）</span>")
+        if k in rev or base in rev:
             name += f"<span style='color:{C_BAD}'>（取反）</span>"
+            n_rev += 1
         parts.append(name)
-    n_rev = len(rev & set(keys))
     head = f"{len(keys)} 个因子" + (f"，其中 {n_rev} 个取反" if n_rev else "")
     return f"<span style='color:{C_MUTED}'>{head}</span><br>" + "、".join(parts)
 

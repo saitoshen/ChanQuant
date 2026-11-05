@@ -124,6 +124,26 @@ def _pct_of(amount, principal: float, dflt: float) -> float:
     return a / principal * 100.0
 
 
+def _cross_period_names(keys, periods) -> list[str]:
+    """策略摘要里那句「跨周期·日线/周线」用的周期名。
+
+    两种写法都要认：新配置把周期编在因子实例 id 里（`mom_60@1d_tq`），老配置
+    是另一份 `{因子: 周期}` 映射。只读其中一种的话，换了写法摘要就变空白，
+    两条其实不同的策略在列表里长得一模一样。
+    """
+    from ttrade import factors as F
+    from ttrade import tqdata
+
+    names: set[str] = set()
+    for k in (keys or []):
+        p = F.split_spec(k)[1]
+        if p:
+            names.add(tqdata.PERIOD_LABEL.get(p, p))
+    for v in dict(periods or {}).values():
+        if str(v or "").strip():
+            names.add(tqdata.PERIOD_LABEL.get(str(v), str(v)))
+    return sorted(names)
+
 
 # ------------------------------------------------------------------ 配置对象
 
@@ -369,12 +389,10 @@ class StrategyConfig:
             # 机器学习那一套（稀疏采样 / 合训）也会跟着 `factor_cfg` 走，
             # 截面 ML 一样受影响，摘要里一并写出来
             _mc = self.factor_cfg or {}
-            if _mc.get("factor_periods"):
-                from ttrade import tqdata
-
-                _names = sorted({tqdata.PERIOD_LABEL.get(str(v), str(v))
-                                 for v in dict(_mc["factor_periods"]).values()})
-                bits.append("跨周期·" + "/".join(_names))
+            _xp = _cross_period_names(list(self.factor_keys or []) + list(
+                self.timing_factor_keys or []), _mc.get("factor_periods"))
+            if _xp:
+                bits.append("跨周期·" + "/".join(_xp))
             if self.factor_mode == "ml":
                 if str(_mc.get("sample_mode") or "all") == "trigger":
                     bits.append("稀疏触发")
@@ -414,13 +432,10 @@ class StrategyConfig:
             bits.append("不按分数出场")
         # 跨周期因子：同一组因子、同一个窗口，把其中一个挪到周线上就是另一条
         # 策略了。列表里不写出来，两条配置看起来一模一样
-        _xp = dict(cfg.get("factor_periods") or {})
+        _xp = _cross_period_names(list(self.factor_keys or []) + list(
+            self.timing_factor_keys or []), cfg.get("factor_periods"))
         if _xp:
-            from ttrade import tqdata
-
-            _names = sorted({tqdata.PERIOD_LABEL.get(str(v), str(v))
-                             for v in _xp.values()})
-            bits.append("跨周期·" + "/".join(_names))
+            bits.append("跨周期·" + "/".join(_xp))
         if self.factor_mode == "ml":
             bits.append(f"模型={cfg.get('model', '')}")
             # 稀疏采样 / 合并训练都不在「窗口 / 阈值」里体现，而它们对结果的影响

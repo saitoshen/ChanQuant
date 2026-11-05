@@ -275,13 +275,40 @@ class FactorConfig:
         return {k for k, v in dict(self.reverse or {}).items() if v}
 
     def period_of(self, key: str, base: str = "") -> str:
-        """这个因子该在哪个周期上算。
+        """这个因子实例该在哪个周期上算。
 
-        `base` 是策略本身的周期。返回空串表示「没有指定」——调用方自己知道
-        基准是什么，这里不替它猜。
+        `key` 可以是实例 id（`mom_60@1w`），也可以是老配置里的纯键 —— 后者
+        去 `factor_periods` 里查。`base` 是策略本身的周期；返回空串表示
+        「没有指定」，调用方自己知道基准是什么，这里不替它猜。
         """
+        _k, p = F.split_spec(key)
+        if p:
+            return p
         p = str(dict(self.factor_periods or {}).get(str(key), "") or "")
         return p or str(base or "")
+
+    def is_reversed(self, key: str) -> bool:
+        """这个实例要不要反着用。
+
+        先按实例 id 查，再退回纯键 —— 界面上「反」是按因子行勾的（一行里的
+        几个周期一起反），老配置里存的也是纯键。两处都认，才不会出现
+        「勾了反转但周线那一份没反」。
+        """
+        rv = self.reversed_keys()
+        return key in rv or F.split_spec(key)[0] in rv
+
+    def weight_of(self, key: str) -> float:
+        """这个实例在「自定权重」下的权重。同样先按实例查、再退回纯键。"""
+        w = dict(self.weights or {})
+        k, _p = F.split_spec(key)
+        for probe in (key, k):
+            try:
+                v = float(w.get(probe))
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                return v
+        return 1.0
 
     def normalized(self) -> "FactorConfig":
         c = FactorConfig(**{k: getattr(self, k) for k in self.__dataclass_fields__})
@@ -426,7 +453,9 @@ def _orientation_frame(
             },
             index=fmat.index,
         )
-    rev = cfg.reversed_keys() & set(ori.columns)
+    # 列名是因子实例 id（`mom_60@1w`），`reversed_keys()` 里可能是纯键也可能
+    # 是实例 id —— 交给 `is_reversed` 两个都认
+    rev = [c for c in ori.columns if cfg.is_reversed(c)]
     if rev:
         ori = ori.copy()
         for c in rev:
@@ -436,10 +465,10 @@ def _orientation_frame(
 
 def _reverse_note(cfg: FactorConfig, keys: list[str]) -> str:
     """反转说明。写成「反转使用：A、B」，界面上直接看得出哪几个因子被反着用。"""
-    rev = [k for k in keys if k in cfg.reversed_keys()]
+    rev = [k for k in keys if cfg.is_reversed(k)]
     if not rev:
         return ""
-    names = "、".join(F.FACTORS[k].label if k in F.FACTORS else k for k in rev)
+    names = "、".join(F.spec_label(k) for k in rev)
     return f"反转使用：{names}（等效于把该因子取负号）"
 
 
@@ -1037,45 +1066,63 @@ def factor_matrix(
     base_period: str = "",
     min_obs: int = 60,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str], dict[str, list[str]]]:
-    """按**每个因子自己的周期**算因子矩阵，再对齐到 `df` 的每一根 bar 上。
+    """按**每个因子实例自己的周期**算因子矩阵，再对齐到 `df` 的每一根 bar 上。
+
+    `keys` 里每一项都是**实例**：`mom_60`（跟策略周期）或 `mom_60@1w`（周线）。
+    同一个因子出现两次、周期不同，就是两列 —— 这正是「一个因子同时用多个
+    周期」的做法，不需要另开一套数据结构。
 
     返回 `(fmat, rawf, kept, gone, missing)`：
 
-    - `fmat` / `rawf`：标准化值 / 原始值，列顺序与 `keys` 一致
-    - `kept`：真正算出来的因子（`keys` 的子集，保持原顺序）
+    - `fmat` / `rawf`：标准化值 / 原始值，列名是实例 id，顺序与 `keys` 一致
+    - `kept`：真正算出来的实例（`keys` 的子集，保持原顺序）
     - `gone`：在这个标的上没有足够观测的
-    - `missing`：`{周期: [因子]}`，跨周期行情根本没读到
+    - `missing`：`{周期: [实例]}`，跨周期行情根本没读到
 
-    单周期（`factor_periods` 为空）时走的就是原来的 `factor_frame` 那条路，
-    结果与以前逐位相同 —— 加了跨周期不该动老策略的每一个数字。
+    单周期（全是纯键、`factor_periods` 为空）时走的就是原来的 `factor_frame`
+    那条路，结果与以前逐位相同 —— 加了跨周期不该动老策略的每一个数字。
     """
     cfg = cfg.normalized()
-    groups: dict[str, list[str]] = {}
+    # 去重但保序：同一个实例重复出现（配置手改过）不该算两遍
+    seen: set[str] = set()
+    inst: list[tuple[str, str, str]] = []      # (实例 id, 因子键, 周期)
     for k in keys:
-        groups.setdefault(cfg.period_of(k, base_period), []).append(k)
+        spec = str(k)
+        if spec in seen:
+            continue
+        seen.add(spec)
+        base, p = F.split_spec(spec)
+        inst.append((spec, base, cfg.period_of(spec, base_period)))
+
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for spec, base, p in inst:
+        groups.setdefault(p, []).append((spec, base))
 
     cols: dict[str, pd.Series] = {}
     raws: dict[str, pd.Series] = {}
     gone: list[str] = []
     missing: dict[str, list[str]] = {}
-    for p, ks in groups.items():
+    for p, items in groups.items():
         cross = bool(p) and p != str(base_period or "")
         frame = (extra or {}).get(p) if cross else df
         if frame is None or frame.empty:
-            missing[p] = [k for k in ks]
+            missing[p] = [spec for spec, _b in items]
             continue
-        use = F.filter_available(frame, ks, min_obs=min_obs)
-        gone.extend([k for k in ks if k not in set(use)])
-        for k in use:
-            r = F.raw(frame, k)
+        # 可用性按**因子键**判（同一个键的两个周期各判一次，因为行情不同）
+        use = set(F.filter_available(frame, [b for _s, b in items], min_obs=min_obs))
+        for spec, base in items:
+            if base not in use:
+                gone.append(spec)
+                continue
+            r = F.raw(frame, base)
             z = F.standardize(r, window=cfg.window, method=cfg.method)
             if cross:
                 r = align_to_base(r, df.index, base_period, p)
                 z = align_to_base(z, df.index, base_period, p)
-            cols[k] = z
-            raws[k] = r
+            cols[spec] = z
+            raws[spec] = r
 
-    kept = [k for k in keys if k in cols]
+    kept = [spec for spec, _b, _p in inst if spec in cols]
     fmat = pd.DataFrame({k: cols[k] for k in kept}, index=df.index) if kept \
         else pd.DataFrame(index=df.index)
     rawf = pd.DataFrame({k: raws[k] for k in kept}, index=df.index) if kept \
@@ -1127,7 +1174,7 @@ def build_score(
     两个都不用传，走的就是原来那条单周期路径。
     """
     cfg = cfg.normalized()
-    keys = [k for k in keys if k in F.FACTORS]
+    keys = [str(k) for k in keys if F.is_factor(k)]
     if not keys:
         raise ValueError("没有选中任何可用因子")
 
@@ -1139,7 +1186,7 @@ def build_score(
         from ttrade import tqdata
 
         lack = "、".join(f"{tqdata.PERIOD_LABEL.get(p, p)}（"
-                        + "、".join(F.FACTORS[k].label for k in ks if k in F.FACTORS)
+                        + "、".join(F.spec_label(k) for k in ks)
                         + "）" for p, ks in missing.items())
         raise ValueError(
             f"跨周期因子缺行情：{lack}。这个标的上没有该周期的数据 —— "
@@ -1164,7 +1211,7 @@ def build_score(
     if gone:
         notes.append(
             f"已剔除 {len(gone)} 个在该标的上没有足够数据的因子："
-            + "、".join(F.FACTORS[k].label for k in gone)
+            + "、".join(F.spec_label(k) for k in gone)
         )
     xnote = cross_period_note(cfg, keys, base_period)
     if xnote:
@@ -1174,10 +1221,10 @@ def build_score(
         k = keys[0]
         ori = _orientation_frame(fmat[[k]], fwd, cfg)
         score = (fmat[k] * ori[k]).rename("score")
-        rev = k in cfg.reversed_keys()
+        rev = cfg.is_reversed(k)
         pack = ScorePack(
             score=score, fmat=fmat, raw=rawf, orient=ori,
-            label=f"单因子 · {F.FACTORS[k].label}" + ("（反转）" if rev else ""),
+            label=f"单因子 · {F.spec_label(k)}" + ("（反转）" if rev else ""),
         )
         pack.notes.extend(notes)      # 「剔除了哪几个因子」这类说明
         if cfg.orient == "auto":
@@ -1203,8 +1250,7 @@ def build_score(
             score = _weighted_mean(signed, w)
             wdesc = f"滚动 IC 加权 · 每 {int(cfg.ic_rebal)} 根重算"
         elif wmode == "custom":
-            w = pd.Series({k: float(cfg.weights.get(k, 1.0)) for k in signed.columns},
-                          dtype=float)
+            w = pd.Series({k: cfg.weight_of(k) for k in signed.columns}, dtype=float)
             w = w.where(w > 0, 0.0)
             if not (float(w.sum()) > 0):
                 w = pd.Series(1.0, index=signed.columns)
@@ -1213,7 +1259,7 @@ def build_score(
             wdesc = "自定权重"
         else:
             score = signed.mean(axis=1, skipna=True).rename("score")
-        n_rev = len(cfg.reversed_keys() & set(keys))
+        n_rev = sum(1 for k in keys if cfg.is_reversed(k))
         pack = ScorePack(
             score=score, fmat=fmat, raw=rawf, orient=ori,
             label=(f"多因子组合 · {len(keys)} 个（{wdesc}）"
@@ -1226,11 +1272,10 @@ def build_score(
             if onote:
                 pack.notes.append(onote)
         if wmode == "custom":
-            used = [(k, float(cfg.weights.get(k, 1.0))) for k in keys]
+            used = [(k, cfg.weight_of(k)) for k in keys]
             pack.notes.append(
                 "权重：" + "、".join(
-                    f"{F.FACTORS[k].label if k in F.FACTORS else k} {v:g}"
-                    for k, v in used if v > 0)
+                    f"{F.spec_label(k)} {v:g}" for k, v in used if v > 0)
                 + (f"（另 {sum(1 for _, v in used if v <= 0)} 个权重为 0，不参与合成）"
                    if any(v <= 0 for _, v in used) else "")
             )
@@ -1360,7 +1405,7 @@ def build_score(
             notes.append("前段样本不足以训练，该区间不持仓（walk-forward 的正常代价）")
         # 反转开关在 ML 模式下不生效：模型自己从数据里学方向和权重，
         # 人工指定方向反而会和它打架。这里只提醒一句，不静默忽略。
-        if cfg.reversed_keys() & set(keys):
+        if any(cfg.is_reversed(k) for k in keys):
             notes.append("机器学习自行学习方向，反转开关在 ML 模式下不生效")
         return ScorePack(
             score=score, fmat=fmat, raw=rawf, pred=pred, importance=imp,
@@ -1410,7 +1455,7 @@ def trigger_signal(df: pd.DataFrame, cfg: FactorConfig,
 
     zs = []
     for key in (cfg.trigger_keys or []):
-        if key not in F.FACTORS:
+        if not F.is_factor(key):
             continue
         # 触发因子也可能被指到别的周期上（和特征因子是同一份 `factor_periods`）。
         # 不认这件事的话，界面上选了「周线」，强度却还是按基准周期算的
@@ -1435,9 +1480,9 @@ def trigger_signal(df: pd.DataFrame, cfg: FactorConfig,
         strength = pd.concat(zs, axis=1).mean(axis=1, skipna=True)
         if cfg.trigger_flip:
             strength = -strength
-        notes.append("触发：因子 " + "、".join(F.FACTORS[k].label
+        notes.append("触发：因子 " + "、".join(F.spec_label(k)
                                               for k in (cfg.trigger_keys or [])
-                                              if k in F.FACTORS)
+                                              if F.is_factor(k))
                      + ("（反转）" if cfg.trigger_flip else ""))
 
     if has_rule:
@@ -1879,7 +1924,7 @@ def pooled_score(
     （决策点 / 强度 / 规则信号都是逐品种的，训练才是合并的）。
     """
     cfg = cfg.normalized()
-    keys = [k for k in (keys or []) if k in F.FACTORS]
+    keys = [k for k in (keys or []) if F.is_factor(k)]
     if len(keys) < 2:
         raise ValueError("机器学习多因子至少需要 2 个因子")
 
@@ -2213,8 +2258,37 @@ def run_rule_with_filter(
 
 # ---------------------------------------------------------------- 评估
 def outcome_report(df: pd.DataFrame, pack: ScorePack, cfg: FactorConfig) -> pd.DataFrame:
-    """对参与合成的因子出 IC/IR 表（与「因子分析」页同一套口径）。"""
-    keys = list(pack.fmat.columns)
-    return M.factor_report(
-        df, keys, horizon=cfg.horizon, window=cfg.window, method=cfg.method
-    )
+    """对参与合成的因子出 IC/IR 表（与「因子分析」页同一套口径）。
+
+    直接拿 `pack.fmat` 里的列算，不按因子键重算一遍 —— 列名是**实例**
+    （`mom_60@1w`），同一个键的两个周期是两列，重算的话两列会变成一模一样，
+    还都会算在基准周期上。
+    """
+    fwd = M.forward_return(df, cfg.horizon)
+    rows = []
+    for c in pack.fmat.columns:
+        base, _p = F.split_spec(c)
+        spec = F.FACTORS.get(base)
+        label = F.spec_label(c)
+        category = spec.category if spec is not None else ""
+        try:
+            f = pack.fmat[c].astype(float)
+            st = M.ic_stats(f, fwd, cfg.window)
+            q = M.quantile_returns(f, fwd, 5, cfg.window)
+        except Exception as exc:      # noqa: BLE001
+            rows.append({"key": c, "label": label, "category": category,
+                         "error": str(exc)[:60]})
+            continue
+        rows.append(
+            {
+                "key": c, "label": label, "category": category,
+                "n": st["n"], "ic": st["ic"], "ic_mean": st["ic_mean"],
+                "ic_std": st["ic_std"], "ir": st["ir"], "ic_pos": st["ic_pos"],
+                "t": st["t"], "hit": st["hit"], "turnover": st["turnover"],
+                "mono": M.monotonicity(q),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if not out.empty and "ic" in out:
+        out = out.reindex(out["ic"].abs().sort_values(ascending=False).index)
+    return out.reset_index(drop=True)

@@ -1031,6 +1031,75 @@ def _run() -> tuple[bool, list[str]]:
     check("跨周期因子（截断 / 对齐）", _factor_cross_period)
 
 
+    def _factor_multi_period():
+        """同一个因子同时用两个周期：各算一列，一起进合成。
+
+        以前 `factor_periods` 是「因子 → 周期」的一对一映射，同一个键只能有
+        一个周期。现在周期编在**实例 id** 里（`mom_20@1d_tq`），同一个因子出现
+        两次就是两列。要验的四件事：两列真的不一样、老写法仍然等价、去重、
+        权重 / 反转能按实例单独给。
+        """
+        import numpy as np
+
+        from ttrade import factor_strategy as FS
+        from ttrade import factors as F
+        from ttrade import tqdata
+
+        wbase = tqdata.load_main("RB", "SHFE", "1w", adjust="qfq")
+        day = tqdata.load_main("RB", "SHFE", "1d_tq", adjust="qfq")
+        plain = FS.FactorConfig(window=252, horizon=5)
+
+        # 1. 同一个因子两档周期 → 两列，且不相等
+        keys = ["mom_20", "mom_20@1d_tq"]
+        extra = FS.period_frames(plain, keys, "1w", lambda p: day)
+        if list(extra) != ["1d_tq"]:
+            raise RuntimeError(f"period_frames 没认出实例里的周期：{list(extra)}")
+        pack = FS.build_score(wbase, "multi", keys, plain,
+                              extra=extra, base_period="1w")
+        if list(pack.fmat.columns) != keys:
+            raise RuntimeError(f"列名不是两个实例：{list(pack.fmat.columns)}")
+        a = pack.fmat["mom_20"].fillna(-9).to_numpy()
+        b = pack.fmat["mom_20@1d_tq"].fillna(-9).to_numpy()
+        if np.allclose(a, b):
+            raise RuntimeError("两档周期算出来一模一样 —— 周期没生效")
+        if not np.isfinite(b).any():
+            raise RuntimeError("跨周期那一列全空")
+
+        # 2. 老写法（纯键 + factor_periods）必须和实例写法逐位相同
+        old = FS.FactorConfig(window=252, horizon=5,
+                              factor_periods={"mom_20": "1d_tq"})
+        pack2 = FS.build_score(wbase, "multi", ["mom_20", "mom_60"], old,
+                               extra=FS.period_frames(
+                                   old, ["mom_20", "mom_60"], "1w", lambda p: day),
+                               base_period="1w")
+        if not np.allclose(pack2.fmat["mom_20"].fillna(-9).to_numpy(), b):
+            raise RuntimeError("老配置（factor_periods 映射）读出来的结果变了")
+
+        # 3. 同一个实例重复出现只算一列
+        dup = FS.build_score(wbase, "multi", ["mom_20@1d_tq", "mom_20@1d_tq"],
+                             plain, extra=extra, base_period="1w")
+        if list(dup.fmat.columns) != ["mom_20@1d_tq"]:
+            raise RuntimeError(f"重复的实例没去重：{list(dup.fmat.columns)}")
+
+        # 4. 权重 / 反转 / 标签都认实例
+        c = FS.FactorConfig(weights={"mom_20@1d_tq": 2.0},
+                            reverse={"mom_20": True})
+        if abs(c.weight_of("mom_20@1d_tq") - 2.0) > 1e-9:
+            raise RuntimeError("按实例给的权重没生效")
+        if abs(c.weight_of("mom_20") - 1.0) > 1e-9:
+            raise RuntimeError("按纯键给的权重不该影响另一个实例")
+        if not (c.is_reversed("mom_20@1d_tq") and c.is_reversed("mom_20")):
+            raise RuntimeError("按纯键勾的反转没传到实例上")
+        lab = F.spec_label("mom_20@1d_tq")
+        if "日线" not in lab or lab == F.spec_label("mom_20"):
+            raise RuntimeError(f"实例的可读名没带上周期：{lab}")
+
+        return (f"同一因子两档周期 → {list(pack.fmat.columns)}；"
+                f"老写法逐位相同；重复实例去重；权重/反转按实例生效")
+
+    check("同一因子多周期（因子实例）", _factor_multi_period)
+
+
     def _factor_filter():
         from ttrade import factor_strategy as FS
         from ttrade import factors as F

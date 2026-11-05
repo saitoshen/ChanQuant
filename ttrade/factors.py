@@ -711,6 +711,58 @@ def _aux_keys() -> list[str]:
 AUX_KEYS: list[str] = []
 
 
+# ---------------------------------------------------------------- 因子实例
+#
+# 一个因子可以在**多个周期**上各算一份（周线的动量 60 和日线的动量 60 是两个
+# 不同的特征）。所以「选了哪个因子」不能只用因子键表示 —— 键 + 周期才是实例。
+#
+# 实例 id 写成 `键@周期`（`mom_60@1w`）。不带 @ 的就是「跟着策略周期走」，
+# 与老配置里的纯键完全等价 —— 老策略读进来不用改任何东西。
+#
+# 分隔符选 @：因子键只有字母数字下划线，周期名是 `5m` / `1w` / `1d_tq` 这种，
+# 两边都不会出现 @，切起来没有歧义。
+SPEC_SEP = "@"
+
+
+def split_spec(spec) -> tuple[str, str]:
+    """实例 id → (因子键, 周期)。`"mom_60@1w"` → `("mom_60", "1w")`。"""
+    s = str(spec or "")
+    if SPEC_SEP in s:
+        k, _, p = s.partition(SPEC_SEP)
+        return k, p
+    return s, ""
+
+
+def make_spec(key: str, period: str = "") -> str:
+    """(因子键, 周期) → 实例 id。周期为空就是纯键。"""
+    p = str(period or "")
+    return f"{key}{SPEC_SEP}{p}" if p else str(key)
+
+
+def is_factor(spec) -> bool:
+    """这个实例 id 的因子真的存在。"""
+    return split_spec(spec)[0] in FACTORS
+
+
+def spec_label(spec) -> str:
+    """实例的可读名：`动量 60 日`，跨周期时写成 `动量 60 日（周线）`。
+
+    标签里带上周期不是装饰：同一张因子重要度表里出现两行「动量 60 日」，
+    谁也分不清哪个是周线那个是日线。
+    """
+    k, p = split_spec(spec)
+    lab = FACTORS[k].label if k in FACTORS else k
+    if not p:
+        return lab
+    try:
+        from ttrade import tqdata
+
+        pn = tqdata.PERIOD_LABEL.get(p, p)
+    except Exception:      # noqa: BLE001
+        pn = p
+    return f"{lab}（{pn}）"
+
+
 # ---------------------------------------------------------------- 计算
 def raw(df: pd.DataFrame, key: str) -> pd.Series:
     """算单个因子的原始值。返回与 df 同索引的 Series。"""
@@ -817,7 +869,8 @@ def available(df: pd.DataFrame, key: str, min_obs: int = 60) -> bool:
 
 
 def filter_available(df: pd.DataFrame, keys: list[str], min_obs: int = 60) -> list[str]:
-    return [k for k in keys if k in FACTORS and available(df, k, min_obs)]
+    """去掉在这个数据上算不出数的因子。因子实例（`mom_60@1w`）按因子键判。"""
+    return [k for k in keys if is_factor(k) and available(df, split_spec(k)[0], min_obs)]
 
 
 def filter_by_market(market: str) -> list[str]:
