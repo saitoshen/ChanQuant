@@ -287,7 +287,8 @@ class MlSignals:
 
     # ---- 给 tick 线程 ----
 
-    def submit(self, key: str, df, cfg, keys: list, predictor=None) -> None:
+    def submit(self, key: str, df, cfg, keys: list, predictor=None,
+               extra: dict | None = None) -> None:
         """提交一次信号计算。
 
         `predictor` 是 `ml_artifact.LivePredictor` —— 有它就走「只预测」快路径
@@ -300,7 +301,7 @@ class MlSignals:
             return
         with self._lock:
             self._jobs[key] = {"df": df, "cfg": cfg, "keys": list(keys),
-                               "predictor": predictor}
+                               "predictor": predictor, "extra": dict(extra or {})}
             if key in self._queued:
                 return            # 已经在排队，直接换掉内容就行
             self._queued.add(key)
@@ -381,9 +382,11 @@ class MlSignals:
                     if self._diag is not None:
                         self._diag.write("ML", f"{key} 走慢路径（后台重训），"
                                               f"bar={len(job['df'])} —— 这条要几十秒")
+                    _fc = replay.factor_config(job["cfg"].factor_cfg or {})
                     out = fstrat.run_factor_strategy(
-                        job["df"], "ml", job["keys"],
-                        replay.factor_config(job["cfg"].factor_cfg or {}),
+                        job["df"], "ml", job["keys"], _fc,
+                        extra=job.get("extra") or {},
+                        base_period=getattr(job["cfg"], "period", "") or "",
                     )
                     sig = out.df["signal"].iloc[-1]
                     sig = 0 if pd.isna(sig) else int(sig)
@@ -1046,8 +1049,10 @@ class PortfolioRunner:
                                  atr(df, st.cfg.stop_atr_n))
             pred = self._predictor_for(st)
             st.ml_fast = pred is not None
+            _fc = replay.factor_config(st.cfg.factor_cfg or {})
             self._ml.submit(self._skey(st.cfg), self._with_aux(st, df), st.cfg,
-                            list(st.cfg.factor_keys or []), predictor=pred)
+                            list(st.cfg.factor_keys or []), predictor=pred,
+                            extra=self._period_extra(st, _fc))
             if not self._pick_ml_signal(st):
                 return
         else:
@@ -1167,9 +1172,10 @@ class PortfolioRunner:
             if len(df) < FACTOR_MIN_BARS:
                 return 0                 # 历史不够，分数全是 NaN，先空仓等数据
             df = self._with_aux(st, df)
+            fc = replay.factor_config(st.cfg.factor_cfg or {})
             out = fstrat.run_factor_strategy(
                 df, st.cfg.factor_mode or "single", list(st.cfg.factor_keys or []),
-                replay.factor_config(st.cfg.factor_cfg or {}),
+                fc, extra=self._period_extra(st, fc), base_period=st.cfg.period,
             )
             sig = out.df["signal"].iloc[-1]
             return 0 if pd.isna(sig) else int(sig)
@@ -1178,6 +1184,23 @@ class PortfolioRunner:
                            reverse=bool(getattr(st.cfg, "rule_reverse", False)))
         sig = out["signal"].iloc[-1]
         return 0 if pd.isna(sig) else int(sig)
+
+    def _period_extra(self, st: SlotState, fc) -> dict:
+        """跨周期因子要用的别的周期行情：`{周期: DataFrame}`。
+
+        和回测同一套取数（`tqdata.load_main`，前复权）—— 实盘的日线因子和
+        回测的日线因子必须是同一份数，否则「回测赚钱、实盘亏钱」又要从头查。
+        没配跨周期因子时返回空 dict，一次多余的读都不做。
+        """
+        if not getattr(fc, "factor_periods", None):
+            return {}
+        keys = list(st.cfg.factor_keys or [])
+        sym, ex = st.cfg.symbol, st.cfg.exchange
+        return fstrat.period_frames(
+            fc, keys, st.cfg.period,
+            lambda p: tqdata.load_main(sym, ex, p, adjust="qfq"),
+            extra_keys=list(getattr(fc, "trigger_keys", None) or []),
+        )
 
     def _with_aux(self, st: SlotState, df: pd.DataFrame) -> pd.DataFrame:
         """给实时序列挂上期限结构 / 期权列。

@@ -198,6 +198,19 @@ class FactorConfig:
     weights: dict = field(default_factory=dict)   # 因子键 -> 权重（custom 用）
     ic_rebal: int = 60               # 滚动 IC 加权：多少根重算一次权重
 
+    # ---- 跨周期因子：{因子键: 周期}
+    #
+    # 空 / 缺键 = 跟着策略本身的周期走（老口径）。填了别的周期，这个因子就
+    # 在**那个周期**的行情上算，再对齐回基准周期。
+    #
+    # 为什么要单独一项：周线策略想用日线因子（「大方向按周线，具体动手看日线
+    # 有没有走坏」），以前只能把策略整个降到日线，周线的过滤就没了。
+    #
+    # 对齐的**截断**规则见 `align_to_base`：大周期的 bar 只有在它收完之后
+    # 才允许被小周期看到。写错这一处就等于在一周的开头用了周末的收盘价 ——
+    # 回测漂亮得不正常，而且一个字都不会报错。
+    factor_periods: dict = field(default_factory=dict)
+
     # ---- 出场规则（只对因子策略生效，覆盖「分数回落就平」）
     #
     #   score：老口径，分数回落到 `exit_z` 以内就平
@@ -261,6 +274,15 @@ class FactorConfig:
         """真正打开反转的因子。顺手把非真值过滤掉，调用方不用自己判。"""
         return {k for k, v in dict(self.reverse or {}).items() if v}
 
+    def period_of(self, key: str, base: str = "") -> str:
+        """这个因子该在哪个周期上算。
+
+        `base` 是策略本身的周期。返回空串表示「没有指定」——调用方自己知道
+        基准是什么，这里不替它猜。
+        """
+        p = str(dict(self.factor_periods or {}).get(str(key), "") or "")
+        return p or str(base or "")
+
     def normalized(self) -> "FactorConfig":
         c = FactorConfig(**{k: getattr(self, k) for k in self.__dataclass_fields__})
         # dict 是可变对象，复制一份，免得调用方事后改原配置影响已经算好的结果
@@ -290,6 +312,10 @@ class FactorConfig:
         c.weights = {str(k): float(v) for k, v in dict(c.weights or {}).items()
                      if float(v) > 0}
         c.ic_rebal = int(max(1, c.ic_rebal))
+        # 跨周期：只留非空值。空串等于「跟基准周期走」，存进去只会让
+        # 「这个因子到底是不是跨周期」这件事变得要多判一次
+        c.factor_periods = {str(k): str(v) for k, v in dict(c.factor_periods or {}).items()
+                            if str(v or "").strip()}
         # 出场规则
         c.exit_mode = str(c.exit_mode or "score")
         if c.exit_mode not in ("score", "tier", "abs", "box"):
@@ -892,6 +918,193 @@ def _rolling_z(s: pd.Series, window: int) -> pd.Series:
     return F.standardize(s, window=window, method="z")
 
 
+# ---------------------------------------------------------------- 跨周期因子
+#
+# 「周线策略调日线因子」这类需求，本质是**同一时刻、两个时间尺度上的数据**。
+# 难点全在一个地方：大周期的 bar 什么时候才算数。
+#
+# 具体的坑：周线 bar 的时间戳是那周最后一根日线的日期（`merge_days` 的约定）。
+# 直接把它贴到周一，就等于在周一就看到了周五的收盘价 —— 一周里每一个周线因子
+# 都是未来数据。回测会好得离谱，而且一个字都不报错。
+#
+# 所以这里引入「决策时刻」：
+#
+#   日线级（1d / 1d_tq / 2d / 1w）：时间戳是**交易日标签**（00:00），这天的
+#       数据要到收盘才齐 → 决策时刻 = 当天 15:00
+#   分钟 / 小时级：时间戳本来就是 bar 的**结束时刻**（`merge_bars` 取组内
+#       最后一根的时间），不用换算
+#
+# 两边都换成决策时刻之后，对齐就退化成「只取 <= 当前时刻的最后一根」——
+# 一次 `searchsorted`，晚于当前时刻的 bar 一根都进不来。这就是截断。
+#
+# 基准周期也要换算：周线 bar 的时间戳同样是「那周最后一天的 00:00」，不换算的
+# 话，周五那根日线因子（15:00 才齐）会被判成「比周线 bar 晚」，每周白丢一天。
+
+DAY_CLOSE = pd.Timedelta(hours=15)
+
+# 日线级周期的名字。**不从 tqdata 导**：这个模块被 selftest / 实盘 / 打包后的
+# 环境反复导入，多一个 import 就多一处能断的地方；而周期名是这里唯一的依赖，
+# 写死一张表反而更稳（`tqdata.is_daily` 判的也是这几个）
+_DAY_PERIODS = {"1d", "1d_tq", "2d", "1w"}
+
+
+def _decision_time(index, period: str) -> pd.DatetimeIndex:
+    """把某个周期的 bar 时间戳换成「这根 bar 的数据已经全部可用的时刻」。"""
+    idx = pd.DatetimeIndex(index)
+    if str(period or "") in _DAY_PERIODS:
+        return idx.normalize() + DAY_CLOSE
+    return idx
+
+
+def align_to_base(
+    series: pd.Series,
+    base_index: pd.Index,
+    base_period: str = "",
+    src_period: str = "",
+) -> pd.Series:
+    """把源周期的序列对齐到基准周期的每一根 bar 上，**只用已收完的 bar**。
+
+    这是整个跨周期功能的关键一步，也是唯一一处会悄悄引入未来数据的地方：
+    源周期里时间戳晚于当前 bar 的那些值，一根都不许进来。用 `searchsorted` 而
+    不是 `reindex(method="ffill")`：后者要求两边都单调且源索引唯一，源周期是
+    合成周期时（周线 / 2 日）偶尔会出现重复时间戳，一重复就抛异常。
+    """
+    base_index = pd.DatetimeIndex(base_index)
+    if series is None or not len(series):
+        return pd.Series(np.nan, index=base_index, dtype=float)
+
+    src_t = _decision_time(series.index, src_period)
+    vals = pd.Series(np.asarray(series, dtype=float), index=src_t)
+    # 同一时刻出现两根（理论上不该有）：留最后一根，别让 searchsorted 拿错
+    vals = vals[~vals.index.duplicated(keep="last")].sort_index()
+    # 2 日 / 周线的**最后一根可能还没走完**（合成周期是按「行序两两成对」「ISO
+    # 周」分组的，最后一组随时会被新来的一天改写）。它的时间戳是组内最后一根
+    # 日线的日期，看上去像「已经收完」，其实是「到现在为止」——用它等于拿
+    # 「这周到今天为止」当周线因子，数值每天变一次，还和以后重算的结果不一样。
+    # 所以整根丢掉：宁可让大周期因子晚一根，也不要用一根会变形的 bar。
+    # 日线级里只有这两档会这样，1d / 1d_tq 每天收盘就是完整的一天。
+    if str(src_period or "") in ("2d", "1w") and len(vals) > 1:
+        vals = vals.iloc[:-1]
+    tgt = _decision_time(base_index, base_period)
+
+    pos = vals.index.values.searchsorted(tgt.values, side="right") - 1
+    out = np.full(len(base_index), np.nan, dtype=float)
+    ok = pos >= 0
+    if ok.any():
+        out[ok] = vals.to_numpy(dtype=float)[pos[ok]]
+    return pd.Series(out, index=base_index, dtype=float)
+
+
+def period_frames(
+    cfg: "FactorConfig",
+    keys: list[str],
+    base_period: str = "",
+    loader=None,
+    extra_keys=(),
+) -> dict[str, pd.DataFrame]:
+    """把跨周期因子要用的行情一次读出来：`{周期: DataFrame}`。
+
+    读的活交给调用方（`loader(period) -> DataFrame`）：界面用带缓存的仓库，
+    实盘用 `tqdata.load_main`，各自清楚该从哪儿取数。这里只负责算「哪些周期
+    真的需要」—— 一个跨周期因子都没配时返回空 dict，调用方什么都不用做。
+
+    `extra_keys` 是触发因子（稀疏采样用的那组）：它们不参与合成，但同样可能
+    被指到别的周期上。
+    """
+    need: list[str] = []
+    for k in list(keys or []) + list(extra_keys or []):
+        p = cfg.period_of(k, base_period)
+        if p and p != str(base_period or "") and p not in need:
+            need.append(p)
+    out: dict[str, pd.DataFrame] = {}
+    if loader is None:
+        return out
+    for p in need:
+        try:
+            frame = loader(p)
+        except Exception:      # noqa: BLE001
+            frame = None       # 读不到就留空，由 factor_matrix 报「缺哪个周期」
+        if frame is not None and len(frame):
+            out[p] = frame
+    return out
+
+
+def factor_matrix(
+    df: pd.DataFrame,
+    keys: list[str],
+    cfg: "FactorConfig",
+    extra: dict[str, pd.DataFrame] | None = None,
+    base_period: str = "",
+    min_obs: int = 60,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str], dict[str, list[str]]]:
+    """按**每个因子自己的周期**算因子矩阵，再对齐到 `df` 的每一根 bar 上。
+
+    返回 `(fmat, rawf, kept, gone, missing)`：
+
+    - `fmat` / `rawf`：标准化值 / 原始值，列顺序与 `keys` 一致
+    - `kept`：真正算出来的因子（`keys` 的子集，保持原顺序）
+    - `gone`：在这个标的上没有足够观测的
+    - `missing`：`{周期: [因子]}`，跨周期行情根本没读到
+
+    单周期（`factor_periods` 为空）时走的就是原来的 `factor_frame` 那条路，
+    结果与以前逐位相同 —— 加了跨周期不该动老策略的每一个数字。
+    """
+    cfg = cfg.normalized()
+    groups: dict[str, list[str]] = {}
+    for k in keys:
+        groups.setdefault(cfg.period_of(k, base_period), []).append(k)
+
+    cols: dict[str, pd.Series] = {}
+    raws: dict[str, pd.Series] = {}
+    gone: list[str] = []
+    missing: dict[str, list[str]] = {}
+    for p, ks in groups.items():
+        cross = bool(p) and p != str(base_period or "")
+        frame = (extra or {}).get(p) if cross else df
+        if frame is None or frame.empty:
+            missing[p] = [k for k in ks]
+            continue
+        use = F.filter_available(frame, ks, min_obs=min_obs)
+        gone.extend([k for k in ks if k not in set(use)])
+        for k in use:
+            r = F.raw(frame, k)
+            z = F.standardize(r, window=cfg.window, method=cfg.method)
+            if cross:
+                r = align_to_base(r, df.index, base_period, p)
+                z = align_to_base(z, df.index, base_period, p)
+            cols[k] = z
+            raws[k] = r
+
+    kept = [k for k in keys if k in cols]
+    fmat = pd.DataFrame({k: cols[k] for k in kept}, index=df.index) if kept \
+        else pd.DataFrame(index=df.index)
+    rawf = pd.DataFrame({k: raws[k] for k in kept}, index=df.index) if kept \
+        else pd.DataFrame(index=df.index)
+    return fmat, rawf, kept, gone, missing
+
+
+def cross_period_note(
+    cfg: "FactorConfig", keys: list[str], base_period: str = ""
+) -> str:
+    """跨周期因子的一句说明（没配就返回空串）。"""
+    hit = [(k, cfg.period_of(k, base_period)) for k in keys]
+    hit = [(k, p) for k, p in hit if p and p != str(base_period or "")]
+    if not hit:
+        return ""
+    from ttrade import tqdata
+
+    def _name(p: str) -> str:
+        return tqdata.PERIOD_LABEL.get(p, p)
+
+    parts = []
+    for p in dict.fromkeys(p for _k, p in hit):
+        n = sum(1 for _k, q in hit if q == p)
+        parts.append(f"{_name(p)} {n} 个")
+    base = _name(base_period) if base_period else "策略周期"
+    return (f"跨周期因子：{'、'.join(parts)}（基准 {base}）——"
+            "只用已收完的 bar，对齐时不会拿到未来数据")
+
+
 # ---------------------------------------------------------------- 分数构建
 def build_score(
     df: pd.DataFrame,
@@ -901,19 +1114,37 @@ def build_score(
     progress=None,
     cancel=None,
     collect_models: list | None = None,
+    extra: dict[str, pd.DataFrame] | None = None,
+    base_period: str = "",
 ) -> ScorePack:
     """三种模式共用的分数构建。返回的 `score` 已是 PIT 标准化值。
 
     `collect_models` 传了就往里塞每一折的模型（见 `walk_forward`）——
     给「离线训练、实盘只预测」用。
+
+    `extra` / `base_period` 是跨周期因子用的：`extra` 是 `{周期: 行情}`，
+    `base_period` 是策略本身的周期（见 `period_frames`）。不配跨周期因子时
+    两个都不用传，走的就是原来那条单周期路径。
     """
     cfg = cfg.normalized()
     keys = [k for k in keys if k in F.FACTORS]
     if not keys:
         raise ValueError("没有选中任何可用因子")
 
-    picked = list(keys)
-    keys = F.filter_available(df, keys)
+    fmat, rawf, keys, gone, missing = factor_matrix(
+        df, keys, cfg, extra=extra, base_period=base_period)
+    if missing:
+        # 跨周期的行情根本没读到。**必须报错**：把那个因子悄悄剔掉，用户看到
+        # 的是「策略能跑、只是分数变了」，而分数变了这件事在界面上看不出来
+        from ttrade import tqdata
+
+        lack = "、".join(f"{tqdata.PERIOD_LABEL.get(p, p)}（"
+                        + "、".join(F.FACTORS[k].label for k in ks if k in F.FACTORS)
+                        + "）" for p, ks in missing.items())
+        raise ValueError(
+            f"跨周期因子缺行情：{lack}。这个标的上没有该周期的数据 —— "
+            "换成已有周期，或者先去「数据管理」补一次"
+        )
     if not keys:
         # 两根原因要分开说：一种是这个标的真的没有这些数据（美股没有持仓量），
         # 另一种是**行情太短**，所有因子都凑不出有效值。合成周期把第二种放大
@@ -925,19 +1156,19 @@ def build_score(
                 f"{int(cfg.window)} 根）—— 把回测区间拉长，或者把窗口调小")
         raise ValueError("选中的因子在该标的上都没有足够数据（如美股无持仓量）")
 
-    fmat = F.factor_frame(df, keys, window=cfg.window, method=cfg.method)
-    rawf = F.raw_frame(df, keys)
     fwd = M.forward_return(df, cfg.horizon)
     notes: list[str] = []
     # 标签上的「N 个」是**过滤后**的数量。少掉几个不是配置被改了，而是这几个
     # 因子在当前标的 / 当前区间上没有足够观测（典型：展期、期权那类列只有
     # 本地库才有）。不说明一句，用户看到数字自己变，会以为策略被换了。
-    gone = [k for k in picked if k not in set(keys)]
     if gone:
         notes.append(
             f"已剔除 {len(gone)} 个在该标的上没有足够数据的因子："
             + "、".join(F.FACTORS[k].label for k in gone)
         )
+    xnote = cross_period_note(cfg, keys, base_period)
+    if xnote:
+        notes.append(xnote)
 
     if mode == "single":
         k = keys[0]
@@ -1023,7 +1254,8 @@ def build_score(
         plan: TriggerPlan | None = None
         wstats: dict = {}
         if str(cfg.sample_mode or "all") == "trigger":
-            st, armed, tnotes, rule_sig = trigger_signal(df, cfg)
+            st, armed, tnotes, rule_sig = trigger_signal(
+                df, cfg, extra=extra, base_period=base_period)
             mask, mnotes = trigger_mask(st, armed, cfg)
             notes.extend(tnotes)
             notes.extend(mnotes)
@@ -1139,7 +1371,9 @@ def build_score(
     raise ValueError(f"未知因子模式 {mode}")
 
 
-def trigger_signal(df: pd.DataFrame, cfg: FactorConfig):
+def trigger_signal(df: pd.DataFrame, cfg: FactorConfig,
+                   extra: dict[str, pd.DataFrame] | None = None,
+                   base_period: str = ""):
     """触发强度（带符号）、「规则刚开仓」标记，以及规则自己的持仓。
 
     强度 = 触发因子的时序 Z-score 均值。**不取绝对值**：符号留着，向上突破
@@ -1178,13 +1412,23 @@ def trigger_signal(df: pd.DataFrame, cfg: FactorConfig):
     for key in (cfg.trigger_keys or []):
         if key not in F.FACTORS:
             continue
+        # 触发因子也可能被指到别的周期上（和特征因子是同一份 `factor_periods`）。
+        # 不认这件事的话，界面上选了「周线」，强度却还是按基准周期算的
+        p = cfg.period_of(key, base_period)
+        frame = df
+        if p and p != str(base_period or ""):
+            frame = (extra or {}).get(p)
+            if frame is None or frame.empty:
+                continue
         try:
-            raw = F.raw(df, key)
+            raw = F.raw(frame, key)
         except Exception:      # noqa: BLE001
             continue
         if raw is None or not len(raw):
             continue
         z = _rolling_z(raw.astype(float), cfg.window)
+        if p and p != str(base_period or ""):
+            z = align_to_base(z, df.index, base_period, p)
         if z.notna().sum() >= 60:
             zs.append(z.rename(key))
     if zs:
@@ -1544,6 +1788,8 @@ def run_factor_strategy(
     progress=None,
     cancel=None,
     collect_models: list | None = None,
+    extra: dict[str, pd.DataFrame] | None = None,
+    base_period: str = "",
 ) -> FactorOutcome:
     """因子策略：分数 → 阈值信号。
 
@@ -1553,10 +1799,13 @@ def run_factor_strategy(
 
     `collect_models` 传了就收集每一折的模型（见 `walk_forward`）——
     给「离线训练、实盘只预测」用。
+
+    `extra` / `base_period` 给跨周期因子用（见 `period_frames`）。
     """
     cfg = cfg.normalized()
     pack = build_score(df, mode, keys, cfg, progress=progress, cancel=cancel,
-                       collect_models=collect_models)
+                       collect_models=collect_models,
+                       extra=extra, base_period=base_period)
     if mode == "ml" and pack.trigger is not None:
         sig = trigger_hysteresis(pack.score.to_numpy(), pack.trigger,
                                  cfg.entry_z, cfg.exit_z)
@@ -1610,6 +1859,8 @@ def pooled_score(
     progress=None,
     cancel=None,
     collect_models: list | None = None,
+    extras: dict[str, dict[str, pd.DataFrame]] | None = None,
+    base_period: str = "",
 ) -> dict[str, ScorePack]:
     """多品种**合并**训练：N 个品种的样本堆成一张长表，训一个模型。
 
@@ -1639,11 +1890,13 @@ def pooled_score(
     dropped: list[str] = []
 
     for sym, df in frames.items():
-        use = F.filter_available(df, keys)
+        # 跨周期因子：每个品种的「别的周期」行情是各自一份（`extras[sym]`）
+        ex = (extras or {}).get(sym) or {}
+        fmat, _raw, use, _gone, _miss = factor_matrix(
+            df, keys, cfg, extra=ex, base_period=base_period)
         if len(use) < 2:
             dropped.append(sym)
             continue
-        fmat = F.factor_frame(df, use, window=cfg.window, method=cfg.method)
         if fmat.empty:
             dropped.append(sym)
             continue
@@ -1653,7 +1906,8 @@ def pooled_score(
         d["__y"] = y.reindex(fmat.index)
         d["__sym"] = sym
         if trigger:
-            st, armed, _tn, rule_sig = trigger_signal(df, cfg)
+            st, armed, _tn, rule_sig = trigger_signal(
+                df, cfg, extra=ex, base_period=base_period)
             m, _mn = trigger_mask(st, armed, cfg)
             if not m.any():
                 # 这个品种一根都没触发：合训里没有它的样本，但预测照样要给它，
@@ -1671,7 +1925,7 @@ def pooled_score(
             d["__m"] = np.asarray(m, dtype=bool)
         else:
             d["__m"] = True
-        info[sym] = {"fmat": fmat, "raw": F.raw_frame(df, use), "mask": plans.get(sym)}
+        info[sym] = {"fmat": fmat, "raw": _raw, "mask": plans.get(sym)}
         parts.append(d)
 
     if not parts:
@@ -1805,15 +2059,20 @@ def run_pooled_strategy(
     progress=None,
     cancel=None,
     collect_models: list | None = None,
+    extras: dict[str, dict[str, pd.DataFrame]] | None = None,
+    base_period: str = "",
 ) -> dict[str, FactorOutcome]:
     """多品种合并训练 + 各自交易。返回 `{品种: FactorOutcome}`。
 
     训练合并、交易分开：每个品种拿到的预测是同一个模型给的，但仓位、成本、
     回测各算各的 —— 否则「多品种等权」就变成了一个组合单。
+
+    `extras` 是逐品种的跨周期行情（`{品种: {周期: 行情}}`），见 `period_frames`。
     """
     cfg = cfg.normalized()
     packs = pooled_score(frames, keys, cfg, progress=progress, cancel=cancel,
-                         collect_models=collect_models)
+                         collect_models=collect_models,
+                         extras=extras, base_period=base_period)
     out: dict[str, FactorOutcome] = {}
     for sym, pack in packs.items():
         df = frames[sym]
@@ -1913,10 +2172,13 @@ def run_rule_with_filter(
     cfg: FactorConfig,
     progress=None,
     cancel=None,
+    extra: dict[str, pd.DataFrame] | None = None,
+    base_period: str = "",
 ) -> FactorOutcome:
     """规则策略 + 因子过滤。`rule_signal` 是原规则策略的输出。"""
     cfg = cfg.normalized()
-    pack = build_score(df, mode, keys, cfg, progress=progress, cancel=cancel)
+    pack = build_score(df, mode, keys, cfg, progress=progress, cancel=cancel,
+                       extra=extra, base_period=base_period)
     filtered = apply_factor_filter(rule_signal, pack.score.to_numpy(), cfg)
 
     out = df.copy()

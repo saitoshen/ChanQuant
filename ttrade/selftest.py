@@ -933,6 +933,104 @@ def _run() -> tuple[bool, list[str]]:
 
     check("反向也不平仓", _factor_no_flip)
 
+    def _factor_cross_period():
+        """跨周期因子：大周期的 bar 只在收完之后才许被小周期看到。
+
+        这一段测的是**未来数据**，不是「能不能算出来」。做法是拿真行情跑一遍，
+        然后把某个时刻之后的大周期数据全改成垃圾，再看那个时刻之前的对齐值
+        有没有变 —— 变了就说明它偷看了未来。朴素做法（直接把周线的时间戳
+        当可用时刻、或者按 `reindex(ffill)` 贴）在这里一定会挂。
+        """
+        import numpy as np
+        import pandas as pd
+        from ttrade import factor_strategy as FS
+        from ttrade import factors as F
+        from ttrade import tqdata
+
+        # 基准用 5 分钟（小周期调大周期，最容易踩未来数据），源用周线
+        base = tqdata.load_main("RB", "SHFE", "5m", adjust="qfq").tail(6000)
+        week = tqdata.load_main("RB", "SHFE", "1w", adjust="qfq")
+        if len(base) < 1000 or len(week) < 300:
+            raise RuntimeError("行情不够，跨周期自检跑不了")
+
+        z = F.standardize(F.raw(week, "mom_20"), window=252, method="z")
+        got = FS.align_to_base(z, base.index, "5m", "1w")
+
+        # 1. 未来扰动：T 之后改成 99，T 之前一个数都不许动
+        T = base.index[-300]
+        z2 = z.copy()
+        z2.loc[z2.index > T] = 99.0
+        got2 = FS.align_to_base(z2, base.index, "5m", "1w")
+        mask = base.index <= T
+        a = got[mask].fillna(-9.0).to_numpy()
+        b = got2[mask].fillna(-9.0).to_numpy()
+        if not np.allclose(a, b):
+            raise RuntimeError(
+                f"改动未来数据后历史对齐值变了 {int((a != b).sum())} 根 —— 有未来数据")
+
+        # 2. 逐根核对：对齐值 = 决策时刻不晚于基准的**最后一根**周线
+        dt_src = FS._decision_time(z.index, "1w")
+        dt_base = FS._decision_time(base.index, "5m")
+        vals = z.to_numpy(dtype=float)
+        # 最后一根周线可能还没走完，按实现约定丢掉
+        keep = len(vals) - 1
+        pos = dt_src[:keep].searchsorted(dt_base, side="right") - 1
+        exp = np.where(pos >= 0, vals[np.clip(pos, 0, keep - 1)], np.nan)
+        both = np.isfinite(exp) & np.isfinite(got.to_numpy())
+        if not np.allclose(exp[both], got.to_numpy()[both]):
+            raise RuntimeError("对齐结果和「最后一根已收完的周线」对不上")
+
+        # 3. 周内不该换值：同一 ISO 周里的对齐值只允许在周五收盘后换一次
+        s = got.dropna()
+        wk = pd.Series(s.index).dt.to_period("W").to_numpy()
+        multi = int((s.groupby(wk).nunique() > 2).sum())
+        if multi:
+            raise RuntimeError(f"有 {multi} 个自然周里周线因子变了两次以上")
+
+        # 4. 周线基准 + 日线因子：跨周期要真的接上，而且比单周期多一列说明
+        wbase = tqdata.load_main("RB", "SHFE", "1w", adjust="qfq")
+        day = tqdata.load_main("RB", "SHFE", "1d_tq", adjust="qfq")
+        cfg = FS.FactorConfig(window=252, horizon=5,
+                              factor_periods={"mom_20": "1d_tq"})
+        extra = FS.period_frames(cfg, ["mom_20", "mom_60"], "1w", lambda p: day)
+        if list(extra) != ["1d_tq"]:
+            raise RuntimeError(f"period_frames 没认出要读哪个周期：{list(extra)}")
+        pack = FS.build_score(wbase, "multi", ["mom_20", "mom_60"], cfg,
+                              extra=extra, base_period="1w")
+        if not any("跨周期因子" in n for n in pack.notes):
+            raise RuntimeError("结果说明里没写跨周期")
+        # 同一天：跨周期的 mom_20 用的就是那根日线的值
+        al = FS.align_to_base(F.standardize(F.raw(day, "mom_20"), window=252,
+                                           method="z"),
+                              wbase.index, "1w", "1d_tq")
+        if not np.allclose(pack.fmat["mom_20"].fillna(-9).to_numpy(),
+                           al.fillna(-9).to_numpy()):
+            raise RuntimeError("跨周期那一列和手工对齐的结果不一致")
+
+        # 5. 缺周期要**报错**，不能悄悄把因子剔掉（剔掉只会让分数变了，
+        #    界面上看不出来）
+        try:
+            FS.build_score(wbase, "multi", ["mom_20"], cfg, extra={},
+                           base_period="1w")
+        except ValueError as exc:
+            if "跨周期因子缺行情" not in str(exc):
+                raise RuntimeError(f"缺周期的报错看不懂：{exc}") from exc
+        else:
+            raise RuntimeError("跨周期行情缺失时没有报错")
+
+        # 6. 单周期（不配跨周期）必须和以前逐位一致
+        plain = FS.FactorConfig(window=252, horizon=5)
+        p0 = FS.build_score(wbase, "multi", ["mom_20", "mom_60"], plain)
+        ref = F.factor_frame(wbase, ["mom_20", "mom_60"], window=252, method="z")
+        if not np.allclose(p0.fmat.fillna(-9).to_numpy(), ref.fillna(-9).to_numpy()):
+            raise RuntimeError("没配跨周期时结果变了（老策略不该被影响）")
+
+        return (f"未来扰动不影响历史；对齐=最后一根已收完的周线；"
+                f"{len(s)} 根覆盖里周内不换值；周线+日线因子接上；缺周期报错")
+
+    check("跨周期因子（截断 / 对齐）", _factor_cross_period)
+
+
     def _factor_filter():
         from ttrade import factor_strategy as FS
         from ttrade import factors as F
@@ -1420,7 +1518,7 @@ def _run() -> tuple[bool, list[str]]:
                 self.err: dict = {}
                 self.submits: list = []
 
-            def submit(self, key, df, cfg, keys, predictor=None):
+            def submit(self, key, df, cfg, keys, predictor=None, extra=None):
                 self.submits.append((key, predictor is not None))
 
             def signal(self, key):
@@ -2283,10 +2381,11 @@ def _run() -> tuple[bool, list[str]]:
             and orients == {"auto", "long_high", "long_low"}
             and n_factors >= 47
             and n_models >= 4
-            # 多因子表要 47 行 × 4 列（因子 / 用 / 反 / 权重），少了「反」列
-            # 就没法逐因子反转，少了「权重」列「不等权」就是空话
+            # 多因子表要 47 行 × 5 列（因子 / 周期 / 用 / 反 / 权重），少了「反」
+            # 列就没法逐因子反转，少了「权重」列「不等权」就是空话，少了「周期」
+            # 列就没法跨周期引用
             and n_rows_f >= 47
-            and n_cols_f == 4
+            and n_cols_f == 5
             and win.chk_frev is not None
             # 权重口径三档（等权 / 不等权 / 滚动 IC）+ 打分范围说明 + 出场规则入口
             and {win.cb_fweight.itemData(i) for i in range(win.cb_fweight.count())}
@@ -3137,22 +3236,22 @@ def _run() -> tuple[bool, list[str]]:
                 raise RuntimeError("多因子组合下没露出权重口径下拉")
             win.cb_fweight.setCurrentIndex(win.cb_fweight.findData("custom"))
             app.processEvents()
-            if win.tbl_fmulti.isColumnHidden(3):
+            if win.tbl_fmulti.isColumnHidden(4):
                 raise RuntimeError("选了「不等权」但权重列还是藏着的")
             # 勾上前两行：默认勾选（`DEFAULT_MULTI`）不一定落在这个市场的因子集里，
             # 上一段稀疏采样的操作也可能把勾去掉
             for _r in range(min(2, win.tbl_fmulti.rowCount())):
-                _cell = win.tbl_fmulti.item(_r, 1)
+                _cell = win.tbl_fmulti.item(_r, 2)
                 if _cell is not None:
                     _cell.setCheckState(Qt.Checked)
             app.processEvents()
             rows = [r for r in range(win.tbl_fmulti.rowCount())
-                    if win.tbl_fmulti.item(r, 1) is not None
-                    and win.tbl_fmulti.item(r, 1).checkState() == Qt.Checked]
+                    if win.tbl_fmulti.item(r, 2) is not None
+                    and win.tbl_fmulti.item(r, 2).checkState() == Qt.Checked]
             if len(rows) < 2:
                 raise RuntimeError("自检环境里勾中的因子不足 2 个，权重往返测不了")
-            win.tbl_fmulti.item(rows[0], 3).setText("3")
-            win.tbl_fmulti.item(rows[1], 3).setText("0.5")
+            win.tbl_fmulti.item(rows[0], 4).setText("3")
+            win.tbl_fmulti.item(rows[1], 4).setText("0.5")
             app.processEvents()
             want_w = win._factor_cfg()
             cfg_w = win._current_config()
@@ -3161,8 +3260,8 @@ def _run() -> tuple[bool, list[str]]:
                         win.tbl_fmulti.item(rows[0], 0).data(Qt.UserRole), 0)) - 3.0) < 1e-9):
                 raise RuntimeError(f"权重没进配置：{want_w.weight_mode} {want_w.weights}")
             win.cb_fweight.setCurrentIndex(win.cb_fweight.findData("equal"))
-            win.tbl_fmulti.item(rows[0], 3).setText("1")
-            win.tbl_fmulti.item(rows[1], 3).setText("1")
+            win.tbl_fmulti.item(rows[0], 4).setText("1")
+            win.tbl_fmulti.item(rows[1], 4).setText("1")
             app.processEvents()
             win.apply_config(cfg_w)
             app.processEvents()

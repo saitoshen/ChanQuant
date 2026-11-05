@@ -157,6 +157,10 @@ PERIOD_LABEL = dict(tqdata.PERIOD_LABEL, **{PERIOD_1D: "日线Tushare"})
 FAMILY_RULE = "rule"
 FAMILY_FACTOR = "factor"
 FAMILY_CROSS = "cross"
+
+# 多因子表格的列号。**一律用常量**：这张表从 4 列扩到 5 列时（加了「周期」），
+# 散在各处的 `item(r, 2)` 全是「反」还是「用」这种问题，靠肉眼是查不出来的
+COL_NAME, COL_PERIOD, COL_USE, COL_REV, COL_W = 0, 1, 2, 3, 4
 FAMILIES = [
     (FAMILY_RULE, "规则策略", "经典技术指标，阈值/交叉直接产生信号"),
     (FAMILY_FACTOR, "因子策略", "因子分数过阈值进出场，可单因子/多因子/机器学习"),
@@ -261,7 +265,9 @@ SIZE_MODES = [
 FACTOR_PARAMS = {
     "window": ("标准化窗口", 120, 500, 20, 252),
     "horizon": ("预测期数", 1, 20, 1, 5),
-    "entry_z": ("进场阈值", 0.3, 3.0, 0.1, 1.0),
+    # 下限 0.1：分数在 ±4 之间，0.1 大约是十分位，想「几乎一直有仓」时能设到。
+    # 离场阈值会跟着压到它下面（见 _tie_exit_to_entry）
+    "entry_z": ("进场阈值", 0.1, 3.0, 0.1, 1.0),
     # 离场阈值可以取负：0 是「分数转负就平」，负值是「反向坐实了才平」，
     # 持仓更长、不容易被一次回抽扫出去。上限受 entry_z 牵制（见 _rebuild_fparams）
     "exit_z": ("离场阈值", -2.0, 2.0, 0.1, 0.3),
@@ -825,13 +831,17 @@ class FactorWorker(QObject):
     failed = Signal(str)
 
     def __init__(self, df: pd.DataFrame, mode: str, keys: list[str],
-                 cfg: fstrat.FactorConfig, rule_signal=None):
+                 cfg: fstrat.FactorConfig, rule_signal=None,
+                 extra: dict | None = None, base_period: str = ""):
         super().__init__()
         self.df = df
         self.mode = mode
         self.keys = keys
         self.cfg = cfg
         self.rule_signal = rule_signal
+        # 跨周期因子要用的别的周期行情：主线程里读好，线程里只算
+        self.extra = dict(extra or {})
+        self.base_period = base_period
         self._cancel = False
 
     def cancel(self) -> None:
@@ -844,11 +854,13 @@ class FactorWorker(QObject):
                 out = fstrat.run_factor_strategy(
                     self.df, self.mode, self.keys, self.cfg,
                     progress=cb, cancel=lambda: self._cancel,
+                    extra=self.extra, base_period=self.base_period,
                 )
             else:
                 out = fstrat.run_rule_with_filter(
                     self.df, self.rule_signal, self.mode, self.keys, self.cfg,
                     progress=cb, cancel=lambda: self._cancel,
+                    extra=self.extra, base_period=self.base_period,
                 )
         except fstrat.Cancelled:
             return
@@ -871,10 +883,13 @@ class CrossWorker(QObject):
     failed = Signal(str)
 
     def __init__(self, frames: dict, cfg, bt, profile: str, label: str,
-                 step1_frames: dict | None = None) -> None:
+                 step1_frames: dict | None = None,
+                 timing_extra: dict | None = None) -> None:
         super().__init__()
         self.frames = frames
         self.step1_frames = step1_frames
+        # 时序腿的跨周期因子行情：{品种: {周期: 行情}}，主线程读好再进线程
+        self.timing_extra = dict(timing_extra or {})
         self.cfg = cfg
         self.bt = bt
         self.profile = profile
@@ -891,6 +906,7 @@ class CrossWorker(QObject):
                 self.frames, self.cfg, self.bt, profile=self.profile,
                 label=self.label, progress=cb, cancel=lambda: self._cancel,
                 step1_frames=self.step1_frames,
+                timing_extra=self.timing_extra,
             )
         except fstrat.Cancelled:
             return
@@ -919,6 +935,10 @@ class BacktestJob:
     factor_keys: tuple
     factor_cfg: object
     filtered: bool
+    # 跨周期因子要用的别的周期行情：{周期: DataFrame}。同样必须在主线程里
+    # 读好 —— 后台线程不许碰行情仓库
+    factor_extra: dict = None
+    factor_base_period: str = ""
     # 反向交易：多品种也要按同一个方向跑。这个开关属于「策略」而不是
     # `BacktestConfig`，所以不能指望 `job.cfg.rule_reverse` —— 那个字段根本不存在
     reverse: bool = False
@@ -956,14 +976,18 @@ def run_backtest_job(job: BacktestJob, progress=None, cancel=None):
     keys = list(job.factor_keys)
     if not keys:
         return None
+    extra = dict(getattr(job, "factor_extra", None) or {})
+    base_period = getattr(job, "factor_base_period", "") or ""
     if rule_signal is None:
         out = fstrat.run_factor_strategy(job.df, job.factor_mode, keys,
                                          job.factor_cfg, progress=progress,
-                                         cancel=cancel)
+                                         cancel=cancel,
+                                         extra=extra, base_period=base_period)
     else:
         out = fstrat.run_rule_with_filter(
             job.df, rule_signal, job.factor_mode, keys, job.factor_cfg,
             progress=progress, cancel=cancel,
+            extra=extra, base_period=base_period,
         )
     return run_backtest(out.df, job.cfg, label=out.label)
 
@@ -1044,12 +1068,15 @@ class MultiWorker(QObject):
         jobs = self.jobs
         total = len(jobs)
         frames = {j.key: j.df for j in jobs}
+        # 跨周期行情是**逐品种一份**（`job.factor_extra` 已经在主线程读好）
+        extras = {j.key: (j.factor_extra or {}) for j in jobs if j.factor_extra}
         first = jobs[0]
         try:
             outs = fstrat.run_pooled_strategy(
                 frames, list(first.factor_keys), first.factor_cfg,
                 progress=lambda d, t, m: self.progress.emit(0, total, m),
                 cancel=lambda: self._cancel,
+                extras=extras, base_period=first.factor_base_period,
             )
         except fstrat.Cancelled:
             return
@@ -2002,7 +2029,7 @@ class MainWindow(QMainWindow):
         self.lbl_fsel = self._section("因子选择")
         sf.addWidget(self.lbl_fsel)
 
-        # 打分范围写在因子列表**上面**：进场阈值滑杆是 0.3~3.0，而分数本身
+        # 打分范围写在因子列表**上面**：进场阈值滑杆是 0.1~3.0，而分数本身
         # 被截断在 ±4 —— 不说明的话，「为什么阈值最大只能设 3」和「为什么分数
         # 永远到不了 5」两个疑问会一直存在
         self.lbl_frange = QLabel(
@@ -2036,34 +2063,49 @@ class MainWindow(QMainWindow):
         bfl.addWidget(self.chk_frev)
         sf.addWidget(self.box_fsingle)
 
-        # 多因子选择：四列表 —— 因子 / 用 / 反 / 权重。
+        # 单因子模式下的周期选择。和「反转」一样：状态存在表格的「周期」列里，
+        # 这里只是那一格的镜像，切到多因子不会出现两套周期
+        self.cb_fperiod = QComboBox()
+        self._fill_period_combo(self.cb_fperiod)
+        self.cb_fperiod.setToolTip(
+            "在哪个周期上算这个因子。\n\n"
+            "「本周期」= 跟策略的周期走（老口径）。选别的周期就是跨周期引用 ——\n"
+            "比如周线策略调日线因子：大方向按周线，具体动手看日线有没有走坏。\n\n"
+            "大周期的 bar 只在**收完之后**才允许被小周期看到，所以不会用到未来数据。"
+        )
+        self.cb_fperiod.currentIndexChanged.connect(self._on_single_period_changed)
+        sf.addWidget(self.cb_fperiod)
+
+        # 多因子选择：五列表 —— 因子 / 周期 / 用 / 反 / 权重。
         # 用 QTableWidget 而不是 QListWidget：每个因子需要独立开关
         # （参与合成、反向使用、权重），QListWidget 只有一列勾选框，塞不下。
         # 「权重」列只在「不等权」时露出来 —— 等权模式下摆一列全 1，
         # 只会让人以为调它有用。
-        self.tbl_fmulti = QTableWidget(0, 4)
+        self.tbl_fmulti = QTableWidget(0, 5)
         self.tbl_fmulti.setObjectName("FactorTable")
         self.tbl_fmulti.setFixedHeight(176)
-        self.tbl_fmulti.setHorizontalHeaderLabels(["因子", "用", "反", "权重"])
+        self.tbl_fmulti.setHorizontalHeaderLabels(
+            ["因子", "周期", "用", "反", "权重"])
         self.tbl_fmulti.verticalHeader().setVisible(False)
         # 47 行一屏放不下，行高压紧到 21px，176px 能露 8 行，剩下的滚动
         self.tbl_fmulti.verticalHeader().setDefaultSectionSize(21)
         self.tbl_fmulti.setShowGrid(False)
         self.tbl_fmulti.setSelectionMode(QAbstractItemView.NoSelection)
         # 只有「权重」列可编辑（那一列的 item 才带 ItemIsEditable）。
-        # 其余列保持只读，靠勾选框交互
+        # 其余列保持只读，靠勾选框 / 下拉框交互
         self.tbl_fmulti.setEditTriggers(QAbstractItemView.DoubleClicked
                                         | QAbstractItemView.EditKeyPressed)
         self.tbl_fmulti.setFocusPolicy(Qt.NoFocus)
         hh = self.tbl_fmulti.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        for _c in (1, 2, 3):
+        hh.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
+        for _c in (COL_PERIOD, COL_USE, COL_REV, COL_W):
             hh.setSectionResizeMode(_c, QHeaderView.Fixed)
         hh.setFixedHeight(22)
-        self.tbl_fmulti.setColumnWidth(1, 34)
-        self.tbl_fmulti.setColumnWidth(2, 34)
-        self.tbl_fmulti.setColumnWidth(3, 52)
-        self.tbl_fmulti.setColumnHidden(3, True)
+        self.tbl_fmulti.setColumnWidth(COL_PERIOD, 66)
+        self.tbl_fmulti.setColumnWidth(COL_USE, 30)
+        self.tbl_fmulti.setColumnWidth(COL_REV, 30)
+        self.tbl_fmulti.setColumnWidth(COL_W, 46)
+        self.tbl_fmulti.setColumnHidden(COL_W, True)
         self._fill_multi_table()
         sf.addWidget(self.tbl_fmulti)
 
@@ -2914,21 +2956,86 @@ class MainWindow(QMainWindow):
     def _on_strategy_removed(self, _key: str) -> None:
         self._fill_strategy_combo()
 
-    def _multi_state(self) -> dict:
-        """每个因子的 (参与合成, 反转, 权重)。重建时用它保住勾选。"""
-        out: dict[str, tuple[bool, bool, str]] = {}
+    def _fill_period_combo(self, cb) -> None:
+        """周期下拉框：本周期 + 各档周期。
+
+        **不按当前品种过滤**：这张表可能被多品种回测共用，各品种能读到的周期
+        不一样；在这里滤掉只会让人以为「这个因子不能跨周期」。真的缺数据时
+        由 `build_score` 报「跨周期因子缺行情」，一句话说清缺哪个。
+        """
+        cb.blockSignals(True)
+        cb.clear()
+        cb.addItem("本周期", "")
+        for p in GUI_PERIODS:
+            cb.addItem(PERIOD_LABEL.get(p, p), p)
+        cb.blockSignals(False)
+
+    def _row_period(self, key: str) -> str:
+        """某个因子选中的周期（空串 = 跟策略周期走）。"""
+        r = self._row_of_factor(key)
+        if r < 0:
+            return ""
+        w = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
+        return str(w.currentData() or "") if isinstance(w, QComboBox) else ""
+
+    def _set_row_period(self, key: str, period: str) -> None:
+        r = self._row_of_factor(key)
+        if r < 0:
+            return
+        w = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
+        if not isinstance(w, QComboBox):
+            return
+        i = w.findData(period or "")
+        if i >= 0 and i != w.currentIndex():
+            w.blockSignals(True)
+            w.setCurrentIndex(i)
+            w.blockSignals(False)
+
+    def _factor_periods(self) -> dict[str, str]:
+        """`{因子键: 周期}`，只收非「本周期」的那些。"""
+        out: dict[str, str] = {}
         for r in range(self.tbl_fmulti.rowCount()):
-            item = self.tbl_fmulti.item(r, 0)
+            item = self.tbl_fmulti.item(r, COL_NAME)
+            if item is None:
+                continue
+            w = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
+            p = str(w.currentData() or "") if isinstance(w, QComboBox) else ""
+            if p:
+                out[str(item.data(Qt.UserRole))] = p
+        return out
+
+    def _sync_single_period(self) -> None:
+        """把当前单因子那一行的周期刷到下拉框上（不触发重算）。"""
+        k = self.cb_fsingle.currentData()
+        p = self._row_period(k) if k else ""
+        self.cb_fperiod.blockSignals(True)
+        i = self.cb_fperiod.findData(p)
+        self.cb_fperiod.setCurrentIndex(i if i >= 0 else 0)
+        self.cb_fperiod.blockSignals(False)
+
+    def _on_single_period_changed(self, *_args) -> None:
+        k = self.cb_fsingle.currentData()
+        if k:
+            self._set_row_period(k, str(self.cb_fperiod.currentData() or ""))
+        self._schedule(immediate=True)
+
+    def _multi_state(self) -> dict:
+        """每个因子的 (参与合成, 反转, 权重, 周期)。重建时用它保住勾选。"""
+        out: dict[str, tuple[bool, bool, str, str]] = {}
+        for r in range(self.tbl_fmulti.rowCount()):
+            item = self.tbl_fmulti.item(r, COL_NAME)
             if item is None:
                 continue
             k = item.data(Qt.UserRole)
-            use = self.tbl_fmulti.item(r, 1)
-            rev = self.tbl_fmulti.item(r, 2)
-            wt = self.tbl_fmulti.item(r, 3)
+            use = self.tbl_fmulti.item(r, COL_USE)
+            rev = self.tbl_fmulti.item(r, COL_REV)
+            wt = self.tbl_fmulti.item(r, COL_W)
+            pcell = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
             out[k] = (
                 bool(use is not None and use.checkState() == Qt.Checked),
                 bool(rev is not None and rev.checkState() == Qt.Checked),
                 ((wt.text().strip() if wt is not None else "") or "1"),
+                str(pcell.currentData() or "") if isinstance(pcell, QComboBox) else "",
             )
         return out
 
@@ -2940,11 +3047,11 @@ class MainWindow(QMainWindow):
         """
         out: dict[str, float] = {}
         for r in range(self.tbl_fmulti.rowCount()):
-            item = self.tbl_fmulti.item(r, 0)
+            item = self.tbl_fmulti.item(r, COL_NAME)
             if item is None:
                 continue
             k = item.data(Qt.UserRole)
-            wt = self.tbl_fmulti.item(r, 3)
+            wt = self.tbl_fmulti.item(r, COL_W)
             try:
                 v = float((wt.text() if wt is not None else "") or 1)
             except (TypeError, ValueError):
@@ -2953,8 +3060,8 @@ class MainWindow(QMainWindow):
         return out
 
     def _fill_multi_table(self) -> None:
-        """重建多因子表格。保留用户已勾的「用 / 反 / 权重」—— 加一个因子不该
-        把之前的勾选全清掉。"""
+        """重建多因子表格。保留用户已勾的「用 / 反 / 权重 / 周期」—— 加一个因子
+        不该把之前的勾选全清掉。"""
         picked = self._multi_state() if self.tbl_fmulti.rowCount() else {}
         # 重建会逐格 setItem，每格都触发 itemChanged；不挡住的话重建 47 行
         # 就排 47 次回测
@@ -2973,12 +3080,31 @@ class MainWindow(QMainWindow):
                 # 显式去掉 ItemIsEditable：表格为了「权重」列开了双击编辑，
                 # 名字列默认是可编辑的，不改的话双击就能把因子名改乱
                 name.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                self.tbl_fmulti.setItem(r, 0, name)
-                use_on, rev_on, wt = picked.get(
-                    k, (k in factors.DEFAULT_MULTI, False, "1"))
+                self.tbl_fmulti.setItem(r, COL_NAME, name)
+                use_on, rev_on, wt, per = picked.get(
+                    k, (k in factors.DEFAULT_MULTI, False, "1", ""))
+                cb = QComboBox()
+                self._fill_period_combo(cb)
+                # 表格行高只有 21px，全局样式给 QComboBox 的 `min-height: 22px`
+                # + 上下 padding 会让它撑到 30px，压到下一行上去。这里单独压扁
+                cb.setStyleSheet(
+                    "QComboBox{padding:0 2px; min-height:0px; font-size:11px;}"
+                    "QComboBox::drop-down{width:12px;}")
+                cb.setFixedHeight(19)
+                i = cb.findData(per)
+                cb.setCurrentIndex(i if i >= 0 else 0)
+                cb.setToolTip(
+                    "这个因子在哪个周期上算。\n\n"
+                    "「本周期」= 跟策略的周期走。选别的周期就是跨周期引用，\n"
+                    "比如周线策略调日线因子、日线策略调周线过滤。\n\n"
+                    "大周期的 bar 只有在**收完之后**才允许被小周期看到 ——\n"
+                    "周线因子在周五收盘前用的都是上一周的值，不会用到未来数据。"
+                )
+                cb.currentIndexChanged.connect(self._on_factor_selection)
+                self.tbl_fmulti.setCellWidget(r, COL_PERIOD, cb)
                 for col, tip, default in (
-                    (1, "勾上表示参与合成", use_on),
-                    (2, "勾上表示这个因子反向使用（取负号）", rev_on),
+                    (COL_USE, "勾上表示参与合成", use_on),
+                    (COL_REV, "勾上表示这个因子反向使用（取负号）", rev_on),
                 ):
                     cell = QTableWidgetItem("")
                     cell.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
@@ -2995,7 +3121,7 @@ class MainWindow(QMainWindow):
                     "按比例起作用：填 3 和 1.5 等于 2:1，不用凑成 100。\n"
                     "填 0 = 不参与合成，和取消「用」等价。"
                 )
-                self.tbl_fmulti.setItem(r, 3, wcell)
+                self.tbl_fmulti.setItem(r, COL_W, wcell)
         self.tbl_fmulti.blockSignals(False)
 
     def _on_factor_added(self, key: str) -> None:
@@ -3922,7 +4048,7 @@ class MainWindow(QMainWindow):
                 else "equal") or "equal"
         if hasattr(self, "tbl_fmulti"):
             # 等权模式下摆一列全 1 的权重，只会让人以为调它有用
-            self.tbl_fmulti.setColumnHidden(3, mode != "custom")
+            self.tbl_fmulti.setColumnHidden(COL_W, mode != "custom")
         if hasattr(self, "row_ic_rebal"):
             self.row_ic_rebal.setVisible(mode == "ic")
 
@@ -4074,6 +4200,9 @@ class MainWindow(QMainWindow):
         self.lbl_fsel.setText("过滤因子" if filtering else "因子选择")
         single = self.factor_mode == "single"
         self.box_fsingle.setVisible(single)
+        # 周期下拉跟着单因子一起显隐：多因子模式下周期在表格里逐行给，
+        # 这里再摆一个「当前因子的周期」只会让人以为它管全局
+        self.cb_fperiod.setVisible(single)
         self.tbl_fmulti.setVisible(not single)
         self.box_fbtns.setVisible(not single)
         if single:
@@ -4132,6 +4261,9 @@ class MainWindow(QMainWindow):
         self.box_fsel.setVisible(True)
         self.lbl_fsel.setText("截面因子")
         self.box_fsingle.setVisible(single)
+        # 周期下拉跟着单因子一起显隐：多因子模式下周期在表格里逐行给，
+        # 这里再摆一个「当前因子的周期」只会让人以为它管全局
+        self.cb_fperiod.setVisible(single)
         self.tbl_fmulti.setVisible(not single)
         self.box_fbtns.setVisible(not single)
         # 权重口径在截面上同样成立：截面多因子也是「几个因子合成一个分数」，
@@ -4168,7 +4300,7 @@ class MainWindow(QMainWindow):
         self.tbl_fmulti.blockSignals(True)
         state = Qt.Checked if on else Qt.Unchecked
         for r in range(self.tbl_fmulti.rowCount()):
-            cell = self.tbl_fmulti.item(r, 1)
+            cell = self.tbl_fmulti.item(r, COL_USE)
             if cell is not None:
                 cell.setCheckState(state)
         self.tbl_fmulti.blockSignals(False)
@@ -4179,7 +4311,7 @@ class MainWindow(QMainWindow):
     # 只是它的一个镜像。两份状态各存一份的话，切模式就会出现「这里勾了那里没勾」。
     def _row_of_factor(self, key: str) -> int:
         for r in range(self.tbl_fmulti.rowCount()):
-            it = self.tbl_fmulti.item(r, 0)
+            it = self.tbl_fmulti.item(r, COL_NAME)
             if it is not None and it.data(Qt.UserRole) == key:
                 return r
         return -1
@@ -4188,14 +4320,14 @@ class MainWindow(QMainWindow):
         r = self._row_of_factor(key)
         if r < 0:
             return False
-        cell = self.tbl_fmulti.item(r, 2)
+        cell = self.tbl_fmulti.item(r, COL_REV)
         return bool(cell is not None and cell.checkState() == Qt.Checked)
 
     def _set_rev_state(self, key: str, on: bool) -> None:
         r = self._row_of_factor(key)
         if r < 0:
             return
-        cell = self.tbl_fmulti.item(r, 2)
+        cell = self.tbl_fmulti.item(r, COL_REV)
         if cell is None:
             return
         self.tbl_fmulti.blockSignals(True)
@@ -4211,6 +4343,7 @@ class MainWindow(QMainWindow):
 
     def _on_single_factor_changed(self, *_args) -> None:
         self._sync_single_rev()
+        self._sync_single_period()
         self._on_factor_selection()
 
     def _on_frev_toggled(self, on: bool) -> None:
@@ -4229,8 +4362,8 @@ class MainWindow(QMainWindow):
         """
         out = set()
         for r in range(self.tbl_fmulti.rowCount()):
-            name = self.tbl_fmulti.item(r, 0)
-            rev = self.tbl_fmulti.item(r, 2)
+            name = self.tbl_fmulti.item(r, COL_NAME)
+            rev = self.tbl_fmulti.item(r, COL_REV)
             if name is None or rev is None:
                 continue
             if rev.checkState() == Qt.Checked:
@@ -4250,8 +4383,8 @@ class MainWindow(QMainWindow):
             return [k] if k else []
         picked = set()
         for r in range(self.tbl_fmulti.rowCount()):
-            name = self.tbl_fmulti.item(r, 0)
-            use = self.tbl_fmulti.item(r, 1)
+            name = self.tbl_fmulti.item(r, COL_NAME)
+            use = self.tbl_fmulti.item(r, COL_USE)
             if name is not None and use is not None and use.checkState() == Qt.Checked:
                 picked.add(name.data(Qt.UserRole))
         return [k for k in factors.FACTORS if k in picked]
@@ -4546,7 +4679,8 @@ class MainWindow(QMainWindow):
             m = self.cb_fmode.findData(cfg.factor_mode)
             if m >= 0:
                 self.cb_fmode.setCurrentIndex(m)
-            self._apply_factor_keys(cfg.factor_keys, cfg.factor_reverse)
+            self._apply_factor_keys(cfg.factor_keys, cfg.factor_reverse,
+                                    (cfg.factor_cfg or {}).get("factor_periods"))
             self._apply_factor_cfg(cfg.factor_cfg)
 
         if cfg.family == FAMILY_CROSS:
@@ -4579,7 +4713,8 @@ class MainWindow(QMainWindow):
             fm = self.cb_fmode.findData(cfg.factor_mode or "multi")
             if fm >= 0:
                 self.cb_fmode.setCurrentIndex(fm)     # 重建因子参数控件
-            self._apply_factor_keys(cfg.factor_keys, cfg.factor_reverse)
+            self._apply_factor_keys(cfg.factor_keys, cfg.factor_reverse,
+                                    (cfg.factor_cfg or {}).get("factor_periods"))
             self._apply_factor_cfg(cfg.factor_cfg)
             # 时序腿的规则参数在 `timing_rule_params` 里，和主规则参数是两套：
             # 截面对冲时用户可能在两个模式下调过不同的参数
@@ -4628,7 +4763,7 @@ class MainWindow(QMainWindow):
         # 加载一条已存的策略是显式动作：手动模式下也要立刻算一遍
         self._schedule(immediate=True, force=True)
 
-    def _apply_factor_keys(self, keys, reverse) -> None:
+    def _apply_factor_keys(self, keys, reverse, periods=None) -> None:
         """恢复因子选择：单因子设下拉，多因子勾表格，反向勾「反」列。"""
         picked = set(keys or [])
         if picked:
@@ -4642,19 +4777,27 @@ class MainWindow(QMainWindow):
         self.tbl_fmulti.blockSignals(True)
         try:
             for r in range(self.tbl_fmulti.rowCount()):
-                name = self.tbl_fmulti.item(r, 0)
+                name = self.tbl_fmulti.item(r, COL_NAME)
                 if name is None:
                     continue
                 k = name.data(Qt.UserRole)
-                use = self.tbl_fmulti.item(r, 1)
-                rev = self.tbl_fmulti.item(r, 2)
+                use = self.tbl_fmulti.item(r, COL_USE)
+                rev = self.tbl_fmulti.item(r, COL_REV)
                 if use is not None:
                     use.setCheckState(Qt.Checked if k in picked else Qt.Unchecked)
                 if rev is not None:
                     on = bool((reverse or {}).get(k))
                     rev.setCheckState(Qt.Checked if on else Qt.Unchecked)
+                # 跨周期：配置里带回来的 {因子: 周期}，没配就是「本周期」
+                pcell = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
+                if isinstance(pcell, QComboBox):
+                    i = pcell.findData(str((periods or {}).get(k) or ""))
+                    pcell.blockSignals(True)
+                    pcell.setCurrentIndex(i if i >= 0 else 0)
+                    pcell.blockSignals(False)
         finally:
             self.tbl_fmulti.blockSignals(False)
+        self._sync_single_period()
 
     def _apply_factor_cfg(self, cfg: dict) -> None:
         if not cfg:
@@ -4721,8 +4864,8 @@ class MainWindow(QMainWindow):
             wts = cfg.get("weights") or {}
             if isinstance(wts, dict) and wts:
                 for r in range(self.tbl_fmulti.rowCount()):
-                    item = self.tbl_fmulti.item(r, 0)
-                    wt = self.tbl_fmulti.item(r, 3)
+                    item = self.tbl_fmulti.item(r, COL_NAME)
+                    wt = self.tbl_fmulti.item(r, COL_W)
                     if item is None or wt is None:
                         continue
                     k = str(item.data(Qt.UserRole))
@@ -5136,6 +5279,8 @@ class MainWindow(QMainWindow):
             method=((self.cb_fmethod.currentData() or "z")
                     if hasattr(self, "cb_fmethod") else "z"),
             reverse={k: True for k in self._reversed_factor_keys()},
+            # 跨周期因子：{因子键: 周期}，没配的因子跟策略周期走
+            factor_periods=self._factor_periods(),
             model=self.cb_fmodel.currentData() or mlmodels.DEFAULT_MODEL,
             train_window=int(get("train_window", 1000)),
             step=int(get("step", 180)),
@@ -5306,17 +5451,23 @@ class MainWindow(QMainWindow):
             return
 
         cfg = self._factor_cfg()
+        # 跨周期因子：先把别的周期的行情读出来（主线程，走仓库缓存）
+        extra = self._extra_periods(cfg, keys, period, skey)
         if self.factor_mode == "ml":
-            self._start_factor_worker(df, keys, cfg, rule_signal)
+            self._start_factor_worker(df, keys, cfg, rule_signal,
+                                      extra=extra, base_period=period)
             return
 
         # 单因子 / 多因子只要几十毫秒，同步算完即可，不必起线程
         try:
             if rule_signal is None:
-                out = fstrat.run_factor_strategy(df, self.factor_mode, keys, cfg)
+                out = fstrat.run_factor_strategy(
+                    df, self.factor_mode, keys, cfg,
+                    extra=extra, base_period=period)
             else:
                 out = fstrat.run_rule_with_filter(
-                    df, rule_signal, self.factor_mode, keys, cfg
+                    df, rule_signal, self.factor_mode, keys, cfg,
+                    extra=extra, base_period=period
                 )
         except Exception as exc:  # noqa: BLE001
             self.lbl_status.setText(f"因子计算失败：{exc}")
@@ -5372,15 +5523,38 @@ class MainWindow(QMainWindow):
             cfg.multiplier, cfg.margin_rate = 1.0, 1.0
 
         rule_key = (self.cb_strategy.currentData() or "") if self.family == FAMILY_RULE else ""
+        fcfg = self._factor_cfg()
+        fkeys = tuple(self._selected_factor_keys())
         return BacktestJob(
             key=key, label=self._key_label(key), df=df, cfg=cfg,
             family=self.family, rule_key=rule_key,
             rule_params=dict(self._current_params()) if rule_key else {},
             factor_mode=self.factor_mode,
-            factor_keys=tuple(self._selected_factor_keys()),
-            factor_cfg=self._factor_cfg(),
+            factor_keys=fkeys,
+            factor_cfg=fcfg,
             filtered=bool(self._filter_active()),
             reverse=self._rule_reverse(),
+            factor_extra=self._extra_periods(fcfg, list(fkeys),
+                                             self._period(), key),
+            factor_base_period=self._period(),
+        )
+
+    def _extra_periods(self, cfg, keys, base_period: str, key: str) -> dict:
+        """跨周期因子要用的别的周期行情：`{周期: DataFrame}`。
+
+        **必须在主线程里读**：行情仓库的缓存不是线程安全的，多品种又是 N 个
+        线程同时跑；这里读成纯数据再进线程，线程里只算。
+
+        取的是**全历史**，不按回测区间裁 —— 标准化窗口要 252 根大周期 bar，
+        裁到「近一年」的话周线只剩五十来根，因子全成 NaN。对齐时只用得上
+        基准 bar 之前的那些值，多给的部分不会被看到（见 `align_to_base`）。
+        """
+        if not getattr(cfg, "factor_periods", None) or not key:
+            return {}
+        return fstrat.period_frames(
+            cfg, list(keys), base_period,
+            lambda p: self.store.get(key, p),
+            extra_keys=list(getattr(cfg, "trigger_keys", None) or []),
         )
 
     def _run_multi(self, keys: list[str]) -> None:
@@ -5708,6 +5882,7 @@ class MainWindow(QMainWindow):
             pool_keys=[_cx["pool_key"]] if _cx["pool_key"] else [],
             pool_top_pct=_cx["pool_pct"],
             label_mode=_cx["label"],
+            period=period,
             factor_mode=self.factor_mode,
             factor_keys=fkeys,
             factor_reverse=rev,
@@ -5755,8 +5930,17 @@ class MainWindow(QMainWindow):
         # 几十毫秒的事（分数面板 + 排序 + 成本向量都在这个量级），主线程里跑
         # 窗口会假死，连「取消」都点不动；机器学习更要跑几十折 walk-forward。
         # 统一走线程能少一套分支，也免得两条路的结果口径慢慢走偏
+        # 时序腿的跨周期因子：逐个品种把它要的别的周期行情读出来（主线程）
+        timing_extra = {}
+        if ccfg.timing_family == "factor" and ccfg.timing_factor_keys                 and fc.factor_periods:
+            for _k in frames:
+                ex = self._extra_periods(fc, list(ccfg.timing_factor_keys),
+                                         period, _k)
+                if ex:
+                    timing_extra[_k] = ex
         self._start_cross_worker(frames, ccfg, bt, label, period, missing,
-                                 step1_frames=step1_frames)
+                                 step1_frames=step1_frames,
+                                 timing_extra=timing_extra)
 
     def _finish_cross(self, out, label: str, ccfg, frames: dict, period: str,
                       bt: BacktestConfig, missing: list[str],
@@ -5809,7 +5993,8 @@ class MainWindow(QMainWindow):
 
     def _start_cross_worker(self, frames, ccfg, bt, label: str, period: str,
                             missing: list[str] | None = None,
-                            step1_frames: dict | None = None) -> None:
+                            step1_frames: dict | None = None,
+                            timing_extra: dict | None = None) -> None:
         """截面回测走后台线程。已经在跑的先取消，避免旧结果盖掉新结果。"""
         self._cancel_cross_worker()
         self._c_seq += 1
@@ -5817,7 +6002,8 @@ class MainWindow(QMainWindow):
 
         worker = CrossWorker(frames, ccfg, bt,
                              self.cb_cost.currentData() or None, label,
-                             step1_frames=step1_frames)
+                             step1_frames=step1_frames,
+                             timing_extra=timing_extra)
         # 收尾要用的上下文挂在 worker 上，靠 `sender()` 取回来。**不能**用
         # `connect(lambda ...)` 把 seq/上下文带过去：lambda 没有 QObject 接收者，
         # PySide 会当成直连，`done` 于是在**工作线程**里直接跑 `_finish_cross`，
@@ -5919,13 +6105,15 @@ class MainWindow(QMainWindow):
         if text:
             self._publish(text, False)
 
-    def _start_factor_worker(self, df, keys, cfg, rule_signal) -> None:
+    def _start_factor_worker(self, df, keys, cfg, rule_signal,
+                             extra=None, base_period="") -> None:
         """ML 模式走后台线程。已经在跑的先取消，避免旧结果盖掉新结果。"""
         self._cancel_factor_worker()
         self._f_seq += 1
         seq = self._f_seq
 
-        worker = FactorWorker(df, self.factor_mode, keys, cfg, rule_signal)
+        worker = FactorWorker(df, self.factor_mode, keys, cfg, rule_signal,
+                              extra=extra, base_period=base_period)
         # 同 `_start_cross_worker`：seq 挂在 worker 上，别用 lambda 带过去 ——
         # 那种连法是直连，收尾会在工作线程里跑，一碰控件就崩
         worker.seq = seq

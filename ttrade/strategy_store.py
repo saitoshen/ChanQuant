@@ -368,8 +368,14 @@ class StrategyConfig:
                                f"{float(self.cross_bot_pct or 0):g}%")
             # 机器学习那一套（稀疏采样 / 合训）也会跟着 `factor_cfg` 走，
             # 截面 ML 一样受影响，摘要里一并写出来
+            _mc = self.factor_cfg or {}
+            if _mc.get("factor_periods"):
+                from ttrade import tqdata
+
+                _names = sorted({tqdata.PERIOD_LABEL.get(str(v), str(v))
+                                 for v in dict(_mc["factor_periods"]).values()})
+                bits.append("跨周期·" + "/".join(_names))
             if self.factor_mode == "ml":
-                _mc = self.factor_cfg or {}
                 if str(_mc.get("sample_mode") or "all") == "trigger":
                     bits.append("稀疏触发")
                 if _mc.get("pooled"):
@@ -406,6 +412,15 @@ class StrategyConfig:
             bits.append("反向不平仓")
         elif cfg.get("exit_no_score"):
             bits.append("不按分数出场")
+        # 跨周期因子：同一组因子、同一个窗口，把其中一个挪到周线上就是另一条
+        # 策略了。列表里不写出来，两条配置看起来一模一样
+        _xp = dict(cfg.get("factor_periods") or {})
+        if _xp:
+            from ttrade import tqdata
+
+            _names = sorted({tqdata.PERIOD_LABEL.get(str(v), str(v))
+                             for v in _xp.values()})
+            bits.append("跨周期·" + "/".join(_names))
         if self.factor_mode == "ml":
             bits.append(f"模型={cfg.get('model', '')}")
             # 稀疏采样 / 合并训练都不在「窗口 / 阈值」里体现，而它们对结果的影响

@@ -109,6 +109,11 @@ class CrossConfig:
     # 填充，**绝不让当天还没收完的那根参与排名**。
     step1_period: str = ""
 
+    # 策略本身的周期（`frames` 是哪一档）。跨周期因子要靠它算「基准时刻」——
+    # 周线 bar 的数据要到那周最后一个交易日收盘才齐，日线 bar 要等到当天 15:00。
+    # 空 = 不知道，按「时间戳就是决策时刻」处理（分钟级本来就该这样）
+    period: str = ""
+
     # 截面因子。三种模式和时序那边一样：single / multi / ml
     factor_mode: str = "multi"
     factor_keys: list = field(default_factory=list)
@@ -625,7 +630,8 @@ def trades_from_weights(weights: pd.DataFrame,
 def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
         profile: str | None = None, label: str = "",
         progress=None, cancel=None,
-        step1_frames: dict[str, pd.DataFrame] | None = None) -> CrossResult:
+        step1_frames: dict[str, pd.DataFrame] | None = None,
+        timing_extra: dict[str, dict] | None = None) -> CrossResult:
     """跑一遍截面策略。出错写进 `CrossResult.error`，不抛异常。
 
     `progress` / `cancel` 只给机器学习模式用：walk-forward 要跑几十折，界面
@@ -634,6 +640,10 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     `step1_frames` 是**第一步（排名 + 筛池）专用的行情**，周期可以和策略不同
     （典型：5 分钟策略用日线成交额筛池）。它的分数会按 `align_to_clock()` 搬到
     策略的时钟上，只用已经收完的那一根。传 None 就是「跟随策略周期」，老行为。
+
+    `timing_extra` 是时序腿的**跨周期因子行情**：`{品种: {周期: 行情}}`，
+    由调用方在主线程里读好（见 `factor_strategy.period_frames`）。时序腿的
+    因子可以被指到别的周期上，截面那条腿（`factor_keys`）暂时还不支持。
     """
     if not frames or len(frames) < MIN_CROSS:
         return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
@@ -704,7 +714,8 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     bpd = fstrat.bars_per_day(score.index)
     step = cfg.step(bpd)
     if cfg.mode == "select":
-        weights = _select_weights(frames, score, cfg, vol, step=step)
+        weights = _select_weights(frames, score, cfg, vol, step=step,
+                                  timing_extra=timing_extra)
     else:
         weights = _hedge_weights(score, cfg, vol, step=step)
 
@@ -1192,7 +1203,8 @@ def _place(score: pd.DataFrame, rows, w: np.ndarray, ok) -> pd.DataFrame:
 
 def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
                     cfg: CrossConfig, vol: pd.DataFrame | None = None,
-                    step: int | None = None) -> pd.DataFrame:
+                    step: int | None = None,
+                    timing_extra: dict[str, dict] | None = None) -> pd.DataFrame:
     """选品种 + 时序：**池内每个品种**各拿一份钱，由自己的时序信号决定方向。
 
     时序信号在**各自的行情表**上算（`strategies.run_strategy` / 因子策略），算完
@@ -1213,7 +1225,7 @@ def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
     """
     sigs: dict[str, pd.Series] = {}
     for sym, df in frames.items():
-        sigs[sym] = _timing_signal(df, cfg)
+        sigs[sym] = _timing_signal(df, cfg, (timing_extra or {}).get(sym))
     sig_panel = pd.concat(sigs, axis=1).sort_index().reindex(score.index).ffill().fillna(0.0)
 
     rows, top, _bot, k_long, _k_short, ok = _rank(score, cfg, all_in=True,
@@ -1257,8 +1269,9 @@ def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
     return held * pd.DataFrame(sig, index=held.index, columns=held.columns)
 
 
-def _timing_signal(df: pd.DataFrame, cfg: CrossConfig) -> pd.Series:
-    """单个品种的时序信号（-1/0/1）。"""
+def _timing_signal(df: pd.DataFrame, cfg: CrossConfig,
+                   extra: dict | None = None) -> pd.Series:
+    """单个品种的时序信号（-1/0/1）。`extra` 是它的跨周期因子行情。"""
     if cfg.timing_family == "rule":
         key = cfg.timing_rule_key
         if key not in STRATEGIES:
@@ -1277,7 +1290,9 @@ def _timing_signal(df: pd.DataFrame, cfg: CrossConfig) -> pd.Series:
         fc = fstrat.FactorConfig(**{k: v for k, v in (cfg.timing_factor_cfg or {}).items()
                                     if k in fstrat.FactorConfig.__dataclass_fields__})
         fc.reverse = dict(cfg.timing_factor_reverse or {})
-        out = fstrat.run_factor_strategy(df, cfg.timing_factor_mode or "single", keys, fc)
+        out = fstrat.run_factor_strategy(
+            df, cfg.timing_factor_mode or "single", keys, fc,
+            extra=extra, base_period=cfg.period or "")
         return pd.Series(out.df["signal"], index=out.df.index).astype(float).fillna(0.0)
     except Exception:  # noqa: BLE001
         return pd.Series(0.0, index=df.index)

@@ -297,7 +297,7 @@ def window(df: pd.DataFrame | None, years: float) -> pd.DataFrame | None:
 
 
 def run(cfg, df: pd.DataFrame | None, market: str = "",
-        with_bh: bool = True) -> Replay:
+        with_bh: bool = True, extra: dict | None = None) -> Replay:
     """按 `cfg` 跑一遍回测。出错不抛异常，写进 `Replay.error`。
 
     不抛异常是有意的：调用方是「双击一行看个图」，报错该显示在页面上，而不是
@@ -362,11 +362,17 @@ def run(cfg, df: pd.DataFrame | None, market: str = "",
         return Replay(error="机器学习多因子至少需要 2 个因子")
 
     fc = factor_config(getattr(cfg, "factor_cfg", {}) or {})
+    # 跨周期因子：调用方在主线程里把别的周期的行情读好（见 `period_frames`），
+    # 这里只负责往下传。没配跨周期因子时 `extra` 是空的，行为与以前一致
+    _extra = dict(extra or {})
     try:
         if rule_signal is None:
-            out = fstrat.run_factor_strategy(df, mode or "single", keys, fc)
+            out = fstrat.run_factor_strategy(df, mode or "single", keys, fc,
+                                             extra=_extra, base_period=period)
         else:
-            out = fstrat.run_rule_with_filter(df, rule_signal, mode or "single", keys, fc)
+            out = fstrat.run_rule_with_filter(df, rule_signal, mode or "single",
+                                              keys, fc,
+                                              extra=_extra, base_period=period)
     except Exception as exc:  # noqa: BLE001
         return Replay(error=f"因子计算失败：{exc}")
 
@@ -386,7 +392,8 @@ def run(cfg, df: pd.DataFrame | None, market: str = "",
     )
 
 
-def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
+def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
+              extras: dict[str, dict] | None = None) -> Replay:
     """多品种等权回放的离线版本。组合页双击一条多品种策略走这里。
 
     和研究页的「多品种回测」是同一个口径：**每个品种各跑一遍**（各自的成本、
@@ -429,7 +436,8 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
         if len(win) < 2:
             return Replay(error="多品种在所选区间里没有足够的行情")
         try:
-            outs = fstrat.run_pooled_strategy(win, fkeys, fc)
+            outs = fstrat.run_pooled_strategy(win, fkeys, fc,
+                                              extras=extras, base_period=period)
         except Exception as exc:  # noqa: BLE001 - 和 `run()` 一样，错误进 Replay
             return Replay(error=f"合并训练失败：{exc}")
         for key, df in win.items():
@@ -454,7 +462,8 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
             # 上一个品种的 tick 带到下一个头上（研究页那边踩过同一个坑）
             one = cfg.clone(symbol=sym, exchange=ex, multi_symbols=[],
                             cross_symbols=[])
-            rp = run(one, frames[key], market=market, with_bh=False)
+            rp = run(one, frames[key], market=market, with_bh=False,
+                     extra=(extras or {}).get(key))
             if not rp.ok:
                 failed.append(f"{key}：{rp.error}")
                 continue
@@ -471,7 +480,8 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
                   bars_per_year=bpy, keys=keys)
 
 
-def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
+def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "",
+              timing_extra: dict[str, dict] | None = None) -> Replay:
     """截面策略的离线回放。组合页双击一条截面策略走这里。
 
     截面要的是**一批**品种的行情，调用方按 `cfg.cross_symbols` 各自取好再递进来
@@ -512,6 +522,7 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
         pool_reverse=dict(getattr(cfg, "cross_pool_reverse", {}) or {}),
         pool_top_pct=float(getattr(cfg, "cross_pool_pct", 60.0) or 60.0),
         label_mode=getattr(cfg, "cross_label_mode", "volret") or "volret",
+        period=period,
         factor_mode=getattr(cfg, "factor_mode", "multi") or "multi",
         factor_keys=list(getattr(cfg, "factor_keys", []) or []),
         factor_reverse=dict(getattr(cfg, "factor_reverse", {}) or {}),
@@ -531,7 +542,7 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "") -> Replay:
              f"{ccfg.step_text(fstrat.bars_per_day(panel.index))}调仓")
     out = cross_engine.run(frames, ccfg, bt,
                            profile=getattr(cfg, "cost_profile", "") or None,
-                           label=label)
+                           label=label, timing_extra=timing_extra)
     if not out.ok:
         return Replay(error=out.error or "截面回测没有算出净值")
     res = cross_engine.to_result(out, label=label, step=out.step,

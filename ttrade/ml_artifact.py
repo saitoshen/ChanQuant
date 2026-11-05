@@ -543,6 +543,23 @@ def _cfg_digest(cfg: "fstrat.FactorConfig") -> dict:
 
 
 # ================================================================== 训练
+def _no_cross_periods(cfg) -> None:
+    """产物这条路还不支持跨周期因子 —— 拦住，而不是算出一份对不上的特征。
+
+    产物里的模型是「按基准周期的行情算出来的特征」训出来的；实盘 `predict`
+    只拿得到基准周期的行情。跨周期因子要成立，得把别的周期的行情也塞进产物
+    （或者让实盘自己去读），那是另一件事。在训练这一步就报错，好过实盘上
+    「模型突然不灵了」—— 后者要查很久。
+    """
+    if dict(getattr(cfg, "factor_periods", None) or {}):
+        raise ValueError(
+            "跨周期因子的机器学习暂不支持「离线训练产物」："
+            "回测和实盘实时重算（后台训练）都能用，"
+            "但要把跨周期因子做进产物，得把别的周期的行情一起存进模型文件。"
+            "先按「不生成产物」的方式跑，或者把因子改回本周期"
+        )
+
+
 def train_artifact(
     df: pd.DataFrame,
     sid: str,
@@ -576,6 +593,8 @@ def train_artifact(
         raise ValueError("机器学习多因子至少需要 2 个因子")
     if df is None or len(df) < 200:
         raise ValueError(f"数据太少（{0 if df is None else len(df)} 根），训不了模型")
+    _no_cross_periods(cfg)
+    _no_cross_periods(cfg)
 
     # ---- 因子矩阵 + 标签（和 build_score 里一样）----
     use = F.filter_available(df, keys)
@@ -1350,6 +1369,7 @@ def train_fold_set(
         raise ValueError("机器学习多因子至少需要 2 个因子")
     if df is None or len(df) < 200:
         raise ValueError(f"数据太少（{0 if df is None else len(df)} 根），训不了模型")
+    _no_cross_periods(cfg)
 
     use = F.filter_available(df, keys)
     if not use:

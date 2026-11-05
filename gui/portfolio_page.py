@@ -140,11 +140,16 @@ def run_replay_job(cfg, kind: str, payload, with_bh: bool = True):
     取数留在主线程是有意的：`DataStore` 是主线程的缓存，后台线程同时读同一个
     DuckDB 连接不安全（研究页那条多品种也是先取数再进线程的）。
     """
+    # payload 可能是 `(行情, 跨周期行情)` 这种两元组：别的周期的行情在主线程
+    # 里已经读好了（`_prepare`），后台线程只算。没配跨周期因子时就是单份行情
+    extra = None
+    if isinstance(payload, tuple):
+        payload, extra = payload
     if kind == "cross":
-        return replay.run_cross(cfg, payload)
+        return replay.run_cross(cfg, payload, timing_extra=extra)
     if kind == "multi":
-        return replay.run_multi(cfg, payload)
-    return replay.run(cfg, payload, with_bh=with_bh)
+        return replay.run_multi(cfg, payload, extras=extra)
+    return replay.run(cfg, payload, with_bh=with_bh, extra=extra)
 
 
 class ReplayWorker(QObject):
@@ -1468,12 +1473,66 @@ class PortfolioPage(QWidget):
         keys = list(getattr(cfg, "symbols", None) or [])
         if is_cross:
             frames, why = self._load_frames(cfg)
-            return ("cross", frames, why) if frames else ("cross", None, why)
+            if not frames:
+                return ("cross", None, why)
+            return ("cross", (frames, self._extra_periods_multi(cfg, frames)), why)
         if len(keys) >= 2:
             frames, why = self._load_frames(cfg, need=2)
-            return ("multi", frames, why) if frames else ("multi", None, why)
+            if not frames:
+                return ("multi", None, why)
+            return ("multi", (frames, self._extra_periods_multi(cfg, frames)), why)
         df, why = self._load(cfg)
-        return ("single", df, why) if df is not None else ("single", None, why)
+        if df is None:
+            return ("single", None, why)
+        return ("single", (df, self._extra_periods(cfg)), why)
+
+    def _extra_periods(self, cfg) -> dict:
+        """跨周期因子要用的别的周期行情（主线程取数）。
+
+        取数走的是同一个 `self._loader` —— 组合页和主窗口的数据源是同一个，
+        没必要各写一套。没配跨周期因子时返回空 dict，一次多余的读都不做。
+        """
+        fc = replay.factor_config(getattr(cfg, "factor_cfg", {}) or {})
+        if not fc.factor_periods or self._loader is None:
+            return {}
+        from ttrade import factor_strategy as fstrat
+
+        mk = replay.market_of(cfg)
+        key = cfg.key()
+        base = getattr(cfg, "period", "") or "1d"
+        return fstrat.period_frames(
+            fc, list(getattr(cfg, "factor_keys", []) or []), base,
+            lambda p: self._loader(mk, key, p),
+            extra_keys=list(getattr(fc, "trigger_keys", None) or []),
+        )
+
+    def _extra_periods_multi(self, cfg, frames: dict) -> dict:
+        """多品种 / 截面：**逐品种**一份跨周期行情 `{品种: {周期: 行情}}`。
+
+        每个品种各自去读：有的品种有 5 分钟、有的只有日线，共用一份等于
+        按「第一个品种能读到什么」决定其余品种怎么算。
+        """
+        fc = replay.factor_config(getattr(cfg, "factor_cfg", {}) or {})
+        if not fc.factor_periods or self._loader is None:
+            return {}
+        from ttrade import factor_strategy as fstrat
+
+        mk = replay.market_of(cfg)
+        base = getattr(cfg, "period", "") or "1d"
+        keys = list(getattr(cfg, "factor_keys", []) or [])
+        # 截面策略的因子在 `factor_keys`，时序腿的在 `timing_factor_keys` ——
+        # 两条腿都可能被指到别的周期上
+        tkeys = list(getattr(cfg, "timing_factor_keys", []) or [])
+        out: dict[str, dict] = {}
+        for k in frames:
+            ex = fstrat.period_frames(
+                fc, keys + tkeys, base,
+                lambda p, _k=k: self._loader(mk, _k, p),
+                extra_keys=list(getattr(fc, "trigger_keys", None) or []),
+            )
+            if ex:
+                out[k] = ex
+        return out
 
     def _view_hint(self, jobs: list, mode: str) -> str:
         """点下去立刻显示的那句话。用户得知道「在跑、跑什么、要多久」。"""
@@ -1481,6 +1540,9 @@ class PortfolioPage(QWidget):
             return (f"正在回测 {len(jobs)} 条策略并合成组合…"
                     f"（后台运行，界面可以继续用）")
         cfg, kind, payload = jobs[0]
+        # 多品种 / 截面的 payload 可能是 `(行情, 跨周期行情)`，这里只关心条数
+        if isinstance(payload, tuple):
+            payload = payload[0]
         if kind == "cross":
             return f"正在回测截面策略（{len(payload)} 个品种）…（后台运行）"
         if kind == "multi":
@@ -1772,7 +1834,7 @@ class PortfolioPage(QWidget):
             df = merge_live(self._live_base, live)
             if df is None or df.empty:
                 return
-            rp = replay.run(cfg, df)
+            rp = replay.run(cfg, df, extra=self._extra_periods(cfg))
         except Exception as exc:  # noqa: BLE001
             self._on_failed(f"实时 K 线刷新失败：{type(exc).__name__}: {exc}")
             return
