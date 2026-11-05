@@ -141,6 +141,9 @@ C_DOWN = "#0f9d58"    # 绿跌
 # 就悄悄换源（历史长度和价格都会变），所以天勤日线用 `1d_tq`。
 PERIOD_1D = "1d"            # Tushare 日线，显示为「日线Tushare」
 PERIOD_1D_TQ = "1d_tq"      # 天勤日线，显示为「日线」
+# 2 日 / 周线由**日线合成**，不下载。底料是「日线Tushare」那一份（期货是
+# data_futures 的 CSV、美股是 data 的 CSV、A 股是 stock.duckdb 的 Tushare 表）——
+# 它比天勤日线覆盖全、历史长，周线才够一个 252 根的因子窗口用。
 GUI_PERIODS = (
     [PERIOD_1D_TQ, PERIOD_1D]
     + [p for p in tqdata.PERIOD_ORDER if p != PERIOD_1D_TQ]
@@ -202,8 +205,23 @@ TIMING_FAMILIES = [
 # 因子模式（因子策略与因子过滤共用）
 FACTOR_MODES = [
     ("single", "单因子", "一个因子的标准化分数过阈值进出场"),
-    ("multi", "多因子等权", "多个因子按 PIT 方向取号后等权平均"),
+    ("multi", "多因子组合", "多个因子按 PIT 方向取号后按权重合成（等权 / 自定权重 / 滚动 IC）"),
     ("ml", "机器学习多因子", "模型学因子权重，walk-forward 滚动训练预测"),
+]
+
+# 多因子组合的权重口径。等权是默认 —— 权重这东西拍脑袋定，
+# 效果往往不如不设，先让人从等权起步再逐项试
+FACTOR_WEIGHTS = [
+    ("equal", "等权", "所有参与合成的因子权重相同，直接取平均。"),
+    ("custom", "不等权（逐因子设权重）",
+     "在下面的因子表「权重」列里逐个人为设定。\n"
+     "权重按比例起作用（填 3 和填 1.5 等于 2:1），不用凑成 100。\n"
+     "填 0 = 这个因子不参与合成，和取消勾选等价。"),
+    ("ic", "滚动 IC 加权",
+     "每 N 根用过去一个窗口的 |IC| 当权重，IC 强的因子说话更响。\n"
+     "方向仍由「方向」那一项决定，这里只调强度 —— 否则自动定向已经翻过\n"
+     "一次号，再乘一次负权重等于反两次。\n"
+     "IC 统计量滞后预测期数，不含未来信息。"),
 ]
 
 # 因子方向口径。auto 是「让数据说」，另两档是固定方向，跨品种可比。
@@ -637,7 +655,18 @@ class DataStore:
         if ck in self._cache:
             return self._cache[ck]
         try:
-            if self.market == "cn_stock":
+            if tqdata.is_multiday(period):
+                # 2 日 / 周线不落盘，现由日线合成。底料走日线那条分支，
+                # 这样「日线Tushare 一根什么价」和「周线由哪几根拼的」是同一份
+                # 数据；衍生列（期限结构 / 期权 IV）在日线分支里已经挂好了，
+                # 合成时按组内最后一根取值，不会把后面才公布的数提前用上
+                base = self.get(key, PERIOD_1D)
+                if base is None or base.empty:
+                    raise RuntimeError(
+                        f"{key} 的日线还没有，{tqdata.PERIOD_LABEL.get(period, period)}"
+                        " 合成不出来")
+                df = tqdata.merge_days(base, period)
+            elif self.market == "cn_stock":
                 df = self._load_stock(key, period)
             elif self.market == "us" or period in (None, "", PERIOD_1D):
                 df = load_local(key, self.data_dir) if self.market == "us" \
@@ -685,6 +714,9 @@ class DataStore:
 
     def has_period(self, key: str, period: str) -> bool:
         """这个标的有没有该周期的数据。按品种缓存，切换品种时只查一次库。"""
+        if tqdata.is_multiday(period):
+            # 合成周期：日线在就有（三个市场都一定有日线，否则标的根本列不出来）
+            return self.has_period(key, PERIOD_1D)
         if self.market == "cn_stock":
             # 日线一定有（只要元数据存在）；分钟级查天勤表
             if period in (None, "", PERIOD_1D, PERIOD_1D_TQ):
@@ -1069,6 +1101,9 @@ class MainWindow(QMainWindow):
         # 规则触发用的参数：{规则 key: {参数名: 值}}。按规则分开存 —— 换成另一条
         # 触发规则再换回来，原来调好的那套还在；合成一个 dict 的话切一次就串味了
         self.trig_rule_params: dict[str, dict] = {}
+        # 出场规则（因子策略）。和 `trig_rule_params` 同一个道理：存一份 dict，
+        # 弹窗开合不会把调好的档位改回默认。空 dict = 全默认（分数出场）
+        self.exit_cfg: dict = {}
         self.df_raw: pd.DataFrame | None = None
         self.df_sig: pd.DataFrame | None = None
         self.res = None
@@ -1633,6 +1668,8 @@ class MainWindow(QMainWindow):
         self.cb_period.setToolTip(
             "日线来自 Tushare（20 年）；5 分钟 / 1 小时来自天勤（10 年），\n"
             "15/30 分钟由 5 分钟合并、2/4 小时由 1 小时合并。\n"
+            "2 日 / 周线由日线合成：2 日线是「连续两根日线成对」，周线按自然周\n"
+            "（周一到周日）分组，都不需要额外下载。\n"
             "两个数据源的主力换月口径不同，跨周期的绝对价位会有细微差异。"
         )
         cl.addWidget(self.cb_period)
@@ -1963,6 +2000,20 @@ class MainWindow(QMainWindow):
         self.lbl_fsel = self._section("因子选择")
         sf.addWidget(self.lbl_fsel)
 
+        # 打分范围写在因子列表**上面**：进场阈值滑杆是 0.3~3.0，而分数本身
+        # 被截断在 ±4 —— 不说明的话，「为什么阈值最大只能设 3」和「为什么分数
+        # 永远到不了 5」两个疑问会一直存在
+        self.lbl_frange = QLabel(
+            "打分范围 −4 ~ +4：每个因子先做滚动标准化（只用过去 252 根），"
+            "两种口径都映射到同一区间 —— z-score 减均值除标准差后按 ±4 截断，"
+            "分位把同一窗口内的排名映射到 ±4（中位 0、最高 +4、最低 −4）。"
+            "换口径不用换阈值，但同一个阈值的分位含义不同：z 的 1.0 约是 84 分位，"
+            "分位的 1.0 只有 62.5 分位 —— 想把频率拉平，分位取 z 的 2~2.5 倍。"
+        )
+        self.lbl_frange.setObjectName("Hint")
+        self.lbl_frange.setWordWrap(True)
+        sf.addWidget(self.lbl_frange)
+
         self.cb_fsingle = QComboBox()
         self._fill_single_combo()
 
@@ -1983,29 +2034,71 @@ class MainWindow(QMainWindow):
         bfl.addWidget(self.chk_frev)
         sf.addWidget(self.box_fsingle)
 
-        # 多因子选择：三列表 —— 因子 / 用 / 反。
-        # 用 QTableWidget 而不是 QListWidget：每个因子需要两个独立开关
-        # （参与合成、反向使用），QListWidget 只有一列勾选框，塞不下第二个。
-        self.tbl_fmulti = QTableWidget(0, 3)
+        # 多因子选择：四列表 —— 因子 / 用 / 反 / 权重。
+        # 用 QTableWidget 而不是 QListWidget：每个因子需要独立开关
+        # （参与合成、反向使用、权重），QListWidget 只有一列勾选框，塞不下。
+        # 「权重」列只在「不等权」时露出来 —— 等权模式下摆一列全 1，
+        # 只会让人以为调它有用。
+        self.tbl_fmulti = QTableWidget(0, 4)
         self.tbl_fmulti.setObjectName("FactorTable")
         self.tbl_fmulti.setFixedHeight(176)
-        self.tbl_fmulti.setHorizontalHeaderLabels(["因子", "用", "反"])
+        self.tbl_fmulti.setHorizontalHeaderLabels(["因子", "用", "反", "权重"])
         self.tbl_fmulti.verticalHeader().setVisible(False)
         # 47 行一屏放不下，行高压紧到 21px，176px 能露 8 行，剩下的滚动
         self.tbl_fmulti.verticalHeader().setDefaultSectionSize(21)
         self.tbl_fmulti.setShowGrid(False)
         self.tbl_fmulti.setSelectionMode(QAbstractItemView.NoSelection)
-        self.tbl_fmulti.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        # 只有「权重」列可编辑（那一列的 item 才带 ItemIsEditable）。
+        # 其余列保持只读，靠勾选框交互
+        self.tbl_fmulti.setEditTriggers(QAbstractItemView.DoubleClicked
+                                        | QAbstractItemView.EditKeyPressed)
         self.tbl_fmulti.setFocusPolicy(Qt.NoFocus)
         hh = self.tbl_fmulti.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        hh.setSectionResizeMode(1, QHeaderView.Fixed)
-        hh.setSectionResizeMode(2, QHeaderView.Fixed)
+        for _c in (1, 2, 3):
+            hh.setSectionResizeMode(_c, QHeaderView.Fixed)
         hh.setFixedHeight(22)
         self.tbl_fmulti.setColumnWidth(1, 34)
         self.tbl_fmulti.setColumnWidth(2, 34)
+        self.tbl_fmulti.setColumnWidth(3, 52)
+        self.tbl_fmulti.setColumnHidden(3, True)
         self._fill_multi_table()
         sf.addWidget(self.tbl_fmulti)
+
+        # 权重口径（只在「多因子组合」时露出来）
+        self.box_fweight = QWidget()
+        wl = QVBoxLayout(self.box_fweight)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.setSpacing(6)
+        self.cb_fweight = QComboBox()
+        for key, label, tip in FACTOR_WEIGHTS:
+            self.cb_fweight.addItem(label, key)
+            self.cb_fweight.setItemData(self.cb_fweight.count() - 1, tip, Qt.ToolTipRole)
+        self.cb_fweight.currentIndexChanged.connect(self._on_fweight_changed)
+        wl.addWidget(self.cb_fweight)
+
+        # 滚动 IC 的重算间隔。60 根 ≈ 日线上三个月调一次权重：
+        # 再短就是在跟着 IC 的日间噪声抖，换手会飙起来
+        self.row_ic_rebal = QWidget()
+        irl = QHBoxLayout(self.row_ic_rebal)
+        irl.setContentsMargins(0, 0, 0, 0)
+        irl.setSpacing(6)
+        lbl = QLabel("IC 重算间隔")
+        lbl.setObjectName("Hint")
+        irl.addWidget(lbl, 1)
+        self.sp_ic_rebal = QSpinBox()
+        self.sp_ic_rebal.setRange(10, 500)
+        self.sp_ic_rebal.setSingleStep(10)
+        self.sp_ic_rebal.setValue(60)
+        self.sp_ic_rebal.setSuffix(" 根")
+        self.sp_ic_rebal.setToolTip(
+            "每多少根重新算一次各因子的 |IC| 权重，中间沿用上一次的值。\n"
+            "IC 的日间噪声很大，逐根跟着抖只会把换手率顶起来。"
+        )
+        self.sp_ic_rebal.valueChanged.connect(lambda _v: self._schedule())
+        irl.addWidget(self.sp_ic_rebal)
+        wl.addWidget(self.row_ic_rebal)
+        sf.addWidget(self.box_fweight)
 
         sel_row = QWidget()
         srl = QHBoxLayout(sel_row)
@@ -2062,6 +2155,24 @@ class MainWindow(QMainWindow):
         self.lbl_fparam = self._section("因子参数")
         sf.addWidget(self.lbl_fparam)
 
+        # 标准化口径。两种都落在 ±4，所以阈值在两者之间可以照抄 ——
+        # 但**同一个阈值的含义不一样**：z 的 1.0 是 84 分位，分位的 1.0 是
+        # 62.5 分位。想等价比较，分位的阈值要乘 2.5 左右（工具提示里写了）
+        self.cb_fmethod = QComboBox()
+        self.cb_fmethod.addItem("z-score（±4 截断）", "z")
+        self.cb_fmethod.addItem("分位（±4 映射）", "rank")
+        self.cb_fmethod.setToolTip(
+            "因子分数的标准化口径。两种都落在 −4 ~ +4，进场阈值不用换算法。\n\n"
+            "z-score：减去过去 252 根的均值、除以标准差，再按 ±4 截断。\n"
+            "分位：同一窗口内的排名映射到 ±4（中位 0，最高 +4，最低 −4）。\n"
+            "分位对极端值免疫 —— 一个 10σ 的毛刺和 3σ 排同一档；代价是丢掉幅度，\n"
+            "涨 2% 和涨 20% 的分数可能一样。\n\n"
+            "注意阈值不等价：z 的 1.0 约等于 84 分位，分位的 1.0 只有 62.5 分位。\n"
+            "想把交易频率拉平，分位这边的阈值取 z 的 2~2.5 倍\n"
+            "（实测 z 0.6 / 1.0 / 1.5 对应分位 1.54 / 2.31 / 2.97）。"
+        )
+        sf.addWidget(self.cb_fmethod)
+
         # 方向口径。这一项之前只在 FactorConfig 里存在、界面没暴露，导致「反转」
         # 是相对「自动定向」的 —— 而自动定向取 sign(扩张 IC)，每个品种不一样、
         # 同一品种还会中途翻。于是同一个「反转」勾选框在 ZN 上≈高分做空、
@@ -2077,6 +2188,27 @@ class MainWindow(QMainWindow):
         self.fparam_box.setSpacing(8)
         sf.addLayout(self.fparam_box)
         cl.addWidget(self.box_fsel)
+
+        # ---------------------------------------------- 出场规则（因子策略专用）
+        #
+        # 四种口径、每种 2~6 个参数，平铺在侧边栏比整个因子参数区还长。
+        # 做成一个按钮 + 一行摘要：平时只占两行，要看的时候一次看全。
+        self.box_fexit = QWidget()
+        ex = QVBoxLayout(self.box_fexit)
+        ex.setContentsMargins(0, 0, 0, 0)
+        ex.setSpacing(6)
+        ex.addWidget(self._section("出场规则"))
+        self.btn_fexit = QPushButton("出场规则…")
+        self.btn_fexit.setObjectName("Ghost")
+        self.btn_fexit.setFixedHeight(26)
+        self.btn_fexit.clicked.connect(self._on_exit_rules)
+        ex.addWidget(self.btn_fexit)
+        self.lbl_fexit = QLabel("")
+        self.lbl_fexit.setObjectName("Hint")
+        self.lbl_fexit.setWordWrap(True)
+        ex.addWidget(self.lbl_fexit)
+        cl.addWidget(self.box_fexit)
+        self._sync_exit_summary()
 
         cl.addWidget(self._section("回测区间"))
         self.cb_range = QComboBox()
@@ -2781,8 +2913,8 @@ class MainWindow(QMainWindow):
         self._fill_strategy_combo()
 
     def _multi_state(self) -> dict:
-        """当前多因子表格里每个因子的 (参与合成, 反转)。重建时用它保住勾选。"""
-        out: dict[str, tuple[bool, bool]] = {}
+        """每个因子的 (参与合成, 反转, 权重)。重建时用它保住勾选。"""
+        out: dict[str, tuple[bool, bool, str]] = {}
         for r in range(self.tbl_fmulti.rowCount()):
             item = self.tbl_fmulti.item(r, 0)
             if item is None:
@@ -2790,16 +2922,41 @@ class MainWindow(QMainWindow):
             k = item.data(Qt.UserRole)
             use = self.tbl_fmulti.item(r, 1)
             rev = self.tbl_fmulti.item(r, 2)
+            wt = self.tbl_fmulti.item(r, 3)
             out[k] = (
                 bool(use is not None and use.checkState() == Qt.Checked),
                 bool(rev is not None and rev.checkState() == Qt.Checked),
+                ((wt.text().strip() if wt is not None else "") or "1"),
             )
         return out
 
+    def _multi_weights(self) -> dict[str, float]:
+        """「不等权」模式下每个因子的权重。非数字当 1，负数也当 1。
+
+        负数不放过：负权重等于「这个因子反着用」，那件事该由「反」列表达。
+        两处都能翻方向，出问题时根本查不出是谁翻的。
+        """
+        out: dict[str, float] = {}
+        for r in range(self.tbl_fmulti.rowCount()):
+            item = self.tbl_fmulti.item(r, 0)
+            if item is None:
+                continue
+            k = item.data(Qt.UserRole)
+            wt = self.tbl_fmulti.item(r, 3)
+            try:
+                v = float((wt.text() if wt is not None else "") or 1)
+            except (TypeError, ValueError):
+                v = 1.0
+            out[str(k)] = v if v > 0 else 1.0
+        return out
+
     def _fill_multi_table(self) -> None:
-        """重建多因子表格。保留用户已勾的「用 / 反」—— 加一个因子不该把之前
-        的勾选全清掉。"""
+        """重建多因子表格。保留用户已勾的「用 / 反 / 权重」—— 加一个因子不该
+        把之前的勾选全清掉。"""
         picked = self._multi_state() if self.tbl_fmulti.rowCount() else {}
+        # 重建会逐格 setItem，每格都触发 itemChanged；不挡住的话重建 47 行
+        # 就排 47 次回测
+        self.tbl_fmulti.blockSignals(True)
         self.tbl_fmulti.setRowCount(0)
         valid = set(factors.filter_by_market(self.market))
         for cat in factors.CATEGORIES:
@@ -2811,8 +2968,12 @@ class MainWindow(QMainWindow):
                 name = QTableWidgetItem(f"{cat} · {spec.label}")
                 name.setData(Qt.UserRole, k)
                 name.setToolTip(spec.desc)
+                # 显式去掉 ItemIsEditable：表格为了「权重」列开了双击编辑，
+                # 名字列默认是可编辑的，不改的话双击就能把因子名改乱
+                name.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 self.tbl_fmulti.setItem(r, 0, name)
-                use_on, rev_on = picked.get(k, (k in factors.DEFAULT_MULTI, False))
+                use_on, rev_on, wt = picked.get(
+                    k, (k in factors.DEFAULT_MULTI, False, "1"))
                 for col, tip, default in (
                     (1, "勾上表示参与合成", use_on),
                     (2, "勾上表示这个因子反向使用（取负号）", rev_on),
@@ -2823,6 +2984,17 @@ class MainWindow(QMainWindow):
                     cell.setTextAlignment(Qt.AlignCenter)
                     cell.setToolTip(tip)
                     self.tbl_fmulti.setItem(r, col, cell)
+                wcell = QTableWidgetItem(wt)
+                wcell.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable
+                               | Qt.ItemIsEditable)
+                wcell.setTextAlignment(Qt.AlignCenter)
+                wcell.setToolTip(
+                    "合成权重（只在「不等权」模式下生效）。\n"
+                    "按比例起作用：填 3 和 1.5 等于 2:1，不用凑成 100。\n"
+                    "填 0 = 不参与合成，和取消「用」等价。"
+                )
+                self.tbl_fmulti.setItem(r, 3, wcell)
+        self.tbl_fmulti.blockSignals(False)
 
     def _on_factor_added(self, key: str) -> None:
         """Agent 注册了新因子：两个因子控件都得重建，然后选中它。"""
@@ -3149,7 +3321,8 @@ class MainWindow(QMainWindow):
                 f"python download_tq.py --main {src} --symbols ..."
             )
         elif miss:
-            self.lbl_period.setText(f"天勤数据已覆盖 {len(GUI_PERIODS) - len(miss)} 个周期")
+            self.lbl_period.setText(
+                f"行情已覆盖 {len(GUI_PERIODS) - len(miss)}/{len(GUI_PERIODS)} 个周期")
         else:
             self.lbl_period.setText("")
 
@@ -3736,6 +3909,52 @@ class MainWindow(QMainWindow):
         self._sync_factor_panel()
         self._schedule(immediate=True)
 
+    # ---------------------------------------------------------- 权重 / 出场
+    def _on_fweight_changed(self) -> None:
+        """权重口径变了：只有「不等权」才露出权重列，只有「滚动 IC」才露出间隔。"""
+        self._sync_weight_ui()
+        self._schedule(immediate=True)
+
+    def _sync_weight_ui(self) -> None:
+        mode = (self.cb_fweight.currentData() if hasattr(self, "cb_fweight")
+                else "equal") or "equal"
+        if hasattr(self, "tbl_fmulti"):
+            # 等权模式下摆一列全 1 的权重，只会让人以为调它有用
+            self.tbl_fmulti.setColumnHidden(3, mode != "custom")
+        if hasattr(self, "row_ic_rebal"):
+            self.row_ic_rebal.setVisible(mode == "ic")
+
+    def _on_exit_rules(self) -> None:
+        """出场规则弹窗。四种口径的参数都在里面，侧边栏只留一行摘要。"""
+        from gui.exit_dialog import ExitRuleDialog
+
+        dlg = ExitRuleDialog(self.exit_cfg, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        vals = dlg.values()
+        # 全都回到默认（分数出场 + 各参数默认值）就**清空**，而不是存一份快照 ——
+        # 存下来之后升级改了默认档位，它不会跟着走（品种信息那边同一个道理）
+        dflt = (vals.get("exit_mode") == "score"
+                and abs(float(vals.get("exit_abs_atr", 2.0)) - 2.0) < 1e-9
+                and int(vals.get("exit_box_bars", 20)) == 20
+                and abs(float(vals.get("exit_box_buf", 0.0))) < 1e-9
+                and int(vals.get("exit_atr_n", 14)) == 14
+                and [[float(a), float(b)] for a, b in vals.get("exit_tiers") or []]
+                == [[2.0, 2.0], [4.0, 1.2], [6.0, 0.8]])
+        self.exit_cfg = {} if dflt else dict(vals)
+        self._sync_exit_summary()
+        self._schedule(immediate=True)
+
+    def _sync_exit_summary(self) -> None:
+        from gui.exit_dialog import summarize
+
+        if not hasattr(self, "lbl_fexit"):
+            return
+        self.lbl_fexit.setText(summarize(self.exit_cfg))
+        # 改过就在按钮上留个记号：摘要要读一行才知道，而「我明明设过」是
+        # 最常见的困惑
+        self.btn_fexit.setText("出场规则… *" if self.exit_cfg else "出场规则…")
+
     def _on_sparse_toggled(self, on: bool) -> None:
         """稀疏采样开关：只展开/收起参数区，不立刻重算 —— 刚打开时参数还是
         默认值，用户多半要先调阈值。真重算由参数改动触发。"""
@@ -3853,6 +4072,14 @@ class MainWindow(QMainWindow):
         self.box_fbtns.setVisible(not single)
         if single:
             self._sync_single_rev()
+        # 权重口径只对「多因子组合」有意义
+        if hasattr(self, "box_fweight"):
+            self.box_fweight.setVisible(self.factor_mode == "multi")
+            self._sync_weight_ui()
+        # 出场规则只对「因子策略」生效：因子过滤只做减法（否决 / 延后 / 离场），
+        # 仓位还是规则的，套一层 ATR 出场会把规则自己的止损逻辑搅乱
+        if hasattr(self, "box_fexit"):
+            self.box_fexit.setVisible(not filtering)
 
         is_ml = self.factor_mode == "ml"
         self.lbl_fmodel.setVisible(is_ml)
@@ -3891,12 +4118,21 @@ class MainWindow(QMainWindow):
         self.factor_mode = self.cb_fmode.currentData() or "multi"
         if hasattr(self, "box_sparse"):
             self.box_sparse.setVisible(False)
+        # 截面那条路不摆出场规则：截面是「一排品种里挑强的」，出场由调仓
+        # （换池子 / 换排名）决定，套 ATR 出场和它的语义冲突
+        if hasattr(self, "box_fexit"):
+            self.box_fexit.setVisible(False)
         single = self.factor_mode == "single"
         self.box_fsel.setVisible(True)
         self.lbl_fsel.setText("截面因子")
         self.box_fsingle.setVisible(single)
         self.tbl_fmulti.setVisible(not single)
         self.box_fbtns.setVisible(not single)
+        # 权重口径在截面上同样成立：截面多因子也是「几个因子合成一个分数」，
+        # 等权 / 自定 / 滚动 IC 三选一，用的是同一个 `build_score`
+        if hasattr(self, "box_fweight"):
+            self.box_fweight.setVisible(self.factor_mode == "multi")
+            self._sync_weight_ui()
         is_ml = self.factor_mode == "ml"
         self.lbl_fmodel.setVisible(is_ml)
         self.cb_fmodel.setVisible(is_ml)
@@ -4387,7 +4623,10 @@ class MainWindow(QMainWindow):
                 wdg.setValue(int(round(float(cfg[name]) * self.fparam_scales.get(name, 1))))
             except (TypeError, ValueError):
                 continue
-        for key, cb in (("model", self.cb_fmodel), ("orient", self.cb_forient)):
+        for key, cb in (("model", self.cb_fmodel), ("orient", self.cb_forient),
+                        ("method", getattr(self, "cb_fmethod", None))):
+            if cb is None:
+                continue
             v = cfg.get(key)
             if v:
                 i = cb.findData(v)
@@ -4424,6 +4663,42 @@ class MainWindow(QMainWindow):
         if isinstance(tp, dict) and tp and tr:
             self.trig_rule_params[tr] = {k: v for k, v in tp.items()}
         self._sync_trigger_src()
+
+        # ---- 多因子组合的权重口径 ----
+        if hasattr(self, "cb_fweight"):
+            i = self.cb_fweight.findData(str(cfg.get("weight_mode") or "equal"))
+            if i >= 0:
+                self.cb_fweight.blockSignals(True)
+                self.cb_fweight.setCurrentIndex(i)
+                self.cb_fweight.blockSignals(False)
+            if hasattr(self, "sp_ic_rebal") and cfg.get("ic_rebal"):
+                self.sp_ic_rebal.setValue(int(cfg["ic_rebal"]))
+            # 权重列：只把配置里有的键写回去，其余保持表格里的现值。
+            # 整表重灌会把用户在界面上刚改过的权重冲掉
+            wts = cfg.get("weights") or {}
+            if isinstance(wts, dict) and wts:
+                for r in range(self.tbl_fmulti.rowCount()):
+                    item = self.tbl_fmulti.item(r, 0)
+                    wt = self.tbl_fmulti.item(r, 3)
+                    if item is None or wt is None:
+                        continue
+                    k = str(item.data(Qt.UserRole))
+                    if k in wts:
+                        wt.setText(f"{float(wts[k]):g}")
+            self._sync_weight_ui()
+
+        # ---- 出场规则 ----
+        em = str(cfg.get("exit_mode") or "score")
+        self.exit_cfg = {} if em == "score" else {
+            "exit_mode": em,
+            "exit_tiers": [[float(a), float(b)] for a, b in
+                           (cfg.get("exit_tiers") or [[2.0, 2.0], [4.0, 1.2], [6.0, 0.8]])],
+            "exit_abs_atr": float(cfg.get("exit_abs_atr") or 2.0),
+            "exit_box_bars": int(cfg.get("exit_box_bars") or 20),
+            "exit_box_buf": float(cfg.get("exit_box_buf") or 0.0),
+            "exit_atr_n": int(cfg.get("exit_atr_n") or 14),
+        }
+        self._sync_exit_summary()
 
     def _apply_trigger_cfg(self, cfg: dict) -> None:
         """把 `factor_cfg` 里那组触发参数灌回控件（只在稀疏采样开启时调）。"""
@@ -4752,12 +5027,18 @@ class MainWindow(QMainWindow):
             return sld.value() / self.fparam_scales.get(name, 1)
 
         sparse = bool(getattr(self, "chk_sparse", None) and self.chk_sparse.isChecked())
+        # 出场规则只在「因子策略」下带出去（见下面 exit_mode 那段）
+        _ex = self.exit_cfg if self.family == FAMILY_FACTOR else {}
         return fstrat.FactorConfig(
             window=int(get("window", 252)),
             horizon=int(get("horizon", 5)),
             entry_z=float(get("entry_z", 1.0)),
             exit_z=float(get("exit_z", 0.3)),
             orient=self.cb_forient.currentData() or "auto",
+            # 标准化口径：z-score 还是分位。两者都映射到 ±4，
+            # 所以换口径不用重算阈值（但同一阈值的分位含义不同）
+            method=((self.cb_fmethod.currentData() or "z")
+                    if hasattr(self, "cb_fmethod") else "z"),
             reverse={k: True for k in self._reversed_factor_keys()},
             model=self.cb_fmodel.currentData() or mlmodels.DEFAULT_MODEL,
             train_window=int(get("train_window", 1000)),
@@ -4784,6 +5065,25 @@ class MainWindow(QMainWindow):
                         and self.chk_ml_pool.isChecked()
                         and self.family == FAMILY_FACTOR
                         and self.factor_mode == "ml"),
+            # 多因子组合的权重口径。等权时不带权重表 —— 带上了也没人看，
+            # 还会让「参数」那一列的字变长
+            weight_mode=((self.cb_fweight.currentData() or "equal")
+                         if hasattr(self, "cb_fweight") else "equal"),
+            weights=(self._multi_weights()
+                     if hasattr(self, "cb_fweight")
+                     and self.cb_fweight.currentData() == "custom" else {}),
+            ic_rebal=(int(self.sp_ic_rebal.value())
+                      if hasattr(self, "sp_ic_rebal") else 60),
+            # 出场规则：空 dict = 全默认（分数出场）。只在「因子策略」下带出去 ——
+            # 截面 / 因子过滤不摆这个入口，配置里却可能残留上一次设的值，
+            # 带出去就会在截面时序腿里悄悄生效（那边没有出场这个概念）
+            exit_mode=str(_ex.get("exit_mode") or "score"),
+            exit_tiers=list(_ex.get("exit_tiers")
+                            or [[2.0, 2.0], [4.0, 1.2], [6.0, 0.8]]),
+            exit_abs_atr=float(_ex.get("exit_abs_atr") or 2.0),
+            exit_box_bars=int(_ex.get("exit_box_bars") or 20),
+            exit_box_buf=float(_ex.get("exit_box_buf") or 0.0),
+            exit_atr_n=int(_ex.get("exit_atr_n") or 14),
         )
 
     def run_analysis(self, df_override: pd.DataFrame | None = None) -> None:
@@ -5769,6 +6069,12 @@ class MainWindow(QMainWindow):
         if pair is None:
             return "先选一个品种"
         period = self._period()
+        if tqdata.is_multiday(period):
+            # 2 日 / 周线是由日线合成的：盘中那根日线还没收，合成出来的粗周期
+            # bar 也就是半成品；2 日线更麻烦 —— 它的配对是按行序两两成对，
+            # 新来一根日线会让配对整体错位一格，实时段和历史段算出来的不是同一根
+            return (f"「{PERIOD_LABEL.get(period, period)}」由日线合成，没有实时行情；"
+                    "要实时请把周期切到「日线」")
         if period not in tqdata.PERIODS:
             # `1d` 是 Tushare 的日线 CSV，没有实时源；天勤日线的键是 `1d_tq`
             return "「日线Tushare」没有实时行情，要实时日线请把周期切到「日线」（天勤）"

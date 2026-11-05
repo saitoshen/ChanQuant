@@ -317,6 +317,83 @@ def _run() -> tuple[bool, list[str]]:
 
     check("前复权末值=盘面价", _qfq_tail)
 
+    def _multiday():
+        """2 日 / 周线：由日线合成，不落盘。
+
+        这里验的不是「能跑」，而是几条**错了不会报错、只会让数字看起来还行**
+        的性质：
+
+        1. 根数对得上（2 日 = ceil(日线/2)，周线 ≈ 日线/5）；
+        2. OHLC 是组内聚合 —— 开取第一根、收取最后一根、高低取极值，量额累加
+           后总量守恒；
+        3. 换一个起始日期切，**同一根 K 线不能变**。这条最容易踩：先切再合，
+           配对就跟着起点走，同一根历史周线在两份报告里长得不一样；
+        4. 年化根数按数据自己推（2 日 ≈ 日线一半），不能写死 252 —— 写死的话
+           年化波动会被高估约 √2 倍，夏普看着更好，纯属假的。
+        """
+        import numpy as np
+
+        from ttrade import tqdata as T
+        from ttrade.backtest import bars_per_year
+
+        # 找一个日线 CSV 在的品种，不依赖天勤库（CI 上不一定有）
+        import os
+
+        from ttrade import futures
+
+        sym = ex = ""
+        for f in sorted(os.listdir(data_dir("cn"))):
+            if f.endswith(".csv") and not f.startswith("_"):
+                s, _, e = f[:-4].rpartition("_")
+                if s and e:
+                    sym, ex = s, e
+                    break
+        if not sym:
+            return "没有期货日线 CSV（可选）"
+
+        # 底料就是这份 CSV —— 不是 `load_main("1d")`（那是天勤日线，只有 2016
+        # 年以后），比对基准必须和合成用的同一份
+        daily = futures.load_local(sym, ex, data_dir("cn"), adjust="qfq")
+        if not len(daily):
+            return "日线为空（可选）"
+        out = []
+        for p in T.MULTIDAY:
+            m = T.load_main(sym, ex, p)
+            if not len(m):
+                raise RuntimeError(f"{p} 合成出来是空的")
+            want = (len(daily) + 1) // 2 if p == "2d" else None
+            if want is not None and len(m) != want:
+                raise RuntimeError(f"2 日线根数 {len(m)} ≠ ceil({len(daily)}/2)={want}")
+            if p == "1w" and not (len(daily) / 5.6 < len(m) < len(daily) / 4.2):
+                raise RuntimeError(f"周线根数 {len(m)} 和日线 {len(daily)} 不成比例")
+            # OHLC 聚合：极值不能越出日线区间，量额守恒
+            if float(m["high"].max()) > float(daily["high"].max()) + 1e-6:
+                raise RuntimeError(f"{p} 的最高价超过了日线的最高价")
+            if float(m["low"].min()) < float(daily["low"].min()) - 1e-6:
+                raise RuntimeError(f"{p} 的最低价低于了日线的最低价")
+            if abs(float(m["volume"].sum()) - float(daily["volume"].sum())) > 1e-6:
+                raise RuntimeError(f"{p} 的成交量合计和日线对不上（合成时漏根了）")
+            # 同一根不能因为起点不同而变
+            cut = m.index[len(m) // 2]
+            part = T.load_main(sym, ex, p, start=cut)
+            row_a, row_b = m.loc[cut], part.iloc[0]
+            if abs(float(row_a["open"]) - float(row_b["open"])) > 1e-9 \
+                    or abs(float(row_a["close"]) - float(row_b["close"])) > 1e-9:
+                raise RuntimeError(f"{p} 换了起始日期之后同一根 K 线变了（先切再合了？）")
+            bpy = bars_per_year(m.index)
+            d_bpy = bars_per_year(daily.index)
+            if p == "2d" and not (0.35 * d_bpy < bpy < 0.65 * d_bpy):
+                raise RuntimeError(f"2 日线年化根数 {bpy:.0f} 和日线 {d_bpy:.0f} 对不上")
+            if p == "1w" and not (30 < bpy < 60):
+                raise RuntimeError(f"周线年化根数 {bpy:.0f} 不在 30~60 之间")
+            out.append(f"{T.PERIOD_LABEL[p]} {len(m)} 根 / 年化 {bpy:.0f} 根")
+            # 合成周期不该有自己的一份落盘数据
+            if os.path.exists(T.main_path(sym, ex, p)):
+                raise RuntimeError(f"{p} 居然有独立落盘文件，应该是现合成的")
+        return f"{sym}_{ex} " + "、".join(out)
+
+    check("2 日 / 周线由日线合成", _multiday)
+
     def _backtest():
         from ttrade.backtest import BacktestConfig, run_backtest
         from ttrade.eastmoney import load_local
@@ -1172,12 +1249,17 @@ def _run() -> tuple[bool, list[str]]:
     check("因子方向口径", _factor_orient)
 
     def _rt_periods():
-        """每个周期都要能进实时。
+        """每个周期都要能进实时 —— 除了 2 日 / 周线，它们必须被明确挡住。
 
         天勤日线的周期键是 `1d_tq`，而 `RT_SEC` 里只有源周期 `1d`。门禁要是按
         原键判断，日线策略一启用就报「实时不支持 1d_tq」直接停机 —— 界面上是
         一条红的「错误」，看不出是周期映射的问题。所以这里逐个周期真调一遍
         `enable()`，而不是只断言常量表包含关系。
+
+        2 日 / 周线由日线合成，**不该**放行：2 日线按「连续两根日线成对」合成，
+        每来一根新日线配对就整体错位一格，实时段和历史段会算出不同的 K 线；
+        放行的话回测和实盘两边分数永远对不上，还不报错。所以这两档要求「有
+        明确的错误提示」而不是「能跑」。
         """
         from ttrade import strategy_runner as R
         from ttrade import strategy_store as SStore
@@ -1187,6 +1269,7 @@ def _run() -> tuple[bool, list[str]]:
         spec = AccountSpec(name="__selftest__", kind="sim")
         run = R.PortfolioRunner(spec)
         bad = []
+        n_live = 0
         for p in tqdata.PERIOD_ORDER:
             sid = f"__rt_{p}"
             run.add(SStore.StrategyConfig(
@@ -1195,11 +1278,17 @@ def _run() -> tuple[bool, list[str]]:
                 factor_keys=["rev_5"], account=spec.name))
             run.enable(sid, True)
             st = run._slots[sid]
-            if not st.running or st.error:
-                bad.append(f"{p}：{st.error or '未启动'}")
+            if tqdata.is_multiday(p):
+                # 必须挡住，且要说清原因（不是「不支持这个周期」这种含糊话）
+                if st.running or "由日线合成" not in (st.error or ""):
+                    bad.append(f"{p}：合成周期没被挡住（{st.error or '居然启动了'}）")
+            else:
+                n_live += 1
+                if not st.running or st.error:
+                    bad.append(f"{p}：{st.error or '未启动'}")
         if bad:
             raise RuntimeError("；".join(bad))
-        return f"{len(tqdata.PERIOD_ORDER)} 个周期全部可实时"
+        return f"{n_live} 个周期可实时，2 日 / 周线明确挡在门外"
 
     check("实时周期门禁", _rt_periods)
 
@@ -1850,10 +1939,20 @@ def _run() -> tuple[bool, list[str]]:
             and orients == {"auto", "long_high", "long_low"}
             and n_factors >= 47
             and n_models >= 4
-            # 多因子表要 47 行 × 3 列（因子 / 用 / 反），少了「反」列就没法逐因子反转
+            # 多因子表要 47 行 × 4 列（因子 / 用 / 反 / 权重），少了「反」列
+            # 就没法逐因子反转，少了「权重」列「不等权」就是空话
             and n_rows_f >= 47
-            and n_cols_f == 3
+            and n_cols_f == 4
             and win.chk_frev is not None
+            # 权重口径三档（等权 / 不等权 / 滚动 IC）+ 打分范围说明 + 出场规则入口
+            and {win.cb_fweight.itemData(i) for i in range(win.cb_fweight.count())}
+            == {"equal", "custom", "ic"}
+            # 标准化口径两档（z-score / 分位）—— 两档都映射到 ±4，
+            # 少一档就只能用 z，极端值敏感的那批品种没得换
+            and {win.cb_fmethod.itemData(i) for i in range(win.cb_fmethod.count())}
+            == {"z", "rank"}
+            and "±4" in win.lbl_frange.text()
+            and win.btn_fexit is not None
             # 多品种勾选 / 截面参数 / 成本档位 / 两套结果视图
             and win.sym_pick is not None
             and win.cb_cross_mode.count() >= 2
@@ -2152,6 +2251,43 @@ def _run() -> tuple[bool, list[str]]:
         except Exception as exc:  # noqa: BLE001
             range_info = f"{type(exc).__name__}: {exc}"
 
+        # 2 日 / 周线：下拉里要有，选了要真的换成更粗的 K 线。
+        # 只看「有没有这个选项」不够 —— 选项在、`DataStore` 没接上，界面上
+        # 会安静地继续画日线，用户以为自己在看周线
+        md_ok = False
+        md_info = ""
+        try:
+            def _pick(period: str) -> int:
+                i = win.cb_period.findData(period)
+                if i < 0:
+                    raise RuntimeError(f"周期下拉里没有 {period}")
+                win.cb_period.blockSignals(True)
+                win.cb_period.setCurrentIndex(i)
+                win.cb_period.blockSignals(False)
+                win.cb_range.setCurrentIndex(5)      # 全部历史
+                win.run_analysis()
+                return len(win.df_raw)
+
+            n_1d = _pick("1d")
+            n_2d = _pick("2d")
+            n_1w = _pick("1w")
+            if n_1d <= 0 or n_2d != (n_1d + 1) // 2 or not (n_1d / 5.6 < n_1w < n_1d / 4.2):
+                raise RuntimeError(
+                    f"合成周期根数不对：日线 {n_1d} / 2 日 {n_2d} / 周线 {n_1w}")
+            md_ok = True
+            md_info = f"日线 {n_1d} 根 → 2 日 {n_2d} 根、周线 {n_1w} 根"
+        except Exception as exc:  # noqa: BLE001
+            md_info = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                win.cb_period.blockSignals(True)
+                win.cb_period.setCurrentIndex(win.cb_period.findData("1d_tq"))
+                win.cb_period.blockSignals(False)
+                win.cb_range.setCurrentIndex(0)
+                win.run_analysis()
+            except Exception:  # noqa: BLE001
+                pass
+
         win.close()
         app.processEvents()
 
@@ -2198,6 +2334,8 @@ def _run() -> tuple[bool, list[str]]:
                 f"回测区间没生效（{range_info}）：cb_range 只是改了显示窗口，"
                 "策略仍然在全历史上算"
             )
+        if not md_ok:
+            raise RuntimeError(f"2 日 / 周线在界面上没接上（{md_info}）")
         if not factor_ok:
             raise RuntimeError(f"因子面板控件缺失：{factor_info}")
         if not live_off:
@@ -2638,6 +2776,208 @@ def _run() -> tuple[bool, list[str]]:
                     f"方向 {got.trigger_side} / 触发 {got.trigger_keys} / "
                     f"反转 {got.trigger_flip}）")
             win.chk_sparse.setChecked(False)
+
+            # ---- 多因子组合的权重口径 + 出场规则 ----
+            #
+            # 这两项都是「界面能设、配置能存、后端真的用上」三件事，任何一环断了
+            # 都只表现成「结果和上次一样」。所以既走一遍配置往返，也在合成数据上
+            # 验一下规则真的改变了平仓时点。
+            import numpy as np
+            import pandas as pd
+            from PySide6.QtCore import Qt
+
+            win.cb_family.setCurrentIndex(win.cb_family.findData("factor"))
+            win.cb_fmode.setCurrentIndex(win.cb_fmode.findData("multi"))
+            app.processEvents()
+            if win.cb_fweight.isHidden():
+                raise RuntimeError("多因子组合下没露出权重口径下拉")
+            win.cb_fweight.setCurrentIndex(win.cb_fweight.findData("custom"))
+            app.processEvents()
+            if win.tbl_fmulti.isColumnHidden(3):
+                raise RuntimeError("选了「不等权」但权重列还是藏着的")
+            # 勾上前两行：默认勾选（`DEFAULT_MULTI`）不一定落在这个市场的因子集里，
+            # 上一段稀疏采样的操作也可能把勾去掉
+            for _r in range(min(2, win.tbl_fmulti.rowCount())):
+                _cell = win.tbl_fmulti.item(_r, 1)
+                if _cell is not None:
+                    _cell.setCheckState(Qt.Checked)
+            app.processEvents()
+            rows = [r for r in range(win.tbl_fmulti.rowCount())
+                    if win.tbl_fmulti.item(r, 1) is not None
+                    and win.tbl_fmulti.item(r, 1).checkState() == Qt.Checked]
+            if len(rows) < 2:
+                raise RuntimeError("自检环境里勾中的因子不足 2 个，权重往返测不了")
+            win.tbl_fmulti.item(rows[0], 3).setText("3")
+            win.tbl_fmulti.item(rows[1], 3).setText("0.5")
+            app.processEvents()
+            want_w = win._factor_cfg()
+            cfg_w = win._current_config()
+            if not (want_w.weight_mode == "custom"
+                    and abs(float(want_w.weights.get(
+                        win.tbl_fmulti.item(rows[0], 0).data(Qt.UserRole), 0)) - 3.0) < 1e-9):
+                raise RuntimeError(f"权重没进配置：{want_w.weight_mode} {want_w.weights}")
+            win.cb_fweight.setCurrentIndex(win.cb_fweight.findData("equal"))
+            win.tbl_fmulti.item(rows[0], 3).setText("1")
+            win.tbl_fmulti.item(rows[1], 3).setText("1")
+            app.processEvents()
+            win.apply_config(cfg_w)
+            app.processEvents()
+            got_w = win._factor_cfg()
+            if not (win.cb_fweight.currentData() == "custom"
+                    and abs(float(got_w.weights.get(
+                        win.tbl_fmulti.item(rows[0], 0).data(Qt.UserRole), 0)) - 3.0) < 1e-9):
+                raise RuntimeError(
+                    f"权重口径没从策略库载回来（{win.cb_fweight.currentData()} / "
+                    f"{got_w.weights}）")
+
+            # 权重按比例起作用：3 : 0.5 和 6 : 1 是同一件事
+            from ttrade import factor_strategy as _FS
+
+            _idx = pd.date_range("2015-01-01", periods=420, freq="B")
+            _rng = np.random.default_rng(7)
+            _px = 100 * np.exp(np.cumsum(_rng.normal(0, 0.012, len(_idx))))
+            _syn = pd.DataFrame(
+                {"open": _px, "high": _px * 1.008, "low": _px * 0.992,
+                 "close": _px, "volume": 1e5}, index=_idx)
+            _syn.attrs["symbol"] = "AG"
+            _syn.attrs["exchange"] = "SHFE"
+            _keys = ["mom_20", "mom_60", "ma_gap_20"]
+            _a = _FS.build_score(_syn, "multi", _keys, _FS.FactorConfig(
+                weight_mode="custom", weights={_keys[0]: 3.0, _keys[1]: 0.5,
+                                               _keys[2]: 1.0}))
+            _b = _FS.build_score(_syn, "multi", _keys, _FS.FactorConfig(
+                weight_mode="custom", weights={_keys[0]: 6.0, _keys[1]: 1.0,
+                                               _keys[2]: 2.0}))
+            _c = _FS.build_score(_syn, "multi", _keys, _FS.FactorConfig())
+            _wa = _a.score.dropna()
+            _diff_ratio = float((_a.score - _b.score).abs().max(skipna=True))
+            if not (_diff_ratio < 1e-9 and len(_wa) > 50):
+                raise RuntimeError(f"权重按比例缩放后分数变了（最大差 {_diff_ratio:.2e}）")
+            if float((_a.score - _c.score).abs().max(skipna=True)) < 1e-6:
+                raise RuntimeError("自定权重和等权算出来一模一样，权重没生效")
+            _ic = _FS.build_score(_syn, "multi", _keys,
+                                  _FS.FactorConfig(weight_mode="ic", ic_rebal=40))
+            if float((_ic.score - _c.score).abs().max(skipna=True)) < 1e-6:
+                raise RuntimeError("滚动 IC 加权和等权算出来一模一样，权重没生效")
+
+            # ---- 标准化口径：z-score / 分位 ----
+            #
+            # 分位这一档以前映射到 ±0.5，而阈值滑杆最小 0.3、最大 3.0 —— 阈值一
+            # 调到 0.5 就再也开不出仓，界面上看起来是「这个策略从来不交易」。
+            # 现在两档都落在 ±4，所以既验范围，也验配置能存能载。
+            from ttrade import factors as _F
+
+            _raw = pd.Series(
+                np.r_[np.linspace(100.0, 120.0, 300), 400.0,
+                      np.linspace(120.0, 118.0, 100)],
+                index=pd.date_range("2018-01-01", periods=401, freq="B"))
+            _rng_rank = _F.standardize(_raw, window=252, method="rank").dropna()
+            _rng_z = _F.standardize(_raw, window=252, method="z").dropna()
+            if _rng_rank.empty or _rng_z.empty:
+                raise RuntimeError("两种口径都算不出分数，窗口给错了")
+            if float(_rng_rank.abs().max()) > 4.0 + 1e-9:
+                raise RuntimeError(
+                    f"分位口径的分数越过了 ±4：{float(_rng_rank.abs().max()):.3f}")
+            if float(_rng_z.abs().max()) > 4.0 + 1e-9:
+                raise RuntimeError(
+                    f"z 口径的分数越过了 ±4：{float(_rng_z.abs().max()):.3f}")
+            # 分位对极端值免疫：那根 400 的毛刺在 z 下被截到 4（说明它确实是个
+            # 巨幅偏离），分位这边它只能顶到 +4，且不因毛刺变大而变
+            _spike = _rng_rank.idxmax()
+            if abs(float(_rng_rank.loc[_spike]) - 4.0) > 1e-9:
+                raise RuntimeError(f"分位口径下最高分的毛刺不是 +4："
+                                   f"{float(_rng_rank.loc[_spike]):.3f}")
+            _raw2 = _raw.copy()
+            _raw2.loc[_spike] = 4000.0
+            _rng_rank2 = _F.standardize(_raw2, window=252, method="rank")
+            if abs(float(_rng_rank2.loc[_spike]) - 4.0) > 1e-9:
+                raise RuntimeError("毛刺放大十倍后分位分数变了，分位没免疫极端值")
+
+            # 配置往返：分位存进策略库再载回来
+            win.cb_fmethod.setCurrentIndex(win.cb_fmethod.findData("rank"))
+            app.processEvents()
+            cfg_m = win._current_config()
+            if win._factor_cfg().method != "rank":
+                raise RuntimeError("分位口径没写进 factor_cfg")
+            win.cb_fmethod.setCurrentIndex(win.cb_fmethod.findData("z"))
+            app.processEvents()
+            win.apply_config(cfg_m)
+            app.processEvents()
+            if not (win.cb_fmethod.currentData() == "rank"
+                    and win._factor_cfg().method == "rank"):
+                raise RuntimeError(
+                    f"标准化口径没从策略库载回来（{win.cb_fmethod.currentData()} / "
+                    f"{win._factor_cfg().method}）")
+            win.cb_fmethod.setCurrentIndex(win.cb_fmethod.findData("z"))
+            app.processEvents()
+
+            # 出场规则：分档（浮盈越多回撤越少）必须比绝对回撤**更早**平仓
+            _n = 20 + 10 + 12
+            _close = np.r_[np.full(20, 100.0), 100 + np.arange(1, 11),
+                           110 - np.arange(1, 13) * 1.0]
+            _ex = pd.DataFrame({"open": _close, "high": _close + 0.5,
+                                "low": _close - 0.5, "close": _close},
+                               index=pd.date_range("2020-01-01", periods=_n, freq="D"))
+            _sig = np.ones(_n, dtype=int)
+            _tier, _ = _FS.apply_exit_rules(
+                _sig, _ex, _FS.FactorConfig(exit_mode="tier"))
+            _abs, _ = _FS.apply_exit_rules(
+                _sig, _ex, _FS.FactorConfig(exit_mode="abs", exit_abs_atr=2.0))
+            _box, _ = _FS.apply_exit_rules(
+                _sig, _ex, _FS.FactorConfig(exit_mode="box", exit_box_bars=10))
+            _score, _ = _FS.apply_exit_rules(
+                _sig, _ex, _FS.FactorConfig(exit_mode="score"))
+            _k_tier = int(np.argmax(_tier == 0)) if (_tier == 0).any() else -1
+            _k_abs = int(np.argmax(_abs == 0)) if (_abs == 0).any() else -1
+            if not (_k_tier > 0 and _k_abs > _k_tier):
+                raise RuntimeError(
+                    f"分档回撤没比绝对回撤更早平仓（分档 {_k_tier} / 绝对 {_k_abs}）")
+            if not (_box == 0).any():
+                raise RuntimeError("反向箱体突破在单边上涨后回落时没平仓")
+            if not np.array_equal(_score, _sig):
+                raise RuntimeError("「分数出场」不该改动信号")
+
+            # 出场规则的配置往返
+            win.exit_cfg = {"exit_mode": "tier",
+                            "exit_tiers": [[1.5, 2.5], [3.0, 1.0], [5.0, 0.5]],
+                            "exit_abs_atr": 2.0, "exit_box_bars": 20,
+                            "exit_box_buf": 0.0, "exit_atr_n": 14}
+            win._sync_exit_summary()
+            cfg_x = win._current_config()
+            win.exit_cfg = {}
+            win._sync_exit_summary()
+            win.apply_config(cfg_x)
+            app.processEvents()
+            got_x = win._factor_cfg()
+            if not (got_x.exit_mode == "tier"
+                    and [[round(float(a), 4), round(float(b), 4)]
+                         for a, b in got_x.exit_tiers]
+                    == [[1.5, 2.5], [3.0, 1.0], [5.0, 0.5]]):
+                raise RuntimeError(f"出场规则没从策略库载回来：{got_x.exit_mode} "
+                                   f"{got_x.exit_tiers}")
+            win.exit_cfg = {}
+            win._sync_exit_summary()
+
+            # 弹窗本身：三档乱序要排好、回撤幅度写反要理顺，不然「浮盈越多
+            # 回撤越小」这句话在界面上是假的，而规则会照错的跑
+            from gui.exit_dialog import ExitRuleDialog, summarize
+
+            _d = ExitRuleDialog({"exit_mode": "tier",
+                                 "exit_tiers": [[6.0, 0.8], [2.0, 2.0], [4.0, 1.2]]})
+            _v = _d.values()
+            if _v["exit_tiers"] != [[2.0, 2.0], [4.0, 1.2], [6.0, 0.8]]:
+                raise RuntimeError(f"分档参数没排好：{_v['exit_tiers']}")
+            _d2 = ExitRuleDialog({"exit_mode": "tier",
+                                  "exit_tiers": [[2.0, 0.5], [4.0, 3.0], [6.0, 2.0]]})
+            _v2 = _d2.values()
+            _tr = [b for _, b in _v2["exit_tiers"]]
+            if _tr != sorted(_tr, reverse=True):
+                raise RuntimeError(f"回撤幅度没有随浮盈递减：{_v2['exit_tiers']}")
+            if "分数出场" not in summarize({}):
+                raise RuntimeError("默认摘要没写「分数出场」")
+            _d.deleteLater()
+            _d2.deleteLater()
+
             # 载入一份 ML 配置会顺手起后台线程（因子分析页重算 IC）。自检到这里
             # 就结束了，线程还在跑的话窗口析构时 Qt 报
             # `QThread: Destroyed while thread is still running`，进程以非零码
@@ -2650,7 +2990,10 @@ def _run() -> tuple[bool, list[str]]:
                     pass
             trig_info = ("「不用」两项都在（切市场后仍在），反转开关跟着触发源灰 / 亮，"
                          "规则触发参数能进配置且换规则不串，"
-                         "稀疏采样存得进策略库也载得回来")
+                         "稀疏采样存得进策略库也载得回来，"
+                         "权重三档（等权/自定/IC）都真起作用且能往返，"
+                         "分位口径也映射到 ±4、对毛刺免疫且能往返，"
+                         "分档回撤比绝对回撤更早平仓、出场规则能往返")
         except Exception as exc:      # noqa: BLE001
             trig_ok, trig_info = False, f"{type(exc).__name__}: {exc}"
         if not trig_ok:
@@ -2664,7 +3007,7 @@ def _run() -> tuple[bool, list[str]]:
                 f"多品种往返 {multi_rt_info}，"
                 f"组合页回测 {view_info}，"
                 f"{side_info}，触发 {trig_info}，"
-                f"回测区间 {range_info}，实时开关已复位，"
+                f"回测区间 {range_info}，合成周期 {md_info}，实时开关已复位，"
                 f"数据管理页就绪，手册 {manual_info}，输出 {out_info}，"
                 f"对话渲染 {chat_info}，能力包 {skill_info}")
 

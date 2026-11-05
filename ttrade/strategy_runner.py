@@ -786,6 +786,13 @@ class PortfolioRunner:
         if on and st.cfg.family == "factor" and not st.cfg.factor_keys:
             st.error = "这条因子策略没有选中因子"
             return
+        # 2 日 / 周线由日线合成，不进实时。周线按自然周分组本来是稳的，但盘中
+        # 那根周线还没收；2 日线更硬伤 —— 它按「连续两根日线成对」合成，每来
+        # 一根新日线，配对就整体错位一格，实时段和历史段算出来的不是同一根 K 线。
+        if on and tqdata.is_multiday(st.cfg.period):
+            st.error = (f"「{tqdata.PERIOD_LABEL.get(st.cfg.period, st.cfg.period)}」"
+                        "由日线合成，不支持实盘；要实盘请把周期切到「日线」")
+            return
         # 门禁按**源周期**判断。`1d_tq`（天勤日线）在 `RT_SEC` 里没有这个键 ——
         # 它的源周期是 `1d`，`_subscribe()` 也是这么映射的。按原键判断会让日线
         # 策略一启动就报「实时不支持 1d_tq」，永远起不来。
@@ -1315,6 +1322,11 @@ class PortfolioRunner:
             return float(n) * num * 60.0
         if unit.endswith("h"):
             return float(n) * num * 3600.0
+        if unit.endswith("w"):
+            # 周线不在 `PERIODS` 里（走默认分支，unit 就是 "1w"），但万一哪天
+            # 放开了实时，7 天不能算成 1 天 —— 活性判据会把「刚来一根」误判成
+            # 「行情停了」，收盘前该调仓的全被拦掉
+            return float(n) * num * 7 * 86400.0
         return float(n) * num * 86400.0
 
     def _market_alive(self, st: SlotState) -> bool:

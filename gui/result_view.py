@@ -1335,16 +1335,23 @@ class ResultView(QObject):
         period = self.period
         plabel = "" if tqdata.is_daily(period) else f" · {PERIOD_LABEL.get(period, period)}"
         tail = "" if self.bars_only else f"   ·   当前状态：{state}"
+        # 日线口径的 index 是当日 00:00，把时分写出来只会让标题多出两个没意义的
+        # 零；2 日 / 周线同理（它们的 index 也是收盘那天）
+        span = (f"{view.index[0]:%Y-%m-%d} ~ {view.index[-1]:%Y-%m-%d}"
+                if tqdata.is_daily(period) else
+                f"{view.index[0]:%Y-%m-%d %H:%M} ~ {view.index[-1]:%Y-%m-%d %H:%M}")
         ax.set_title(
-            f"{head}{plabel}   ·   {spec_label}   ·   "
-            f"{view.index[0]:%Y-%m-%d %H:%M} ~ {view.index[-1]:%Y-%m-%d %H:%M}"
-            f"{tail}",
+            f"{head}{plabel}   ·   {spec_label}   ·   {span}{tail}",
             fontsize=11.5, color=C_TEXT, loc="left", pad=10,
         )
         if self.bars_only:
             source = "合约原始价（不复权，只够看图）"
         elif self.market == "us":
             source = "东方财富后复权"
+        elif tqdata.is_multiday(period):
+            # 2 日 / 周线的底料是 Tushare 日线 CSV，不是天勤 —— 写「天勤」会
+            # 让用户拿它和「日线」（天勤）逐根对，对不上还以为复权算错了
+            source = "Tushare 换月前复权（由日线合成）"
         elif period == PERIOD_1D:
             source = "Tushare 换月前复权"
         else:

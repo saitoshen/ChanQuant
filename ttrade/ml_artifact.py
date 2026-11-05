@@ -535,6 +535,10 @@ def _cfg_digest(cfg: "fstrat.FactorConfig") -> dict:
         "entry_z": float(cfg.entry_z),
         "exit_z": float(cfg.exit_z),
         "pooled": bool(getattr(cfg, "pooled", False)),
+        # 出场规则（`exit_*`）**故意不算**：它只影响平仓时点，不参与训练，
+        # 也不影响模型本身。算进去的话，改一个跟踪止损倍数就得重训十分钟的
+        # 模型 —— 那是纯粹白等。实盘那边 `LivePredictor` 每根都会按当前配置
+        # 重算出场，本来就不依赖产物里存的那份。
     }
 
 
@@ -820,6 +824,15 @@ class LivePredictor:
         # 缓冲里的预测值是不是**全一样**（模型退化成常数预测器）。
         # 这和「历史预测不够」是两回事，报错文案要分开说。
         self._z_degenerate = False
+        # ATR 出场规则的状态机。和回测**同一份实现**（`fstrat.ExitTracker`）——
+        # 各写一遍迟早会分叉，而「回测 2.3 年平仓、实盘一直拿着」这种差异
+        # 没有任何线索可查。`score` 模式（默认）不建，省得每根都去算 ATR
+        self._exit = (fstrat.ExitTracker(self.cfg)
+                      if str(self.cfg.exit_mode or "score") != "score" else None)
+        self._exit_synced = False
+        # 上一根的 |分数|：出场后要判断「这一根是不是刚越过进场阈值」，
+        # 也就是「算不算一笔新交易」。和回测 `apply_exit_rules` 里的 fresh 同一口径
+        self._prev_abs_z = float("nan")
 
     # ---- 状态机 ----
 
@@ -901,6 +914,52 @@ class LivePredictor:
         self.state.src = src
         return cur
 
+    def _exit_step(self, df: pd.DataFrame, sig: int, z: float = float("nan")) -> int:
+        """把 ATR 出场规则叠到信号上。和回测的 `apply_exit_rules` 同一份状态机。
+
+        口径细节（和回测逐条对齐）：
+
+        - ATR 用 `exit_atr_n` 根的简单均值，和回测同一个函数
+        - 箱体边界只取**过去** N 根（不含当根），否则当根的低点天然就是箱体
+          下沿，永远触发不了
+        - 进程重启后第一次调用时，把仓位对齐到产物里存的 `state.cur`，浮盈从
+          当根重新起算 —— 重启那一刻的浮盈已经无从查证，硬编一个反而更假
+        """
+        if self._exit is None:
+            return sig
+        try:
+            close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
+            high = (pd.to_numeric(df["high"], errors="coerce").to_numpy(dtype=float)
+                    if "high" in df.columns else close)
+            low = (pd.to_numeric(df["low"], errors="coerce").to_numpy(dtype=float)
+                   if "low" in df.columns else close)
+            atr = fstrat._atr_array(df, self.cfg.exit_atr_n)
+            i = len(df) - 1
+            if not self._exit_synced:
+                self._exit_synced = True
+                cur = int(self.state.cur)
+                if cur != 0:
+                    self._exit.pos = cur
+                    self._exit.entry = (float(close[i]) if np.isfinite(close[i]) else 0.0)
+                    self._exit.best = 0.0
+            bars = self._exit.bars
+            lo = hi = float("nan")
+            if i >= bars:
+                lo = float(np.nanmin(low[i - bars:i]))
+                hi = float(np.nanmax(high[i - bars:i]))
+            # 「刚越过进场阈值」= 这笔算出的是新信号，不是上一笔的延续。
+            # 出场之后靠它决定能不能再进（否则趋势没走完，仓位就永远空着）
+            az = abs(float(z)) if np.isfinite(z) else float("nan")
+            e = float(self.cfg.entry_z)
+            fresh = bool(np.isfinite(az) and az > e
+                         and not (np.isfinite(self._prev_abs_z) and self._prev_abs_z > e))
+            self._prev_abs_z = az
+            return self._exit.step(int(sig), close[i], atr[i], lo, hi, fresh)
+        except Exception as exc:  # noqa: BLE001 - 出场规则炸了不该让整根信号丢
+            if self.log:
+                self.log(f"出场规则计算失败，这一根按分数信号走：{exc}")
+            return sig
+
     # ---- 主流程 ----
 
     def predict(self, df: pd.DataFrame) -> dict:
@@ -954,6 +1013,8 @@ class LivePredictor:
                         del lst[:-256]
             else:
                 sig = self._hysteresis_step(z)
+
+            sig = self._exit_step(df, int(sig), z)
 
             self._held_score = z
             self.state.held_score = z

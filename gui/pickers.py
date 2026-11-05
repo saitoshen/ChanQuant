@@ -551,11 +551,21 @@ class ContractPicker(QWidget):
         self._emit()
 
     def _fill_futures(self) -> None:
+        from ttrade import tqdata
         from ttrade import tqstore as S
 
         self.cb_month.clear()
         self.lbl_note.setText("")
         if not self._symbol:
+            return
+        # 真实合约只下到日线 / 1h / 5m（那是下载链路的口径）。2 日 / 周线是
+        # 由日线合成的，没有也不该有「合约级」版本 —— 不单独说一句的话，
+        # 这里会提示「去数据管理勾上『一并下载真实合约』」，而那个勾根本
+        # 变不出 2 日线的合约数据
+        if tqdata.is_multiday(self._period):
+            self.lbl_note.setText(
+                f"真实合约只到日线；{tqdata.PERIOD_LABEL.get(self._period, self._period)}"
+                "由日线合成，看主连就行")
             return
         df = S.list_contracts(self._symbol, self._exchange, self._period)
         if df.empty:

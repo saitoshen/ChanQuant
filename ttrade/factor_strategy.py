@@ -73,6 +73,33 @@ def _is_degenerate_model(model, X_probe: np.ndarray) -> bool:
 
 
 # ---------------------------------------------------------------- 配置
+def _clean_tiers(tiers) -> list[list[float]]:
+    """把「分档浮盈回撤」的参数规整成 [(浮盈 ATR, 回撤 ATR), …]。
+
+    两条约束都在这里兜住，界面和配置文件都可能是脏的：
+
+    - 浮盈门槛按升序排、去重。乱序的话「取第一个满足的档」会取到低档，
+      高浮盈反而按宽松的回撤走
+    - 回撤幅度必须随浮盈**递减**（浮盈越多、允许回撤越小）。写反了不会报错，
+      只会让这条规则悄悄变成「浮盈越多越松」，也就是完全相反的东西
+    """
+    out: list[list[float]] = []
+    for pair in list(tiers or []):
+        try:
+            p, t = float(pair[0]), float(pair[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (p == p and t == t) or t <= 0:      # NaN / 非正回撤
+            continue
+        out.append([max(0.0, p), t])
+    out.sort(key=lambda x: x[0])
+    # 递减约束：从高浮盈那档往下压，保证低档的回撤不小于高档
+    for i in range(len(out) - 2, -1, -1):
+        if out[i][1] < out[i + 1][1]:
+            out[i][1] = out[i + 1][1]
+    return out or [[2.0, 2.0], [4.0, 1.2], [6.0, 0.8]]
+
+
 @dataclass
 class FactorConfig:
     # 因子构造
@@ -147,6 +174,40 @@ class FactorConfig:
     # 和实盘就能和回测对齐。
     pooled: bool = False
 
+    # ---- 多因子组合的权重（只对 multi 生效）
+    #
+    #   equal ：等权平均。老口径，也是默认 —— 权重这东西拍脑袋定，
+    #           效果往往不如不设，先让人从等权起步
+    #   custom：人为权重。界面上每个因子填一个数，按权重加权平均；
+    #           某根缺值时按当根**有值的那些权重**重新归一，不会因为
+    #           一个因子缺数就把整行分数拉低
+    #   ic    ：滚动 IC 加权。每 `ic_rebal` 根，用过去一个窗口的 IC 绝对值
+    #           当权重 —— 方向仍由 `orient` 决定，所以这里只取强度不取符号，
+    #           不然「自动定向已经翻过一次号」再乘一次负权重，等于反两次
+    weight_mode: str = "equal"       # equal / custom / ic
+    weights: dict = field(default_factory=dict)   # 因子键 -> 权重（custom 用）
+    ic_rebal: int = 60               # 滚动 IC 加权：多少根重算一次权重
+
+    # ---- 出场规则（只对因子策略生效，覆盖「分数回落就平」）
+    #
+    #   score：老口径，分数回落到 `exit_z` 以内就平
+    #   tier ：分档浮盈回撤。浮盈和回撤都按 ATR 折算，分 3 档 —— 浮盈越多，
+    #          允许的回撤越小（先让利润跑，跑起来之后收紧）
+    #   abs  ：绝对回撤。从持仓期间的最高浮盈回撤固定 N×ATR 就平，不分档
+    #   box  ：反向箱体突破。持仓期间价格反向穿越「过去 N 根的高低点」就平
+    #
+    # 这几种都是**只减仓不反手**：出场之后要等信号自己回到 0 再重新给方向，
+    # 否则一根大阴线平多、紧接着反手做空，那是另一条策略（趋势反手），
+    # 不该藏在「出场规则」里偷偷发生。
+    exit_mode: str = "score"
+    # 三档：(浮盈达到几个 ATR, 从最高点回撤几个 ATR 就平)。必须递减，
+    # 否则「浮盈越多回撤越少」这句话就是假的
+    exit_tiers: list = field(default_factory=lambda: [[2.0, 2.0], [4.0, 1.2], [6.0, 0.8]])
+    exit_abs_atr: float = 2.0        # 绝对回撤：回撤几个 ATR
+    exit_box_bars: int = 20          # 反向箱体：箱体回看根数（决定箱体宽度）
+    exit_box_buf: float = 0.0        # 反向箱体：边界缓冲（ATR 倍数），0 = 触到就走
+    exit_atr_n: int = 14             # 算 ATR 的根数
+
     def reversed_keys(self) -> set[str]:
         """真正打开反转的因子。顺手把非真值过滤掉，调用方不用自己判。"""
         return {k for k, v in dict(self.reverse or {}).items() if v}
@@ -169,6 +230,23 @@ class FactorConfig:
         c.trigger_z = float(c.trigger_z)
         c.trigger_flip = bool(c.trigger_flip)
         c.trigger_rule_flip = bool(c.trigger_rule_flip)
+        # 权重：只认正数。负权重等于「这个因子反着用」，那件事该由「反转」
+        # 勾选框表达 —— 两个地方都能翻方向，出问题时根本查不出是谁翻的
+        c.weight_mode = str(c.weight_mode or "equal")
+        if c.weight_mode not in ("equal", "custom", "ic"):
+            c.weight_mode = "equal"
+        c.weights = {str(k): float(v) for k, v in dict(c.weights or {}).items()
+                     if float(v) > 0}
+        c.ic_rebal = int(max(1, c.ic_rebal))
+        # 出场规则
+        c.exit_mode = str(c.exit_mode or "score")
+        if c.exit_mode not in ("score", "tier", "abs", "box"):
+            c.exit_mode = "score"
+        c.exit_tiers = _clean_tiers(c.exit_tiers)
+        c.exit_abs_atr = float(max(0.1, c.exit_abs_atr))
+        c.exit_box_bars = int(max(2, c.exit_box_bars))
+        c.exit_box_buf = float(max(0.0, c.exit_box_buf))
+        c.exit_atr_n = int(max(2, c.exit_atr_n))
         return c
 
 
@@ -242,7 +320,7 @@ def _orientation_frame(
 ) -> pd.DataFrame:
     """每个因子在每个时点的方向。`orient` 配置可覆盖为固定方向。
 
-    反转在这里生效，而不是在最后对综合分数取负号：多因子等权时，只反一个因子
+    反转在这里生效，而不是在最后对综合分数取负号：多因子组合时，只反一个因子
     必须只把那一列取反；整体取负会把其它因子也一起反掉。
     """
     if cfg.orient == "long_high":
@@ -274,6 +352,19 @@ def _reverse_note(cfg: FactorConfig, keys: list[str]) -> str:
     return f"反转使用：{names}（等效于把该因子取负号）"
 
 
+def _warmup_note(score: pd.Series | None, n_bars: int, cfg: FactorConfig) -> str:
+    """分数整列 NaN 时说清原因，别让人以为策略坏了。
+
+    标准化窗口是**根**，不是「天」。同一个 252 在 5 分钟上只占两天，在周线上
+    是五年 —— 周线策略选「近 1 年」只有五十来根，分数全空、信号全 0，界面上
+    就是一条不交易的策略，看不出是样本不够。
+    """
+    if score is None or len(score) == 0 or int(score.notna().sum()) > 0:
+        return ""
+    return (f"分数全空：这段行情只有 {int(n_bars)} 根，而标准化窗口要 "
+            f"{int(cfg.window)} 根 —— 把回测区间拉长，或者把窗口调小")
+
+
 def _orient_note(ori: pd.DataFrame | None, cfg: FactorConfig) -> str:
     """自动定向时报出**末期实际生效**的方向。
 
@@ -292,6 +383,62 @@ def _orient_note(ori: pd.DataFrame | None, cfg: FactorConfig) -> str:
     if len(last) == 1:
         return "末期方向：" + ("高分做多（+1）" if up else "高分做空（−1）")
     return f"末期方向：{up} 个高分做多 / {down} 个高分做空"
+
+
+# ---------------------------------------------------------------- 多因子权重
+def _weighted_mean(mat: pd.DataFrame, w) -> pd.Series:
+    """按权重求每行加权平均，缺值跳过、**当根重新归一**。
+
+    `w` 可以是 Series（每个因子一个权重），也可以是与 `mat` 同形的 DataFrame
+    （权重逐根变，滚动 IC 加权用）。
+
+    缺值必须按「当根有值的那些权重」归一，不能直接用 `w.sum()`：那样
+    「A 因子这根没数」会被算成「A 因子给了个 0 分」，分数被系统性拉向 0 ——
+    因子预热期和展期 / 期权这类稀疏因子正好全落在这种情形里。
+    """
+    if isinstance(w, pd.DataFrame):
+        ww = w.reindex(index=mat.index, columns=mat.columns).astype(float)
+    else:
+        row = w.reindex(mat.columns).fillna(0.0).to_numpy(dtype=float)
+        ww = pd.DataFrame(np.tile(row, (len(mat), 1)), index=mat.index,
+                          columns=mat.columns)
+    wm = ww.where(mat.notna())
+    den = wm.sum(axis=1, skipna=True)
+    num = (mat.fillna(0.0) * wm.fillna(0.0)).sum(axis=1)
+    return (num / den.where(den > 0)).rename("score")
+
+
+def rolling_ic_weights(fmat: pd.DataFrame, fwd: pd.Series, cfg: FactorConfig
+                       ) -> pd.DataFrame:
+    """滚动 IC 权重：每 `ic_rebal` 根，用过去一个窗口的 |IC| 当权重。
+
+    **必须滞后 horizon**：`fwd[t]` 是 t+1 开盘到 t+h 收盘的收益，t 时刻还没发生。
+    不滞后就等于用未来收益给今天配权重，回测会好得离谱 —— 和 `pit_orientation`
+    是同一个坑，那边已经踩过一次。
+
+    取绝对值不取符号：方向归 `orient` 管（自动定向已经按 IC 符号翻过号），
+    这里再乘一次符号等于反两次，会变成「越没用的因子给越多权重」。
+
+    权重不是逐根变的：每 `ic_rebal` 根更新一次，中间沿用上一次的值。IC 的日间
+    噪声本来就大，每根都跟着抖会把换手率顶起来。
+    """
+    win = int(max(20, cfg.window))
+    mp = max(20, win // 4)
+    cols = {}
+    for c in fmat.columns:
+        ic = fmat[c].rolling(win, min_periods=mp).corr(fwd).shift(int(cfg.horizon))
+        cols[c] = ic.abs()
+    w = pd.DataFrame(cols, index=fmat.index).astype(float)
+    step = int(max(1, cfg.ic_rebal))
+    grid = pd.Series(False, index=w.index)
+    grid.iloc[::step] = True
+    w = w.where(grid).ffill()
+    # 一个因子都没 IC（预热期，或者这批因子在这段行情里全不灵）时退回等权。
+    # 权重全 0 会让分数整段 NaN，界面上就是「策略没信号」，查起来毫无线索
+    dead = ~(w.sum(axis=1, skipna=True) > 0)
+    if bool(dead.any()):
+        w.loc[dead, :] = 1.0
+    return w
 
 
 # ---------------------------------------------------------------- 阈值状态机
@@ -398,6 +545,179 @@ def trigger_hysteresis(
     return pos
 
 
+def _atr_array(df: pd.DataFrame, n: int) -> np.ndarray:
+    """真实波幅均值（ATR）整段序列。口径和 `backtest._atr_array` 一致。
+
+    出场规则里所有「几个 ATR」都按这个算：`exit_atr_n` 默认 14，和回测里
+    「按止损金额定仓」用的那个 14 是同一个数 —— 两处用不同 ATR 的话，
+    「止损 5×ATR」和「回撤 2×ATR」在图上对不上，没法解释。
+    """
+    close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
+    high = (pd.to_numeric(df["high"], errors="coerce").to_numpy(dtype=float)
+            if "high" in df.columns else close)
+    low = (pd.to_numeric(df["low"], errors="coerce").to_numpy(dtype=float)
+           if "low" in df.columns else close)
+    n = max(2, int(n or 14))
+    prev = np.concatenate(([np.nan], close[:-1]))
+    tr = np.maximum(np.maximum(high - low, np.abs(high - prev)), np.abs(low - prev))
+    return pd.Series(tr).rolling(n, min_periods=n).mean().to_numpy(dtype=float)
+
+
+class ExitTracker:
+    """ATR 出场规则的状态机。**回测逐根推进、实盘每根推一次，共用这一份。**
+
+    出场规则必须是同一份实现，否则「回测里 2.3 年平仓、实盘一直拿着」这种
+    差异没有任何线索可查 —— 两条路各写一遍，迟早会分叉。
+
+    三种规则都是**只减仓、不反手**：触发之后强制空仓，等信号自己回到 0
+    （或者自己翻到反方向 = 一笔新交易）才重新放行。理由很实际 ——
+    一根大阴线平多、紧接着反手做空，那是「趋势反手」策略，不该藏在
+    「出场规则」这个开关里悄悄发生。
+
+    浮盈的起点是**信号生效那根的收盘价**（不是下一根开盘）。回测的真实成交
+    在下一根开盘，两者差一个跳空，但规则必须是「只看收盘就能判」的 ——
+    实盘那一刻还不知道下一根开在哪。宁可定义得朴素一点，也要两边算得一样。
+
+    ATR 缺失（预热期前 n 根）时不动：没有尺子就不要凭空白砍一刀。
+    """
+
+    def __init__(self, cfg: FactorConfig):
+        self.cfg = cfg
+        self.mode = str(cfg.exit_mode or "score")
+        self.tiers = _clean_tiers(cfg.exit_tiers)
+        self.bars = int(max(2, cfg.exit_box_bars))
+        self.buf = float(max(0.0, cfg.exit_box_buf))
+        self.pos = 0
+        self.entry = 0.0
+        self.best = 0.0        # 持仓期间的最好浮盈（ATR 倍数）
+        self.blocked = False   # 已被出场规则平掉，等信号归零 / 翻向再放行
+        self.n_exit = 0
+
+    def step(self, want: int, px: float, atr: float,
+             box_low: float = float("nan"), box_high: float = float("nan"),
+             fresh: bool = False) -> int:
+        """推进一根，返回这根**实际**该持有的仓位（-1/0/1）。
+
+        `want` 是阈值信号说的仓位；返回值是叠加出场规则之后的仓位。
+        `box_low` / `box_high` 是箱体边界（调用方按「过去 N 根、不含当根」算好）。
+        `fresh` 表示这根**分数刚越过进场阈值**（从阈值内穿到阈值外）。
+
+        `fresh` 是为「出场之后还能再进」准备的。只看信号的话，出场后信号
+        往往还是 +1（趋势没结束），仓位就永远空着 —— 一条 20 年的趋势策略
+        会因为一次回撤退出而错过后面整段。真正的语义应该是「这一笔被止损了，
+        等下一次进场信号再进」，而进场信号就是分数重新越过阈值。
+        """
+        want = int(want)
+        if self.blocked:
+            if want == 0 or (self.pos != 0 and want == -self.pos):
+                self.blocked = False       # 信号自己走平 / 翻向：重新放行
+            elif fresh and want == self.pos:
+                # 同一方向但分数重新越过进场阈值：算一笔新交易
+                self.blocked = False
+            else:
+                return 0
+        if want != self.pos:
+            self.pos = want
+            self.entry = px if np.isfinite(px) else 0.0
+            self.best = 0.0
+            return self.pos
+        if self.pos == 0:
+            return 0
+        a = float(atr) if np.isfinite(atr) else 0.0
+        if a <= 0 or not np.isfinite(px) or not self.entry:
+            return self.pos
+
+        exc = self.pos * (px - self.entry) / a    # 浮盈，ATR 倍数（空头也转正）
+        if exc > self.best:
+            self.best = exc
+        hit = False
+        if self.mode == "tier":
+            allow = self.tiers[0][1]
+            for need, trail in self.tiers:
+                if self.best >= need:
+                    allow = trail
+            hit = (self.best - exc) >= allow
+        elif self.mode == "abs":
+            hit = (self.best - exc) >= float(self.cfg.exit_abs_atr)
+        elif self.mode == "box":
+            if np.isfinite(box_low) and np.isfinite(box_high):
+                if self.pos > 0:
+                    hit = px < box_low + self.buf * a
+                else:
+                    hit = px > box_high - self.buf * a
+        if hit:
+            self.pos = 0
+            self.blocked = True
+            self.n_exit += 1
+            return 0
+        return self.pos
+
+    def describe(self) -> str:
+        mode = self.mode
+        label = {"tier": "分档浮盈回撤", "abs": "绝对回撤",
+                 "box": "反向箱体突破"}.get(mode, mode)
+        if mode == "tier":
+            return (f"出场：{label}（" + "、".join(
+                f"浮盈≥{p:g}ATR 回撤{t:g}ATR" for p, t in self.tiers)
+                + f"），共平仓 {self.n_exit} 次")
+        if mode == "abs":
+            return (f"出场：{label}（从最高浮盈回撤 "
+                    f"{self.cfg.exit_abs_atr:g}ATR），共平仓 {self.n_exit} 次")
+        return (f"出场：{label}（箱体 {self.bars} 根，边界缓冲 {self.buf:g}ATR），"
+                f"共平仓 {self.n_exit} 次")
+
+
+def apply_exit_rules(
+    sig: np.ndarray,
+    df: pd.DataFrame,
+    cfg: FactorConfig,
+    score: np.ndarray | None = None,
+    entry: float = 0.0,
+) -> tuple[np.ndarray, str]:
+    """在阈值信号之上叠加 ATR 口径的出场规则。返回 (新信号, 说明)。
+
+    出场判定用**当根收盘**，而回测在**下一根开盘**执行（`run_backtest` 的
+    `target = roll(sig, 1)`）—— 和进场同一个口径，没有未来信息。
+
+    箱体边界只取**过去** N 根（`[i-bars, i)`，不含当根）：把当根算进去的话，
+    当根的低点天然就是「箱体下沿」，永远触发不了。
+
+    `score` / `entry` 传了才支持「出场后分数重新越过阈值就再进」（见
+    `ExitTracker.step` 的 `fresh`）。不传就是老行为：等信号自己归零或翻向。
+    """
+    s = np.asarray(sig, dtype=int)
+    mode = str(cfg.exit_mode or "score")
+    if mode == "score" or len(s) == 0:
+        return s, ""
+
+    close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
+    high = (pd.to_numeric(df["high"], errors="coerce").to_numpy(dtype=float)
+            if "high" in df.columns else close)
+    low = (pd.to_numeric(df["low"], errors="coerce").to_numpy(dtype=float)
+           if "low" in df.columns else close)
+    atr = _atr_array(df, cfg.exit_atr_n)
+    tracker = ExitTracker(cfg)
+
+    fresh = None
+    if score is not None and len(score) == len(s):
+        sc = np.abs(np.asarray(score, dtype=float))
+        e = float(entry)
+        prev = np.r_[np.nan, sc[:-1]]
+        # 从「阈值内」穿到「阈值外」的那一根。NaN（预热期）不算穿越
+        with np.errstate(invalid="ignore"):
+            fresh = (sc > e) & ~(prev > e)
+
+    out = s.copy()
+    for i in range(len(s)):
+        lo = hi = float("nan")
+        if i >= tracker.bars:
+            lo = float(np.nanmin(low[i - tracker.bars:i]))
+            hi = float(np.nanmax(high[i - tracker.bars:i]))
+        out[i] = tracker.step(int(s[i]), close[i], atr[i], lo, hi,
+                              bool(fresh[i]) if fresh is not None else False)
+    return out, tracker.describe()
+
+
 def _rolling_z(s: pd.Series, window: int) -> pd.Series:
     """对模型预测值再做一次 PIT 标准化，让 entry_z 在各模型间可比。"""
     return F.standardize(s, window=window, method="z")
@@ -426,6 +746,14 @@ def build_score(
     picked = list(keys)
     keys = F.filter_available(df, keys)
     if not keys:
+        # 两根原因要分开说：一种是这个标的真的没有这些数据（美股没有持仓量），
+        # 另一种是**行情太短**，所有因子都凑不出有效值。合成周期把第二种放大
+        # 了 —— 周线「近 1 年」只有五十来根，看着像「因子没数据」，其实是样本
+        # 不够，用户照着提示去换因子只会白折腾
+        if len(df) < max(60, int(cfg.window) // 2):
+            raise ValueError(
+                f"这段行情只有 {len(df)} 根，太短了算不出因子（标准化窗口要 "
+                f"{int(cfg.window)} 根）—— 把回测区间拉长，或者把窗口调小")
         raise ValueError("选中的因子在该标的上都没有足够数据（如美股无持仓量）")
 
     fmat = F.factor_frame(df, keys, window=cfg.window, method=cfg.method)
@@ -460,24 +788,61 @@ def build_score(
         note = _reverse_note(cfg, keys)
         if note:
             pack.notes.append(note)
+        note = _warmup_note(score, len(df), cfg)
+        if note:
+            pack.notes.append(note)
         return pack
 
     if mode == "multi":
         ori = _orientation_frame(fmat, fwd, cfg)
         signed = fmat * ori
-        score = signed.mean(axis=1, skipna=True).rename("score")
+        wmode = str(cfg.weight_mode or "equal")
+        wdesc = "等权"
+        if wmode == "ic":
+            w = rolling_ic_weights(fmat, fwd, cfg)
+            score = _weighted_mean(signed, w)
+            wdesc = f"滚动 IC 加权 · 每 {int(cfg.ic_rebal)} 根重算"
+        elif wmode == "custom":
+            w = pd.Series({k: float(cfg.weights.get(k, 1.0)) for k in signed.columns},
+                          dtype=float)
+            w = w.where(w > 0, 0.0)
+            if not (float(w.sum()) > 0):
+                w = pd.Series(1.0, index=signed.columns)
+                notes.append("权重全填了 0，已退回等权")
+            score = _weighted_mean(signed, w)
+            wdesc = "自定权重"
+        else:
+            score = signed.mean(axis=1, skipna=True).rename("score")
         n_rev = len(cfg.reversed_keys() & set(keys))
         pack = ScorePack(
             score=score, fmat=fmat, raw=rawf, orient=ori,
-            label=f"多因子等权 · {len(keys)} 个" + (f"（{n_rev} 个反转）" if n_rev else ""),
+            label=(f"多因子组合 · {len(keys)} 个（{wdesc}）"
+                   + (f"（{n_rev} 个反转）" if n_rev else "")),
         )
         pack.notes.extend(notes)      # 「剔除了哪几个因子」这类说明
         if cfg.orient == "auto":
-            pack.notes.append("各因子先按自身 PIT 方向取号，再等权平均")
+            pack.notes.append(f"各因子先按自身 PIT 方向取号，再{wdesc}合成")
             onote = _orient_note(ori, cfg)
             if onote:
                 pack.notes.append(onote)
+        if wmode == "custom":
+            used = [(k, float(cfg.weights.get(k, 1.0))) for k in keys]
+            pack.notes.append(
+                "权重：" + "、".join(
+                    f"{F.FACTORS[k].label if k in F.FACTORS else k} {v:g}"
+                    for k, v in used if v > 0)
+                + (f"（另 {sum(1 for _, v in used if v <= 0)} 个权重为 0，不参与合成）"
+                   if any(v <= 0 for _, v in used) else "")
+            )
+        elif wmode == "ic":
+            pack.notes.append(
+                f"权重按过去 {int(cfg.window)} 根的 |IC| 定，每 "
+                f"{int(cfg.ic_rebal)} 根更新一次（滞后 {int(cfg.horizon)} 期，无未来信息）"
+            )
         note = _reverse_note(cfg, keys)
+        if note:
+            pack.notes.append(note)
+        note = _warmup_note(score, len(df), cfg)
         if note:
             pack.notes.append(note)
         return pack
@@ -983,13 +1348,20 @@ def run_factor_strategy(
     else:
         sig = hysteresis(pack.score.to_numpy(), cfg.entry_z, cfg.exit_z)
 
+    notes = list(pack.notes)
+    # ATR 口径的出场规则：叠在阈值信号之上（`score` 模式 = 不叠加）。
+    # 带上分数和进场阈值，出场后分数重新越过阈值就能再进（见 ExitTracker.step）
+    sig, exit_note = apply_exit_rules(
+        sig, df, cfg, score=pack.score.to_numpy(dtype=float), entry=cfg.entry_z)
+    if exit_note:
+        notes.append(exit_note)
+
     out = df.copy()
     out["factor_score"] = pack.score
     for c in pack.raw.columns:
         out[f"f_{c}"] = pack.raw[c]
     out["signal"] = sig
 
-    notes = list(pack.notes)
     if cfg.orient == "auto" and mode in ("single", "multi"):
         flips = int((pack.orient.diff().abs() > 0).any(axis=1).sum()) if pack.orient is not None else 0
         if flips:
@@ -1228,13 +1600,18 @@ def run_pooled_strategy(
                                      cfg.entry_z, cfg.exit_z)
         else:
             sig = hysteresis(pack.score.to_numpy(), cfg.entry_z, cfg.exit_z)
+        # 出场规则逐品种各自判：ATR 是各品种自己的波动尺度，箱体也是各自的高低点
+        sig, exit_note = apply_exit_rules(
+            sig, df, cfg, score=pack.score.to_numpy(dtype=float), entry=cfg.entry_z)
         d = df.copy()
         d["factor_score"] = pack.score
         for c in pack.raw.columns:
             d[f"f_{c}"] = pack.raw[c]
         d["signal"] = sig
-        out[sym] = FactorOutcome(df=d, pack=pack, label=pack.label,
-                                 notes=list(pack.notes))
+        notes = list(pack.notes)
+        if exit_note:
+            notes.append(exit_note)
+        out[sym] = FactorOutcome(df=d, pack=pack, label=pack.label, notes=notes)
     return out
 
 

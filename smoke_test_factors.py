@@ -428,8 +428,14 @@ check("z 值被裁剪在 ±4 内", bool(z.dropna().abs().max() <= 4.0 + 1e-12),
 check("预热期是 NaN", bool(np.isnan(z.iloc[0])))
 
 zr = F.standardize(raw60, window=252, method="rank")
-check("rank 标准化落在 (-0.5, 0.5]",
-      bool(zr.dropna().min() > -0.5 - 1e-9 and zr.dropna().max() <= 0.5 + 1e-9))
+# 分位映射到 ±4，和 z 同量纲 —— 否则阈值滑杆（0.3~3.0）比分位上限还大，
+# 阈值一调过 0.5 就再也开不出仓
+check("rank 标准化落在 (−4, +4]",
+      bool(zr.dropna().min() > -4.0 - 1e-9 and zr.dropna().max() <= 4.0 + 1e-9),
+      f"min={float(zr.dropna().min()):.4f} max={float(zr.dropna().max()):.4f}")
+check("rank 的中位数是 0",
+      bool(abs(float(zr.dropna().median())) < 1.0),
+      f"median={float(zr.dropna().median()):.4f}")
 check("rank 标准化截断重算零差异",
       same_series(zr, F.standardize(F.raw(DF.iloc[:CUT], "mom_60"), 252, "rank"), CUT))
 

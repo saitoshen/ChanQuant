@@ -377,6 +377,20 @@ class StrategyConfig:
             return " ".join(bits)
         cfg = self.factor_cfg or {}
         bits = [f"窗口={cfg.get('window', 252)}", f"阈值={cfg.get('entry_z', 1.0)}"]
+        # 分位口径和 z-score 是同一条策略的两种算法，阈值一样结果差很多，
+        # 不写出来列表上两条会像重复项
+        if str(cfg.get("method") or "z") != "z":
+            bits.append("分位")
+        if self.factor_mode == "multi":
+            # 权重口径和出场规则对结果的影响不比窗口小：同样是 5 个因子，
+            # 等权和滚动 IC 加权是两条策略；出场换成 ATR 分档之后交易笔数
+            # 会少一大截。不写出来，列表里两条看起来像重复项
+            wm = str(cfg.get("weight_mode") or "equal")
+            bits.append({"equal": "等权", "custom": "自定权重",
+                         "ic": "IC 加权"}.get(wm, wm))
+        if str(cfg.get("exit_mode") or "score") != "score":
+            bits.append({"tier": "分档回撤出场", "abs": "ATR 回撤出场",
+                         "box": "箱体出场"}.get(str(cfg.get("exit_mode")), "ATR 出场"))
         if self.factor_mode == "ml":
             bits.append(f"模型={cfg.get('model', '')}")
             # 稀疏采样 / 合并训练都不在「窗口 / 阈值」里体现，而它们对结果的影响

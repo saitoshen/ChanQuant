@@ -347,7 +347,8 @@ register(Tool(
     prompt=(
         "**查行情**：`query_bars`。用户问「XX 最近怎么样 / 收多少 / 涨了多少」时用它，"
         "别用回测去间接算。`symbol` 填库里的代号（`RB_SHFE` 这种，见 `list_symbols`），"
-        "`period` 是 `1d` / `1d_tq` / `1h` / `5m` 之类。"
+        "`period` 是 `1d` / `1d_tq` / `1h` / `5m` 之类；`2d`（2 日）和 `1w`（周线）"
+        "由日线合成，不用单独下载。"
     ),
     max_turns=3,
 ))

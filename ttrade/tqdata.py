@@ -44,10 +44,24 @@ PERIODS: dict[str, tuple[str, int]] = {
     "4h": ("1h", 4),
 }
 
-# 展示顺序（GUI 的周期下拉框按这个排）
-PERIOD_ORDER = ["1d_tq", "5m", "15m", "30m", "1h", "2h", "4h"]
+# 比日线更粗的两档，由**日线合成**，不下载。
+#
+# 为什么不塞进上面的 `PERIODS`：那张表是「源周期 + 日内合并根数」，键全都能
+# 实时订阅（`strategy_runner.RT_SEC` 按**源周期**判门禁）。把 `2d` 塞进去，
+# 源周期会被判成 `1d`、门禁放行，然后实盘按一天一根跑 —— 回测是两天一根、
+# 实盘是一天一根，两边的分数永远对不上，而且不报错。所以单独一张表，实时
+# 门禁认不出来就自动挡住。
+#
+# 值 = 几根日线合成一根；0 表示「按自然周分组」而不是固定根数。
+MULTIDAY: dict[str, int] = {"2d": 2, "1w": 0}
+
+# 展示顺序（GUI 的周期下拉框按这个排）。2 日 / 周线紧挨着日线，因为它们是
+# 从日线合成出来的 —— 排在一起，用户一眼看得出这一组是「由日线粗化」。
+PERIOD_ORDER = ["2d", "1w", "1d_tq", "5m", "15m", "30m", "1h", "2h", "4h"]
 
 PERIOD_LABEL = {
+    "2d": "2 日",
+    "1w": "周线",
     "1d_tq": "日线",
     "5m": "5 分钟",
     "15m": "15 分钟",
@@ -58,13 +72,19 @@ PERIOD_LABEL = {
 }
 
 
+def is_multiday(period: str) -> bool:
+    """这个周期是不是「比日线更粗、由日线合成」的那两档。"""
+    return str(period or "") in MULTIDAY
+
+
 def is_daily(period: str) -> bool:
-    """这个周期是不是「一天一根」。
+    """这个周期的时间戳是不是只到**日精度**（一天一根，或由日线合成的更粗周期）。
 
     判断日线口径的地方（坐标轴格式、持仓天数、年化根数）原来都写 `== "1d"`，
     加了天勤日线之后必须两处都认，否则天勤日线的横轴会显示成 `00:00`。
+    2 日 / 周线的时间戳同样是日期，横轴也不能带时分。
     """
-    return period in ("1d", "1d_tq")
+    return period in ("1d", "1d_tq") or is_multiday(period)
 
 
 
@@ -75,7 +95,12 @@ def source_period(period: str) -> str:
     `PERIODS`）。所以补历史必须**按源周期**下：直接下 15m 存成 15m，既违背
     「周期是合并出来的」这套约定，读的时候也只会去找 5m —— 白下一场，界面上
     还是「没有数据」。1d 没有合并关系，原样返回。
+
+    2 日 / 周线的底料也是日线，所以返回 `1d` —— 但它们**不在 `PERIODS` 里**，
+    实时门禁按 `PERIODS` 查不到就会挡住（见 `MULTIDAY` 那段说明）。
     """
+    if is_multiday(period):
+        return "1d"
     return PERIODS.get(period, (period, 1))[0]
 
 
@@ -92,8 +117,18 @@ def switch_path(symbol: str, exchange: str) -> str:
     return os.path.join(tq_root(), "switch", f"{symbol}_{exchange}.csv")
 
 
+def daily_csv_path(symbol: str, exchange: str) -> str:
+    """期货日线 CSV（Tushare）。2 日 / 周线就是由它合成的。"""
+    return os.path.join(data_dir("cn"), f"{symbol}_{exchange}.csv")
+
+
 def has_period(symbol: str, exchange: str, period: str) -> bool:
     """仓库里有没有这个品种的这个周期。查 DuckDB，不再看 CSV。"""
+    if is_multiday(period):
+        # 合成周期不单独落盘：日线在就有
+        if tqstore.exists() and tqstore.bar_count(symbol, exchange, "1d"):
+            return True
+        return os.path.exists(daily_csv_path(symbol, exchange))
     if tqstore.exists() and tqstore.bar_count(symbol, exchange, PERIODS.get(period, (period, 1))[0]):
         return True
     return os.path.exists(main_path(symbol, exchange, period))
@@ -108,9 +143,16 @@ def available_periods(symbol: str, exchange: str) -> list[str]:
     src = tqstore.periods_of(symbol, exchange) if tqstore.exists() else set()
     out = []
     for p in PERIOD_ORDER:
+        if is_multiday(p):
+            continue          # 合成周期不落盘，单独判（见下面）
         need = PERIODS.get(p, (p, 1))[0]
         if need in src or os.path.exists(main_path(symbol, exchange, p)):
             out.append(p)
+    # 2 日 / 周线只要日线在就能合成。底料优先用 Tushare 日线 CSV —— 它比天勤
+    # 日线覆盖全（94 vs 78 个品种）、历史长（17 年 vs 10 年），周线合成下来
+    # 才够一个 252 根的因子窗口用
+    if has_period(symbol, exchange, "2d"):
+        out = [p for p in PERIOD_ORDER if is_multiday(p)] + out
     return out
 
 
@@ -157,6 +199,8 @@ def load_main(
 
     列：open/high/low/close/volume/open_oi/close_oi/adj_factor/trading_day。
     """
+    if is_multiday(period):
+        return _load_multiday(symbol, exchange, period, adjust, start, end)
     src, n = PERIODS.get(period, (period, 1))
     df = tqstore.load_bars(symbol, exchange, src, start, end) if tqstore.exists() else pd.DataFrame()
 
@@ -230,6 +274,96 @@ def merge_bars(df: pd.DataFrame, n: int) -> pd.DataFrame:
     out.index = pd.DatetimeIndex(idx.to_numpy())
     out.index.name = "datetime"
     _ = last_dt
+    return out
+
+
+def merge_days(df: pd.DataFrame, period: str = "2d") -> pd.DataFrame:
+    """把**日线**合成更粗的周期：2 日 / 周线。
+
+    - `2d`：按**行序两两成对**。不能按自然日分（周末和节假日会让「2 日」变成
+      跨四个自然日的一根），也不能从尾部往前配（每天新来一根，配对就整体错位
+      一格，同一段历史昨天算出来和今天算出来不是同一根 K 线）。
+    - `1w`：按 ISO 周（周一到周日）分组。这是**绝对**的分组键 —— 新来一根不会
+      让历史重新分组，所以周线在增量场景下是稳的；2 日线做不到这一点，实时段
+      因此不放行（见 `MULTIDAY` 和 `strategy_runner` 的门禁）。
+
+    OHLC 聚合口径与 `merge_bars` 一致：开取第一根、收取最后一根、高低取极值、
+    量额累加；index 用**组内最后一根**的时间（这根 bar 的收盘时刻），
+    `trading_day` 也取最后一根 —— 下游按它对期限结构 / 期权 IV，取第一天会
+    提前用上当时还没公布的数。
+
+    其余列（`adj_factor` / `price_scale` / 展期、期权这些衍生列 / `open_interest`）
+    一律取组内最后一根：它们都是「那一天的值」，不是流量，累加没有意义。
+    """
+    if df is None or df.empty or not is_multiday(period):
+        return df
+    d = df.copy()
+    if "trading_day" in d.columns:
+        day = pd.to_datetime(d["trading_day"])
+    else:
+        day = pd.Series(pd.DatetimeIndex(d.index), index=d.index)
+    if period == "1w":
+        key = day.dt.to_period("W")
+    else:
+        key = pd.Series(np.arange(len(d)) // max(1, int(MULTIDAY[period])), index=d.index)
+    d["_g"] = key.to_numpy()
+
+    agg: dict[str, str] = {}
+    for col in d.columns:
+        if col == "_g":
+            continue
+        if col == "open":
+            agg[col] = "first"
+        elif col == "high":
+            agg[col] = "max"
+        elif col == "low":
+            agg[col] = "min"
+        elif col in ("volume", "amount"):
+            agg[col] = "sum"
+        else:
+            agg[col] = "last"
+
+    g = d.groupby("_g", sort=True)
+    out = g.agg(agg)
+    idx = g.apply(lambda x: x.index[-1], include_groups=False)
+    out.index = pd.DatetimeIndex(idx.to_numpy())
+    out.index.name = df.index.name
+    # attrs 里挂着品种 / 交易所（`factors_ext` 靠它认品种，季节性、仓单、基差
+    # 那几片因子都从这儿取）。groupby 出来是个新 DataFrame，不显式搬一次的话
+    # 合成周期上这些因子会整列 NaN —— 而且不报错，只是「没数据」
+    try:
+        out.attrs.update(getattr(df, "attrs", None) or {})
+    except Exception:      # noqa: BLE001
+        pass
+    return out
+
+
+def _load_multiday(
+    symbol: str,
+    exchange: str,
+    period: str,
+    adjust: str = "qfq",
+    start=None,
+    end=None,
+) -> pd.DataFrame:
+    """2 日 / 周线：读日线，再合成。
+
+    底料是 **Tushare 日线 CSV**（`futures.load_local`），不是天勤日线。天勤日线
+    只覆盖 78 个品种、十年出头，周线合成下来五百多根，跑一个 252 根窗口的因子
+    就没剩几年可看了；Tushare 日线有 17 年、覆盖全部品种。
+
+    注意**先合成再按 start/end 切**：2 日线是「行序两两成对」，先切再合会让
+    不同的起始日期切出不同的配对，同一根历史 K 线在两张图上长得不一样。
+    """
+    from .futures import load_local as _load_daily
+
+    daily = _load_daily(symbol, exchange, data_dir("cn"), adjust=adjust)
+    out = merge_days(daily, period)
+    if start is not None:
+        out = out[out.index >= pd.Timestamp(start)]
+    if end is not None:
+        out = out[out.index <= pd.Timestamp(end)]
+    out.attrs["symbol"] = symbol
     return out
 
 

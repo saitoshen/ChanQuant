@@ -739,8 +739,16 @@ def standardize(
 ) -> pd.Series:
     """滚动标准化。**PIT 的核心**：统计量只取 ≤T 的窗口。
 
-    - `method="z"`   : 滚动 z-score，按 ±clip 截断（等价于温和的缩尾）
-    - `method="rank"` : 滚动分位，映射到 [-0.5, 0.5]，对异常值更稳健
+    两种口径**都落在 [−4, +4]**，所以进场阈值、离场阈值、稀疏触发的档位在
+    两种口径之间可以照抄 —— 换口径不用重调一遍参数。
+
+    - `method="z"`    : 滚动 z-score，按 ±clip 截断（等价于温和的缩尾）
+    - `method="rank"` : 滚动分位，线性映射到 ±4（分位 0.5 → 0，1.0 → +4）
+
+    分位这一档以前映射到 [−0.5, +0.5]，结果是**阈值滑杆和它根本对不上**：
+    滑杆最小 0.3、最大 3.0，而分数永远不超过 0.5 —— 阈值一到 0.5 就再也
+    开不出仓，界面上看起来就是「这个策略从来不交易」。同一个量纲之后这个
+    坑没了。
 
     不用全样本均值/标准差 —— 那是把未来的分布信息泄漏到今天。
     """
@@ -748,7 +756,10 @@ def standardize(
     mp = max(20, window // 4)
     roll = s.rolling(window, min_periods=mp)
     if method == "rank":
-        return (roll.rank(pct=True) - 0.5).astype(float)
+        # rank(pct=True) 落在 (0, 1]，减 0.5 再乘 8 就是 ±4。
+        # 分位天然免疫极端值（一个 10σ 的毛刺和 3σ 排同一档），
+        # 代价是丢掉幅度信息 —— 涨 2% 和涨 20% 在分数上可能一样
+        return ((roll.rank(pct=True) - 0.5) * 8.0).astype(float)
     m = roll.mean()
     sd = roll.std(ddof=1)
     z = _safe_div(s - m, sd)
