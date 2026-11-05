@@ -1818,6 +1818,94 @@ def _run() -> tuple[bool, list[str]]:
 
     check("机器学习实盘取信号（没有新 bar 也要能读到）", _ml_live_poll)
 
+    def _live_rule_filter():
+        """实盘信号必须和回测走同一条「规则 + 因子过滤」。
+
+        `_signal` 原来只跑规则、**完全不看 `factor_mode`**：回测里被因子否决掉
+        的那些开仓，实盘照开 —— 账户里真会多出那些仓位，而且两条曲线从第一天
+        起就不是同一条。这里挑一个「规则说要开、因子说不行」的时点，要求实盘
+        信号跟着因子走；顺带核一遍「没开过滤时实盘信号就是规则信号」。
+        """
+        from ttrade import replay as RP
+        from ttrade import strategy_runner as R
+        from ttrade import strategy_store as SStore
+        from ttrade.factor_strategy import run_rule_with_filter
+        from ttrade.strategies import run_strategy
+
+        df = _us_df()
+        base = SStore.StrategyConfig(symbol="X", family="rule", rule_key="donchian",
+                                     period="1d", sizing="unit", principal=100000.0)
+        filt = base.clone(factor_mode="multi", factor_keys=["mom_20", "mom_60"],
+                          factor_cfg={"window": 252, "entry_z": 1.0,
+                                      "exit_z": 0.3, "filter_mode": "hold"})
+        fc = RP.factor_config(filt.factor_cfg)
+        keys = list(filt.factor_keys)
+
+        class _H(R.PortfolioRunner):
+            """只借 `_signal` 这一条路：辅助列和跨周期行情都按「没有」处理。"""
+
+            def __init__(self):
+                self._aux_warned = set()
+                self._qfq_base = {}
+                self._log_fn = None
+
+            def _with_aux(self, st, d):
+                return d
+
+            def _period_extra(self, st, f):
+                return {}
+
+        h = _H()
+
+        class _St:
+            symbol = "X"
+            exchange = ""
+            underlying = ""
+            cfg = None
+
+        st = _St()
+
+        def _sig(cfg, d):
+            st.cfg = cfg
+            return h._signal(st, d)
+
+        rule_sig = run_strategy(df, "donchian", {})["signal"].to_numpy(int)
+        want_f = int(run_rule_with_filter(
+            df, rule_sig, "multi", keys, fc).df["signal"].iloc[-1])
+        got_f = _sig(filt, df)
+        got_p = _sig(base, df)
+        if got_f != want_f:
+            raise RuntimeError(
+                f"实盘过滤信号和回测口径不一致：实盘 {got_f} / 回测 {want_f}")
+        if got_p != int(rule_sig[-1]):
+            raise RuntimeError(f"没开过滤时实盘信号不该变：{got_p} / {int(rule_sig[-1])}")
+
+        # 找一个两者分歧的时点。找不到（数据换了）也不算失败 —— 上面那两条
+        # 已经证明实盘走的是同一条过滤口径，这一条只是把它钉到具体某根 bar 上
+        div = None
+        for cut in range(len(df) - 5, max(320, len(df) - 120), -1):
+            sub = df.iloc[:cut]
+            rs = run_strategy(sub, "donchian", {})["signal"].to_numpy(int)
+            a = int(rs[-1])
+            b = int(run_rule_with_filter(sub, rs, "multi", keys, fc).df["signal"].iloc[-1])
+            if a != b:
+                div = (cut, a, b)
+                break
+        if div is not None:
+            cut, a, b = div
+            sub = df.iloc[:cut]
+            if _sig(filt, sub) != b:
+                raise RuntimeError(
+                    f"分歧点上实盘没跟着因子走：{_sig(filt, sub)} / 过滤 {b}")
+            if _sig(base, sub) != a:
+                raise RuntimeError(f"分歧点上不过滤的实盘信号错了：{_sig(base, sub)} / {a}")
+            tail = f"分歧点 第 {cut} 根：规则 {a} → 过滤 {b}"
+        else:
+            tail = "样本里没有分歧点，只核了口径一致"
+        return f"实盘=回测同一套过滤，{tail}"
+
+    check("实盘信号走因子过滤", _live_rule_filter)
+
     def _factor_reverse():
         """逐因子反转：分数严格取负，仓位严格对调。"""
         import numpy as np
@@ -3723,6 +3811,54 @@ def _run() -> tuple[bool, list[str]]:
             win.exit_cfg = {}
             win._sync_exit_summary()
 
+            # ---- 规则 + 因子过滤：存进策略库再载回来，过滤条件必须还在 ----
+            #
+            # 这一段曾经整条丢掉：`_current_config` 只在「因子策略 / 截面」时才
+            # 把 `factor_mode` / `factor_keys` 写进配置，于是「规则 + 因子过滤」
+            # 存进去再载回来就变成一条**没有过滤**的规则策略 —— 回测笔数直接变
+            # 一个人，界面上还什么都看不出来（勾选框是空的，看着像「库里没存」）。
+            from ttrade import strategy_store as _SStore
+
+            win.cb_family.setCurrentIndex(win.cb_family.findData("rule"))
+            app.processEvents()
+            win.chk_filter.setChecked(True)
+            app.processEvents()
+            win.cb_filter_mode.setCurrentIndex(win.cb_filter_mode.findData("multi"))
+            win.cb_filter_when.setCurrentIndex(win.cb_filter_when.findData("hold"))
+            app.processEvents()
+            _cf = win._current_config()
+            if not (_cf.factor_mode == "multi" and _cf.factor_keys):
+                raise RuntimeError(
+                    f"因子过滤没进配置：mode={_cf.factor_mode!r} "
+                    f"keys={len(_cf.factor_keys or [])}")
+            if str((_cf.factor_cfg or {}).get("filter_mode") or "") != "hold":
+                raise RuntimeError("过滤时机（转差就离场）没进 factor_cfg")
+            if "因子过滤" not in _cf.strategy_label():
+                raise RuntimeError(f"策略库列表看不出这条带过滤：{_cf.strategy_label()}")
+            if "过滤" not in _cf.params_text():
+                raise RuntimeError(f"参数摘要里没有过滤条件：{_cf.params_text()}")
+            _n_keys = len(_cf.factor_keys)
+            # 清空界面，再从「库里读回来」的那份配置灌回去
+            win.chk_filter.setChecked(False)
+            app.processEvents()
+            win.apply_config(_SStore.StrategyConfig.from_dict(_cf.to_dict()))
+            app.processEvents()
+            if not (win.chk_filter.isChecked()
+                    and win.cb_filter_mode.currentData() == "multi"
+                    and win.cb_filter_when.currentData() == "hold"
+                    and win._filter_active()):
+                raise RuntimeError(
+                    f"过滤条件没载回来：勾={win.chk_filter.isChecked()} "
+                    f"mode={win.cb_filter_mode.currentData()} "
+                    f"when={win.cb_filter_when.currentData()}")
+            _cf2 = win._current_config()
+            if (_cf2.factor_mode, len(_cf2.factor_keys or [])) != ("multi", _n_keys):
+                raise RuntimeError(
+                    f"过滤条件载回来之后再存一次就变了：{_cf2.factor_mode} "
+                    f"{len(_cf2.factor_keys or [])} / 原来 {_n_keys}")
+            win.chk_filter.setChecked(False)
+            app.processEvents()
+
             # 弹窗本身：三档乱序要排好、回撤幅度写反要理顺，不然「浮盈越多
             # 回撤越小」这句话在界面上是假的，而规则会照错的跑
             from gui.exit_dialog import ExitRuleDialog, summarize
@@ -3759,7 +3895,8 @@ def _run() -> tuple[bool, list[str]]:
                          "权重三档（等权/自定/IC）都真起作用且能往返，"
                          "分位口径也映射到 ±4、对毛刺免疫且能往返，"
                          "分档回撤比绝对回撤更早平仓、独立止损与各口径叠加且不跟浮盈抬、"
-                         "只勾止损也能往返、出场规则能往返")
+                         "只勾止损也能往返、出场规则能往返、"
+                         "规则+因子过滤能往返")
         except Exception as exc:      # noqa: BLE001
             trig_ok, trig_info = False, f"{type(exc).__name__}: {exc}"
         if not trig_ok:

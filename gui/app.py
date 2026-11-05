@@ -4739,7 +4739,15 @@ class MainWindow(QMainWindow):
             sym, ex = skey, ""
         is_factor = self.family == FAMILY_FACTOR
         is_cross = self.family == FAMILY_CROSS
-        fc = self._factor_cfg() if (is_factor or is_cross) else None
+        # 「规则策略 + 因子过滤」也要把因子那一组字段带上。
+        #
+        # 这里原来只看 `is_factor or is_cross`，于是过滤用的因子、过滤方式、
+        # 过滤时机**一个都没进配置**：存进策略库再载回来就是一条没有过滤的
+        # 规则策略，回测结果当然对不上（用户报的「夜盘策略存进去，再加载就
+        # 没有这个设置」就是这个）。`replay.run` 判「有没有过滤」看的是
+        # `factor_mode` 非空，所以只要它空着，整条过滤就凭空消失
+        has_factor = is_factor or is_cross or self._filter_active()
+        fc = self._factor_cfg() if has_factor else None
         _cx = self._cross_new_params()
         return SStore.StrategyConfig(
             name=self.ed_cfg_name.text().strip(),
@@ -4750,8 +4758,8 @@ class MainWindow(QMainWindow):
             rule_key=self.cb_strategy.currentData() or "",
             rule_params=self._current_params(),
             rule_reverse=self._rule_reverse(),
-            factor_mode=self.factor_mode if (is_factor or is_cross) else "",
-            factor_keys=self._selected_factor_keys() if (is_factor or is_cross) else [],
+            factor_mode=self.factor_mode if has_factor else "",
+            factor_keys=self._selected_factor_keys() if has_factor else [],
             factor_reverse={k: True for k in self._reversed_factor_keys()},
             factor_cfg=dict(vars(fc)) if fc is not None else {},
             sizing=self.cb_size.currentData() or "capital",
@@ -4853,6 +4861,26 @@ class MainWindow(QMainWindow):
             self._apply_factor_keys(cfg.factor_keys, cfg.factor_reverse,
                                     (cfg.factor_cfg or {}).get("factor_periods"))
             self._apply_factor_cfg(cfg.factor_cfg)
+
+        if cfg.family == FAMILY_RULE:
+            # 规则策略 + 因子过滤：`factor_mode` 非空就说明这份配置带着过滤条件
+            # （`replay.run` 用的是同一个判据）。勾选框、过滤方式、过滤时机、
+            # 因子清单都得灌回去 —— 以前这一段完全没有，载入之后界面上过滤是
+            # 关着的，跟配置里那份对不上，用户只能以为「策略库里没存」
+            on = bool(cfg.factor_mode)
+            self.chk_filter.blockSignals(True)
+            self.chk_filter.setChecked(on)
+            self.chk_filter.blockSignals(False)
+            if on:
+                fm = self.cb_filter_mode.findData(cfg.factor_mode)
+                if fm >= 0:
+                    self.cb_filter_mode.setCurrentIndex(fm)
+                self._apply_factor_keys(cfg.factor_keys, cfg.factor_reverse,
+                                        (cfg.factor_cfg or {}).get("factor_periods"))
+                # `filter_mode`（否决 / 延后 / 离场）在 `_apply_factor_cfg` 里
+                self._apply_factor_cfg(cfg.factor_cfg)
+            # 信号被屏蔽过，面板的显隐 / 标题要手动同步一次
+            self._sync_factor_panel()
 
         if cfg.family == FAMILY_CROSS:
             # 品种勾选已经在上面统一恢复过了（`cfg.symbols`），这里只处理截面
@@ -4994,7 +5022,11 @@ class MainWindow(QMainWindow):
             except (TypeError, ValueError):
                 continue
         for key, cb in (("model", self.cb_fmodel), ("orient", self.cb_forient),
-                        ("method", getattr(self, "cb_fmethod", None))):
+                        ("method", getattr(self, "cb_fmethod", None)),
+                        # 过滤时机（否决 / 延后 / 离场）。`_factor_cfg()` 一直在
+                        # 往外写它，这里却没读回来 —— 「规则 + 因子过滤」存进
+                        # 策略库再载入，三个时机永远回到默认的「只在开仓时否决」
+                        ("filter_mode", self.cb_filter_when)):
             if cb is None:
                 continue
             v = cfg.get(key)

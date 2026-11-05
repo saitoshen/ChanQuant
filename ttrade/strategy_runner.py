@@ -493,7 +493,10 @@ class PortfolioRunner:
 
     def _uses_aux(self) -> bool:
         for st in self._slots.values():
-            if st.cfg.family == "factor":
+            # 「规则 + 因子过滤」的因子同样要衍生列，不能只看 factor 族
+            uses = st.cfg.family == "factor" or (
+                st.cfg.family == "rule" and bool(st.cfg.factor_mode or ""))
+            if uses:
                 for k in (st.cfg.factor_keys or []):
                     if k.startswith(self._AUX_PREFIXES):
                         return True
@@ -785,6 +788,19 @@ class PortfolioRunner:
             return
         if on and not st.cfg.rule_key and st.cfg.family == "rule":
             st.error = "这条策略没有选规则"
+            return
+        # 「规则 + 因子过滤」：过滤条件是策略的一半，缺了它跑出来的就是另一条策略
+        if (on and st.cfg.family == "rule" and (st.cfg.factor_mode or "")
+                and not st.cfg.factor_keys):
+            st.error = "这条策略开了因子过滤，但一个过滤因子都没选"
+            return
+        # 机器学习过滤要走 walk-forward 重训，每来一根新 bar 就得重算一遍
+        # （分钟级上是几十秒），实盘来不及。宁可拦下来，也不能默默按**不过滤**
+        # 的规则信号下单 —— 那等于换了一条策略在跑
+        if (on and st.cfg.family == "rule"
+                and (st.cfg.factor_mode or "") == "ml"):
+            st.error = ("「机器学习」过滤暂不支持实盘：每根 bar 都要重训，"
+                        "来不及下单。把过滤方式换成单因子 / 多因子组合再开")
             return
         if on and st.cfg.family == "factor" and not st.cfg.factor_keys:
             st.error = "这条因子策略没有选中因子"
@@ -1162,27 +1178,49 @@ class PortfolioRunner:
         几手 —— 两边各写一份的话，「回测赚钱、实盘亏钱」永远说不清是策略不行
         还是实现不一致。
 
+        **「规则 + 因子过滤」走 `run_rule_with_filter`**：以前这里只跑规则、
+        完全不看 `factor_mode`，于是回测里被否决掉的那些开仓，实盘照开 ——
+        账户里真会多出那些仓位，而且两条曲线从第一天起就不是同一条。
+
         **机器学习不走这里**（实盘）：`_refresh_signal` 会把 ML 交给后台线程，
         这里只留一条同步的慢路径给离线测试 / 脚本用。
 
         `orient="auto"` 在实时段有个天然缺陷：方向是按全样本 IC 的符号定的，
         样本一变就可能翻。用户要是没显式指定方向，日志里会看到它翻。
         """
-        if st.cfg.family == "factor":
+        mode = st.cfg.factor_mode or ""
+        # 要算因子的三种情况：因子策略本身、规则 + 因子过滤。衍生列（展期 /
+        # 期权）得先挂上，不然那几个因子整列 NaN，过滤会把所有信号都否掉
+        needs_factor = st.cfg.family == "factor" or (
+            st.cfg.family == "rule" and bool(mode))
+        if needs_factor:
             if len(df) < FACTOR_MIN_BARS:
                 return 0                 # 历史不够，分数全是 NaN，先空仓等数据
             df = self._with_aux(st, df)
+
+        if st.cfg.family == "factor":
             fc = replay.factor_config(st.cfg.factor_cfg or {})
             out = fstrat.run_factor_strategy(
-                df, st.cfg.factor_mode or "single", list(st.cfg.factor_keys or []),
+                df, mode or "single", list(st.cfg.factor_keys or []),
                 fc, extra=self._period_extra(st, fc), base_period=st.cfg.period,
             )
             sig = out.df["signal"].iloc[-1]
             return 0 if pd.isna(sig) else int(sig)
 
-        out = run_strategy(df, st.cfg.rule_key, st.cfg.rule_params,
-                           reverse=bool(getattr(st.cfg, "rule_reverse", False)))
-        sig = out["signal"].iloc[-1]
+        rule = run_strategy(df, st.cfg.rule_key, st.cfg.rule_params,
+                            reverse=bool(getattr(st.cfg, "rule_reverse", False)))
+        if not needs_factor:
+            sig = rule["signal"].iloc[-1]
+            return 0 if pd.isna(sig) else int(sig)
+
+        # 规则 + 因子过滤：规则信号是「原料」，过滤只做减法（否决 / 延后 / 离场）
+        fc = replay.factor_config(st.cfg.factor_cfg or {})
+        out = fstrat.run_rule_with_filter(
+            df, rule["signal"].to_numpy(int), mode or "single",
+            list(st.cfg.factor_keys or []), fc,
+            extra=self._period_extra(st, fc), base_period=st.cfg.period,
+        )
+        sig = out.df["signal"].iloc[-1]
         return 0 if pd.isna(sig) else int(sig)
 
     def _period_extra(self, st: SlotState, fc) -> dict:

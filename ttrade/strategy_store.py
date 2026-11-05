@@ -363,7 +363,13 @@ class StrategyConfig:
             name = spec.label if spec else (self.rule_key or "未选策略")
             # 反向要写进名字里：列表里两条同名策略一条正着做一条反着做，
             # 不标出来的话只能靠点进去看，而它们的曲线是镜像的
-            return f"{name}（反向）" if self.rule_reverse else name
+            if self.rule_reverse:
+                name = f"{name}（反向）"
+            # 「规则 + 因子过滤」也要标出来：库里「唐奇安」和「唐奇安 + 因子过滤」
+            # 两行的参数一模一样，交易笔数却能差一半，不标就是两条重复项
+            if self.factor_mode and self.factor_keys:
+                return f"{name} + 因子过滤"
+            return name
         mode = {"single": "单因子", "multi": "多因子", "ml": "机器学习"}.get(
             self.factor_mode, self.factor_mode or "因子"
         )
@@ -373,7 +379,22 @@ class StrategyConfig:
     def params_text(self) -> str:
         """参数摘要，给表格的「参数」列用。"""
         if self.family == "rule":
-            return " ".join(f"{k}={v}" for k, v in (self.rule_params or {}).items())
+            bits = [f"{k}={v}" for k, v in (self.rule_params or {}).items()]
+            # 因子过滤的条件不写出来的话，库里两条「参数一模一样」的规则策略
+            # 看起来就是重复项，而实际交易笔数能差一半
+            if self.factor_mode and self.factor_keys:
+                _fc = self.factor_cfg or {}
+                mode = {"single": "单因子", "multi": "多因子",
+                        "ml": "机器学习"}.get(self.factor_mode, self.factor_mode)
+                when = {"entry": "开仓否决", "delay": "转好再进",
+                        "hold": "转差离场"}.get(
+                    str(_fc.get("filter_mode") or "entry"), "开仓否决")
+                bits.append(f"过滤{mode}·{len(self.factor_keys)}因子·{when}")
+                _xp = _cross_period_names(list(self.factor_keys or []),
+                                          _fc.get("factor_periods"))
+                if _xp:
+                    bits.append("跨周期·" + "/".join(_xp))
+            return " ".join(bits)
         if self.family == "cross":
             mode = {"single": "单因子", "multi": "多因子", "ml": "机器学习"}.get(
                 self.factor_mode, self.factor_mode or "多因子")
