@@ -256,15 +256,33 @@ class PeriodButton(QToolButton):
         if not self._quiet:
             self.changed.emit()
 
+    def _label(self, ps: list[str]) -> str:
+        """按钮上的字。列宽只有 58px，放不下就一层层退化。
+
+        「本周期+日线+周线」这种全称一定放不下；短名拼（本+日+周）多数时候够，
+        四档以上就只剩「N 档」了 —— 完整的勾选永远在菜单和 tooltip 里，按钮上
+        只需要「这行跟别人不一样」这个信息。
+        """
+        if ps == [""]:
+            return "本周期"
+        shorts = [_short_period(p) for p in ps]
+        room = max(0, self.width() - 8)
+        fm = self.fontMetrics()
+        # 「本+日+周」放不下就换细一点的间隔号（本·日·周），再放不下就只报档数
+        for sep in ("+", "·"):
+            txt = sep.join(shorts)
+            if room <= 0 or fm.horizontalAdvance(txt) <= room:
+                return txt
+        return f"{len(ps)} 档"
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt 的命名
+        super().resizeEvent(event)
+        # 宽度变了要重算一次：`_label` 是按当前宽度决定用全名还是「N 档」的
+        self._refresh()
+
     def _refresh(self) -> None:
         ps = self.periods() or [""]
-        # 列宽只有 84px：「本周期+日线+周线」这种全称会被省略号截掉，反而看不出
-        # 勾了什么。多档时用短名拼（本+日+周），单档「本周期」保留全称
-        if ps == [""]:
-            txt = "本周期"
-        else:
-            txt = "+".join(_short_period(p) for p in ps)
-        self.setText(txt)
+        self.setText(self._label(ps))
         names = [PERIOD_LABEL.get(p, p) for p in ps if p]
         self.setToolTip(
             "这个因子在哪些周期上各算一份。\n\n"
@@ -2225,10 +2243,14 @@ class MainWindow(QMainWindow):
         for _c in (COL_PERIOD, COL_USE, COL_REV, COL_W):
             hh.setSectionResizeMode(_c, QHeaderView.Fixed)
         hh.setFixedHeight(22)
-        self.tbl_fmulti.setColumnWidth(COL_PERIOD, 84)
-        self.tbl_fmulti.setColumnWidth(COL_USE, 30)
-        self.tbl_fmulti.setColumnWidth(COL_REV, 30)
-        self.tbl_fmulti.setColumnWidth(COL_W, 46)
+        # 四列固定宽度，剩下全给「因子」——因子名最长能到 288px（
+        # 「时段 · 非活跃时段反转 13:30-14:00」），而侧边栏可视宽度只有三百多，
+        # 右边这几列每省一个像素，名字就多露一个字。周期 52 刚好放得下「本周期」
+        # 和「本+日」，再长由 `PeriodButton._label` 退化成「N 档」
+        self.tbl_fmulti.setColumnWidth(COL_PERIOD, 52)
+        self.tbl_fmulti.setColumnWidth(COL_USE, 24)
+        self.tbl_fmulti.setColumnWidth(COL_REV, 24)
+        self.tbl_fmulti.setColumnWidth(COL_W, 30)
         self.tbl_fmulti.setColumnHidden(COL_W, True)
         self._fill_multi_table()
         sf.addWidget(self.tbl_fmulti)
@@ -3215,9 +3237,12 @@ class MainWindow(QMainWindow):
                     continue
                 r = self.tbl_fmulti.rowCount()
                 self.tbl_fmulti.insertRow(r)
-                name = QTableWidgetItem(f"{cat} · {spec.label}")
+                full = f"{cat} · {spec.label}"
+                name = QTableWidgetItem(full)
                 name.setData(Qt.UserRole, k)
-                name.setToolTip(spec.desc)
+                # 列宽有限，长名字会被省略号截掉。悬停先把**全名**给出来（desc
+                # 太长，放第二段），至少能确认这一行到底是哪个因子
+                name.setToolTip(f"{full}\n\n{spec.desc}")
                 # 显式去掉 ItemIsEditable：表格为了「权重」列开了双击编辑，
                 # 名字列默认是可编辑的，不改的话双击就能把因子名改乱
                 name.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
