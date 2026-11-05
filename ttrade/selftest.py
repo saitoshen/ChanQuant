@@ -409,6 +409,98 @@ def _run() -> tuple[bool, list[str]]:
 
     check("策略回测", _backtest)
 
+    def _trade_notes():
+        """交易记录的备注：进场策略 / 出场原因，外加累计盈亏的口径。
+
+        三条都不难错、错了又都不好发现，所以单列一项：
+        - 引擎的兜底原因（策略名 / 信号离场 / 信号反向）
+        - 策略写进 df 的逐根原因，必须按**决策根**取（差一根就把原因安到
+          另一根上，界面上看不出错，只会觉得「这次平得莫名其妙」）
+        - 累计盈亏是复利连乘，不是百分比相加
+        """
+        from ttrade.backtest import BacktestConfig, run_backtest
+        import numpy as np
+        import pandas as pd
+
+        idx = pd.date_range("2021-01-01", periods=40, freq="D")
+        px = np.r_[np.full(10, 100.0), np.linspace(100, 120, 15),
+                   np.linspace(120, 105, 15)]
+        base = pd.DataFrame({"open": px, "high": px + 1, "low": px - 1,
+                             "close": px,
+                             "signal": np.r_[np.zeros(5, int), np.ones(30, int),
+                                             np.zeros(5, int)]}, index=idx)
+        r = run_backtest(base, BacktestConfig(), label="唐奇安")
+        if not r.trades:
+            raise RuntimeError("样本没产生交易，这一项失去意义")
+        t0 = r.trades[0]
+        if t0.entry_note != "唐奇安":
+            raise RuntimeError(f"进场原因没兜底成策略名：{t0.entry_note!r}")
+        if t0.exit_note != "信号离场":
+            raise RuntimeError(f"出场原因没兜底：{t0.exit_note!r}")
+
+        # 反向：信号从 +1 直接到 -1，出场原因该是「信号反向」而不是「信号离场」
+        flip = base.copy()
+        flip["signal"] = np.r_[np.ones(20, int), -np.ones(20, int)]
+        rf = run_backtest(flip, BacktestConfig(), label="双均线")
+        if not rf.trades or rf.trades[0].exit_note != "信号反向":
+            raise RuntimeError(
+                f"反向时出场原因不对：{rf.trades[0].exit_note if rf.trades else '没有交易'}")
+
+        # 策略自己写的原因要按决策根取：信号在第 6 根（下标 5）由 0 变 1，
+        # 进场发生在第 7 根开盘，原因必须来自下标 5 那根（决策根）；
+        # 平仓同理，信号在下标 35 由 1 变 0，平仓在下标 36 开盘
+        noted = base.copy()
+        noted["exit_note"] = [""] * len(base)
+        noted["entry_note"] = [""] * len(base)
+        noted.iloc[5, noted.columns.get_loc("entry_note")] = "第 6 根决策进场"
+        noted.iloc[35, noted.columns.get_loc("exit_note")] = "第 36 根决策离场"
+        noted.iloc[36, noted.columns.get_loc("exit_note")] = "错位了"
+        rn = run_backtest(noted, BacktestConfig(), label="x")
+        if not rn.trades:
+            raise RuntimeError("带备注列的样本没产生交易")
+        tn = rn.trades[0]
+        if tn.entry_note != "第 6 根决策进场" or tn.exit_note != "第 36 根决策离场":
+            raise RuntimeError(
+                f"逐根原因没按决策根取：进场 {tn.entry_note!r} / 出场 {tn.exit_note!r}")
+
+        # 因子策略：两列都要有，出场原因要写清是哪条口径
+        from ttrade import factor_strategy as FS
+        from ttrade import factors as F
+
+        df_f = _us_df()
+        key = "mom_20" if "mom_20" in F.FACTORS else next(iter(F.FACTORS))
+        cfg_f = FS.FactorConfig(window=60, entry_z=1.0, exit_z=0.3,
+                                exit_mode="tier",
+                                exit_tiers=[[2.0, 2.0], [4.0, 1.2], [6.0, 0.8]],
+                                exit_sl=True, exit_sl_atr=2.5)
+        out_f = FS.run_factor_strategy(df_f, "single", [key], cfg_f)
+        d_f = out_f.df
+        if "entry_note" not in d_f.columns or "exit_note" not in d_f.columns:
+            raise RuntimeError("因子策略没往 df 里写 entry_note / exit_note")
+        ent = d_f.loc[d_f["entry_note"].astype(bool), "entry_note"]
+        ext = d_f.loc[d_f["exit_note"].astype(bool), "exit_note"]
+        if ent.empty:
+            raise RuntimeError("因子策略一条进场原因都没写")
+        if not str(ent.iloc[0]).startswith("因子分"):
+            raise RuntimeError(f"进场原因没写分数：{ent.iloc[0]!r}")
+        if ext.empty:
+            raise RuntimeError("开了分档回撤却一条出场原因都没写")
+        if "分档浮盈回撤" not in str(ext.iloc[0]):
+            raise RuntimeError(f"出场原因没写清口径：{ext.iloc[0]!r}")
+
+        # 累计盈亏：复利连乘。两笔 +10% / −10% 连乘是 −1%，相加是 0%
+        class _T:
+            def __init__(self, ret):
+                self.ret = ret
+
+        from gui.result_view import cumulative_returns
+
+        cc = cumulative_returns([_T(0.10), _T(-0.10)])
+        if abs(cc[0] - 0.10) > 1e-12 or abs(cc[1] + 0.01) > 1e-12:
+            raise RuntimeError(f"累计盈亏不是复利连乘：{cc}")
+        return (f"兜底 {t0.entry_note}/{t0.exit_note}、反向 {rf.trades[0].exit_note}、"
+                f"决策根对齐、因子写入口径、累计按笔复利")
+
     def _us_df():
         """自检里反复要用的一份行情，按需加载一次就缓存。"""
         nonlocal _cache
@@ -419,6 +511,79 @@ def _run() -> tuple[bool, list[str]]:
                            if f.endswith(".csv") and not f.startswith("_"))
             _cache["us"] = load_local(cands[0], data_dir("us"))
         return _cache["us"]
+
+    # 放在 `_us_df` 之后：`check()` 是立即执行的，定义在前会拿不到这个闭包
+    check("交易记录备注与累计盈亏", _trade_notes)
+
+    def _lib_name_rules():
+        """策略库存入时的两种重名。
+
+        规则不一样，混在一起就一定会有一边做错：
+
+        - 撞**内置模板**的名字 → 不许存。左侧策略库把内置和「我的」分两组列，
+          同名之后谁也指代不清
+        - 撞**自己库里**的一条 → 可以存，覆盖它。覆盖要**原地替换**（位置、
+          创建时间、sid 都不变），换个新 sid 的话组合和 Agent 那边就指向一个
+          不存在的 id 了
+        """
+        import tempfile
+
+        from ttrade import strategy_store as S
+
+        tmp = tempfile.mkdtemp(prefix="cq_lib_")
+        old = S.LIB_FILE
+        S.LIB_FILE = os.path.join(tmp, "lib.json")
+        try:
+            def mk(name):
+                return S.StrategyConfig(symbol="RB_SHFE", name=name)
+
+            first = S.add_to_library(mk("白银动量60-1h"))
+            try:
+                S.add_to_library(mk("白银动量60-1h"))
+                raise RuntimeError("同名自定义策略没被拦下来")
+            except S.NameConflict as exc:
+                if exc.builtin or exc.item is None:
+                    raise RuntimeError(f"自定义重名被判成了内置：{exc}")
+            again = S.add_to_library(mk("白银动量60-1h"), overwrite=True)
+            lib = S.load_library()
+            if len(lib) != 1:
+                raise RuntimeError(f"覆盖之后库里变成了 {len(lib)} 条")
+            if lib[0].sid != first.sid or again.sid != first.sid:
+                raise RuntimeError("覆盖换了 sid（组合和 Agent 那边会指向不存在的 id）")
+
+            # 改名撞车：把这一条改叫别人的名字。要拦，而且**不能**给 item ——
+            # 给了界面就会弹「要覆盖吗」，点了覆盖又回到同一条分支，转一圈
+            # 还是存不进去
+            S.add_to_library(mk("碳酸锂动量60-5m"))
+            first.name = "碳酸锂动量60-5m"
+            try:
+                S.add_to_library(first)
+                raise RuntimeError("改名撞车没被拦下来")
+            except S.NameConflict as exc:
+                if exc.item is not None or exc.builtin:
+                    raise RuntimeError("改名撞车不该让界面去问「覆盖吗」")
+            first.name = "白银动量60-1h"
+
+            tpl_name = S.TPL.names()[0]
+            try:
+                S.add_to_library(mk(tpl_name))
+                raise RuntimeError("和内置策略重名却存进去了")
+            except S.NameConflict as exc:
+                if not exc.builtin:
+                    raise RuntimeError(f"内置重名没标 builtin：{exc}")
+
+            # 从模板另存是「另存到我的」，不该被自己那条内置名挡住，自动编号
+            t = S.TPL.to_config(S.TPL.keys()[0])
+            t.symbol = "RB_SHFE"
+            copy = S.add_to_library(t)
+            if S.norm_name(copy.title()) in S.builtin_names():
+                raise RuntimeError(f"模板副本的名字和内置撞上了：{copy.title()}")
+            return (f"自定义重名要确认、覆盖原地替换（{len(lib)} 条、sid 不变）、"
+                    f"内置重名拦住（{tpl_name}）、模板副本自动编号为「{copy.title()}」")
+        finally:
+            S.LIB_FILE = old
+
+    check("策略库存入的重名规则", _lib_name_rules)
 
     def _factor_lib():
         from ttrade import factors as F
@@ -588,6 +753,185 @@ def _run() -> tuple[bool, list[str]]:
         return f"单因子 · {F.FACTORS[F.DEFAULT_SINGLE].label}，{held} 根持仓"
 
     check("因子策略（单因子）", _factor_strategy)
+
+    def _factor_exit_z():
+        """离场阈值取负：放宽的是离场、拉长的是持仓，不能顺手把进场也改了。"""
+        import numpy as np
+
+        from ttrade import factor_strategy as FS
+
+        # 1. 负值不能被归一化夹回 0。界面上拖到 -1、跑出来还是 0，是那种
+        #    「改了参数但结果一模一样」的静默失败，最难查
+        if abs(FS.FactorConfig(exit_z=-1.0).normalized().exit_z + 1.0) > 1e-9:
+            raise RuntimeError("离场阈值 -1.0 被归一化改掉了")
+        if abs(FS.FactorConfig(exit_z=-5.0).normalized().exit_z + 2.0) > 1e-9:
+            raise RuntimeError("离场阈值下限应为 -2")
+        # 2. 上限仍压在进场阈值以内：倒挂之后分数刚越过进场线就满足出场条件，
+        #    信号每根都在开平之间抖
+        if abs(FS.FactorConfig(entry_z=0.5, exit_z=2.0).normalized().exit_z - 0.5) > 1e-9:
+            raise RuntimeError("离场阈值没有压在进场阈值以内")
+
+        # 3. 多单：分数 +2 站住，回落到 -0.5，再跌到 -1.5。
+        #    exit=0.3 在回落那根就平；exit=-1.0 要等到 -1.5。
+        #    看「最后一根多头」而不是「第一根空仓」：分数直接跌到 -1.5 时
+        #    同一根就反手做空了，pos 是 -1 不是 0
+        s = np.r_[np.full(10, np.nan), np.full(6, 2.0),
+                  np.full(6, -0.5), np.full(4, -1.5)]
+        tight = FS.hysteresis(s, 1.0, 0.3)
+        loose = FS.hysteresis(s, 1.0, -1.0)
+        k_tight = int(np.max(np.flatnonzero(tight == 1)))
+        k_loose = int(np.max(np.flatnonzero(loose == 1)))
+        if (k_tight, k_loose) != (15, 21):
+            raise RuntimeError(
+                f"负阈值没拉长持仓：exit=0.3 拿到第 {k_tight} 根、"
+                f"exit=-1 拿到第 {k_loose} 根（应为 15 / 21）")
+
+        # 4. 空头要对称：分数 -2 站住，回升到 +0.5，再涨到 +1.5
+        s2 = np.r_[np.full(10, np.nan), np.full(6, -2.0),
+                   np.full(6, 0.5), np.full(4, 1.5)]
+        a2 = FS.hysteresis(s2, 1.0, 0.3)
+        b2 = FS.hysteresis(s2, 1.0, -1.0)
+        if (int(np.max(np.flatnonzero(a2 == -1))),
+                int(np.max(np.flatnonzero(b2 == -1)))) != (15, 21):
+            raise RuntimeError("空头的负离场阈值不对称")
+
+        # 5. 实盘逐根推进的那份状态机必须和回测同一套判据。两处各写一遍、
+        #    只有一处放开了负值的话，回测拿着、实盘平掉，没有任何线索可查
+        import types
+
+        from ttrade import ml_artifact as MA
+
+        fake = types.SimpleNamespace(
+            cfg=FS.FactorConfig(entry_z=1.0, exit_z=-1.0).normalized(),
+            state=types.SimpleNamespace(cur=0),
+        )
+        step = types.MethodType(MA.LivePredictor._hysteresis_step, fake)
+        live = np.asarray([step(float(v)) for v in s], dtype=int)
+        if not np.array_equal(live, loose):
+            raise RuntimeError("实盘状态机和回测 hysteresis 在负阈值下不一致")
+        return (f"归一化保留 −1、下限 −2、上限压进场；多空都拿到第 21 根"
+                f"（exit=0.3 只到第 15 根）；实盘同步")
+
+    check("离场阈值取负（持仓更长）", _factor_exit_z)
+
+    def _factor_no_score():
+        """禁止分数出场：离场阈值不参与，但反向信号和 ATR 规则照旧。"""
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factor_strategy as FS
+
+        # 1. 归一化。一条出场规则都没有的组合要自动关掉 —— 否则仓位会一直
+        #    拿到回测结束，而界面上那个勾还亮着
+        if FS.FactorConfig(exit_mode="score", exit_no_score=True).normalized().exit_no_score:
+            raise RuntimeError("没有任何 ATR 规则时「禁止分数出场」应该被关掉")
+        if not FS.FactorConfig(exit_mode="score", exit_sl=True,
+                               exit_no_score=True).normalized().exit_no_score:
+            raise RuntimeError("只开止损时「禁止分数出场」是有效配置，不该被关掉")
+        if not FS.FactorConfig(exit_mode="tier",
+                               exit_no_score=True).normalized().exit_no_score:
+            raise RuntimeError("选了分档回撤时「禁止分数出场」不该被关掉")
+
+        # 2. 分数回落到阈值内：默认口径平仓，勾了「禁止分数出场」就不平
+        n = 40
+        px = np.r_[np.full(10, 100.0), 100 + np.arange(1, 11), np.full(20, 110.0)]
+        df = pd.DataFrame({"open": px, "high": px + 0.5, "low": px - 0.5,
+                           "close": px},
+                          index=pd.date_range("2021-01-01", periods=n, freq="D"))
+        sig = np.r_[np.zeros(10, dtype=int), np.ones(10, dtype=int),
+                    np.zeros(20, dtype=int)]
+        cut, _ = FS.apply_exit_rules(sig, df, FS.FactorConfig(exit_mode="tier"))
+        if (cut[20:] != 0).any():
+            raise RuntimeError("没勾「禁止分数出场」时应该照常按离场阈值平仓")
+        hold, desc = FS.apply_exit_rules(
+            sig, df, FS.FactorConfig(exit_mode="tier", exit_no_score=True))
+        if (hold[20:] != 1).any():
+            k = int(np.argmax(hold[20:] != 1)) + 20
+            raise RuntimeError(f"勾了「禁止分数出场」还在按离场阈值平仓：第 {k} 根")
+        if "不按分数出场" not in desc:
+            raise RuntimeError(f"摘要没写「不按分数出场」：{desc!r}")
+
+        # 3. 分数**反向**越过进场阈值仍然平仓：那是反向信号，不是离场阈值
+        rev = np.r_[np.zeros(10, dtype=int), np.ones(10, dtype=int),
+                    np.full(20, -1, dtype=int)]
+        out_rev, _ = FS.apply_exit_rules(
+            rev, df, FS.FactorConfig(exit_mode="tier", exit_no_score=True))
+        if (out_rev[20:] != -1).any():
+            raise RuntimeError("分数反向时仍然要平仓（拿着反方向的仓等 ATR 太危险）")
+
+        # 4. 只勾止损时，止损就是唯一一条出场线 —— 信号全程 +1 也照样被平
+        px2 = np.r_[np.full(10, 100.0), np.full(10, 100.0), np.full(20, 97.0)]
+        df2 = pd.DataFrame({"open": px2, "high": px2 + 0.5, "low": px2 - 0.5,
+                            "close": px2},
+                           index=pd.date_range("2021-01-01", periods=n, freq="D"))
+        out_sl, _ = FS.apply_exit_rules(
+            np.ones(n, dtype=int), df2,
+            FS.FactorConfig(exit_mode="score", exit_sl=True, exit_sl_atr=2.0,
+                            exit_no_score=True))
+        if (out_sl[20:] != 0).any():
+            raise RuntimeError("禁止分数出场后，止损这条线没有生效")
+        return (f"归一化拦掉「无出场规则」；回落不平（第 20 根起仍持有）；"
+                f"反向照平；止损 2ATR 独立生效")
+
+    check("禁止分数出场", _factor_no_score)
+
+    def _factor_no_flip():
+        """反向也不平仓：分数翻向不换仓，只认 ATR。"""
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factor_strategy as FS
+
+        # 1. 归一化。反向都不平，回落自然也不平；没有 ATR 规则时两条都关掉
+        c = FS.FactorConfig(exit_mode="tier", exit_no_flip=True).normalized()
+        if not (c.exit_no_flip and c.exit_no_score):
+            raise RuntimeError("勾了「反向也不平」应同时打开「不按分数出场」")
+        c2 = FS.FactorConfig(exit_mode="score", exit_no_flip=True).normalized()
+        if c2.exit_no_flip or c2.exit_no_score:
+            raise RuntimeError("没有任何 ATR 规则时，两条都该被关掉")
+
+        n = 40
+        idx = pd.date_range("2021-01-01", periods=n, freq="D")
+
+        def mk(px):
+            return pd.DataFrame({"open": px, "high": px + 0.5, "low": px - 0.5,
+                                 "close": px}, index=idx)
+
+        # 2. 分数从 +1 直接翻到 -1（中间不经过 0）
+        px = np.r_[np.full(10, 100.0), np.linspace(100, 106, 10), np.full(20, 106.0)]
+        df = mk(px)
+        sig = np.r_[np.zeros(10, dtype=int), np.ones(10, dtype=int),
+                    np.full(20, -1, dtype=int)]
+        # 只拦回落：反向照平（翻成 -1）
+        out_a, _ = FS.apply_exit_rules(
+            sig, df, FS.FactorConfig(exit_mode="tier", exit_no_score=True))
+        if (out_a[20:] != -1).any():
+            raise RuntimeError("只勾「不使用离场阈值」时，反向仍然要平仓")
+        # 反向也不平：仓位一直是 +1
+        out_b, desc = FS.apply_exit_rules(
+            sig, df, FS.FactorConfig(exit_mode="tier", exit_no_flip=True))
+        if (out_b[20:] != 1).any():
+            k = int(np.argmax(out_b[20:] != 1)) + 20
+            raise RuntimeError(f"勾了「反向也不平仓」还在换仓：第 {k} 根")
+        if "反向也不平仓" not in desc:
+            raise RuntimeError(f"摘要没写「反向也不平仓」：{desc!r}")
+
+        # 3. ATR 平掉之后，分数翻向要能开新仓 —— 否则 no_flip 下分数一路
+        #    反向不回头，仓位就永久空着（止损一次、策略作废）
+        px2 = np.r_[np.full(10, 100.0), np.linspace(100, 112, 12),
+                    np.linspace(112, 100, 12), np.full(6, 100.0)]
+        sig2 = np.r_[np.zeros(10, dtype=int), np.ones(12, dtype=int),
+                     np.full(18, -1, dtype=int)]
+        out_c, _ = FS.apply_exit_rules(
+            sig2, mk(px2), FS.FactorConfig(exit_mode="tier", exit_no_flip=True))
+        if not (out_c[22:] == -1).any():
+            raise RuntimeError(
+                "ATR 平掉之后分数翻向没能开新仓（no_flip 下仓位会永久空着）")
+        return ("归一化：反向不平隐含不按分数出场、无 ATR 规则时全关；"
+                "回落与反向都不平（第 20 根起仍持有 +1）；"
+                "ATR 平掉后反向信号能开新仓")
+
+    check("反向也不平仓", _factor_no_flip)
 
     def _factor_filter():
         from ttrade import factor_strategy as FS
@@ -2937,11 +3281,73 @@ def _run() -> tuple[bool, list[str]]:
             if not np.array_equal(_score, _sig):
                 raise RuntimeError("「分数出场」不该改动信号")
 
+            # ---- 独立止损 ----
+            #
+            # 三件事必须同时成立，缺一条就会表现成「勾了止损但没反应」：
+            # 1. 口径还是「分数出场」时它也生效（这是它和四种口径最大的区别）；
+            # 2. 它和别的口径**叠加**，不是替换 —— 分档回撤开着也照样止损；
+            # 3. 止损线钉在进场价上，不跟着浮盈抬（否则它就是「绝对回撤」了）。
+            _n2 = 30
+            _dn = np.r_[np.full(10, 100.0), 100 - np.arange(1, 11) * 1.0,
+                        np.full(10, 89.0)]
+            _df2 = pd.DataFrame({"open": _dn, "high": _dn + 0.4,
+                                 "low": _dn - 0.4, "close": _dn},
+                                index=pd.date_range("2021-01-01", periods=_n2, freq="D"))
+            _sig2 = np.ones(_n2, dtype=int)
+            _sl, _ = _FS.apply_exit_rules(
+                _sig2, _df2,
+                _FS.FactorConfig(exit_mode="score", exit_sl=True, exit_sl_atr=2.0))
+            _k_sl = int(np.argmax(_sl == 0)) if (_sl == 0).any() else -1
+            if _k_sl <= 10:
+                raise RuntimeError(
+                    f"「分数出场」下止损没生效（第一根平仓在 {_k_sl}，应该 10 根之后）")
+            # 止损关掉时同一条路径必须原样返回
+            _off, _ = _FS.apply_exit_rules(
+                _sig2, _df2, _FS.FactorConfig(exit_mode="score", exit_sl=False))
+            if not np.array_equal(_off, _sig2):
+                raise RuntimeError("没勾止损却改动了信号")
+            # 叠加：分档回撤 + 宽止损 ≈ 只有分档；分档 + 紧止损要更早平
+            _tier_only, _ = _FS.apply_exit_rules(
+                _sig2, _df2, _FS.FactorConfig(exit_mode="tier"))
+            _tier_wide, _ = _FS.apply_exit_rules(
+                _sig2, _df2,
+                _FS.FactorConfig(exit_mode="tier", exit_sl=True, exit_sl_atr=50.0))
+            _tier_tight, _ = _FS.apply_exit_rules(
+                _sig2, _df2,
+                _FS.FactorConfig(exit_mode="tier", exit_sl=True, exit_sl_atr=0.5))
+            if not np.array_equal(_tier_only, _tier_wide):
+                raise RuntimeError("宽止损（50ATR）不该改变分档回撤的结果")
+            _k_t1 = int(np.argmax(_tier_only == 0)) if (_tier_only == 0).any() else 999
+            _k_t2 = int(np.argmax(_tier_tight == 0)) if (_tier_tight == 0).any() else 999
+            if not _k_t2 <= _k_t1:
+                raise RuntimeError(
+                    f"叠加止损之后没有更早平仓（分档 {_k_t1} / 分档+紧止损 {_k_t2}）")
+            # 止损线不跟着浮盈抬：先涨到 +5ATR 再回到进场价，止损设在 2ATR 时
+            # **不该**在回到进场价时平仓（那是绝对回撤干的事）
+            _n3 = 30
+            _up = np.r_[np.full(5, 100.0), 100 + np.arange(1, 16) * 1.0,
+                        115 - np.arange(1, 11) * 1.0]
+            _df3 = pd.DataFrame({"open": _up, "high": _up + 0.4,
+                                 "low": _up - 0.4, "close": _up},
+                                index=pd.date_range("2022-01-01", periods=_n3, freq="D"))
+            _sl3, _ = _FS.apply_exit_rules(
+                np.ones(_n3, dtype=int), _df3,
+                _FS.FactorConfig(exit_mode="score", exit_sl=True, exit_sl_atr=2.0))
+            _abs3, _ = _FS.apply_exit_rules(
+                np.ones(_n3, dtype=int), _df3,
+                _FS.FactorConfig(exit_mode="abs", exit_abs_atr=2.0))
+            if not ((_abs3 == 0).any() and not (_sl3 == 0).any()):
+                raise RuntimeError(
+                    "止损和绝对回撤被做成了同一件事：涨上去再回落时，"
+                    f"绝对回撤该平（{'平' if (_abs3 == 0).any() else '没平'}）、"
+                    f"止损不该平（{'平了' if (_sl3 == 0).any() else '没平'}）")
+
             # 出场规则的配置往返
             win.exit_cfg = {"exit_mode": "tier",
                             "exit_tiers": [[1.5, 2.5], [3.0, 1.0], [5.0, 0.5]],
                             "exit_abs_atr": 2.0, "exit_box_bars": 20,
-                            "exit_box_buf": 0.0, "exit_atr_n": 14}
+                            "exit_box_buf": 0.0, "exit_atr_n": 14,
+                            "exit_sl": True, "exit_sl_atr": 1.5}
             win._sync_exit_summary()
             cfg_x = win._current_config()
             win.exit_cfg = {}
@@ -2955,6 +3361,35 @@ def _run() -> tuple[bool, list[str]]:
                     == [[1.5, 2.5], [3.0, 1.0], [5.0, 0.5]]):
                 raise RuntimeError(f"出场规则没从策略库载回来：{got_x.exit_mode} "
                                    f"{got_x.exit_tiers}")
+            # 止损单独往返一次：只勾止损、口径仍是「分数出场」时，老写法会把
+            # 整份 exit_cfg 清空（判据只看 exit_mode），止损就悄悄丢了
+            win.exit_cfg = {"exit_mode": "score", "exit_sl": True,
+                            "exit_sl_atr": 1.5}
+            win._sync_exit_summary()
+            cfg_y = win._current_config()
+            win.exit_cfg = {}
+            win._sync_exit_summary()
+            win.apply_config(cfg_y)
+            app.processEvents()
+            got_y = win._factor_cfg()
+            if not (got_y.exit_sl and abs(float(got_y.exit_sl_atr) - 1.5) < 1e-9
+                    and got_y.exit_mode == "score"):
+                raise RuntimeError(
+                    f"只勾止损时配置没往返：exit_sl={got_y.exit_sl} "
+                    f"{got_y.exit_sl_atr} / mode={got_y.exit_mode}")
+            # 「禁止分数出场」单独往返一次：同一个坑 —— `_apply_factor_cfg`
+            # 的清空判据只看 exit_mode 的话，勾了它载回来就没了
+            win.exit_cfg = {"exit_mode": "score", "exit_sl": True,
+                            "exit_sl_atr": 2.0, "exit_no_score": True}
+            win._sync_exit_summary()
+            cfg_n = win._current_config()
+            win.exit_cfg = {}
+            win._sync_exit_summary()
+            win.apply_config(cfg_n)
+            app.processEvents()
+            got_n = win._factor_cfg()
+            if not got_n.exit_no_score:
+                raise RuntimeError("「禁止分数出场」没往返（载入后被清空了）")
             win.exit_cfg = {}
             win._sync_exit_summary()
 
@@ -2993,7 +3428,8 @@ def _run() -> tuple[bool, list[str]]:
                          "稀疏采样存得进策略库也载得回来，"
                          "权重三档（等权/自定/IC）都真起作用且能往返，"
                          "分位口径也映射到 ±4、对毛刺免疫且能往返，"
-                         "分档回撤比绝对回撤更早平仓、出场规则能往返")
+                         "分档回撤比绝对回撤更早平仓、独立止损与各口径叠加且不跟浮盈抬、"
+                         "只勾止损也能往返、出场规则能往返")
         except Exception as exc:      # noqa: BLE001
             trig_ok, trig_info = False, f"{type(exc).__name__}: {exc}"
         if not trig_ok:

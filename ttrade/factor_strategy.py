@@ -13,6 +13,11 @@
 `entry_z > exit_z` 是关键：没有迟滞的话，分数在阈值附近抖动会让策略每天
 开平仓，手续费吃光收益。默认 1.0 / 0.3。
 
+`exit_z` 可以取负（范围 -2 ~ 2）。取 0 是「只等分数转负就平」，取负则是
+「要反向到足够强才平」——`exit_z = -1` 意味着做多之后分数要跌破 -1 才走，
+中间那一段「分数已经转负但还没到 -1」照样拿着。想拉长持仓、少被噪音
+扫出去，就把它往负里调。注意它只放宽**离场**，进场条件一个字没动。
+
 ## 方向为什么不能写死
 
 用「动量高就做多」这种先验方向，在 A 股商品期货上会直接亏 —— 实测
@@ -108,6 +113,11 @@ class FactorConfig:
     horizon: int = 5             # 预测/评估的前向收益期数
 
     # 阈值信号
+    #
+    # exit_z 允许为负：0 是「分数转负就平」，负值是「要反向到足够强才平」。
+    # 想持仓长一点、别被一次回抽扫出去，就往负里调（下限 -2）。上限始终压在
+    # entry_z 以内 —— 迟滞一旦倒挂，分数刚过进场线就同时满足出场条件，
+    # 信号会在开平之间每根抖一次。
     entry_z: float = 1.0
     exit_z: float = 0.3
     orient: str = "auto"         # auto（PIT 滚动 IC 定向）/ long_high / long_low
@@ -199,6 +209,11 @@ class FactorConfig:
     # 这几种都是**只减仓不反手**：出场之后要等信号自己回到 0 再重新给方向，
     # 否则一根大阴线平多、紧接着反手做空，那是另一条策略（趋势反手），
     # 不该藏在「出场规则」里偷偷发生。
+    #
+    # 另外还有一条**独立**的止损（`exit_sl`）：它和上面四种口径是**与**的关系，
+    # 不是第五个选项。选了分档回撤也能同时挂止损 —— 分档管的是「赚了之后怎么
+    # 收」，止损管的是「一进场就错，亏到哪认输」，两件事不该二选一。
+    # 口径为 `score` 时它也一样生效：那时它是唯一一条 ATR 规则。
     exit_mode: str = "score"
     # 三档：(浮盈达到几个 ATR, 从最高点回撤几个 ATR 就平)。必须递减，
     # 否则「浮盈越多回撤越少」这句话就是假的
@@ -207,6 +222,40 @@ class FactorConfig:
     exit_box_bars: int = 20          # 反向箱体：箱体回看根数（决定箱体宽度）
     exit_box_buf: float = 0.0        # 反向箱体：边界缓冲（ATR 倍数），0 = 触到就走
     exit_atr_n: int = 14             # 算 ATR 的根数
+
+    # ---- 独立止损（和上面四种口径**叠加**，不是二选一）
+    #
+    # 从**进场价**往回走 N×ATR 就平仓。它不看浮盈最高点，所以和「绝对回撤」
+    # 有区别：绝对回撤是「从最好浮盈回撤 N×ATR」，浮盈到过 +5ATR 之后，回撤
+    # 到 +3ATR 就平了，永远不会亏；止损是「从进场价亏 N×ATR」，浮盈再高也
+    # 不改变这条线的位置。两件事，一个管收利润、一个管认亏。
+    exit_sl: bool = False
+    exit_sl_atr: float = 2.0
+
+    # ---- 禁止分数出场（离场阈值完全不参与）
+    #
+    # 勾了之后，分数回落到 `exit_z` 以内**不平仓**，仓位只由上面那些 ATR 规则
+    # 了结。和止损一样是独立开关，不是第五种口径 —— 它管的是「要不要让离场
+    # 阈值参与」，不是「用哪种 ATR 算法」。
+    #
+    # 进场条件一个字不动（分数仍要越过 `entry_z` 才开仓）；分数**反向**越过
+    # 进场阈值时仍然平仓 —— 那是反向信号，不是离场阈值。拿着反方向的仓等
+    # ATR 触发，等于让一条趋势策略硬扛整个反向趋势。
+    exit_no_score: bool = False
+
+    # ---- 分数反向也不平仓（比上面那条更彻底）
+    #
+    # 勾了之后，持仓期间分数**反向越过进场阈值**（+1 变 -1 这种）也不平仓，
+    # 仓位只由 ATR 规则了结。它包含 `exit_no_score`：反向都不平，回落当然
+    # 也不平（`normalized()` 里会顺手把那条也打开）。
+    #
+    # 用途是「有浮盈后尽量不出场」这一类：胜率会降（回吐的次数变多），换来
+    # 更大的盈亏比 —— 截断亏损、让利润奔跑。顺带也过滤掉一批噪音反向信号：
+    # 分数在正负之间来回穿，只要 ATR 没到，仓位就不动。
+    #
+    # 代价要清楚：**进场方向只由第一笔决定**，之后分数翻向不再换仓。一路
+    # 反向的趋势里，仓位靠 ATR 止损退出，而不是靠分数。
+    exit_no_flip: bool = False
 
     def reversed_keys(self) -> set[str]:
         """真正打开反转的因子。顺手把非真值过滤掉，调用方不用自己判。"""
@@ -219,7 +268,10 @@ class FactorConfig:
         c.window = int(max(60, c.window))
         c.horizon = int(max(1, c.horizon))
         c.entry_z = float(max(0.0, c.entry_z))
-        c.exit_z = float(min(max(0.0, c.exit_z), c.entry_z))
+        # 离场阈值下限 -2：负值是「反向到足够强才平」，持仓更长。上限仍压在
+        # entry_z 以内 —— 迟滞倒挂的话，分数刚越过进场线就同时满足出场条件，
+        # 信号每根都在开平之间抖，手续费吃光收益
+        c.exit_z = float(min(max(-2.0, c.exit_z), c.entry_z))
         c.train_window = int(max(200, c.train_window))
         c.step = int(max(20, c.step))
         c.min_train = int(max(120, c.min_train))
@@ -247,6 +299,19 @@ class FactorConfig:
         c.exit_box_bars = int(max(2, c.exit_box_bars))
         c.exit_box_buf = float(max(0.0, c.exit_box_buf))
         c.exit_atr_n = int(max(2, c.exit_atr_n))
+        # 止损：0 或负数等于关掉（界面上勾了但填 0 也算关，免得写出一条
+        # 「进场即平仓」的规则）
+        c.exit_sl = bool(c.exit_sl) and float(c.exit_sl_atr or 0) > 0
+        c.exit_sl_atr = float(max(0.1, c.exit_sl_atr))
+        # 禁止分数出场 + 口径 score + 没开止损 = 一条出场规则都没有，仓位会
+        # 一直拿到回测结束。这种组合没有意义，直接当没勾（界面上也会拦住）
+        c.exit_no_flip = bool(c.exit_no_flip)
+        # 反向都不平，回落自然也不平：两条勾选框在界面上有包含关系，
+        # 配置层面也按同一套语义归一，免得程序调用时出现「no_flip 但还在
+        # 按离场阈值平仓」这种自相矛盾的组合
+        c.exit_no_score = bool(c.exit_no_score) or c.exit_no_flip
+        c.exit_no_score = c.exit_no_score and (c.exit_mode != "score" or c.exit_sl)
+        c.exit_no_flip = c.exit_no_flip and c.exit_no_score
         return c
 
 
@@ -445,7 +510,13 @@ def rolling_ic_weights(fmat: pd.DataFrame, fwd: pd.Series, cfg: FactorConfig
 def hysteresis(
     score: np.ndarray, entry: float, exit_: float
 ) -> np.ndarray:
-    """带迟滞的阈值状态机。NaN 分数一律强制空仓（预热期不交易）。"""
+    """带迟滞的阈值状态机。NaN 分数一律强制空仓（预热期不交易）。
+
+    `exit_` 为负时（比如 -1.0），做多要等分数跌破 -1 才平、做空要等分数涨过
+    +1 才平 —— 中间那段「方向已经不对、但强度还不够」照样拿着。所以同一个
+    状态机既支持「分数转负就走」（`exit_=0`），也支持「反向坐实了才走」
+    （`exit_<0`），不需要另写一套。
+    """
     s = np.asarray(score, dtype=float)
     n = len(s)
     pos = np.zeros(n, dtype=int)
@@ -578,6 +649,10 @@ class ExitTracker:
     在下一根开盘，两者差一个跳空，但规则必须是「只看收盘就能判」的 ——
     实盘那一刻还不知道下一根开在哪。宁可定义得朴素一点，也要两边算得一样。
 
+    止损（`exit_sl`）是**独立**的一条：它不看浮盈最高点，只看「离进场价亏了
+    几个 ATR」，所以和上面三种口径是叠加关系而不是并列关系。分档回撤管的是
+    「赚了之后怎么收」，止损管的是「一进场就错，亏到哪认输」。
+
     ATR 缺失（预热期前 n 根）时不动：没有尺子就不要凭空白砍一刀。
     """
 
@@ -587,11 +662,29 @@ class ExitTracker:
         self.tiers = _clean_tiers(cfg.exit_tiers)
         self.bars = int(max(2, cfg.exit_box_bars))
         self.buf = float(max(0.0, cfg.exit_box_buf))
+        # 0 = 没开止损。`normalized()` 已经把「勾了但填 0」折算成关掉
+        self.sl = float(cfg.exit_sl_atr or 0.0) if cfg.exit_sl else 0.0
+        # 离场阈值完全不参与：分数回落到 exit_z 以内不平仓
+        self.no_score = bool(cfg.exit_no_score)
+        # 更彻底一层：分数反向越过进场阈值也不平仓（隐含 no_score）
+        self.no_flip = bool(cfg.exit_no_flip)
+        # 上一次被出场规则平掉时的方向。分数翻向要算「另一笔交易」，
+        # 没有这个值的话，no_flip 下分数一路反向、仓位会永久空着
+        self.exit_dir = 0
         self.pos = 0
         self.entry = 0.0
         self.best = 0.0        # 持仓期间的最好浮盈（ATR 倍数）
         self.blocked = False   # 已被出场规则平掉，等信号归零 / 翻向再放行
         self.n_exit = 0
+        self.n_sl = 0          # 其中由止损打掉几次（单独记，摘要里要说清）
+        # 上一根**为什么**平仓（没平就是空串）。`apply_exit_rules` 把它逐根
+        # 收下来写进 `exit_note` 列，交易记录页的备注列直接读 —— 只给一句
+        # 「分档浮盈回撤」，用户没法判断这次是该平还是被噪音扫掉的
+        self.last = ""
+
+    def active(self) -> bool:
+        """这条配置会不会真的改动信号。"""
+        return self.mode != "score" or self.sl > 0 or self.no_score
 
     def step(self, want: int, px: float, atr: float,
              box_low: float = float("nan"), box_high: float = float("nan"),
@@ -607,12 +700,33 @@ class ExitTracker:
         会因为一次回撤退出而错过后面整段。真正的语义应该是「这一笔被止损了，
         等下一次进场信号再进」，而进场信号就是分数重新越过阈值。
         """
-        want = int(want)
+        raw = int(want)                # 阈值信号原样，用来判断「信号自己走平」
+        want = raw
+        self.last = ""
+        # 禁止分数出场：离场阈值说「平」的时候不认，仓位继续拿着。
+        # 只认反向 —— 分数反向越过的是**进场**阈值，不是离场阈值；拿着
+        # 反方向的仓等 ATR 触发，等于让一条趋势策略硬扛整个反向趋势
+        if self.no_score and raw == 0:
+            want = self.pos
+        # 更彻底一层：反向也不认。持仓中分数翻向时维持原仓位，一路拿到 ATR
+        # 触发为止（空仓时照常跟随，否则连第一笔都进不去）
+        if self.no_flip and self.pos != 0 and want != 0 and want != self.pos:
+            want = self.pos
         if self.blocked:
-            if want == 0 or (self.pos != 0 and want == -self.pos):
-                self.blocked = False       # 信号自己走平 / 翻向：重新放行
-            elif fresh and want == self.pos:
-                # 同一方向但分数重新越过进场阈值：算一笔新交易
+            # 释放看 `raw` 不看 `want`：no_score 下 want 被改写成了持仓方向，
+            # 拿它判「信号走平」永远成立，止损一次就会在下一根立刻重开
+            if raw == 0:
+                self.blocked = False       # 信号自己走平：重新放行
+            elif self.no_flip and self.exit_dir and raw == -self.exit_dir:
+                # 分数翻到了反方向 = 另一笔交易。no_flip 下分数可能一路反向
+                # 不回头，不认这一条的话仓位会永久空着（止损一次就再也不开）。
+                # 只在 no_flip 下放开：默认口径的行为一个字不改
+                self.blocked = False
+            elif fresh and want != 0:
+                # 分数重新越过进场阈值：算一笔新交易。
+                # 原来这里写的是 `want == self.pos`，可出场时 pos 已经被清成 0，
+                # 那个分支永远进不去 —— 分数一直不回落到阈值内的话仓位就永久
+                # 空着，一次止损废掉后面整段（趋势策略最要命的那种）
                 self.blocked = False
             else:
                 return 0
@@ -631,24 +745,48 @@ class ExitTracker:
         if exc > self.best:
             self.best = exc
         hit = False
+        why = ""
         if self.mode == "tier":
             allow = self.tiers[0][1]
             for need, trail in self.tiers:
                 if self.best >= need:
                     allow = trail
             hit = (self.best - exc) >= allow
+            if hit:
+                why = (f"分档浮盈回撤（浮盈最高 {self.best:+.1f}ATR，"
+                       f"回撤 {self.best - exc:.1f}ATR ≥ {allow:g}）")
         elif self.mode == "abs":
             hit = (self.best - exc) >= float(self.cfg.exit_abs_atr)
+            if hit:
+                why = (f"绝对回撤（从最高浮盈 {self.best:+.1f}ATR 回撤 "
+                       f"{self.best - exc:.1f}ATR ≥ {float(self.cfg.exit_abs_atr):g}）")
         elif self.mode == "box":
             if np.isfinite(box_low) and np.isfinite(box_high):
                 if self.pos > 0:
                     hit = px < box_low + self.buf * a
+                    if hit:
+                        why = (f"反向箱体突破（收 {px:,.2f} 跌破过去 {self.bars} 根"
+                               f"最低 {box_low:,.2f}）")
                 else:
                     hit = px > box_high - self.buf * a
+                    if hit:
+                        why = (f"反向箱体突破（收 {px:,.2f} 涨过过去 {self.bars} 根"
+                               f"最高 {box_high:,.2f}）")
+        # 止损：**独立**于上面三种口径，任何口径下都判一次。
+        # 判据是「离进场价亏了几个 ATR」，不看浮盈最高点 —— 和「绝对回撤」
+        # 的区别就在这里：浮盈到过 +5ATR 之后，绝对回撤会在回落到 +3ATR 时
+        # 平（保住利润），止损这条线的位置却一直钉在进场价下面 N 个 ATR。
+        # 所以两者同时开是有意义的：一个收利润，一个认亏。
+        if not hit and self.sl > 0 and exc <= -self.sl:
+            hit = True
+            self.n_sl += 1
+            why = f"ATR 止损（亏 {-exc:.1f}ATR ≥ {self.sl:g}）"
         if hit:
+            self.exit_dir = self.pos      # 记住被平掉的方向（no_flip 释放要用）
             self.pos = 0
             self.blocked = True
             self.n_exit += 1
+            self.last = why
             return 0
         return self.pos
 
@@ -656,15 +794,31 @@ class ExitTracker:
         mode = self.mode
         label = {"tier": "分档浮盈回撤", "abs": "绝对回撤",
                  "box": "反向箱体突破"}.get(mode, mode)
+        sl = (f" ＋ 止损 {self.sl:g}ATR（其中 {self.n_sl} 次由止损打掉）"
+              if self.sl > 0 else "")
+        # 不按分数出场要说出来：同一套 ATR 参数、勾没勾这一项，交易笔数会差
+        # 一大截，而图上只是「有些仓位拿得久」，看不出是配置还是行情
+        ns = ("，反向也不平仓" if self.no_flip else
+              "，不按分数出场" if self.no_score else "")
+        if mode == "score":
+            # 只开了止损、没选 ATR 口径：别写成「出场：score」，那是个内部键名
+            if self.no_score and self.sl > 0:
+                # 分数规则一条都不剩，唯一的出场线就是止损
+                return (f"出场：只按止损 {self.sl:g}ATR{ns}（共平仓 "
+                        f"{self.n_exit} 次，全部由止损打掉）")
+            if self.sl > 0:
+                return (f"出场：分数出场 ＋ 止损 {self.sl:g}ATR"
+                        f"（共平仓 {self.n_exit} 次，其中止损 {self.n_sl} 次）")
+            return ""
         if mode == "tier":
             return (f"出场：{label}（" + "、".join(
                 f"浮盈≥{p:g}ATR 回撤{t:g}ATR" for p, t in self.tiers)
-                + f"），共平仓 {self.n_exit} 次")
+                + f"）{ns}，共平仓 {self.n_exit} 次{sl}")
         if mode == "abs":
             return (f"出场：{label}（从最高浮盈回撤 "
-                    f"{self.cfg.exit_abs_atr:g}ATR），共平仓 {self.n_exit} 次")
-        return (f"出场：{label}（箱体 {self.bars} 根，边界缓冲 {self.buf:g}ATR），"
-                f"共平仓 {self.n_exit} 次")
+                    f"{self.cfg.exit_abs_atr:g}ATR）{ns}，共平仓 {self.n_exit} 次{sl}")
+        return (f"出场：{label}（箱体 {self.bars} 根，边界缓冲 {self.buf:g}ATR）"
+                f"{ns}，共平仓 {self.n_exit} 次{sl}")
 
 
 def apply_exit_rules(
@@ -673,6 +827,7 @@ def apply_exit_rules(
     cfg: FactorConfig,
     score: np.ndarray | None = None,
     entry: float = 0.0,
+    reasons_out: list | None = None,
 ) -> tuple[np.ndarray, str]:
     """在阈值信号之上叠加 ATR 口径的出场规则。返回 (新信号, 说明)。
 
@@ -684,10 +839,19 @@ def apply_exit_rules(
 
     `score` / `entry` 传了才支持「出场后分数重新越过阈值就再进」（见
     `ExitTracker.step` 的 `fresh`）。不传就是老行为：等信号自己归零或翻向。
+
+    止损和四种口径是**叠加**关系：口径选 `score`（等于不叠 ATR 规则）但勾了
+    止损时，这里照样要跑一遍 —— 那时候止损就是唯一一条 ATR 规则。
+
+    `reasons_out` 传了就把逐根的平仓原因填进去（长度 = len(sig)，没平是空串）。
+    用**出参**而不是返回值，是为了不破坏既有的 `sig, desc = ...` 两元解包 ——
+    这条函数有十几处调用，加一个返回值等于把每一处都改一遍。
     """
     s = np.asarray(sig, dtype=int)
-    mode = str(cfg.exit_mode or "score")
-    if mode == "score" or len(s) == 0:
+    cfg = cfg.normalized()
+    if len(s) == 0:
+        return s, ""
+    if not ExitTracker(cfg).active():
         return s, ""
 
     close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
@@ -708,6 +872,7 @@ def apply_exit_rules(
             fresh = (sc > e) & ~(prev > e)
 
     out = s.copy()
+    reasons: list[str] = []
     for i in range(len(s)):
         lo = hi = float("nan")
         if i >= tracker.bars:
@@ -715,6 +880,10 @@ def apply_exit_rules(
             hi = float(np.nanmax(high[i - tracker.bars:i]))
         out[i] = tracker.step(int(s[i]), close[i], atr[i], lo, hi,
                               bool(fresh[i]) if fresh is not None else False)
+        reasons.append(tracker.last)
+    if reasons_out is not None:
+        reasons_out.clear()
+        reasons_out.extend(reasons)
     return out, tracker.describe()
 
 
@@ -916,11 +1085,16 @@ def build_score(
             ent = (f"进场：触发方向 + 模型分数过进场阈值（{cfg.entry_z:g}）"
                    if plan.factor_channel else
                    f"进场：规则刚开仓 / 刚翻向 + 模型分数过进场阈值（{cfg.entry_z:g}）")
+            # 「回落到 x 以内」只对非负阈值说得通。负阈值是「反向超过 |x| 才平」，
+            # 照原话说会让人以为 -1 比 0 更容易出场，正好相反
+            _how = (f"触发强度反向超过 {-cfg.exit_z:g} 才平（离场阈值 {cfg.exit_z:g}）"
+                    if cfg.exit_z < 0 else
+                    f"触发强度回落到 {cfg.exit_z:g} 以内")
             if plan.factor_channel and plan.rule_channel:
-                ext = (f"出场：因子触发的仓位看触发强度回落到 {cfg.exit_z:g} 以内，"
+                ext = (f"出场：因子触发的仓位看{_how}，"
                        "规则触发的仓位跟规则自己的 signal")
             elif plan.factor_channel:
-                ext = f"出场：触发强度回落到 {cfg.exit_z:g} 以内，每根都判"
+                ext = f"出场：{_how}，每根都判"
             else:
                 ext = "出场：跟规则自己的 signal（规则变 0 或翻向就平）"
             # 反转了哪条通道要写出来：同一组参数、「反转因子」勾没勾，图上仓位方向
@@ -1320,6 +1494,47 @@ def walk_forward(
     return pd.Series(pred, index=fmat.index, name="pred"), imp_ser, total
 
 
+# ---------------------------------------------------------------- 逐笔原因
+def _entry_reasons(score, sig, entry: float, plan=None) -> np.ndarray:
+    """逐根的**进场原因**：信号从空仓 / 反向变成某一方向的那些根。
+
+    只写在**变化的那一根**（决策根）。`run_backtest` 是去决策根取值的
+    （`target = roll(sig, 1)`），这里再 shift 一次就多错一根。
+
+    触发模式（稀疏采样）分两条通道，原因也分开写：规则通道开的仓，说「规则
+    触发」；因子通道开的仓，把触发强度一起写出来 —— 否则用户看到「因子分
+    +2.31 进场」，但那一根的分数其实在触发点之间是阶梯常值，对不上。
+    """
+    n = len(sig)
+    out = np.empty(n, dtype=object)
+    out[:] = ""
+    sc = None if score is None else np.asarray(score, dtype=float)
+    prev = np.r_[0, np.asarray(sig, dtype=int)[:-1]]
+    for i in range(n):
+        cur = int(sig[i])
+        if cur == 0 or cur == int(prev[i]):
+            continue
+        side = "做多" if cur > 0 else "做空"
+        v = float(sc[i]) if sc is not None and i < len(sc) else float("nan")
+        if plan is not None:
+            rule_v = np.asarray(plan.rule_sig, dtype=float)
+            if i < len(rule_v) and np.isfinite(rule_v[i]) and rule_v[i] != 0:
+                out[i] = f"规则触发进场（{side}）"
+                continue
+            st = np.asarray(plan.strength, dtype=float)
+            s_v = float(st[i]) if i < len(st) else float("nan")
+            if np.isfinite(s_v):
+                out[i] = f"触发进场（{side}，强度 {s_v:+.2f} ≥ {entry:g}）"
+            else:
+                out[i] = f"触发进场（{side}）"
+            continue
+        if np.isfinite(v):
+            out[i] = f"因子分 {v:+.2f} 越过进场阈值 {entry:g}（{side}）"
+        else:
+            out[i] = f"信号进场（{side}）"
+    return out
+
+
 # ---------------------------------------------------------------- 策略入口
 def run_factor_strategy(
     df: pd.DataFrame,
@@ -1351,8 +1566,10 @@ def run_factor_strategy(
     notes = list(pack.notes)
     # ATR 口径的出场规则：叠在阈值信号之上（`score` 模式 = 不叠加）。
     # 带上分数和进场阈值，出场后分数重新越过阈值就能再进（见 ExitTracker.step）
+    exit_why: list[str] = []
     sig, exit_note = apply_exit_rules(
-        sig, df, cfg, score=pack.score.to_numpy(dtype=float), entry=cfg.entry_z)
+        sig, df, cfg, score=pack.score.to_numpy(dtype=float), entry=cfg.entry_z,
+        reasons_out=exit_why)
     if exit_note:
         notes.append(exit_note)
 
@@ -1361,6 +1578,11 @@ def run_factor_strategy(
     for c in pack.raw.columns:
         out[f"f_{c}"] = pack.raw[c]
     out["signal"] = sig
+    # 交易记录页的备注列读这两列（`run_backtest` 按决策根取值）。
+    # 阈值出场没有 ATR 规则时 `exit_why` 是空的，引擎会兜底写「信号离场」
+    out["entry_note"] = _entry_reasons(pack.score, sig, cfg.entry_z,
+                                       pack.trigger if mode == "ml" else None)
+    out["exit_note"] = exit_why if exit_why else ""
 
     if cfg.orient == "auto" and mode in ("single", "multi"):
         flips = int((pack.orient.diff().abs() > 0).any(axis=1).sum()) if pack.orient is not None else 0
@@ -1601,13 +1823,17 @@ def run_pooled_strategy(
         else:
             sig = hysteresis(pack.score.to_numpy(), cfg.entry_z, cfg.exit_z)
         # 出场规则逐品种各自判：ATR 是各品种自己的波动尺度，箱体也是各自的高低点
+        exit_why: list[str] = []
         sig, exit_note = apply_exit_rules(
-            sig, df, cfg, score=pack.score.to_numpy(dtype=float), entry=cfg.entry_z)
+            sig, df, cfg, score=pack.score.to_numpy(dtype=float), entry=cfg.entry_z,
+            reasons_out=exit_why)
         d = df.copy()
         d["factor_score"] = pack.score
         for c in pack.raw.columns:
             d[f"f_{c}"] = pack.raw[c]
         d["signal"] = sig
+        d["entry_note"] = _entry_reasons(pack.score, sig, cfg.entry_z, pack.trigger)
+        d["exit_note"] = exit_why if exit_why else ""
         notes = list(pack.notes)
         if exit_note:
             notes.append(exit_note)
@@ -1699,6 +1925,22 @@ def run_rule_with_filter(
     for c in pack.raw.columns:
         out[f"f_{c}"] = pack.raw[c]
     out["signal"] = filtered
+    # 备注列：进场原因是「规则 + 因子同意」，出场原因是规则自己走平 / 翻向
+    # （过滤只做减法，不会另起一条出场通道）
+    _sc = pack.score.to_numpy(dtype=float)
+    _prev = np.r_[0, np.asarray(filtered, dtype=int)[:-1]]
+    _why = np.empty(len(filtered), dtype=object)
+    _why[:] = ""
+    for i in range(len(filtered)):
+        cur = int(filtered[i])
+        if cur == 0 or cur == int(_prev[i]):
+            continue
+        side = "做多" if cur > 0 else "做空"
+        v = float(_sc[i]) if i < len(_sc) else float("nan")
+        _why[i] = (f"规则 + 因子过滤（{side}，因子分 {v:+.2f}）"
+                   if np.isfinite(v) else f"规则 + 因子过滤（{side}）")
+    out["entry_note"] = _why
+    out["exit_note"] = ""
 
     base = int(np.abs(np.diff(np.asarray(rule_signal, dtype=int))).sum())
     kept = int(np.abs(np.diff(filtered)).sum())

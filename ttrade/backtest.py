@@ -127,6 +127,12 @@ class Trade:
     # 截面策略一笔只对应一个品种，但同一个 `Result` 里混着好几个品种的交易；
     # 单策略回测只有一只标的，留空即可
     symbol: str = ""
+    # 这一笔「为什么进、为什么出」，交易记录页的备注列直接读它。
+    # 引擎只填**默认值**（策略名 / 信号反向 / 信号离场），具体口径由策略自己
+    # 往 df 里写 `entry_note` / `exit_note` 两列覆盖 —— 「分档浮盈回撤」「ATR
+    # 止损」这类信息只有因子策略自己知道，引擎不该假装懂
+    entry_note: str = ""
+    exit_note: str = ""
 
 
 @dataclass
@@ -275,6 +281,20 @@ def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float
     return float(max(equity, 0.0) / (price * mult))
 
 
+def _note_col(data: pd.DataFrame, name: str) -> np.ndarray | None:
+    """取一列逐根的原因说明，转成 object 数组；没有这一列返回 None。
+
+    非字符串（NaN / None / 数字）一律当空串：pandas 的字符串列里缺值一定是
+    NaN，直接拼进界面会显示成「nan」。
+    """
+    if name not in data.columns:
+        return None
+    out = np.empty(len(data), dtype=object)
+    for i, v in enumerate(data[name].to_numpy(dtype=object)):
+        out[i] = "" if v is None or (isinstance(v, float) and v != v) else str(v).strip()
+    return out
+
+
 def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str = "") -> Result:
     """按 signal 列执行回测。df 需含 open/close 与 signal（取值 -1/0/1）。"""
     cfg = cfg or BacktestConfig()
@@ -294,6 +314,10 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     if cfg.long_only:
         sig = np.maximum(sig, 0)
     idx = data.index
+    # 逐根的「进场 / 出场原因」，可选列。策略自己写（因子策略会写「因子分
+    # +2.31 越过进场阈值 2」「分档浮盈回撤」这种），没写就留空由引擎兜底
+    note_in = _note_col(data, "entry_note")
+    note_out = _note_col(data, "exit_note")
     n = len(data)
     mult = float(cfg.multiplier or 1.0)
     mode = (cfg.sizing or "unit").lower()
@@ -324,7 +348,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     entry_bar = 0
     entry_dir = 1
 
-    def close_position(i: int, price: float, held: float) -> None:
+    def close_position(i: int, price: float, held: float, why: str = "") -> None:
         nonlocal entry_price, entry_date
         if entry_price is None:
             return
@@ -338,13 +362,21 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
                 bars=i - entry_bar,
                 direction=entry_dir,
                 lots=abs(float(held)),
+                entry_note=entry_why,
+                exit_note=why,
             )
         )
         entry_price = entry_date = None
 
+    entry_why = ""
+
     for i in range(n):
         want = target[i]
         if want != pos:
+            # 这一根的动作是**上一根收盘**定下的（`target = roll(sig, 1)`），
+            # 所以原因也要从上一根取 —— 拿当根去解释，会写出「用今天收盘的
+            # 信号解释昨天开盘的平仓」，时间轴反了
+            dec = i - 1 if i > 0 else 0
             # ---- 先平掉现有仓位 ----
             if pos != 0:
                 sp = cfg.slip_amount(open_[i], scale[i] if scale is not None else 1.0)
@@ -356,7 +388,9 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
                 # 滑点按「每手多少价差 × 乘数 × 手数」折成钱，和手续费一起记
                 cost_total += fee + sp * mult * abs(lots)
                 notional_total += abs(lots) * mult * abs(price)
-                close_position(i, price, lots)
+                why = (note_out[dec] if note_out is not None else "") or (
+                    "信号反向" if want == -pos else "信号离场")
+                close_position(i, price, lots, why)
                 lots = 0.0
                 pos = 0
 
@@ -373,6 +407,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
                     notional_total += q * mult * abs(price)
                     lots = q if want > 0 else -q
                     entry_price, entry_date, entry_bar, entry_dir = price, idx[i], i, want
+                    entry_why = (note_in[dec] if note_in is not None else "") or label
                     pos = want
 
         eq = cash + (lots * mult * (close[i] - entry_price) if pos != 0 else 0.0)
@@ -394,6 +429,8 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
                 direction=entry_dir,
                 open_position=True,
                 lots=abs(float(lots)),
+                entry_note=entry_why,
+                exit_note="样本结束，仍持仓",
             )
         )
 

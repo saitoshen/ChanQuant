@@ -826,9 +826,10 @@ class LivePredictor:
         self._z_degenerate = False
         # ATR 出场规则的状态机。和回测**同一份实现**（`fstrat.ExitTracker`）——
         # 各写一遍迟早会分叉，而「回测 2.3 年平仓、实盘一直拿着」这种差异
-        # 没有任何线索可查。`score` 模式（默认）不建，省得每根都去算 ATR
-        self._exit = (fstrat.ExitTracker(self.cfg)
-                      if str(self.cfg.exit_mode or "score") != "score" else None)
+        # 没有任何线索可查。`score` 口径、没开止损、也没勾「不按分数出场」时
+        # 不建，省得每根都去算 ATR（`active()` 就是这三个条件的并集）
+        _probe = fstrat.ExitTracker(self.cfg)
+        self._exit = _probe if _probe.active() else None
         self._exit_synced = False
         # 上一根的 |分数|：出场后要判断「这一根是不是刚越过进场阈值」，
         # 也就是「算不算一笔新交易」。和回测 `apply_exit_rules` 里的 fresh 同一口径

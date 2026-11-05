@@ -744,7 +744,7 @@
     "start": "2013-12-06",
     "end": "2026-11-04",
     "med_amount": 1140.7,
-    "adj_factor_end": 0.041724,
+    "adj_factor_end": 0.041996,
     "adj_factor_span": 102.7618,
     "adjusted": true,
     "file": "FB_DCE.csv"
@@ -1284,8 +1284,8 @@
     "start": "2025-09-10",
     "end": "2026-11-04",
     "med_amount": 63118.7,
-    "adj_factor_end": 1.01077,
-    "adj_factor_span": 1.0177,
+    "adj_factor_end": 1.012449,
+    "adj_factor_span": 1.0194,
     "adjusted": true,
     "file": "OP_SHFE.csv"
   },

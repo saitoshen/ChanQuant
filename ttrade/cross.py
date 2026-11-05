@@ -599,12 +599,23 @@ def trades_from_weights(weights: pd.DataFrame,
             k = min(end, n - 1)
             p0, p1 = float(px[i]), float(px[k])
             ret = (p1 / p0 - 1.0) * s if p0 > 0 else 0.0
+            # 备注列：进场看权重多大，出场看权重是归零还是反向。截面策略没有
+            # ATR 出场规则，这两种就是全部的离场方式
+            w0 = float(w[i]) if np.isfinite(w[i]) else 0.0
+            if opened:
+                why = "样本结束，仍持仓"
+            elif end < n and np.isfinite(w[end]) and np.sign(w[end]) == -s:
+                why = "权重反向"
+            else:
+                why = "权重归零"
             out.append(Trade(
                 entry_date=idx[i], exit_date=idx[k],
                 entry_price=p0, exit_price=p1, ret=float(ret),
                 bars=int(k - i), direction=int(s), open_position=bool(opened),
                 lots=0.0,          # 截面是权重不是手数，界面上显示「—」
                 symbol=str(sym),
+                entry_note=f"截面权重 {w0:+.2f} 进场",
+                exit_note=why,
             ))
             i = j + 1
     out.sort(key=lambda t: (t.entry_date, t.exit_date))

@@ -591,6 +591,15 @@ def is_template(sid: str) -> bool:
     return str(sid or "").startswith(TEMPLATE_PREFIX)
 
 
+def names() -> list[str]:
+    """全部内置模板的名字（原始写法，没归一化）。
+
+    给「自定义策略不许和内置重名」那条校验用：左侧策略库把内置和「我的」分两组
+    列出来，两组的名字一模一样时，用户和 Agent 都没法用名字指代其中任意一条。
+    """
+    return [str(t.get("name") or "").strip() for t in _RAW]
+
+
 def keys(group: str = "") -> list[str]:
     """模板键，按分组顺序。`group` 给了就只返回那一组。"""
     if group:

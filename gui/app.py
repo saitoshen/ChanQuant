@@ -262,7 +262,9 @@ FACTOR_PARAMS = {
     "window": ("标准化窗口", 120, 500, 20, 252),
     "horizon": ("预测期数", 1, 20, 1, 5),
     "entry_z": ("进场阈值", 0.3, 3.0, 0.1, 1.0),
-    "exit_z": ("离场阈值", 0.0, 1.5, 0.1, 0.3),
+    # 离场阈值可以取负：0 是「分数转负就平」，负值是「反向坐实了才平」，
+    # 持仓更长、不容易被一次回抽扫出去。上限受 entry_z 牵制（见 _rebuild_fparams）
+    "exit_z": ("离场阈值", -2.0, 2.0, 0.1, 0.3),
     # 单位是**交易日**不是 bar 根数：5m 和日线的「1000」不该是同一段历史。
     # 换算在 factor_strategy._to_bars() 里做，按数据的 bar 密度来
     "train_window": ("训练窗口（交易日）", 400, 2500, 100, 1000),
@@ -3925,16 +3927,20 @@ class MainWindow(QMainWindow):
             self.row_ic_rebal.setVisible(mode == "ic")
 
     def _on_exit_rules(self) -> None:
-        """出场规则弹窗。四种口径的参数都在里面，侧边栏只留一行摘要。"""
+        """出场规则弹窗。四种口径的参数 + 独立止损都在里面，侧边栏只留一行摘要。"""
         from gui.exit_dialog import ExitRuleDialog
 
         dlg = ExitRuleDialog(self.exit_cfg, self)
         if dlg.exec() != QDialog.Accepted:
             return
         vals = dlg.values()
-        # 全都回到默认（分数出场 + 各参数默认值）就**清空**，而不是存一份快照 ——
-        # 存下来之后升级改了默认档位，它不会跟着走（品种信息那边同一个道理）
+        # 全都回到默认（分数出场 + 没开止损 + 各参数默认值）就**清空**，
+        # 而不是存一份快照 —— 存下来之后升级改了默认档位，它不会跟着走
+        # （品种信息那边同一个道理）
         dflt = (vals.get("exit_mode") == "score"
+                and not vals.get("exit_sl")
+                and not vals.get("exit_no_score")
+                and not vals.get("exit_no_flip")
                 and abs(float(vals.get("exit_abs_atr", 2.0)) - 2.0) < 1e-9
                 and int(vals.get("exit_box_bars", 20)) == 20
                 and abs(float(vals.get("exit_box_buf", 0.0))) < 1e-9
@@ -4333,6 +4339,43 @@ class MainWindow(QMainWindow):
                 self.fparam_box, self.fparam_widgets, self.fparam_scales,
                 pname, label, lo, hi, step, default,
             )
+        self._tie_exit_to_entry()
+        if "exit_z" in names:
+            # 滑杆量程从 0 放开到 -2 之后，「负的离场阈值是什么意思」必须写出来：
+            # 直觉上负数像是更容易触发，实际正好相反
+            hint = QLabel(
+                "离场阈值可以取负：0 = 分数一转负就平；−1 = 分数要反向跌到 −1 "
+                "才平，中间那段「方向已经不对、但还没坐实」照样拿着 —— 想拿久一点"
+                "就往负里调。上限压在进场阈值以内，不会倒挂。"
+            )
+            hint.setObjectName("Hint")
+            hint.setWordWrap(True)
+            self.fparam_box.addWidget(hint)
+
+    def _tie_exit_to_entry(self) -> None:
+        """把离场阈值的滑杆上限拴在进场阈值上。
+
+        迟滞要求 `exit_z < entry_z`。倒挂之后分数刚越过进场线就同时满足出场
+        条件，信号每根都在开平之间抖一次 —— 而界面上两个数字都「合法」，从
+        参数面板完全看不出问题，只会觉得「这策略怎么天天进出」。所以不做提示、
+        直接在滑杆范围上堵死。
+
+        上限还要再压一层：`entry_z` 能拖到 3.0，但离场阈值本身的上限是 2.0，
+        跟着放大就白扩了量程。
+        """
+        se = self.fparam_widgets.get("entry_z")
+        sx = self.fparam_widgets.get("exit_z")
+        if se is None or sx is None:
+            return
+        s = self.fparam_scales.get("exit_z", 10)
+        cap = int(round(2.0 * s))
+        gap = max(1, int(round(0.1 * s)))       # 至少留一档，等于 0.1
+
+        def _tie(v, _sx=sx, _cap=cap, _gap=gap):
+            _sx.setMaximum(min(_cap, max(_sx.minimum(), int(v) - _gap)))
+
+        se.valueChanged.connect(_tie)
+        _tie(se.value())
 
     def _current_params(self) -> dict:
         out = {}
@@ -4689,7 +4732,14 @@ class MainWindow(QMainWindow):
 
         # ---- 出场规则 ----
         em = str(cfg.get("exit_mode") or "score")
-        self.exit_cfg = {} if em == "score" else {
+        sl = bool(cfg.get("exit_sl"))
+        ns = bool(cfg.get("exit_no_score"))
+        nf = bool(cfg.get("exit_no_flip"))
+        # 口径是 score、没开止损、也没勾「不按分数出场」= 全默认，清空。
+        # **不能只看 exit_mode**：只勾了止损（或只勾了「不按分数出场」）、
+        # 口径仍是「分数出场」时，按老写法会把那一项一起丢掉，表现就是
+        # 「存进策略库再载回来，止损 / 不按分数出场没了」
+        self.exit_cfg = {} if (em == "score" and not sl and not ns and not nf) else {
             "exit_mode": em,
             "exit_tiers": [[float(a), float(b)] for a, b in
                            (cfg.get("exit_tiers") or [[2.0, 2.0], [4.0, 1.2], [6.0, 0.8]])],
@@ -4697,6 +4747,10 @@ class MainWindow(QMainWindow):
             "exit_box_bars": int(cfg.get("exit_box_bars") or 20),
             "exit_box_buf": float(cfg.get("exit_box_buf") or 0.0),
             "exit_atr_n": int(cfg.get("exit_atr_n") or 14),
+            "exit_sl": sl,
+            "exit_sl_atr": float(cfg.get("exit_sl_atr") or 2.0),
+            "exit_no_score": ns,
+            "exit_no_flip": nf,
         }
         self._sync_exit_summary()
 
@@ -4807,18 +4861,60 @@ class MainWindow(QMainWindow):
         if not cfg.symbol:
             self.lbl_status.setText("还没选标的，无法存入策略库")
             return
+        replaced = False
         try:
             saved = SStore.add_to_library(cfg)
+        except SStore.NameConflict as exc:
+            if exc.builtin or exc.item is None:
+                # 和内置模板重名：不能存，只能改名。左侧列表分「内置 / 我的」
+                # 两组，同名之后用户和 Agent 都指代不清
+                self.lbl_status.setText(str(exc))
+                self._publish(str(exc), True)
+                return
+            # 和自己库里的一条重名：可以存，问一句要不要覆盖它
+            if not self._confirm_overwrite(exc.item):
+                self.lbl_status.setText(
+                    f"没有覆盖，「{exc.item.title()}」保持原样，这次没存")
+                return
+            try:
+                saved = SStore.add_to_library(cfg, overwrite=True)
+                replaced = True
+            except ValueError as exc2:      # noqa: BLE001 - 兜底，别再炸一次
+                self.lbl_status.setText(f"覆盖失败：{exc2}")
+                self._publish(f"覆盖失败：{exc2}", True)
+                return
         except ValueError as exc:
-            # 重名。库里已经有一条同名的了，让用户自己决定改名还是先删
             self.lbl_status.setText(str(exc))
             self._publish(str(exc), True)
             return
-        msg = f"已存入策略库：{saved.title()}"
+        msg = (f"已覆盖策略库里的「{saved.title()}」" if replaced
+               else f"已存入策略库：{saved.title()}")
         if self.chk_to_portfolio.isChecked():
             item = SStore.add_to_portfolio(cfg)
             msg += f"；已加入策略交易列表：{item.title()}"
         self.lbl_status.setText(msg)
+
+    def _confirm_overwrite(self, old) -> bool:
+        """「库里已经有同名的了，要覆盖吗」。默认停在「不覆盖」上。
+
+        默认按钮给「取消」：覆盖会把原来那条的参数换成现在这套，点错一次
+        之前调好的东西就没了，而且不可撤销。想覆盖的人多按一下不费事，
+        误触一次代价很大。
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("策略已存在")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"策略库里已经有「{old.title()}」了")
+        box.setInformativeText(
+            "同名可以存，但会覆盖库里那一条：参数换成现在这套，"
+            "名字、创建时间和它在列表里的位置保持不变。\n\n"
+            "不想覆盖的话点「取消」，然后给这次的策略改个名字再存。"
+        )
+        yes = box.addButton("覆盖", QMessageBox.AcceptRole)
+        no = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(no)
+        box.exec()
+        return box.clickedButton() is yes
 
     def _restore_last_config(self) -> None:
         """启动时恢复上次保存的配置。
@@ -5084,6 +5180,13 @@ class MainWindow(QMainWindow):
             exit_box_bars=int(_ex.get("exit_box_bars") or 20),
             exit_box_buf=float(_ex.get("exit_box_buf") or 0.0),
             exit_atr_n=int(_ex.get("exit_atr_n") or 14),
+            # 止损独立于 exit_mode：口径选「分数出场」也照样带出去
+            exit_sl=bool(_ex.get("exit_sl")),
+            exit_sl_atr=float(_ex.get("exit_sl_atr") or 2.0),
+            # 「不使用离场阈值出场」同理，也是独立开关
+            exit_no_score=bool(_ex.get("exit_no_score")),
+            # 更彻底一层：分数反向也不平（隐含上一条）
+            exit_no_flip=bool(_ex.get("exit_no_flip")),
         )
 
     def run_analysis(self, df_override: pd.DataFrame | None = None) -> None:

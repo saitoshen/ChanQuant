@@ -377,6 +377,11 @@ class StrategyConfig:
             return " ".join(bits)
         cfg = self.factor_cfg or {}
         bits = [f"窗口={cfg.get('window', 252)}", f"阈值={cfg.get('entry_z', 1.0)}"]
+        # 离场阈值现在能取负，对持仓时长的影响不比窗口小：同样的进场阈值，
+        # 0.3 和 -1.0 是两条策略（后者要反向坐实才平）。默认值不写，免得刷屏
+        _xz = float(cfg.get("exit_z", 0.3) or 0.0)
+        if abs(_xz - 0.3) > 1e-9:
+            bits.append(f"离场{_xz:g}")
         # 分位口径和 z-score 是同一条策略的两种算法，阈值一样结果差很多，
         # 不写出来列表上两条会像重复项
         if str(cfg.get("method") or "z") != "z":
@@ -391,6 +396,16 @@ class StrategyConfig:
         if str(cfg.get("exit_mode") or "score") != "score":
             bits.append({"tier": "分档回撤出场", "abs": "ATR 回撤出场",
                          "box": "箱体出场"}.get(str(cfg.get("exit_mode")), "ATR 出场"))
+        # 止损独立于口径：只勾止损、口径还是「分数出场」时，上面那条不会写，
+        # 这里必须补上 —— 否则列表里「加了止损」和「没加」两条看起来一模一样
+        if cfg.get("exit_sl"):
+            bits.append(f"止损 {float(cfg.get('exit_sl_atr') or 2.0):g}ATR")
+        # 勾了「不按分数出场」也是独立一条：同样的 ATR 参数，勾没勾它交易笔数
+        # 差一大截，摘要不写的话两条配置在列表里长得一模一样
+        if cfg.get("exit_no_flip"):
+            bits.append("反向不平仓")
+        elif cfg.get("exit_no_score"):
+            bits.append("不按分数出场")
         if self.factor_mode == "ml":
             bits.append(f"模型={cfg.get('model', '')}")
             # 稀疏采样 / 合并训练都不在「窗口 / 阈值」里体现，而它们对结果的影响
@@ -659,26 +674,55 @@ def save_library(items: list[StrategyConfig]) -> None:
     _save(LIB_FILE, [c.to_dict() for c in items])
 
 
-def add_to_library(cfg: StrategyConfig) -> StrategyConfig:
+class NameConflict(ValueError):
+    """名字撞上了。
+
+    两种撞法处理方式不同，所以带上原因：
+
+    - `builtin=True`：撞的是**内置模板**的名字。不能存 —— 左侧策略库把内置和
+      「我的」分两组列出来，两组同名之后谁也指代不清。让用户换个名字
+    - `builtin=False`：撞的是**自己库里**的一条。可以存，覆盖它就行，
+      所以 `item` 带上那一条，界面拿它的名字去问「要覆盖吗」
+    """
+
+    def __init__(self, msg: str, *, builtin: bool = False,
+                 item: StrategyConfig | None = None) -> None:
+        super().__init__(msg)
+        self.builtin = builtin
+        self.item = item
+
+
+def builtin_names() -> set[str]:
+    """内置模板名字的归一化集合。"""
+    return {norm_name(n) for n in TPL.names() if n}
+
+
+def add_to_library(cfg: StrategyConfig, overwrite: bool = False) -> StrategyConfig:
     """存进策略库。同 sid 覆盖，否则追加。
 
-    **名字不许重复。** 库里出现三条「白银动量60-1h」之后，用户和 Agent 都没法
-    用名字指代任何一条 —— `find_library` 只能猜「最后存的那条」，删的时候还得
-    靠列表里的位置。重名直接抛 `ValueError`，让调用方去改名。
+    **名字不许和内置模板重复。** 左侧策略库把内置和「我的」分两组列出来，两边
+    同名之后，用户和 Agent 都没法用名字指代其中任意一条（`find_library` 只能
+    挑「我的」那条）。这种直接抛 `NameConflict(builtin=True)`，让调用方去改名。
+
+    **和「我的」里的一条同名时**：`overwrite=False` 抛 `NameConflict(item=…)`，
+    界面拿它去问「要覆盖吗」；`overwrite=True` 就**原地替换**那一条（位置、
+    创建时间、sid 都沿用原来的）—— 用户改了两个参数再存一次，库里不该出现
+    两条「白银动量60-1h」，也不该逼他先删再存。
 
     例外是**没起名**的配置：名字是「品种 · 策略」自动拼的，同品种同策略存两份
     参数不同的版本是正常用法，这时自动加序号（`…（2）`），不挡人。
     """
     items = load_library()
     # 内置模板不是库里的一条。存它等于「从模板另存一份到我的」：换新号，
-    # 名字沿用模板名，重名就自己加序号 —— 用户载入模板、改两个数、点保存，
-    # 不该先撞上一条「重名，换个名字」，他根本没起过名；也不该被自动命名成
-    # 「AG_SHFE · 单因子 · 1 个因子」这种他自己没见过的名字。
+    # 名字沿用模板名 —— 但模板名本身被内置占着，所以从（2）开始编号。
+    # 用户载入模板、改两个数、点保存，不该先撞上一条「重名，换个名字」，
+    # 他根本没起过名；也不该被自动命名成「AG_SHFE · 单因子 · 1 个因子」
+    # 这种他自己没见过的名字。
     if TPL.is_template(cfg.sid):
         base = (cfg.name or (TPL.BY_KEY.get(cfg.sid) or {}).get("name", "")).strip()
         cfg.sid = ""
         if base:
-            taken = {norm_name(c.title()) for c in items}
+            taken = {norm_name(c.title()) for c in items} | builtin_names()
             name, n = base, 2
             while norm_name(name) in taken:
                 name = f"{base}（{n}）"
@@ -687,18 +731,26 @@ def add_to_library(cfg: StrategyConfig) -> StrategyConfig:
     _ensure_sid(cfg)
     for i, old in enumerate(items):
         if old.sid == cfg.sid:
-            # 同 sid 是「改这一条」：名字撞到**别的**条目也要拦，否则改个名就
-            # 能造出两条重名的
+            # 同 sid 是「改这一条」。改名撞到**别的**条目就拦下来：那不是
+            # 「存一份新的」，是「把这条改叫别人的名字」，覆盖掉别人等于
+            # 悄悄删了一条策略，代价和意图完全不对等
             want = norm_name(cfg.title())
-            if any(norm_name(o.title()) == want for o in items if o.sid != cfg.sid):
-                raise ValueError(f"策略库里已经有「{cfg.title()}」了，换一个名字")
+            dup = next((o for o in items
+                        if o.sid != cfg.sid and norm_name(o.title()) == want), None)
+            if dup is not None:
+                # `item` 故意不给：这一条是「改名撞车」，不是「存一份新的」。
+                # 带 item 出去，界面会弹「要覆盖吗」，点了覆盖又回到这条分支，
+                # 转一圈还是存不进去 —— 不如直接说清「换个名字」
+                raise NameConflict(
+                    f"策略库里已经有「{dup.title()}」了。这是改名，不是存新的，"
+                    "换一个名字再存。")
             items[i] = cfg
             save_library(items)
             return cfg
 
     if not str(cfg.name or "").strip():
         base = cfg.title()
-        taken = {norm_name(c.title()) for c in items}
+        taken = {norm_name(c.title()) for c in items} | builtin_names()
         if norm_name(base) in taken:
             n = 2
             while norm_name(f"{base}（{n}）") in taken:
@@ -706,12 +758,26 @@ def add_to_library(cfg: StrategyConfig) -> StrategyConfig:
             cfg.name = f"{base}（{n}）"
     else:
         want = norm_name(cfg.title())
+        if want in builtin_names():
+            raise NameConflict(
+                f"「{cfg.title()}」是内置策略的名字，自定义策略不能和它重名。"
+                "换一个名字再存。",
+                builtin=True)
         dup = next((o for o in items if norm_name(o.title()) == want), None)
         if dup is not None:
-            raise ValueError(
-                f"策略库里已经有「{dup.title()}」了。换一个名字，"
-                "或者先删掉库里那一条再存。"
-            )
+            if not overwrite:
+                raise NameConflict(
+                    f"策略库里已经有「{dup.title()}」了", item=dup)
+            # 原地替换：位置、创建时间、sid 全部沿用。换个新 sid 的话，组合里
+            # 引用它的那条、Agent 记住的那条就都指向一个不存在的 id 了
+            idx = items.index(dup)
+            if not cfg.created:
+                cfg.created = dup.created
+            cfg.name = dup.name
+            cfg.sid = dup.sid
+            items[idx] = cfg
+            save_library(items)
+            return cfg
 
     if not cfg.created:
         cfg.created = time.strftime("%Y-%m-%d %H:%M")

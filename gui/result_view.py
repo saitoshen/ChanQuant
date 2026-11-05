@@ -171,6 +171,24 @@ def _lots_text(v: float) -> str:
     return f"{v:,.0f}" if abs(v - round(v)) < 1e-6 else f"{v:,.2f}"
 
 
+def cumulative_returns(trades) -> list[float]:
+    """逐笔的累计收益率：按行序复利（每笔收益连乘）。
+
+    逐笔列表里的「累计」只能这么定义 —— 把百分比直接相加等于假设每笔都押
+    同样的本金，而手数是按风险定额算的，两边对不上；连乘至少和「一直满仓
+    复投」的直觉一致，也和绩效页的「累计收益」是同一个算法。
+
+    持仓中那一笔的 `ret` 是浮动的（按最后一根收盘估值），照算 —— 那一行的
+    累计写的就是「现在平掉会是多少」。
+    """
+    cum = 1.0
+    out: list[float] = []
+    for t in trades:
+        cum *= 1.0 + float(t.ret)
+        out.append(cum - 1.0)
+    return out
+
+
 # ------------------------------------------------------------------ 图表基类
 
 
@@ -417,6 +435,9 @@ class ResultView(QObject):
         self._k_tip = None
         self._k_bars = None
         self._k_notes: dict = {}
+        # 窗口内的因子分（和 `_k_bars` 等长），十字光标的信息框要读它。
+        # 因子模式下才有值；截面 / 只画 K 线时为 None
+        self._k_score: np.ndarray | None = None
         self._k_redraw_timer = QTimer(self)
         self._k_redraw_timer.setSingleShot(True)
         self._k_redraw_timer.timeout.connect(self._flush_kline_redraw)
@@ -698,7 +719,8 @@ class ResultView(QObject):
         self.lbl_trades.setWordWrap(True)
         lay.addWidget(self.lbl_trades)
 
-        cols = ["#", "策略", "方向", "开仓", "开仓价", "平仓", "平仓价", "手数", "收益", "持仓", "备注"]
+        cols = ["#", "策略", "方向", "开仓", "开仓价", "平仓", "平仓价", "手数",
+                "收益", "持仓", "累计盈亏", "备注"]
         if self.kind == "portfolio":
             cols[1] = "策略"
         else:
@@ -712,9 +734,12 @@ class ResultView(QObject):
         h = self.tbl_trades.horizontalHeader()
         for i in range(len(cols)):
             h.setSectionResizeMode(i, QHeaderView.ResizeToContents)
-        # 最后一列（备注）多数行是空的。让它撑满剩余宽度的话，表格右边会多出
-        # 一条 600px 的空白栏，看起来像「备注」全丢了
-        h.setStretchLastSection(False)
+        # 备注列现在装着「进场：… ｜ 出场：…」，长度不定。给它 `Stretch`：
+        # 其余列按内容收紧，剩下的宽度全归它 —— 窗口宽的时候刚好能读全，
+        # 窄的时候截断（鼠标悬停有完整提示）。原来是固定宽度，宽屏上右边
+        # 留一条空白，窄屏上又横着滚，两头不讨好
+        h.setSectionResizeMode(len(cols) - 1, QHeaderView.Stretch)
+        h.setStretchLastSection(True)
         lay.addWidget(self.tbl_trades, 1)
         return w
 
@@ -827,6 +852,7 @@ class ResultView(QObject):
         # 把上一张图又摆回来
         self._k_view = None
         self._k_total = 0
+        self._k_score = None      # 上一个策略的分数不能留着，信息框会读到它
         self._pending_draw.clear()
         self.pages()
         self.status.emit(msg)
@@ -1035,6 +1061,9 @@ class ResultView(QObject):
         )
 
         self._k_notes = self._signal_notes()
+        # 信息框要读的因子分：切一段和 `view` 等长的，索引对得上就行
+        self._k_score = (score_full[start:start + win] if score_full is not None
+                         else None)
 
         self.canvas_k.fresh()
         if has_score:
@@ -1243,8 +1272,18 @@ class ResultView(QObject):
                 # 在这儿画一根虚线会让人以为「分数跌破它就平仓」，而实际平仓看的是
                 # 突破强度有没有回落。宁可不画，也别画一根错的
                 if str(getattr(cfg, "sample_mode", "") or "") != "trigger":
-                    for lv in (cfg.exit_z, -cfg.exit_z):
+                    # 用 set 去重：exit_z = 0 时 ±0 是同一条线，画两遍会让
+                    # 标签叠成重影
+                    for lv in sorted({cfg.exit_z, -cfg.exit_z}):
                         axf.axhline(lv, color=C_MUTED, lw=0.7, ls=":", alpha=0.7, zorder=2)
+                        # 离场阈值现在能取负，±1.0 两条淡点线在图上几乎分不清哪条
+                        # 管出场；而且负阈值下它和进场线可能正好重合（进场 1.0 /
+                        # 离场 -1.0 时就是同两条线）。标出来才看得出「这个位置
+                        # 既是进场线也是离场线」
+                        axf.text(0.988, lv, f"离场 {lv:+.1f}",
+                                 transform=axf.get_yaxis_transform(),
+                                 fontsize=7, color=C_MUTED, va="bottom",
+                                 ha="right", zorder=6)
             axf.axhline(0.0, color="#cbd5e1", lw=0.7, zorder=2)
             axf.set_ylabel("因子分", fontsize=8, color=C_MUTED, rotation=0, labelpad=14)
             axf.grid(True, color=C_GRID, lw=0.5, alpha=0.7)
@@ -1441,7 +1480,7 @@ class ResultView(QObject):
         self.canvas_k.draw_idle()
 
     def _bar_text(self, i: int) -> str:
-        """一根 K 线的读数：时间、开高低收、涨跌幅、量，外加这一根上的信号。"""
+        """一根 K 线的读数：时间、开高低收、涨跌幅、量、因子分，外加这一根上的信号。"""
         view = self._k_bars
         row = view.iloc[i]
         ts = view.index[i]
@@ -1454,6 +1493,14 @@ class ResultView(QObject):
         vol = float(row.get("volume", 0) or 0)
         if vol > 0:
             lines.append(f"量 {vol / 1e4:,.1f} 万")
+        # 因子分：这一根策略实际拿到的分数（单因子 = 该因子，多因子 = 合成，
+        # 机器学习 = 标准化后的预测）。图上那条分数曲线看趋势，具体数值只能
+        # 靠这里读 —— 想看「这根到底过没过阈值」不用再目测
+        sc = self._k_score
+        if sc is not None and i < len(sc):
+            v = float(sc[i])
+            if np.isfinite(v):
+                lines.append(f"因子分 {v:+.2f}")
         for note in self._k_notes.get(ts, []) or []:
             lines.append(note)
         return "\n".join(lines)
@@ -1750,6 +1797,9 @@ class ResultView(QObject):
         avg_win = float(np.mean(wins)) if wins else 0.0
         avg_loss = float(np.mean(losses)) if losses else 0.0
 
+        # 累计盈亏：按笔复利（每笔收益连乘），口径见 `cumulative_returns`
+        cums = cumulative_returns([t for _n, t in rows])
+
         if not rows:
             self.lbl_trades.setText("这次回测没有产生交易（信号全程为空仓，或者样本太短）")
             tbl.setRowCount(0)
@@ -1758,18 +1808,31 @@ class ResultView(QObject):
             f"共 {len(rows)} 笔（已平 {n_closed} 笔，持仓中 {n_open} 笔）"
             f" · 盈利 {len(wins)} 笔 / 亏损 {len(losses)} 笔"
             f" · 平均盈利 {avg_win*100:+.2f}% / 平均亏损 {avg_loss*100:+.2f}%"
+            f" · 累计盈亏 {cums[-1]*100:+.2f}%（按笔复利，含持仓中那笔的浮动）"
             + ("　（组合：按策略分别平仓，不合并对冲）"
                if with_name and not getattr(self.ctx, "cross", None) else
                "　（截面：一笔 = 某品种一段连续同向持仓，权重变化不算新的一笔）"
                if with_name else "")
         )
 
+        # 列位置按表头名字找。原来靠 len(vals)-3 这种倒数去数，每加一列就要
+        # 重数一遍，数错了颜色会跑到别的列上
+        head = [tbl.horizontalHeaderItem(j).text() if tbl.horizontalHeaderItem(j) else ""
+                for j in range(tbl.columnCount())]
+        c_ret = head.index("收益")
+        c_cum = head.index("累计盈亏")
+        c_note = head.index("备注")
+
         shown = rows
         tbl.setRowCount(len(shown))
         for i, (name, t) in enumerate(shown):
             d = "多" if t.direction > 0 else "空"
             note = []
-            if t.open_position:
+            if t.entry_note:
+                note.append(f"进场：{t.entry_note}")
+            if t.exit_note:
+                note.append(f"出场：{t.exit_note}")
+            if t.open_position and not t.exit_note:
                 note.append("持仓中")
             vals = [str(i + 1)]
             if with_name:
@@ -1785,16 +1848,22 @@ class ResultView(QObject):
                 _lots_text(t.lots),
                 f"{t.ret*100:+.2f}%",
                 f"{t.bars}",
-                "、".join(note),
+                f"{cums[i]*100:+.2f}%",
+                " ｜ ".join(note),
             ]
             for j, v in enumerate(vals):
                 it = QTableWidgetItem(v)
-                if j >= 3 and j != len(vals) - 1:
+                if j >= 3 and j != c_note:
                     it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if j == len(vals) - 3:      # 收益列（手数插在它前面，倒数第三个不变）
+                if j == c_ret:
                     it.setForeground(QColor(C_UP if t.ret >= 0 else C_DOWN))
+                elif j == c_cum:
+                    it.setForeground(QColor(C_UP if cums[i] >= 0 else C_DOWN))
+                    it.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))
                 if t.open_position:
                     it.setForeground(QColor(C_MUTED))
+                if j == c_note:
+                    it.setToolTip(v)
                 tbl.setItem(i, j, it)
             tbl.setRowHeight(i, 22)
 
