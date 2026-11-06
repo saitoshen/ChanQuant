@@ -617,9 +617,8 @@ def cost_vector(frames: dict[str, pd.DataFrame], bt: BacktestConfig,
 def _metrics(equity: pd.Series, bpy: float) -> dict:
     """截面组合的绩效，口径和 `backtest._metrics` 一致：**累计与年化走单利**。
 
-    传进来的 `equity` 是「归一化到 1.0」的净值曲线，所以 `base = 1.0` 就是本金，
-    年化 = 累计收益 ÷ 年数。波动和夏普仍用「相对上一根」的日收益率，理由见
-    `backtest._metrics` 的说明。
+    传进来的 `equity` 是「归一化到 1.0」的净值曲线，所以 `base = 1.0` 就是本金：
+    年化 = 累计收益 ÷ 年数，逐根收益 = 当日净值变化 ÷ 1.0，回撤 = (净值 − 峰值) ÷ 1.0。
     """
     eq = equity.dropna()
     if len(eq) < 2:
@@ -630,11 +629,12 @@ def _metrics(equity: pd.Series, bpy: float) -> dict:
     years = max(len(eq) / max(bpy, 1.0), 1e-9)
     # 单利年化：累计收益 ÷ 年数（不取 1/年数 次方）
     cagr = float(total / years) if years > 0 else 0.0
-    ret = eq.pct_change().fillna(0.0)
+    # 逐根收益 = 当日净值变化 ÷ 本金（单利）。净值是归一化的，本金就是 1.0
+    ret = (eq.diff().fillna(0.0) / base) if base > 0 else eq * 0.0
     vol = float(ret.std(ddof=1) * np.sqrt(bpy)) if ret.std(ddof=1) > 0 else 0.0
     sharpe = float(ret.mean() * bpy / vol) if vol > 0 else 0.0
-    peak = eq.cummax()
-    dd = float((eq / peak - 1.0).min())
+    # 回撤同样以本金为分母（不是相对历史峰值），和 `backtest._metrics` 一致
+    dd = float(((eq - eq.cummax()) / base).min()) if base > 0 else 0.0
     calmar = float(cagr / abs(dd)) if dd < 0 else 0.0
     return {"total_return": total, "cagr": cagr, "initial_cash": float(base),
             "ann_vol": vol, "sharpe": sharpe, "max_dd": dd, "calmar": calmar}

@@ -308,11 +308,13 @@ def portfolio_metrics(curves_by_mode: dict) -> pd.DataFrame:
             c = portfolio_curve(d)
             if c is None or len(c) < 30:
                 continue
-            ret = c.pct_change().fillna(0.0)
+            # 单利口径（和绩效页一致）：曲线从 1.0 起步，本金就是 1.0
+            base = float(c.iloc[0]) or 1.0
             years = max((c.index[-1] - c.index[0]).days, 1) / 365.25
-            cagr = float(c.iloc[-1] ** (1 / years) - 1)
-            vol = float(ret.std(ddof=1) * np.sqrt(252))
-            mdd = float((c / c.cummax() - 1.0).min())
+            cagr = float((c.iloc[-1] - base) / base / years)
+            ret = (c.diff().fillna(0.0) / base).to_numpy()
+            vol = float(np.std(ret, ddof=1) * np.sqrt(252))
+            mdd = float(((c - c.cummax()) / base).min())
             rows.append(
                 {
                     "mode": mode,
@@ -321,7 +323,7 @@ def portfolio_metrics(curves_by_mode: dict) -> pd.DataFrame:
                     "n": len(d),
                     "cagr": cagr,
                     "vol": vol,
-                    "sharpe": float(ret.mean() * 252 / vol) if vol > 0 else 0.0,
+                    "sharpe": float(np.mean(ret) * 252 / vol) if vol > 0 else 0.0,
                     "max_dd": mdd,
                     "calmar": cagr / abs(mdd) if mdd < 0 else 0.0,
                 }

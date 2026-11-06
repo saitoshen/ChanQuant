@@ -1717,10 +1717,19 @@ class ResultView(QObject):
         ax.yaxis.set_minor_formatter(plain)
         ax.tick_params(labelbottom=False, colors=C_MUTED, labelsize=9)
 
-        dd_s = drawdown_series(res.equity) * 100
+        # 回撤以**本金**为分母（和绩效表那行「最大回撤」同一口径）
+        dd_s = drawdown_series(res.equity, res.metrics.get("initial_cash")) * 100
         if bh is not None:
-            dd_b = drawdown_series(bh.equity) * 100
-            ax2.fill_between(dd_b.index, dd_b.values, 0, color=C_BH, alpha=0.35, label="持有回撤")
+            dd_b = drawdown_series(bh.equity, bh.metrics.get("initial_cash")) * 100
+            # 基准是「一次买满、一直拿着」：持仓市值可以是本金的几十倍，回撤
+            # 按本金一算就是几千个百分点，画进来会把策略那条压成平线。超出
+            # 一个数量级就只在图例里报个数，不画
+            if abs(float(dd_b.min())) <= max(abs(float(dd_s.min())) * 3.0, 30.0):
+                ax2.fill_between(dd_b.index, dd_b.values, 0,
+                                 color=C_BH, alpha=0.35, label="持有回撤")
+            else:
+                ax2.plot([], [], lw=6, alpha=0.35, color=C_BH,
+                         label=f"持有回撤 {float(dd_b.min()):.0f}%（超出坐标范围，未入图）")
         ax2.fill_between(dd_s.index, dd_s.values, 0, color=C_STRAT, alpha=0.45, label="策略回撤")
         ax2.set_ylabel("回撤 %", fontsize=9, color=C_MUTED)
         ax2.grid(True, color=C_GRID, lw=0.5, alpha=0.7)
@@ -1827,9 +1836,10 @@ class ResultView(QObject):
             # 本金固定，赚到的钱并没有变成下一笔的仓位，按复利折年会低估
             ("年化收益（单利）", pct(m["cagr"]), pct(b["cagr"]) if b else "—",
              None if b is None else m["cagr"] >= b["cagr"]),
-            # 回撤是「权益 / 历史峰值 − 1」：比的是从高点回落多少，不拿本金当
-            # 分母（一条涨了十倍的曲线按本金算会写出 −300%，没法看也没法比）
-            ("最大回撤", pct(m["max_dd"]), pct(b["max_dd"]) if b else "—",
+            # 回撤 = (权益 − 历史峰值) ÷ 本金。单利框架里本金是唯一的分母，
+            # 和卡玛的分子（年化，相对本金）同一个基准；写成「相对峰值」的话，
+            # 赚了一半之后同样的回落只会写出 −13%，回撤越赚越好看
+            ("最大回撤（相对本金）", pct(m["max_dd"]), pct(b["max_dd"]) if b else "—",
              None if b is None else m["max_dd"] >= b["max_dd"]),
             ("夏普比率", num(m["sharpe"]), num(b["sharpe"]) if b else "—",
              None if b is None or m["sharpe"] != m["sharpe"] else m["sharpe"] >= b["sharpe"]),

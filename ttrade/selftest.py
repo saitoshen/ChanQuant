@@ -605,8 +605,12 @@ def _run() -> tuple[bool, list[str]]:
             累计收益 = (期末权益 − 本金) ÷ 本金
             年化收益 = 累计收益 ÷ 年数            （不取 1/年数 次方）
             逐根收益 = 当日盈亏 ÷ 本金
-            最大回撤 = 权益 ÷ 历史峰值 − 1
+            最大回撤 = (权益 − 历史峰值) ÷ 本金
             卡玛     = 单利年化 ÷ |最大回撤|
+
+        分母全是本金 —— 回撤要是写成「相对峰值」，赚了一半之后同样的回落只
+        会写出 −13%（而不是 −20%），回撤会随着盈利越变越好看，卡玛的分子
+        分母也就不是一个基准了。
 
         外加阶段分析：月度/年度收益也是「段盈亏 ÷ 本金」，所以**十二个月相加
         等于年度、各年相加等于累计**。这条最容易被改回复利（除以段初权益），
@@ -661,9 +665,8 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(
                 f"年化 {m['cagr']:.6f} ≠ 累计 ÷ 年数 {total / years:.6f}（又用复利折年了？）")
 
-        # 波动 / 夏普走「相对上一根」的日收益率（不是盈亏 ÷ 本金，否则权益涨几倍
-        # 之后波动会被放大成四位数的百分比）
-        step = eq.pct_change().fillna(0.0)
+        # 波动 / 夏普走「当日盈亏 ÷ 本金」，和年化收益同一个分母
+        step = eq.diff().fillna(0.0) / base
         want_vol = float(step.std(ddof=1) * np.sqrt(cfg.bars_per_year))
         if abs(m["ann_vol"] - want_vol) > 1e-9:
             raise RuntimeError(
@@ -672,9 +675,10 @@ def _run() -> tuple[bool, list[str]]:
         if abs(m["sharpe"] - want_sharpe) > 1e-9:
             raise RuntimeError(f"夏普 {m['sharpe']:.4f} ≠ {want_sharpe:.4f}")
 
-        want_dd = float((eq / eq.cummax() - 1.0).min())
+        want_dd = float(((eq - eq.cummax()) / base).min())
         if abs(m["max_dd"] - want_dd) > 1e-9:
-            raise RuntimeError(f"最大回撤 {m['max_dd']:.6f} ≠ 权益/峰值−1 {want_dd:.6f}")
+            raise RuntimeError(
+                f"最大回撤 {m['max_dd']:.6f} ≠ (权益−峰值)/本金 {want_dd:.6f}")
         if abs(m["calmar"] - m["cagr"] / abs(m["max_dd"])) > 1e-9:
             raise RuntimeError("卡玛不是「单利年化 ÷ |最大回撤|」")
 

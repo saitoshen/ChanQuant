@@ -196,11 +196,13 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
         最大回撤 = 权益 ÷ 历史峰值 − 1（回撤本来就该相对峰值看，见下）
         卡玛     = 年化收益 ÷ |最大回撤|
 
-    例外是**逐根收益率**（年化波动、夏普用的那条序列）：它仍然按「相对上一根
-    权益」算。拿「当日盈亏 ÷ 本金」当收益率，权益涨到几倍之后同一笔盈亏会被
-    放大成几倍的「收益率」，波动能算出四位数的百分比（买入持有二十年涨百倍时
-    尤其明显），夏普随之失去意义。日收益率的定义就是相对上一根的变化率，和
-    累计口径是不是单利无关。
+        逐根收益 = 当日盈亏 ÷ 本金
+        夏普     = 逐根收益的日均 × 年根数 ÷ 年化波动
+
+    分母全是本金，所以「日均 × 年根数」和「累计 ÷ 年数」是同一个量级的数，
+    夏普、卡玛、年化摆放着能互相验算。买了一只二十年涨百倍的股票，本金口径下
+    后期的日盈亏就是本金的几十倍，波动自然很大 —— 那不是算错，是「仓位市值
+    已经远超初始本金」这件事本身。
     """
     equity = equity.dropna()
     if len(equity) < 2:
@@ -217,21 +219,21 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
     # 假设每年把赚到的钱再押进去，而本金固定时那笔钱并没有变成仓位
     cagr = float(total / years) if years > 0 else 0.0
 
-    # 逐根收益率：相对上一根权益。权益被亏穿成负数后，拿负数当基数会算出
-    # 「-100 亏到 -50 = +50%」这种假反弹，所以那之后的收益记 0
-    ret = equity.pct_change().fillna(0.0)
-    ret = ret.where(equity.shift(1) > 0, 0.0)
+    # 逐根收益 = 当日盈亏 ÷ 本金（单利）。`pct_change()` 是「相对上一根权益」，
+    # 那是复利口径：权益涨上去之后同样的盈亏被算成更小的波动，夏普跟着虚高
+    ret = (equity.diff().fillna(0.0) / base if base > 0
+           else pd.Series(0.0, index=equity.index))
 
     bpy = float(bars_per_year or TRADING_DAYS)
     vol = ret.std(ddof=1) * np.sqrt(bpy) if ret.std(ddof=1) > 0 else 0.0
     sharpe = (ret.mean() * bpy) / vol if vol > 0 else 0.0
 
-    # 回撤相对**历史峰值**，不相对本金：本金口径下一条涨了十倍的曲线，回撤
-    # 会写成 −300% 这种没法看也没法比的数。相对峰值是「从高点回落了多少」，
-    # 两种口径下都是这个含义
-    dd_series = equity / equity.cummax() - 1.0
+    # 回撤也按**本金**算：(权益 − 历史峰值) ÷ 本金。单利框架里本金是唯一的分母，
+    # 换成「相对峰值」的话，赚了一半之后同样的回落会被算成更小的百分比，
+    # 而且和卡玛的分子（年化，相对本金）不是一个基准 —— 两个数摆在一起没法比
+    dd_series = (equity - equity.cummax()) / base if base > 0 else equity * 0.0
     max_dd = float(dd_series.min())
-    # 卡玛的分子用单利年化，和绩效表上那行「年化收益」是同一个数
+    # 卡玛：分子分母都以本金为基准
     calmar = cagr / abs(max_dd) if max_dd < 0 else 0.0
 
     # 权益一旦被亏穿，波动 / 夏普 / 卡玛都失去意义（净值翻号后的「反弹」不是
@@ -317,10 +319,9 @@ def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float
     `unit` 口径返回的是**手数**（可以是小数，名义敞口 = 权益），其余口径返回整数手。
     手数为 0 表示这笔不做（钱不够一手保证金）。
 
-    `capital` 和 `risk` 都是**单利**：手数只看「分配的资金 / 止损金额」，不看
-    账户当前权益。赚了不加大仓位，亏了也不缩 —— 这样回测出来的是「这套规则在
-    固定规模下能赚多少」，而不是「复利滚了二十年之后的奇迹」。要看复利，把
-    资金口径换成 `unit`。
+    **四种口径都是单利**：手数只看「本金（或分配的那部分）/ 止损金额 / 固定
+    手数」，不看账户当前权益。赚了不加大仓位，亏了也不缩 —— 回测出来的是
+    「这套规则在固定本金下能赚多少」，而不是「复利滚了二十年之后的奇迹」。
     """
     if price <= 0:
         return 0.0
@@ -341,9 +342,12 @@ def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float
         # 按当前权益收口就变成复利了：50 万赚到 80 万会自己加到 80 万的仓，
         # 亏到 30 万又自动减到 30 万 —— 那是另一套策略，不是用户要的「单利」
         return float(max(int(cfg.budget / per), 0))
-    # 名义敞口 = 权益。期货一手是 price × 乘数，不除乘数的话
-    # 「不加杠杆」会变成 10 倍杠杆（RB 乘数 10）
-    return float(max(equity, 0.0) / (price * mult))
+    # 名义敞口 = **本金**（固定）。原来是「当前权益」，权益从 10 万涨到 34 万，
+    # 手数跟着放大 3.4 倍 —— 那是复利，和其余三种口径不是一套东西：双均线 /
+    # 唐奇安 / 海龟 / 通道突破 / MACD 这几条老策略因此会跑出「越赚越猛」的曲线，
+    # 和固定手数的结果没法比。改成盯本金之后，四种口径统一是单利。
+    # 期货一手是 price × 乘数，不除乘数的话「不加杠杆」会变成 10 倍杠杆
+    return float(max(float(cfg.initial_cash or equity or 0.0), 0.0) / (price * mult))
 
 
 def _note_col(data: pd.DataFrame, name: str) -> np.ndarray | None:
@@ -720,13 +724,18 @@ def combine_trades(named: list[tuple[str, Result]]) -> list[tuple[str, Trade]]:
     return out
 
 
-def drawdown_series(equity: pd.Series) -> pd.Series:
-    """回撤曲线：相对**历史峰值**回落了多少。
+def drawdown_series(equity: pd.Series, base: float | None = None) -> pd.Series:
+    """回撤曲线：(权益 − 历史峰值) ÷ **本金**，和绩效页的「最大回撤」同一口径。
 
-    不拿本金当分母 —— 一条涨了十倍的曲线，按本金算会写出 −300% 这种没法看、
-    也没法横向比的数。回撤的含义就是「从高点回落」，两种口径下都一样。
+    本金是单利框架里唯一的分母。用「相对当时权益」的话，赚了一半之后同样的
+    回落只写出 −13%（而不是 −20%），回撤会随着盈利越变越好看 —— 那是复利
+    口径，和卡玛的分子（年化，相对本金）也对不上。
     """
-    return equity / equity.cummax() - 1.0
+    eq = pd.to_numeric(equity, errors="coerce")
+    b = float(base or (eq.dropna().iloc[0] if eq.notna().any() else 0.0) or 0.0)
+    if b <= 0:
+        return eq * 0.0
+    return (eq - eq.cummax()) / b
 
 
 def yearly_returns(equity: pd.Series, base: float | None = None) -> pd.Series:
@@ -773,10 +782,11 @@ def stage_table(equity: pd.Series, freq: str = "YE",
             continue
         last = float(seg.iloc[-1])
         ret = (last - prev) / base0 if base0 > 0 else 0.0
-        dd = float((seg / seg.cummax() - 1.0).min())
-        # 段内波动按根数年化，和 `_metrics` 一样走「相对上一根」的日收益率
-        # （不是盈亏 ÷ 本金，理由见 `_metrics` 的说明）
-        r = seg.pct_change().dropna()
+        # 段内回撤同样以本金为分母（和 `_metrics` 一致），不是段内峰值的百分比
+        dd = (float(((seg - seg.cummax()) / base0).min())
+              if base0 > 0 else 0.0)
+        # 段内波动按根数年化，和 `_metrics` 一样走「当日盈亏 ÷ 本金」
+        r = (seg.diff().dropna() / base0) if base0 > 0 else seg.diff().dropna() * 0.0
         vol = float(r.std(ddof=1) * np.sqrt(252)) if len(r) > 1 else 0.0
         rows.append({"period": key, "ret": ret, "max_dd": dd, "vol": vol, "bars": len(seg)})
         prev = last
