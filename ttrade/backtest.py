@@ -170,7 +170,7 @@ class Result:
 
 
 _METRIC_KEYS = (
-    "total_return", "cagr", "ann_vol", "sharpe", "max_dd", "calmar",
+    "total_return", "cagr", "cagr_simple", "ann_vol", "sharpe", "max_dd", "calmar",
     "exposure", "long_exposure", "short_exposure",
     "n_trades", "n_long", "n_short",
     "win_rate", "avg_trade", "profit_factor", "payoff", "avg_win", "avg_loss",
@@ -201,6 +201,17 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
         cagr = -1.0
     else:
         cagr = ratio ** (1 / years) - 1
+
+    # 单利年化 = 累计收益 ÷ 年数。它和 `cagr` 是同一段行情的两种折年方式：
+    #
+    #     cagr        假设每年把赚到的钱再押进去（几何平均）
+    #     cagr_simple 假设只按最初那笔本金算（算术平均）
+    #
+    # 两个都给，是因为账户到底滚不滚，取决于仓位口径：`unit`（名义敞口=权益）
+    # 会随权益放大手数，是真的在滚，该看 `cagr`；`capital` / `fixed` / `risk`
+    # 的手数固定，赚到的钱不会自己变成仓位，那 `cagr` 会偏低，`cagr_simple`
+    # 才是「这笔本金每年挣了多少」。只给一个数，另一边的人就会觉得算错了
+    cagr_simple = float(total / years) if years > 0 else 0.0
 
     bpy = float(bars_per_year or TRADING_DAYS)
     vol = ret.std(ddof=1) * np.sqrt(bpy) if ret.std(ddof=1) > 0 else 0.0
@@ -253,6 +264,7 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
     return {
         "total_return": float(total),
         "cagr": float(cagr),
+        "cagr_simple": float(cagr_simple),
         "ann_vol": float(vol),
         "sharpe": float(sharpe),
         "max_dd": max_dd,

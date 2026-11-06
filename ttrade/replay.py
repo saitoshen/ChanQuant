@@ -216,13 +216,17 @@ def summary(rp: "Replay", head: str, period: str) -> str:
         title += f" · {rp.label}"
     lines = [title, span]
     lines.append(
-        f"策略  总收益 {m['total_return'] * 100:+.1f}%｜年化 {m['cagr'] * 100:+.2f}%"
+        f"策略  总收益 {m['total_return'] * 100:+.1f}%"
+        f"｜年化 {m['cagr'] * 100:+.2f}%（复利）/ "
+        f"{m.get('cagr_simple', 0.0) * 100:+.2f}%（单利）"
         f"｜最大回撤 {m['max_dd'] * 100:.1f}%｜夏普 {_num(m['sharpe'])}"
         f"｜卡玛 {_num(m['calmar'])}"
     )
     if b is not None:
         lines.append(
-            f"基准  总收益 {b['total_return'] * 100:+.1f}%｜年化 {b['cagr'] * 100:+.2f}%"
+            f"基准  总收益 {b['total_return'] * 100:+.1f}%"
+            f"｜年化 {b['cagr'] * 100:+.2f}%（复利）/ "
+            f"{b.get('cagr_simple', 0.0) * 100:+.2f}%（单利）"
             f"｜最大回撤 {b['max_dd'] * 100:.1f}%｜夏普 {_num(b['sharpe'])}"
         )
         lines.append(f"超额  {(m['cagr'] - b['cagr']) * 100:+.2f}%/年")

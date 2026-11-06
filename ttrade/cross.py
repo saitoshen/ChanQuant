@@ -613,19 +613,21 @@ def cost_vector(frames: dict[str, pd.DataFrame], bt: BacktestConfig,
 def _metrics(equity: pd.Series, bpy: float) -> dict:
     eq = equity.dropna()
     if len(eq) < 2:
-        return {"total_return": 0.0, "cagr": 0.0, "ann_vol": 0.0, "sharpe": 0.0,
-                "max_dd": 0.0, "calmar": 0.0}
+        return {"total_return": 0.0, "cagr": 0.0, "cagr_simple": 0.0, "ann_vol": 0.0,
+                "sharpe": 0.0, "max_dd": 0.0, "calmar": 0.0}
     ret = eq.pct_change().dropna()
     total = float(eq.iloc[-1] / eq.iloc[0] - 1.0) if eq.iloc[0] > 0 else 0.0
     years = max(len(eq) / max(bpy, 1.0), 1e-9)
     cagr = (1.0 + total) ** (1.0 / years) - 1.0 if total > -1 else -1.0
+    # 单利年化，口径和 `backtest._metrics` 一致（累计收益 ÷ 年数）
+    cagr_simple = float(total / years) if years > 0 else 0.0
     vol = float(ret.std(ddof=0) * np.sqrt(bpy)) if len(ret) else 0.0
     sharpe = float(ret.mean() * bpy / vol) if vol > 0 else 0.0
     peak = eq.cummax()
     dd = float((eq / peak - 1.0).min())
     calmar = float(cagr / abs(dd)) if dd < 0 else 0.0
-    return {"total_return": total, "cagr": cagr, "ann_vol": vol,
-            "sharpe": sharpe, "max_dd": dd, "calmar": calmar}
+    return {"total_return": total, "cagr": cagr, "cagr_simple": cagr_simple,
+            "ann_vol": vol, "sharpe": sharpe, "max_dd": dd, "calmar": calmar}
 
 
 def trades_from_weights(weights: pd.DataFrame,

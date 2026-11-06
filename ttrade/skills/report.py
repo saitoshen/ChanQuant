@@ -262,11 +262,11 @@ def build_pack(symbol: str) -> dict:
             m = res.metrics or {}
             rows.append([spec.label, _pct(m.get("cagr")), _pct(m.get("max_dd")),
                          _num(m.get("sharpe")), _num(m.get("n_trades"), 0)])
-            notes.append(f"{spec.label} 年化 {_pct(m.get('cagr'))}、"
+            notes.append(f"{spec.label} 年化(CAGR) {_pct(m.get('cagr'))}、"
                          f"最大回撤 {_pct(m.get('max_dd'))}、夏普 {_num(m.get('sharpe'))}")
         if rows:
             blocks.append(B.block_table(
-                ["策略", "年化", "最大回撤", "夏普", "交易数"], rows,
+                ["策略", "年化 CAGR", "最大回撤", "夏普", "交易数"], rows,
                 note="同一品种、同一区间、默认成本；买入持有是基准"))
             feed.append("【策略对比】" + "；".join(notes)
                         + "。（基准是买入持有，跑不赢它说明赚的是 beta 不是择时）")

@@ -6223,7 +6223,9 @@ class MainWindow(QMainWindow):
         blown_txt = "　已爆仓（净值归零）" if float(out.equity.min()) <= 0 else ""
         self.lbl_status.setText(
             f"{label} · 累计 {m['total_return'] * 100:+.1f}%"
-            f" · 年化 {m['cagr'] * 100:+.2f}% · 回撤 {m['max_dd'] * 100:.1f}%"
+            f" · 年化 {m['cagr'] * 100:+.2f}%（复利）"
+            f"/ {m.get('cagr_simple', 0.0) * 100:+.2f}%（单利）"
+            f" · 回撤 {m['max_dd'] * 100:.1f}%"
             f" · 调仓 {m['n_trades']} 次"
             + blown_txt
             + (f"　缺：{'、'.join(missing)}" if missing else "")

@@ -521,7 +521,7 @@ class ResultView(QObject):
         # 指标卡片条（横向，放在图表上方）
         cards = QHBoxLayout()
         cards.setSpacing(8)
-        self.card_cagr = MetricCard("策略年化")
+        self.card_cagr = MetricCard("策略年化 CAGR")
         self.card_dd = MetricCard("最大回撤")
         self.card_sharpe = MetricCard("夏普比率")
         self.card_excess = MetricCard("vs 持有超额")
@@ -1743,10 +1743,29 @@ class ResultView(QObject):
             return "—" if x is None or x != x else f"{cur}{x:,.{dp}f}"
 
         rows = [
-            ("年化收益 CAGR", pct(m["cagr"]), pct(b["cagr"]) if b else "—",
-             None if b is None else m["cagr"] >= b["cagr"]),
+            # 累计收益就是**账户真实增长**：期末 ÷ 期初 − 1。交易记录里逐笔净额
+            # 相加再除以初始资金，算出来是同一个数（自检里钉着这条）—— 所以它
+            # 既不是「逐笔百分比相加」，也不是「百分比连乘」，而是钱多了多少。
+            # 手数随权益放大的口径下，这个数本身已经含了滚动
             ("累计收益", pct(m["total_return"]), pct(b["total_return"]) if b else "—",
              None if b is None else m["total_return"] >= b["total_return"]),
+            # 同一段行情，两种折年方式，一起摆出来才不会有人觉得算错了：
+            #   复利 CAGR   假设赚到的钱每年再押进去（几何平均）
+            #   单利        只按最初那笔本金算（累计 ÷ 年数，算术平均）
+            # 到底哪个对，取决于仓位口径：`unit`（名义敞口=权益）手数随权益放大，
+            # 是真的在滚，看 CAGR；`capital` / `fixed` / `risk` 手数固定，赚到的
+            # 钱不会自己变成仓位，CAGR 会偏低，单利才是「这笔本金每年挣多少」
+            ("年化收益（复利 CAGR）", pct(m["cagr"]), pct(b["cagr"]) if b else "—",
+             None if b is None else m["cagr"] >= b["cagr"]),
+            # 老报告里没有 cagr_simple（这一项是 v2.6.16 才加的），缺就写「—」，
+            # 别拿 0 去比 —— 那会把「没这个数」显示成「跑输基准」
+            ("年化收益（单利）", pct(m.get("cagr_simple")),
+             pct(b.get("cagr_simple")) if b else "—",
+             None if b is None or m.get("cagr_simple") is None
+             or b.get("cagr_simple") is None
+             else m["cagr_simple"] >= b["cagr_simple"]),
+            # 回撤是「权益 / 历史峰值 − 1」，比的是钱，和单利复利无关：
+            # 峰值 100 万回落到 80 万就是 −20%，两种折年方式下都是这个数
             ("最大回撤", pct(m["max_dd"]), pct(b["max_dd"]) if b else "—",
              None if b is None else m["max_dd"] >= b["max_dd"]),
             ("夏普比率", num(m["sharpe"]), num(b["sharpe"]) if b else "—",
