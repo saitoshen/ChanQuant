@@ -17,7 +17,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # 直接运行 gui/app.py 时，sys.path[0] 是 gui/ 目录，需要把项目根目录补进去，
 # 否则 from ttrade.* 会报 ModuleNotFoundError（双击 bat 启动时同样受影响）。
@@ -5968,6 +5968,9 @@ class MainWindow(QMainWindow):
         # 是镜像的，标题不写清楚就只能靠翻交易记录猜
         tag = "多品种等权" + ("（反向）" if reverse else "")
         res = combine(results, label=tag)
+        # 绩效页的「品种」下拉框读它，切到单个品种看谁在赚。标签换成品种名，
+        # 腿自己的 label 原本是策略名
+        res.legs = {str(k): replace(r, label=str(k)) for k, r in named}
         trades = combine_trades(named)
         bpy = bars_per_year(res.equity.index)
         ctx = ViewCtx(

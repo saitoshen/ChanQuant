@@ -22,7 +22,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pandas as pd
 
@@ -481,6 +481,10 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
     if not results:
         return Replay(error="多品种一个都没跑出来：" + "；".join(failed[:4]))
     res = combine(results, label=f"多品种等权 · {len(results)} 个")
+    # 逐品种留给绩效页的「品种」下拉框：组合是等权的，切进去看单个品种才分得清
+    # 是「每个都赚一点」还是「一个赚翻、其余全亏」。标签换成品种名 —— 每条腿
+    # 原本的 label 是策略名（「唐奇安」），切过去图例上写着策略名会认不出是谁
+    res.legs = {str(k): replace(r, label=str(k)) for k, r in named}
     bpy = bars_per_year(res.equity.index)
     return Replay(res=res, bh=None, label=res.label,
                   family=getattr(cfg, "family", "rule"),

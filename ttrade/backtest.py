@@ -167,6 +167,9 @@ class Result:
     trades: list[Trade]
     metrics: dict = field(default_factory=dict)
     label: str = ""
+    # 逐品种拆账（只有截面策略有）：品种 → 该品种自己的 Result。绩效页的
+    # 「品种」下拉框读它，回答「组合里到底是哪个在赚」
+    legs: dict = field(default_factory=dict)
 
 
 _METRIC_KEYS = (

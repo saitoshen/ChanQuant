@@ -197,6 +197,10 @@ class CrossResult:
     # 要在它自己的周期上算 —— 把日线分数铺到 5 分钟每根 bar 上再算 IC，等于把
     # 同一个观测重复几十遍，t 值会被吹起来
     score_step1: pd.DataFrame | None = None
+    # 逐品种拆账：键是品种代码，值是 {equity, trades, cost_pct, notional_pct}。
+    # 绩效页的「品种」下拉框读它 —— 组合赚了 30% 不等于每个品种都赚，
+    # 得能点进去看是哪个在赚、哪个在拖
+    per_symbol: dict = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -865,28 +869,57 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     fee = (weights.diff().abs() * cvec).sum(axis=1).fillna(0.0)
     net = port_ret - fee
 
-    # 单根亏 100% 以上就是爆仓，净值钉在 0 —— 负数净值没有意义，而且会把
-    # 「最大回撤 / 夏普」这些比例型指标一起算崩（`combine` 平均时更糟）
-    equity = (1.0 + net.clip(lower=-1.0)).cumprod()
+    # **单利**：本金固定，每根盈亏直接加在账户上 —— 权重本身就是**本金**的比例
+    # （不是当时权益的比例），所以净值 = 1 + Σ净收益。原来是
+    # `(1+net).cumprod()`，那是把每根收益按当时权益复利滚一遍：本金涨上去之后
+    # 同样的盈亏会被算成更小的百分比，期末资金、成本、夏普、卡玛跟着全偏，
+    # 和单品种那条「固定手数」的口径也对不上
+    equity = 1.0 + net.cumsum()
+    # 亏穿本金就钉在 0：负数净值没有意义，还会把回撤 / 夏普一起算崩
+    equity = equity.clip(lower=0.0)
     equity.iloc[0] = 1.0
     bpy = bt.bars_per_year or 252.0
     n_reb = len(range(0, len(score), step))
-    # 成本占**初始资金**的比例：`fee` 是「当根换手 × 单边成本率」，乘上换手前的
-    # 净值就是那一刻的金额。截面净值是归一化曲线，所以这里只能先记比例，
-    # 到 `to_result` 里再乘回本金
+    # 成本占**本金**的比例。单利下本金恒定，`fee`（当根换手 × 单边成本率）
+    # 本身就已经是「占本金多少」，不用再乘当时净值
     m = _metrics(equity, bpy)
-    m["cost_pct"] = float((fee * equity.shift(1).fillna(1.0)).sum())
-    # 成交额（同样是占初始资金的比例）：成本率 = 成本 ÷ 成交额，绩效页那一行
-    # 显示的是它。换手 Σ|Δw| 就是「这一根买卖了净值的多少倍」
+    m["cost_pct"] = float(fee.sum())
+    # 成交额（同样是占本金的比例）：成本率 = 成本 ÷ 成交额，绩效页那一行
+    # 显示的是它。换手 Σ|Δw| 就是「这一根买卖了本金的多少倍」
     turnover = weights.diff().abs().sum(axis=1).fillna(0.0)
-    m["notional_pct"] = float((turnover * equity.shift(1).fillna(1.0)).sum())
+    m["notional_pct"] = float(turnover.sum())
+
+    # 逐品种拆账。Σ 各品种的贡献 = `net`，所以各腿净值加总就是组合净值 ——
+    # 绩效页切到单品种时看的是这一条，不是「组合净值 × 权重」那种近似
+    per_symbol: dict = {}
+    ones = pd.Series(1.0, index=weights.index)
+    for sym in weights.columns:
+        if sym not in rets or sym not in close:
+            continue
+        wv = weights[sym]
+        cv = float(cvec.get(sym, 0.0) or 0.0)
+        lfee = wv.diff().abs().fillna(0.0) * cv
+        lnet = wv.shift(1).fillna(0.0) * rets[sym].fillna(0.0) - lfee
+        leq = (1.0 + lnet.cumsum()).clip(lower=0.0)
+        leq.iloc[0] = 1.0
+        per_symbol[sym] = {
+            "equity": leq,
+            "cost_pct": float(lfee.sum()),
+            "notional_pct": float(wv.diff().abs().fillna(0.0).sum()),
+            "trades": trades_from_weights(
+                weights[[sym]], close[[sym]], rets=rets[[sym]],
+                cvec=pd.Series({sym: cv}, dtype=float), eq_prev=ones),
+        }
     return CrossResult(
         equity=equity, weights=weights, metrics=m,
         label=label, legs=int(weights.abs().gt(0).sum(axis=1).max() or 0),
         n_rebalance=n_reb,
         step=step, bars_per_day=bpd,
+        # `eq_prev` 给常数 1.0（= 本金）：单利下每根的盈亏都按本金算，
+        # 不是按当时权益算
         trades=trades_from_weights(weights, close, rets=rets, cvec=cvec,
-                                   eq_prev=equity.shift(1).fillna(1.0)),
+                                   eq_prev=ones),
+        per_symbol=per_symbol,
         score=score,
         score_step1=(score_src if src is not frames else None),
     )
@@ -966,8 +999,32 @@ def to_result(out: "CrossResult", label: str = "", step: int = 0,
     cash = float(initial_cash or 0.0)
     trades = [replace(t, gross=float(t.gross) * cash, cost=float(t.cost) * cash)
               for t in out.trades]
+
+    # ---- 逐品种：每条腿单独成一份 Result，绩效页的「品种」下拉框直接换过去
+    #
+    # 腿的净值也是归一化的（1.0 = 本金），所以指标同样按 `base=1.0` 算，
+    # 金额项乘回本金。成本按**这个品种自己**的换手算 —— 组合的总成本是各腿
+    # 成本相加，切到单品种时不能拿组合的总成本去摊
+    legs: dict = {}
+    for sym, leg in (getattr(out, "per_symbol", None) or {}).items():
+        leq = leg["equity"]
+        lpos = pd.Series(np.sign(out.weights[sym].reindex(leq.index).fillna(0.0)),
+                         index=leq.index, name="position")
+        ltrades = [replace(t, gross=float(t.gross) * cash, cost=float(t.cost) * cash)
+                   for t in leg["trades"]]
+        lm = dict(_metrics(leq, lpos, ltrades, bpy, base=1.0))
+        lm["initial_cash"] = cash
+        lm["final_equity"] = float(leq.iloc[-1]) * cash
+        lm["total_cost"] = float(leg["cost_pct"]) * cash
+        lm["notional"] = float(leg["notional_pct"]) * cash
+        lm["avg_cost"] = float(lm["total_cost"] / lm["n_trades"]) if lm["n_trades"] else 0.0
+        lm["cost_rate"] = (float(lm["total_cost"] / lm["notional"])
+                           if lm["notional"] > 0 else 0.0)
+        legs[str(sym)] = Result(equity=leq * cash, position=lpos, trades=ltrades,
+                                metrics=lm, label=str(sym))
+
     return Result(equity=eq, position=pos, trades=trades,
-                  metrics=m, label=label)
+                  metrics=m, label=label, legs=legs)
 
 
 @dataclass

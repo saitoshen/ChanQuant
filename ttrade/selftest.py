@@ -752,7 +752,37 @@ def _run() -> tuple[bool, list[str]]:
         if pnl_gap > 1e-3:
             raise RuntimeError(
                 f"截面逐笔净额对不上净值变化，差 {pnl_gap:.4f}")
-        return f"{len(res.trades)} 笔，Σ成本=总成本、Σ净额=净值变化"
+
+        # ---- 单利 + 逐品种
+        #
+        # 组合净值必须是 `1 + Σ各腿净收益`（单利），不是 `(1+net)` 连乘 ——
+        # 复利下本金涨上去，同样的盈亏会被算成更小的百分比，期末资金、成本、
+        # 夏普、卡玛跟着全偏。而且各腿相加必须**正好回到组合**，否则绩效页
+        # 切到单品种看到的是另一套数
+        m = res.metrics
+        leg_sum = sum(r.metrics["total_return"] for r in res.legs.values())
+        if abs(leg_sum - m["total_return"]) > 1e-9:
+            raise RuntimeError(
+                f"各腿累计相加 {leg_sum:.6f} ≠ 组合累计 {m['total_return']:.6f}")
+        leg_cost = sum(r.metrics["total_cost"] for r in res.legs.values())
+        if abs(leg_cost - m["total_cost"]) > 1e-3:
+            raise RuntimeError(
+                f"各腿成本相加 {leg_cost:.2f} ≠ 组合总成本 {m['total_cost']:.2f}")
+        for sym, lr in res.legs.items():
+            lm = lr.metrics
+            if abs(float(lm["initial_cash"]) - bt.initial_cash) > 1e-6:
+                raise RuntimeError(f"{sym} 的本金不是 {bt.initial_cash}")
+            want = (1.0 + float(lm["total_return"])) * bt.initial_cash
+            if abs(float(lm["final_equity"]) - want) > 1e-3:
+                raise RuntimeError(
+                    f"{sym} 期末资金 {lm['final_equity']:.2f} ≠ 本金×(1+累计) {want:.2f}")
+        # 年化必须是单利：累计 ÷ 年数
+        yrs = (res.equity.index[-1] - res.equity.index[0]).days / 365.25
+        if abs(m["cagr"] - m["total_return"] / yrs) > 1e-9:
+            raise RuntimeError(
+                f"截面的年化 {m['cagr']:.6f} ≠ 累计 ÷ 年数 {m['total_return']/yrs:.6f}")
+        return (f"{len(res.trades)} 笔，Σ成本=总成本、Σ净额=净值变化、"
+                f"{len(res.legs)} 个品种各腿相加=组合、年化走单利")
 
     check("截面逐笔金额口径", _cross_trade_money)
 

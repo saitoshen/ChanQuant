@@ -45,6 +45,7 @@ from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -558,6 +559,23 @@ class ResultView(QObject):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 8, 8)
 
+        # 多品种才有「切到某个品种」这回事。放在页首而不是表格顶上：换的不只是
+        # 右边那张指标表，左边的资金曲线和回撤也跟着换
+        self.cb_leg = None
+        if self.kind != "single":
+            top = QHBoxLayout()
+            top.setContentsMargins(0, 0, 0, 2)
+            lab = QLabel("品种")
+            lab.setStyleSheet("font-size: 11px; color: #6b7280;")
+            top.addWidget(lab)
+            self.cb_leg = QComboBox()
+            self.cb_leg.setMinimumWidth(200)
+            self.cb_leg.addItem("全部组合（各品种合计）", "")
+            self.cb_leg.currentIndexChanged.connect(self._on_leg_changed)
+            top.addWidget(self.cb_leg)
+            top.addStretch(1)
+            lay.addLayout(top)
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
 
@@ -569,9 +587,9 @@ class ResultView(QObject):
         rl = QVBoxLayout(right)
         rl.setContentsMargins(8, 0, 0, 0)
         rl.setSpacing(6)
-        cap = QLabel("绩效指标对比" if self.kind == "single" else "组合绩效指标")
-        cap.setStyleSheet("font-size: 13px; font-weight: 600; color: #0f172a;")
-        rl.addWidget(cap)
+        self.lbl_perf_cap = QLabel("绩效指标对比" if self.kind == "single" else "组合绩效指标")
+        self.lbl_perf_cap.setStyleSheet("font-size: 13px; font-weight: 600; color: #0f172a;")
+        rl.addWidget(self.lbl_perf_cap)
 
         self.table = QTableWidget(0, 3 if self.kind == "single" else 2)
         self.table.setHorizontalHeaderLabels(
@@ -594,6 +612,44 @@ class ResultView(QObject):
 
         lay.addWidget(splitter)
         return w
+
+    def _sync_leg_combo(self, res) -> None:
+        """按结果重建「品种」下拉框。换策略时上一个策略的品种名不能留着 ——
+        点进去会读到另一份数据的腿。"""
+        cb = getattr(self, "cb_leg", None)
+        if cb is None:
+            return
+        legs = sorted((getattr(res, "legs", None) or {}).keys()) if res is not None else []
+        cb.blockSignals(True)
+        cb.clear()
+        cb.addItem("全部组合（各品种合计）", "")
+        for sym in legs:
+            cb.addItem(sym, sym)
+        cb.setCurrentIndex(0)
+        cb.blockSignals(False)
+        # 没有逐品种数据（多策略等权组合、老的保存结果）时置灰，别给个点不动的空框
+        cb.setEnabled(bool(legs))
+
+    def _perf_res(self):
+        """绩效页当前该显示哪一份结果：全部组合，还是下拉框里选中的那个品种。"""
+        cb = getattr(self, "cb_leg", None)
+        if cb is None or self.res is None:
+            return self.res
+        key = cb.currentData() or ""
+        if not key:
+            return self.res
+        return (getattr(self.res, "legs", None) or {}).get(key, self.res)
+
+    def _perf_name(self, res) -> str:
+        """图例 / 表头上的名字：选中的品种就读品种名，否则读结果自己的标签。"""
+        cb = getattr(self, "cb_leg", None)
+        if cb is not None and cb.currentData():
+            return cb.currentText()
+        return res.label
+
+    def _on_leg_changed(self, _i: int = 0) -> None:
+        self._update_table()
+        self._draw_perf()
 
     # ---- 因子分析
 
@@ -834,6 +890,7 @@ class ResultView(QObject):
         self._cf_rep, self._cf_key = None, ""
 
         self.pages()          # 确保控件都建好
+        self._sync_leg_combo(res)
         if self.kind == "single":
             self.lbl_legend.setText(ctx.legend)
             self._draw_kline(keep_window)
@@ -872,6 +929,7 @@ class ResultView(QObject):
         """
         self.df = self.raw = self.res = self.bh = None
         self.trades = []
+        self._sync_leg_combo(None)
         # 画布已经被换成「一句话」了，不能留着旧窗口等 `eventFilter` 补画时
         # 把上一张图又摆回来
         self._k_view = None
@@ -1616,7 +1674,7 @@ class ResultView(QObject):
             self._draw_perf_impl()
 
     def _draw_perf_impl(self) -> None:
-        res, bh = self.res, self.bh
+        res, bh = (self._perf_res() or self.res), self.bh
         fig = self.canvas_p.fresh()
         gs = fig.add_gridspec(
             2, 1, height_ratios=[3.0, 1.0], hspace=0.12,
@@ -1629,7 +1687,8 @@ class ResultView(QObject):
         if bh is not None:
             eq_b = bh.equity / bh.equity.iloc[0]
             ax.plot(eq_b.index, eq_b.values, color=C_BH, lw=1.5, label="买入持有")
-        ax.plot(eq_s.index, eq_s.values, color=C_STRAT, lw=1.7, label=res.label)
+        ax.plot(eq_s.index, eq_s.values, color=C_STRAT, lw=1.7,
+                label=self._perf_name(res))
         ax.fill_between(eq_s.index, 1, eq_s.values,
                         where=eq_s.values >= 1, color=C_STRAT, alpha=0.06)
         ax.fill_between(eq_s.index, 1, eq_s.values,
@@ -1718,8 +1777,17 @@ class ResultView(QObject):
     def _update_table(self) -> None:
         if self.res is None:
             return
-        m = self.res.metrics
+        # 下拉框选中的是哪个品种，这张表就显示谁；默认「全部组合」
+        res = self._perf_res() or self.res
+        m = res.metrics
         b = self.bh.metrics if self.bh is not None else None
+        if self.kind != "single":
+            whole = res is self.res
+            name = "组合" if whole else self._perf_name(res)
+            self.table.setHorizontalHeaderItem(1, QTableWidgetItem(name))
+            cap = getattr(self, "lbl_perf_cap", None)
+            if cap is not None:
+                cap.setText("组合绩效指标" if whole else f"{name} · 单品种绩效")
 
         def pct(x):
             # 亏穿过之后年化波动是 NaN（见 `backtest._metrics`）：写「—」，
