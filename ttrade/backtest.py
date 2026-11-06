@@ -170,7 +170,7 @@ class Result:
 
 
 _METRIC_KEYS = (
-    "total_return", "cagr", "cagr_simple", "ann_vol", "sharpe", "max_dd", "calmar",
+    "total_return", "cagr", "ann_vol", "sharpe", "max_dd", "calmar",
     "exposure", "long_exposure", "short_exposure",
     "n_trades", "n_long", "n_short",
     "win_rate", "avg_trade", "profit_factor", "payoff", "avg_win", "avg_loss",
@@ -179,52 +179,60 @@ _METRIC_KEYS = (
 
 
 def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
-             bars_per_year: float = float(TRADING_DAYS)) -> dict:
+             bars_per_year: float = float(TRADING_DAYS),
+             base: float | None = None) -> dict:
+    """绩效指标。**全套单利口径**：本金（= 期初权益）固定不变。
+
+    系统的回测框架是单利框架 —— 本金和使用的资金是给定的，赚到的钱不会自动
+    变成下一笔的仓位（`capital` / `fixed` / `risk` 三种手数口径都是固定手数，
+    `unit` 也只是「名义敞口=当时的本金」）。所以比例型指标统一拿**本金**当
+    分母，而不是「上一根权益」：
+
+        累计收益 = (期末权益 − 本金) ÷ 本金
+        年化收益 = 累计收益 ÷ 年数
+        最大回撤 = 权益 ÷ 历史峰值 − 1（回撤本来就该相对峰值看，见下）
+        卡玛     = 年化收益 ÷ |最大回撤|
+
+    例外是**逐根收益率**（年化波动、夏普用的那条序列）：它仍然按「相对上一根
+    权益」算。拿「当日盈亏 ÷ 本金」当收益率，权益涨到几倍之后同一笔盈亏会被
+    放大成几倍的「收益率」，波动能算出四位数的百分比（买入持有二十年涨百倍时
+    尤其明显），夏普随之失去意义。日收益率的定义就是相对上一根的变化率，和
+    累计口径是不是单利无关。
+    """
     equity = equity.dropna()
     if len(equity) < 2:
         return {k: 0.0 for k in _METRIC_KEYS}
 
-    # 权益可能被亏穿成负数（回测不再强平，见 `run_backtest`）。拿负数当基数算
-    # 收益率没有意义 —— -100 亏到 -50 会算出 +50% —— 所以只保留「上一根还是
-    # 正的」那些，之后的收益记 0，波动和夏普不会再被翻号后的假反弹污染
-    ret = equity.pct_change().fillna(0.0)
-    ret = ret.where(equity.shift(1) > 0, 0.0)
-    ratio = equity.iloc[-1] / equity.iloc[0]
-    total = ratio - 1.0
+    # 本金 = 期初权益。`run_backtest` 第 0 根一定是空仓，所以它就是 `initial_cash`。
+    # 调用方可以显式传进来（基准第一根就已经建了仓，`eq.iloc[0]` 不等于本金）
+    base = float(base if base else equity.iloc[0])
+    total = (float(equity.iloc[-1]) - base) / base if base > 0 else 0.0
 
     days = max((equity.index[-1] - equity.index[0]).days, 1)
     years = days / 365.25
-    # 负数开 1/years 次方是复数，直接算「全部亏完」
-    if years <= 0:
-        cagr = 0.0
-    elif ratio <= 0:
-        cagr = -1.0
-    else:
-        cagr = ratio ** (1 / years) - 1
+    # 单利年化 = 累计收益 ÷ 年数。没有 `(1+累计)^(1/年数)−1` 那一步 —— 那是
+    # 假设每年把赚到的钱再押进去，而本金固定时那笔钱并没有变成仓位
+    cagr = float(total / years) if years > 0 else 0.0
 
-    # 单利年化 = 累计收益 ÷ 年数。它和 `cagr` 是同一段行情的两种折年方式：
-    #
-    #     cagr        假设每年把赚到的钱再押进去（几何平均）
-    #     cagr_simple 假设只按最初那笔本金算（算术平均）
-    #
-    # 两个都给，是因为账户到底滚不滚，取决于仓位口径：`unit`（名义敞口=权益）
-    # 会随权益放大手数，是真的在滚，该看 `cagr`；`capital` / `fixed` / `risk`
-    # 的手数固定，赚到的钱不会自己变成仓位，那 `cagr` 会偏低，`cagr_simple`
-    # 才是「这笔本金每年挣了多少」。只给一个数，另一边的人就会觉得算错了
-    cagr_simple = float(total / years) if years > 0 else 0.0
+    # 逐根收益率：相对上一根权益。权益被亏穿成负数后，拿负数当基数会算出
+    # 「-100 亏到 -50 = +50%」这种假反弹，所以那之后的收益记 0
+    ret = equity.pct_change().fillna(0.0)
+    ret = ret.where(equity.shift(1) > 0, 0.0)
 
     bpy = float(bars_per_year or TRADING_DAYS)
     vol = ret.std(ddof=1) * np.sqrt(bpy) if ret.std(ddof=1) > 0 else 0.0
     sharpe = (ret.mean() * bpy) / vol if vol > 0 else 0.0
 
+    # 回撤相对**历史峰值**，不相对本金：本金口径下一条涨了十倍的曲线，回撤
+    # 会写成 −300% 这种没法看也没法比的数。相对峰值是「从高点回落了多少」，
+    # 两种口径下都是这个含义
     dd_series = equity / equity.cummax() - 1.0
     max_dd = float(dd_series.min())
+    # 卡玛的分子用单利年化，和绩效表上那行「年化收益」是同一个数
     calmar = cagr / abs(max_dd) if max_dd < 0 else 0.0
 
-    # 权益一旦被亏穿，「相对上一根」的百分比收益会在 0 附近炸开（300 → 20000
-    # 就是 +6500%），年化波动能算出六位数、夏普随之失去意义，卡玛也是。这三个
-    # 是**比例型**指标，亏穿过就标 NaN，界面显示「—」；累计收益、最大回撤、
-    # 期末资金这些绝对值指标照常给
+    # 权益一旦被亏穿，波动 / 夏普 / 卡玛都失去意义（净值翻号后的「反弹」不是
+    # 收益），标 NaN，界面显示「—」；累计收益、最大回撤、期末资金照常给
     if float(equity.min()) <= 0:
         vol = sharpe = calmar = float("nan")
 
@@ -264,7 +272,8 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
     return {
         "total_return": float(total),
         "cagr": float(cagr),
-        "cagr_simple": float(cagr_simple),
+        # 本金：所有比例型指标的分母，也是绩效表里「本金」那一行读的
+        "initial_cash": float(base),
         "ann_vol": float(vol),
         "sharpe": float(sharpe),
         "max_dd": max_dd,
@@ -512,7 +521,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
 
     eq = pd.Series(equity, index=idx, name="equity")
     ps = pd.Series(pos_state, index=idx, name="position")
-    m = _metrics(eq, ps, trades, cfg.bars_per_year)
+    m = _metrics(eq, ps, trades, cfg.bars_per_year, base=cfg.initial_cash)
     m["final_equity"] = float(eq.iloc[-1])
     # 成本单列出来：手续费和滑点已经扣进权益里了，但用户要能回答「这些钱花在哪」
     m["total_cost"] = float(cost_total)
@@ -560,7 +569,7 @@ def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None) -> Result:
         gross=float(q) * mult * (float(close[-1]) - float(open_[0])),
         cost=float(fee0) + abs(float(price - open_[0]) * q * mult),
     )
-    m = _metrics(eq, ps, [trade], cfg.bars_per_year)
+    m = _metrics(eq, ps, [trade], cfg.bars_per_year, base=cfg.initial_cash)
     m["final_equity"] = float(eq.iloc[-1])
     # 基准只有一次开仓（而且一直没平），成本就是这么一点 —— 正好当对照：
     # 策略那条如果成本是这个数的几十倍，说明换手才是真正的敌人
@@ -681,7 +690,7 @@ def combine(results: list[Result], label: str = "组合",
     # 年化口径按组合自己的日频算。沿用某一条成分的 bars_per_year 会错得离谱：
     # 一条 30 分钟策略一年几千根，拿它去年化日频曲线，夏普会虚高一个量级
     bpy = bars_per_year(eq.index)
-    m = _metrics(eq, pos, trades, bpy)
+    m = _metrics(eq, pos, trades, bpy, base=float(initial_cash))
     m["final_equity"] = float(eq.iloc[-1])
     total_cost = (sum(cost_pcts) / len(cost_pcts)) * float(initial_cash) if cost_pcts else 0.0
     m["total_cost"] = float(total_cost)
@@ -709,56 +718,76 @@ def combine_trades(named: list[tuple[str, Result]]) -> list[tuple[str, Trade]]:
 
 
 def drawdown_series(equity: pd.Series) -> pd.Series:
+    """回撤曲线：相对**历史峰值**回落了多少。
+
+    不拿本金当分母 —— 一条涨了十倍的曲线，按本金算会写出 −300% 这种没法看、
+    也没法横向比的数。回撤的含义就是「从高点回落」，两种口径下都一样。
+    """
     return equity / equity.cummax() - 1.0
 
 
-def yearly_returns(equity: pd.Series) -> pd.Series:
-    """按自然年计算收益率。"""
-    yr = equity.resample("YE").last()
+def yearly_returns(equity: pd.Series, base: float | None = None) -> pd.Series:
+    """按自然年计算收益率（**单利**：当年盈亏 ÷ 本金）。
+
+    和 `stage_table` 同一个口径 —— 各年**相加**等于累计收益，而「年末 ÷ 上年末」
+    那种复利算法下，各年相乘才等于累计。
+    """
+    eq = pd.to_numeric(equity, errors="coerce").dropna()
+    if eq.empty:
+        return pd.Series(dtype=float, name="return")
+    base0 = float(base if base else eq.iloc[0])
+    yr = eq.resample("YE").last()
     prev = yr.shift(1)
-    prev.iloc[0] = equity.iloc[0]
-    return (yr / prev - 1.0).rename("return")
+    prev.iloc[0] = base0
+    return ((yr - prev) / base0).rename("return")
 
 
-def stage_table(equity: pd.Series, freq: str = "YE") -> pd.DataFrame:
+def stage_table(equity: pd.Series, freq: str = "YE",
+                base: float | None = None) -> pd.DataFrame:
     """按自然周期切段：段收益、段内最大回撤、段内波动、根数。
 
-    **段收益用「上段末 → 本段末」算**，不是「段内第一根 → 段末」。第一根只是
-    这个月的第一天，拿它当基准会把「上月末到本月初」那段跳空吞掉，十二个月的
-    收益连乘起来对不上全年 —— 而这两个数字都会摆在页面上，对不上就是 bug。
+    **单利口径**：段收益 = (本段末 − 上段末) ÷ 本金。原来是「本段末 ÷ 上段末 − 1」，
+    那是复利 —— 十二个月得**连乘**才等于全年，而本金固定时每个月的盈亏都是直接
+    加在账户上的，月度收益**相加**就该等于年度收益。用上段末当分母还有个毛病：
+    赚钱之后同样的盈利会被算成更小的百分比，前后两个月没法比。
 
-    段内最大回撤的峰值在段首重置：它回答的是「这个月里最多回撤了多少」，
-    不是「从历史最高点回撤了多少」。后者叫全局回撤，看资金曲线就够了。
+    基准取「上段末」而不是「段内第一根」：第一根只是这个月的第一天，拿它当基准
+    会把「上月末到本月初」那段跳空吞掉。
+
+    段内最大回撤的峰值在段首重置，且相对峰值而不是本金：它回答的是「这个月里
+    最多回撤了多少」，不是「从历史最高点回撤了多少」。
     """
     eq = pd.to_numeric(equity, errors="coerce").dropna()
     if len(eq) < 2:
         return pd.DataFrame(columns=["period", "ret", "max_dd", "vol", "bars"])
 
-    base = float(eq.iloc[0])
+    base0 = float(base if base else eq.iloc[0])
+    prev = base0
     rows = []
     for key, seg in eq.groupby(pd.Grouper(freq=freq)):
         seg = seg.dropna()
         if seg.empty:
             continue
         last = float(seg.iloc[-1])
-        ret = last / base - 1.0 if base else 0.0
+        ret = (last - prev) / base0 if base0 > 0 else 0.0
         dd = float((seg / seg.cummax() - 1.0).min())
-        # 段内波动按根数年化，和 `_metrics` 的口径一致（否则月表里的数字
-        # 和绩效页的「年化波动」对不上，看的人会以为有一处算错了）
+        # 段内波动按根数年化，和 `_metrics` 一样走「相对上一根」的日收益率
+        # （不是盈亏 ÷ 本金，理由见 `_metrics` 的说明）
         r = seg.pct_change().dropna()
         vol = float(r.std(ddof=1) * np.sqrt(252)) if len(r) > 1 else 0.0
         rows.append({"period": key, "ret": ret, "max_dd": dd, "vol": vol, "bars": len(seg)})
-        base = last
+        prev = last
     return pd.DataFrame(rows)
 
 
-def month_matrix(equity: pd.Series) -> pd.DataFrame:
+def month_matrix(equity: pd.Series, base: float | None = None) -> pd.DataFrame:
     """月度收益矩阵：行=年，列=1..12，值=当月收益（缺失为 NaN）。
 
-    年度和月度分开算（都走 `stage_table`），不用「十二个月连乘」倒推年度 ——
-    首尾不满整年的那两段会让连乘结果和真实年度收益差出几个点。
+    单利口径，所以**同一行的十二个月相加就是这一年的年度收益**，不用拿年度
+    数字倒推。年度和月度分开算（都走 `stage_table`），首尾不满整年的那两段
+    也不会互相拖累。
     """
-    st = stage_table(equity, "ME")
+    st = stage_table(equity, "ME", base=base)
     if st.empty:
         return pd.DataFrame()
     df = st.assign(year=st["period"].dt.year, month=st["period"].dt.month)

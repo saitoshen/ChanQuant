@@ -597,27 +597,27 @@ def _run() -> tuple[bool, list[str]]:
     check("交易成本双边与金额口径", _trade_cost)
 
     def _return_basis():
-        """累计收益 / 年化 / 最大回撤必须是**同一套口径**。
+        """业绩统计全套单利：本金固定，所有比例都以本金为分母。
 
-        用户报「累计收益按单利、年化还按复利，对不上」。查下来其实没混：
-        三个数都长在同一条权益曲线上 ——
+        框架是**单利**框架 —— 本金和使用资金固定不变，赚到的钱不会自动变成
+        下一笔的仓位。所以：
 
-            累计收益 = 期末 ÷ 期初 − 1
-            年化     = 这条累计收益按日历时长复利折年
+            累计收益 = (期末权益 − 本金) ÷ 本金
+            年化收益 = 累计收益 ÷ 年数            （不取 1/年数 次方）
+            逐根收益 = 当日盈亏 ÷ 本金
             最大回撤 = 权益 ÷ 历史峰值 − 1
+            卡玛     = 单利年化 ÷ |最大回撤|
 
-        而交易记录里逐笔净额相加 ÷ 初始资金，和累计收益**是同一个数**：钱是
-        可加的，账户怎么涨，逐笔金额加起来就怎么涨。所谓「单利」只是「按金额
-        相加」的观感，不是把百分比直接相加。
-
-        这一项把四条恒等式钉住，其中最后一条专门防回归：累计收益一旦被写成
-        「逐笔收益率相加」，在这个有赚有亏的样本上会立刻和金额口径分家。
+        外加阶段分析：月度/年度收益也是「段盈亏 ÷ 本金」，所以**十二个月相加
+        等于年度、各年相加等于累计**。这条最容易被改回复利（除以段初权益），
+        一旦回去，月表上的数字和年度柱状图就对不上了。
         """
         import numpy as np
         import pandas as pd
 
         from gui.result_view import cumulative_pnl
-        from ttrade.backtest import BacktestConfig, run_backtest
+        from ttrade.backtest import (BacktestConfig, month_matrix, run_backtest,
+                                     stage_table)
 
         # 三年、两段上涨夹一段下跌：既有多笔交易，又有明显的回撤段
         n = 780
@@ -637,41 +637,73 @@ def _run() -> tuple[bool, list[str]]:
         if len(r.trades) < 2:
             raise RuntimeError("样本交易太少，这一项验不出东西")
 
+        # 本金：绩效表第一行读它，也是下面所有比例的分母
+        if abs(float(m.get("initial_cash", 0.0)) - cfg.initial_cash) > 1e-9:
+            raise RuntimeError(f"本金不是 initial_cash：{m.get('initial_cash')}")
+
+        base = float(m["initial_cash"])
         total = float(m["total_return"])
-        if abs(total - (float(eq.iloc[-1]) / float(eq.iloc[0]) - 1.0)) > 1e-9:
-            raise RuntimeError("累计收益不是「期末 ÷ 期初 − 1」")
-        # 金额口径：逐笔净额相加 ÷ 初始资金。和上面那个必须是同一个数，
+        if abs(total - (float(eq.iloc[-1]) - base) / base) > 1e-9:
+            raise RuntimeError("累计收益不是「(期末 − 本金) ÷ 本金」")
+        # 金额口径：逐笔净额相加 ÷ 本金。和上面那个必须是同一个数，
         # 否则交易记录和绩效页会各说一套
-        by_money = sum(t.pnl for t in r.trades) / cfg.initial_cash
+        by_money = sum(t.pnl for t in r.trades) / base
         if abs(total - by_money) > 1e-9:
             raise RuntimeError(
-                f"累计收益 {total:.6f} ≠ 逐笔净额合计 ÷ 初始资金 {by_money:.6f}")
+                f"累计收益 {total:.6f} ≠ 逐笔净额合计 ÷ 本金 {by_money:.6f}")
         cums = cumulative_pnl(r.trades)
-        if abs(cums[-1] - (m["final_equity"] - cfg.initial_cash)) > 1e-6:
+        if abs(cums[-1] - (m["final_equity"] - base)) > 1e-6:
             raise RuntimeError("交易记录的累计盈亏 ≠ 期末 − 初始")
 
+        # 单利年化：累计 ÷ 年数。写成 (1+累计)^(1/年数)−1 就是复利，直接判死
         years = (eq.index[-1] - eq.index[0]).days / 365.25
-        want_cagr = (1.0 + total) ** (1.0 / years) - 1.0
-        if abs(m["cagr"] - want_cagr) > 1e-9:
+        if abs(m["cagr"] - total / years) > 1e-9:
             raise RuntimeError(
-                f"复利年化 {m['cagr']:.6f} ≠ (1+累计)^(1/年数)−1 {want_cagr:.6f}")
-        if abs(m["cagr_simple"] - total / years) > 1e-9:
+                f"年化 {m['cagr']:.6f} ≠ 累计 ÷ 年数 {total / years:.6f}（又用复利折年了？）")
+
+        # 波动 / 夏普走「相对上一根」的日收益率（不是盈亏 ÷ 本金，否则权益涨几倍
+        # 之后波动会被放大成四位数的百分比）
+        step = eq.pct_change().fillna(0.0)
+        want_vol = float(step.std(ddof=1) * np.sqrt(cfg.bars_per_year))
+        if abs(m["ann_vol"] - want_vol) > 1e-9:
             raise RuntimeError(
-                f"单利年化 {m['cagr_simple']:.6f} ≠ 累计 ÷ 年数 {total / years:.6f}")
+                f"年化波动 {m['ann_vol']:.6f} ≠ 逐根收益率年化 {want_vol:.6f}")
+        want_sharpe = float(step.mean() * cfg.bars_per_year / want_vol)
+        if abs(m["sharpe"] - want_sharpe) > 1e-9:
+            raise RuntimeError(f"夏普 {m['sharpe']:.4f} ≠ {want_sharpe:.4f}")
+
         want_dd = float((eq / eq.cummax() - 1.0).min())
         if abs(m["max_dd"] - want_dd) > 1e-9:
             raise RuntimeError(f"最大回撤 {m['max_dd']:.6f} ≠ 权益/峰值−1 {want_dd:.6f}")
         if abs(m["calmar"] - m["cagr"] / abs(m["max_dd"])) > 1e-9:
-            raise RuntimeError("卡玛不是「复利年化 ÷ |最大回撤|」")
+            raise RuntimeError("卡玛不是「单利年化 ÷ |最大回撤|」")
+
+        # 阶段分析：各年相加 = 累计；每年的十二个月相加 = 该年
+        yrs = stage_table(eq, "YE", base=base)
+        if yrs.empty:
+            raise RuntimeError("阶段表是空的")
+        if abs(float(yrs["ret"].sum()) - total) > 1e-9:
+            raise RuntimeError(
+                f"各年收益相加 {yrs['ret'].sum():.6f} ≠ 累计收益 {total:.6f}")
+        months = month_matrix(eq, base=base)
+        for _, row in yrs.iterrows():
+            y = row["period"].year
+            if y not in months.index:
+                continue
+            got = float(months.loc[y].sum(skipna=True))
+            if abs(got - float(row["ret"])) > 1e-9:
+                raise RuntimeError(
+                    f"{y} 年十二个月相加 {got:.6f} ≠ 年度收益 {row['ret']:.6f}")
 
         # 防回归：累计收益**不是**逐笔收益率相加。这个样本有赚有亏，两种算法
         # 必然分家；一旦哪天改回相加，这一条会先炸
         by_pct = sum(t.ret for t in r.trades)
         if abs(total - by_pct) < 1e-6:
             raise RuntimeError(
-                f"累计收益等于逐笔收益率相加（{by_pct:.4f}）—— 口径退回单利了？")
-        return (f"累计 {total*100:+.1f}% = Σ净额/本金、复利年化 {m['cagr']*100:+.2f}% / "
-                f"单利 {m['cagr_simple']*100:+.2f}%、回撤 {m['max_dd']*100:.1f}% 同源")
+                f"累计收益等于逐笔收益率相加（{by_pct:.4f}）—— 口径退回百分比相加了？")
+        return (f"本金 {base:,.0f}、累计 {total*100:+.1f}%、年化 {m['cagr']*100:+.2f}%"
+                f"（累计÷{years:.2f}年）、回撤 {m['max_dd']*100:.1f}%、"
+                f"月度相加=年度、年度相加=累计")
 
     def _cross_trade_money():
         """截面策略的逐笔金额也要能加回净值变化。

@@ -173,7 +173,6 @@ def run_all(market: str = "us", cfg: BacktestConfig | None = None,
                     "strategy": key,
                     "strategy_label": spec.label,
                     "cagr": m["cagr"],
-                    "cagr_simple": m.get("cagr_simple", 0.0),
                     "total_return": m["total_return"],
                     "max_dd": m["max_dd"],
                     "sharpe": m["sharpe"],
@@ -394,7 +393,7 @@ def plot_risk_return(table: pd.DataFrame, out_path: str) -> None:
 
     ax.axhline(0, color="#6b7280", lw=0.8, ls="--")
     ax.set_xlabel("最大回撤 (%)")
-    ax.set_ylabel("年化收益 CAGR (%)")
+    ax.set_ylabel("年化收益（单利）(%)")
     ax.set_title("风险—收益分布：趋势跟踪 vs 买入持有", fontsize=13, pad=10)
     ax.grid(True, ls=":", alpha=0.35)
     ax.legend(frameon=False, fontsize=9)

@@ -521,7 +521,7 @@ class ResultView(QObject):
         # 指标卡片条（横向，放在图表上方）
         cards = QHBoxLayout()
         cards.setSpacing(8)
-        self.card_cagr = MetricCard("策略年化 CAGR")
+        self.card_cagr = MetricCard("策略年化")
         self.card_dd = MetricCard("最大回撤")
         self.card_sharpe = MetricCard("夏普比率")
         self.card_excess = MetricCard("vs 持有超额")
@@ -789,6 +789,10 @@ class ResultView(QObject):
 
         self.tbl_month = QTableWidget(0, 13)
         self.tbl_month.setHorizontalHeaderLabels(["年"] + [f"{m}月" for m in range(1, 13)])
+        # 单利口径，说清楚分母是什么，不然「月度相加=年度」会被当成算错
+        self.tbl_month.setToolTip(
+            "单利口径：当月收益 = 当月盈亏 ÷ 本金。\n"
+            "所以同一行的十二个月相加就是当年的年度收益，各年相加就是累计收益。")
         self.tbl_month.verticalHeader().setVisible(False)
         self.tbl_month.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl_month.setSelectionMode(QAbstractItemView.NoSelection)
@@ -1743,29 +1747,20 @@ class ResultView(QObject):
             return "—" if x is None or x != x else f"{cur}{x:,.{dp}f}"
 
         rows = [
-            # 累计收益就是**账户真实增长**：期末 ÷ 期初 − 1。交易记录里逐笔净额
-            # 相加再除以初始资金，算出来是同一个数（自检里钉着这条）—— 所以它
-            # 既不是「逐笔百分比相加」，也不是「百分比连乘」，而是钱多了多少。
-            # 手数随权益放大的口径下，这个数本身已经含了滚动
+            # 本金摆在第一行：所有比例都是相对它的。单利框架下本金固定不变，
+            # 「赚了 24 万」和「赚了 241%」说的是一件事，两个数得能对上
+            ("本金", money(m.get("initial_cash")),
+             money(b.get("initial_cash")) if b else "—", None),
+            # 累计收益 = (期末权益 − 本金) ÷ 本金。交易记录里逐笔净额相加再除以
+            # 本金，算出来是同一个数（自检里钉着这条）
             ("累计收益", pct(m["total_return"]), pct(b["total_return"]) if b else "—",
              None if b is None else m["total_return"] >= b["total_return"]),
-            # 同一段行情，两种折年方式，一起摆出来才不会有人觉得算错了：
-            #   复利 CAGR   假设赚到的钱每年再押进去（几何平均）
-            #   单利        只按最初那笔本金算（累计 ÷ 年数，算术平均）
-            # 到底哪个对，取决于仓位口径：`unit`（名义敞口=权益）手数随权益放大，
-            # 是真的在滚，看 CAGR；`capital` / `fixed` / `risk` 手数固定，赚到的
-            # 钱不会自己变成仓位，CAGR 会偏低，单利才是「这笔本金每年挣多少」
-            ("年化收益（复利 CAGR）", pct(m["cagr"]), pct(b["cagr"]) if b else "—",
+            # 年化 = 累计收益 ÷ 年数。**单利**，没有 (1+累计)^(1/年数)−1 那一步：
+            # 本金固定，赚到的钱并没有变成下一笔的仓位，按复利折年会低估
+            ("年化收益（单利）", pct(m["cagr"]), pct(b["cagr"]) if b else "—",
              None if b is None else m["cagr"] >= b["cagr"]),
-            # 老报告里没有 cagr_simple（这一项是 v2.6.16 才加的），缺就写「—」，
-            # 别拿 0 去比 —— 那会把「没这个数」显示成「跑输基准」
-            ("年化收益（单利）", pct(m.get("cagr_simple")),
-             pct(b.get("cagr_simple")) if b else "—",
-             None if b is None or m.get("cagr_simple") is None
-             or b.get("cagr_simple") is None
-             else m["cagr_simple"] >= b["cagr_simple"]),
-            # 回撤是「权益 / 历史峰值 − 1」，比的是钱，和单利复利无关：
-            # 峰值 100 万回落到 80 万就是 −20%，两种折年方式下都是这个数
+            # 回撤是「权益 / 历史峰值 − 1」：比的是从高点回落多少，不拿本金当
+            # 分母（一条涨了十倍的曲线按本金算会写出 −300%，没法看也没法比）
             ("最大回撤", pct(m["max_dd"]), pct(b["max_dd"]) if b else "—",
              None if b is None else m["max_dd"] >= b["max_dd"]),
             ("夏普比率", num(m["sharpe"]), num(b["sharpe"]) if b else "—",
@@ -1955,8 +1950,10 @@ class ResultView(QObject):
         if self.res is None or not len(self.res.equity):
             return
         eq = self.res.equity.dropna()
-        yrs = stage_table(eq, "YE")
-        months = month_matrix(eq)
+        # 本金当分母（单利口径，见 `backtest.stage_table`）。取不到就用期初权益
+        base = float(self.res.metrics.get("initial_cash") or eq.iloc[0])
+        yrs = stage_table(eq, "YE", base=base)
+        months = month_matrix(eq, base=base)
 
         self._draw_stage_chart(yrs)
         if yrs.empty:

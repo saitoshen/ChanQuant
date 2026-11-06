@@ -611,22 +611,28 @@ def cost_vector(frames: dict[str, pd.DataFrame], bt: BacktestConfig,
 
 
 def _metrics(equity: pd.Series, bpy: float) -> dict:
+    """截面组合的绩效，口径和 `backtest._metrics` 一致：**累计与年化走单利**。
+
+    传进来的 `equity` 是「归一化到 1.0」的净值曲线，所以 `base = 1.0` 就是本金，
+    年化 = 累计收益 ÷ 年数。波动和夏普仍用「相对上一根」的日收益率，理由见
+    `backtest._metrics` 的说明。
+    """
     eq = equity.dropna()
     if len(eq) < 2:
-        return {"total_return": 0.0, "cagr": 0.0, "cagr_simple": 0.0, "ann_vol": 0.0,
+        return {"total_return": 0.0, "cagr": 0.0, "initial_cash": 0.0, "ann_vol": 0.0,
                 "sharpe": 0.0, "max_dd": 0.0, "calmar": 0.0}
-    ret = eq.pct_change().dropna()
-    total = float(eq.iloc[-1] / eq.iloc[0] - 1.0) if eq.iloc[0] > 0 else 0.0
+    base = float(eq.iloc[0])
+    total = float((float(eq.iloc[-1]) - base) / base) if base > 0 else 0.0
     years = max(len(eq) / max(bpy, 1.0), 1e-9)
-    cagr = (1.0 + total) ** (1.0 / years) - 1.0 if total > -1 else -1.0
-    # 单利年化，口径和 `backtest._metrics` 一致（累计收益 ÷ 年数）
-    cagr_simple = float(total / years) if years > 0 else 0.0
-    vol = float(ret.std(ddof=0) * np.sqrt(bpy)) if len(ret) else 0.0
+    # 单利年化：累计收益 ÷ 年数（不取 1/年数 次方）
+    cagr = float(total / years) if years > 0 else 0.0
+    ret = eq.pct_change().fillna(0.0)
+    vol = float(ret.std(ddof=1) * np.sqrt(bpy)) if ret.std(ddof=1) > 0 else 0.0
     sharpe = float(ret.mean() * bpy / vol) if vol > 0 else 0.0
     peak = eq.cummax()
     dd = float((eq / peak - 1.0).min())
     calmar = float(cagr / abs(dd)) if dd < 0 else 0.0
-    return {"total_return": total, "cagr": cagr, "cagr_simple": cagr_simple,
+    return {"total_return": total, "cagr": cagr, "initial_cash": float(base),
             "ann_vol": vol, "sharpe": sharpe, "max_dd": dd, "calmar": calmar}
 
 
@@ -908,7 +914,9 @@ def to_result(out: "CrossResult", label: str = "", step: int = 0,
     pos[has_long.to_numpy()] = 1.0
     pos[(has_short & ~has_long).to_numpy()] = -1.0
 
-    m = dict(_metrics(eq, pos, [], bpy))
+    m = dict(_metrics(eq, pos, [], bpy, base=1.0))
+    # 归一化净值的「本金」是 1.0，绩效表「本金」那行要的是真钱
+    m["initial_cash"] = float(initial_cash or 0.0)
     ret = eq.pct_change().fillna(0.0)
     step = max(1, int(step or out.step or 1))
     seg: list[float] = []
