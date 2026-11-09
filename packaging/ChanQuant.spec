@@ -177,6 +177,24 @@ HIDDEN = [
     "openpyxl",
     "openpyxl.cell._writer",
     "pypdf",
+    # Tushare（期货 / 美股 / A 股日线）。只有 `ttrade/futures.py:get_pro()` 里
+    # 一处**函数内** import —— 惰性建 pro 客户端，免得没配 token 也去连网。
+    #
+    # 实测结论（v2.6.19 的发布包解开 PYZ 查过）：**它其实在包里**，57 个子模块，
+    # lxml / tqdm / simplejson / websocket / bs4 也都在。原因是 PyInstaller 6 的
+    # AST 扫描会进函数体（`_Visitor.visit_FunctionDef` 设 `_in_def` 后照样
+    # `generic_visit`），只是把边标成 `function=True`，**不是看不到**。
+    # 所以网上「函数内 import 必须写 hiddenimports」的说法在 PyInstaller 6 上不成立。
+    #
+    # 那为什么还列在这里：**防回归**。哪天 get_pro() 改成
+    # `importlib.import_module("tushare")`，或者包一层字符串映射，静态分析就真
+    # 看不见了，而表现是「打包版一点更新日线就 ImportError、源码运行却正常」。
+    # 真正的验收是打包后 `--selftest` 里那条「Tushare 客户端」。
+    "tushare",
+    "tushare.pro",
+    "tushare.pro.client",
+    "tushare.pro.data_pro",
+    "tushare.util.formula",
     # CTP 客户端。只在装了 openctp-ctp 的平台上有（Windows），没装就是空列表
     "ttrade.ctp_client",
     # 交易页选到 CTP 账户时才会 import（`gui.live._hub_of` 里函数内导入），

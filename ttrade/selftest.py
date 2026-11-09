@@ -2194,6 +2194,46 @@ def _run() -> tuple[bool, list[str]]:
 
     check("机器学习模型依赖", _ml_deps)
 
+    def _tushare():
+        """Tushare 是期货日线 / 美股 / A 股日线的唯一来源。
+
+        唯一的 import 在 `ttrade/futures.py:get_pro()` 里，而且是**函数内**的
+        （惰性建 pro 客户端）。打包漏了它的表现是「一点更新日线就 ImportError，
+        源码运行却完全正常」—— 用户只会看到一句 ModuleNotFoundError，看不出
+        是打包问题，所以必须由自检来守。
+
+        依赖也要一起验：tushare 自己 import 时会拉 lxml / tqdm / simplejson /
+        bs4，缺任何一个都是同样的报错形状。
+        """
+        import importlib
+
+        need = ["tushare", "tushare.pro", "tushare.pro.client",
+                "lxml", "tqdm", "simplejson", "bs4"]
+        miss, why = [], {}
+        for m in need:
+            try:
+                importlib.import_module(m)
+            except Exception as exc:      # noqa: BLE001
+                miss.append(m)
+                why[m] = f"{type(exc).__name__}: {exc}"
+        if miss:
+            raise RuntimeError(
+                "缺 " + "、".join(miss) + "｜"
+                + "；".join(f"{k}: {v}" for k, v in why.items())
+                + "（packaging/ChanQuant.spec 的 HIDDEN 里应当已列上 tushare）"
+            )
+        ver = getattr(importlib.import_module("tushare"), "__version__", "?")
+        from ttrade import futures as FU
+
+        try:
+            tok = FU.read_token()
+        except Exception:      # noqa: BLE001
+            # 没配 token 不算失败：这是配置问题，不是包装错了
+            return f"tushare {ver}、依赖齐全；token 未配置（日线 / 美股 / A 股下不了）"
+        return f"tushare {ver}、依赖齐全；token {len(tok)} 字符"
+
+    check("Tushare 客户端（期货/美股/A股日线）", _tushare)
+
     def _matplotlib():
         os.environ.setdefault("MPLCONFIGDIR", cache_dir("mpl"))
         import matplotlib
