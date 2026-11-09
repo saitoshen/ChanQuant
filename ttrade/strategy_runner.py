@@ -210,6 +210,10 @@ class SlotState:
     # 这一笔**实际挂的**止损价：绑在成交时的触发价上，不跟着 bar 走。
     # 重启会丢，`_ib_arm` 会按标记价补挂一条并写日志
     ib_stop: float = float("nan")
+    # 已经决定平仓、但成交还没回来（或者回报慢）。下一根 bar 的 `_ib_arm`
+    # 看到 `st.held` 还是老仓时**不能**把它重新捡回来：那等于把刚下的平仓
+    # 单撤掉，止损白打了。成交回报到、`held` 归零之后自动清掉
+    ib_exit_pending: bool = False
 
     def title(self) -> str:
         return self.cfg.title()
@@ -1191,11 +1195,14 @@ class PortfolioRunner:
         st.ib_armed = True
 
         held = int(st.held.get(st.underlying, 0)) if st.underlying else 0
+        if held == 0:
+            st.ib_exit_pending = False     # 平掉了，欠的那笔账清掉
 
         # ① 反向突破离场：上一根**收盘**决定，这一根**开盘**执行
         if held and ((held > 0 and lv["exit_long"]) or (held < 0 and lv["exit_short"])):
             st.target = 0
             st.ib_armed = False          # 这根不再看入场，等下一根重来
+            st.ib_exit_pending = True
             st.ib_stop = float("nan")
             st.last_action = "反向突破离场（本根开盘）"
             self._log(f"{st.title()}：{st.underlying} 反向突破离场，本根开盘平")
@@ -1203,6 +1210,14 @@ class PortfolioRunner:
 
         # ② 有仓：继续拿着，等盘中的止损
         if held:
+            if st.ib_exit_pending:
+                # 上一根已经决定平了，单子还没成交（或者回报没到）。这时候把
+                # `target` 写回 `held`，`_rebalance` 会认为目标仓没变 ⇒ 平仓单
+                # 不会被撤，但下一轮又按「持有」算 —— 只要中间哪次重算把
+                # target 改回去，这笔平仓就丢了。索性一直按平仓走到底
+                st.target = 0
+                st.ib_armed = False
+                return
             st.target = held
             if not (st.ib_stop == st.ib_stop and st.ib_stop > 0):
                 # 没有止损价 = 程序重启过（`ib_stop` 只存在内存里）。按当前
@@ -1242,6 +1257,7 @@ class PortfolioRunner:
                 if hit:
                     st.target = 0
                     st.ib_armed = False      # 这根 bar 不再入场
+                    st.ib_exit_pending = True
                     st.ib_stop = float("nan")
                     st.last_action = f"K 线内止损：现价 {price:.3f} 越过 {sp:.3f}"
                     self._log(f"{st.title()}：K 线内止损 {st.underlying} "
@@ -1256,6 +1272,7 @@ class PortfolioRunner:
         if el == el and price >= el:
             st.target = st.lots
             st.ib_fired = True
+            st.ib_exit_pending = False     # 重新持仓了，上一笔的平仓账已清
             # 止损绑**触发价**（那一刻的下单价），不是此刻的最新价 ——
             # 最新价可能已经冲过去一段，用它会悄悄把止损挪得更松
             st.ib_stop = el - d if (d == d and d > 0) else float("nan")
@@ -1266,6 +1283,7 @@ class PortfolioRunner:
               and st.cfg.note == "short"):    # 不允许做空时忽略空头触发价
             st.target = -st.lots
             st.ib_fired = True
+            st.ib_exit_pending = False
             st.ib_stop = es + d if (d == d and d > 0) else float("nan")
             st.last_action = f"K 线内入场：现价 {price:.3f} 跌破 {es:.3f}"
             self._log(f"{st.title()}：K 线内做空 {st.underlying} 触发价 {es:.3f}"

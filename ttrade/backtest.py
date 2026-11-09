@@ -95,6 +95,19 @@ class BacktestConfig:
     # 两个数字的差就是「同根内不可知」这件事值多少钱。
     intrabar_samebar_stop: bool = True
 
+    # 平仓当根要不要允许再开新仓（默认 **不许**）。
+    #
+    # 「反手」在 K 线内是**假装精确**：一根 5 分钟线里「先止损、再反向开仓」
+    # 和「先反向开仓、再被打止损」，盘口上长得一模一样，分不出先后 —— 挑对
+    # 自己有利的那个就是凭空造 alpha。默认让出一根 bar 的空窗：这根平掉了就
+    # 平掉了，下一根才重新看触发价。
+    #
+    # 这也和平台规则的语义对齐：`sbbox_mini` 那套是「收盘确认 → 下一根开盘」，
+    # 持有多单时根本看不到空头信号（`pos` 当根还是 1），只有多单真的出场之后
+    # 才可能做空。原先 K 线内那条会在**同一根**里平多开空，看着像反手，实盘
+    # 做不到。想看那个乐观口径，把它设 True 再跑一遍。
+    intrabar_reentry_samebar: bool = False
+
     @property
     def label(self) -> str:
         return "只做多" if self.long_only else "多空双向"
@@ -433,6 +446,8 @@ def run_intrabar_backtest(data: pd.DataFrame, cfg: BacktestConfig,
     2. 盘中：已有仓位的止损（可能跳空成交在开盘价）；
     3. 盘中：空仓才看入场；
     4. 盘中：刚进的仓，同一根就打到止损 —— **按先入场后止损处理**。
+    5. 盘中：本根平过仓（止损或开盘出场）⇒ 本根**不再开新仓**，下一根才重新
+       看触发价 —— 也就是「不反手」，见 `intrabar_reentry_samebar`。
 
     第 4 条是保守假设。没有分笔数据时，「这根 K 线先冲到高点再砸到低点」
     和「先砸后冲」看起来一模一样，猜对自己有利的一边等于自己给自己送 alpha。
@@ -476,6 +491,7 @@ def run_intrabar_backtest(data: pd.DataFrame, cfg: BacktestConfig,
     entry_dir = 1
     entry_why = ""
     stop_px = float("nan")
+    closed_i = -1            # 最近一次平仓发生在哪一根（防「平仓当根又开仓」）
     pos_state = np.zeros(n, dtype=int)
     equity = np.zeros(n, dtype=float)
     trades: list[Trade] = []
@@ -486,7 +502,7 @@ def run_intrabar_backtest(data: pd.DataFrame, cfg: BacktestConfig,
     def do_close(i: int, raw_px: float, why: str) -> None:
         """平掉当前仓位。`raw_px` 是**不含滑点**的成交基准价。"""
         nonlocal cash, lots, pos, entry_price, entry_date, entry_cost
-        nonlocal cost_total, notional_total, stop_px
+        nonlocal cost_total, notional_total, stop_px, closed_i
         if entry_price <= 0 or pos == 0:
             return
         sp = _slip(raw_px, i)
@@ -518,6 +534,7 @@ def run_intrabar_backtest(data: pd.DataFrame, cfg: BacktestConfig,
         entry_date = None
         entry_cost = 0.0
         stop_px = float("nan")
+        closed_i = i
 
     def do_open(i: int, raw_px: float, direction: int, why: str) -> bool:
         """开仓。`raw_px` 是**不含滑点**的成交基准价（触发价或开盘价）。"""
@@ -570,7 +587,11 @@ def run_intrabar_backtest(data: pd.DataFrame, cfg: BacktestConfig,
                 do_close(i, max(o, stop_px), "ATR 止损")
 
         # ③ 空仓时看本根有没有触发入场
-        if pos == 0:
+        # 本根刚平过仓就不再开新仓：持有多单时看不到空头触发价，多单出场之后
+        # 也要等到下一根才重新看 —— 否则「止损 / 反向突破离场」的同一根里就能
+        # 反手做空，而那一刻的先后顺序是分不出来的（见
+        # `intrabar_reentry_samebar`）
+        if pos == 0 and (cfg.intrabar_reentry_samebar or closed_i != i):
             up, dn = e_long[i], e_short[i]
             # 止损距离必须已知：ATR 没暖起来就进的话，这一笔没有止损，
             # 后面 300 根都靠「反向突破」兜底 —— 那不是这套规则

@@ -382,6 +382,17 @@ def strat_sbbox_ib(
     这一条不盘中化：用户明确要求「下一根 K 线开盘价格出场」，而且收盘箱体
     本身也要收盘才成立。
 
+    ## 不反手
+
+    持有多单时**完全看不到空头信号** —— 空头触发价再被打穿，也只当没发生；
+    只有多单真出场（ATR 止损 / 反向突破平仓）之后，**下一根起**才可能开空。
+    持空单反之，只有止损或信号出场之后才可能做多。
+
+    这不是保守，是「反手」在 K 线内根本没法验证：一根 5 分钟线里「先止损平多
+    再跌破开空」和「先跌破开空再被止损」，盘口长得一样。所以平仓当根一律不再
+    开新仓（引擎侧同一开关 `BacktestConfig.intrabar_reentry_samebar`），
+    和 `sbbox_mini` 那套「收盘确认 → 下一根开盘」的语义一致。
+
     「当日」按**交易日**算（`index + 6h` 再取日期），夜盘 21:00 之后归次日 ——
     晚上九点的开盘价要是和早上九点算成同一天，波幅基准整个错位。
     """
@@ -453,15 +464,20 @@ def strat_sbbox_ib(
     pos = 0
     stop = np.nan
     for i in range(n):
+        closed = False
         if pos == 1 and i > 0 and xl[i - 1]:
-            pos, stop = 0, np.nan
+            pos, stop, closed = 0, np.nan, True
         elif pos == -1 and i > 0 and xs[i - 1]:
-            pos, stop = 0, np.nan
+            pos, stop, closed = 0, np.nan, True
         if pos == 1 and np.isfinite(stop) and l_a[i] <= stop:
-            pos, stop = 0, np.nan
+            pos, stop, closed = 0, np.nan, True
         elif pos == -1 and np.isfinite(stop) and h_a[i] >= stop:
-            pos, stop = 0, np.nan
-        if pos == 0:
+            pos, stop, closed = 0, np.nan, True
+        # 本根刚平过仓 ⇒ 本根不再开新仓（下一根才重新看触发价）。不这么写，
+        # 一根 K 线里「止损平多」紧接着「跌破开空」就会被记成反手 —— 而这两件
+        # 事在盘口上的先后根本分不出来。`sbbox_mini` 那套本来就是这个语义，
+        # 这里和它对齐
+        if pos == 0 and not closed:
             lu = bool(np.isfinite(up[i])) and h_a[i] >= up[i]
             su = bool(np.isfinite(dn[i])) and l_a[i] <= dn[i]
             # 同一根两头都打穿：分不出先后，宁可这单不做

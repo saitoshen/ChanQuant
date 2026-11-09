@@ -2942,6 +2942,12 @@ ChanQuant/
 （最不利）处理，`BacktestConfig.intrabar_samebar_stop=False` 可以切成「只从下一根开始止损」，
 两个数字的差就是这件事值多少钱 —— 在 5 分钟螺纹上它是 36% 的交易，不能假装不存在。
 
+**不反手**：平仓的那一根不再开新仓（`intrabar_reentry_samebar=False`，默认）。持有多单时
+完全看不到空头触发价，多单止损或反向突破离场之后，**下一根起**才可能做空；空单反之。
+理由同上：一根 K 线里「先止损平多、再跌破开空」和「先开空、再被止损」在盘口上长得一样，
+挑对自己有利的那个就是白送 alpha。这条语义和 `sbbox_mini`（收盘确认 → 下一根开盘）一致 ——
+那边持多时 `pos` 还是 1，本来就看不到空头信号。
+
 回测走 `run_intrabar_backtest`（`run_backtest` 见到 `entry_*` 列自动分流），
 实盘走 `PortfolioRunner._intrabar_tick`：每个 tick 拿最新价比一次触发价 / 止损价，
 越价就改目标仓、再由原来那条 `_rebalance` 链路下单。**老路径一行没动** ——

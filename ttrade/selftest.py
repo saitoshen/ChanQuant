@@ -613,8 +613,66 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(
                 f"反向突破离场没按开盘价成交：老路 {a.trades[0].exit_price} "
                 f"vs K 线内 {b.trades[0].exit_price}")
+
+        # ---- 不反手：平仓当根不许再开新仓，下一根才重新看触发价 ----
+        #
+        # 持有多单时看不到空头触发价；多单出场（ATR 止损 / 反向突破开盘平）
+        # 的**那一根**即使空头触发价被打穿，也只能空仓等着。否则一根 K 线里
+        # 「先止损平多、再跌破开空」会被记成反手，而这两件事的先后盘口上分不
+        # 出来 —— 挑对自己有利的那个就是白送 alpha
+        def _flip_frame(exit_at_open: bool):
+            px_ = np.array([100.0] * 10, dtype=float)
+            hi_ = np.array([101.0] * 6 + [106.0, 101.0, 99.0, 99.0], dtype=float)
+            lo_ = np.array([99.0] * 6 + [102.0, 95.0, 90.0, 99.0], dtype=float)
+            f = pd.DataFrame({"open": px_, "high": hi_, "low": lo_, "close": px_,
+                              "signal": np.zeros(10, dtype=int)},
+                             index=pd.date_range("2022-01-01", periods=10, freq="D"))
+            f["entry_long"] = np.nan
+            f["entry_short"] = np.nan
+            f["exit_long"] = 0.0
+            f["exit_short"] = 0.0
+            f["stop_dist"] = 4.0
+            f.iloc[6, f.columns.get_loc("entry_long")] = 105.0   # 第 7 根做多
+            f.iloc[6, f.columns.get_loc("exit_long")] = 1.0 if exit_at_open else 0.0
+            # 第 8 根：多单被打止损（101，开盘 100 更低 ⇒ 按 100 成交），
+            # 同一根的空头触发价 96 也被打穿（最低 95）
+            f.iloc[7, f.columns.get_loc("entry_short")] = 96.0
+            # 第 9 根：继续往下，空头在这一根才该开出来
+            f.iloc[8, f.columns.get_loc("entry_short")] = 96.0
+            return f
+
+        for tag, ex_open in (("ATR 止损", False), ("反向突破离场", True)):
+            f = _flip_frame(ex_open)
+            rr = run_backtest(f, cfg, label="不反手")
+            if len(rr.trades) != 2:
+                raise RuntimeError(
+                    f"{tag} 那一根不该开新仓：预期 2 笔（多单 + 下一根的空单），"
+                    f"实得 {len(rr.trades)} 笔")
+            if int(rr.position.iloc[7]) != 0:
+                raise RuntimeError(
+                    f"{tag} 当根应该空仓，实得持仓 {int(rr.position.iloc[7])}")
+            t2 = rr.trades[1]
+            if t2.direction != -1:
+                raise RuntimeError(f"{tag} 之后那一笔应该做空，实得方向 {t2.direction}")
+            if rr.equity.index.get_loc(t2.entry_date) != 8:
+                raise RuntimeError(
+                    f"{tag} 之后的空单应该在第 9 根开，实际开在 "
+                    f"{rr.equity.index.get_loc(t2.entry_date) + 1} 根")
+            # 对照：允许平仓当根再开仓（乐观口径）⇒ 同一根里就反手了
+            cfg_opt = BacktestConfig(initial_cash=100_000.0, sizing="fixed",
+                                     volume=1, multiplier=1.0, fee_per_lot=0.0,
+                                     tick_size=0.0, slippage=0.0,
+                                     intrabar_reentry_samebar=True)
+            ro = run_backtest(f, cfg_opt, label="反手口径")
+            if len(ro.trades) < 2:
+                raise RuntimeError("开了 intrabar_reentry_samebar 却没反手")
+            if ro.equity.index.get_loc(ro.trades[1].entry_date) != 7:
+                raise RuntimeError(
+                    "开了 intrabar_reentry_samebar，空单应该在同一根就开出来")
+
         return (f"触发价成交 {t.entry_price:g}、止损 {r2.trades[0].exit_price:g}、"
-                f"同根止损开关生效、无列时走老路径")
+                f"同根止损开关生效、平仓当根不反手（下一根才开空）、"
+                f"无列时走老路径")
 
     check("K 线内进出场（触发价 / 止损 / 老路径不变）", _intrabar)
 
