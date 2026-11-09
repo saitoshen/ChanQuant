@@ -1022,6 +1022,11 @@ class StrategySpec:
     # 用户注册的策略自带源码：`exec` 出来的函数没有源文件，`inspect.getsource()`
     # 取不到，库页要展示代码就只能存一份
     code: str = ""
+    # 参数中文名的**本策略覆盖**。同一个参数名在不同策略里含义不同时必填 ——
+    # `range_n` 在 `sbbox_mini` 里是「根 bar」（1 = 上一根 K 线的振幅），在
+    # `sbbox_ib` 里是「交易日」（1 = 昨天一整天）。共用一条「参考根数」会让
+    # 人以为是同一回事，实测量级差 10 倍。
+    param_labels: dict = field(default_factory=dict)
 
 
 # 参数的中文名。研究页的滑杆、组合页的「设置参数」、手册都从这里取 ——
@@ -1041,6 +1046,19 @@ PARAM_LABELS = {
     "day_start": "日窗起(分)", "day_end": "日窗止(分)",
     "night_start": "夜窗起(分)", "night_end": "夜窗止(分)",
 }
+
+
+def param_label(spec: "StrategySpec | None", name: str) -> str:
+    """参数在界面上显示的中文名。
+
+    先看策略自己的 `param_labels` 覆盖，再退回全局表。**同一个参数名在两个策略
+    里含义不同时必须用覆盖**，否则滑杆上写着同一个词、底下是两个量级的东西。
+    """
+    if spec is not None:
+        hit = getattr(spec, "param_labels", {}).get(name)
+        if hit:
+            return hit
+    return PARAM_LABELS.get(name, name)
 
 
 STRATEGIES: dict[str, StrategySpec] = {
@@ -1143,6 +1161,9 @@ STRATEGIES: dict[str, StrategySpec] = {
             "atr_n": (10, 50, 1),
             "stop_mult": (0.5, 5.0, 0.5),
         },
+        # 🔴 这个 range_n 的单位是**交易日**（前 range_n 个交易日的平均全天振幅），
+        # 和 sbbox_mini 的「根 bar」不是一个东西，标签必须分开
+        param_labels={"range_n": "参考天数"},
         desc="两个条件**同时**满足才进：成交价要同时越过「前 20 根箱体上沿」和"
              "「当日开盘 ± 昨幅×40%」，也就是越过两者中更高的那个（碰价即进，"
              "不等收盘）。1.5×ATR（周期 10~50，默认 20）盘中止损；收盘反向突破 "

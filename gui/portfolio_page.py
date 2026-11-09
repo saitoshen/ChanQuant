@@ -109,7 +109,7 @@ from ttrade import strategy_store as SStore
 from ttrade import tqlive
 from ttrade.tqlive import merge_live
 from ttrade.backtest import combine, combine_trades
-from ttrade.strategies import PARAM_LABELS, STRATEGIES
+from ttrade.strategies import STRATEGIES, param_label
 from ttrade.strategy_runner import PortfolioRunner
 from ttrade.universe import cn_name
 
@@ -749,7 +749,7 @@ class EditDialog(QDialog):
                 except (TypeError, ValueError):
                     sp.setValue(default)
                 self.sp_params[name] = sp
-                form.addRow(PARAM_LABELS.get(name, name), sp)
+                form.addRow(param_label(spec, name), sp)
         elif cfg.family == "factor":
             form.addRow(_hint(
                 "因子策略的参数（窗口 / 阈值 / 因子）请在「策略研究」页调好，"

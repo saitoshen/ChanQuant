@@ -121,7 +121,7 @@ from ttrade.backtest import (
 )
 from ttrade.eastmoney import load_local
 from ttrade.strategies import (
-    PARAM_LABELS, STRATEGIES, available_text, resolve_key, run_strategy,
+    STRATEGIES, available_text, param_label, resolve_key, run_strategy,
 )
 from ttrade.universe import UNIVERSE, cn_name, sector_of
 
@@ -4321,7 +4321,7 @@ class MainWindow(QMainWindow):
             elif not spec.params:
                 btn.setToolTip(f"{spec.label} 没有可调参数")
             elif cur:
-                txt = "、".join(f"{PARAM_LABELS.get(k, k)} {v:g}"
+                txt = "、".join(f"{param_label(spec, k)} {v:g}"
                                 for k, v in cur.items())
                 btn.setToolTip(f"{spec.label} 用的是改过的参数：{txt}\n点这里再改")
             else:
@@ -4343,7 +4343,7 @@ class MainWindow(QMainWindow):
         rows = []
         for name, dflt in spec.params.items():
             lo, hi, step = spec.param_meta.get(name, (1, 100, 1))
-            rows.append((name, PARAM_LABELS.get(name, name), lo, hi, step, dflt,
+            rows.append((name, param_label(spec, name), lo, hi, step, dflt,
                          cur.get(name, dflt)))
         dlg = RuleParamsDialog(spec.label, rows, self)
         if dlg.exec() != QDialog.Accepted:
@@ -4658,7 +4658,7 @@ class MainWindow(QMainWindow):
             lo, hi, step = spec.param_meta.get(pname, (1, 100, 1))
             self._add_param_slider(
                 self.param_box, self.param_widgets, self.param_scales,
-                pname, PARAM_LABELS.get(pname, pname), lo, hi, step, default,
+                pname, param_label(spec, pname), lo, hi, step, default,
             )
 
     def _rebuild_fparams(self) -> None:
