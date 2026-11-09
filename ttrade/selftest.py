@@ -670,8 +670,38 @@ def _run() -> tuple[bool, list[str]]:
                 raise RuntimeError(
                     "开了 intrabar_reentry_samebar，空单应该在同一根就开出来")
 
+        # 反方向也要一样：持空单时看不到多头触发价，空单出场之后下一根才做多
+        op_s = np.array([100.0] * 6 + [98.0, 96.0, 99.0, 100.0], dtype=float)
+        hi_s = np.array([101.0] * 6 + [98.5, 100.0, 101.0, 101.0], dtype=float)
+        lo_s = np.array([99.0] * 6 + [94.0, 95.0, 97.0, 98.0], dtype=float)
+        cl_s = np.array([100.0] * 6 + [96.0, 97.0, 100.0, 100.0], dtype=float)
+        fs = pd.DataFrame({"open": op_s, "high": hi_s, "low": lo_s, "close": cl_s,
+                           "signal": np.zeros(10, dtype=int)},
+                          index=pd.date_range("2023-01-01", periods=10, freq="D"))
+        fs["entry_long"] = np.nan
+        fs["entry_short"] = np.nan
+        fs["exit_long"] = 0.0
+        fs["exit_short"] = 0.0
+        fs["stop_dist"] = 4.0
+        fs.iloc[6, fs.columns.get_loc("entry_short")] = 95.0   # 第 7 根做空
+        fs.iloc[7, fs.columns.get_loc("entry_long")] = 99.0    # 同根多头触发价也被打穿
+        fs.iloc[8, fs.columns.get_loc("entry_long")] = 99.0    # 下一根才该开多
+        rs = run_backtest(fs, cfg, label="不反手·空")
+        if len(rs.trades) != 2 or rs.trades[1].direction != 1:
+            raise RuntimeError(
+                f"空单出场之后应该只留下一笔下一根的多单：{[(t.direction, str(t.entry_date)) for t in rs.trades]}")
+        if int(rs.position.iloc[7]) != 0:
+            raise RuntimeError(f"空单止损当根应该空仓，实得 {int(rs.position.iloc[7])}")
+        if rs.equity.index.get_loc(rs.trades[1].entry_date) != 8:
+            raise RuntimeError("空单出场之后的做多应该在第 9 根，实得 "
+                               f"第 {rs.equity.index.get_loc(rs.trades[1].entry_date) + 1} 根")
+        rs_opt = run_backtest(fs, cfg_opt, label="反手口径·空")
+        if len(rs_opt.trades) < 2 or rs_opt.equity.index.get_loc(
+                rs_opt.trades[1].entry_date) != 7:
+            raise RuntimeError("开了 intrabar_reentry_samebar，多单应该在同一根就开出来")
+
         return (f"触发价成交 {t.entry_price:g}、止损 {r2.trades[0].exit_price:g}、"
-                f"同根止损开关生效、平仓当根不反手（下一根才开空）、"
+                f"同根止损开关生效、平仓当根不反手（多/空两侧都验，下一根才开）、"
                 f"无列时走老路径")
 
     check("K 线内进出场（触发价 / 止损 / 老路径不变）", _intrabar)

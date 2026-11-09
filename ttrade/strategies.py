@@ -370,8 +370,10 @@ def strat_sbbox_ib(
     ## 止损
 
     `stop_mult` × ATR(`atr_n`)，绑在**成交价**上，K 线内碰到就按止损价成交。
-    ATR 周期默认 75（用户给的区间 50~100 的中点偏上：短周期噪音多，取长一点
-    止损不容易被一根毛刺扫掉）。
+    ATR 周期可调区间 **10~50**，默认 **20**。周期越短，止损贴得越近：1h 上
+    20 根就是 20 小时，跟着最近的波动走；5 分钟上 20 根只有 100 分钟，止损会
+    非常紧，同一根里被扫掉的概率明显上升 —— 那种对照看
+    `BacktestConfig.intrabar_samebar_stop`（关掉它 = 「只从下一根开始止损」）。
 
     🔴 ATR 取**上一根**（`shift(1)`）：当根的 high/low/close 在 K 线走的过程中
     还没定型，拿当根的 ATR 去定当根的止损就是前视，回测会好得没有道理。
@@ -1119,18 +1121,19 @@ STRATEGIES: dict[str, StrategySpec] = {
         func=strat_sbbox_ib,
         intrabar=True,
         params={"entry_n": 20, "exit_n": 60, "vol_ratio": 0.4,
-                "range_n": 1, "atr_n": 75, "stop_mult": 1.5},
+                "range_n": 1, "atr_n": 20, "stop_mult": 1.5},
         param_meta={
             "entry_n": (5, 240, 5),
             "exit_n": (10, 480, 10),
             "vol_ratio": (0.1, 1.5, 0.05),
             "range_n": (1, 10, 1),
-            "atr_n": (50, 100, 5),
+            "atr_n": (10, 50, 1),
             "stop_mult": (0.5, 5.0, 0.5),
         },
         desc="K 线内成交：价格碰到「20 根箱体上沿」或「当日开盘 ± 昨幅×40%」"
-             "更高的那个就进，1.5×ATR(75) 盘中止损；收盘反向突破 60 根收盘"
-             "箱体则下一根开盘平。与 sbbox_mini 条件相近，但不等收盘。",
+             "更高的那个就进，1.5×ATR（周期 10~50，默认 20）盘中止损；收盘反向"
+             "突破 60 根收盘箱体则下一根开盘平。平仓当根不反手，下一根才重新看"
+             "触发价 —— 与 sbbox_mini 条件相近，但不等收盘。",
     ),
     "im_orb": StrategySpec(
         key="im_orb",
