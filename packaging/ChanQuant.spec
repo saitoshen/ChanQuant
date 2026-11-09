@@ -195,6 +195,14 @@ HIDDEN = [
     "tushare.pro.client",
     "tushare.pro.data_pro",
     "tushare.util.formula",
+    # six：**v2.6.19 就是栽在这个上**。tushare 自己声明的依赖里没有 six，但
+    # `tushare/futures/intlfutures.py` 第 12 行是顶层 `import six`，而
+    # `import tushare` 会连带加载它（`tushare/__init__.py` 里
+    # `from tushare.futures import ...`）。CI 环境没装 six ⇒ 静态分析找不到 ⇒
+    # 打包版一点「更新国内期货」就 ModuleNotFoundError；源码环境因为 six 常被
+    # 别的包顺带装上，本地复现不出来。requirements.txt 里已经补了 six==1.17.0，
+    # 这一行是第二道保险（自检里也会 import 它）。
+    "six",
     # CTP 客户端。只在装了 openctp-ctp 的平台上有（Windows），没装就是空列表
     "ttrade.ctp_client",
     # 交易页选到 CTP 账户时才会 import（`gui.live._hub_of` 里函数内导入），

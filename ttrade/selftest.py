@@ -2203,12 +2203,17 @@ def _run() -> tuple[bool, list[str]]:
         是打包问题，所以必须由自检来守。
 
         依赖也要一起验：tushare 自己 import 时会拉 lxml / tqdm / simplejson /
-        bs4，缺任何一个都是同样的报错形状。
+        bs4 / six，缺任何一个都是同样的报错形状。
+
+        🔴 `six` 是 v2.6.19 实际翻车的那一个：tushare 声明的依赖里没有它，但
+        `tushare/futures/intlfutures.py` 顶层 `import six`，而 `import tushare`
+        会连带加载该子模块。CI 环境没装 six ⇒ 打包版一点「更新国内期货」就
+        ModuleNotFoundError。所以 `tushare.futures.intlfutures` 也单列出来验。
         """
         import importlib
 
-        need = ["tushare", "tushare.pro", "tushare.pro.client",
-                "lxml", "tqdm", "simplejson", "bs4"]
+        need = ["tushare", "tushare.futures.intlfutures", "tushare.pro",
+                "tushare.pro.client", "six", "lxml", "tqdm", "simplejson", "bs4"]
         miss, why = [], {}
         for m in need:
             try:
@@ -2220,7 +2225,8 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(
                 "缺 " + "、".join(miss) + "｜"
                 + "；".join(f"{k}: {v}" for k, v in why.items())
-                + "（packaging/ChanQuant.spec 的 HIDDEN 里应当已列上 tushare）"
+                + "（requirements.txt 与 packaging/ChanQuant.spec 的 HIDDEN 里"
+                  "都应当已列上 six / tushare）"
             )
         ver = getattr(importlib.import_module("tushare"), "__version__", "?")
         from ttrade import futures as FU
@@ -2230,7 +2236,16 @@ def _run() -> tuple[bool, list[str]]:
         except Exception:      # noqa: BLE001
             # 没配 token 不算失败：这是配置问题，不是包装错了
             return f"tushare {ver}、依赖齐全；token 未配置（日线 / 美股 / A 股下不了）"
-        return f"tushare {ver}、依赖齐全；token {len(tok)} 字符"
+        # 再真建一次 pro 客户端：这一步会把整条 import 链走完（含 futures /
+        # intlfutures → six），但**不联网** —— DataApi 构造只做字符串拼接。
+        # 只 import 模块名是不够的，漏的往往是链条中间那一段。
+        try:
+            FU.get_pro()
+        except Exception as exc:          # noqa: BLE001
+            raise RuntimeError(
+                f"依赖都在但建 pro 客户端失败：{type(exc).__name__}: {exc}"
+            ) from exc
+        return f"tushare {ver}、依赖齐全、pro 客户端可建；token {len(tok)} 字符"
 
     check("Tushare 客户端（期货/美股/A股日线）", _tushare)
 

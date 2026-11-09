@@ -29,6 +29,16 @@ openpyxl==3.1.5
 # 仅 download_futures.py 需要；GUI 与回测不 import，但保留在依赖里
 # 让「快速开始」能一路跑通
 tushare==1.4.29
+# tushare 自己 **声明** 的依赖里没有 six，但它的 `tushare/futures/intlfutures.py`
+# 第 12 行是顶层 `import six`，而 `import tushare` 就会连带加载这个子模块
+# （`tushare/__init__.py` 里 from tushare.futures import ...）。
+#
+# 不写进来的后果是**只在打包版上出现**：CI 环境没有 six ⇒ PyInstaller 报
+# "Hidden import 'six' not found" 后跳过 ⇒ 装完一点「更新国内期货」就
+# `ModuleNotFoundError: No module named 'six'`，而源码环境里 six 往往被别的包
+# 顺带装上，本地怎么都复现不出来。v2.6.19 的发布包就是这么坏的
+# （解开 PYZ 查过：tushare 57 个子模块在，six 一个都没有）。
+six==1.17.0
 
 # 因子策略里的机器学习多因子。三件套缺一不可：
 #   scikit-learn 提供高斯过程（GPR），同时 lightgbm / xgboost 的 sklearn
