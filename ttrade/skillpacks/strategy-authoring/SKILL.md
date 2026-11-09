@@ -17,7 +17,7 @@ version: 1
    更难维护。
 2. **先看 `strategy_list`**。9 套内置规则策略（买入持有、卖出持有两条基准，
    加双均线、唐奇安突破、ATR 通道、MACD、海龟、箱体波幅突破·迷你、
-   IM 波幅突破·时段版）加用户自己注册的，都在里面。
+   箱体波幅突破·K线内、IM 波幅突破·时段版）加用户自己注册的，都在里面。
    自研策略的收益**必须和买入持有比** —— 跑不赢它，说明赚的是 beta 不是择时。
 3. 逻辑确实不同，再写。
 
@@ -31,6 +31,16 @@ version: 1
  "func": "sig_sbbox_mini",
  "code": "def sig_sbbox_mini(df, entry=240, exit=720, vol_max=0.4, atr_n=200):\n    out = df.copy()\n    hi = out['high'].rolling(entry).max().shift(1)\n    lo = out['low'].rolling(exit).min().shift(1)\n    vol = out['close'].pct_change().rolling(20).std()\n    out['signal'] = _position_state(\n        long_in=out['close'] > hi,\n        long_out=out['close'] < lo,\n        short_in=out['close'] < lo,\n        short_out=out['close'] > hi,\n    )\n    out.loc[vol > vol_max, 'signal'] = 0\n    return out"}
 ```
+
+## 成交时点：`signal` 是收盘定的，下一根开盘成交
+
+用户写的策略只需要给 `signal`，引擎统一「T 日收盘定仓、T+1 开盘成交」。**不要**在
+策略里自己 `shift` 去模拟盘中成交 —— 引擎会再 `roll` 一次，变成晚两天。
+
+想要「K 线突破的那个价格进场」（突破类策略的常见要求），内置里已经有
+`箱体+波幅突破·K线内`（`sbbox_ib`）：它额外输出 `entry_long` / `entry_short` /
+`stop_dist` / `exit_long` / `exit_short` 五列，引擎据此在 K 线走的**过程中**成交。
+用户自定义策略目前不支持这条通道 —— 没有 `intrabar` 标记，引擎只会读 `signal`。
 
 ## 七条硬约束
 

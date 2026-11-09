@@ -54,7 +54,7 @@ from ttrade import ml_artifact
 from ttrade import replay
 from ttrade import daylimit, orderbook, positionbook, topup, tqdata
 from ttrade import strategy_store as SStore
-from ttrade.strategies import run_strategy
+from ttrade.strategies import STRATEGIES, next_levels, run_strategy
 from ttrade.tqfetch import PERIOD_SEC
 from ttrade.tqlive import AccountSpec, bars_from_serial, merge_live
 from ttrade.tqsdk_symbols import is_stock, trade_symbol
@@ -196,6 +196,20 @@ class SlotState:
     # 这次提交走的是快路径（有训练产物、只预测）还是慢路径（后台重训）。
     # 慢路径没出结果时说「重训中」，快路径说「计算中」—— 两者等待时间差 10 倍
     ml_fast: bool = False
+
+    # ---- K 线内进出场（`StrategySpec.intrabar` 的规则策略用） ----
+    # 这根 bar 的触发价算好没有。**每根 bar 只算一次**：算一次要把整个
+    # `_signal_frame` 跑一遍策略，几百毫秒，放在每个 tick 里做就是自残
+    ib_armed: bool = False
+    # 这根 bar 已经按触发价进过一次场。防止「成交回报没到 → 又开始比价 →
+    # 再发一遍」这种重复下单；新的 bar 会把它清掉
+    ib_fired: bool = False
+    ib_entry_long: float = float("nan")    # 本根做多触发价
+    ib_entry_short: float = float("nan")   # 本根做空触发价
+    ib_stop_dist: float = float("nan")     # 止损距离（价格单位，= 倍数 × ATR）
+    # 这一笔**实际挂的**止损价：绑在成交时的触发价上，不跟着 bar 走。
+    # 重启会丢，`_ib_arm` 会按标记价补挂一条并写日志
+    ib_stop: float = float("nan")
 
     def title(self) -> str:
         return self.cfg.title()
@@ -865,6 +879,9 @@ class PortfolioRunner:
                     # 机器学习还在算第一批信号：仓位保持原样，只把在途单追完
                     self._chase(st)
                     continue
+                # K 线内触发：只用最新价跟「这一根的触发价」比，不需要新 bar。
+                # 突破策略的真实成交就发生在这一刻，等收盘再看等于白送一段行情
+                self._intrabar_tick(st)
                 self._rebalance(st)
                 self._chase(st)
             except Exception as exc:  # noqa: BLE001
@@ -1048,8 +1065,10 @@ class PortfolioRunner:
         st.last_bar = last
 
         df = self._signal_frame(st, kl)
-        # 最后一根是正在走的活 bar，信号只用已收盘的算（见模块文档）。此刻正是
-        # 新 bar 刚开盘，用上一根收盘的信号下单 = 回测里的 T+1 开盘成交。
+        # 最后一根是正在走的活 bar，**K 线内策略要用它**（「当日开盘价」在一天
+        # 的第一根上就是它自己）。下面那行 `iloc[:-1]` 只是给「收盘定信号」的
+        # 老策略用的副本，`full` 留给 `_ib_arm`
+        full = df
         if len(df) > 1:
             df = df.iloc[:-1]
         if len(df) < MIN_BARS:
@@ -1076,6 +1095,13 @@ class PortfolioRunner:
         if st.cfg.note != "short":
             st.signal = max(0, st.signal)     # 不允许做空时把空头信号裁掉
         st.lots = self._lots(st, self._mark_price(st, df), atr(df, st.cfg.stop_atr_n))
+        if self._ib_on(st):
+            # K 线内那一族不用 `signal` 定目标仓 —— 入场 / 止损由盘中触发价
+            # 决定（见 `_intrabar_tick`）。这根 bar 在这里只做两件事：
+            # ① 重算本根的触发价；② 执行上一根收盘留下的「反向突破离场」
+            st.signal = 0
+            self._ib_arm(st, full)
+            return
         st.target = st.signal * st.lots
 
     def _pick_ml_signal(self, st: SlotState) -> bool:
@@ -1115,6 +1141,135 @@ class PortfolioRunner:
             st.signal = max(0, st.signal)
         st.target = st.signal * st.lots
         return True
+
+    # ---- K 线内进出场（`StrategySpec.intrabar`） ----
+
+    @staticmethod
+    def _ib_on(st: SlotState) -> bool:
+        """这条策略走不走「K 线内触发」。
+
+        只认**规则策略**：因子 / 机器学习那两族的信号是整段历史打分出来的
+        一个数，没有「触发价」这个概念，硬套只会给它们加一层假精确。
+        """
+        if st.cfg.family != "rule" or not st.cfg.rule_key:
+            return False
+        # 「规则 + 因子过滤」走的是收盘定信号那条路（`run_rule_with_filter`
+        # 已经把 K 线内那几列扔了）。这里也必须退回去，否则会出现「回测按
+        # 过滤后的信号、实盘按触发价」两套口径
+        if getattr(st.cfg, "factor_mode", ""):
+            return False
+        spec = STRATEGIES.get(st.cfg.rule_key)
+        return bool(spec is not None and getattr(spec, "intrabar", False))
+
+    def _ib_arm(self, st: SlotState, full: pd.DataFrame) -> None:
+        """新 bar 到点：算出**这一根**的触发价，并执行上一根留下的出场。
+
+        和回测（`run_intrabar_backtest`）同一条规则、同一个策略函数，唯一
+        差别是这里没有「未来这根 K 线的收盘」，所以触发价必须靠 `shift(1)` /
+        「上一根 ATR」这些**已经定型**的量算出来（由 `next_levels` 保证）。
+        """
+        try:
+            lv = next_levels(full, st.cfg.rule_key, st.cfg.rule_params,
+                             reverse=bool(getattr(st.cfg, "rule_reverse", False)))
+        except Exception as exc:  # noqa: BLE001
+            st.ib_armed = False
+            st.last_action = f"算不出 K 线内触发价：{type(exc).__name__}: {exc}"
+            self._log(f"{st.title()}：{st.last_action}")
+            return
+        if not lv:
+            # 算不出触发价（历史不够 / 策略没给这几列）：**保持原仓**。
+            # 这时候 target 留在 0 就会被 `_rebalance` 当成「该平仓」，
+            # 一次缺数就把用户的仓平掉，比不交易糟糕得多
+            st.ib_armed = False
+            st.target = int(st.held.get(st.underlying, 0)) if st.underlying else 0
+            return
+
+        st.ib_entry_long = lv["entry_long"]
+        st.ib_entry_short = lv["entry_short"]
+        st.ib_stop_dist = lv["stop_dist"]
+        st.ib_fired = False
+        st.ib_armed = True
+
+        held = int(st.held.get(st.underlying, 0)) if st.underlying else 0
+
+        # ① 反向突破离场：上一根**收盘**决定，这一根**开盘**执行
+        if held and ((held > 0 and lv["exit_long"]) or (held < 0 and lv["exit_short"])):
+            st.target = 0
+            st.ib_armed = False          # 这根不再看入场，等下一根重来
+            st.ib_stop = float("nan")
+            st.last_action = "反向突破离场（本根开盘）"
+            self._log(f"{st.title()}：{st.underlying} 反向突破离场，本根开盘平")
+            return
+
+        # ② 有仓：继续拿着，等盘中的止损
+        if held:
+            st.target = held
+            if not (st.ib_stop == st.ib_stop and st.ib_stop > 0):
+                # 没有止损价 = 程序重启过（`ib_stop` 只存在内存里）。按当前
+                # 标记价补挂一条，宁可比原来宽松，也不能裸奔到下一根
+                d = st.ib_stop_dist
+                mark = self._mark_price(st, full)
+                if d == d and d > 0 and mark > 0:
+                    st.ib_stop = mark - d if held > 0 else mark + d
+                    self._log(f"{st.title()}：{st.underlying} 持仓没有止损价"
+                              f"（多半是刚重启），按标记价 {mark:.3f} 补挂 "
+                              f"{st.ib_stop:.3f}")
+            return
+
+        # ③ 空仓：目标就是空，等盘中触发价
+        st.target = 0
+
+    def _intrabar_tick(self, st: SlotState) -> None:
+        """每个 tick 拿最新价比一次触发价 / 止损价，越价就把目标仓改掉。
+
+        **只改 `st.target`，不发单**：真正的下单、追单、在途管理还是走
+        `_rebalance` / `_chase` 那一套。这样「盘中触发」和「收盘调仓」共用
+        同一条下单链路，不会出现两套互不知情的委托在互相打。
+        """
+        if not st.ib_armed or not st.underlying:
+            return
+        q = self._contract_quote(st.underlying)
+        price = float(getattr(q, "last_price", 0) or 0) if q is not None else 0.0
+        if not (price > 0 and math.isfinite(price)):
+            return                    # 没行情（收盘 / 断流）：这一轮什么也不做
+
+        held = int(st.held.get(st.underlying, 0))
+
+        if held:
+            sp = st.ib_stop
+            if sp == sp and sp > 0:
+                hit = price <= sp if held > 0 else price >= sp
+                if hit:
+                    st.target = 0
+                    st.ib_armed = False      # 这根 bar 不再入场
+                    st.ib_stop = float("nan")
+                    st.last_action = f"K 线内止损：现价 {price:.3f} 越过 {sp:.3f}"
+                    self._log(f"{st.title()}：K 线内止损 {st.underlying} "
+                              f"现价 {price:.3f}，止损 {sp:.3f}")
+            return
+
+        if st.ib_fired or st.lots <= 0:
+            return
+
+        d = st.ib_stop_dist
+        el, es = st.ib_entry_long, st.ib_entry_short
+        if el == el and price >= el:
+            st.target = st.lots
+            st.ib_fired = True
+            # 止损绑**触发价**（那一刻的下单价），不是此刻的最新价 ——
+            # 最新价可能已经冲过去一段，用它会悄悄把止损挪得更松
+            st.ib_stop = el - d if (d == d and d > 0) else float("nan")
+            st.last_action = f"K 线内入场：现价 {price:.3f} 越过 {el:.3f}"
+            self._log(f"{st.title()}：K 线内做多 {st.underlying} 触发价 {el:.3f}"
+                      f"，现价 {price:.3f}，止损 {st.ib_stop:.3f}")
+        elif (es == es and price <= es
+              and st.cfg.note == "short"):    # 不允许做空时忽略空头触发价
+            st.target = -st.lots
+            st.ib_fired = True
+            st.ib_stop = es + d if (d == d and d > 0) else float("nan")
+            st.last_action = f"K 线内入场：现价 {price:.3f} 跌破 {es:.3f}"
+            self._log(f"{st.title()}：K 线内做空 {st.underlying} 触发价 {es:.3f}"
+                      f"，现价 {price:.3f}，止损 {st.ib_stop:.3f}")
 
     def _signal_frame(self, st: SlotState, kl) -> pd.DataFrame:
         """算信号用的行情：**本地前复权历史 + 实时 bar**。
@@ -2128,6 +2283,14 @@ class PortfolioRunner:
                 "ml_wait": bool(not st.ml_ready and st.running),
                 "ml_age": float(st.ml_age or 0.0),
                 "ml_why": str(st.ml_why or ""),
+                # K 线内那一族：界面要能看到「这一根的触发价 / 止损挂在哪」，
+                # 否则用户只知道「有仓」，不知道离被打掉还有多远
+                "intrabar": bool(self._ib_on(st)),
+                "ib_entry_long": (None if st.ib_entry_long != st.ib_entry_long
+                                  else float(st.ib_entry_long)),
+                "ib_entry_short": (None if st.ib_entry_short != st.ib_entry_short
+                                   else float(st.ib_entry_short)),
+                "ib_stop": None if st.ib_stop != st.ib_stop else float(st.ib_stop),
             }
             for st in self._slots.values()
         ]

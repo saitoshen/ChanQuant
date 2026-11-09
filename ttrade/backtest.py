@@ -83,6 +83,18 @@ class BacktestConfig:
     # 写成 0.1 的话，任何忘了填乘数/保证金率的地方都会悄悄变成 10 倍杠杆
     margin_rate: float = 1.0
 
+    # ---- K 线内成交（只有 `run_intrabar_backtest` 读它） ----
+    # 允许「同一根 K 线里先进场、再被止损」。默认 **开**：没有分笔数据时
+    # 「先冲高再砸下来」和「先砸再冲高」长得一模一样，按对自己有利的那个
+    # 假设等于白送 alpha。
+    #
+    # 但要知道代价：止损距离比这根 K 线的振幅还小时（比如 5 分钟上
+    # 1.5×ATR 只有一跳半），突破那根往往就是最宽的一根，于是三成以上的仓
+    # 会在**同一根**里被扫掉。那种结果不是策略烂，是**这根 K 线的信息量
+    # 不够**。想看「只从下一根开始止损」的乐观口径，把它设 False 再跑一遍，
+    # 两个数字的差就是「同根内不可知」这件事值多少钱。
+    intrabar_samebar_stop: bool = True
+
     @property
     def label(self) -> str:
         return "只做多" if self.long_only else "多空双向"
@@ -364,14 +376,278 @@ def _note_col(data: pd.DataFrame, name: str) -> np.ndarray | None:
     return out
 
 
+def _num_col(data: pd.DataFrame, name: str, n: int) -> np.ndarray:
+    """取一列数值，缺列或非数值一律 NaN。
+
+    K 线内进出场那一族的列（触发价 / 止损距离 / 出场标志）都可以缺：策略
+    只做多就不写 `entry_short`，不设止损就不写 `stop_dist`。缺列按 NaN
+    处理，逐根的判断自然跳过它 —— 不需要为每种组合写一遍分支。
+    """
+    if name not in data.columns:
+        return np.full(n, np.nan, dtype=float)
+    return pd.to_numeric(data[name], errors="coerce").to_numpy(dtype=float)
+
+
+def _finite(x: float) -> bool:
+    """`NaN` 和 `inf` 都不算有效价（`x == x` 判不出 inf）。"""
+    return bool(np.isfinite(x))
+
+
+def run_intrabar_backtest(data: pd.DataFrame, cfg: BacktestConfig,
+                          label: str = "") -> Result:
+    """**K 线内部进出场**：按「触发价」成交，而不是等下一根开盘。
+
+    老路径（`signal` → T+1 开盘成交）是「收盘后才做决定」的模型，适合日线、
+    也适合任何「收盘确认」的规则。但突破类策略的真实成交发生在 K 线走的
+    过程中：价格碰到 20 根箱体上沿的那一刻就该进场，等收盘再说等于白送了
+    一段行情。这条分支就是为那种规则准备的。
+
+    ## 策略要提供哪些列（全部可选，缺列 = 该功能不用）
+
+    | 列名 | 含义 | 单位 |
+    |---|---|---|
+    | `entry_long`  | 本根内做多的触发价 | 价格 |
+    | `entry_short` | 本根内做空的触发价 | 价格 |
+    | `exit_long`   | 1 = 多头下一根开盘平 | 0/1 |
+    | `exit_short`  | 1 = 空头下一根开盘平 | 0/1 |
+    | `stop_dist`   | 止损距离（入场价 ∓ 它） | 价格 |
+
+    `stop_dist` 是**距离**不是价位：止损要绑在「实际成交价」上，策略在写这一列
+    时还不知道引擎会用哪个价成交（含滑点、含跳空）。给距离，引擎自己减。
+
+    ## 成交价的判定
+
+    一律取「触发价」，但被开盘跳空打断时**按开盘价成交** —— 开盘价已经越过
+    触发价，说明那一刻市场没有给你触发价：
+
+        做多入场  fill = max(open, entry_long)
+        做空入场  fill = min(open, entry_short)
+        多头止损  fill = min(open, stop)      ← 低开直接穿，比 stop 更差
+        空头止损  fill = max(open, stop)
+
+    滑点在成交价上再叠一层（买加卖减），和 `run_backtest` 同一套 `slip_amount`。
+
+    ## 同一根 K 线里的先后顺序（无 tick 数据，只能定约定）
+
+    1. 开盘：上一根收盘给的 `exit_*` 先执行 —— 那是**已知**的、开盘就该做的；
+    2. 盘中：已有仓位的止损（可能跳空成交在开盘价）；
+    3. 盘中：空仓才看入场；
+    4. 盘中：刚进的仓，同一根就打到止损 —— **按先入场后止损处理**。
+
+    第 4 条是保守假设。没有分笔数据时，「这根 K 线先冲到高点再砸到低点」
+    和「先砸后冲」看起来一模一样，猜对自己有利的一边等于自己给自己送 alpha。
+    反过来（假设先止损后入场）会让回测好得离谱，实盘永远做不到。
+    """
+    open_ = data["open"].to_numpy(dtype=float)
+    close = data["close"].to_numpy(dtype=float)
+    high = (data["high"].to_numpy(dtype=float) if "high" in data.columns
+            else open_.copy())
+    low = (data["low"].to_numpy(dtype=float) if "low" in data.columns
+           else open_.copy())
+    scale = (pd.to_numeric(data["price_scale"], errors="coerce").fillna(1.0)
+             .to_numpy(dtype=float) if "price_scale" in data.columns else None)
+
+    idx = data.index
+    n = len(data)
+    mult = float(cfg.multiplier or 1.0)
+
+    e_long = _num_col(data, "entry_long", n)
+    e_short = _num_col(data, "entry_short", n)
+    if cfg.long_only:
+        # 「只做多」在老路径上靠裁 `signal` 实现，这里没有 signal 可裁 —— 只能
+        # 把做空触发价整列抹掉。不抹的话，界面上勾了「只做多」，回测还是会做空
+        e_short = np.full(n, np.nan, dtype=float)
+    x_long = _num_col(data, "exit_long", n)
+    x_short = _num_col(data, "exit_short", n)
+    stop_d = _num_col(data, "stop_dist", n)
+    note_in = _note_col(data, "entry_note")
+    note_out = _note_col(data, "exit_note")
+
+    cash = float(cfg.initial_cash)
+    cost_total = 0.0
+    notional_total = 0.0
+    lots = 0.0
+    pos = 0
+    entry_price = 0.0        # 含滑点的成交价（账户口径）
+    entry_raw = 0.0          # 不含滑点的盘口价（毛盈亏口径，见 Trade.gross）
+    entry_cost = 0.0
+    entry_date = None
+    entry_bar = 0
+    entry_dir = 1
+    entry_why = ""
+    stop_px = float("nan")
+    pos_state = np.zeros(n, dtype=int)
+    equity = np.zeros(n, dtype=float)
+    trades: list[Trade] = []
+
+    def _slip(price: float, i: int) -> float:
+        return cfg.slip_amount(price, scale[i] if scale is not None else 1.0)
+
+    def do_close(i: int, raw_px: float, why: str) -> None:
+        """平掉当前仓位。`raw_px` 是**不含滑点**的成交基准价。"""
+        nonlocal cash, lots, pos, entry_price, entry_date, entry_cost
+        nonlocal cost_total, notional_total, stop_px
+        if entry_price <= 0 or pos == 0:
+            return
+        sp = _slip(raw_px, i)
+        # 平多 = 卖出（滑点往下）；平空 = 买入（滑点往上）
+        fill = raw_px - sp if pos == 1 else raw_px + sp
+        cash += lots * mult * (fill - entry_price)
+        fee = cfg.fee_amount(lots, mult, fill)
+        cash -= fee
+        close_cost = fee + sp * mult * abs(lots)
+        cost_total += close_cost
+        notional_total += abs(lots) * mult * abs(fill)
+        trades.append(Trade(
+            entry_date=entry_date,
+            exit_date=idx[i],
+            entry_price=float(entry_price),
+            exit_price=float(fill),
+            ret=_trade_ret(entry_dir, entry_price, fill),
+            bars=i - entry_bar,
+            direction=entry_dir,
+            lots=abs(float(lots)),
+            gross=float(lots) * mult * (float(raw_px) - float(entry_raw)),
+            cost=float(entry_cost) + float(close_cost),
+            entry_note=entry_why,
+            exit_note=why,
+        ))
+        lots = 0.0
+        pos = 0
+        entry_price = 0.0
+        entry_date = None
+        entry_cost = 0.0
+        stop_px = float("nan")
+
+    def do_open(i: int, raw_px: float, direction: int, why: str) -> bool:
+        """开仓。`raw_px` 是**不含滑点**的成交基准价（触发价或开盘价）。"""
+        nonlocal cash, lots, pos, entry_price, entry_raw, entry_date
+        nonlocal entry_bar, entry_dir, entry_cost, entry_why, stop_px
+        nonlocal cost_total, notional_total
+        sp = _slip(raw_px, i)
+        fill = raw_px + sp if direction > 0 else raw_px - sp
+        # risk 口径要的是 ATR 本身，而这一族给的是「倍数 × ATR」后的距离
+        a = 0.0
+        if _finite(stop_d[i]) and float(cfg.stop_mult or 0) > 0:
+            a = float(stop_d[i]) / float(cfg.stop_mult)
+        q = size_lots(cfg, fill, cash, a)
+        if q <= 0:
+            return False
+        fee = cfg.fee_amount(q, mult, fill)
+        cash -= fee
+        entry_cost = fee + sp * mult * q
+        cost_total += entry_cost
+        notional_total += q * mult * abs(fill)
+        lots = q if direction > 0 else -q
+        pos = direction
+        entry_price = float(fill)
+        entry_raw = float(raw_px)
+        entry_date = idx[i]
+        entry_bar = i
+        entry_dir = direction
+        entry_why = why
+        # 止损绑**实际成交价**：策略只知道距离，成交价是引擎算出来的
+        stop_px = float("nan")
+        if _finite(stop_d[i]) and float(stop_d[i]) > 0:
+            stop_px = fill - float(stop_d[i]) if direction > 0 else fill + float(stop_d[i])
+        return True
+
+    for i in range(n):
+        o, hi, lo, cl = open_[i], high[i], low[i], close[i]
+
+        # ① 上一根收盘给的出场：本根开盘执行
+        if pos != 0 and i > 0:
+            want_out = (x_long[i - 1] > 0.5) if pos == 1 else (x_short[i - 1] > 0.5)
+            if want_out:
+                why = (note_out[i - 1] if note_out is not None else "") or "反向突破离场"
+                do_close(i, o, why)
+
+        # ② 已有仓位的止损（K 线内；开盘已穿过就按开盘价，更差）
+        if pos != 0 and _finite(stop_px):
+            if pos == 1 and lo <= stop_px:
+                do_close(i, min(o, stop_px), "ATR 止损")
+            elif pos == -1 and hi >= stop_px:
+                do_close(i, max(o, stop_px), "ATR 止损")
+
+        # ③ 空仓时看本根有没有触发入场
+        if pos == 0:
+            up, dn = e_long[i], e_short[i]
+            # 止损距离必须已知：ATR 没暖起来就进的话，这一笔没有止损，
+            # 后面 300 根都靠「反向突破」兜底 —— 那不是这套规则
+            ready = _finite(stop_d[i]) and float(stop_d[i]) > 0
+            long_ok = ready and _finite(up) and hi >= up
+            short_ok = ready and _finite(dn) and lo <= dn
+            if long_ok and short_ok:
+                # 同一根两头都打穿：分不出先后，宁可这单不做
+                long_ok = short_ok = False
+            if long_ok:
+                raw = max(o, up)
+                why = (note_in[i] if note_in is not None else "") or label
+                if (do_open(i, raw, 1, why) and cfg.intrabar_samebar_stop
+                        and lo <= stop_px):
+                    # 🔴 这里只能按 `stop_px` 成交，**不能**再取 `min(o, stop_px)`：
+                    # 开仓发生在开盘之后，当根开盘价在时间上早于建仓，用它就
+                    # 等于「建仓前就按开盘价止损了」—— 一分钟没持仓，却记一笔
+                    # 亏损，而且亏损幅度被放大成「整根 K 线的幅度」
+                    do_close(i, stop_px, "ATR 止损")
+            elif short_ok:
+                raw = min(o, dn)
+                why = (note_in[i] if note_in is not None else "") or label
+                if (do_open(i, raw, -1, why) and cfg.intrabar_samebar_stop
+                        and hi >= stop_px):
+                    do_close(i, stop_px, "ATR 止损")
+
+        eq = cash + (lots * mult * (cl - entry_price) if pos != 0 else 0.0)
+        pos_state[i] = pos
+        equity[i] = eq
+
+    # 未平仓的最后一笔（口径与 `run_backtest` 一致：只付开仓那一侧成本）
+    if pos != 0 and entry_price > 0:
+        last = close[-1]
+        trades.append(Trade(
+            entry_date=entry_date,
+            exit_date=idx[-1],
+            entry_price=float(entry_price),
+            exit_price=float(last),
+            ret=_trade_ret(entry_dir, entry_price, last),
+            bars=n - 1 - entry_bar,
+            direction=entry_dir,
+            open_position=True,
+            lots=abs(float(lots)),
+            gross=float(lots) * mult * (float(last) - float(entry_raw)),
+            cost=float(entry_cost),
+            entry_note=entry_why,
+            exit_note="样本结束，仍持仓",
+        ))
+
+    eq = pd.Series(equity, index=idx, name="equity")
+    ps = pd.Series(pos_state, index=idx, name="position")
+    m = _metrics(eq, ps, trades, cfg.bars_per_year, base=cfg.initial_cash)
+    m["final_equity"] = float(eq.iloc[-1])
+    m["total_cost"] = float(cost_total)
+    m["notional"] = float(notional_total)
+    m["avg_cost"] = float(cost_total / m["n_trades"]) if m["n_trades"] else 0.0
+    m["cost_rate"] = float(cost_total / notional_total) if notional_total > 0 else 0.0
+    m["intrabar"] = 1.0
+    return Result(equity=eq, position=ps, trades=trades, metrics=m, label=label)
+
+
 def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str = "") -> Result:
-    """按 signal 列执行回测。df 需含 open/close 与 signal（取值 -1/0/1）。"""
+    """按 signal 列执行回测。df 需含 open/close 与 signal（取值 -1/0/1）。
+
+    带 `entry_long` / `entry_short` 列的策略走 K 线内成交（见
+    `run_intrabar_backtest`），**其余一律走原来的 T+1 开盘路径**。老路径
+    一行没动，是为了让所有历史回测结果仍能逐位对拍 —— 多一条执行模型不等于
+    换掉原来的那一条。
+    """
     cfg = cfg or BacktestConfig()
     data = df.dropna(subset=["open", "close"]).copy()
     # 价格必须为正：期货无成交日会返回 0 价，参与运算会导致除零、净值变 inf
     data = data[(data["open"] > 0) & (data["close"] > 0)]
     if "signal" not in data:
         raise ValueError("缺少 signal 列")
+    if "entry_long" in data.columns or "entry_short" in data.columns:
+        return run_intrabar_backtest(data, cfg, label=label)
 
     open_ = data["open"].to_numpy(dtype=float)
     close = data["close"].to_numpy(dtype=float)

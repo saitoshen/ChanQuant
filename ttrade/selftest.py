@@ -515,6 +515,95 @@ def _run() -> tuple[bool, list[str]]:
     # 放在 `_us_df` 之后：`check()` 是立即执行的，定义在前会拿不到这个闭包
     check("交易记录备注与累计盈亏", _trade_notes)
 
+    def _intrabar():
+        """K 线内进出场（`run_intrabar_backtest`）。
+
+        这条分支容易出的错都是「不报错、只是数字悄悄变好看」那种，所以四件事
+        必须逐条验：入口成交在**触发价**（不是下一根开盘）、止损成交在
+        **止损价**、拿掉那几列之后老路径**一个数都不许变**、同根止损开关
+        真的生效。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade.backtest import BacktestConfig, run_backtest
+
+        cfg = BacktestConfig(initial_cash=100_000.0, sizing="fixed", volume=1,
+                             multiplier=1.0, fee_per_lot=0.0, tick_size=0.0,
+                             slippage=0.0)
+
+        # 10 根平价，第 7 根（下标 6）一根大阳线扫过触发价 105
+        px = np.array([100.0] * 6 + [104.0, 110.0, 112.0, 111.0], dtype=float)
+        hi = np.array([101.0] * 6 + [110.0, 111.0, 113.0, 112.0], dtype=float)
+        lo = np.array([99.0] * 6 + [103.0, 108.0, 110.0, 109.0], dtype=float)
+        idx = pd.date_range("2021-01-01", periods=len(px), freq="D")
+        d = pd.DataFrame({"open": px, "high": hi, "low": lo, "close": px,
+                          "signal": np.zeros(len(px), dtype=int)}, index=idx)
+        d["entry_long"] = np.nan
+        d["entry_short"] = np.nan
+        d["exit_long"] = 0.0
+        d["exit_short"] = 0.0
+        d["stop_dist"] = 4.0
+        d.iloc[6, d.columns.get_loc("entry_long")] = 105.0
+
+        r = run_backtest(d, cfg, label="K线内")
+        if r.metrics.get("intrabar") != 1.0:
+            raise RuntimeError("带了 entry_long 却没走 K 线内分支")
+        if len(r.trades) != 1:
+            raise RuntimeError(f"应该只有 1 笔交易，实得 {len(r.trades)} 笔")
+        t = r.trades[0]
+        # 开盘 104 低于触发价 105 ⇒ 按 105 成交；滑点为 0
+        if abs(t.entry_price - 105.0) > 1e-9:
+            raise RuntimeError(f"入场没按触发价成交：{t.entry_price}")
+        # 止损 105 − 4 = 101，当根最低 103 没打到 ⇒ 应该还在持仓
+        if not t.open_position:
+            raise RuntimeError("当根最低 103 没到止损 101，不该平仓")
+
+        # 同根打穿止损：最低价压到 100 ⇒ 按 101 止损
+        d2 = d.copy()
+        d2.iloc[6, d2.columns.get_loc("low")] = 100.0
+        r2 = run_backtest(d2, cfg, label="K线内")
+        if len(r2.trades) != 1 or r2.trades[0].open_position:
+            raise RuntimeError("同根打穿止损却没平仓")
+        if abs(r2.trades[0].exit_price - 101.0) > 1e-9:
+            raise RuntimeError(f"止损没按止损价成交：{r2.trades[0].exit_price}")
+
+        # 关掉同根止损：这一笔就该活下来
+        cfg2 = BacktestConfig(initial_cash=100_000.0, sizing="fixed", volume=1,
+                              multiplier=1.0, fee_per_lot=0.0, tick_size=0.0,
+                              slippage=0.0, intrabar_samebar_stop=False)
+        r3 = run_backtest(d2, cfg2, label="K线内")
+        if not r3.trades or not r3.trades[0].open_position:
+            raise RuntimeError("关了同根止损，这一笔不该被扫掉")
+
+        # 拿掉那几列 ⇒ 走老路径，且结果必须和「本来就没有这几列」完全一致
+        plain = d[["open", "high", "low", "close", "signal"]].copy()
+        rp = run_backtest(plain, cfg, label="老路")
+        if rp.metrics.get("intrabar") is not None:
+            raise RuntimeError("没有 entry_* 列却走了 K 线内分支")
+        if rp.metrics["n_trades"] != 0:
+            raise RuntimeError("signal 全 0 却产生了交易")
+
+        # 出场：上一根收盘给标志，下一根**开盘**成交
+        d4 = plain.copy()
+        d4["signal"] = np.r_[np.ones(7, dtype=int), np.zeros(3, dtype=int)]
+        a = run_backtest(d4, cfg, label="老路")
+        d5 = d.copy()
+        d5["signal"] = d4["signal"]
+        d5["exit_long"] = 0.0
+        d5.iloc[7, d5.columns.get_loc("exit_long")] = 1.0
+        b = run_backtest(d5, cfg, label="K线内")
+        if not a.trades or not b.trades:
+            raise RuntimeError("离场对比样本没成交")
+        if abs(a.trades[0].exit_price - b.trades[0].exit_price) > 1e-9:
+            raise RuntimeError(
+                f"反向突破离场没按开盘价成交：老路 {a.trades[0].exit_price} "
+                f"vs K 线内 {b.trades[0].exit_price}")
+        return (f"触发价成交 {t.entry_price:g}、止损 {r2.trades[0].exit_price:g}、"
+                f"同根止损开关生效、无列时走老路径")
+
+    check("K 线内进出场（触发价 / 止损 / 老路径不变）", _intrabar)
+
     def _trade_cost():
         """成本必须**双边**收，逐笔成本加起来要等于绩效页的「总成本」。
 

@@ -2227,6 +2227,12 @@ def run_rule_with_filter(
     filtered = apply_factor_filter(rule_signal, pack.score.to_numpy(), cfg)
 
     out = df.copy()
+    # 「规则 + 因子过滤」走的是**收盘定信号**那条老通道。K 线内那一族的
+    # `entry_long` / `entry_short` / `stop_dist` / `exit_*` 必须扔掉：留着的话
+    # `run_backtest` 会判定走 intrabar 分支，而那条分支**根本不读 `signal`** ——
+    # 「因子过滤」就变成一个点了没用、也不报错的按钮
+    for _c in ("entry_long", "entry_short", "exit_long", "exit_short", "stop_dist"):
+        out.pop(_c, None)
     out["factor_score"] = pack.score
     out["rule_signal"] = np.asarray(rule_signal, dtype=int)
     for c in pack.raw.columns:

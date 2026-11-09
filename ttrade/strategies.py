@@ -13,6 +13,7 @@ signal 表示「当日收盘后确定的目标仓位」：
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -330,6 +331,159 @@ def strat_sbbox_mini(
             epx = cu[i] if pos != 0 else np.nan
         sig[i] = pos
 
+    out["signal"] = sig
+    return out
+
+
+def strat_sbbox_ib(
+    df: pd.DataFrame,
+    entry_n: int = 20,
+    exit_n: int = 60,
+    vol_ratio: float = 0.4,
+    range_n: int = 1,
+    atr_n: int = 75,
+    stop_mult: float = 1.5,
+) -> pd.DataFrame:
+    """箱体 + 波幅双突破，**K 线内成交**（`_ib` = intrabar）。
+
+    和 `strat_sbbox_mini` 的区别不在条件，在**成交时点**：
+
+    - `sbbox_mini` 等收盘确认，下一根开盘才成交；
+    - 这一条在价格**碰到触发价的那一刻**就成交 —— 突破 20 根箱体上沿、或者
+      相对当日开盘涨过昨日波幅的 40%，谁先满足谁触发。
+
+    ## 入场
+
+    两个条件都表示「价格向上越过某个价位」：
+
+        箱体突破    价格 > 前 entry_n 根的最高价
+        波幅突破    价格 > 当日开盘 + vol_ratio × 昨日高低波幅
+
+    价格越过**两者中更高的那个**，两个条件必然同时成立，所以触发价取
+
+        做多  up = max(前 entry_n 根最高, 当日开盘 + vol_ratio × 昨日波幅)
+        做空  dn = min(前 entry_n 根最低, 当日开盘 - vol_ratio × 昨日波幅)
+
+    取 max 而不是「两个条件都成立才算」，是因为后者只能收盘才知道成没成 ——
+    那又退回 `sbbox_mini` 了。用户要的是「K 线突破的那个价格进场」。
+
+    ## 止损
+
+    `stop_mult` × ATR(`atr_n`)，绑在**成交价**上，K 线内碰到就按止损价成交。
+    ATR 周期默认 75（用户给的区间 50~100 的中点偏上：短周期噪音多，取长一点
+    止损不容易被一根毛刺扫掉）。
+
+    🔴 ATR 取**上一根**（`shift(1)`）：当根的 high/low/close 在 K 线走的过程中
+    还没定型，拿当根的 ATR 去定当根的止损就是前视，回测会好得没有道理。
+
+    ## 出场
+
+    当根**收盘价**反向突破前 `exit_n` 根收盘价箱体 ⇒ **下一根开盘**平仓。
+    这一条不盘中化：用户明确要求「下一根 K 线开盘价格出场」，而且收盘箱体
+    本身也要收盘才成立。
+
+    「当日」按**交易日**算（`index + 6h` 再取日期），夜盘 21:00 之后归次日 ——
+    晚上九点的开盘价要是和早上九点算成同一天，波幅基准整个错位。
+    """
+    out = df.copy()
+    n = len(out)
+    if n == 0:
+        for k in ("entry_long", "entry_short", "exit_long", "exit_short", "stop_dist"):
+            out[k] = pd.Series(dtype=float)
+        out["signal"] = pd.Series(dtype=int)
+        return out
+
+    c, h, l, o = out["close"], out["high"], out["low"], out["open"]
+
+    # ---- 入场箱体：前 entry_n 根的高/低点，shift(1) 把当根排除在外 ----
+    box_hi = h.rolling(entry_n, min_periods=entry_n).max().shift(1)
+    box_lo = l.rolling(entry_n, min_periods=entry_n).min().shift(1)
+
+    # ---- 出场箱体：前 exit_n 根的**收盘价**（不是高低点） ----
+    c_hi = c.rolling(exit_n, min_periods=exit_n).max().shift(1)
+    c_lo = c.rolling(exit_n, min_periods=exit_n).min().shift(1)
+
+    # ---- 当日开盘（按交易日，夜盘归次日） ----
+    day_key = (pd.DatetimeIndex(out.index) + pd.Timedelta(hours=6)).normalize()
+    day_open = o.groupby(day_key).transform("first")
+
+    # ---- 昨日高低波幅：按交易日聚合全天 high.max − low.min，再 shift(1) ----
+    # 直接对 bar 做 rolling(max) − rolling(min) 会跨交易日把「昨天下午 + 今天
+    # 早上」混成一段，波幅基准偏小；必须先在交易日这一层聚合。
+    per_day = pd.DataFrame({"h": h.to_numpy(dtype=float),
+                            "l": l.to_numpy(dtype=float)}, index=day_key)
+    day_rng = (per_day["h"].groupby(level=0).max()
+               - per_day["l"].groupby(level=0).min())
+    # range_n 个交易日的均值，再整体前移一天 ⇒ 用到的都是「昨天及更早」
+    ref_rng = day_rng.rolling(range_n, min_periods=1).mean().shift(1)
+    yday = pd.Series(day_key).map(ref_rng).to_numpy(dtype=float)
+
+    # ---- 触发价 ----
+    box_hi_a = box_hi.to_numpy(dtype=float)
+    box_lo_a = box_lo.to_numpy(dtype=float)
+    do_a = day_open.to_numpy(dtype=float)
+    band = float(vol_ratio) * yday
+    up = np.maximum(box_hi_a, do_a + band)
+    dn = np.minimum(box_lo_a, do_a - band)
+
+    # ---- 止损距离（价格单位）= stop_mult × 上一根 ATR ----
+    stop_dist = (float(stop_mult) * atr(out, int(atr_n)).shift(1))
+    sd_a = stop_dist.to_numpy(dtype=float)
+
+    # 任一输入缺失（箱体没暖起来 / 第一个交易日没有「昨日」/ ATR 还没到周期）
+    # ⇒ 这根不触发。填 0 或填当根价格都会凭空造出一个触发点。
+    # **ATR 也是必要条件**：没有止损距离就不该进场，否则这一笔没有止损，
+    # 只会被后面的「反向突破」兜底，跟这套规则不是一回事
+    bad = ~(np.isfinite(box_hi_a) & np.isfinite(do_a) & np.isfinite(yday)
+            & np.isfinite(sd_a) & (sd_a > 0))
+    up[bad] = np.nan
+    dn[bad] = np.nan
+
+    # ---- 出场标志：当根收盘反向突破 exit_n 根收盘箱体，引擎读 i-1 那一格 ----
+    xl = (c < c_lo).to_numpy()
+    xs = (c > c_hi).to_numpy()
+
+    # ---- `signal` 列：只是给信号图看的持仓状态 ----
+    # 真正的成交由引擎按同一套规则、带滑点和手数重放。这里的状态机是它的
+    # 精简镜像（用 open 近似成交价、不管滑点），**不要**拿它当回测结果用。
+    o_a = o.to_numpy(dtype=float)
+    h_a = h.to_numpy(dtype=float)
+    l_a = l.to_numpy(dtype=float)
+    sig = np.zeros(n, dtype=int)
+    pos = 0
+    stop = np.nan
+    for i in range(n):
+        if pos == 1 and i > 0 and xl[i - 1]:
+            pos, stop = 0, np.nan
+        elif pos == -1 and i > 0 and xs[i - 1]:
+            pos, stop = 0, np.nan
+        if pos == 1 and np.isfinite(stop) and l_a[i] <= stop:
+            pos, stop = 0, np.nan
+        elif pos == -1 and np.isfinite(stop) and h_a[i] >= stop:
+            pos, stop = 0, np.nan
+        if pos == 0:
+            lu = bool(np.isfinite(up[i])) and h_a[i] >= up[i]
+            su = bool(np.isfinite(dn[i])) and l_a[i] <= dn[i]
+            # 同一根两头都打穿：分不出先后，宁可这单不做
+            if lu and not su:
+                fill = max(o_a[i], up[i])
+                pos = 1
+                stop = fill - sd_a[i]
+                if l_a[i] <= stop:      # 同根先入场后止损，按止损价成交
+                    pos, stop = 0, np.nan
+            elif su and not lu:
+                fill = min(o_a[i], dn[i])
+                pos = -1
+                stop = fill + sd_a[i]
+                if h_a[i] >= stop:
+                    pos, stop = 0, np.nan
+        sig[i] = pos
+
+    out["entry_long"] = up
+    out["entry_short"] = dn
+    out["exit_long"] = xl.astype(float)
+    out["exit_short"] = xs.astype(float)
+    out["stop_dist"] = sd_a
     out["signal"] = sig
     return out
 
@@ -829,6 +983,11 @@ class StrategySpec:
     param_meta: dict = field(default_factory=dict)
     desc: str = ""
     bidirectional: bool = True   # 是否支持做空
+    # 是否按「K 线内触发价」成交（回测走 `run_intrabar_backtest`，实盘走
+    # `PortfolioRunner._intrabar_tick`）。为真时策略必须输出 `entry_long` /
+    # `entry_short` / `stop_dist` / `exit_long` / `exit_short` 这几列 ——
+    # 只给 `signal` 的旧策略一律保持 False，走「收盘定信号、下一根开盘成交」
+    intrabar: bool = False
     # 用户注册的策略自带源码：`exec` 出来的函数没有源文件，`inspect.getsource()`
     # 取不到，库页要展示代码就只能存一份
     code: str = ""
@@ -843,7 +1002,7 @@ PARAM_LABELS = {
     # 下面几条是 sbbox_mini / im_orb 的参数。标签要短：研究页那个滑杆标签
     # 只有 62px，超过六个汉字就被截断
     "exit_n": "离场箱体", "vol_ratio": "波幅倍数", "range_n": "参考根数",
-    "stop_mult": "止损倍数",
+    "stop_mult": "止损倍数", "entry_n": "入场箱体",
     "entry_start": "开仓起(分)", "entry_end": "开仓止(分)", "exit_min": "平仓(分)",
     # 波幅突破那一族（ria_break_day / ria_break_night / cta_break）
     "ratio": "波幅倍数", "check_min": "确认(分)", "hold_days": "持仓(天)",
@@ -937,6 +1096,25 @@ STRATEGIES: dict[str, StrategySpec] = {
         },
         desc="箱体突破 + 相对当日开盘的波幅确认，双条件同时成立才入场；"
              "反向 5×ATR 或反向 720 根箱体离场。设计用于 5 分钟周期。",
+    ),
+    "sbbox_ib": StrategySpec(
+        key="sbbox_ib",
+        label="箱体+波幅突破·K线内",
+        func=strat_sbbox_ib,
+        intrabar=True,
+        params={"entry_n": 20, "exit_n": 60, "vol_ratio": 0.4,
+                "range_n": 1, "atr_n": 75, "stop_mult": 1.5},
+        param_meta={
+            "entry_n": (5, 240, 5),
+            "exit_n": (10, 480, 10),
+            "vol_ratio": (0.1, 1.5, 0.05),
+            "range_n": (1, 10, 1),
+            "atr_n": (50, 100, 5),
+            "stop_mult": (0.5, 5.0, 0.5),
+        },
+        desc="K 线内成交：价格碰到「20 根箱体上沿」或「当日开盘 ± 昨幅×40%」"
+             "更高的那个就进，1.5×ATR(75) 盘中止损；收盘反向突破 60 根收盘"
+             "箱体则下一根开盘平。与 sbbox_mini 条件相近，但不等收盘。",
     ),
     "im_orb": StrategySpec(
         key="im_orb",
@@ -1032,11 +1210,72 @@ def run_strategy(df: pd.DataFrame, key: str, params: dict | None = None,
     out = spec.func(df, **p)
     if reverse:
         out["signal"] = -out["signal"].astype(int)
+        # K 线内那一族的多空方向藏在触发价 / 出场标志里，`-signal` 翻不动它们。
+        # 不换的话「反向」只翻了个没人读的展示列，回测还是按原方向成交 ——
+        # 这种错不会报错，只会让研究页的「反向」按钮静默失效
+        for a, b in (("entry_long", "entry_short"), ("exit_long", "exit_short")):
+            if a not in out.columns and b not in out.columns:
+                continue
+            va = (out[a].to_numpy(dtype=float) if a in out.columns
+                  else np.full(len(out), np.nan))
+            vb = (out[b].to_numpy(dtype=float) if b in out.columns
+                  else np.full(len(out), np.nan))
+            out[a], out[b] = vb, va
     return out
 
 
-_MINE_TAIL = re.compile(r"\s*[·•・\-—_]\s*(我的|内置)\s*$")
+def next_levels(df: pd.DataFrame, key: str, params: dict | None = None,
+                reverse: bool = False) -> dict:
+    """**正在走的这根** K 线的 K 线内参数：触发价 / 止损距离 / 出场标志。
 
+    实盘只能拿已收盘的 bar 算指标，却要在还没走完的这根里判断价格有没有碰到
+    触发价。所以这里把「正在走的这根」（`df` 的最后一行）一起算进去：
+
+    - `entry_*` / `stop_dist` 取**最后一行**。策略里这些量全部走 `shift(1)`
+      或「上一根 ATR」，最后一行拿到的正是「用已收盘数据算出来、给当前这根
+      用」的那组值；
+    - `exit_*` 取**倒数第二行**。那两列的含义是「这根收盘决定、下一根开盘
+      执行」，所以当前这根要执行的是**上一根**留下的标志。
+
+    `df` 最后一行是正在走的 bar，它的 high/low 还不完整 —— 对触发价没影响
+    （`shift(1)` 已经把它排除），但 `day_open` 要用它：一天第一根 K 线开盘
+    那一刻，「当日开盘价」就是它自己，拿上一交易日的收盘去凑就是错的。
+
+    返回空 dict 表示这条策略不支持 K 线内成交（`spec.intrabar` 为假）。
+    """
+    spec = STRATEGIES.get(str(key or ""))
+    if spec is None or not getattr(spec, "intrabar", False):
+        return {}
+    if df is None or len(df) < 2:
+        return {}
+    p = dict(spec.params)
+    if params:
+        p.update({k: v for k, v in params.items() if k in p})
+    out = spec.func(df, **p)
+    if reverse:
+        for a, b in (("entry_long", "entry_short"), ("exit_long", "exit_short")):
+            va = out[a].to_numpy(dtype=float).copy()
+            vb = out[b].to_numpy(dtype=float).copy()
+            out[a], out[b] = vb, va
+
+    def num(row, name: str) -> float:
+        try:
+            v = float(row.get(name, float("nan")))
+        except (TypeError, ValueError):
+            return float("nan")
+        return v if math.isfinite(v) else float("nan")
+
+    last, prev = out.iloc[-1], out.iloc[-2]
+    return {
+        "entry_long": num(last, "entry_long"),
+        "entry_short": num(last, "entry_short"),
+        "stop_dist": num(last, "stop_dist"),
+        "exit_long": bool(num(prev, "exit_long") > 0.5),
+        "exit_short": bool(num(prev, "exit_short") > 0.5),
+    }
+
+
+_MINE_TAIL = re.compile(r"\s*[·•・\-—_]\s*(我的|内置)\s*$")
 
 def _norm(s: str) -> str:
     t = _MINE_TAIL.sub("", str(s or "").strip())
