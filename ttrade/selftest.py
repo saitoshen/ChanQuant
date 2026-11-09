@@ -532,10 +532,11 @@ def _run() -> tuple[bool, list[str]]:
     def _intrabar():
         """K 线内进出场（`run_intrabar_backtest`）。
 
-        这条分支容易出的错都是「不报错、只是数字悄悄变好看」那种，所以四件事
+        这条分支容易出的错都是「不报错、只是数字悄悄变好看」那种，所以五件事
         必须逐条验：入口成交在**触发价**（不是下一根开盘）、止损成交在
-        **止损价**、拿掉那几列之后老路径**一个数都不许变**、同根止损开关
-        真的生效。
+        **止损价**、拿掉那几列之后老路径**一个数都不许变**、**进场当根不出场**
+        （逐笔 bars>0，且只有诊断开关能造出 bars==0）、显式打开
+        `intrabar_samebar_stop` 才在当根扫。
         """
         import numpy as np
         import pandas as pd
@@ -573,22 +574,37 @@ def _run() -> tuple[bool, list[str]]:
         if not t.open_position:
             raise RuntimeError("当根最低 103 没到止损 101，不该平仓")
 
-        # 同根打穿止损：最低价压到 100 ⇒ 按 101 止损
+        # ---- 同根止损：**默认关**，进场当根不判止损 ----
+        #
+        # 最低价压到 100（止损 101），但这根 bar 的 low 完全可能是在进场之前
+        # 做出来的 —— 进场要求价格摸到 105，而 100 在开盘 104 那一刻就在下面
+        # 了。默认口径认定「这个 low 早于建仓」，所以这一笔不该被扫掉。
         d2 = d.copy()
         d2.iloc[6, d2.columns.get_loc("low")] = 100.0
         r2 = run_backtest(d2, cfg, label="K线内")
-        if len(r2.trades) != 1 or r2.trades[0].open_position:
-            raise RuntimeError("同根打穿止损却没平仓")
-        if abs(r2.trades[0].exit_price - 101.0) > 1e-9:
-            raise RuntimeError(f"止损没按止损价成交：{r2.trades[0].exit_price}")
+        if len(r2.trades) != 1 or not r2.trades[0].open_position:
+            raise RuntimeError("默认关同根止损，这一笔不该被当根扫掉")
+        if abs(r2.trades[0].entry_price - 105.0) > 1e-9:
+            raise RuntimeError(f"进场价被同根止损带歪：{r2.trades[0].entry_price}")
 
-        # 关掉同根止损：这一笔就该活下来
+        # 显式打开同根止损（悲观上界）⇒ 当根就该按 101 止损
         cfg2 = BacktestConfig(initial_cash=100_000.0, sizing="fixed", volume=1,
                               multiplier=1.0, fee_per_lot=0.0, tick_size=0.0,
-                              slippage=0.0, intrabar_samebar_stop=False)
+                              slippage=0.0, intrabar_samebar_stop=True)
         r3 = run_backtest(d2, cfg2, label="K线内")
-        if not r3.trades or not r3.trades[0].open_position:
-            raise RuntimeError("关了同根止损，这一笔不该被扫掉")
+        if len(r3.trades) != 1 or r3.trades[0].open_position:
+            raise RuntimeError("开了同根止损，打穿却没平仓")
+        if abs(r3.trades[0].exit_price - 101.0) > 1e-9:
+            raise RuntimeError(f"止损没按止损价成交：{r3.trades[0].exit_price}")
+
+        # 默认口径下，**下一根**才判止损：把下根最低价压到 100 ⇒ 按 101 平
+        d3 = d2.copy()
+        d3.iloc[7, d3.columns.get_loc("low")] = 100.0
+        r4 = run_backtest(d3, cfg, label="K线内")
+        if len(r4.trades) != 1 or r4.trades[0].open_position:
+            raise RuntimeError("下一根打穿止损却没平仓")
+        if abs(r4.trades[0].exit_price - 101.0) > 1e-9:
+            raise RuntimeError(f"下一根止损价不对：{r4.trades[0].exit_price}")
 
         # 拿掉那几列 ⇒ 走老路径，且结果必须和「本来就没有这几列」完全一致
         plain = d[["open", "high", "low", "close", "signal"]].copy()
@@ -747,6 +763,33 @@ def _run() -> tuple[bool, list[str]]:
                 f"{len(bad)}/{len(ru_.trades)} 笔进场只满足了其中一条线，"
                 f"例如 {bad[0]}")
 
+        # ---- 🔴 铁律：进场当根不出场 ----
+        #
+        # 两根一起验，缺一不可：
+        #   ① 真实策略 + 真实行情，**逐笔**都不许出现 bars == 0（当根出场）；
+        #   ② 合成样本上证明「只有诊断开关 `intrabar_samebar_stop=True` 能
+        #      造出 bars == 0」—— 否则说明还有别的路能当根出场，守卫漏了。
+        #
+        # `bars = 出场那根 - 进场那根`，当根出场就是 0。未平仓那笔不算（它的
+        # `bars` 是「到样本末尾还剩几根」，进场正好落在最后一根时也是 0）。
+        bad_same = [tr for tr in ru_.trades
+                    if not tr.open_position and tr.bars == 0]
+        if bad_same:
+            tr = bad_same[0]
+            raise RuntimeError(
+                f"进场当根出场：{len(bad_same)}/{len(ru_.trades)} 笔在 "
+                f"{tr.entry_date} 那根就平了（{tr.exit_note}）—— 进场那一根的 "
+                f"high/low 分不出建仓前还是建仓后，不能用来判出场")
+        if [tr for tr in r2.trades if not tr.open_position and tr.bars == 0]:
+            raise RuntimeError("默认口径下仍出现当根出场")
+        if r4.trades[0].bars != 1:
+            raise RuntimeError(
+                f"下一根止损那笔的持仓根数应是 1，实得 {r4.trades[0].bars}")
+        if not [tr for tr in r3.trades if tr.bars == 0]:
+            raise RuntimeError(
+                "开了诊断开关却没造出当根出场 —— 说明它已经不起作用了，"
+                "「进场当根不出场」这条断言也就没法被证伪")
+
         # ---- 按止损金额定仓：手数必须用这一笔的止损距离算 ----
         # 手数 = risk_amount ÷ (stop_dist × 乘数)。走「先除 stop_mult 还原 ATR
         # 再乘回去」那条老路的话，cfg.stop_mult 和策略参数不一致就会按另一个
@@ -771,12 +814,15 @@ def _run() -> tuple[bool, list[str]]:
                 f"手数跟着 cfg.stop_mult 变了（{rr_risk2.trades[0].lots} vs {want_lots}）"
                 "—— 说明还在按 ATR 反推，没直接用 stop_dist")
 
-        return (f"触发价成交 {t.entry_price:g}、止损 {r2.trades[0].exit_price:g}、"
-                f"同根止损开关生效、平仓当根不反手（多/空两侧都验，下一根才开）、"
+        return (f"触发价成交 {t.entry_price:g}、同根止损默认关（当根不扫、"
+                f"下一根按 {r4.trades[0].exit_price:g} 扫）、显式打开按 "
+                f"{r3.trades[0].exit_price:g} 当根扫、"
+                f"进场当根不出场（{len(ru_.trades)} 笔逐笔 bars>0）、"
+                f"平仓当根不反手（多/空两侧都验，下一根才开）、"
                 f"进场两条线都是「且」（{len(ru_.trades)} 笔逐笔验）、"
                 f"按止损金额定仓 {want_lots} 手、无列时走老路径")
 
-    check("K 线内进出场（触发价 / 止损 / 老路径不变）", _intrabar)
+    check("K 线内进出场（触发价 / 进场当根不出场 / 老路径不变）", _intrabar)
 
     def _td_key():
         """交易日归日：sbbox 必须读 `trading_day` 列，不能自己写 `index + 6h`。

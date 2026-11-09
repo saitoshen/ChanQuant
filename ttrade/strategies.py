@@ -375,8 +375,14 @@ def strat_sbbox_ib(
     `stop_mult` × ATR(`atr_n`)，绑在**成交价**上，K 线内碰到就按止损价成交。
     ATR 周期可调区间 **10~50**，默认 **20**。周期越短，止损贴得越近：1h 上
     20 根就是 20 小时，跟着最近的波动走；5 分钟上 20 根只有 100 分钟，止损会
-    非常紧，同一根里被扫掉的概率明显上升 —— 那种对照看
-    `BacktestConfig.intrabar_samebar_stop`（关掉它 = 「只从下一根开始止损」）。
+    非常紧。
+
+    🔴 **进场当根不出场**：进场那一根只负责建仓，止损从**下一根**才开始判
+    （`BacktestConfig.intrabar_samebar_stop` 默认 `False`，引擎的 ① ② 两处
+    出场都带 `i > entry_bar` 守卫）。原因：进场那根 bar 的 `low` 很可能是
+    **建仓之前**做出来的 —— 进场要求价格摸到触发价，而 low 往往在开盘那一刻
+    就已经成交过。拿整根 bar 的 low 去判，止损距离比这根振幅小的时候几乎必然
+    误杀，一次都没持仓却记一笔亏损。那个开关打开只是「悲观上界」的诊断口径。
 
     🔴 ATR 取**上一根**（`shift(1)`）：当根的 high/low/close 在 K 线走的过程中
     还没定型，拿当根的 ATR 去定当根的止损就是前视，回测会好得没有道理。
@@ -492,14 +498,15 @@ def strat_sbbox_ib(
                 fill = max(o_a[i], up[i])
                 pos = 1
                 stop = fill - sd_a[i]
-                if l_a[i] <= stop:      # 同根先入场后止损，按止损价成交
-                    pos, stop = 0, np.nan
+                # 🔴 这里**不判同根止损**。这根 bar 的 low 很可能是进场之前做出来的
+                # （进场要求价格摸到 up，而 low 在开盘那一刻就已成交过），拿它判
+                # 止损会凭空少掉一笔。引擎的口径是 `intrabar_samebar_stop=False`
+                # （默认），镜像必须跟它一致 —— 否则「信号图上有仓、回测里没这笔」
+                # 和「回测里有仓、信号图上没有」都会出现。
             elif su and not lu:
                 fill = min(o_a[i], dn[i])
                 pos = -1
                 stop = fill + sd_a[i]
-                if h_a[i] >= stop:
-                    pos, stop = 0, np.nan
         sig[i] = pos
 
     out["entry_long"] = up

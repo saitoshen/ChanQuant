@@ -84,16 +84,23 @@ class BacktestConfig:
     margin_rate: float = 1.0
 
     # ---- K 线内成交（只有 `run_intrabar_backtest` 读它） ----
-    # 允许「同一根 K 线里先进场、再被止损」。默认 **开**：没有分笔数据时
-    # 「先冲高再砸下来」和「先砸再冲高」长得一模一样，按对自己有利的那个
-    # 假设等于白送 alpha。
+    # 🔴 **铁律：进场当根不出场**。引擎里 ① 反向突破离场 ② ATR 止损 都带
+    # `i > entry_bar` 守卫，进场那一根只负责建仓，任何出场都要等到下一根。
+    # 理由不是「乐观/悲观」的偏好，是**这根 bar 承载不了这个判断**：high/low
+    # 分不出「进场前」还是「进场后」，而突破那根本身往往就是最宽的一根，
+    # 它的 low 绝大多数是在建仓之前做出来的。拿它判止损 = 凭空多一次亏损。
+    # 碳酸锂 2026-11-05 10:00 那根：open 88420、high 93460、low 88100，
+    # 触发价 92640、止损 89405 —— 价格必须先从 88420 涨到 92640 才可能进场，
+    # 而 88100 在开盘那一刻就已成交过，早于建仓。
     #
-    # 但要知道代价：止损距离比这根 K 线的振幅还小时（比如 5 分钟上
-    # 1.5×ATR 只有一跳半），突破那根往往就是最宽的一根，于是三成以上的仓
-    # 会在**同一根**里被扫掉。那种结果不是策略烂，是**这根 K 线的信息量
-    # 不够**。想看「只从下一根开始止损」的乐观口径，把它设 False 再跑一遍，
-    # 两个数字的差就是「同根内不可知」这件事值多少钱。
-    intrabar_samebar_stop: bool = True
+    # 下面这个开关是**唯一的例外，且只用于诊断**：打开 = 允许进场当根就被扫，
+    # 得到的是「K 线内不可知」这件事值多少钱的**悲观上界**（因为那条路九成
+    # 是假止损）。默认关。不要拿 True 的结果当回测结论。
+    #
+    # 实盘（`strategy_runner._intrabar_tick`）逐 tick 判止损，价格路径真实可见，
+    # 本来就不会有这个问题，也不读这个开关；回测与实盘剩下的差就是「K 线粒度」
+    # 本身带来的那部分。
+    intrabar_samebar_stop: bool = False
 
     # 平仓当根要不要允许再开新仓（默认 **不许**）。
     #
@@ -600,15 +607,25 @@ def run_intrabar_backtest(data: pd.DataFrame, cfg: BacktestConfig,
     for i in range(n):
         o, hi, lo, cl = open_[i], high[i], low[i], close[i]
 
+        # 🔴 **进场当根不出场**：① ② 都加了 `i > entry_bar`。
+        # 这根 bar 的 high/low 分不出「进场前」还是「进场后」，拿它判任何出场
+        # 都是在赌对自己有利的那个顺序 —— 而止损方向的那个赌注是系统性亏钱
+        # （突破那根往往最宽，low 常常在建仓前就做出来了）。所以进场那一根
+        # 只负责建仓，出场从**下一根**起才允许。
+        #
+        # 唯一的例外是 ③ 末尾那个诊断开关 `intrabar_samebar_stop`（默认关），
+        # 它的存在只为量出「K 线内不可知」值多少钱，不能拿来出结果。
+        live_pos = pos != 0 and i > entry_bar
+
         # ① 上一根收盘给的出场：本根开盘执行
-        if pos != 0 and i > 0:
+        if live_pos and i > 0:
             want_out = (x_long[i - 1] > 0.5) if pos == 1 else (x_short[i - 1] > 0.5)
             if want_out:
                 why = (note_out[i - 1] if note_out is not None else "") or "反向突破离场"
                 do_close(i, o, why)
 
         # ② 已有仓位的止损（K 线内；开盘已穿过就按开盘价，更差）
-        if pos != 0 and _finite(stop_px):
+        if live_pos and _finite(stop_px):
             if pos == 1 and lo <= stop_px:
                 do_close(i, min(o, stop_px), "ATR 止损")
             elif pos == -1 and hi >= stop_px:
@@ -634,7 +651,10 @@ def run_intrabar_backtest(data: pd.DataFrame, cfg: BacktestConfig,
                 why = (note_in[i] if note_in is not None else "") or label
                 if (do_open(i, raw, 1, why) and cfg.intrabar_samebar_stop
                         and lo <= stop_px):
-                    # 🔴 这里只能按 `stop_px` 成交，**不能**再取 `min(o, stop_px)`：
+                    # ⚠️ 只有显式打开诊断开关才会走到这里（默认关）。
+                    # 这一步**故意违反**「进场当根不出场」，只为给出悲观上界，
+                    # 不要拿它的结果当回测结论。
+                    # 🔴 只能按 `stop_px` 成交，**不能**再取 `min(o, stop_px)`：
                     # 开仓发生在开盘之后，当根开盘价在时间上早于建仓，用它就
                     # 等于「建仓前就按开盘价止损了」—— 一分钟没持仓，却记一笔
                     # 亏损，而且亏损幅度被放大成「整根 K 线的幅度」
