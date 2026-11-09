@@ -319,6 +319,30 @@ def _last_dates(con) -> dict[int, date]:
     return out
 
 
+# `query_edb_data` 取的是「**非价量**数据」（宏观 / 仓单 / 库存 / 利润…），
+# 天勤按账户功能位收费。免费账户每一次请求都被同一句话挡回来。
+# 这里按**服务端返回的字面量**匹配，不查功能位名 —— 功能位叫什么天勤没写文档，
+# 而这句话是它原样返回的，反而稳。
+_DENIED_MARKERS = (
+    "不支持下载非价量数据",
+    "非价量数据",
+)
+
+
+def _is_denied(exc: BaseException) -> bool:
+    """这个异常是「没权限」，还是「这一批数据有问题」？
+
+    区别很重要：没权限的话剩下每一批都会一样地失败，继续跑只是刷屏 + 白等退避。
+    """
+    text = str(exc)
+    return any(m in text for m in _DENIED_MARKERS)
+
+
+def _denied_reason(exc: BaseException) -> str:
+    return ("免费账户没有「非价量数据」下载权限 —— EDB 基本面是付费功能"
+            "（升级：tqsdk-buy），不影响 K 线与策略回测")
+
+
 def update(api, start: date | None = None, end: date | None = None,
            incremental: bool = True, progress=None,
            cancel=None) -> dict:
@@ -328,7 +352,10 @@ def update(api, start: date | None = None, end: date | None = None,
     `OVERLAP_DAYS`。按批而不是按 ID 是因为一次请求能带 100 个 ID，逐个 ID 查
     等于把请求数乘 100 倍；而整批都从 2010 重查也只有一两秒，没必要精算。
 
-    返回 `{ids, rows, batches, failed, start, end}`。
+    返回 `{ids, rows, batches, failed, start, end, denied, stopped}`。
+
+    `denied` 非空表示账户没有这个功能位（免费账户），此时 `stopped=True`、
+    已经立刻停下 —— 剩下的批次不会再试。
     """
     indicators = load_indicators()
     ids = sorted(indicators)
@@ -336,7 +363,8 @@ def update(api, start: date | None = None, end: date | None = None,
     end = end or date.today()
 
     stats = {"ids": len(ids), "rows": 0, "batches": 0,
-             "failed": 0, "start": start, "end": end}
+             "failed": 0, "start": start, "end": end,
+             "denied": "", "stopped": False}
 
     with connect() as con:
         upsert_meta(con, indicators)
@@ -361,8 +389,17 @@ def update(api, start: date | None = None, end: date | None = None,
 
             try:
                 df = fetch(api, batch, lo, end)
-            except Exception:      # noqa: BLE001
-                # 一个批次失败不该把整轮打断：另外 142 个指标是好的
+            except Exception as exc:      # noqa: BLE001
+                # 权限被拒 ≠ 这一批坏了：`query_edb_data` 是**付费**功能，免费账户
+                # 每一批都会被同样的话挡回来。原来这里只 `failed += 1` 继续跑，
+                # 结果是 3 批刷 3 行「第 n/m 批失败，跳过」，用户看不出是权限问题，
+                # 还白等了一轮退避重试。识别到就**立刻停**，原因带回去给调用方。
+                if _is_denied(exc):
+                    stats["denied"] = _denied_reason(exc)
+                    stats["stopped"] = True
+                    if progress is not None:
+                        progress(n, total, f"EDB 跳过：{stats['denied']}")
+                    break
                 stats["failed"] += 1
                 if progress is not None:
                     progress(n, total, f"EDB 第 {n}/{total} 批失败，跳过")

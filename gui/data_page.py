@@ -188,7 +188,17 @@ class TqWorker(QObject):
                 # 只补一天也一样被拦，很容易被误判成「回溯设得太长」。
                 free_mode = not TQ.can_download(api)
                 if free_mode:
-                    self.progress.emit(0, 0, "免费账户：改用最近 8000 根 K 线接口")
+                    # 免费账户只有 `get_kline_serial`，单次上限 8000 根。
+                    # 这句话必须写清「深度被账户等级限住」，否则用户看到后面的
+                    # 「期权已跳过」「真实合约 0 个」会以为程序还在走专业版接口。
+                    # 深度按库里实测（5m 64 根/日、1h 6.6 根/日）折算。
+                    self.progress.emit(
+                        0, 0,
+                        "账户等级：免费版（无 tq_dl）→ 改用 get_kline_serial，"
+                        "单次上限 %d 根（日线全量 / 1h 约 5 年 / 5m 约 5.9 个月）"
+                        % TQ.RECENT_BARS)
+                else:
+                    self.progress.emit(0, 0, "账户等级：专业版（可下完整历史）")
 
                 # 基本面先跑：只要几秒，而且和 K 线完全独立。放在后面的话，
                 # 用户中途取消（或者 5m 真实合约跑两小时）就白等了
@@ -197,11 +207,16 @@ class TqWorker(QObject):
                     self.progress.emit(0, 0, "更新基本面（EDB）…")
                     try:
                         from ttrade import edb as EDB
-                        n_edb = EDB.update(
+                        st_edb = EDB.update(
                             api,
                             progress=lambda a, b, m: self.progress.emit(a, b, m),
                             cancel=lambda: self._cancel,
-                        )["rows"]
+                        )
+                        n_edb = st_edb["rows"]
+                        if st_edb.get("denied"):
+                            # 免费账户：EDB 是付费的「非价量数据」接口，一批都下不来。
+                            # 说清楚原因，别让人以为是自己网络或库坏了
+                            self.progress.emit(0, 0, st_edb["denied"])
                     except Exception as exc:  # noqa: BLE001
                         # 基本面失败不该拖累行情 —— 两件事的数据源都不一样
                         self.progress.emit(0, 0,
@@ -213,13 +228,21 @@ class TqWorker(QObject):
                 # 期权放在行情之前：它自己会反复重建会话，混在补行情中间做
                 # 会把主连那轮的连接状态搅乱
                 n_opt = 0
+                opt_denied = False
                 if self.options:
                     self.progress.emit(0, 0, "更新期权（隐含波动率）…")
                     try:
                         from ttrade import optfetch as OPT
                         if not TQ.can_download(api):
+                            # 期权是**唯一**没有「最近 N 根」替代路径的品种：K 线
+                            # 能靠 get_kline_serial 拿 8000 根，期权链的隐含波动率
+                            # 必须走全量历史下载。所以免费账户就是拿不到，不是失败。
+                            opt_denied = True
                             self.progress.emit(
-                                0, 0, "期权需要历史下载权限（tq_dl），已跳过")
+                                0, 0,
+                                "期权跳过：免费账户没有全量历史下载权限（tq_dl），"
+                                "而期权没有「最近 N 根」替代路径 —— 属正常降级，"
+                                "不影响 K 线与基本面")
                         else:
                             o = OPT.update(
                                 sess, periods=(self.period,),
@@ -330,13 +353,15 @@ class TqWorker(QObject):
             note = ""
             if free_mode:
                 note = ("　【免费账户】单次只能取 8000 根 K 线：主连和真实合约的日线"
-                        "都是完整的，5m 只拿得到每个合约最后约 5.5 个月。")
+                        "都是完整的，1h 约 5 年、5m 只拿得到每个合约最后约 6 个月。")
                 if self.period in ("5m", "15m", "30m"):
                     note += " 展期因子在早期合约上会退回日线口径。"
             if self.edb and n_edb:
                 note += f"　【基本面】本次写入 {n_edb:,} 行（data_tq/edb.duckdb）"
             if self.options and n_opt:
                 note += f"　【期权】本次写入 {n_opt:,} 行（data_tq/option.duckdb）"
+            elif self.options and opt_denied:
+                note += "　【期权】免费账户不可用（已跳过，属正常）"
             self.done.emit(
                 f"天勤 {period_label} {head}：{len(pairs)} 个品种，本次写入 {rows:,} 行{extra}；"
                 f"新补切换表 {n_switch} 个，校正换月日 {moved} 处，刷新复权 {touched} 个品种周期"

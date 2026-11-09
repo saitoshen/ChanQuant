@@ -50,6 +50,7 @@ from ttrade.tqfetch import (  # noqa: E402
     CONTRACT_YEARS,
     MAIN_YEARS,
     PERIOD_SEC,
+    RECENT_BARS,
     Session,
     adj_factor_series,
     fetch_switch,
@@ -144,8 +145,28 @@ def main() -> int:
     sess = Session()
     if args.check:
         try:
-            q = sess.get().query_quotes(ins_class="FUTURE", expired=False)
+            api = sess.get()
+            q = api.query_quotes(ins_class="FUTURE", expired=False)
             print(f"连接正常，未到期期货合约 {len(q)} 个")
+            # 把权限和**每个周期实际能拿多深**打出来。这一步不做的话，用户只能
+            # 从「真实合约 0 个」「5m 只有几个月」去猜自己被限在哪 —— 那是最
+            # 容易误判成「程序走了专业版接口」的地方。
+            pro = can_download(api)
+            print(f"账户等级：{'专业版（有 tq_dl，可下完整历史）' if pro else '免费版（无 tq_dl）'}")
+            if pro:
+                print("  可得深度：日线 全部 · 1h 全部 · 5m 全部（按 --years/--days 回溯）")
+            else:
+                # 每交易日的 bar 数取自库里实测（78 个品种 2026-06~09 的均值）：
+                # 5m ≈ 64 根、1h ≈ 6.6 根（含夜盘，日盘段品种会略少）。按 21 个
+                # 交易日/月、244 个交易日/年折算 —— 别用「48 根/日」那种拍脑袋值，
+                # 商品期货带夜盘后一天远不止 48 根。
+                m5 = RECENT_BARS / 64 / 21
+                h1 = RECENT_BARS / 6.6 / 244
+                print(f"  可得深度：日线 全部（一个合约一辈子才 240 根）"
+                      f" · 1h 约 {h1:.1f} 年 · 5m 约 {m5:.1f} 个月"
+                      f"（单次上限 {RECENT_BARS} 根，走 get_kline_serial）")
+                print("  不可得：期权的历史数据（没有「最近 N 根」替代路径）、"
+                      "基本面 EDB（付费的非价量数据接口）、真实合约的远古分钟明细")
         finally:
             sess.close()
         return 0

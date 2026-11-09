@@ -88,6 +88,11 @@ def main() -> int:
     finally:
         sess.close()
 
+    if st.get("denied"):
+        # 权限问题不是「失败了」，不需要再跑一次 —— 换账户或升级才有用
+        print(f"跳过：{st['denied']}")
+        _print_stats()
+        return 0
     print(f"完成：{st['batches']} 个批次成功，写入 {st['rows']:,} 行"
           + (f"，{st['failed']} 个批次失败（再跑一次会补上）" if st["failed"] else ""))
     _print_stats()
