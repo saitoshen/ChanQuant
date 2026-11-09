@@ -179,7 +179,9 @@ def report(cfg: SR.ScreenConfig, res: SR.ScreenResult, panels: dict, tag: str) -
         f"累计 **{pct(m['total_return'])}**，年化 **{pct(m['cagr'])}**",
         f"- 夏普 {m['sharpe']:.2f}　最大回撤 {pct(m['max_dd'])}　"
         f"卡玛 {m['calmar']:.2f}　年化波动 {pct(m['ann_vol'])}",
-        f"- 全市场等权基准 {pct(m['bench_total'])}，**超额 {pct(m['excess'])}**",
+        f"- 全市场等权基准 {pct(m['bench_total'])}，"
+        f"**{'跑输' if m['excess'] < 0 else '跑赢'} {abs(m['excess']) * 100:.2f} 个百分点**"
+        f"（两个累计收益相减，不是复利差）",
         f"- 交易 {m.get('n_trades', 0)} 笔　胜率 {pct(m.get('win_rate', float('nan')))}　"
         f"盈亏比 {m.get('profit_factor', float('nan')):.2f}　"
         f"均持 {m.get('avg_days', 0):.1f} 根",
@@ -237,6 +239,21 @@ def main() -> int:
           f"本金 {base.capital:,.0f} 元，最多同时持 {base.max_pos} 只，"
           f"持有 {base.hold_days} 根后开盘卖；成本 手续费 {base.fee_rate:.2%}"
           f"+滑点 {base.slippage:.2%}（单边）、印花税 {base.stamp_duty:.2%}（卖出）。", "",
+          "## 口径（这些是我替你定的，都可以改）", "",
+          "- **时点**：T 日收盘筛 ⇒ T+1 开盘买 / 卖。PE、量比、成交额都是 T 日收盘"
+          "才定型的数，所以不构成前视。",
+          "- **成本**：手续费 8bp + 滑点 10bp（单边）+ 印花税 5bp（卖出），"
+          "单次往返约 **21bp**。",
+          "- **成交**：T+1 开盘一字涨停买不进（`open ≥ 涨停价`）、一字跌停卖不出"
+          "（顺延到下一个能卖的交易日）、停牌顺延。不假装成交。",
+          "- **价格**：筛选和涨跌停判定用**原始价**（用户看到的那个数），"
+          "算收益用**后复权价**（否则除权日凭空亏一块）。",
+          f"- **PE**：`{base.pe_min:g} < PE(TTM) ≤ 上限`。**负 PE（亏损）被排除** —— "
+          "亏损股本来就没有 PE 这个数，Tushare 也给空值；「低估值」不含「不赚钱」。",
+          "- **ST**：按**当时**的曾用名判（`stock_namechange`），不是现在是不是 ST。",
+          "- **板块**：按代码判，退市段也在池子里（`stock_meta` 只有在市股票）。",
+          "- **基准**：全市场等权（含 ST、含小票）。真实账户买不到那么小的票，"
+          "所以这条基准偏强。", "",
           "## 条件漏斗", "", fn.to_markdown(index=False), "",
           f"## 纯选股超额（零成本，PE ≤ {min(float(x) for x in args.pe.split(',')):g}）", "",
           "被选中那批票的远期收益 − 当天全市场等权收益。**这一段不含任何成本**，"
