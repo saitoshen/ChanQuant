@@ -56,7 +56,8 @@ FLOW_COLS = [
     "mf_sm_ratio",       # 小单净买入手数 / 全部手数
 ]
 
-AUX_COLS = list(BASIC_MAP) + FLOW_COLS + ["adj_factor", "concept_count", "board_code"]
+AUX_COLS = list(BASIC_MAP) + FLOW_COLS + ["adj_factor", "concept_count",
+                                          "board_code", "is_st"]
 
 # 板块 → 哑变量。不是「好因子」，是控制变量：创业板/科创板的波动中枢和涨跌幅
 # 限制都和主板不同，混在一起做截面排序时它天然占优或吃亏。
@@ -150,8 +151,9 @@ def attach(df: pd.DataFrame, ts_code: str, intraday: bool = False) -> pd.DataFra
         return df
 
     parts = [p for p in (_basic_frame(ts_code), _moneyflow_frame(ts_code)) if not p.empty]
-    if not parts:
-        return df
+    # 这里**不能**在 `parts` 为空时提前 return：下面还有 ST 标记和板块哑变量要挂，
+    # 它们不依赖基本面 / 资金流。提前返回会让「基本面还没下载」变成「ST 过滤悄悄
+    # 不生效」—— 不报错，只是结果变好看。
 
     # 资金流净额要除以成交额才有意义；成交额就在 df 上（Tushare 日线有 amount）
     if "amount" in df.columns:
@@ -202,4 +204,17 @@ def attach(df: pd.DataFrame, ts_code: str, intraday: bool = False) -> pd.DataFra
         b = _board_code(ts_code)
         if np.isfinite(b):
             out["board_code"] = b
+
+    # ST 标记（含 *ST）：按**当时的**曾用名判，不是「现在是不是 ST」。
+    # 用当前名称整段套到五年前，「后来摘帽的」会被当成一直正常、「后来戴帽的」
+    # 被当成一直 ST；而 ST 直接改涨跌停幅度（主板 5%/10%），「昨日涨停」的判定
+    # 也跟着一起错。
+    #
+    # 分钟 bar 不用后移：ST 是**当天开盘起**生效的（前一晚就公告了），
+    # 盘中任何时候都知道当天是不是 ST。这一点和换手率 / 资金流不同。
+    if "is_st" not in out.columns:
+        try:
+            out["is_st"] = SS.is_st_series(out.index, ts_code).to_numpy(dtype=bool)
+        except Exception:  # noqa: BLE001 - 缺表时当作非 ST，但不会影响其余列
+            out["is_st"] = False
     return out

@@ -529,6 +529,144 @@ def _run() -> tuple[bool, list[str]]:
     # 放在 `_us_df` 之后：`check()` 是立即执行的，定义在前会拿不到这个闭包
     check("交易记录备注与累计盈亏", _trade_notes)
 
+    def _a_screen():
+        """A 股选股策略（`a_vol_breakout`）的条件口径。
+
+        这类「一堆阈值」的策略最怕的不是算错，而是**某一条悄悄没生效**：
+        ST 过滤没挂上、涨停按错板块的幅度判、PE 把负值也算成「低估值」——
+        都不会报错，结果只会变好看。所以每条边界都钉一遍。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade.strategies import _round2, run_strategy
+
+        def make(pct, vol, pe, amt, close, board=0.0, is_st=False):
+            n = len(pct)
+            px = np.asarray(close, dtype=float)
+            return pd.DataFrame({
+                "open": px, "high": px * 1.01, "low": px * 0.99, "close": px,
+                "volume": np.asarray(vol, dtype=float),
+                "amount": np.asarray(amt, dtype=float),          # 千元
+                "pct_chg": np.asarray(pct, dtype=float),
+                "pe_ttm": np.asarray(pe, dtype=float),
+                "board_code": np.full(n, board),
+                "is_st": np.full(n, is_st),
+                "signal": np.zeros(n, dtype=int),
+            }, index=pd.date_range("2024-01-01", periods=n, freq="B"))
+
+        # ① 涨停价必须四舍五入。`np.round` 是银行家舍入（3.005 → 3.00），
+        #    交易所是四舍五入（3.01），差一分钱就能把涨停判成没涨停
+        if abs(_round2(np.array([3.005]))[0] - 3.01) > 1e-9:
+            raise RuntimeError("_round2 没做四舍五入（银行家舍入会把涨停判错）")
+
+        pct = [0, 0, 0, 0, 5.0, 1, 1, 1, 1, 1]
+        vol = [100, 100, 100, 100, 500, 100, 100, 100, 100, 100]
+        amt = [10000] * 4 + [60000] + [10000] * 5      # 千元，5000 万 = 50000
+        base = make(pct, vol, [15] * 10, amt, [50] * 10)
+        sig = run_strategy(base, "a_vol_breakout", {"hold_days": 5})["signal"].to_numpy()
+        if sig[4] != 1 or sig[4:9].sum() != 5 or sig[9] != 0:
+            raise RuntimeError(f"基本触发/持有根数不对：{sig.tolist()}")
+
+        # ② ST、北交所：一律不买
+        if run_strategy(make(pct, vol, [15] * 10, amt, [50] * 10, is_st=True),
+                        "a_vol_breakout", {})["signal"].sum() != 0:
+            raise RuntimeError("ST 股不该有信号")
+        if run_strategy(make(pct, vol, [15] * 10, amt, [50] * 10, board=3.0),
+                        "a_vol_breakout", {})["signal"].sum() != 0:
+            raise RuntimeError("北交所不该有信号")
+
+        # ③ 昨日涨停 ⇒ 今天不买。主板 10%、创业板 20% 要分开判：
+        #    创业板涨 20% 用主板口径看只是「涨得多」，会被误买
+        for board, chg, px in ((0.0, 10.0, 55.0), (1.0, 20.0, 12.0)):
+            f = make([0, chg, 5.0, 0, 0, 0, 0, 0, 0, 0], [100] * 10, [15] * 10,
+                     [60000] * 10, [px] * 10, board=board)
+            f.iloc[0, f.columns.get_loc("close")] = px / (1 + chg / 100)
+            f.iloc[1, [f.columns.get_loc(c) for c in ("open", "high", "low", "close")]] = px
+            if run_strategy(f, "a_vol_breakout", {})["signal"].iloc[1] != 0:
+                raise RuntimeError(f"board={board} 昨日涨停，今天不该买")
+
+        # ④ PE：上限含等号，负 PE 不算低估值；25 / 30 两档要能切换
+        for pe, want in ((25.0, True), (25.01, False), (0.0, False), (-8.0, False)):
+            f = make(pct, vol, [pe] * 10, amt, [50] * 10)
+            got = run_strategy(f, "a_vol_breakout", {"pe_max": 25})["signal"].sum() > 0
+            if bool(got) != want:
+                raise RuntimeError(f"PE={pe} 判定错：{got} != {want}")
+        f27 = make(pct, vol, [27.0] * 10, amt, [50] * 10)
+        if run_strategy(f27, "a_vol_breakout", {"pe_max": 30})["signal"].sum() == 0:
+            raise RuntimeError("PE 上限调到 30，27 倍该放进来")
+
+        # ⑤ 量比 / 成交额 / 股价：边界都是「≥ 或 ≤」，差一点点就该翻面
+        for volv, want in ((299, False), (300, True)):
+            f = make(pct, [100] * 4 + [volv] + [100] * 5, [15] * 10, amt, [50] * 10)
+            if (run_strategy(f, "a_vol_breakout", {"vol_mult": 3})["signal"].sum() > 0) != want:
+                raise RuntimeError(f"量比 {volv/100:.2f} 倍判定错")
+        for a, want in ((49999, False), (50000, True)):
+            f = make(pct, vol, [15] * 10, [10000] * 4 + [a] + [10000] * 5, [50] * 10)
+            if (run_strategy(f, "a_vol_breakout", {"amt_min": 5000})["signal"].sum() > 0) != want:
+                raise RuntimeError(f"成交额 {a} 千元判定错")
+        for px, want in ((80.01, False), (79.99, True)):
+            f = make(pct, vol, [15] * 10, amt, [px] * 10)
+            if (run_strategy(f, "a_vol_breakout", {"max_price": 80})["signal"].sum() > 0) != want:
+                raise RuntimeError(f"股价 {px} 判定错")
+
+        return ("四舍五入涨停价、5 根持有、ST/北交所排除、"
+                "主板 10% 与创业板 20% 涨停分别判、PE 25/30 两档、"
+                "量比/成交额/股价三条边界")
+
+    check("A股选股策略（放量启动）的条件口径", _a_screen)
+
+    def _a_rule():
+        """全市场组合回测（`stockrule`）的两个**量纲/编码**坑。
+
+        这两个错都不会报错，只会让回测结果系统性偏松：
+
+        ① `stock_meta.board` 存的是中文（主板/创业板/…），`_limit_pct` 要的是
+           0/1/2/3。「非北交所」按白名单 `{0,1,2}` 判 ⇒ 没做映射时整列都是
+           NaN，全部被剔掉，回测直接变成空仓；或者映射漏了沪市 600/601/603，
+           整个沪市主板静默消失。
+        ② Tushare `daily.amount` 是**千元**，而配置里的 `amt_min` 按万元给。
+           不除 10 就变成「成交额 ≥ 500 万」也能过，等于这条条件宽松了 10 倍。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import stockrule as SR
+
+        idx = pd.date_range("2024-01-02", periods=3, freq="B")
+        codes = ["SSE.600000", "SZSE.300001", "BSE.920285"]
+
+        def panel(amount_last):
+            return {
+                "close": pd.DataFrame(50.0, index=idx, columns=codes),
+                "open": pd.DataFrame(50.0, index=idx, columns=codes),
+                "volume": pd.DataFrame([[100, 100, 100]] * 2 + [[600, 600, 600]],
+                                       index=idx, columns=codes),
+                "amount": pd.DataFrame([[1e5, 1e5, 1e5]] * 2
+                                       + [amount_last], index=idx, columns=codes),
+                "pct_chg": pd.DataFrame([[0.0, 0.0, 0.0]] * 2 + [[5.0, 5.0, 5.0]],
+                                        index=idx, columns=codes),
+                "pe_ttm": pd.DataFrame(15.0, index=idx, columns=codes),
+                "board": pd.Series([0.0, 1.0, 3.0], index=codes),      # 沪主板/创业板/北交所
+                "is_st": pd.DataFrame(False, index=idx, columns=codes),
+            }
+
+        # 成交额 49999 千元 = 4999.9 万元 ⇒ 不够；50000 千元 = 5000 万 ⇒ 刚好够
+        low = SR.screen(panel([49999.0, 49999.0, 49999.0]),
+                        SR.ScreenConfig(amt_min=5000.0)).to_numpy()[-1]
+        high = SR.screen(panel([50000.0, 50000.0, 50000.0]),
+                         SR.ScreenConfig(amt_min=5000.0)).to_numpy()[-1]
+        if low.any():
+            raise RuntimeError("4999.9 万元的成交额不该通过 5000 万的门槛（量纲差 10 倍）")
+        if not (high[0] and high[1]):
+            raise RuntimeError("沪市主板 600xxx / 创业板 300xxx 都应该通过「非北交所」")
+        if high[2]:
+            raise RuntimeError("北交所（board=3）不该通过")
+
+        return "成交额千元→万元换算、板块编码 0/1/2/3 与「非北交所」白名单"
+
+    check("A股全市场组合回测的量纲与板块编码", _a_rule)
+
     def _chart_from_trades():
         """K 线与信号页的持仓/标记必须**与交易记录同源**。
 

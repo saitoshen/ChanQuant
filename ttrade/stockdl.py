@@ -129,17 +129,10 @@ def fetch_basic(pro=None) -> pd.DataFrame:
 
 
 def _guess_board(ts_code: str) -> str:
-    """从代码猜板块。`SSE.688xxx` = 科创板，`SZSE.300xxx` = 创业板。"""
-    ex, _, code = ts_code.partition(".")
-    if ex == "BSE":
-        return "北交所"
-    if code.startswith("688"):
-        return "科创板"
-    if code.startswith("300") or code.startswith("301"):
-        return "创业板"
-    if code.startswith("000") or code.startswith("001") or code.startswith("002"):
-        return "主板"
-    return ""
+    """板块判定统一走 `stockstore.guess_board`（那里有完整的坑记录）。"""
+    from ttrade import stockstore as SS
+
+    return SS.guess_board(ts_code)
 
 
 # ------------------------------------------------------------------ 日线
@@ -456,6 +449,7 @@ def run_meta() -> dict:
 # 把代码转成天勤格式），概念板块放最后（它是全市场一次请求，跑得快但行数最多）
 PARTS = [
     ("meta", "股票列表"),
+    ("st", "ST 变更（曾用名）"),
     ("daily", "日线 + 复权因子"),
     ("basic", "基本面（PE/PB/换手/市值）"),
     ("moneyflow", "资金流"),
@@ -484,6 +478,38 @@ def stats_text() -> str:
     if exs:
         lines.append("交易所：" + "、".join(exs))
     return "\n".join(lines)
+
+
+def fetch_namechange(pro=None, start: str = "20100101") -> pd.DataFrame:
+    """曾用名 / ST 变更（一次请求拉全市场，`namechange` 支持只给起始日）。
+
+    🔴 这是**唯一**能还原「某天是不是 ST」的来源。`stock_meta.name` 只是当前
+    名称：拿它整段套到五年前，「后来摘帽的」被当成一直正常、「后来戴帽的」被
+    当成一直 ST —— 两个方向都错，而且 ST 会改涨跌停幅度（主板 5%/10%），
+    「昨日涨停」的判定跟着一起错。
+    """
+    pro = pro or get_pro()
+    try:
+        df = pro.namechange(start_date=start)
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    df["ts_code"] = df["ts_code"].apply(ts_to_tq)
+    return df
+
+
+def run_namechange(start: str = "20100101", **_kw) -> dict:
+    """把 ST 变更写进 `stock_namechange`。一次请求，秒级。"""
+    try:
+        df = fetch_namechange(start=start)
+    except Exception as exc:  # noqa: BLE001
+        return {"done": 0, "rows": 0, "errors": [str(exc)]}
+    if df.empty:
+        return {"done": 0, "rows": 0, "errors": ["没有曾用名记录"]}
+    n = _write(df, SS.upsert_namechange, "stock_namechange")
+    return {"done": n, "rows": n, "errors": []}
 
 
 def run(parts=None, start: str | None = None, end: str | None = None,
@@ -521,6 +547,8 @@ def run(parts=None, start: str | None = None, end: str | None = None,
             elif key == "moneyflow":
                 st = run_moneyflow(start=start, end=end, cancel=cancel,
                                    progress=lambda a, b: inner(a, b))
+            elif key == "st":
+                st = run_namechange(start=start or "20100101")
             else:
                 st = run_concept(cancel=cancel)
         except Exception as exc:  # noqa: BLE001 - 一项失败不该拖垮其余项

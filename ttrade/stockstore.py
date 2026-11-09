@@ -159,6 +159,21 @@ DDL = [
         v VARCHAR
     )
     """,
+    # 曾用名 / ST 变更记录（Tushare `namechange`）。**回测里判「当时是不是 ST」
+    # 只能靠它**：`stock_meta.name` 只是当前的名称，拿它整段套到五年前，等于
+    # 把「后来摘帽的」当成一直正常、「后来戴帽的」当成一直 ST —— 两个方向都错，
+    # 而且错得不报错。ST 直接改涨跌停幅度（主板 5%/10%），也就会改「涨停」的判定。
+    """
+    CREATE TABLE IF NOT EXISTS stock_namechange (
+        ts_code     VARCHAR NOT NULL,
+        name        VARCHAR,
+        start_date  DATE NOT NULL,
+        end_date    DATE,
+        ann_date    DATE,
+        reason      VARCHAR,
+        PRIMARY KEY (ts_code, start_date)
+    )
+    """,
 ]
 
 
@@ -229,6 +244,32 @@ def _insert_df(con, table: str, df: pd.DataFrame) -> None:
 
 
 # ------------------------------------------------------------------ 写入
+
+def guess_board(ts_code: str) -> str:
+    """按代号判板块：主板 / 创业板 / 科创板 / 北交所。
+
+    🔴 **不能只列举「已知前缀」就完事**：落不进任何分支会返回空串，而沪市
+    `600/601/603/605` 这一大批主板股正好一个分支都命中不了 ⇒ 1744 只（占全
+    市场三成）的板块变成「未知」。A 股策略里「非北交所」是按白名单
+    `{主板, 创业板, 科创板}` 判的，结果就是**整个沪市主板被静默剔出门外**，
+    而且不报错、只让回测结果看起来"更干净"。
+
+    🔴 也不能只靠 `stock_meta`：那张表只有**当前在市**的股票，区间内退市的
+    197 只查不到板块 → 同样被白名单剔掉。所以板块一律按**代号**判。
+    """
+    ex, _, code = ts_code.partition(".")
+    if ex == "BSE":
+        return "北交所"
+    if code.startswith("688") or code.startswith("689"):
+        return "科创板"                      # 689 = 科创板 CDR
+    if code.startswith("300") or code.startswith("301"):
+        return "创业板"
+    if ex in ("SSE", "SZSE"):
+        if code.startswith("900") or code.startswith("200"):
+            return ""                        # 沪/深 B 股，用人民币以外的币种计价
+        return "主板"
+    return ""
+
 
 def upsert_meta(con, df: pd.DataFrame) -> int:
     """`df` 需要 ts_code/name/exchange/board/industry/list_date/delist_date。"""
@@ -308,6 +349,24 @@ def upsert_basic(con, df: pd.DataFrame) -> int:
             d[c] = None
     d = d[BASIC_COLS]
     _insert_df(con, "stock_basic_ts", d)
+    return len(d)
+
+
+def upsert_namechange(con, df: pd.DataFrame) -> int:
+    """曾用名 / ST 变更（Tushare `namechange`）。列：ts_code/name/start_date/end_date…"""
+    if df is None or len(df) == 0:
+        return 0
+    d = pd.DataFrame({
+        # 调用方负责把代码转成库内格式（天勤 `SSE.600000`），这一层不做源站适配
+        "ts_code": df["ts_code"].astype(str),
+        "name": df["name"].astype(str),
+        "start_date": pd.to_datetime(df["start_date"], errors="coerce").dt.date,
+        "end_date": pd.to_datetime(df.get("end_date"), errors="coerce").dt.date,
+        "ann_date": pd.to_datetime(df.get("ann_date"), errors="coerce").dt.date,
+        "reason": df.get("change_reason", pd.Series("", index=df.index)).fillna("").astype(str),
+    })
+    d = d.dropna(subset=["start_date"])
+    _insert_df(con, "stock_namechange", d)
     return len(d)
 
 
@@ -450,6 +509,63 @@ def load_basic(ts_code: str) -> pd.DataFrame:
             "SELECT * FROM stock_basic_ts WHERE ts_code = ? ORDER BY dt",
             [ts_code],
         ).df()
+
+
+def load_namechange(ts_code: str = "") -> pd.DataFrame:
+    """曾用名 / ST 变更记录。不传 `ts_code` 就返回全市场（一万行以内，很小）。"""
+    if not exists():
+        return pd.DataFrame()
+    with connect(read_only=True) as con:
+        try:
+            if ts_code:
+                return con.execute(
+                    "SELECT * FROM stock_namechange WHERE ts_code = ? "
+                    "ORDER BY start_date", [ts_code]).df()
+            return con.execute(
+                "SELECT * FROM stock_namechange ORDER BY ts_code, start_date").df()
+        except Exception:  # noqa: BLE001 - 老库没这张表
+            return pd.DataFrame()
+
+
+def st_intervals(ts_code: str = "") -> pd.DataFrame:
+    """**ST 区间**（含 `*ST`）：`ts_code / start / end`，`end` 为 NaT 表示还没结束。
+
+    判据是名字里带 `ST`。Tushare 的 `namechange` 把每次改名都记下来，所以
+    「2022 年是 ST、2024 年摘帽」这种能精确还原 —— 而 `stock_meta.name` 只有
+    当前名字，整段套用会把两个方向都判错。
+    """
+    raw = load_namechange(ts_code)
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=["ts_code", "start", "end"])
+    st = raw[raw["name"].astype(str).str.upper().str.contains("ST", na=False)].copy()
+    if st.empty:
+        return pd.DataFrame(columns=["ts_code", "start", "end"])
+    out = pd.DataFrame({
+        "ts_code": st["ts_code"].astype(str),
+        "start": pd.to_datetime(st["start_date"], errors="coerce"),
+        "end": pd.to_datetime(st["end_date"], errors="coerce"),
+    })
+    return out.dropna(subset=["start"]).sort_values(["ts_code", "start"])
+
+
+def is_st_series(index: "pd.DatetimeIndex", ts_code: str) -> "pd.Series":
+    """这根 bar 当天该股是不是 ST（含 `*ST`），按 `index` 对齐的布尔列。
+
+    逐个区间标而不是逐日查表：一只票五年也就改几次名。
+    """
+    import numpy as np
+
+    out = pd.Series(False, index=index)
+    iv = st_intervals(ts_code)
+    if iv.empty:
+        return out
+    for _, r in iv.iterrows():
+        end = r["end"]
+        mask = index >= r["start"]
+        if pd.notna(end):
+            mask &= index <= end
+        out.loc[mask] = True
+    return out.fillna(False).astype(bool) if not isinstance(out.dtype, np.dtype("bool")) else out
 
 
 def load_moneyflow(ts_code: str) -> pd.DataFrame:

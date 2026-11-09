@@ -28,6 +28,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Tushare A 股股票数据")
     ap.add_argument("--stats", action="store_true", help="只看库里有什么")
     ap.add_argument("--meta", action="store_true", help="下载股票元数据")
+    ap.add_argument("--st", action="store_true", help="下载 ST / 曾用名变更记录")
     ap.add_argument("--daily", action="store_true", help="下载全历史日线 + 复权因子")
     ap.add_argument("--basic", action="store_true", help="下载基本面")
     ap.add_argument("--concept", action="store_true", help="下载概念板块")
@@ -41,7 +42,7 @@ def main() -> int:
         print(DL.stats_text())
         return 0
 
-    picked = [k for k in ("meta", "daily", "basic", "moneyflow", "concept")
+    picked = [k for k in ("meta", "st", "daily", "basic", "moneyflow", "concept")
               if getattr(args, k)]
     if args.all:
         picked = [k for k, _ in DL.PARTS]

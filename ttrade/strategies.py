@@ -1010,6 +1010,117 @@ def strat_cta_break(
     return out
 
 
+# ---------------------------------------------------------------- A 股选股型
+def _limit_pct(is_st, board):
+    """涨跌停幅度。`board`：0 主板 / 1 创业板 / 2 科创板 / 3 北交所。
+
+    🔴 ST 会**改涨跌停幅度**（主板 5%），所以「昨日是否涨停」这件事必须先知道
+    当时是不是 ST。创业板/科创板注册制之后不论 ST 都是 20%，北交所 30%。
+    """
+    st = np.asarray(is_st, dtype=bool)
+    b = np.asarray(board, dtype=float)
+    return np.where(b == 3, 0.30,
+                    np.where(st & (b == 0), 0.05,
+                             np.where((b == 1) | (b == 2), 0.20, 0.10)))
+
+
+def _round2(x):
+    """价格四舍五入到分。**不能用 `np.round`**：它是银行家舍入（.005 → 偶数），
+    交易所是四舍五入，差一分钱就会把「涨停」判成「没涨停」。"""
+    return np.floor(np.asarray(x, dtype=float) * 100.0 + 0.5) / 100.0
+
+
+def strat_a_vol_breakout(df: pd.DataFrame, max_price: float = 80.0,
+                         gain_lo: float = 0.0, gain_hi: float = 9.8,
+                         vol_mult: float = 3.0, amt_min: float = 5000.0,
+                         pe_min: float = 0.0, pe_max: float = 25.0,
+                         hold_days: int = 5) -> pd.DataFrame:
+    """A 股·放量启动（选股型，日线）。
+
+    当日收盘同时满足下面八条 ⇒ 记一个信号，**下一根开盘买**，持有 `hold_days`
+    根后开盘卖：
+
+    1. 非 ST（按**当时**的曾用名判，不是现在是不是 ST）
+    2. 非北交所
+    3. 昨日未涨停（按板块 + 当日 ST 状态还原昨天的涨停价）
+    4. 股价 < `max_price`（默认 80）
+    5. 今日涨幅在 [`gain_lo`, `gain_hi`]（默认 0 ~ 9.8%）
+    6. 今日成交量 ≥ `vol_mult` × 昨日（默认 3 倍）
+    7. `pe_min` < PE(TTM) ≤ `pe_max`（默认 0 ~ 25；**负 PE 是亏损，不算「低估值」**）
+    8. 今日成交额 ≥ `amt_min` 万元（默认 5000 万）
+
+    🔴 需要的列都是 A 股日线专有的（`pct_chg` / `volume` / `amount` / `pe_ttm`
+    / `is_st` / `board_code`）。缺列直接报错、**不静默降级** —— 「ST 过滤悄悄
+    没生效」这种错不会报错，只会让结果看着更好。
+    """
+    out = df.copy()
+    need = ("pct_chg", "volume", "amount", "pe_ttm", "is_st", "board_code")
+    miss = [c for c in need if c not in out.columns]
+    if miss:
+        raise ValueError(
+            "A股·放量启动 只能跑 A 股日线，缺列：" + "、".join(miss)
+            + "（需要 Tushare 日线 + 基本面 + 曾用名 ST 记录）"
+        )
+
+    n = len(out)
+    c = out["close"].to_numpy(dtype=float)
+    pct = pd.to_numeric(out["pct_chg"], errors="coerce").to_numpy(dtype=float)
+    vol = pd.to_numeric(out["volume"], errors="coerce").to_numpy(dtype=float)
+    # Tushare `daily.amount` 单位是**千元**，参数按「万元」给，这里换成同一量纲
+    amt = pd.to_numeric(out["amount"], errors="coerce").to_numpy(dtype=float) / 10.0
+    pe = pd.to_numeric(out["pe_ttm"], errors="coerce").to_numpy(dtype=float)
+    is_st = pd.Series(out["is_st"]).fillna(False).astype(bool).to_numpy()
+    board = pd.to_numeric(out["board_code"], errors="coerce").to_numpy(dtype=float)
+
+    # 昨日成交量 / 收盘价
+    prev_vol = np.r_[np.nan, vol[:-1]]
+    prev_close = np.r_[np.nan, c[:-1]]
+    prev2_close = np.r_[np.nan, np.nan, c[:-2]]
+    # 昨天的涨停价：用**前天**收盘 × (1 + 昨天的幅度)。幅度用昨天的 ST 状态，
+    # 因为 ST 是当天起效的
+    prev_st = np.r_[False, is_st[:-1]]
+    yday_up = _round2(prev2_close * (1.0 + _limit_pct(prev_st, board)))
+    yday_limit_up = prev_close >= yday_up - 1e-6
+
+    with np.errstate(invalid="ignore"):
+        ok = (
+            (~is_st)                                  # 1 非 ST
+            & np.isin(board, (0.0, 1.0, 2.0))         # 2 非北交所（板块已知）
+            & (~yday_limit_up)                        # 3 昨日未涨停
+            & (c < float(max_price))                  # 4 股价
+            & (pct >= float(gain_lo)) & (pct <= float(gain_hi))   # 5 今日涨幅
+            & (vol >= float(vol_mult) * prev_vol)     # 6 放量
+            & (pe > float(pe_min)) & (pe <= float(pe_max))        # 7 低估值
+            & (amt >= float(amt_min))                 # 8 成交额（万元）
+        )
+    ok = np.asarray(ok, dtype=bool)
+
+    # 持仓状态机：满足条件当根出信号，引擎在**下一根开盘**成交；连持 hold_days 根
+    hold = max(int(hold_days), 1)
+    sig = np.zeros(n, dtype=int)
+    left = 0
+    for i in range(n):
+        if left > 0:
+            sig[i] = 1
+            left -= 1
+        elif ok[i]:
+            sig[i] = 1
+            left = hold - 1
+
+    out["signal"] = sig
+    # 逐根写「为什么进」：交易记录页的备注列直接读它。只给真正触发的那几根写，
+    # 其余留空 —— 几千根都挂一句话会把表撑爆，也看不出重点
+    note = np.full(n, "", dtype=object)
+    if ok.any():
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ratio = vol / prev_vol
+        for i in np.flatnonzero(ok):
+            note[i] = (f"放量启动：涨幅 {pct[i]:.2f}%·量比 {ratio[i]:.2f}"
+                       f"·PE {pe[i]:.1f}")
+    out["entry_note"] = note
+    return out
+
+
 # ---------------------------------------------------------------- 注册表
 @dataclass
 class StrategySpec:
@@ -1048,8 +1159,12 @@ PARAM_LABELS = {
     "stop_mult": "止损倍数", "entry_n": "入场箱体",
     "entry_start": "开仓起(分)", "entry_end": "开仓止(分)", "exit_min": "平仓(分)",
     # 波幅突破那一族（ria_break_day / ria_break_night / cta_break）
-    "ratio": "波幅倍数", "check_min": "确认(分)", "hold_days": "持仓(天)",
+    "ratio": "波幅倍数", "check_min": "确认(分)",     "hold_days": "持仓(天)",
     "hold_bars": "持仓(根)",
+    # A 股选股型（a_vol_breakout）。滑杆标签只有 62px，超过六个汉字会被截断
+    "max_price": "股价上限", "gain_lo": "涨幅下限", "gain_hi": "涨幅上限",
+    "vol_mult": "量比", "amt_min": "成交额(万)",
+    "pe_min": "PE 下限", "pe_max": "PE 上限",
     "day_start": "日窗起(分)", "day_end": "日窗止(分)",
     "night_start": "夜窗起(分)", "night_end": "夜窗止(分)",
 }
@@ -1251,6 +1366,31 @@ STRATEGIES: dict[str, StrategySpec] = {
         desc="future_quant cta_short 的规则时序：一天只看一个检查点（默认 10:40），"
              "偏离超过 0.4×前一日振幅就顺向开仓；5×ATR 止损 + 次日 09:35 定时平。"
              "把确认时刻改成 21:30、平仓改成 09:05 就是夜盘版。",
+    ),
+    # ---- A 股选股型（只做多、只吃日线）----
+    "a_vol_breakout": StrategySpec(
+        key="a_vol_breakout",
+        label="A股·放量启动",
+        func=strat_a_vol_breakout,
+        params={"max_price": 80.0, "gain_lo": 0.0, "gain_hi": 9.8,
+                "vol_mult": 3.0, "amt_min": 5000.0,
+                "pe_min": 0.0, "pe_max": 25.0, "hold_days": 5},
+        param_meta={
+            "max_price": (5, 200, 5),
+            "gain_lo": (0, 5, 0.5),
+            "gain_hi": (5, 20, 0.2),
+            "vol_mult": (1.5, 10.0, 0.5),
+            "amt_min": (1000, 50000, 500),
+            "pe_min": (0, 20, 1),
+            "pe_max": (5, 100, 5),
+            "hold_days": (1, 30, 1),
+        },
+        bidirectional=False,        # A 股融券做空不现实，只做多
+        param_labels={"hold_days": "持有(根)"},
+        desc="八条同时满足才买：非 ST（按**当时**的曾用名判）、非北交所、昨日未涨停、"
+             "股价低于上限、今日涨幅在上限内、今日成交量≥昨日的 N 倍、PE(TTM) 在上限内、"
+             "成交额达标。当日收盘出信号，**下一根开盘买**，持有 N 根后开盘卖。"
+             "只能跑 A 股日线（需要 pct_chg / pe_ttm / is_st / board_code 这几列）。",
     ),
 }
 
