@@ -235,8 +235,21 @@ def check_tool_markup() -> None:
         '<|DSML|>parameter name="symbol" string="true">RB_SHFE<|DSML|>parameter>\n'
         '<|DSML|>parameter name="limit" string="false">60<|DSML|>parameter>'
     )
+    # 🔴 全角竖线（U+FF5C）。2026-11-09 真实故障：模型把 `|` 写成了全角 `｜`，
+    # 而解析器只认半角 ⇒ 参数值的前瞻落到 `$` ⇒ name 被读成
+    # `factor-authoring</｜｜DSML｜｜ parameter>…` ⇒ 界面报「没有名为『…』的技能」，
+    # 而且 strip 也清不掉、屏幕上留着原文。模型换输入法或中转层做全角转换都会踩。
+    wide = (
+        '<\uff5c\uff5cDSML\uff5c\uff5c calls>\n'
+        '<\uff5c\uff5cDSML\uff5c\uff5c invoke name="scan">\n'
+        '<\uff5c\uff5cDSML\uff5c\uff5c parameter name="rule" string="true">breakout_high'
+        '</\uff5c\uff5cDSML\uff5c\uff5c parameter>\n'
+        '</\uff5c\uff5cDSML\uff5c\uff5c invoke>\n'
+        '</\uff5c\uff5cDSML\uff5c\uff5c calls>'
+    )
 
-    for label, text in (("紧凑", compact), ("拆开", spaced), ("漏闭合", broken)):
+    for label, text in (("紧凑", compact), ("拆开", spaced),
+                        ("漏闭合", broken), ("全角竖线", wide)):
         a = A.parse_action(text)
         check(a.ok, f"{label}写法的工具语法没解析成动作（{a.error}）")
         check(a.kind in ("scan", "query_bars"), f"{label}写法解析出的动作名不对（{a.kind}）")
@@ -245,6 +258,13 @@ def check_tool_markup() -> None:
     check(a.payload.get("rule") == "breakout_high", "工具语法的字符串参数没读对")
     # string="false" 表示「不是字符串」，要按 JSON 解析成数字
     check(a.payload.get("window") == 20, f"数字参数没转成 int（{a.payload.get('window')!r}）")
+
+    # 全角那例的参数值必须干净 —— 带上标签的话下游会当成「没有这个技能」
+    wide_action = A.parse_action(wide)
+    check(wide_action.payload.get("rule") == "breakout_high",
+          f"全角写法的参数值里混进了标签（{wide_action.payload.get('rule')!r}）")
+    check("DSML" not in str(wide_action.payload),
+          f"全角写法的参数值里还有 DSML 残留：{wide_action.payload}")
 
     # json 代码块优先：模型两种都写时，按平台协议的那个走
     both = ('```json\n{"action":"query_bars","symbol":"RB_SHFE","rows":5}\n```\n\n'
@@ -255,6 +275,9 @@ def check_tool_markup() -> None:
     shown = A.strip_tool_markup("先看一下。\n\n" + compact + "\n\n完事。")
     check("DSML" not in shown and "<|" not in shown, f"气泡里还有标记残留：{shown!r}")
     check("先看一下" in shown and "完事" in shown, "清理时把人话一起删了")
+    shown_wide = A.strip_tool_markup("先看一下。\n\n" + wide + "\n\n完事。")
+    check("DSML" not in shown_wide,
+          f"全角写法的标记没从气泡里清掉：{shown_wide!r}")
     check(A.strip_tool_markup("普通回答，没标记") == "普通回答，没标记", "无标记的文本被改动了")
 
 

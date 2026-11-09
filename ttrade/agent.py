@@ -828,10 +828,19 @@ _JSON_BLOCK = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
 # 这些标记在真实输出里被拆得很散，`>` 的位置还不固定：
 #   `<|DSML|>calls>`      —— 尖括号先闭合，再跟标签名
 #   `< | | DSML | | calls>` —— 标签名夹在两个竖线后面
+#   `<｜｜DSML｜｜ calls>`   —— 全角竖线（U+FF5C），模型照着半角的样子写出来
 # 所以统一按「`<` + 若干竖线 + DSML + 若干竖线 + 可选 `>` + 标签名 + `>`」
 # 来认，竖线一个或多个、每段之间允许空白。宁可放宽，也别让一整段动作
 # 变成屏幕上的乱码。
-_DSML_HEAD = r"<\s*/?\s*(?:\|\s*)+DSML\s*(?:\|\s*)+>?\s*"
+#
+# 🔴 竖线必须覆盖**全角**。只写半角 `|` 的后果（2026-11-09 真实故障）：
+# 模型吐的是 `<｜｜DSML｜｜ parameter>`，`_DSML_HEAD` 一个都匹配不上 ⇒
+# `_DSML_PARAM` 的 `(?=_DSML_HEAD|$)` 只能落到 `$` ⇒ 参数值一路吃到文本末尾，
+# 变成 `factor-authoring</｜｜DSML｜｜ parameter>…`，于是界面报
+# 「没有名为『factor-authoring</｜｜DSML｜｜ …』的技能」，而且 strip 也清不掉、
+# 屏幕上留着原文。模型换了输入法、或中转层做了全角转换，都会踩到。
+_PIPE = r"[|\uFF5C\u2502\u00A6\u01C0]"
+_DSML_HEAD = r"<\s*/?\s*(?:" + _PIPE + r"\s*)+DSML\s*(?:" + _PIPE + r"\s*)+>?\s*"
 
 
 def _dsml_tag(word: str) -> str:
@@ -850,7 +859,22 @@ _DSML_PARAM = re.compile(
     re.S | re.I,
 )
 # 清屏用：`<|end_of_sentence|>` 这类零散 token
-_BARE_TOKEN = re.compile(r"<\s*(?:\|\s*)+[^|<>]{1,40}(?:\|\s*)+>?", re.I)
+_BARE_TOKEN = re.compile(
+    r"<\s*(?:" + _PIPE + r"\s*)+[^" + _PIPE + r"<>]{1,40}(?:" + _PIPE + r"\s*)+>?", re.I)
+
+# 兜底：参数值尾巴上粘了工具标记就切掉。
+#
+# 正常路径下 `_DSML_PARAM` 的前瞻会停在下个标签之前，用不上这个。但只要模型
+# 用了没枚举到的写法（全角、异体竖线、多一段空白…），前瞻就落到 `$`，值会
+# 一路吃到文本末尾 —— 2026-11-09 那次就是这么把技能名解析成
+# `factor-authoring</｜｜DSML｜｜ parameter>…` 的。
+# 所以这里按「任何一段含 DSML 的标签」再切一刀，宁可切掉，也别把标签当名字。
+_DSML_TAIL = re.compile(r"<[^<>]{0,60}DSML[^<>]{0,60}>", re.I)
+
+
+def _clean_value(raw: str) -> str:
+    m = _DSML_TAIL.search(raw)
+    return raw[:m.start()] if m else raw
 
 
 def parse_tool_markup(text: str) -> dict | None:
@@ -863,12 +887,12 @@ def parse_tool_markup(text: str) -> dict | None:
     names = _DSML_INVOKE.findall(text or "")
     if not names:
         return None
-    obj: dict = {"action": names[-1].strip()}
+    obj: dict = {"action": _clean_value(names[-1]).strip()}
     for key, is_str, raw in _DSML_PARAM.findall(text or ""):
         key = key.strip()
         if key in obj:
             continue
-        val = raw.strip()
+        val = _clean_value(raw).strip()
         if is_str.lower() == "false":
             try:
                 obj[key] = json.loads(val)
