@@ -778,6 +778,100 @@ def _run() -> tuple[bool, list[str]]:
 
     check("K 线内进出场（触发价 / 止损 / 老路径不变）", _intrabar)
 
+    def _td_key():
+        """交易日归日：sbbox 必须读 `trading_day` 列，不能自己写 `index + 6h`。
+
+        周五 21:00 的夜盘归下周一，这条靠时间推算必错：周五 21:00 + 6h 落到
+        **周六**。切错之后不报错，只是周一的「当日开盘」取成周一 09:00 的开盘
+        （丢掉隔夜跳空）、「昨日全天振幅」取成周五夜盘那一小段，开仓门槛悄悄
+        松掉 —— RB/SA 实测 13.2% / 12.8% 的 bar 受影响。所以这里造三帧：
+
+          a) 无 `trading_day` 列            → 走 +6h 兜底（已知会错）
+          b) 列 = +6h 的结果                → 必须与 a 逐值一致（兜底没被改坏）
+          c) 列 = 真值（周五夜盘归周一）     → 必须与 a **不同**，且周一那根的
+                                              触发价要等于独立重算的值
+
+        最后一条是关键：只验 `_trading_days` 返回对没用，得验策略真的在用它。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade.strategies import _trading_days, run_strategy
+
+        spec = [("2026-10-23", (9, 10, 11, 13, 14, 21, 22, 23)),   # 周五 + 夜盘
+                ("2026-10-26", (9, 10, 11, 13, 14)),               # 周一
+                ("2026-10-27", (9, 10, 11, 13, 14, 21, 22, 23))]   # 周二 + 夜盘
+        idx, px = [], []
+        v = 100.0
+        for d, hours in spec:
+            for hh in hours:
+                idx.append(pd.Timestamp(f"{d} {hh:02d}:00:00"))
+                px.append(v)
+                v += 0.5
+        base = pd.DataFrame({"open": px, "high": [x + 1.0 for x in px],
+                             "low": [x - 1.0 for x in px],
+                             "close": [x + 0.2 for x in px],
+                             "volume": 100}, index=pd.DatetimeIndex(idx))
+        plus6 = pd.DatetimeIndex(base.index + pd.Timedelta(hours=6)).normalize()
+        fri_night = [i for i, t in enumerate(base.index)
+                     if pd.Timestamp("2026-10-23 21:00") <= t
+                     <= pd.Timestamp("2026-10-23 23:00")]
+        i_mon = list(base.index).index(pd.Timestamp("2026-10-26 09:00"))
+        if len(fri_night) != 3:
+            raise RuntimeError(f"造的数据不对，周五夜盘应有 3 根，实得 {len(fri_night)}")
+
+        # c 帧：把 +6h 给出的那个周六改回周一（这就是交易所口径）
+        truth = [pd.Timestamp("2026-10-26") if t == pd.Timestamp("2026-10-24") else t
+                 for t in plus6]
+        a = base.copy()
+        b = base.copy(); b["trading_day"] = plus6
+        c = base.copy(); c["trading_day"] = pd.DatetimeIndex(truth)
+
+        # ① 规则：c 帧下周五夜盘归周一；a/b 帧下落到周六（证明兜底确实是错的）
+        if any(pd.Timestamp(_trading_days(c)[i]) != pd.Timestamp("2026-10-26")
+               for i in fri_night):
+            raise RuntimeError("带 trading_day 列时，周五夜盘没归到周一")
+        if any(pd.Timestamp(_trading_days(a)[i]) != pd.Timestamp("2026-10-24")
+               for i in fri_night):
+            raise RuntimeError("无 trading_day 列时的 +6h 兜底不再落到周六，"
+                               "说明兜底被改动了（本测试的前提失效）")
+
+        # ② 兜底没被改坏：列里装 +6h 的结果，输出应与无列完全一致
+        kw = {"entry_n": 2, "exit_n": 2, "atr_n": 2, "stop_mult": 1.5}
+        oa = run_strategy(a, "sbbox_ib", kw)
+        ob = run_strategy(b, "sbbox_ib", kw)
+        oc = run_strategy(c, "sbbox_ib", kw)
+        fa = oa["entry_long"].fillna(-9e18).to_numpy(float)
+        fb = ob["entry_long"].fillna(-9e18).to_numpy(float)
+        if not np.allclose(fa, fb):
+            raise RuntimeError("列里装的是 +6h 结果，输出却与无列不同 —— 兜底路径变了")
+
+        # ③ 策略真的读了这一列
+        fc = oc["entry_long"].fillna(-9e18).to_numpy(float)
+        if np.allclose(fa, fc):
+            raise RuntimeError("sbbox_ib 没读 trading_day 列（输出与 +6h 一模一样）")
+
+        # ④ 周一 09:00 那根的触发价 = max(箱体上沿, 周五 21:00 开盘 + 0.4×周五全天振幅)
+        # 🔴 「周五全天」是**周五这个交易日**（日盘 + 周四夜盘），**不含周五夜盘** ——
+        # 周五夜盘属于下周一。把夜盘算进来的话会得出「周五振幅」偏大，正是这个
+        # 口径错误的另一种写法。
+        box_hi = float(base["high"].iloc[i_mon - 2:i_mon].max())
+        do_c = float(base["open"].iloc[fri_night[0]])
+        fri_day = [i for i in range(len(base)) if truth[i] == pd.Timestamp("2026-10-23")]
+        rng_fri = float(base["high"].iloc[fri_day].max()
+                        - base["low"].iloc[fri_day].min())
+        want = max(box_hi, do_c + 0.4 * rng_fri)
+        got = float(oc["entry_long"].iloc[i_mon])
+        if abs(got - want) > 1e-9:
+            raise RuntimeError(
+                f"周一触发价 {got:.4f} ≠ 独立重算 {want:.4f}"
+                f"（箱体 {box_hi:.2f}、周五开盘 {do_c:.2f}、周五振幅 {rng_fri:.2f}）")
+        got_a = float(oa["entry_long"].iloc[i_mon])
+        return (f"+6h 兜底仍落周六、trading_day 列周五夜盘归周一、"
+                f"周一触发价 {got:.2f}（+6h 口径会算成 {got_a:.2f}）")
+
+    check("交易日归日（sbbox 读 trading_day 列、不自己写 +6h）", _td_key)
+
     def _trade_cost():
         """成本必须**双边**收，逐笔成本加起来要等于绩效页的「总成本」。
 

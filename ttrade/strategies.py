@@ -281,9 +281,12 @@ def strat_sbbox_mini(
     离场两条：收盘反向走 `stop_mult` 倍 ATR（止损），或者反向突破 `exit_n` 根
     箱体（趋势结束）。信号在收盘确定，下一根开盘成交 —— 和平台其它策略一致。
 
-    「当日」按**交易日**算，不是自然日：`index + 6h` 再取日期，夜盘 21:00 之后
-    的 K 线就归到第二个交易日了。不这么切的话，晚上九点的开盘价会和早上九点的
-    算成同一天，波幅基准整个错位。
+    「当日」按**交易日**算，不是自然日：走 `_trading_days()`，优先用数据里带的
+    `trading_day` 列（交易所口径），没有该列才退回「整体 +6h 再取日期」。
+    🔴 不要在这里自己写 `index + 6h`：周五 21:00 的夜盘加 6h 会落到**周六**，
+    于是周一的「当日开盘」错取成周一 09:00 的开盘（丢掉隔夜跳空），周一的
+    「昨日全天振幅」错取成周五夜盘那一小段 —— RB/SA 上实测分别有 13.2% / 12.8%
+    的 bar 受影响，波幅基准被低估 45~49%，周一的开仓门槛被系统放松。
     """
     out = df.copy()
     c, h, l, o = out["close"], out["high"], out["low"], out["open"]
@@ -293,7 +296,7 @@ def strat_sbbox_mini(
     hi_x = c.rolling(exit_n, min_periods=exit_n).max().shift(1)
     lo_x = c.rolling(exit_n, min_periods=exit_n).min().shift(1)
 
-    day_key = (out.index + pd.Timedelta(hours=6)).normalize().to_numpy()
+    day_key = _trading_days(out)
     day_open = o.groupby(day_key).transform("first")
     dev = c - day_open
 
@@ -395,8 +398,10 @@ def strat_sbbox_ib(
     开新仓（引擎侧同一开关 `BacktestConfig.intrabar_reentry_samebar`），
     和 `sbbox_mini` 那套「收盘确认 → 下一根开盘」的语义一致。
 
-    「当日」按**交易日**算（`index + 6h` 再取日期），夜盘 21:00 之后归次日 ——
-    晚上九点的开盘价要是和早上九点算成同一天，波幅基准整个错位。
+    「当日」按**交易日**算：走 `_trading_days()`，优先用数据里带的 `trading_day`
+    列（交易所口径），没有该列才退回「整体 +6h 再取日期」。🔴 别在这里自己写
+    `index + 6h` —— 周五 21:00 加 6h 落到周六，周一的「当日开盘」和「昨日振幅」
+    都会错位（RB/SA 实测 13.2% / 12.8% 的 bar 受影响）。
     """
     out = df.copy()
     n = len(out)
@@ -417,7 +422,7 @@ def strat_sbbox_ib(
     c_lo = c.rolling(exit_n, min_periods=exit_n).min().shift(1)
 
     # ---- 当日开盘（按交易日，夜盘归次日） ----
-    day_key = (pd.DatetimeIndex(out.index) + pd.Timedelta(hours=6)).normalize()
+    day_key = _trading_days(out)
     day_open = o.groupby(day_key).transform("first")
 
     # ---- 昨日高低波幅：按交易日聚合全天 high.max − low.min，再 shift(1) ----
@@ -639,10 +644,18 @@ def _trading_days(df: pd.DataFrame) -> np.ndarray:
     交易所口径的真值 —— 周五 21:00 的夜盘属于下周一，节假日顺延，这些靠时间
     推算都会错。没有这一列（股票、手工造的日线）才退回下面的经验规则。
 
+    🔴 **该列并非全品种可信**（2026-11 实测）：夜盘跨零点收盘的 13 个品种
+    （AG/AU/CU/AL/NI/PB/SN/ZN/SS/SC/BC/AD/AO）有 8~11% 的 bar 的 `trading_day`
+    落在**周六/周日** —— 天勤没把周五夜盘往前滚到周一。23:00 收盘的品种
+    （RB/SA/M…）该列是对的。所以「周五夜盘归周一」这条只对 23:00 收盘的品种成立；
+    要彻底修得改成「交易日 = 有日盘的自然日，夜盘前滚到下一个有日盘的日子」，
+    不看这一列。
+
     经验规则：整体加 6 小时再取日期。期货交易日从**夜盘 21:00** 开始，不是
     自然日 00:00：21:30 那根属于第二天，凌晨 02:00 那根也属于第二天。
     21:30+6h=次日 03:30，02:00+6h=当日 08:00，白天各时段都在自己那天；
     无夜盘品种（只有 09:00-15:00）加不加都是同一天，不受影响。
+    🔴 但**周五夜盘必错**：周五 21:00 + 6h = 周六。这条只配当兜底，别当正解。
 
     切错的话「当日开盘价」和「前一日波幅」两处都会错位 —— 而这两个数正是
     波幅突破的全部依据。
