@@ -2088,6 +2088,12 @@ class MainWindow(QMainWindow):
         r3.addWidget(self.sp_trig_tiers, 1)
         sb.addLayout(r3)
 
+        # 和下面那行同一个毛病：带前后缀的两个数字框，最小宽度各按整串文字算
+        # （143 + 107 px），并排就比卡片可用宽度（~304 px）还宽，整张卡片被撑到
+        # 326 px、右边被裁掉。宽度交给布局，文字挤了由控件自己省
+        for w in (self.sp_trig_z, self.sp_trig_tiers):
+            w.setSizePolicy(QSizePolicy.Ignored, w.sizePolicy().verticalPolicy())
+
         r4 = QHBoxLayout()
         r4.setContentsMargins(0, 0, 0, 0)
         r4.setSpacing(6)

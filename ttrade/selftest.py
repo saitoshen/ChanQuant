@@ -231,6 +231,11 @@ def _run() -> tuple[bool, list[str]]:
             return "未下载 EDB（可选）"
         wh = {str(v).lower() for v in m[m["category"] == "warehouse"]["variety"]}
         d = _dd("cn")
+        # 先把候选收齐再逐条验：这一项的靶子是 `attrs["symbol"]` 别丢，
+        # 不是「仓单数值必须已经下全」。以前取到第一个候选就 return，碰上
+        # 只同步了指标清单、没下数值的品种（免费账户下不了非价量数据）就整项
+        # 报红，把真正的红也淹掉了
+        cands: list[tuple[str, str, str, object]] = []
         for fn in sorted(os.listdir(d)):
             if not fn.endswith(".csv") or fn.startswith("_"):
                 continue
@@ -241,6 +246,12 @@ def _run() -> tuple[bool, list[str]]:
             df = load_futures_csv(key, d)
             if df is None or len(df) < 300:
                 continue
+            cands.append((key, sym, ex, df))
+        if not cands:
+            return "没有同时具备 EDB 仓单和日线 CSV 的品种（可选）"
+
+        best_key, best_r = "", -1.0
+        for key, sym, ex, df in cands:
             if df.attrs.get("symbol") != sym:
                 raise RuntimeError(
                     f"{key} 加载后 attrs['symbol'] 为空 —— 基本面因子会整列 NaN"
@@ -252,10 +263,13 @@ def _run() -> tuple[bool, list[str]]:
                     f"{key} 并衍生列之后 attrs['symbol'] 被抹掉了（join 丢 attrs）"
                 )
             r = float(F.raw(df, "war_oi").notna().mean())
-            if r < 0.5:
-                raise RuntimeError(f"{key} 仓单持仓比只有 {r:.0%} 有值")
-            return f"{key} 品种标记 {sym}，仓单持仓比 {r:.0%} 有值"
-        return "没有同时具备 EDB 仓单和日线 CSV 的品种（可选）"
+            if r > best_r:
+                best_key, best_r = key, r
+            if r >= 0.5:
+                return f"{key} 品种标记 {sym}，仓单持仓比 {r:.0%} 有值"
+        # 一个品种都没仓单数值 ⇒ 无从验证覆盖率，但 attrs 那条已经全部验过
+        return (f"跳过仓单覆盖率（{len(cands)} 个候选的 EDB 仓单只有清单没数值，"
+                f"最好 {best_key} {best_r:.0%}）；品种标记 {len(cands)} 个都已挂上")
 
     check("期货日线品种标记（基本面因子）", _fund_attrs)
 
@@ -1479,7 +1493,29 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError("过滤结果缺少 rule_signal 列")
         base = int((sig != 0).sum())
         kept = int((out.df["signal"] != 0).sum())
-        return f"规则 {base} 根持仓 → 过滤后 {kept} 根"
+
+        # K 线内那一族的策略走「规则 + 因子过滤」时，`entry_*` / `stop_dist` 必须
+        # 被扔掉：留着的话 `run_backtest` 会分流到 intrabar 分支，而那条分支**根本
+        # 不读 `signal`** —— 「因子过滤」就变成一个点了没用、也不报错的按钮。
+        # 这三件事一起钉住：过滤跑得通、那几列真的没了、回测没走 intrabar 分支
+        ib = run_strategy(df, "sbbox_ib")
+        if "entry_long" not in ib.columns:
+            raise RuntimeError("sbbox_ib 没出 entry_long —— intrabar 通道没接上")
+        out2 = FS.run_rule_with_filter(ib, ib["signal"].to_numpy(int), "multi",
+                                       F.DEFAULT_MULTI, cfg)
+        left = [c for c in ("entry_long", "entry_short", "exit_long",
+                            "exit_short", "stop_dist") if c in out2.df.columns]
+        if left:
+            raise RuntimeError(f"规则 + 因子过滤没扔掉 K 线内那几列：{left}")
+        from ttrade.backtest import BacktestConfig, run_backtest
+
+        rb = run_backtest(out2.df, BacktestConfig(initial_cash=100_000.0,
+                                                  sizing="fixed", volume=1))
+        if rb.metrics.get("intrabar") is not None:
+            raise RuntimeError("过滤之后还是走了 K 线内分支（signal 被无视）")
+
+        return (f"规则 {base} 根持仓 → 过滤后 {kept} 根；"
+                f"K 线内策略过滤后不再走 intrabar 分支")
 
     check("规则 + 因子过滤", _factor_filter)
 

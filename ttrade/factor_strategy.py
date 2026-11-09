@@ -2231,8 +2231,11 @@ def run_rule_with_filter(
     # `entry_long` / `entry_short` / `stop_dist` / `exit_*` 必须扔掉：留着的话
     # `run_backtest` 会判定走 intrabar 分支，而那条分支**根本不读 `signal`** ——
     # 「因子过滤」就变成一个点了没用、也不报错的按钮
-    for _c in ("entry_long", "entry_short", "exit_long", "exit_short", "stop_dist"):
-        out.pop(_c, None)
+    # 注意：`DataFrame.pop()` 只收一个参数，没有 dict 那种默认值写法
+    _drop = [c for c in ("entry_long", "entry_short", "exit_long", "exit_short",
+                         "stop_dist") if c in out.columns]
+    if _drop:
+        out = out.drop(columns=_drop)
     out["factor_score"] = pack.score
     out["rule_signal"] = np.asarray(rule_signal, dtype=int)
     for c in pack.raw.columns:
