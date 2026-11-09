@@ -131,26 +131,6 @@ def _aux_missing_tip(key: str, category: str, market: str = "") -> str:
     return "这个因子在当前标的上算不出值（缺数据或样本不足）。"
 
 
-def _extract_trades(sig) -> list[tuple[int, int, int]]:
-    """把 signal 序列拆成一笔笔持仓：返回 [(开仓下标, 平仓下标, 方向)]。
-
-    方向 1 为多、-1 为空。最后一笔还没平仓时，平仓下标取最后一根——
-    这样它也能画出连线，只是线段末端贴着右边缘，一眼能看出「还开着」。
-    """
-    out: list[tuple[int, int, int]] = []
-    cur, entry = 0, 0
-    for i, s in enumerate(sig):
-        s = int(s)
-        if s == cur:
-            continue
-        if cur != 0:
-            out.append((entry, i, cur))
-        cur, entry = s, i
-    if cur != 0 and len(sig):
-        out.append((entry, len(sig) - 1, cur))
-    return out
-
-
 def set_tab_visible(tabs, title: str, on: bool) -> None:
     """按标题显隐页签。Qt 的 `setTabVisible` 要下标，标题是两边唯一对得上的东西。"""
     if tabs is None:
@@ -1099,6 +1079,70 @@ class ResultView(QObject):
                 fn(*args)
         return super().eventFilter(obj, ev)
 
+    def _k_pos_from_trades(self, index):
+        """从**交易记录**还原每根 bar 的持仓方向、开平仓点、持仓连线。
+
+        🔴 为什么不再从 `signal` 列推 —— 两个坑，都会让图与交易记录对不上：
+
+        ① **只做多**时，`signal` 是按「多空双向」算出来的，图上再
+           `np.maximum(sig, 0)` 把空头裁成 0。可回测里空头那段时间是**空仓**，
+           本来能开多；图上却表现成「那段什么都没有」。碳酸锂 1h 实测：
+           交易记录 **52 笔**，图上只剩 **24 段**，开仓点**重叠 0 个** ——
+           用户看到的「图形信号和交易记录不一致」就是这。
+
+        ② **K 线内策略是当根成交**（`entry_long` 那一根触价就进），图上却统一
+           平移一根按 T+1 口径画 ⇒ 所有标记晚一根。两条路径共用一个位移，
+           必然有一边是错的。
+
+        交易记录是唯一真值（手数、成交价、进出那根都在里面）。图直接照它画，
+        两边就不可能再不一致 —— 而且顺带拿到了手数，可以在标记旁标出来。
+
+        返回 `(pos, entries, exits, lines)`：
+          pos     长度 n 的 0/±1，第 i 根**收盘时**的持仓方向
+          entries {下标: [(方向, 手数, 成交价)]}
+          exits   {下标: [(方向, 手数, 成交价)]}
+          lines   [(开仓下标, 平仓下标, 方向, 开仓价, 平仓价)]，未平仓的平仓下标取 n-1
+        """
+        n = len(index)
+        pos = np.zeros(n, dtype=int)
+        entries: dict = {}
+        exits: dict = {}
+        lines: list = []
+        if not n:
+            return pos, entries, exits, lines
+        # 交易记录的日期就是 `self.df` 的索引标签，和 `_signal_notes` 用同一个键
+        pos_of = {ts: i for i, ts in enumerate(index)}
+        t0 = index[0]
+        for _name, t in self.trades or []:
+            d = int(t.direction)
+            lots = float(getattr(t, "lots", 0) or 0)
+            e_ts, x_ts = pd.Timestamp(t.entry_date), pd.Timestamp(t.exit_date)
+            e = pos_of.get(t.entry_date)
+            real_entry = e is not None
+            if not real_entry:
+                # 开仓在区间之前（用户切了「近 1 年」）。只要这笔不是「进出都在
+                # 区间之前」，就得从第一根起算持仓 —— 直接跳过会让整段持仓消失，
+                # 图上看成空仓，比不画更误导。
+                if e_ts > t0:
+                    continue                    # 落在区间之后，与本图无关
+                if not t.open_position and x_ts < t0:
+                    continue                    # 进出都在区间之前，确实无关
+                e = 0
+            x = pos_of.get(t.exit_date)
+            closed = (not t.open_position) and x is not None
+            if not closed:
+                x = n - 1
+            # 平仓那根**开盘就平掉了**，所以持仓区间是 [开仓, 平仓)
+            end = x if closed else n
+            if end > e:
+                pos[e:end] = d
+            if real_entry:
+                entries.setdefault(e, []).append((d, lots, float(t.entry_price)))
+            if closed and x > 0:
+                exits.setdefault(x, []).append((d, lots, float(t.exit_price)))
+            lines.append((e, x, d, float(t.entry_price), float(t.exit_price)))
+        return pos, entries, exits, lines
+
     def _render_kline_impl(self) -> None:
         view_all = self._k_view
         if view_all is None or not len(view_all):
@@ -1122,18 +1166,16 @@ class ResultView(QObject):
         vol = view["volume"].to_numpy(float)
         up = c >= o
 
-        # 全量的信号：窗口第一根到底是不是「开仓」，得看它的前一根，
-        # 只拿窗口内的数据判断会把每根都误认成开仓点。
+        # 全量的信号：标题里的「下一根开盘要做什么」还要用它。
         raw_sig = view_all["signal"].to_numpy(int)
         if self.long_only:
             raw_sig = np.maximum(raw_sig, 0)
-        # **执行口径**：回测是「T 收盘出信号、T+1 开盘成交」，所以第 i 根上的
-        # 持仓和开平动作来自第 i-1 根收盘的信号。图上必须按执行口径画 ——
-        # 画在信号那根的收盘价上，看起来像「收盘价成交」，和回测、实盘都对不上
-        sig_full = np.concatenate([[0], raw_sig[:-1]])
-        open_full = view_all["open"].to_numpy(float)
-        sig_view = sig_full[start:start + win]
-        prev = np.concatenate([[0], sig_full[:-1]])[start:start + win]
+        # 🔴 持仓底色 / 开平仓三角 / 持仓连线**一律从交易记录还原**，不再从
+        # `signal` 列推 —— 两个坑见 `_k_pos_from_trades` 的 docstring。
+        # 一句话：`signal` 在多空双向口径下算出来，只做多时裁一刀就再也对不上；
+        # K 线内策略又是当根成交，统一平移一根必然有一边是错的。
+        pos_all, k_ent, k_ext, k_lines = self._k_pos_from_trades(view_all.index)
+        sig_view = pos_all[start:start + win]
 
         # 因子模式下多画一行分数曲线：能直接看到「分数在哪里穿过阈值、
         # 穿过去之后策略怎么走」，比只看三角标记有用得多。
@@ -1173,7 +1215,8 @@ class ResultView(QObject):
 
         # 持仓区间底色：多头蓝、空头红。合并连续区间用 axvspan，
         # 避免逐点 fill_between 产生上千个多边形。
-        # 只做多模式下把空头信号裁掉，保证图形与回测口径一致。
+        # 区间来自**交易记录**（见 `_k_pos_from_trades`），所以只做多模式下
+        # 不会再有「图上是空仓、记录里有一笔多单」这种错位。
         for dir_val, bg in ((1, C_HOLD_BG), (-1, C_SHORT_BG)):
             mask = (sig_view == dir_val).astype(int)
             if not mask.any():
@@ -1243,30 +1286,56 @@ class ResultView(QObject):
         # 盈利红、亏损绿（A 股习惯）。只在开仓点可见时才画——否则好几笔交易会
         # 全都从窗口左边缘起笔，看着像凭空冒出来的一堆线。平仓在窗口外时线画到
         # 右边缘，正好表示「还持有」。
-        for e_i, x_i, d in _extract_trades(sig_full):
+        for e_i, x_i, d, p0, p1 in k_lines:
             if e_i < start or e_i >= start + win:
                 continue
             b = min(x_i, start + win - 1)
             if b <= e_i:
                 continue
-            # 连线两头都是**成交价**（T+1 开盘），不是收盘价
-            gain = (open_full[x_i] - open_full[e_i]) * d
+            # 两头都用**真实成交价**（交易记录里的），不是窗口内某根的开盘价：
+            # K 线内策略是在 bar 中间触价成交的，拿开盘价画线会在跳空那几笔上
+            # 画错方向，看着像盈利的其实是亏的
+            y1 = p1 if b == x_i else c[b - start]
+            gain = (y1 - p0) * d
             ax.plot(
-                [e_i - start, b - start], [open_full[e_i], open_full[b]],
+                [e_i - start, b - start], [p0, y1],
                 color=C_PROFIT if gain >= 0 else C_LOSSLINE,
                 ls=(0, (4, 3)), lw=1.15, alpha=0.88, zorder=5,
             )
 
-        # 开平仓信号：颜色=持仓方向（紫多 / 琥珀空），形状=开仓/平仓（▲开 ▼平）
+        # 开平仓信号：颜色=持仓方向（紫多 / 琥珀空），形状=开仓/平仓（▲开 ▼平）。
         # 直接反手（多→空 / 空→多）时，平仓和开仓落在同一根上，两个三角会完全重叠，
         # 后画的把先画的盖掉。这种情况只画开仓标记——平仓本来也由连线交代了。
-        pos = sig_view
+        #
+        # 🔴 标记也来自交易记录，并在**开仓**标记外侧写出**手数**：手数只有成交
+        # 记录里才有，标出来才能一眼对上交易记录页那一行「几手」。
+        n_v = len(view)
+        open_l = np.zeros(n_v, dtype=bool)
+        open_s = np.zeros(n_v, dtype=bool)
+        shut_l = np.zeros(n_v, dtype=bool)
+        shut_s = np.zeros(n_v, dtype=bool)
+        lots_at: list[tuple[int, int, float]] = []      # (窗口下标, 方向, 手数)
+        for i_e, items in k_ent.items():
+            if not (start <= i_e < start + win):
+                continue
+            for d, lots, _px in items:
+                open_l[i_e - start] = open_l[i_e - start] or d > 0
+                open_s[i_e - start] = open_s[i_e - start] or d < 0
+                if lots > 0:
+                    lots_at.append((i_e - start, d, lots))
+        for i_x, items in k_ext.items():
+            if not (start <= i_x < start + win) or i_x in k_ent:
+                continue
+            for d, _lots, _px in items:
+                shut_l[i_x - start] = shut_l[i_x - start] or d > 0
+                shut_s[i_x - start] = shut_s[i_x - start] or d < 0
+
         off = (h.max() - l.min()) * 0.028
         marks = [
-            ((pos == 1) & (prev != 1), "^", C_LONG_SIG, -1, "开多"),
-            ((pos == 0) & (prev == 1), "v", C_LONG_SIG, +1, "平多"),
-            ((pos == -1) & (prev != -1), "v", C_SHORT_SIG, +1, "开空"),
-            ((pos == 0) & (prev == -1), "^", C_SHORT_SIG, -1, "平空"),
+            (open_l, "^", C_LONG_SIG, -1, "开多"),
+            (shut_l, "v", C_LONG_SIG, +1, "平多"),
+            (open_s, "v", C_SHORT_SIG, +1, "开空"),
+            (shut_s, "^", C_SHORT_SIG, -1, "平空"),
         ]
         for cond, marker, color, side, label in marks:
             idxs = np.where(cond)[0]
@@ -1275,6 +1344,21 @@ class ResultView(QObject):
             y = l[idxs] - off if side < 0 else h[idxs] + off
             ax.scatter(idxs, y, marker=marker, s=72, c=color,
                        edgecolors="white", linewidths=0.9, zorder=6, label=label)
+
+        # 手数标注。只在开仓那一侧写：平仓的手数和开仓一样，写两遍只会把图糊住。
+        # 窗口里开仓太密（>30 笔）时不写 —— 那样每根旁边都挤一个数字，反而读不出
+        # 任何东西；这种情况下把鼠标停在那一根上，信息框里照样有手数。
+        if lots_at and len(lots_at) <= 30:
+            for j, d, lots in lots_at:
+                y = l[j] - off * 1.9 if d > 0 else h[j] + off * 1.9
+                ax.annotate(
+                    f"{_lots_text(lots)}手", (j, y),
+                    ha="center", va="top" if d > 0 else "bottom",
+                    fontsize=6.5, color=C_TEXT, zorder=7,
+                    # 底衬：数字经常正落在相邻 K 线的影线上，没有白底就读不清
+                    bbox=dict(boxstyle="round,pad=0.12", fc="white",
+                              ec="none", alpha=0.75),
+                )
 
         # 最新价参考线。只在窗口右端确实是最新一根时才画，而且用中性灰点线：
         # 原来用红/绿虚线画，跟「持仓盈亏连线」是同一个样式，看着像凭空多出一笔
@@ -1374,7 +1458,9 @@ class ResultView(QObject):
 
         # 坐标轴
         ax.set_xlim(-1, len(view))
-        pad = (h.max() - l.min()) * 0.06
+        # 上下留 8%：开仓三角在 low/high 外面 2.8%，它旁边的「几手」还要再往外
+        # 一层，留 6% 正好把字顶到框外，看着像被裁掉了
+        pad = (h.max() - l.min()) * 0.08
         ax.set_ylim(l.min() - pad, h.max() + pad)
         ax.grid(True, color=C_GRID, lw=0.6, ls="-", alpha=0.9)
         ax.set_axisbelow(True)
@@ -1447,11 +1533,14 @@ class ResultView(QObject):
         head = f"{sym}  {name}" + (f"（{exch_cn}）" if exch else "")
         # 「当前状态」永远指最新一根，不是窗口最后一根——否则滚到历史位置时
         # 标题会跟着变，看着像当前真的空仓了。
-        state = {1: "多头持仓", -1: "空头持仓"}.get(int(sig_full[-1]), "空仓")
+        # 状态取**交易记录还原出来的持仓**（`pos_all`），和图上底色/三角同源；
+        # 原来取 `signal` 平移一根的版本在 K 线内策略上会晚一根。
+        state = {1: "多头持仓", -1: "空头持仓"}.get(int(pos_all[-1]), "空仓")
         # 最后一根收盘又出了新信号时，仓位还没变（要等下一根开盘），
-        # 但人看着图会问「那现在到底算什么」，所以把待执行的动作写出来
+        # 但人看着图会问「那现在到底算什么」，所以把待执行的动作写出来。
+        # 只做多模式下 `raw_sig` 已经裁过，不会写出「下一根开盘开空」。
         pend = int(raw_sig[-1]) if len(raw_sig) else 0
-        if pend != int(sig_full[-1]):
+        if pend != int(pos_all[-1]):
             state += "（下一根开盘" + {1: "开多", -1: "开空"}.get(pend, "平仓") + "）"
         period = self.period
         plabel = "" if tqdata.is_daily(period) else f" · {PERIOD_LABEL.get(period, period)}"

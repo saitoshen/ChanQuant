@@ -529,6 +529,66 @@ def _run() -> tuple[bool, list[str]]:
     # 放在 `_us_df` 之后：`check()` 是立即执行的，定义在前会拿不到这个闭包
     check("交易记录备注与累计盈亏", _trade_notes)
 
+    def _chart_from_trades():
+        """K 线与信号页的持仓/标记必须**与交易记录同源**。
+
+        原来图上是从 `signal` 列推的，两个坑都让图和交易记录对不上：
+        ① 只做多时 `signal` 却是多空双向算出来的，图上 `max(sig,0)` 裁掉空头，
+           空头那段变成「空仓」，而回测里本来能开多 —— 碳酸锂实测记录 52 笔、
+           图上 24 段、开仓点重叠 0 个；
+        ② K 线内策略是当根成交，图上统一平移一根（T+1 口径）⇒ 标记全晚一根。
+
+        现在改成从 `self.trades` 还原。这一项逐条钉住那个映射：
+        区间、开平仓那根、方向、手数，以及「开仓在区间之前」别整段丢掉。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade.backtest import Trade
+
+        from gui.result_view import ResultView
+
+        idx = pd.date_range("2024-03-01", periods=20, freq="D")
+        t1 = Trade(entry_date=idx[2], exit_date=idx[8], entry_price=100.0,
+                   exit_price=110.0, ret=0.1, bars=6, direction=1, lots=3.0)
+        t2 = Trade(entry_date=idx[10], exit_date=idx[-1], entry_price=120.0,
+                   exit_price=115.0, ret=0.04, bars=9, direction=-1,
+                   open_position=True, lots=5.0)
+        fake = type("R", (), {"trades": [("X", t1), ("X", t2)]})()
+
+        pos, ent, ext, lines = ResultView._k_pos_from_trades(fake, idx)
+        want = np.zeros(20, dtype=int)
+        want[2:8] = 1          # 平仓那根（idx[8]）开盘就平了 ⇒ 不含
+        want[10:] = -1         # 未平仓 ⇒ 一直到最后一根
+        if not (pos == want).all():
+            raise RuntimeError(f"持仓区间不对：{pos.tolist()}")
+        if sorted(ent) != [2, 10]:
+            raise RuntimeError(f"开仓标记位置不对：{sorted(ent)}")
+        if sorted(ext) != [8]:
+            raise RuntimeError(f"平仓标记位置不对：{sorted(ext)}")
+        if abs(ent[2][0][1] - 3.0) > 1e-9 or abs(ent[10][0][1] - 5.0) > 1e-9:
+            raise RuntimeError("手数没带到图上（开仓标记要能手数）")
+        if len(lines) != 2 or lines[1][1] != len(idx) - 1:
+            raise RuntimeError(f"持仓连线不对：{lines}")
+
+        # 切「近 1 年」：开仓在区间之前、还没平的那笔，必须从第一根就显示持仓，
+        # 否则整段凭空消失，看着像空仓
+        sub = idx[5:]
+        pos2, ent2, ext2, _ = ResultView._k_pos_from_trades(fake, sub)
+        if not (pos2[:3] == 1).all():
+            raise RuntimeError(f"区间前开仓的那笔没延续进来：{pos2[:5].tolist()}")
+        if 0 in ent2:
+            raise RuntimeError("区间前的开仓不该被画成「第 1 根开仓」")
+        if sorted(ext2) != [3]:        # idx[8] 在子区间里是第 3 根
+            raise RuntimeError(f"子区间的平仓位置不对：{sorted(ext2)}")
+
+        return (f"同源映射：{int((pos != 0).sum())} 根持仓、"
+                f"开仓 {len(ent)} 个、平仓 {len(ext)} 个、"
+                f"手数 3/5 手带到图上、区间前开仓延续、连线到右边缘")
+
+    # 注意：`check()` 是立即执行的，这一项 import 了 Qt，
+    # 要等下面的 `_window` 把 QApplication 建起来之前再验（见文件末尾的 check）
+
     def _intrabar():
         """K 线内进出场（`run_intrabar_backtest`）。
 
@@ -4540,6 +4600,9 @@ def _run() -> tuple[bool, list[str]]:
                 f"对话渲染 {chat_info}，能力包 {skill_info}")
 
     check("构建主窗口（端到端）", _window)
+
+    # K 线与信号页的持仓映射：这一项 import 了 Qt，放在窗口之后跑
+    check("K线与信号：持仓与交易记录同源（含手数）", _chart_from_trades)
 
     return ok, lines
 
