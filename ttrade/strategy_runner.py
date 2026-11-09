@@ -1191,6 +1191,16 @@ class PortfolioRunner:
         st.ib_entry_long = lv["entry_long"]
         st.ib_entry_short = lv["entry_short"]
         st.ib_stop_dist = lv["stop_dist"]
+        # 「按止损金额定仓」：手数直接用**这一根的止损距离**算，
+        # 而不是 `stop_mult × ATR(stop_atr_n)` 反推 —— 后者要求
+        # `cfg.stop_mult` / `cfg.stop_atr_n` 和策略自己的参数一字不差，
+        # 改一个滑杆没同步另一个，仓位就按另一个风险在走，还不报错。
+        # 放在这里算：止损距离只有策略自己知道（它是 `atr_n × stop_mult`）
+        if (st.cfg.sizing or "").lower() == "risk":
+            d = float(lv["stop_dist"])
+            m = self._volume_multiple(st)
+            if d == d and d > 0 and m > 0:
+                st.lots = max(1, int(float(st.cfg.risk_amount or 0) / (d * m)))
         st.ib_fired = False
         st.ib_armed = True
 
@@ -1504,6 +1514,14 @@ class PortfolioRunner:
             return 0.0
         return price * mult * default_margin_rate(symbol)
 
+    def _volume_multiple(self, st: SlotState) -> float:
+        """这个合约每手多少单位（合约乘数）。拿不到返回 0 —— 调用方自己兜底。"""
+        q = self._contract_quote(st.underlying)
+        try:
+            return float(getattr(q, "volume_multiple", 0) or 0) if q is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
     def _lots(self, st: SlotState, price: float, atr_value: float) -> int:
         """这条策略满仓该下几手。
 
@@ -1522,10 +1540,7 @@ class PortfolioRunner:
             return max(1, int(cfg.volume or 1))
 
         q = self._contract_quote(st.underlying)
-        try:
-            mult = float(getattr(q, "volume_multiple", 0) or 0) if q is not None else 0.0
-        except (TypeError, ValueError):
-            mult = 0.0
+        mult = self._volume_multiple(st)
 
         if mode == "risk":
             stop_px = max(0.0, float(cfg.stop_mult or 0)) * float(atr_value or 0)

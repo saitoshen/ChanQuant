@@ -33,7 +33,7 @@ from ttrade.paths import user_dir
 
 # 按「止损金额」定仓的策略。它们把止损距离写在策略参数里（stop_mult × ATR），
 # 固定手数等于把风险敞口交给运气 —— 老配置没有 sizing 字段时按这条兜底。
-RISK_SIZED = {"sbbox_mini"}
+RISK_SIZED = {"sbbox_mini", "sbbox_ib"}
 
 LIB_FILE = "strategy_lib.json"
 PORT_FILE = "portfolio.json"

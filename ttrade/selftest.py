@@ -700,9 +700,81 @@ def _run() -> tuple[bool, list[str]]:
                 rs_opt.trades[1].entry_date) != 7:
             raise RuntimeError("开了 intrabar_reentry_samebar，多单应该在同一根就开出来")
 
+        # ---- 进场是「且」不是「或」：成交价必须同时越过两条线 ----
+        #
+        # 这两个条件都是「价格向上越过某个价位」，引擎取 max（做空取 min）作为
+        # 触发价 —— 越过 max 就同时越过了两条。看着像「二选一」的写法，其实
+        # 恰是「两个都成立」的盘中判据。所以每笔成交价减两条线都必须 > 0，
+        # 有一条 ≤ 0 就说明它只破了其中一条线。
+        from ttrade.strategies import run_strategy as _rs
+
+        # 先在**同一份被过滤过的行情**上算，再拿它跑引擎：`run_backtest` 会丢掉
+        # 开/收非正的行，用未过滤的数组按下标去对，会整体错位一格以上
+        u = _us_df()
+        u = u.dropna(subset=["open", "close"])
+        u = u[(u["open"] > 0) & (u["close"] > 0)]
+        o_ = _rs(u, "sbbox_ib")
+        dkey = (pd.DatetimeIndex(u.index) + pd.Timedelta(hours=6)).normalize()
+        bh = u["high"].rolling(20, min_periods=20).max().shift(1).to_numpy(float)
+        bl = u["low"].rolling(20, min_periods=20).min().shift(1).to_numpy(float)
+        dop = u["open"].groupby(dkey).transform("first").to_numpy(float)
+        pd_ = pd.DataFrame({"h": u["high"].to_numpy(float),
+                            "l": u["low"].to_numpy(float)}, index=dkey)
+        rng_ = (pd_["h"].groupby(level=0).max()
+                - pd_["l"].groupby(level=0).min()).shift(1)
+        ydy = pd.Series(dkey).map(rng_).to_numpy(float)
+        ru_ = run_backtest(o_, cfg, label="且/或")
+        if not ru_.trades:
+            raise RuntimeError("且/或自检样本没成交")
+        pos_of = {ts: i for i, ts in enumerate(ru_.equity.index)}
+        bad = []
+        for tr in ru_.trades:
+            i = pos_of[tr.entry_date]
+            px = tr.entry_price
+            # 用 `>=` 不是 `>`：触发价取的是两条线里更高的那条，成交价正好**落在**
+            # 那条线上（滑点为 0 时是精确相等）。「碰到就算突破」是策略自己的口径
+            # （`hi >= up`），这里跟着它
+            eps = 1e-9
+            if tr.direction > 0:
+                ok = px >= bh[i] - eps and px >= dop[i] + 0.4 * ydy[i] - eps
+            else:
+                ok = px <= bl[i] + eps and px <= dop[i] - 0.4 * ydy[i] + eps
+            if not ok:
+                bad.append((str(tr.entry_date), tr.direction, round(px, 4),
+                            round(bh[i], 4), round(dop[i] + 0.4 * ydy[i], 4)))
+        if bad:
+            raise RuntimeError(
+                f"{len(bad)}/{len(ru_.trades)} 笔进场只满足了其中一条线，"
+                f"例如 {bad[0]}")
+
+        # ---- 按止损金额定仓：手数必须用这一笔的止损距离算 ----
+        # 手数 = risk_amount ÷ (stop_dist × 乘数)。走「先除 stop_mult 还原 ATR
+        # 再乘回去」那条老路的话，cfg.stop_mult 和策略参数不一致就会按另一个
+        # 风险下单，而且不报错
+        cfg_risk = BacktestConfig(initial_cash=1_000_000.0, sizing="risk",
+                                  risk_amount=10_000.0, multiplier=10.0,
+                                  fee_per_lot=0.0, tick_size=0.0, slippage=0.0,
+                                  stop_mult=1.5)
+        rr_risk = run_backtest(d, cfg_risk, label="按止损金额")
+        want_lots = int(10_000.0 / (4.0 * 10.0))     # stop_dist=4、乘数 10
+        if not rr_risk.trades or int(rr_risk.trades[0].lots) != want_lots:
+            raise RuntimeError(
+                f"按止损金额定仓的手数不对：{rr_risk.trades[0].lots if rr_risk.trades else 0}"
+                f"，应为 {want_lots}")
+        cfg_risk2 = BacktestConfig(initial_cash=1_000_000.0, sizing="risk",
+                                   risk_amount=10_000.0, multiplier=10.0,
+                                   fee_per_lot=0.0, tick_size=0.0, slippage=0.0,
+                                   stop_mult=99.0)   # 改 stop_mult 不该影响手数
+        rr_risk2 = run_backtest(d, cfg_risk2, label="按止损金额·改倍数")
+        if int(rr_risk2.trades[0].lots) != want_lots:
+            raise RuntimeError(
+                f"手数跟着 cfg.stop_mult 变了（{rr_risk2.trades[0].lots} vs {want_lots}）"
+                "—— 说明还在按 ATR 反推，没直接用 stop_dist")
+
         return (f"触发价成交 {t.entry_price:g}、止损 {r2.trades[0].exit_price:g}、"
                 f"同根止损开关生效、平仓当根不反手（多/空两侧都验，下一根才开）、"
-                f"无列时走老路径")
+                f"进场两条线都是「且」（{len(ru_.trades)} 笔逐笔验）、"
+                f"按止损金额定仓 {want_lots} 手、无列时走老路径")
 
     check("K 线内进出场（触发价 / 止损 / 老路径不变）", _intrabar)
 

@@ -375,6 +375,35 @@ def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float
     return float(max(float(cfg.initial_cash or equity or 0.0), 0.0) / (price * mult))
 
 
+def size_lots_intrabar(cfg: BacktestConfig, price: float, equity: float,
+                       stop_dist: float, mult: float) -> float:
+    """K 线内这一族的手数。
+
+    `risk`（按止损金额定仓）口径**直接用策略给的 `stop_dist`**：
+
+        手数 = risk_amount ÷ (stop_dist × 合约乘数)
+
+    这样「打到止损就亏 `risk_amount`」是字面意义上的成立 —— 因为引擎用的止损
+    距离和算手数用的止损距离是同一个数。
+
+    老路径的 `risk` 是「倍数 × ATR(stop_atr_n)」反推出来的，而这一族本来就有
+    `stop_dist`。反推要多绕一层：先除 `cfg.stop_mult` 还原 ATR，再乘回去。
+    `cfg.stop_mult` 填得和策略参数不一致（策略自己的 stop_mult 是可调参数），
+    仓位就按另一个风险在走，而且不会报错 —— 这正是「止损金额分配仓位」最容易
+    出错的地方，所以这里绕开反推。
+    """
+    mode = (cfg.sizing or "").lower()
+    if mode == "risk" and _finite(stop_dist) and float(stop_dist) > 0:
+        per = float(stop_dist) * float(mult or 1.0)
+        if per > 0:
+            # 和 `size_lots` 同一个下限：至少 1 手，凑不出 1 手就不做
+            return float(max(1, int(float(cfg.risk_amount or 0) / per)))
+    a = 0.0
+    if _finite(stop_dist) and float(cfg.stop_mult or 0) > 0:
+        a = float(stop_dist) / float(cfg.stop_mult)
+    return size_lots(cfg, price, equity, a)
+
+
 def _note_col(data: pd.DataFrame, name: str) -> np.ndarray | None:
     """取一列逐根的原因说明，转成 object 数组；没有这一列返回 None。
 
@@ -543,11 +572,10 @@ def run_intrabar_backtest(data: pd.DataFrame, cfg: BacktestConfig,
         nonlocal cost_total, notional_total
         sp = _slip(raw_px, i)
         fill = raw_px + sp if direction > 0 else raw_px - sp
-        # risk 口径要的是 ATR 本身，而这一族给的是「倍数 × ATR」后的距离
-        a = 0.0
-        if _finite(stop_d[i]) and float(cfg.stop_mult or 0) > 0:
-            a = float(stop_d[i]) / float(cfg.stop_mult)
-        q = size_lots(cfg, fill, cash, a)
+        # 手数：`risk` 口径按这一笔的**实际止损距离**算（见 `size_lots_intrabar`），
+        # 其余口径照旧。不能先反推 ATR 再走 `size_lots` —— 那要多绕一层，
+        # 且依赖 `cfg.stop_mult` 和策略参数一致
+        q = size_lots_intrabar(cfg, fill, cash, stop_d[i], mult)
         if q <= 0:
             return False
         fee = cfg.fee_amount(q, mult, fill)

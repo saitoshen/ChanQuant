@@ -3433,6 +3433,9 @@ class MainWindow(QMainWindow):
             w.setVisible(on)
 
     def _on_size_changed(self, *_a) -> None:
+        # 用户自己动过仓位口径 ⇒ 之后切策略不再自动拨回「按止损金额」
+        if not getattr(self, "_sizing_auto", False):
+            self._size_user = True
         self._sync_size()
         self._apply_sizing(self.cfg)
         # 截面的名义敞口是从这一组控件推出来的，摘要要跟着变
@@ -3845,7 +3848,33 @@ class MainWindow(QMainWindow):
         spec = STRATEGIES[key]
         self.lbl_desc.setText(spec.desc)
         self._rebuild_params(spec)
+        self._auto_size_for(key)
         self._schedule(immediate=True)
+
+    def _auto_size_for(self, key: str) -> None:
+        """选了「按止损金额定仓」的策略，就把它切成那个口径。
+
+        这些策略的止损距离写在**策略参数**里（`atr_n` × `stop_mult`），手数再用
+        「资金分配 / 固定手数」定，等于风险大小交给运气 —— 同一个止损距离下，
+        本金 100 万和 50 万下的「每笔亏多少钱」差一倍。
+
+        只在用户**没手动改过**仓位口径时自动切：手动选过「资金分配」就尊重他的
+        选择，不每次切策略都把它拨回去。恢复配置（`_booting`）期间也不动 ——
+        那时候下面会按存档里的值灌一遍。
+        """
+        if getattr(self, "_booting", False) or getattr(self, "_size_user", False):
+            return
+        if key not in getattr(SStore, "RISK_SIZED", set()):
+            return
+        idx = self.cb_size.findData("risk")
+        if idx < 0 or self.cb_size.currentIndex() == idx:
+            return
+        self._sizing_auto = True
+        try:
+            self.cb_size.setCurrentIndex(idx)
+        finally:
+            self._sizing_auto = False
+        self._sync_size()
 
     def _rule_reverse(self) -> bool:
         """「反向交易」有没有勾上。只有规则族用得上，其它族一律 False。"""
