@@ -672,6 +672,10 @@ class ResultView(QObject):
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
         for i in range(1, 7):
             hh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        # 因子名最长能到「时段 · 非活跃时段反转 13:30-14:00」，而右边六列
+        # （IC / ICIR / IC>0 / t / 单调 / 换手）默认各占 60 来像素，430px 的面板
+        # 留给名字不到 40px —— 一眼全是「时段 · 非活…」。面板本身加宽到 620
+        # （见下面 `setSizes`），名字列才能完整露出来；真遇到更长的，悬停看全名
         ll.addWidget(self.tbl_factor, 1)
         splitter.addWidget(left)
 
@@ -680,7 +684,8 @@ class ResultView(QObject):
         splitter.addWidget(self.canvas_f)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([430, 760])
+        # 左边放表格（因子名要能读完），右边四格图。左右都可以拖
+        splitter.setSizes([620, 700])
 
         lay.addWidget(splitter)
 
@@ -2263,7 +2268,12 @@ class ResultView(QObject):
                 return it
 
             name = ("● " if on else "　") + str(r["label"])
-            self.tbl_factor.setItem(i, 0, cell(name, False, on, "#1d4ed8" if on else None))
+            it_name = cell(name, False, on, "#1d4ed8" if on else None)
+            # 列宽再宽也挡不住更长的名字 —— 悬停给全名和因子说明
+            spec = factors.FACTORS.get(str(r.get("key") or ""))
+            it_name.setToolTip(
+                f"{r['label']}" + (f"\n\n{spec.desc}" if spec is not None else ""))
+            self.tbl_factor.setItem(i, 0, it_name)
 
             ic = r.get("ic")
             if pd.notna(ic):
