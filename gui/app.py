@@ -1589,13 +1589,13 @@ class MainWindow(QMainWindow):
             cfg.name = lib.title()
             if vol > 0:
                 cfg.sizing, cfg.volume = "fixed", vol
-            cfg.note = note
+            cfg.note = self._agent_short_note(note, cfg)
             return cfg, ""
 
         # A 股代码三种写法（`600000` / `600000.SH` / `SSE.600000`）先收敛，
         # 否则模型说「用茅台回测双均线」会被回一句「品种不存在」
         sym, ex = SStore.normalize_symbol(p.get("symbol", ""), p.get("exchange", ""))
-        return SStore.StrategyConfig(
+        cfg = SStore.StrategyConfig(
             symbol=sym,
             exchange=ex,
             period=p.get("period", "1d"),
@@ -1604,14 +1604,33 @@ class MainWindow(QMainWindow):
             # Agent 明说了几手就按固定手数，没说就走「分配资金」口径
             sizing="fixed" if vol else "capital",
             volume=vol or 1,
-            note=note,
-        ), ""
+        )
+        # 交易所确定之后才能判市场，所以 note 放在构造完再填（见下）
+        cfg.note = self._agent_short_note(note, cfg)
+        return cfg, ""
+
+    @staticmethod
+    def _agent_short_note(note: str, cfg) -> str:
+        """Agent 造出来的配置该不该允许做空。
+
+        `note` 这个字段是「做空标记」（`"short"` = 允许做空）。它以前还被当成
+        备注文本传过 —— `_agent_config(p, note="Agent 回测")` —— 而那个字符串
+        从来没被显示过，实际效果只是「悄悄退化成只做多」。期货策略绝大多数是
+        多空双向的（双均线、唐奇安、MACD），只做多等于跑的是另半个策略，
+        收益对不上策略说明，而且**不报错**。
+
+        现在：Agent 明确说 short 就照办，没说就按市场默认（期货勾上、A 股 / 美股
+        不勾），判据统一走 `replay.default_allow_short()`。
+        """
+        if note == "short" or replay.default_allow_short(cfg):
+            return "short"
+        return ""
 
     def _on_agent_trade(self, action) -> None:
         """Agent 给了交易动作。动作**已经在界面上确认过**才走到这里。"""
         p = action.payload
         if action.kind == "backtest":
-            cfg, why = self._agent_config(p, note="Agent 回测")
+            cfg, why = self._agent_config(p, note="")
             if cfg is None:
                 self.agent_page.notify(why, bad=True)
                 return
@@ -3075,10 +3094,17 @@ class MainWindow(QMainWindow):
 
         内置的排在前面、用户注册的排后面 —— 库里越加越多之后，用户自己的东西
         不该把内置那几套挤到下面去。
+
+        按市场过滤：`StrategySpec.markets` 非空时只在列出的市场里出现。A 股
+        选股策略挂在期货品种上只会缺列报错，摆在期货的下拉里就是让人点一次、
+        看一次报错。**切市场时必须重来一遍**（`_on_market_changed` 里调），
+        否则下拉里留着上一个市场的策略。
         """
         keep = self.cb_strategy.currentData()
-        builtin = [k for k in STRATEGIES if not STRATEGIES[k].code]
-        mine = [k for k in STRATEGIES if STRATEGIES[k].code]
+        allowed = [k for k in STRATEGIES
+                   if not STRATEGIES[k].markets or self.market in STRATEGIES[k].markets]
+        builtin = [k for k in allowed if not STRATEGIES[k].code]
+        mine = [k for k in allowed if STRATEGIES[k].code]
         self.cb_strategy.blockSignals(True)
         self.cb_strategy.clear()
         for key in builtin + mine:
@@ -3523,6 +3549,10 @@ class MainWindow(QMainWindow):
             self._fill_single_combo()
             self._fill_tfactor_combo()
             self._fill_multi_table()
+        # 规则策略下拉也要按市场重填：`a_vol_breakout` 这类只标了 cn_stock 的
+        # 策略，切到期货之后还留在下拉里就是「选了必报错」
+        if hasattr(self, "cb_strategy"):
+            self._fill_strategy_combo()
         if hasattr(self, "cb_pool_factor"):
             self._fill_factor_combo(self.cb_pool_factor, "log_amount_20")
         # 触发因子也得重填：期货上的展期 / 期权因子在美股上算不出来，留着就是

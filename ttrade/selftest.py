@@ -667,6 +667,65 @@ def _run() -> tuple[bool, list[str]]:
 
     check("A股全市场组合回测的量纲与板块编码", _a_rule)
 
+    def _short_default():
+        """内置策略「允许做空」的默认勾选：期货勾上，A 股 / 美股不勾。
+
+        这是容易悄悄回归的一处：判据原来散在三个地方（研究页读市场表、策略库
+        读 `note == "short"`、内置模板在 `to_config` 里直接把 note 清空），
+        结果 34 条期货内置模板全部默认**只做多** —— 而双均线 / 唐奇安 / MACD
+        的说明本身就是「上穿做多、下穿做空」，不勾做空只剩半个策略。
+
+        这一项三条腿都要钉住：① 判据函数本身；② 34 条期货模板的 `note`；
+        ③ A 股模板必须**不**带 short（融券做空对散户不成立）。
+        """
+        from ttrade import replay as RP
+        from ttrade import strategy_templates as T
+        from ttrade.strategy_store import StrategyConfig
+
+        cases = [
+            (StrategyConfig(symbol="RB", exchange="SHFE", period="1d"), True, "期货"),
+            (StrategyConfig(symbol="600000", exchange="SSE", period="1d"), False, "A股"),
+            (StrategyConfig(symbol="AAPL", exchange="", period="1d"), False, "美股"),
+        ]
+        for cfg, want, name in cases:
+            got = RP.default_allow_short(cfg)
+            if bool(got) != want:
+                raise RuntimeError(
+                    f"{name}的「允许做空」默认值错：{got} != {want}")
+
+        fut = []
+        stock = []
+        for k in T.keys():
+            c = T.to_config(k)
+            if c is None:
+                continue
+            if c.market == "cn_stock":
+                if c.note == "short":
+                    raise RuntimeError(f"{k} 是 A 股模板，不该默认允许做空")
+                stock.append(k)
+            else:
+                if c.note != "short":
+                    raise RuntimeError(
+                        f"期货模板 {k} 没默认勾「允许做空」（note={c.note!r}）")
+                fut.append(k)
+        if len(fut) < 30:
+            raise RuntimeError(f"期货模板只有 {len(fut)} 条，样本不对")
+        if not stock:
+            raise RuntimeError("没有 A 股内置模板")
+
+        # A 股策略必须标了市场，否则会出现在期货的策略下拉里、点一次报一次错
+        from ttrade.strategies import STRATEGIES
+
+        spec = STRATEGIES.get("a_vol_breakout")
+        if spec is None:
+            raise RuntimeError("a_vol_breakout 没注册成内置策略")
+        if tuple(spec.markets) != ("cn_stock",):
+            raise RuntimeError(f"a_vol_breakout 的 markets 不对：{spec.markets}")
+        return (f"期货 {len(fut)} 条模板默认勾做空、A 股 {len(stock)} 条不勾；"
+                f"a_vol_breakout 限定 {spec.markets}")
+
+    check("内置策略「允许做空」的默认勾选", _short_default)
+
     def _chart_from_trades():
         """K 线与信号页的持仓/标记必须**与交易记录同源**。
 

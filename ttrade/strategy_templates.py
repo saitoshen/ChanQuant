@@ -69,6 +69,10 @@ GROUPS: list[tuple[str, str, str]] = [
     ("cross", "截面 · 多空对冲",
      "一次比一批品种的强弱，多强的、空弱的。和前面几组不是一个物种：信号来自"
      "品种之间的横向比较，不是单个品种的时间序列。"),
+    ("stock", "A股 · 选股条件",
+     "另一类东西：判据是「这只票今天符不符合一组筛选条件」（估值、量能、"
+     "涨跌幅、板块），不是均线或因子打分。研究页在一只票上把它画出来是为了"
+     "看清信号长什么样；真正的用法是 `run_stock_screen.py` 的全市场组合回测。"),
 ]
 
 GROUP_LABEL = {k: label for k, label, _ in GROUPS}
@@ -574,6 +578,32 @@ _RAW: list[dict] = [
         principal=10000000.0,
         capital_pct=50.0,
     ),
+    dict(
+        key='tpl_a_vol1d', name='A股·放量启动（八条件选股）', group='stock',
+        teach=(
+            "判据是一组筛选条件，不是指标：非 ST、非北交所、昨日未涨停、股价<80、"
+            "今日涨幅 0~9.8%、今日量≥昨日 3 倍、PE(TTM) 0~25、成交额≥5000 万。"
+            "八条同时满足才买，持有 5 根后开盘卖。\n\n"
+            "研究页这里只是把它在一只票上**画出来**，让你看信号长什么样。真正的"
+            "用法是 `run_stock_screen.py` 的全市场组合回测 —— 平台的回测引擎是逐"
+            "品种的，表达不了「今天符合条件的是这 30 只、明天换成另外 25 只」这种"
+            "动态持仓，拆成 5000 只各跑一遍再平均等于每只权重 1/5000。\n\n"
+            "实测结论（2021-11 ~ 2026-11，PE<25）：累计 −47.2%，全市场等权基准"
+            "+167.1%。纯选股超额 H=5 只有 −8.9bp，而单次往返成本 21bp —— 毛 edge "
+            "量级小于成本量级，这类高换手选股没有生存空间。留着它是当**反面样本**："
+            "同一份框架里改条件重跑，就知道新想法是不是也这样。"
+        ),
+        symbol="600000",
+        exchange="SSE",
+        period="1d",
+        family="rule",
+        rule_key="a_vol_breakout",
+        rule_params={"max_price": 80.0, "gain_lo": 0.0, "gain_hi": 9.8,
+                     "vol_mult": 3.0, "amt_min": 5000.0,
+                     "pe_min": 0.0, "pe_max": 25.0, "hold_days": 5},
+        capital_pct=30.0,
+        range_years=5.0,
+    ),
 ]
 
 BY_KEY: dict[str, dict] = {t["key"]: t for t in _RAW}
@@ -652,6 +682,16 @@ def summary(key: str) -> str:
     return " · ".join(bits)
 
 
+def _default_allow_short(cfg) -> bool:
+    """「允许做空」的默认值。判据在 `replay.default_allow_short()`，这里只做
+    一次懒加载 —— 本模块被界面填充列表直接调用，不该为了一个布尔值把
+    pandas / backtest 拉进启动路径（`to_config` 本来也是懒加载 `strategy_store`）。
+    """
+    from ttrade import replay
+
+    return replay.default_allow_short(cfg)
+
+
 def to_config(key: str, **overrides):
     """把模板还原成一份完整的 `StrategyConfig`。
 
@@ -691,7 +731,12 @@ def to_config(key: str, **overrides):
     d.update(overrides)
     cfg = StrategyConfig.from_dict(d)
     cfg.created = ""          # 模板没有「创建时间」，别让界面显示成今天
-    cfg.note = ""
+    # **允许做空**：期货模板默认勾上，A 股模板不勾。
+    # 这里原来写的是 `cfg.note = ""` —— 等于 34 条期货模板全部默认只做多，
+    # 而双均线 / 唐奇安 / MACD 这些策略的说明本身是「上穿做多、下穿做空」，
+    # 不勾做空就只剩半个策略，回测出来的净值和策略描述对不上，用户只会认为
+    # 程序算错了。判据统一走 `replay.default_allow_short()`。
+    cfg.note = "short" if _default_allow_short(cfg) else ""
     cfg.enabled = False
     return cfg
 

@@ -61,6 +61,22 @@ def market_of(cfg) -> str:
     return "cn" if ex else "us"
 
 
+def default_allow_short(cfg) -> bool:
+    """「允许做空」的默认值：**期货勾上，A 股 / 美股不勾**。
+
+    这是唯一判据，别再在每个入口各写一份。以前是三处各写各的：
+    研究页读 `MARKETS[市场]["allow_short"]`、策略库读 `note == "short"`、
+    内置模板在 `to_config()` 里直接把 `note` 清空 —— 结果同一条期货策略换个
+    入口进来，勾选状态就不一样：**34 条内置模板全部默认不勾**，而期货策略
+    绝大多数是多空双向的（双均线、唐奇安、MACD 都要做空），不勾等于只剩半个
+    策略，回测收益直接对不上策略说明。
+
+    A 股不勾是因为融券做空对散户基本不成立（`cn_stock` 的 `allow_short` 本来
+    就是 False）；美股同理（`MARKET_COST` 里也是 False）。
+    """
+    return bool(MARKET_COST.get(market_of(cfg), {}).get("allow_short", False))
+
+
 def split_key(key: str, market: str = "") -> tuple[str, str]:
     """`StrategyConfig.key()` 的逆运算：把 `RB_SHFE` / `SSE.600000` / `AAPL`
     拆回 (代号, 交易所)。

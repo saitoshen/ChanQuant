@@ -1132,6 +1132,11 @@ class StrategySpec:
     param_meta: dict = field(default_factory=dict)
     desc: str = ""
     bidirectional: bool = True   # 是否支持做空
+    # 只在这些市场里有意义（`us` / `cn` / `cn_stock`）。**空 = 不限制**。
+    # 研究页的策略下拉按它过滤：A 股选股策略挂在期货品种上跑不出东西（缺
+    # `pct_chg` / `pe_ttm` / `is_st` 这些列，会直接报错），摆在期货的下拉里
+    # 只是让人点一次、看一次报错。
+    markets: tuple = ()
     # 是否按「K 线内触发价」成交（回测走 `run_intrabar_backtest`，实盘走
     # `PortfolioRunner._intrabar_tick`）。为真时策略必须输出 `entry_long` /
     # `entry_short` / `stop_dist` / `exit_long` / `exit_short` 这几列 ——
@@ -1386,6 +1391,7 @@ STRATEGIES: dict[str, StrategySpec] = {
             "hold_days": (1, 30, 1),
         },
         bidirectional=False,        # A 股融券做空不现实，只做多
+        markets=("cn_stock",),      # 只能跑 A 股日线，别摆在期货的下拉里
         param_labels={"hold_days": "持有(根)"},
         desc="八条同时满足才买：非 ST（按**当时**的曾用名判）、非北交所、昨日未涨停、"
              "股价低于上限、今日涨幅在上限内、今日成交量≥昨日的 N 倍、PE(TTM) 在上限内、"
