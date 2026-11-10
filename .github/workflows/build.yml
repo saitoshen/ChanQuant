@@ -140,7 +140,13 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.archive }}
           if-no-files-found: error
-          retention-days: 30
+          # **只留 1 天**。这个 artifact 的唯一用途是交给下面的 release job 拼
+          # Release 资产，几分钟就下走了。原先写 30 天，每次发版堆 1.07 GB，
+          # 攒到 161 个 / 35.7 GB 之后把账户的 artifact 配额打爆 ——
+          # 所有平台都卡在 upload-artifact 这一步，报
+          # "Artifact storage quota has been hit"，整个 Release 被跳过。
+          # 真包在 Release 里，不靠 artifact 长期留存。
+          retention-days: 1
 
   release:
     name: 发布 Release
