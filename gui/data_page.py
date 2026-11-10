@@ -239,10 +239,16 @@ class TqWorker(QObject):
                         # 整个挂牌期。代价是串行 —— 实测 0.45 秒/合约，
                         # 全量 21.3 万个约 27 小时，所以必须说清 ETA。
                         if free_mode:
+                            # 三个周期的量级差太多，笼统写「约 27 小时」会吓跑
+                            # 只想补 5m 股指期权的人
+                            hint = {"1d": "全量约 27 小时",
+                                    "1h": "全量约 19 小时",
+                                    "5m": "5m 只有中金所 IO/MO/HO，约十几分钟"
+                                    }.get(self.period, "全量要几小时")
                             self.progress.emit(
                                 0, 0,
-                                "期权：免费账户 → 逐合约 get_kline_serial，"
-                                "全量约 27 小时；可随时取消，再点一次续传")
+                                f"期权：免费账户 → 逐合约 get_kline_serial，"
+                                f"{hint}；可随时取消，再点一次续传")
                         o = OPT.update(
                             sess, periods=(self.period,),
                             start=OPT.DEFAULT_START,
