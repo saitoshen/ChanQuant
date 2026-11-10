@@ -89,6 +89,130 @@ def _run() -> tuple[bool, list[str]]:
 
     check("读取期货行情（含复权）", _load_cn)
 
+    def _opt_free_path():
+        """免费账户（无 tq_dl）的期权下载**不能被跳过**。
+
+        回归点：数据管理页原来一看没有 `tq_dl` 就把期权整段跳过。实测免费账号
+        对已摘牌合约照样能 `get_kline_serial`，所以要降级到逐合约路径。
+
+        全程离线：假 api + 临时 DuckDB（`TRENDDESK_OPT_DB`），不碰真库。
+        """
+        import shutil
+        import tempfile
+
+        import pandas as pd
+
+        from ttrade import optfetch as OF
+        from ttrade import optstore as OS
+
+        tmp = tempfile.mkdtemp(prefix="optfree_")
+        old_env = os.environ.get("TRENDDESK_OPT_DB")
+        old_csv = OF.export_csv
+        os.environ["TRENDDESK_OPT_DB"] = os.path.join(tmp, "opt.duckdb")
+        # export_csv 会往真实 data 目录写，自检里禁掉
+        OF.export_csv = lambda *a, **k: ""
+
+        und = "DCE.m2401"
+        calls = ["DCE.m2401-C-3000", "DCE.m2401-P-3000"]
+        # 到期日 = 2024-01-18：最后一根 01-17，正好落在「到期前 1 天」之内，
+        # 第二次跑才会被判成「已是最新」
+        expire_s = pd.Timestamp("2024-01-18 15:00:00", tz="Asia/Shanghai").value / 1e9
+
+        def _kl(base: float, nan: bool = False) -> pd.DataFrame:
+            # 天勤的 `datetime` 是 **UTC 纳秒整数**。别用
+            # `DatetimeIndex.astype("int64")` —— 带时区的索引会按 pandas 的
+            # 解析精度给成微秒，日期直接跑到 1970 年，结果被区间过滤成空表
+            t0 = pd.Timestamp("2024-01-15 00:00:00", tz="Asia/Shanghai").value
+            ns = [t0 + i * 86_400 * 10 ** 9 for i in range(3)]
+            px = [float("nan")] * 3 if nan else [base, base + 1, base + 2]
+            return pd.DataFrame({
+                "datetime": ns,
+                "open": px, "high": px, "low": px, "close": px,
+                "volume": 5, "open_oi": 7, "close_oi": 8,
+            })
+
+        class _Q:
+            expire_datetime = expire_s
+            underlying_symbol = und
+
+        class _Api:
+            def __init__(self, pro: bool = False) -> None:
+                self.pro = pro
+                self.asked: list[int] = []
+
+            class _Auth:
+                def __init__(self, pro: bool) -> None:
+                    self.pro = pro
+
+                def _has_feature(self, name: str) -> bool:
+                    # 免费账户：tq_dl 没有；其他功能位也一律没有
+                    return self.pro
+
+            @property
+            def _auth(self):
+                return _Api._Auth(self.pro)
+
+            def query_quotes(self, ins_class=None, exchange_id=None, expired=None):
+                return list(calls) if exchange_id == ["DCE"] else []
+
+            def get_quote(self, sym):
+                return _Q()
+
+            def get_kline_serial(self, sym, dur, data_length=0):
+                self.asked.append(int(data_length))
+                if sym.endswith("-P-3000"):        # 深度虚值，从没成交
+                    return _kl(0, nan=True)
+                return _kl(1.0)
+
+        class _Sess:
+            def __init__(self, api) -> None:
+                self.api = api
+
+            def get(self):
+                return self.api
+
+            def reset(self) -> None:
+                pass
+
+        try:
+            api = _Api(pro=False)
+            # 第一条腿：`update` 自己认出免费账户并降级（不是调用方硬传 free=True）
+            st = OF.update(_Sess(api), periods=("1d",), incremental=True)
+            one = st["1d"]
+            assert one.get("free") is True, f"没走免费路径：{one}"
+            assert one["rows"] == 3, f"写入 {one['rows']} 行，应为 3"
+            assert max(api.asked) <= 10000, f"请求了 {max(api.asked)} 根"
+
+            with OS.connect(read_only=True) as con:
+                n_meta = con.execute("SELECT count(*) FROM option_meta").fetchone()[0]
+                n_bar = con.execute("SELECT count(*) FROM option_bars").fetchone()[0]
+                n_und = con.execute(
+                    "SELECT count(*) FROM option_underlying").fetchone()[0]
+            assert n_meta == 2, f"合约 {n_meta} 个，应为 2（含没成交的那个）"
+            assert n_bar == 3, f"K 线 {n_bar} 行"
+            assert n_und == 3, f"标的 {n_und} 行"
+
+            # 第二条腿：断点续传 —— 已下到到期日前的链要跳过
+            st2 = OF.update(_Sess(api), periods=("1d",), incremental=True)
+            assert st2["1d"]["skipped"] == 1, f"没跳过：{st2['1d']}"
+            assert st2["1d"]["rows"] == 0, f"重复写入 {st2['1d']['rows']} 行"
+
+            # 第三条腿：专业账户不能走免费路径（否则白降级）
+            from ttrade import tqfetch as TQF
+            assert TQF.can_download(_Api(pro=False)) is False
+            assert TQF.can_download(_Api(pro=True)) is True
+            return (f"免费账户降级写入 {one['rows']} 行、{n_meta} 个合约；"
+                    f"重跑跳过 {st2['1d']['skipped']} 条链")
+        finally:
+            OF.export_csv = old_csv
+            if old_env is None:
+                os.environ.pop("TRENDDESK_OPT_DB", None)
+            else:
+                os.environ["TRENDDESK_OPT_DB"] = old_env
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    check("期权免费路径（无 tq_dl 也照下）", _opt_free_path)
+
     def _tq_data():
         """天勤分钟级仓库：能读、复权因子与切换表一致。
 

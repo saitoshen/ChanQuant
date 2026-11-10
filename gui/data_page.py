@@ -188,14 +188,14 @@ class TqWorker(QObject):
                 # 只补一天也一样被拦，很容易被误判成「回溯设得太长」。
                 free_mode = not TQ.can_download(api)
                 if free_mode:
-                    # 免费账户只有 `get_kline_serial`，单次上限 8000 根。
+                    # 免费账户只有 `get_kline_serial`，单次上限 RECENT_BARS 根。
                     # 这句话必须写清「深度被账户等级限住」，否则用户看到后面的
-                    # 「期权已跳过」「真实合约 0 个」会以为程序还在走专业版接口。
+                    # 「真实合约 0 个」会以为程序还在走专业版接口。
                     # 深度按库里实测（5m 64 根/日、1h 6.6 根/日）折算。
                     self.progress.emit(
                         0, 0,
                         "账户等级：免费版（无 tq_dl）→ 改用 get_kline_serial，"
-                        "单次上限 %d 根（日线全量 / 1h 约 5 年 / 5m 约 5.9 个月）"
+                        "单次上限 %d 根（日线全量 / 1h 约 6 年 / 5m 约 7 个月）"
                         % TQ.RECENT_BARS)
                 else:
                     self.progress.emit(0, 0, "账户等级：专业版（可下完整历史）")
@@ -228,29 +228,33 @@ class TqWorker(QObject):
                 # 期权放在行情之前：它自己会反复重建会话，混在补行情中间做
                 # 会把主连那轮的连接状态搅乱
                 n_opt = 0
-                opt_denied = False
+                opt_note = ""
                 if self.options:
                     self.progress.emit(0, 0, "更新期权（隐含波动率）…")
                     try:
                         from ttrade import optfetch as OPT
-                        if not TQ.can_download(api):
-                            # 期权是**唯一**没有「最近 N 根」替代路径的品种：K 线
-                            # 能靠 get_kline_serial 拿 8000 根，期权链的隐含波动率
-                            # 必须走全量历史下载。所以免费账户就是拿不到，不是失败。
-                            opt_denied = True
+                        # **免费账户不再跳过期权**。没有 `tq_dl` 就走逐合约
+                        # `get_kline_serial`（`OPT.update` 自己判断走哪条路）：
+                        # 已摘牌合约照样有数据，1d 一个合约一次请求就覆盖它的
+                        # 整个挂牌期。代价是串行 —— 实测 0.45 秒/合约，
+                        # 全量 21.3 万个约 27 小时，所以必须说清 ETA。
+                        if free_mode:
                             self.progress.emit(
                                 0, 0,
-                                "期权跳过：免费账户没有全量历史下载权限（tq_dl），"
-                                "而期权没有「最近 N 根」替代路径 —— 属正常降级，"
-                                "不影响 K 线与基本面")
-                        else:
-                            o = OPT.update(
-                                sess, periods=(self.period,),
-                                start=OPT.DEFAULT_START,
-                                progress=lambda a, b, m: self.progress.emit(a, b, m),
-                                cancel=lambda: self._cancel,
-                            ).get(self.period, {})
-                            n_opt = int(o.get("rows") or 0)
+                                "期权：免费账户 → 逐合约 get_kline_serial，"
+                                "全量约 27 小时；可随时取消，再点一次续传")
+                        o = OPT.update(
+                            sess, periods=(self.period,),
+                            start=OPT.DEFAULT_START,
+                            progress=lambda a, b, m: self.progress.emit(a, b, m),
+                            cancel=lambda: self._cancel,
+                        ).get(self.period, {})
+                        n_opt = int(o.get("rows") or 0)
+                        if free_mode:
+                            opt_note = ("　【期权】免费账户：逐合约取最近 %d 根"
+                                        % TQ.RECENT_BARS)
+                            if o.get("skipped"):
+                                opt_note += f"，已是最新跳过 {o['skipped']} 条链"
                     except Exception as exc:      # noqa: BLE001
                         self.progress.emit(0, 0,
                                            f"期权更新失败：{str(exc)[:60]}，继续补行情")
@@ -352,16 +356,18 @@ class TqWorker(QObject):
                     extra += f"；{len(bad)} 个品种有合约没下全（{shown}），再点一次会续传"
             note = ""
             if free_mode:
-                note = ("　【免费账户】单次只能取 8000 根 K 线：主连和真实合约的日线"
-                        "都是完整的，1h 约 5 年、5m 只拿得到每个合约最后约 6 个月。")
+                note = (f"　【免费账户】单次只能取 {TQ.RECENT_BARS} 根 K 线：主连和"
+                        "真实合约的日线都是完整的，1h 约 6 年、5m 只拿得到每个合约"
+                        "最后约 7 个月。")
                 if self.period in ("5m", "15m", "30m"):
                     note += " 展期因子在早期合约上会退回日线口径。"
             if self.edb and n_edb:
                 note += f"　【基本面】本次写入 {n_edb:,} 行（data_tq/edb.duckdb）"
             if self.options and n_opt:
                 note += f"　【期权】本次写入 {n_opt:,} 行（data_tq/option.duckdb）"
-            elif self.options and opt_denied:
-                note += "　【期权】免费账户不可用（已跳过，属正常）"
+            elif self.options:
+                note += "　【期权】本次没有新数据（已下完的合约会跳过）"
+            note += opt_note
             self.done.emit(
                 f"天勤 {period_label} {head}：{len(pairs)} 个品种，本次写入 {rows:,} 行{extra}；"
                 f"新补切换表 {n_switch} 个，校正换月日 {moved} 处，刷新复权 {touched} 个品种周期"
@@ -803,11 +809,13 @@ class DataPage(QWidget):
         # 是几百 GB，而 5m 期权的用途只有股指日内，没必要全下。
         self.chk_tq_options = QCheckBox("一并更新期权（隐含波动率）")
         self.chk_tq_options.setToolTip(
-            "从天勤下全部期货期权的 K 线，算平值 IV / 偏度 / 曲率 / 看跌看涨比，\n"
-            "写 data_tq/option.duckdb（和行情库分开），并导出\n"
-            "data_tq/option_iv/tq_iv_<周期>.csv。\n\n"
-            "口径与 Tushare 那条不同：天勤只有收盘价、没有结算价，两套 IV 不能混用。\n"
-            "第一次全量要几小时；已经下完的合约按到期日自动跳过，重跑是续传。"
+            "从天勤下全部期货期权（商品期权 + 中金所股指期权；ETF 期权不收）的 K 线，\n"
+            "算平值 IV / 偏度 / 曲率 / 看跌看涨比，写 data_tq/option.duckdb\n"
+            "（和行情库分开），并导出 data_tq/option_iv/tq_iv_<周期>.csv。\n\n"
+            "口径与 Tushare 那条不同：天勤只有收盘价、没有结算价，两套 IV 不能混用。\n\n"
+            "免费账户也能下：没有 tq_dl 就退到逐合约 get_kline_serial（已摘牌合约\n"
+            "照样有数据），只是串行取数 —— 全量约 21 万个合约，1d 约 27 小时。\n"
+            "专业账户走 DataDownloader 批量。两条路都支持中断续传。"
         )
         lay.addWidget(self.chk_tq_options)
 

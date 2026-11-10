@@ -55,6 +55,8 @@ def main() -> int:
     ap.add_argument("--end", default=None, help="结束日期，默认今天")
     ap.add_argument("--full", action="store_true",
                     help="不跳过已下完的合约（默认按合约到期日增量）")
+    ap.add_argument("--free", action="store_true",
+                    help="强制走免费路径（逐合约 get_kline_serial），用于验证降级")
     ap.add_argument("--stats", action="store_true", help="只看库里有什么")
     ap.add_argument("--iv-only", action="store_true", help="只重算 IV 并导出 CSV")
     args = ap.parse_args()
@@ -92,25 +94,29 @@ def main() -> int:
     sess = T.Session()
     try:
         api = sess.get()
-        if not T.can_download(api):
-            print("这个天勤账户没有 `tq_dl`（历史数据下载）功能位。\n"
-                  "期权没有「最近 8000 根」的替代路径 —— 已摘牌期权的 "
-                  "get_kline_serial 返回全 0，只能走 DataDownloader。\n"
-                  "升级地址：https://www.shinnytech.com/tqsdk-buy/")
-            return 3
+        free = True if args.free else not T.can_download(api)
+        if free:
+            print(
+                "这个天勤账户没有 `tq_dl`（历史数据下载）→ 走**免费路径**：\n"
+                f"  逐合约 get_kline_serial，一次一个合约，最多取最近 {T.RECENT_BARS} 根。\n"
+                "  1d：一个合约一次请求就覆盖它的整个挂牌期（≈完整）。\n"
+                "  1h：约 3 年内完整的链；更老的链只剩最后一段。5m 只剩约 2 个月。\n"
+                "  速度：实测 0.45 秒/合约 → 全量 21.3 万个约 27 小时（1h 约 19 小时）。\n"
+                "  可随时 Ctrl+C，重跑按合约续传。\n", flush=True)
         print(f"周期 {periods}，品种 {'全部' if varieties is None else varieties}，"
               f"{start} → {end}", flush=True)
         # 传 Session 而不是 api：跑长任务时要靠它定期重建会话清订阅
         st = OF.update(sess, periods=periods, varieties=varieties,
                        start=start, end=end, incremental=not args.full,
+                       free=free,
                        progress=lambda a, b, m: print(f"  {m}", flush=True))
     finally:
         sess.close()
 
     for p, s in st.items():
         print(f"{p}: {s['chains']} 条链，写入 {s['rows']:,} 行，"
-              f"跳过 {s['skipped']} 条（已是最新），失败 {s['failed']} 条，"
-              f"IV {s['iv']:,} 行")
+              f"跳过 {s['skipped']} 条（已是最新），空链 {s.get('empty', 0)} 条，"
+              f"失败 {s['failed']} 条，IV {s['iv']:,} 行")
     _print_stats()
     return 0
 

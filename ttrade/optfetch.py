@@ -7,7 +7,7 @@
 2. **下载** —— 每条链一个 `DataDownloader` 任务，**把标的放在第一个**。
 3. **算 IV** —— 每个品种每个时间点取最近两个到期月，反解后拟二次微笑。
 
-三个必须记住的事实（都是实测出来的）：
+四个必须记住的事实（都是实测出来的）：
 
 **① `query_options(标的)` 对已摘牌的标的会卡住**，不能用它枚举。只能
 `query_quotes` + 代码分组。
@@ -20,9 +20,29 @@
 第一个合约没数据就整批返回空。所以标的必须排第一 —— 标的永远有行情，顺带
 还解决了「算 IV 要用的 F 从哪来」。
 
-**免费账户**：`tq_dl` 是专业版功能位，没有就走不了 `DataDownloader`。期权没有
-「最近 8000 根」的替代路径（单合约 `get_kline_serial` 对已摘牌期权返回全 0），
-所以免费账户直接拒绝，并把话说清楚。
+**④ 免费账户走 `get_kline_serial`，一样能把期权下下来。**
+
+`tq_dl` 是专业版功能位，免费账户建 `DataDownloader` 会被直接拒。但
+`get_kline_serial` 不受限，**已摘牌合约照样有数据** —— 2026-11-10 用免费账号实测：
+`SHFE.cu1901C50000`（2018-12）、`DCE.m1909-C-3000`、`CZCE.SR909C5000` 都返回非空；
+六个交易所的商品期权 + 中金所股指期权 1d/1h 全通（ETF 期权是专业版，本就不收）。
+
+（早前这里写过「单合约 `get_kline_serial` 对已摘牌期权返回全 0」—— 那是把一个
+**不存在的代码**的 85 秒超时误当成了「没有数据」。真实合约一律有数。）
+
+代价是**只能取「最近 N 根」**，不能指定区间，而且**一次一个合约串行**：
+实测 1d 0.45 秒/合约、1h 0.33 秒/合约。全量 21.3 万个合约（2936 条链）约 27 / 19
+小时，**可中断、可续传**；之后每天增量只有当天新挂的几百个合约，几分钟。
+
+- 1d：一个合约一次请求就能覆盖它的**整个挂牌期**（期权寿命 ~250 个交易日
+  < 上限根数），所以免费账户拿 1d 几乎是完整的
+- 1h：约 3 年内的链完整，更老的链只剩「最后 N 根」
+- 5m：只剩到期前约 2 个月
+
+订阅只增不减（每个 `get_kline_serial` 都挂一个行情订阅），所以免费路径每处理
+`FREE_RECYCLE_EVERY` 个合约重建一次会话。实测 `close()` + 新连接只要 **0.7 秒**，
+摊到 300 个合约上可以忽略（这里附一句：模块别处的注释说重建要 80 秒，那是代理
+链路下的老观测，直连时是 0.7 秒）。
 """
 
 from __future__ import annotations
@@ -286,6 +306,77 @@ def _run_batch(api, syms: list[str], dur: int, start: date, end: date,
     return path
 
 
+# ------------------------------------------------------------------ 免费账户路径
+#
+# 没有 `tq_dl` 时的替身：逐合约 `get_kline_serial`。见模块开头第 ④ 条。
+
+# 每处理这么多合约重建一次会话。订阅只增不减（每个 get_kline_serial 都挂一个
+# 行情订阅），跑上几千个之后服务端会把连接踢掉。实测重建只要 0.7 秒，摊到 300
+# 个合约上不到万分之三，比「连接废了再救」划算得多。
+FREE_RECYCLE_EVERY = 300
+
+
+def fetch_contract_free(api, contract: str, period: str) -> pd.DataFrame:
+    """单个合约的「最近 N 根」，列对齐 `OS.BAR_COLS`。
+
+    和下载路径的差别只有一处：**起点由账户等级决定，不由调用方决定**。
+    没成交的合约（深度虚值）返回空表 —— 那不是失败。
+    """
+    from .tqfetch import fetch_recent
+
+    df = fetch_recent(api, contract, period)
+    if df.empty:
+        return _empty_bars()
+    df = df.copy()
+    df["contract"] = contract
+    df["period"] = period
+    # fetch_recent 只给存在的列；`upsert_bars` 是硬取 BAR_COLS 的，缺列会 KeyError
+    for c in OS.BAR_COLS:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df[OS.BAR_COLS]
+
+
+def download_chain_free(api, underlying: str, members: list[str], period: str,
+                        start: date, end: date) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """下一条链，返回 `(期权 bars, 标的 bars)`。—— 免费账户专用。
+
+    **串行**：`get_kline_serial` 内部自己等数据就绪，挂并发只会互相拖慢，
+    它也没有 `DataDownloader` 那种「建任务 + 推进」的模型。
+
+    某一根取不到就跳过（虚值没人成交是常态），不因为一个合约丢掉整条链。
+    """
+    bars: list[pd.DataFrame] = []
+    for c in members:
+        try:
+            df = fetch_contract_free(api, c, period)
+        except Exception:      # noqa: BLE001
+            continue
+        if not df.empty:
+            bars.append(df)
+
+    und = pd.DataFrame(columns=["contract", "period", "dt", "close"])
+    try:
+        u = fetch_contract_free(api, underlying, period)
+        if not u.empty:
+            und = u[["contract", "period", "dt", "close"]].copy()
+    except Exception:      # noqa: BLE001
+        pass
+
+    if not bars:
+        return _empty_bars(), und
+
+    out = pd.concat(bars, ignore_index=True)
+    # 免费接口只能取「最近 N 根」，所以起始日只能用来**裁剪**：留着 2016 年之前
+    # 的空槽没有意义，还会让 `list_months` 的 first 显示成假的更早日期
+    lo = pd.Timestamp(start)
+    hi = pd.Timestamp(end) + pd.Timedelta(days=1)
+    out = out[(out["dt"] >= lo) & (out["dt"] < hi)]
+    if not und.empty:
+        und = und[(und["dt"] >= lo) & (und["dt"] < hi)]
+    return (out if len(out) else _empty_bars()), und
+
+
 # ------------------------------------------------------------------ 隐含波动率
 
 
@@ -464,11 +555,211 @@ def _plan(chains: dict[str, list[str]], period: str,
     return out
 
 
+def _can_download(api) -> bool:
+    """账户有没有 `tq_dl`。读不到功能位时按「能下」（专业版）处理。"""
+    from .tqfetch import can_download
+
+    return can_download(api)
+
+
+def _contract_meta(members: list[str], expiry) -> pd.DataFrame:
+    """一条链的合约定义表。两个路径共用，口径必须一致。"""
+    rows = []
+    for c in members:
+        pc = parse_contract(c)
+        if pc is None:
+            continue
+        rows.append({"contract": c, "variety": variety_of(c),
+                     "exchange": c.partition(".")[0],
+                     "opt_class": pc[0], "strike": pc[1],
+                     "expiry": expiry, "underlying": None})
+    return pd.DataFrame(rows)
+
+
+def _meta_without_bars(period: str) -> set[str]:
+    """登记过合约定义、但这个周期一根 K 线都没有的合约。
+
+    绝大多数是**从没成交过的深度虚值**（天勤给「合约存在但没数据」的壳）。
+    不记住它们的话，每次增量都会把这几万个合约重新探一遍 —— 按 0.45 秒/合约
+    算相当于每跑一次白等几个小时。
+    """
+    if not OS.exists():
+        return set()
+    try:
+        with OS.connect(read_only=True) as con:
+            rows = con.execute(
+                "SELECT m.contract FROM option_meta m WHERE NOT EXISTS ("
+                "  SELECT 1 FROM option_bars b"
+                "  WHERE b.contract = m.contract AND b.period = ?)",
+                [period],
+            ).fetchall()
+    except Exception:      # noqa: BLE001
+        return set()
+    return {r[0] for r in rows}
+
+
+def update_free(sess, periods: tuple[str, ...] = ("1d", "1h"),
+                varieties: list[str] | None = None,
+                start: date = DEFAULT_START, end: date | None = None,
+                incremental: bool = True, progress=None, cancel=None,
+                recycle_every: int = FREE_RECYCLE_EVERY) -> dict:
+    """免费账户的 `update`：逐合约 `get_kline_serial`。
+
+    和 `update` 返回同一个结构，另外每期多一个 `free=True` 和 `empty`（整条链
+    一个合约都没数据的条数 —— 老链或全是虚值时会这样，不是错误）。
+
+    增量比专业路径多一层跳过：**已摘牌、且上次就一根 K 线都没有的合约不再探**
+    （`_meta_without_bars`）。这类合约占两成上下，不跳过的话每次增量都要为它们
+    白跑几个小时。
+
+    进度回调会带上 ETA：全量 21 万个合约按实测 0.45 秒/合约要 27 小时，
+    不给个剩余时间的话用户没法判断该不该等。
+    """
+    end = end or date.today()
+    api = sess.get() if hasattr(sess, "get") else sess
+    chains = list_options(api)
+    stats: dict[str, dict] = {}
+    since = 0
+
+    def reset_api():
+        nonlocal api, since
+        if hasattr(sess, "reset"):
+            sess.reset()
+            api = sess.get() if hasattr(sess, "get") else sess
+        since = 0
+
+    for period in periods:
+        plan = _plan(chains, period, varieties)
+        done = OS.done_contracts(period) if incremental else {}
+        empty_known = _meta_without_bars(period) if incremental else set()
+        st = {"period": period, "chains": len(plan), "rows": 0, "skipped": 0,
+              "failed": 0, "empty": 0, "iv": 0, "free": True}
+        stats[period] = st
+        total = len(plan)
+        # 已处理合约数 / 开始时间，用来算 ETA
+        n_contracts, t0 = 0, time.time()
+        grace = pd.Timestamp(end) - pd.Timedelta(days=3)
+
+        for n, (underlying, members) in enumerate(plan.items(), 1):
+            if cancel is not None and cancel():
+                st["cancelled"] = True
+                break
+
+            if recycle_every and since >= recycle_every:
+                reset_api()
+
+            try:
+                info = chain_info(api, members)
+            except Exception:      # noqa: BLE001
+                # 一次 get_quote 就失败，多半是连接废了：重建再试一次
+                reset_api()
+                try:
+                    info = chain_info(api, members)
+                except Exception:  # noqa: BLE001
+                    info = None
+            if info is None:
+                st["failed"] += 1
+                continue
+
+            exp = pd.Timestamp(info["expiry"])
+            need = []
+            for c in members:
+                if c in done and pd.Timestamp(done[c]) >= exp - pd.Timedelta(days=1):
+                    continue        # 已下到到期日前
+                if c in empty_known and exp < grace:
+                    continue        # 已摘牌且确认没成交：不会再有了
+                need.append(c)
+            if not need:
+                st["skipped"] += 1
+                if progress is not None:
+                    progress(n, total, f"{period} {n}/{total}　{underlying} 已是最新")
+                continue
+
+            if progress is not None:
+                eta = ""
+                if n_contracts >= 30:
+                    per = (time.time() - t0) / n_contracts
+                    left = per * max(0, sum(len(m) for m in list(plan.values())[n - 1:]))
+                    eta = f"　剩余约 {left / 60:.0f} 分钟"
+                progress(n, total, f"{period} {n}/{total}　{underlying}"
+                                   f"（{len(need)} 个合约）{eta}")
+
+            meta = _contract_meta(need, info["expiry"])
+            if meta.empty:
+                continue
+            meta["underlying"] = info["underlying"]
+
+            try:
+                bars, und = download_chain_free(
+                    api, info["underlying"], need, period,
+                    _chain_start(start, exp), end)
+            except Exception:      # noqa: BLE001
+                # 连接多半已经废了：重建会话再来一次。还失败就记一笔继续 ——
+                # 一条链失败不该让整轮停住，重跑时它会被重新捡起来
+                reset_api()
+                bars, und = _empty_bars(), pd.DataFrame(
+                    columns=["contract", "period", "dt", "close"])
+                try:
+                    bars, und = download_chain_free(
+                        api, info["underlying"], need, period,
+                        _chain_start(start, exp), end)
+                except Exception:  # noqa: BLE001
+                    pass
+            since += len(need)
+            n_contracts += len(need)
+
+            # 这一轮里探到「确实没数据」的，记下来给下一轮和同一轮后面的链用
+            got = set(bars["contract"].tolist()) if not bars.empty else set()
+            fresh = [c for c in need if c not in got]
+            empty_known.update(fresh)
+
+            if bars.empty and und.empty:
+                # 整条链一个合约都没成交过（早年链、纯虚值链）。不是错误，
+                # 但要单独计数 —— 不然「失败 0 条」会让人误以为全下到了
+                st["empty"] += 1
+                continue
+
+            try:
+                with OS.connect() as con:
+                    OS.upsert_meta(con, meta)
+                    st["rows"] += OS.upsert_bars(con, bars)
+                    OS.upsert_underlying(con, und)
+                    OS.set_meta(
+                        con, "last_update", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    )
+            except Exception as exc:   # noqa: BLE001
+                # 界面正好在读期权库（挑合约），写锁抢不到。这条链的数据丢了，
+                # 重跑时会被重新捡起来
+                st["failed"] += 1
+                if progress is not None:
+                    progress(n, total,
+                             f"{info['underlying']} 写库失败：{str(exc)[:50]}")
+
+        if progress is not None:
+            progress(total, total, f"{period} 计算隐含波动率…")
+        vs = sorted({variety_of(c) for m in plan.values() for c in m})
+        for v in vs:
+            if cancel is not None and cancel():
+                break
+            iv = compute_iv(v, period)
+            if iv.empty:
+                continue
+            try:
+                with OS.connect() as con:
+                    st["iv"] += OS.upsert_iv(con, iv)
+            except Exception:      # noqa: BLE001
+                continue
+
+        export_csv(period)
+
+    return stats
+
+
 def update(sess, periods: tuple[str, ...] = ("1d", "1h"),
            varieties: list[str] | None = None,
            start: date = DEFAULT_START, end: date | None = None,
            incremental: bool = True, progress=None, cancel=None,
-           tmpdir: str | None = None) -> dict:
+           tmpdir: str | None = None, free: bool | None = None) -> dict:
     """把期权行情 + IV 摘要拉进库。
 
     `sess` 要一个 `tqfetch.Session`（有 `get` / `reset`）。传裸 api 也能跑，
@@ -477,11 +768,21 @@ def update(sess, periods: tuple[str, ...] = ("1d", "1h"),
     增量口径是**按合约**：库里最后一根已经到（或超过）到期日前的，说明这个
     合约下完了，跳过。中途断了重跑就是断点续传。
 
+    `free` 留空 = 自动判断：账户没有 `tq_dl` 就走 `update_free`（逐合约
+    `get_kline_serial`），有就走 `DataDownloader`。**免费账户不再被跳过**。
+
     返回 `{period: {...}}`，每期有 `chains / rows / skipped / failed / iv`。
     """
     end = end or date.today()
+    api0 = sess.get() if hasattr(sess, "get") else sess
+    if free is None:
+        free = not _can_download(api0)
+    if free:
+        return update_free(sess, periods=periods, varieties=varieties, start=start,
+                           end=end, incremental=incremental, progress=progress,
+                           cancel=cancel)
     tmp = tmpdir or os.path.join(os.path.dirname(OS.db_path()), "opt_tmp")
-    chains = list_options(sess.get() if hasattr(sess, "get") else sess)
+    chains = list_options(api0)
     stats: dict[str, dict] = {}
 
     for period in periods:
