@@ -73,6 +73,13 @@ GROUPS: list[tuple[str, str, str]] = [
      "另一类东西：判据是「这只票今天符不符合一组筛选条件」（估值、量能、"
      "涨跌幅、板块），不是均线或因子打分。研究页在一只票上把它画出来是为了"
      "看清信号长什么样；真正的用法是 `run_stock_screen.py` 的全市场组合回测。"),
+    ("mine_rule", "收编 · 规则策略",
+     "从使用者的策略库里收编回来的配置（`strategy_templates_lib.py`）。"
+     "这些不是教科书示例，是真跑过的组合 —— 参数怎么调、周期怎么选，照着看。"),
+    ("mine_factor", "收编 · 因子组合",
+     "同上，因子族。重点看三件事：选了哪些因子、哪些要取反、方向交给 IC 还是写死。"),
+    ("mine_cross", "收编 · 截面",
+     "同上，截面策略：品种池、调仓间隔、多空各取多少。"),
 ]
 
 GROUP_LABEL = {k: label for k, label, _ in GROUPS}
@@ -94,6 +101,7 @@ _FCFG_DEFAULTS = {
 
 # `StrategyConfig` 的默认值，同理。
 _SCFG_DEFAULTS = {
+    "short_only": False,
     "sizing": "capital", "principal": 1_000_000.0, "capital_pct": 30.0,
     "risk_pct": 1.0, "stop_atr_n": 14, "stop_mult": 5.0, "volume": 1,
     "cost_profile": "", "range_years": 0.0,
@@ -605,6 +613,13 @@ _RAW: list[dict] = [
         range_years=5.0,
     ),
 ]
+
+# 从「我的策略库」收编的那批（见 `strategy_templates_lib.py`）。单独一个模块是
+# 因为它有将近 10 万字符的数据，混在这个文件里会把「手写范例」和「使用者配置」
+# 搅在一起，改哪个都不好找
+from ttrade.strategy_templates_lib import RAW as _LIB_RAW
+
+_RAW = _RAW + _LIB_RAW
 
 BY_KEY: dict[str, dict] = {t["key"]: t for t in _RAW}
 

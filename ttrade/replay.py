@@ -119,6 +119,9 @@ def make_bt(market: str, allow_short: bool = False,
                     getattr(cfg, "cost_profile", "") or None, market="cn")
     if cfg is None:
         return bt
+    # 方向：`note == "short"` 是「允许做空」，`short_only` 是「禁止做多」。
+    # 后者只有在允许做空的前提下才有意义，所以两个都写进回测配置
+    bt.short_only = bool(getattr(cfg, "short_only", False)) and bt.long_only is False
     bt.sizing = getattr(cfg, "sizing", "") or "capital"
     bt.capital = float(getattr(cfg, "capital", 0) or 0)
     bt.risk_amount = float(getattr(cfg, "risk_amount", 0) or 20_000)
@@ -259,7 +262,12 @@ def summary(rp: "Replay", head: str, period: str) -> str:
         f"｜每笔成本率 {_pct(m.get('cost_rate'))}"
         + (f"｜基准 {_money(b.get('total_cost'))}" if b is not None else "")
     )
-    if not rp.long_only and m.get("n_short"):
+    if getattr(rp, "short_only", False):
+        lines.append(
+            f"方向  只做空（禁止做多）｜空头 {m['n_short']} 笔"
+            f"｜仓位时间 {m['exposure'] * 100:.0f}%"
+        )
+    elif not rp.long_only and m.get("n_short"):
         lines.append(
             f"方向  多头 {m['long_exposure'] * 100:.0f}% / 空头 {m['short_exposure'] * 100:.0f}%"
             f"｜空头 {m['n_short']} 笔"
@@ -284,6 +292,7 @@ class Replay:
     keys: list = field(default_factory=list)
     filter_active: bool = False
     long_only: bool = False
+    short_only: bool = False
     bars_per_year: float = 252.0
     error: str = ""
     # 截面策略的 (品种行情, CrossConfig, 分数面板)。「截面因子分析」要拿品种池
@@ -376,10 +385,10 @@ def run(cfg, df: pd.DataFrame | None, market: str = "",
             res = run_backtest(base, bt, label=label)
         except Exception as exc:  # noqa: BLE001
             return Replay(error=f"回测失败：{exc}")
-        bh = buy_and_hold(df, bt) if with_bh else None
+        bh = buy_and_hold(df, bt, short=bt.short_only) if with_bh else None
         return Replay(df=base, raw=df, res=res, bh=bh, label=label, family=family,
                       rule_key=rule_key, period=period, long_only=bt.long_only,
-                      bars_per_year=bpy)
+                      short_only=bt.short_only, bars_per_year=bpy)
 
     if not keys:
         return Replay(error=f"{cfg.title()} 没有选中因子，无法回放")
@@ -409,11 +418,12 @@ def run(cfg, df: pd.DataFrame | None, market: str = "",
         res = run_backtest(out.df, bt, label=label)
     except Exception as exc:  # noqa: BLE001
         return Replay(error=f"回测失败：{exc}")
-    bh = buy_and_hold(df, bt) if with_bh else None
+    bh = buy_and_hold(df, bt, short=bt.short_only) if with_bh else None
     return Replay(
         df=out.df, raw=df, res=res, bh=bh, label=label, family=family,
         rule_key=rule_key, period=period, factor_cfg=fc, outcome=out, keys=keys,
-        filter_active=filter_active, long_only=bt.long_only, bars_per_year=bpy,
+        filter_active=filter_active, long_only=bt.long_only,
+        short_only=bt.short_only, bars_per_year=bpy,
     )
 
 
@@ -502,10 +512,11 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
     # 原本的 label 是策略名（「唐奇安」），切过去图例上写着策略名会认不出是谁
     res.legs = {str(k): replace(r, label=str(k)) for k, r in named}
     bpy = bars_per_year(res.equity.index)
+    _bt = make_bt(mk, getattr(cfg, "note", "") == "short", cfg)
     return Replay(res=res, bh=None, label=res.label,
                   family=getattr(cfg, "family", "rule"),
                   period=period,
-                  long_only=make_bt(mk, getattr(cfg, "note", "") == "short", cfg).long_only,
+                  long_only=_bt.long_only, short_only=_bt.short_only,
                   bars_per_year=bpy, keys=keys)
 
 
@@ -544,6 +555,7 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "",
         top_pct=float(getattr(cfg, "cross_top_pct", 10.0) or 10.0),
         bot_pct=float(getattr(cfg, "cross_bot_pct", 10.0) or 10.0),
         long_only=bt.long_only,
+        short_only=bt.short_only,
         weight=getattr(cfg, "cross_weight", "risk") or "risk",
         tiers=int(getattr(cfg, "cross_tiers", 0) or 0),
         tier_units=list(getattr(cfg, "cross_tier_units", []) or []),
@@ -580,5 +592,6 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "",
                                  bpy=bt.bars_per_year,
                                  initial_cash=bt.initial_cash)
     return Replay(res=res, bh=None, label=label, family="cross", period=period,
-                  long_only=bt.long_only, bars_per_year=bt.bars_per_year,
+                  long_only=bt.long_only, short_only=bt.short_only,
+                  bars_per_year=bt.bars_per_year,
                   cross=(frames, ccfg, out.score))

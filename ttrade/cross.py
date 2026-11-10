@@ -75,7 +75,8 @@ class CrossConfig:
     # （界面上也不显示）—— 见模块说明里那一段
     top_pct: float = 10.0               # 多头：选最强的百分之几
     bot_pct: float = 10.0               # 空头：选最弱的百分之几（可以和多头不同）
-    long_only: bool = False
+    long_only: bool = False             # 不允许做空（只做多）
+    short_only: bool = False            # 禁止做多（只做空）；和上面互斥
     # risk = 风险平价（按波动率倒数分配，默认）；equal = 等权；score = 按分数加权
     # tier = 按分数分档给份数（见 tiers / tier_units）
     weight: str = "risk"
@@ -1323,7 +1324,8 @@ def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig,
         for i in range(len(rows)):
             if not ok[i]:
                 continue
-            w[i] = 0.5 * _tier_share(mat[i], top[i], int(cfg.tiers), units)
+            if not cfg.short_only:
+                w[i] = 0.5 * _tier_share(mat[i], top[i], int(cfg.tiers), units)
             if not cfg.long_only:
                 w[i] -= 0.5 * _tier_share(mat[i], bot[i], int(cfg.tiers), units,
                                           ascending=True)
@@ -1333,7 +1335,8 @@ def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig,
         for i in range(len(rows)):
             if not ok[i]:
                 continue
-            w[i] = _rp_share(vmat[i], top[i], 0.5)
+            if not cfg.short_only:
+                w[i] = _rp_share(vmat[i], top[i], 0.5)
             if not cfg.long_only:
                 w[i] -= _rp_share(vmat[i], bot[i], 0.5)
     elif cfg.weight == "score":
@@ -1344,10 +1347,13 @@ def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig,
         share = np.zeros_like(pos)
         share[good] = pos[good] / s[good, None]
         w = np.where(good[:, None], 0.5 * share, top * (0.5 * inv_l)[:, None])
+        if cfg.short_only:
+            w = np.zeros_like(w)          # 禁止做多：多头腿整腿不建
         if not cfg.long_only:
             w = w - bot * (0.5 * inv_s)[:, None]
     else:
-        w = top * (0.5 * inv_l)[:, None]
+        w = (np.zeros(top.shape, dtype=float) if cfg.short_only
+             else top * (0.5 * inv_l)[:, None])
         if not cfg.long_only:
             w = w - bot * (0.5 * inv_s)[:, None]
     return _place(score, rows, w, ok)
@@ -1386,7 +1392,8 @@ def _rank(score: pd.DataFrame, cfg: CrossConfig, all_in: bool = False,
         k_long = np.where(ok, n_valid, 0)
         k_short = np.zeros(len(rows), dtype=int)
     else:
-        k_long = _n(cfg.top_pct)
+        k_long = (np.zeros(len(rows), dtype=int) if cfg.short_only
+                  else _n(cfg.top_pct))
         k_short = (np.zeros(len(rows), dtype=int) if cfg.long_only
                    else _n(cfg.bot_pct))
     top = np.zeros(mat.shape, dtype=bool)
@@ -1485,6 +1492,10 @@ def _select_weights(frames: dict[str, pd.DataFrame], score: pd.DataFrame,
     sig = sig_panel.to_numpy(dtype=float)
     if cfg.long_only:
         sig = np.clip(sig, 0.0, None)
+    elif cfg.short_only:
+        # 禁止做多：+1 砍成 0，只留 -1 / 0。权重那份钱还在（`held` 是绝对额），
+        # 方向由信号的符号决定 —— 空头就是负敞口
+        sig = np.clip(sig, None, 0.0)
     return held * pd.DataFrame(sig, index=held.index, columns=held.columns)
 
 

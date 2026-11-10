@@ -255,7 +255,11 @@ class StrategyConfig:
 
     account: str = ""          # 账户名（AccountSpec.name），空表示用当前连接
     enabled: bool = False
+    # `note == "short"` 就是「允许做空」。原来是自由文本，现在只剩这一个取值
     note: str = ""
+    # 禁止做多（只做空）。和「允许做空」互斥：两个都开等于一笔都不做，
+    # 界面上会拦住这种组合（勾了一个就把另一个弹掉或禁掉）
+    short_only: bool = False
     created: str = ""
 
     # 回测用的成本档位（`ttrade.costs.PROFILES` 的 key：optimistic / neutral /
@@ -485,7 +489,9 @@ class StrategyConfig:
         head = self.title() if self.family == "cross" else f"{self.title()}｜{self.key()}"
         return (
             f"{head} {self.period}｜{self.strategy_label()}"
-            f"｜{self.size_text()}" + (f"｜账户 {self.account}" if self.account else "")
+            f"｜{self.size_text()}"
+            + ("｜只做空" if getattr(self, "short_only", False) else "")
+            + (f"｜账户 {self.account}" if self.account else "")
         )
 
     # ---- 序列化 ----

@@ -704,6 +704,15 @@ class EditDialog(QDialog):
         self.chk_short.setChecked(cfg.note == "short")
         form.addRow("", self.chk_short)
 
+        # 和研究页那对开关同一语义：只做空要先允许做空，两个都勾等于不做，
+        # 所以关掉「允许做空」时「禁止做多」直接灰掉并清空
+        self.chk_no_long = QCheckBox("禁止做多（只做空）")
+        self.chk_no_long.setChecked(bool(getattr(cfg, "short_only", False)))
+        self.chk_no_long.setEnabled(self.chk_short.isChecked())
+        self.chk_short.toggled.connect(self._sync_dir)
+        self.chk_no_long.toggled.connect(self._sync_dir)
+        form.addRow("", self.chk_no_long)
+
         # 反向交易只在规则族上有意义：因子策略的方向由因子本身的正负决定，
         # 要翻方向是在研究页把因子反过来，不是在这里
         self.chk_reverse = None
@@ -781,6 +790,15 @@ class EditDialog(QDialog):
         box.rejected.connect(self.reject)
         form.addRow(box)
 
+    def _sync_dir(self, _checked: bool = False) -> None:
+        """方向两个开关联动，和研究页同一套规则（见 `MainWindow._sync_dir_flags`）。"""
+        allow = self.chk_short.isChecked()
+        self.chk_no_long.setEnabled(allow)
+        if not allow and self.chk_no_long.isChecked():
+            self.chk_no_long.blockSignals(True)
+            self.chk_no_long.setChecked(False)
+            self.chk_no_long.blockSignals(False)
+
     def _sync_size(self) -> None:
         """只显示当前口径用得上的字段，免得一堆数字看不出哪个生效。
 
@@ -828,6 +846,7 @@ class EditDialog(QDialog):
         cfg.stop_mult = float(self.sp_stop.value())
         cfg.volume = self.sp_vol.value()
         cfg.note = "short" if self.chk_short.isChecked() else ""
+        cfg.short_only = bool(self.chk_no_long.isChecked() and self.chk_short.isChecked())
         cfg.account = self.cb_acct.currentData() or ""
         if self.sp_params:
             cfg.rule_params = {k: sp.value() for k, sp in self.sp_params.items()}

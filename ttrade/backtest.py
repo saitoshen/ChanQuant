@@ -72,6 +72,10 @@ class BacktestConfig:
     #   capital：手数 = 分配资金 ÷ 每手保证金（期货默认）
     #   risk   ：手数 = 止损金额 ÷（止损倍数 × ATR × 乘数）
     #   fixed  ：固定 `volume` 手
+    # 禁止做多（只做空）。和 `long_only` 是一对互斥开关，两个都开等于不做 ——
+    # 界面上不允许勾成那样。截面那条路会在权重里直接不建多头腿
+    short_only: bool = False
+
     sizing: str = "unit"
     capital: float = 0.0          # 分配资金（0 = 用 initial_cash）
     risk_amount: float = 20_000.0
@@ -727,6 +731,10 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     sig = data["signal"].fillna(0).astype(int).to_numpy()
     if cfg.long_only:
         sig = np.maximum(sig, 0)
+    if cfg.short_only:
+        # 禁止做多：把 +1 砍成 0，只留 -1 / 0。和 long_only 对称，两个都开等于
+        # 全空仓（上层 UI 会拦住这种组合，这里只保证引擎语义明确）
+        sig = np.minimum(sig, 0)
     idx = data.index
     # 逐根的「进场 / 出场原因」，可选列。策略自己写（因子策略会写「因子分
     # +2.31 越过进场阈值 2」「分档浮盈回撤」这种），没写就留空由引擎兜底
@@ -885,8 +893,14 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     return Result(equity=eq, position=ps, trades=trades, metrics=m, label=label)
 
 
-def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None) -> Result:
-    """买入持有基准：首个交易日开盘全仓买入并一直持有。"""
+def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None,
+                 short: bool = False) -> Result:
+    """买入持有基准：首个交易日开盘全仓买入并一直持有。
+
+    `short=True` 是它的镜像 —— 首日**卖空**并一直拿着，给「禁止做多」的策略
+    当对照。不镜像的话，一条只做空的策略会去跟「一直做多」比，比出来的超额
+    没有意义。
+    """
     cfg = cfg or BacktestConfig(long_only=True)
     d = df.dropna(subset=["open", "close"]).copy()
     d = d[(d["open"] > 0) & (d["close"] > 0)]
@@ -903,22 +917,24 @@ def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None) -> Result:
     q = size_lots(cfg, price, cfg.initial_cash, 0.0)
     fee0 = cfg.fee_amount(q, mult, price)
     cash = cfg.initial_cash - fee0
-    equity = cash + q * mult * (close - price)
+    # 空头就是把 q 取负：`cash + q×乘数×(收 − 开)` 对正负都成立
+    held = -float(q) if short else float(q)
+    equity = cash + held * mult * (close - price)
     eq = pd.Series(equity, index=d.index, name="equity")
-    ps = pd.Series(1, index=d.index, name="position")
+    ps = pd.Series(-1 if short else 1, index=d.index, name="position")
     trade = Trade(
         entry_date=d.index[0],
         exit_date=d.index[-1],
         entry_price=float(price),
         exit_price=float(close[-1]),
-        ret=float(close[-1] / price - 1.0),
+        ret=float(1.0 - close[-1] / price) if short else float(close[-1] / price - 1.0),
         bars=len(d) - 1,
-        direction=1,
+        direction=-1 if short else 1,
         open_position=True,
-        lots=float(q),
+        lots=abs(float(q)),
         # 基准只开了仓、一直没平，所以成本只有开仓那一侧（手续费 + 滑点）。
         # 毛盈亏用**盘口价**（`open_[0]`，不含滑点），滑点在成本里已经算过
-        gross=float(q) * mult * (float(close[-1]) - float(open_[0])),
+        gross=held * mult * (float(close[-1]) - float(open_[0])),
         cost=float(fee0) + abs(float(price - open_[0]) * q * mult),
     )
     m = _metrics(eq, ps, [trade], cfg.bars_per_year, base=cfg.initial_cash)
@@ -930,7 +946,8 @@ def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None) -> Result:
     m["avg_cost"] = float(m["total_cost"])
     m["notional"] = float(abs(q) * mult * price)
     m["cost_rate"] = float(m["total_cost"] / m["notional"]) if m["notional"] > 0 else 0.0
-    return Result(equity=eq, position=ps, trades=[trade], metrics=m, label="买入持有")
+    return Result(equity=eq, position=ps, trades=[trade], metrics=m,
+                  label="卖空持有" if short else "买入持有")
 
 
 def _to_daily(eq: pd.Series) -> pd.Series:

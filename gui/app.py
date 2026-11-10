@@ -2558,6 +2558,17 @@ class MainWindow(QMainWindow):
         )
         cl.addWidget(self.chk_short)
 
+        # 「禁止做多」是「允许做空」的另一半。两个都不勾 = 只做多，两个都勾 =
+        # 一笔不做 —— 那种组合没有意义，所以勾一个就把另一个的状态顶掉（见
+        # `_sync_dir_flags`），不留一个「策略永远空仓」的入口
+        self.chk_no_long = QCheckBox("禁止做多（只做空）")
+        self.chk_no_long.setChecked(False)
+        self.chk_no_long.setToolTip(
+            "勾选后只保留空头信号（signal 取 -1/0），多头信号一律不做。\n"
+            "和「允许做空」互斥：要做空必须先允许做空。默认不勾。"
+        )
+        cl.addWidget(self.chk_no_long)
+
         # ---------------------------------------------- 策略配置（保存 / 入库）
         cl.addWidget(self._section("策略配置"))
         self.ed_cfg_name = QLineEdit()
@@ -2978,6 +2989,7 @@ class MainWindow(QMainWindow):
                 w.valueChanged.connect(lambda *_: self._refresh_cross_summary())
             self.chk_ma.currentIndexChanged.connect(self._schedule)
             self.chk_short.toggled.connect(self._on_short_toggled)
+            self.chk_no_long.toggled.connect(self._on_short_toggled)
 
             self.cb_family.currentIndexChanged.connect(self._on_family_changed)
             self.cb_cross_mode.currentIndexChanged.connect(self._on_cross_mode_changed)
@@ -3393,6 +3405,33 @@ class MainWindow(QMainWindow):
             return bool(MARKETS.get(self.market, {}).get("allow_short", False))
         return self.chk_short.isChecked()
 
+    def _no_long_enabled(self) -> bool:
+        """当前是否禁止做多（只做空）。它必须有「允许做空」打底才算数。"""
+        if not hasattr(self, "chk_no_long"):
+            return False
+        return bool(self.chk_no_long.isChecked() and self._short_enabled())
+
+    def _sync_dir_flags(self) -> None:
+        """让两个方向开关始终处于「有意义」的状态。
+
+        只有四种组合，其中「不允许做空 + 禁止做多」等于永远空仓，没有任何
+        意义 —— 与其让它算出一条平线，不如在界面上就顶掉：关掉「允许做空」
+        时把「禁止做多」清掉并置灰；勾「禁止做多」时自动把「允许做空」勾上。
+        """
+        if not hasattr(self, "chk_no_long") or not hasattr(self, "chk_short"):
+            return
+        allow = self._short_enabled()
+        self.chk_no_long.setEnabled(allow)
+        if not allow and self.chk_no_long.isChecked():
+            self.chk_no_long.blockSignals(True)
+            self.chk_no_long.setChecked(False)
+            self.chk_no_long.blockSignals(False)
+        elif allow and self.chk_no_long.isChecked() and not self.chk_short.isChecked():
+            # 理论上进不来（allow 为真说明 chk_short 已勾），保险起见补一下
+            self.chk_short.blockSignals(True)
+            self.chk_short.setChecked(True)
+            self.chk_short.blockSignals(False)
+
     def _new_cfg(self, info: dict) -> BacktestConfig:
         """按当前界面重建回测配置。
 
@@ -3402,6 +3441,7 @@ class MainWindow(QMainWindow):
         cfg = BacktestConfig(
             fee_rate=info["fee"], slippage=info["slippage"],
             long_only=not (info["allow_short"] and self._short_enabled()),
+            short_only=self._no_long_enabled(),
         )
         if self.market == "cn":
             self._apply_cost(cfg)
@@ -3475,7 +3515,18 @@ class MainWindow(QMainWindow):
         if hasattr(self, "lbl_cross_sum"):
             self.lbl_cross_sum.setText(self._cross_summary())
 
-    def _on_short_toggled(self, _checked: bool) -> None:
+    def _on_short_toggled(self, checked: bool) -> None:
+        # 两个方向开关走同一个处理，所以要先看是谁被点了：
+        #   勾「禁止做多」→ 必须有「允许做空」打底，没勾就替它勾上
+        #   取消「允许做空」→ 把「禁止做多」清掉（`_sync_dir_flags` 负责）
+        # 反过来做（只要禁止做多勾着就强制勾回允许做空）会让人关不掉做空
+        src = self.sender()
+        if (src is getattr(self, "chk_no_long", None) and checked
+                and not self._short_enabled()):
+            self.chk_short.blockSignals(True)
+            self.chk_short.setChecked(True)
+            self.chk_short.blockSignals(False)
+        self._sync_dir_flags()
         self.cfg = self._new_cfg(MARKETS[self.market])
         self._schedule(immediate=True)
 
@@ -3536,6 +3587,12 @@ class MainWindow(QMainWindow):
             self.chk_short.blockSignals(True)
             self.chk_short.setChecked(bool(info["allow_short"]))
             self.chk_short.blockSignals(False)
+        if hasattr(self, "chk_no_long"):
+            # 换市场等于换一条新策略的方向：禁止做多回到默认的「不勾」
+            self.chk_no_long.blockSignals(True)
+            self.chk_no_long.setChecked(False)
+            self.chk_no_long.blockSignals(False)
+            self.chk_no_long.setEnabled(bool(info["allow_short"]))
         self.cfg = self._new_cfg(info)
         self.lbl_sub.setText(info["sub"])
         self._sync_data_page()
@@ -4837,6 +4894,7 @@ class MainWindow(QMainWindow):
             stop_mult=float(self.sp_stop.value()),
             volume=int(self.sp_vol.value()),
             note="short" if self.chk_short.isChecked() else "",
+            short_only=self._no_long_enabled(),
             range_years=float(self.cb_range.currentData() or 0),
             cost_profile=(self.cb_cost.currentData() or "") if self.market == "cn" else "",
             # 多品种勾选：不管当前是哪个策略族都要存。以前只有截面存了
@@ -5002,6 +5060,11 @@ class MainWindow(QMainWindow):
             self._sync_cross_controls()
 
         self.chk_short.setChecked(cfg.note == "short")
+        if hasattr(self, "chk_no_long"):
+            self.chk_no_long.blockSignals(True)
+            self.chk_no_long.setChecked(bool(getattr(cfg, "short_only", False)))
+            self.chk_no_long.blockSignals(False)
+        self._sync_dir_flags()
         i = self.cb_size.findData(getattr(cfg, "sizing", "capital") or "capital")
         if i >= 0:
             self.cb_size.setCurrentIndex(i)
@@ -6182,6 +6245,7 @@ class MainWindow(QMainWindow):
             top_pct=float(self.sp_cross_pct.value()),
             bot_pct=float(self.sp_cross_bot.value()),
             long_only=self.cfg.long_only,
+            short_only=self.cfg.short_only,
             weight=self.cb_cross_w.currentData() or "risk",
             tiers=_cx["tiers"],
             tier_units=_cx["units"],

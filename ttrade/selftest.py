@@ -850,6 +850,101 @@ def _run() -> tuple[bool, list[str]]:
 
     check("内置策略「允许做空」的默认勾选", _short_default)
 
+    def _no_long_flag():
+        """「禁止做多」：只留空头，界面默认不勾。
+
+        它和「允许做空」是一对：两个都勾等于一笔不做，所以界面把「不允许做空
+        + 禁止做多」这种组合直接弹掉（见 `MainWindow._sync_dir_flags`）。
+        引擎这一侧要保证的是——勾上之后**一根多头都没有**，而不是「大部分是空头」。
+
+        单品种和截面两条路都要验：截面不是把 signal 取反，而是**根本不建多头腿**，
+        所以看的是权重里有没有正数。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import cross as CX
+        from ttrade.backtest import BacktestConfig, run_backtest
+
+        idx = pd.date_range("2022-01-03", periods=200, freq="B")
+        px = 100 * np.exp(np.cumsum(np.r_[np.full(60, 0.002), np.full(60, -0.002),
+                                          np.full(80, 0.001)]))
+        sig = np.where(np.arange(200) % 80 < 40, 1, -1)
+        df = pd.DataFrame({"open": px, "high": px * 1.01, "low": px * 0.99,
+                           "close": px, "signal": sig}, index=idx)
+
+        def _run(**kw):
+            cfg = BacktestConfig(initial_cash=100_000.0, sizing="fixed",
+                                 volume=10, **kw)
+            return run_backtest(df, cfg).metrics
+
+        both = _run()
+        long_only = _run(long_only=True)
+        short_only = _run(short_only=True)
+        if both["long_exposure"] <= 0 or both["short_exposure"] <= 0:
+            raise RuntimeError("默认（双向）本该多空都有")
+        if long_only["short_exposure"] > 0 or long_only["n_short"]:
+            raise RuntimeError("只做多里还有空头")
+        if short_only["long_exposure"] > 0 or short_only["n_long"]:
+            raise RuntimeError(
+                f"只做空里还有多头：long_exposure={short_only['long_exposure']:.3f}、"
+                f"n_long={short_only['n_long']}")
+
+        # ---- 截面：只做空时权重里不能有正数
+        rng = np.random.default_rng(4)
+        cidx = pd.date_range("2021-01-04", periods=300, freq="B")
+        frames = {}
+        for k in range(6):
+            p = 100 * np.exp(np.cumsum(rng.normal(0.0004, 0.012, len(cidx))))
+            frames[f"S{k}_SHFE"] = pd.DataFrame(
+                {"open": p, "high": p * 1.01, "low": p * 0.99, "close": p,
+                 "volume": 1e4, "open_interest": 1e4}, index=cidx)
+        bt = BacktestConfig(initial_cash=500_000.0, fee_rate=0.0003, slippage=0.0)
+
+        def _cross(**kw):
+            cfg = CX.CrossConfig(mode="hedge", factor_mode="single",
+                                 factor_keys=["mom_20"], top_pct=30.0, bot_pct=30.0,
+                                 weight="equal", rebalance=5, **kw)
+            out = CX.run(frames, cfg, bt)
+            if not out.ok:
+                raise RuntimeError(f"截面回测没跑通：{out.error}")
+            return out.weights
+
+        w_both = _cross()
+        w_long = _cross(long_only=True)
+        w_short = _cross(short_only=True)
+        if float(w_both.clip(lower=0).sum(axis=1).max()) <= 0:
+            raise RuntimeError("默认对冲本该有多头腿")
+        if float(w_long.clip(upper=0).abs().sum(axis=1).max()) > 1e-12:
+            raise RuntimeError("截面「只做多」里还有空头腿")
+        if float(w_short.clip(lower=0).sum(axis=1).max()) > 1e-12:
+            raise RuntimeError("截面「只做空」里还有多头腿")
+        if float(w_short.clip(upper=0).abs().sum(axis=1).max()) <= 0:
+            raise RuntimeError("截面「只做空」连空头腿都没了")
+
+        # ---- 收编模板：默认「允许做空、不禁止做多」
+        from ttrade import strategy_templates as T
+
+        libs = [k for k in T.keys() if k.startswith("tpl_lib_")]
+        if len(libs) < 50:
+            raise RuntimeError(f"收编进去的模板只有 {len(libs)} 条")
+        for k in libs:
+            c = T.to_config(k)
+            if c is None:
+                raise RuntimeError(f"{k} 还原不出来")
+            if getattr(c, "short_only", False):
+                raise RuntimeError(f"{k} 默认勾了「禁止做多」，应该默认不勾")
+            if c.market != "cn_stock" and c.note != "short":
+                raise RuntimeError(f"{k} 默认没勾「允许做空」")
+        names = T.names()
+        if len(set(names)) != len(names):
+            raise RuntimeError("内置模板有重名")
+        return (f"单品种 long={long_only['long_exposure']:.2f}/short={short_only['short_exposure']:.2f}、"
+                f"截面多头腿 {float(w_short.clip(lower=0).sum(axis=1).max()):.0f}、"
+                f"收编 {len(libs)} 条模板默认允许做空且不禁止做多")
+
+    check("禁止做多（只做空）", _no_long_flag)
+
     def _chart_from_trades():
         """K 线与信号页的持仓/标记必须**与交易记录同源**。
 
@@ -1598,14 +1693,14 @@ def _run() -> tuple[bool, list[str]]:
             def mk(name):
                 return S.StrategyConfig(symbol="RB_SHFE", name=name)
 
-            first = S.add_to_library(mk("白银动量60-1h"))
+            first = S.add_to_library(mk("压测用·白银动量60-1h"))
             try:
-                S.add_to_library(mk("白银动量60-1h"))
+                S.add_to_library(mk("压测用·白银动量60-1h"))
                 raise RuntimeError("同名自定义策略没被拦下来")
             except S.NameConflict as exc:
                 if exc.builtin or exc.item is None:
                     raise RuntimeError(f"自定义重名被判成了内置：{exc}")
-            again = S.add_to_library(mk("白银动量60-1h"), overwrite=True)
+            again = S.add_to_library(mk("压测用·白银动量60-1h"), overwrite=True)
             lib = S.load_library()
             if len(lib) != 1:
                 raise RuntimeError(f"覆盖之后库里变成了 {len(lib)} 条")
@@ -1615,15 +1710,15 @@ def _run() -> tuple[bool, list[str]]:
             # 改名撞车：把这一条改叫别人的名字。要拦，而且**不能**给 item ——
             # 给了界面就会弹「要覆盖吗」，点了覆盖又回到同一条分支，转一圈
             # 还是存不进去
-            S.add_to_library(mk("碳酸锂动量60-5m"))
-            first.name = "碳酸锂动量60-5m"
+            S.add_to_library(mk("压测用·碳酸锂动量60-5m"))
+            first.name = "压测用·碳酸锂动量60-5m"
             try:
                 S.add_to_library(first)
                 raise RuntimeError("改名撞车没被拦下来")
             except S.NameConflict as exc:
                 if exc.item is not None or exc.builtin:
                     raise RuntimeError("改名撞车不该让界面去问「覆盖吗」")
-            first.name = "白银动量60-1h"
+            first.name = "压测用·白银动量60-1h"
 
             tpl_name = S.TPL.names()[0]
             try:

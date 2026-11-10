@@ -1098,6 +1098,8 @@ class PortfolioRunner:
             st.signal = self._signal(st, df)
         if st.cfg.note != "short":
             st.signal = max(0, st.signal)     # 不允许做空时把空头信号裁掉
+        elif getattr(st.cfg, "short_only", False):
+            st.signal = min(0, st.signal)     # 禁止做多：+1 砍成空仓，只留空头
         st.lots = self._lots(st, self._mark_price(st, df), atr(df, st.cfg.stop_atr_n))
         if self._ib_on(st):
             # K 线内那一族不用 `signal` 定目标仓 —— 入场 / 止损由盘中触发价
@@ -1279,7 +1281,8 @@ class PortfolioRunner:
 
         d = st.ib_stop_dist
         el, es = st.ib_entry_long, st.ib_entry_short
-        if el == el and price >= el:
+        if el == el and price >= el and not getattr(st.cfg, "short_only", False):
+            # 禁止做多时多头触发价作废：价格冲上去了也不开多
             st.target = st.lots
             st.ib_fired = True
             st.ib_exit_pending = False     # 重新持仓了，上一笔的平仓账已清
