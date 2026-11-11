@@ -1133,6 +1133,12 @@ GRID_FOLLOW_BY_SYMBOL: dict[str, int] = {
     "IM": 1, "IC": 1, "IF": 1, "IH": 1,     # 股指：顺势
     "SR": 0, "NR": 0,                        # 白糖 / 20 号胶：逆势
 }
+# 🔴表里没有的品种**默认走逆势**（2026-11-11 全市场体检改的）。
+# 原来这里兜底是 1（顺势）—— 等于把股指的顺势口径套到全部 72 个非股指品种上，
+# 实测顺势在非股指上中位累计 −43.9%（78 个品种只有 7 个正），逆势 −16.5%
+# （15 个正）。而且**没有任何品种在两个方向上都赚钱** ⇒ 方向本来就该按品种定，
+# 兜底值必须选「天然属于网格」的那一个：网格赚的是价格回中枢，逆势才是它的本义。
+# 详见 MEMORY #112。
 
 # 分品种定稿参数（2026-11-11 全历史寻优，笔数均 >= 1000 笔，见 MEMORY #109f）。
 # 为什么必须分品种：**格宽要按「单 bar 波幅」定** —— 股指 5m 波幅大、格宽要放到
@@ -1141,34 +1147,44 @@ GRID_FOLLOW_BY_SYMBOL: dict[str, int] = {
 # IC 累计 +28% 会变成 −5%（中枢一改就翻负）。
 #
 # 每项含义：ma_n 中枢根数 / grid_n 档数 / grid_mode 格宽口径
-#          （1=5mATR, 2=日线ATR）/ atr_mult 倍数 / hold 持有过夜
+#          （1=5mATR, 2=日线ATR）/ atr_mult 倍数 / hold 持有过夜 / flat_pct 震荡阈值
 GRID_PRESET_BY_SYMBOL: dict[str, dict] = {
-    "IM": {"ma_n": 36, "grid_n": 4, "grid_mode": 1, "atr_mult": 3.0, "hold": 0},
-    "IC": {"ma_n": 36, "grid_n": 4, "grid_mode": 2, "atr_mult": 0.4, "hold": 0},
-    "IF": {"ma_n": 36, "grid_n": 4, "grid_mode": 1, "atr_mult": 3.0, "hold": 0},
-    "IH": {"ma_n": 60, "grid_n": 4, "grid_mode": 2, "atr_mult": 0.8, "hold": 0},
-    "SR": {"ma_n": 96, "grid_n": 5, "grid_mode": 1, "atr_mult": 4.0, "hold": 1},
+    "IM": {"ma_n": 36, "grid_n": 4, "grid_mode": 1, "atr_mult": 3.0, "hold": 0,
+           "flat_pct": 0.0},
+    "IC": {"ma_n": 36, "grid_n": 4, "grid_mode": 2, "atr_mult": 0.4, "hold": 0,
+           "flat_pct": 0.0},
+    "IF": {"ma_n": 36, "grid_n": 4, "grid_mode": 1, "atr_mult": 3.0, "hold": 0,
+           "flat_pct": 0.0},
+    "IH": {"ma_n": 60, "grid_n": 4, "grid_mode": 2, "atr_mult": 0.8, "hold": 0,
+           "flat_pct": 0.0},
+    "SR": {"ma_n": 96, "grid_n": 5, "grid_mode": 1, "atr_mult": 4.0, "hold": 1,
+           "flat_pct": 0.0},
 }
-# 表里没有的品种：按「股指那一档」的中性配置兜底，并且不隔夜（保守）
+# 表里没有的品种：按「股指那一档」的中性配置兜底，不隔夜、**开震荡过滤**（保守）。
+# 🔴`flat_pct` 兜底 1.0 是 2026-11-11 全市场体检的结果：78 个品种里绝大多数是
+# 「趋势段做网格」被拖死的，开 1% 的震荡过滤是唯一能把爆仓数压到 0 的开关。
+# 但那 5 个定稿品种**实测被过滤拖坏**（组合 27.65% → 9.02%），所以它们显式写 0。
+# 判据：过滤是「救大面积」+「伤尖子」，只能按品种分，不能全局开。
 GRID_PRESET_FALLBACK: dict = {"ma_n": 36, "grid_n": 4, "grid_mode": 1,
-                              "atr_mult": 3.0, "hold": 0}
+                              "atr_mult": 3.0, "hold": 0, "flat_pct": 1.0}
 
 
 def strat_grid(df: pd.DataFrame, ma_n: int = -1, grid_n: int = -1,
-               grid_pct: float = 0.5, flat_pct: float = 0.0,
+               grid_pct: float = 0.5, flat_pct: float = -1.0,
                flat_min: int = 895, night: int = 0,
                follow: int = -1, hold: int = -1,
                grid_mode: int = -1, atr_n: int = 300,
                atr_nd: int = 10, atr_mult: float = -1.0,
                net_stop: float = 0.0, grid_side: int = 2,
                mid_band: float = 0.0) -> pd.DataFrame:
-    """网格交易：一格一档。**默认顺势**（中枢之上做多、之下做空）。**为日内 5 分钟设计**。
+    """网格交易：一格一档。**方向默认按品种**（股指顺势、其余逆势）。**为日内 5 分钟设计**。
 
     规则来自网格交易的标准定义，只把「起始价」换成了滚动中枢：
 
     - **中枢**：`ma_n` 均线，用**上一根**收盘算，不看当根（不能用未来）。
-    - **方向（`follow`）**，这一条决定整个策略的性质：
-      - `follow=1` **顺势**（默认）：价格在中枢**之上**做多头网格、**之下**做空头
+    - **方向（`follow`）**，这一条决定整个策略的性质（`-1` = 按品种，见
+      `GRID_FOLLOW_BY_SYMBOL`；表里没有的品种兜底 **逆势**）：
+      - `follow=1` **顺势**：价格在中枢**之上**做多头网格、**之下**做空头
         网格。档位挂在**趋势那一侧** —— 中枢之上第 k 档 = `中枢 + k×格距`，突破
         一档买一份；止盈挂在**再上一格**。
       - `follow=0` **逆势**：中枢**之下**做多、之上做空，档位挂在**回调侧**
@@ -1187,7 +1203,9 @@ def strat_grid(df: pd.DataFrame, ma_n: int = -1, grid_n: int = -1,
       波动率跳变时档位价会整体平移（实盘要按「当根算出的档位」重挂单）。
       🔴两条 ATR 都 `shift(1)`，不许用当根的波动决定当根挂哪。
     - **`flat_pct`**：趋势过滤。只有中枢在 `ma_n` 根内的变化率不超过它才开网格，
-      否则空仓。0 = 不过滤。
+      否则空仓。`0` = 不过滤；`-1`（默认）= 按品种（定稿 5 个 0、其余 1.0）。
+      🔴全市场实测：开 1% 能把爆仓数从 4 压到 0，但会把这 5 个定稿品种的组合收益
+      从 27.65% 拖到 9.02% —— **救大面积、伤尖子**，所以只能按品种分。
     - **中枢为什么不用固定起始价**：固定起始价在实盘里没法复现 —— 今天开跑和
       昨天开跑的网格是两套不同的档位价，回测和实盘永远对不上。改成滚动中枢后，
       任何一根 K 线都能独立算出同一张网。
@@ -1261,9 +1279,15 @@ def strat_grid(df: pd.DataFrame, ma_n: int = -1, grid_n: int = -1,
         atr_mult = _pre["atr_mult"]
     if int(hold) < 0:
         hold = _pre["hold"]
+    if float(flat_pct) < 0:
+        # 震荡阈值也走「-1 = 按品种」：定稿的 5 个显式 0（过滤会拖坏它们），
+        # 其余品种兜底 1.0（趋势段不开网，是唯一能把爆仓压到 0 的开关）。
+        flat_pct = _pre["flat_pct"]
     follow = int(follow)
     if follow < 0:
-        follow = int(GRID_FOLLOW_BY_SYMBOL.get(_sym, 1))
+        # 🔴兜底 0（逆势），不是 1。网格赚的是「价格回中枢」，逆势是它的本义；
+        #    顺势只对股指成立，而股指已经在表里显式列了。
+        follow = int(GRID_FOLLOW_BY_SYMBOL.get(_sym, 0))
     out = df.copy()
     close = pd.to_numeric(out["close"], errors="coerce").astype(float)
     n = int(ma_n)
@@ -1556,7 +1580,7 @@ STRATEGIES: dict[str, StrategySpec] = {
         key="grid_trade",
         label="网格交易（日内档位）",
         func=strat_grid,
-        params={"ma_n": -1, "grid_n": -1, "grid_pct": 0.6, "flat_pct": 0.0,
+        params={"ma_n": -1, "grid_n": -1, "grid_pct": 0.6, "flat_pct": -1.0,
                 "flat_min": 895, "night": 0, "follow": -1, "hold": -1,
                 "grid_mode": -1, "atr_n": 300, "atr_nd": 10, "atr_mult": -1.0,
                 "net_stop": 0.0, "grid_side": 2, "mid_band": 0.0},
@@ -1564,7 +1588,7 @@ STRATEGIES: dict[str, StrategySpec] = {
             "ma_n": (-1, 120, 1),
             "grid_n": (-1, 20, 1),
             "grid_pct": (0.05, 3.0, 0.05),
-            "flat_pct": (0.0, 10.0, 0.5),
+            "flat_pct": (-1.0, 10.0, 0.5),
             "flat_min": (600, 900, 5),
             "night": (0, 1, 1),
             "follow": (-1, 1, 1),
@@ -1578,7 +1602,7 @@ STRATEGIES: dict[str, StrategySpec] = {
             "mid_band": (0.0, 12.0, 0.5),
         },
         param_labels={"ma_n": "中枢周期(-1按品种)", "grid_n": "网格档数(-1按品种)",
-                      "grid_pct": "每格间距(%)", "flat_pct": "震荡阈值(%)",
+                      "grid_pct": "每格间距(%)", "flat_pct": "震荡阈值(%)-1按品种",
                       "flat_min": "平仓(分)", "night": "做夜盘(0/1)",
                       "follow": "方向(1顺/0逆/-1按品种)",
                       "hold": "持有过夜(-1按品种)",

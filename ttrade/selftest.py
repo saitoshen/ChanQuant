@@ -3354,6 +3354,56 @@ def _run() -> tuple[bool, list[str]]:
 
     check("网格三种方向结构（只多/只空/多空都做）", _grid_side_modes)
 
+    def _grid_symbol_defaults():
+        """分品种默认值：表外品种兜底 = **逆势 + 震荡过滤**，表内定稿一个字不改。
+
+        这是回归保险。2026-11-11 之前兜底方向是「顺势」，等于把股指的口径套到
+        72 个非股指品种上 —— 全市场 78 个品种只有 7 个正收益、中位累计 −43.9%
+        （换逆势后 −16.5%，再开震荡过滤爆仓数从 4 降到 0）。判据只认结构：
+        表外品种必须解析成 `grid_follow=0`，股指定稿必须还是 `1`。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade.strategies import run_strategy
+
+        rng = np.random.default_rng(3)
+        stamps = []
+        for k in range(14):
+            base = pd.Timestamp("2024-03-04") + pd.Timedelta(days=k)
+            stamps += [base + pd.Timedelta(minutes=m)
+                       for m in list(range(540, 691, 5)) + list(range(810, 896, 5))]
+        idx = pd.DatetimeIndex(stamps)
+        nb = len(idx)
+        px = 100.0 + 6.0 * np.sin(np.arange(nb) / 40.0) + np.cumsum(rng.normal(0, 0.05, nb))
+        d = pd.DataFrame({"open": px, "high": px + 0.3, "low": px - 0.3,
+                          "close": px, "volume": [1000] * nb}, index=idx)
+
+        def run_default(sym):
+            d.attrs["symbol"] = sym
+            o = run_strategy(d, "grid_trade", {})
+            return float(pd.to_numeric(o["grid_follow"], errors="coerce").iloc[0]), o
+
+        f_rb, o_rb = run_default("RB")
+        f_im, _ = run_default("IM")
+        if f_rb != 0.0:
+            raise RuntimeError(f"表外品种兜底方向不是逆势（拿到 {f_rb}）——"
+                               f"整批非股指品种会被股指口径拖死")
+        if f_im != 1.0:
+            raise RuntimeError(f"股指定稿的顺势被兜底改掉了（拿到 {f_im}）")
+
+        d.attrs["symbol"] = "RB"
+        o_off = run_strategy(d, "grid_trade", {"flat_pct": 0.0})
+        z_on = float((pd.to_numeric(o_rb["signal"], errors="coerce") == 0).mean())
+        z_off = float((pd.to_numeric(o_off["signal"], errors="coerce") == 0).mean())
+        if not z_on > z_off:
+            raise RuntimeError(f"表外品种默认没开震荡过滤"
+                               f"（零信号 {z_on:.1%} vs 关掉 {z_off:.1%}）")
+        return (f"RB 兜底 逆势+过滤（零信号 {z_on:.0%} vs 关掉 {z_off:.0%}）；"
+                f"IM 仍顺势")
+
+    check("网格分品种默认值（表外逆势+过滤 / 表内定稿不动）", _grid_symbol_defaults)
+
 
 
 
