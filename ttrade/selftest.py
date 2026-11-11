@@ -3091,6 +3091,192 @@ def _run() -> tuple[bool, list[str]]:
 
     check("启停按钮按真实运行状态判方向", _want_on_rule)
 
+    def _grid_levels():
+        """网格交易：signal 是**档位号**，回测走独立的分级仓位分支。
+
+        2026-11-11 新增。三条必须成立：
+        ① 网格要真的跑出 |signal|>1 的档位（否则它就是一条普通的高低卖）；
+        ② 档位信号**不能**进老循环 —— 老循环里 `pos = want` 之后到处按
+           `pos == 1` 判多空，-3 会被当成「非多头」走进空头分支，算错也不报错；
+        ③ 逐笔 `Σ(gross − cost)` 必须等于账户变化（项目里的老判据，分级分支
+           每条腿各记一笔，最容易在这里对不上）。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade.backtest import BacktestConfig, run_backtest
+        from ttrade.strategies import run_strategy
+
+        idx = pd.date_range("2024-01-01", periods=40, freq="D")
+        px = [100.0] * 20 + [99, 98, 97, 96, 97, 98, 99, 100, 101, 102]
+        px += [100.0] * (40 - len(px))
+        d = pd.DataFrame({
+            "open": px, "high": [p * 1.002 for p in px],
+            "low": [p * 0.998 for p in px], "close": px, "volume": [1000] * 40,
+        }, index=idx)
+
+        # 🔴基线显式固定：`grid_mode`/`hold`/`atr_mult` 的默认值是「-1 = 按品种」，
+        #    而这个夹具没有 `attrs["symbol"]`、只有 40 根 bar（ATR300 预热不了）
+        #    ⇒ 必须显式指定走百分比口径，否则整条信号会是 0。
+        out = run_strategy(d, "grid_trade",
+                           {"ma_n": 10, "grid_n": 8, "grid_pct": 1.0,
+                            "grid_mode": 0, "hold": 0})
+        sig = out["signal"].to_numpy(int)
+        if int(np.abs(sig).max()) <= 1:
+            raise RuntimeError(f"网格没有产生档位，还是 ±1：{sorted(set(sig.tolist()))}")
+
+        cfg = BacktestConfig(initial_cash=100000, multiplier=10, margin_rate=0.1,
+                             sizing="fixed", volume=1, fee_rate=0.0001)
+        r = run_backtest(out, cfg, label="网格")
+        if "max_level" not in r.metrics:
+            raise RuntimeError("档位信号没走分级分支（进了老循环）")
+        pnl = sum(t.gross - t.cost for t in r.trades)
+        chg = float(r.equity.iloc[-1]) - cfg.initial_cash
+        if abs(pnl - chg) > 1e-6:
+            raise RuntimeError(f"Σ(gross−cost)={pnl:.4f} 与账户变化 {chg:.4f} 对不上")
+
+        # 老策略必须仍然走老路径，否则全部历史回测都换口径了
+        d2 = d.copy()
+        d2["signal"] = 1
+        if "max_level" in run_backtest(d2, cfg).metrics:
+            raise RuntimeError("±1 的信号也进了分级分支（老路径被改到了）")
+        return (f"档位 max={int(np.abs(sig).max())}、分级回测逐笔自洽"
+                f"（Σ净额 {pnl:.2f}）、±1 仍走老路径")
+
+    check("网格交易（档位仓位）的回测口径", _grid_levels)
+
+    def _grid_intraday():
+        """网格日内版：14:50 之后不许再有信号、14:55 起必须空仓、不隔夜。
+
+        2026-11-11 新增。这一条同时守住两个刚踩过的坑：
+
+        ① **节假日前一天漏网**：「下一根已经过了平仓时刻」是靠分钟数比的，
+           而节前没有夜盘，下一根直接跳到节后 09:00（540 < 895），14:55 那根
+           就打不掉了 ⇒ 等于给节后开盘挂一张隔夜单。判据改成「下一根的时钟
+           比这一根更早」＝换场/换日。下面专门造一个「日盘后直接跳到次日」
+           的样本，就是当初漏掉的那个形状。
+        ② **持仓曲线回不到 0**：`pos` 原来写在 `if want_dir != 0` 里面，清仓
+           那根不进这个分支 ⇒ 持仓一直沿用上一个方向，看图上「14:55 是否
+           空仓」永远显示有仓。所以这里断言的是**持仓序列**，不是权益。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade.backtest import BacktestConfig, run_backtest
+        from ttrade.strategies import run_strategy
+
+        day_min = list(range(540, 691, 5)) + list(range(810, 896, 5))   # 09:00~14:55
+        night_min = list(range(1260, 1376, 5))                          # 21:00~22:55
+        stamps, prices = [], []
+        for k in range(3):
+            base = pd.Timestamp("2024-01-02") + pd.Timedelta(days=k)
+            for j, m in enumerate(day_min + night_min):
+                # 第 1 天砸 5 格、第 2 天抽回 5 格，第 0 天打底
+                if k == 1:
+                    px = 100.0 - min(j, 5) * 1.0
+                elif k == 2:
+                    px = 95.0 + min(j, 5) * 1.0
+                else:
+                    px = 100.0
+                stamps.append(base + pd.Timedelta(minutes=m))
+                prices.append(px)
+
+        idx = pd.DatetimeIndex(stamps)
+        d = pd.DataFrame({"open": prices, "high": prices, "low": prices,
+                          "close": prices, "volume": [1000] * len(idx)}, index=idx)
+
+        out = run_strategy(d, "grid_trade",
+                           {"ma_n": 10, "grid_n": 8, "grid_pct": 1.0,
+                            "flat_pct": 0.0, "flat_min": 895, "night": 0,
+                            "grid_mode": 0, "hold": 0})
+        sig = out["signal"].to_numpy(int)
+        ms = (idx.hour * 60 + idx.minute).to_numpy(int)
+        is_day = (ms >= 480) & (ms < 960)
+        if int(np.abs(sig).max()) <= 1:
+            raise RuntimeError(f"样本没跑出档位：{sorted(set(sig.tolist()))}")
+
+        late = is_day & (ms >= 890)                     # 14:50 及以后
+        if np.any(sig[late] != 0):
+            bad = [str(idx[i]) for i in np.flatnonzero(late & (sig != 0))][:3]
+            raise RuntimeError(f"收盘前还有信号（会给次日挂隔夜单）：{bad}")
+        if np.any(sig[~is_day] != 0):
+            raise RuntimeError("night=0 时夜盘还有信号")
+
+        cfg = BacktestConfig(initial_cash=100000, multiplier=10, margin_rate=0.1,
+                             sizing="fixed", volume=1, fee_rate=0.0001)
+        r = run_backtest(out, cfg, label="网格")
+        pos = r.position.to_numpy(int)
+        if np.any(pos[is_day & (ms >= 895)] != 0):
+            raise RuntimeError("14:55 那根还带着仓（日内强平没生效）")
+        if np.any(pos[~is_day] != 0):
+            raise RuntimeError("夜盘带着仓")
+        days = idx.normalize().to_numpy()
+        first = np.r_[True, days[1:] != days[:-1]]
+        if np.any(pos[first] != 0):
+            raise RuntimeError("每个交易日第一根还带着仓（隔夜了）")
+        # 反过来也要保证这一刻真的交易过，否则上面几条是「一直空仓」的假通过
+        if not np.any(pos != 0):
+            raise RuntimeError("样本从头到尾没持仓，日内约束是假通过")
+        return (f"档位 max={int(np.abs(sig).max())}、14:50 后零信号、"
+                f"14:55/夜盘/次日开盘均零仓")
+
+    check("网格交易（日内强平 + 不隔夜）", _grid_intraday)
+
+    def _grid_no_lookahead():
+        """网格挂单模型不许用当根收盘定方向（2026-11-11 修掉的前视）。
+
+        做法：把第 k 根的**收盘价**随意改掉，第 k 根**及之前**已经完全平掉的
+        那批交易必须一模一样。之前 `want = sign(sig[i])` 用的是当根收盘算出的
+        档位号，却在本根内成交 —— 等于用收盘知道该做多、再回头在开盘挂单。
+        实测这一条值多少钱：中证 1000 顺势版 +923% → +98%。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade.backtest import BacktestConfig, run_backtest
+        from ttrade.strategies import run_strategy
+
+        rng = np.random.default_rng(7)
+        day_min = list(range(540, 691, 5)) + list(range(810, 896, 5))
+        stamps = []
+        for k in range(6):
+            base = pd.Timestamp("2024-03-04") + pd.Timedelta(days=k)
+            stamps += [base + pd.Timedelta(minutes=m) for m in day_min]
+        idx = pd.DatetimeIndex(stamps)
+        n = len(idx)
+        px = 100.0 + np.cumsum(rng.normal(0, 0.12, n))
+        d = pd.DataFrame({"open": px, "high": px + 0.15, "low": px - 0.15,
+                          "close": px, "volume": [1000] * n}, index=idx)
+
+        prm = {"ma_n": 12, "grid_n": 3, "grid_pct": 0.3,
+               "flat_pct": 0.0, "flat_min": 895, "night": 0, "follow": 1,
+               "grid_mode": 0, "hold": 0}
+        cfg = BacktestConfig(initial_cash=100000, sizing="fixed", volume=1,
+                             multiplier=10, margin_rate=0.1, fee_rate=0.0001)
+
+        a = run_backtest(run_strategy(d, "grid_trade", prm), cfg)
+        k = n // 2
+        d2 = d.copy()
+        d2.iloc[k, d2.columns.get_loc("close")] = px[k] * 1.05   # 只改这一根收盘
+        b = run_backtest(run_strategy(d2, "grid_trade", prm), cfg)
+
+        cut = idx[k]
+        # 比 **进场**：第 k 根当根进场的价格如果受「这一根收盘」影响，就是前视。
+        # 出场价不比 —— 它本来就晚于 k，受后续行情影响是应该的。
+        ta = [(t.entry_date, round(t.entry_price, 6)) for t in a.trades
+              if t.entry_date <= cut]
+        tb = [(t.entry_date, round(t.entry_price, 6)) for t in b.trades
+              if t.entry_date <= cut]
+        if ta != tb:
+            raise RuntimeError(f"改了第 {k} 根的收盘，这一根及之前的进场价却变了 —— "
+                               f"有前视（{len(ta)} 笔 vs {len(tb)} 笔）")
+        if not ta:
+            raise RuntimeError("样本太短，前半段没成交，测不出前视")
+        return f"扰动第 {k} 根收盘，当根及之前 {len(ta)} 笔进场价一分不动"
+
+    check("网格挂单模型：不许用当根收盘定方向（前视）", _grid_no_lookahead)
+
+
 
 
     def _factor_reverse():

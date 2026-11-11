@@ -1121,6 +1121,287 @@ def strat_a_vol_breakout(df: pd.DataFrame, max_price: float = 80.0,
     return out
 
 
+# 网格的**按品种默认方向**（`follow=-1` 时查这张表，没列出的按顺势）。
+# 依据是 2026-11-11 同一段样本（5m、挂单成本、禁同根、14:55 强平、格 0.6%/3 档）：
+#   股指四兄弟 IM/IC/IF/IH 这段是单边上涨（+27%~+71%），顺势 +129%~+155%、
+#   逆势基本全部爆仓；白糖 SR 是震荡（-9.3%），逆势 +42.5%（卡玛 2.49）、
+#   顺势 -33.8%。所以方向不是「哪种更好」的问题，而是品种行情性质的问题。
+# 🔴 这是**样本内的结论**，不是永久属性：品种从趋势转震荡时要重新判。
+#    NR 两条路都不赚（逆势扫 12 组最好 -21.4%），放进来是因为用户指定，
+#    实盘前必须自己复核。
+GRID_FOLLOW_BY_SYMBOL: dict[str, int] = {
+    "IM": 1, "IC": 1, "IF": 1, "IH": 1,     # 股指：顺势
+    "SR": 0, "NR": 0,                        # 白糖 / 20 号胶：逆势
+}
+
+# 分品种定稿参数（2026-11-11 全历史寻优，笔数均 >= 1000 笔，见 MEMORY #109f）。
+# 为什么必须分品种：**格宽要按「单 bar 波幅」定** —— 股指 5m 波幅大、格宽要放到
+# 0.56~0.75%，白糖只要 0.47%；而中枢长度取决于品种的「记忆长度」：股指 36 根
+# （0.75 日）最优，上证 50 要 60 根、白糖要 96 根。同一套参数套全品种，实测
+# IC 累计 +28% 会变成 −5%（中枢一改就翻负）。
+#
+# 每项含义：ma_n 中枢根数 / grid_n 档数 / grid_mode 格宽口径
+#          （1=5mATR, 2=日线ATR）/ atr_mult 倍数 / hold 持有过夜
+GRID_PRESET_BY_SYMBOL: dict[str, dict] = {
+    "IM": {"ma_n": 36, "grid_n": 4, "grid_mode": 1, "atr_mult": 3.0, "hold": 0},
+    "IC": {"ma_n": 36, "grid_n": 4, "grid_mode": 2, "atr_mult": 0.4, "hold": 0},
+    "IF": {"ma_n": 36, "grid_n": 4, "grid_mode": 1, "atr_mult": 3.0, "hold": 0},
+    "IH": {"ma_n": 60, "grid_n": 4, "grid_mode": 2, "atr_mult": 0.8, "hold": 0},
+    "SR": {"ma_n": 96, "grid_n": 5, "grid_mode": 1, "atr_mult": 4.0, "hold": 1},
+}
+# 表里没有的品种：按「股指那一档」的中性配置兜底，并且不隔夜（保守）
+GRID_PRESET_FALLBACK: dict = {"ma_n": 36, "grid_n": 4, "grid_mode": 1,
+                              "atr_mult": 3.0, "hold": 0}
+
+
+def strat_grid(df: pd.DataFrame, ma_n: int = -1, grid_n: int = -1,
+               grid_pct: float = 0.5, flat_pct: float = 0.0,
+               flat_min: int = 895, night: int = 0,
+               follow: int = -1, hold: int = -1,
+               grid_mode: int = -1, atr_n: int = 300,
+               atr_nd: int = 10, atr_mult: float = -1.0,
+               net_stop: float = 0.0) -> pd.DataFrame:
+    """网格交易：一格一档。**默认顺势**（中枢之上做多、之下做空）。**为日内 5 分钟设计**。
+
+    规则来自网格交易的标准定义，只把「起始价」换成了滚动中枢：
+
+    - **中枢**：`ma_n` 均线，用**上一根**收盘算，不看当根（不能用未来）。
+    - **方向（`follow`）**，这一条决定整个策略的性质：
+      - `follow=1` **顺势**（默认）：价格在中枢**之上**做多头网格、**之下**做空头
+        网格。档位挂在**趋势那一侧** —— 中枢之上第 k 档 = `中枢 + k×格距`，突破
+        一档买一份；止盈挂在**再上一格**。
+      - `follow=0` **逆势**：中枢**之下**做多、之上做空，档位挂在**回调侧**
+        （中枢之下第 k 档 = `中枢 − k×格距`），止盈挂在**回到中枢的那一格**。
+        这是教科书网格，「跌买涨卖」，2026-11-11 之前的默认值。
+      🔴 两种方向不只是信号取负：**档位挂在哪一侧、止盈朝哪边走**都要一起翻。
+      只把 signal 取负而不动几何，结果是「顺势方向 + 逆势价位」，档位永远挂在
+      价格到不了的那一侧 —— 实测中证 1000 两年只成交 53 笔，是结构错位不是策略。
+    - **档位**：以中枢为 0 档，每偏离一个「格宽」算一档，最多 `grid_n` 档。
+      格宽有三种口径（`grid_mode`）：
+      - `0`（默认）固定百分比 `grid_pct`% —— 简单，但同一个数套到不同品种上
+        含义完全不一样（实测股指要 1.0%、白糖要 0.30%）。
+      - `1` = `atr_n` 根 **5 分钟** ATR × `atr_mult`（默认 300 根 ≈ 6 个交易日）。
+      - `2` = `atr_nd` 根 **日线** ATR × `atr_mult`。
+      ATR 口径的好处是格宽跟着波动率自己走，**一套参数能跨品种**；代价是
+      波动率跳变时档位价会整体平移（实盘要按「当根算出的档位」重挂单）。
+      🔴两条 ATR 都 `shift(1)`，不许用当根的波动决定当根挂哪。
+    - **`flat_pct`**：趋势过滤。只有中枢在 `ma_n` 根内的变化率不超过它才开网格，
+      否则空仓。0 = 不过滤。
+    - **中枢为什么不用固定起始价**：固定起始价在实盘里没法复现 —— 今天开跑和
+      昨天开跑的网格是两套不同的档位价，回测和实盘永远对不上。改成滚动中枢后，
+      任何一根 K 线都能独立算出同一张网。
+
+    `signal` 是**档位号**而不是 -1/0/1：`+k` = 持 k 份多头，`-k` = k 份空头。
+    「一份」是多少手由回测的手数口径决定 —— 用「固定手数」就是每格 1 手，和
+    `grid_volume_long = [0,1,2,...]` 完全一致。回测走 `run_grid_intrabar`
+    （K 线内挂单成交），实盘走 `st.target = signal × lots`。
+
+    ## 日内约束（这一族参数就是为 5 分钟周期加的）
+
+    - `flat_min`：**平仓时刻**，从 0 点起的分钟数，默认 **895 = 14:55**。
+      回测是「T 根收盘定信号、T+1 根开盘成交」，而 5m bar 的时间戳是**起点**
+      （日盘最后一根是 14:55，覆盖 14:55~15:00）。想「14:55 手上必须是空的」，
+      就得在 **14:50 那根**把 signal 打成 0 —— 下面按「下一根的开盘时刻 >=
+      flat_min」清零，正好落在这里。改成别的时刻就按那个时刻自动前推一根。
+    - **跨时段一律清零**：夜盘转日盘、日盘转夜盘都不留仓。日盘的午休
+      （11:30~13:30）不算跨时段，可以持仓过午休 —— 那没有隔夜风险。
+    - `night`：0 = 只做日盘（默认），1 = 夜盘也做。夜盘同样在时段末尾清零，
+      不会把仓带进第二天。
+    - `hold`：**1 = 持有过夜，只在方向翻转时强平**。这时上面三条时段规则
+      （`flat_min` / 跨时段 / 夜盘清零）**全部关掉**，仓位一直拿到「信号反号」
+      那一根才用开盘价市价全平；单档止盈照旧。⚠️ 代价是隔夜跳空全部暴露 ——
+      日盘平仓省掉的是强平亏损，换来的是跳空风险，两者要分开看。
+    - `net_stop`：**破网止损**（单位=格宽）。价格越过最外一档再走这么多格宽，
+      就把整张网全平、当天不再开新网。`0` = 关闭（老行为）。
+    - **日线及以上自动跳过整段约束**：日线的时间戳是当天零点，套「日盘」判据
+      会把信号整条清零。判据是相邻 bar 的中位间隔（>= 1 天即视为非日内）。
+    """
+    # ---- 方向：`follow` 取 1 / 0 / -1（按品种自动）----
+    # 中枢之外的第二个决策点：同一套档位规则，方向反了就是另一条策略 ——
+    # 趋势品种顺势才赚、震荡品种逆势才赚（同一样本里白糖逆势 +42%、顺势 -34%）。
+    # `df.attrs["symbol"]` 由数据层挂上（因子层也靠它认品种），切片与复制都会
+    # 保留；读不到就按顺势。
+    _sym = str((getattr(df, "attrs", None) or {}).get("symbol") or "").upper()
+    # ---- 分品种定稿参数：任一参数填 -1 就走 `GRID_PRESET_BY_SYMBOL` ----
+    # 和 `follow=-1` 是同一套约定：**留 -1 = 按品种自动**，显式填数字就覆盖。
+    # 这样「一套默认值跑批」和「单品种手调」用同一份代码，不用维护两条路径。
+    _pre = GRID_PRESET_BY_SYMBOL.get(_sym, GRID_PRESET_FALLBACK)
+    if int(ma_n) < 0:
+        ma_n = _pre["ma_n"]
+    if int(grid_n) < 0:
+        grid_n = _pre["grid_n"]
+    if int(grid_mode) < 0:
+        grid_mode = _pre["grid_mode"]
+    if float(atr_mult) < 0:
+        atr_mult = _pre["atr_mult"]
+    if int(hold) < 0:
+        hold = _pre["hold"]
+    follow = int(follow)
+    if follow < 0:
+        follow = int(GRID_FOLLOW_BY_SYMBOL.get(_sym, 1))
+    out = df.copy()
+    close = pd.to_numeric(out["close"], errors="coerce").astype(float)
+    n = int(ma_n)
+    gmax = max(int(grid_n), 1)
+    pct = float(grid_pct) / 100.0
+    out["center"] = sma(close, n).shift(1)
+
+    # ---- 格宽：按百分比，还是按 ATR ----
+    # `grid_mode=0` 固定百分比（`grid_pct`）；`1` = `atr_n` 根 5 分钟 ATR；
+    # `2` = `atr_nd` 根**日线** ATR。后两种都再乘 `atr_mult`。
+    # 🔴为什么值得换：固定百分比在低波品种上太宽（网格从不成交）、在高波品种上
+    #    又太窄（一个 bar 扫穿整张网 + 手续费吃掉）。实测同一套 `grid_pct` 必须
+    #    给股指配 1.0%、给白糖配 0.30% —— 差 3 倍多。ATR 定档就是把这一步
+    #    交给波动率自己算。
+    # 🔴两处都必须 `shift(1)`：第 i 根的档位若用到第 i 根的 ATR，就是拿当根
+    #    的波动去决定当根挂哪 —— 前视。日线口径再 shift 一次日线，保证「今天
+    #    用昨天及以前的日线 ATR」。
+    mode = int(grid_mode)
+    step = None
+    if mode in (1, 2) and "high" in out.columns and "low" in out.columns:
+        hi = pd.to_numeric(out["high"], errors="coerce").astype(float)
+        lo = pd.to_numeric(out["low"], errors="coerce").astype(float)
+        pc = close.shift(1)
+        tr = pd.concat([hi - lo, (hi - pc).abs(), (lo - pc).abs()], axis=1).max(axis=1)
+        if mode == 1:
+            atr = tr.rolling(max(int(atr_n), 2),
+                             min_periods=max(2, int(atr_n) // 3)).mean().shift(1)
+        else:
+            # 日线口径：先按**自然日**聚合。夜盘 21:00 的 bar 会归到当天而不是
+            # 下一个交易日，日线 bar 因此不是严格意义上的「交易日」bar —— 但
+            # 它只用历史价、且整体 shift 一根，不会前视；对 ATR 量级的影响
+            # 远小于「用当根 ATR」的代价（最后那一种直接是前视）。
+            d = pd.DataFrame({"h": hi, "l": lo, "c": close})
+            dd = d.resample("1D").agg({"h": "max", "l": "min", "c": "last"}).dropna()
+            dpc = dd["c"].shift(1)
+            dtr = pd.concat([dd["h"] - dd["l"], (dd["h"] - dpc).abs(),
+                             (dd["l"] - dpc).abs()], axis=1).max(axis=1)
+            datr = dtr.rolling(max(int(atr_nd), 2),
+                               min_periods=max(2, int(atr_nd) // 2)).mean().shift(1)
+            key = pd.DatetimeIndex(out.index).normalize()
+            atr = pd.Series(pd.Series(datr.to_numpy(), index=dd.index)
+                            .reindex(key).to_numpy(), index=out.index).ffill()
+        step = (atr * float(atr_mult)).where(lambda s: s > 0)
+    if step is None:
+        # 固定百分比（默认）：中枢还没算出来时（预热段）置 NaN 留空仓
+        step = (out["center"] * pct).where(lambda s: s > 0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        down = (out["center"] - close) / step
+        up = (close - out["center"]) / step
+
+    lv_long = np.floor(down.clip(lower=0, upper=float(gmax)))
+    lv_short = np.floor(up.clip(lower=0, upper=float(gmax)))
+    lv_long = lv_long.fillna(0).to_numpy()
+    lv_short = lv_short.fillna(0).to_numpy()
+
+    valid = out["center"].notna().to_numpy() & (close > 0).to_numpy()
+    below = (close <= out["center"]).to_numpy()
+    # 方向：顺势 = 跟着价格站的那一侧（之上做多、之下做空）；逆势 = 反过来。
+    # 档位**绝对值**不变，变的是符号 —— 也就是「这一侧的偏离算多头还是空头」。
+    # 档位到底挂在中心哪一侧、止盈朝哪边走，由回测按 `grid_follow` 一起算，
+    # 只翻信号不翻几何会变成「顺势方向 + 逆势价位」，挂单永远成交不了。
+    if int(follow):
+        sig = np.where(below, -lv_long, lv_short)
+    else:
+        sig = np.where(below, lv_long, -lv_short)
+    sig = np.where(valid, sig, 0).astype(int)
+
+    # 震荡过滤：中枢自己在这一段里的变化率。趋势段不开网
+    calm = None
+    if float(flat_pct) > 0:
+        chg = (out["center"] / out["center"].shift(n) - 1.0).abs().to_numpy()
+        calm = np.isfinite(chg) & (chg <= float(flat_pct) / 100.0)
+        sig = np.where(calm, sig, 0).astype(int)
+
+    # ---- 日内时段约束 ----
+    idx = pd.DatetimeIndex(out.index)
+    ms = (np.asarray(idx.hour) * 60 + np.asarray(idx.minute)).astype(int)
+    # 日盘 08:00~16:00（含各品种 09:00 / 09:30 开盘差异），其余算夜盘
+    is_day = (ms >= 480) & (ms < 960)
+    total = len(out)
+    # 日线及以上没有「日内时段」这回事：日线的时间戳一律是当天零点，套上
+    # 「日盘 08:00~16:00」的判据会把整条信号清零（回测/自检里全是 0 档）。
+    # 用相邻 bar 的中位间隔当判据 —— 5m 数据的中位间隔就是 5 分钟，日线是
+    # 1440 分钟（周末空档不改变中位数）。
+    step_min = 1440.0
+    if total > 2:
+        # 用 `total_seconds()` 而不是拿 `asi8` 自己除：`asi8` 的单位跟着索引的
+        # 分辨率走（ns / us 都见过），除错一个量级就会把日线当成 1 分钟数据。
+        gap = (pd.Series(idx).diff().dt.total_seconds() / 60.0).to_numpy()
+        gap = gap[np.isfinite(gap) & (gap > 0)]
+        if gap.size:
+            step_min = float(np.median(gap))
+    # `force` 要在两个分支外先建好：`hold=1` 时不进时段块，下面算 `grid_flat`
+    # 还要用它（全 False = 没有任何一根是「被时段规则打掉」的）。
+    force = np.zeros(total, dtype=bool)
+    if total and step_min < 1440 and not int(hold):
+        # 这一根的信号是在**下一根的开盘**成交的，所以时段判定要看下一根
+        exec_ms = np.full(total, -1, dtype=int)
+        cross = np.zeros(total, dtype=bool)
+        if total > 1:
+            exec_ms[:-1] = ms[1:]
+            cross[:-1] = is_day[1:] != is_day[:-1]
+        if not int(night):
+            sig = np.where(is_day, sig, 0).astype(int)
+        # ① 跨时段（夜→日 / 日→夜）不留仓；② 日盘里下一根已经到/过了平仓时刻；
+        # ③ 最后一根没有下一根可成交，也按清仓处理
+        force = cross | (is_day & (exec_ms >= int(flat_min))) | (exec_ms < 0)
+        if not int(night):
+            # ④ **本时段最后一根**也不留单。上面 ② 是靠「下一根的分钟数 >= 895」
+            #    把 14:55 那根顺带打掉的，而节假日前一天没有夜盘，下一根直接
+            #    跳到节后 09:00（540 < 895）⇒ 漏网，等于给节后开盘挂了一张隔夜
+            #    单。判据用「下一根的时钟比这一根更早」＝换场/换日，不依赖数值。
+            back = (exec_ms >= 0) & (exec_ms < ms)
+            force = force | back
+        sig = np.where(force, 0, sig).astype(int)
+
+    out["signal"] = sig
+    # ---- 挂单成交模型要用的两列 ----
+    # `grid_step`：一格在**价格**上是多少（中枢 × 间距%）。K 线内成交要自己算
+    #   第 k 档挂在哪个价位上，只知道「档位号」是不够的。
+    # `grid_flat`：这一根的信号是**被时段/过滤规则强制打掉**的（不是「价格回到
+    #   中枢自然出网」）。回测据此区分「下一根开盘市价全平」和「靠止盈单逐档
+    #   平」—— 尾盘强平只能走市价，不能指望挂单成交。
+    out["grid_step"] = step.astype(float)
+    # 方向模式：1=顺势（档位挂趋势侧、止盈再走一格）/ 0=逆势（档位挂回调侧、
+    # 止盈回中枢）。回测必须知道这一位，否则光看档位号算不出该挂在哪个价位。
+    out["grid_follow"] = float(int(follow))
+    # 这张网最多铺几档。回测的挂单模型要按「预先挂好的整排单」成交，不能拿
+    # 收盘档位的最大值当上限 —— 那会随着行情漂移（一路上涨的样本可能只观测到
+    # 2 档，等于偷偷把网缩小了）。
+    out["grid_cap"] = float(gmax)
+    # 破网止损：价格越过「最外一档再走 `net_stop` 个格宽」就全部平掉，当天不再
+    # 开新网（`net_stop=0` = 关闭）。0 档到最外档是 `grid_n` 个格宽，所以它的
+    # 绝对距离是 `(grid_n + net_stop) × 格宽`。
+    # 🔴为什么网格必须要这一条：打满档位之后就再没有仓位约束了，价格继续单边走
+    #    就是「满仓扛单」，直到 14:55 强平（或一直扛过夜）。这是网格亏损的主要
+    #    来源，也是 `flat_pct` 过滤治不了的那一块。
+    # 由回测引擎执行（它才有 high/low 路径），策略只负责把参数传下去。
+    out["grid_net_stop"] = float(max(float(net_stop), 0.0))
+    grid_flat = np.zeros(len(out), dtype=bool)
+    if total and step_min < 1440 and not int(hold):
+        grid_flat = force.copy()
+    if calm is not None:
+        grid_flat = grid_flat | (~calm)
+    out["grid_flat"] = grid_flat
+    # 逐档逐根不好标备注（几千根都在网里），只标「换了档」的那几根 —— 交易记录
+    # 的备注列读的就是这一列
+    note = np.full(len(out), "", dtype=object)
+    prev = np.concatenate([[0], sig[:-1]])
+    _up = "上穿" if int(follow) else "下穿"
+    _dn = "下穿" if int(follow) else "上穿"
+    for i in np.flatnonzero(sig != prev):
+        k = int(sig[i])
+        if k == 0:
+            note[i] = "回到中枢 / 出网 / 日内平仓，清仓"
+        elif k > 0:
+            note[i] = f"{_up}中枢第 {k} 档：持多 {k} 份"
+        else:
+            note[i] = f"{_dn}中枢第 {-k} 档：持空 {-k} 份"
+    out["entry_note"] = note
+    return out
+
+
 # ---------------------------------------------------------------- 注册表
 @dataclass
 class StrategySpec:
@@ -1216,6 +1497,60 @@ STRATEGIES: dict[str, StrategySpec] = {
         params={"fast": 50, "slow": 200},
         param_meta={"fast": (5, 200, 5), "slow": (20, 400, 10)},
         desc="快线上穿慢线做多、下穿做空。对称反手，始终在市。",
+    ),
+    "grid_trade": StrategySpec(
+        key="grid_trade",
+        label="网格交易（日内档位）",
+        func=strat_grid,
+        params={"ma_n": -1, "grid_n": -1, "grid_pct": 0.6, "flat_pct": 0.0,
+                "flat_min": 895, "night": 0, "follow": -1, "hold": -1,
+                "grid_mode": -1, "atr_n": 300, "atr_nd": 10, "atr_mult": -1.0,
+                "net_stop": 0.0},
+        param_meta={
+            "ma_n": (-1, 120, 1),
+            "grid_n": (-1, 20, 1),
+            "grid_pct": (0.05, 3.0, 0.05),
+            "flat_pct": (0.0, 10.0, 0.5),
+            "flat_min": (600, 900, 5),
+            "night": (0, 1, 1),
+            "follow": (-1, 1, 1),
+            "hold": (-1, 1, 1),
+            "grid_mode": (-1, 2, 1),
+            "atr_n": (20, 600, 10),
+            "atr_nd": (2, 60, 1),
+            "atr_mult": (-1.0, 4.0, 0.1),
+            "net_stop": (0.0, 5.0, 0.5),
+        },
+        param_labels={"ma_n": "中枢周期(-1按品种)", "grid_n": "网格档数(-1按品种)",
+                      "grid_pct": "每格间距(%)", "flat_pct": "震荡阈值(%)",
+                      "flat_min": "平仓(分)", "night": "做夜盘(0/1)",
+                      "follow": "方向(1顺/0逆/-1按品种)",
+                      "hold": "持有过夜(-1按品种)",
+                      "grid_mode": "格宽口径(-1按品种/0百分比/1五分钟ATR/2日线ATR)",
+                      "atr_n": "5mATR根数", "atr_nd": "日线ATR天数",
+                      "atr_mult": "ATR倍数(-1按品种)",
+                      "net_stop": "破网止损(格宽,0=关)"},
+        desc="一格一档，**为日内 5 分钟设计**：`ma_n` 均线当中枢。\n"
+             "「顺势(1)/逆势(0)」**默认 1 = 顺势**：价格在中枢**之上**做多头网格"
+             "（档位挂在中心之上，突破一档买一份，止盈再走一格），**之下**做空头"
+             "镜像。逆势(0) 是教科书网格「跌买涨卖」，档位挂回调侧、止盈回中枢。"
+             "🔴两种不只是信号取负，档位挂在哪一侧要一起翻 —— 只翻信号会变成"
+             "「顺势方向 + 逆势价位」，单子永远挂不到价（实测中证 1000 两年 53 笔）。\n"
+             "「平仓(分)」默认 895 = **14:55 清仓**，按「下一根开盘成交」自动前推"
+             "一根（即 14:50 那根出平仓信号）；夜盘转日盘、日盘转夜盘一律不留仓，"
+             "午休可以持仓。「做夜盘(0/1)」默认 0 = 只做日盘。\n"
+             "signal 是**档位号**（+k = 持 k 份多），所以手数口径要用「固定手数」，"
+             "每格 1 手才等于文章里的 grid_volume = 1..N。\n"
+             "「震荡阈值」>0 时只在均线走平的震荡段开网。\n"
+             "每格间距不能小于成本：手续费 + 滑点折成价格往往是 0.1~0.3%。\n"
+             "🔴回测成本请选**「挂单」档**（0.1 跳滑点）：网格每一档都是限价挂单，"
+             "成交价就是挂单价，不是穿过去再追回来。\n"
+             "🔴成交是**K 线内挂单**：突破/砸到第 k 档就在那个价位成交、走到止盈价"
+             "就在那平，不等下一根开盘。但**同一根 K 线绝不进出** —— 一根 bar 的"
+             "high/low 先后分不出来，「先买后卖」是拿 OHLC 编出来的来回。\n"
+             "🔴**逆势版实测在 5m 日内约束下没有正期望**（72 组只有 2 组微正）："
+             "止盈单笔均赚 262~2434 元，但 14:55 强平的单笔均亏 92~3692 元、笔数是"
+             "止盈的 4~5 倍 —— 日内强平把「不止损等回本」这个网格唯一的优势砍掉了。",
     ),
     "donchian": StrategySpec(
         key="donchian",

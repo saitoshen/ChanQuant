@@ -106,8 +106,20 @@ class BacktestConfig:
     # 本身带来的那部分。
     intrabar_samebar_stop: bool = False
 
-    # 平仓当根要不要允许再开新仓（默认 **不许**）。
-    #
+    # ---- 网格（档位信号）的成交模型 ----
+    # True（默认）：**挂单**成交 —— 档位价上挂着限价单，K 线内触到就按那个价
+    #   成交，止盈也是提前挂好的一格。见 `run_grid_intrabar`。
+    # False：回到「第 T 根收盘定档、第 T+1 根开盘成交」。留给对拍用：同一份
+    #   信号在两种成交模型下的差，就是「追价 vs 挂单」值多少钱。
+    # 只对 `max|signal| > 1` 且带 `grid_step` 列的（网格那一族）生效。
+    grid_intrabar: bool = True
+
+    # 🔴 同一根 K 线不许既进场又出场 —— 这是**结构性不变量**，不做成开关。
+    #    一根 bar 只有 OHLC，high/low 的先后分不出来，允许同根来回等于拿路径
+    #    假设编收益：实测铁矿 5m 放宽 = +25.3%，收紧 = −21.0%。想多要来回只能
+    #    降周期（1m），不能放宽假设。见 `run_grid_intrabar` 的 ④。
+
+    # 平仓当根要不要允许再开新仓（默认 **不许**）。    #
     # 「反手」在 K 线内是**假装精确**：一根 5 分钟线里「先止损、再反向开仓」
     # 和「先反向开仓、再被打止损」，盘口上长得一模一样，分不出先后 —— 挑对
     # 自己有利的那个就是凭空造 alpha。默认让出一根 bar 的空窗：这根平掉了就
@@ -353,9 +365,10 @@ def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float
     """这一笔该下多少手。
 
     `unit` 口径返回的是**手数**（可以是小数，名义敞口 = 权益），其余口径返回整数手。
-    手数为 0 表示这笔不做（钱不够一手保证金）。
+    手数为 0 表示这笔不做（钱不够一手保证金）；例外是 `budget`（按分配资金定手数，
+    四舍五入但**最少 1 手**，见下）。
 
-    **四种口径都是单利**：手数只看「本金（或分配的那部分）/ 止损金额 / 固定
+    **五种口径都是单利**：手数只看「本金（或分配的那部分）/ 止损金额 / 固定
     手数」，不看账户当前权益。赚了不加大仓位，亏了也不缩 —— 回测出来的是
     「这套规则在固定本金下能赚多少」，而不是「复利滚了二十年之后的奇迹」。
     """
@@ -370,6 +383,18 @@ def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float
         if per <= 0:
             return 1.0                      # ATR 还没暖起来：先 1 手，别裸奔
         return float(max(1, int(float(cfg.risk_amount or 0) / per)))
+    if mode == "budget":
+        # 「按分配资金定手数」：手数 = 分配的钱 ÷ 这一手要花的钱（价格×乘数），
+        # **四舍五入**，且**不足一手按 1 手**。
+        # 为什么必须留 1 手这个下限：股指一手名义就 80~120 万，100 万本金分三档，
+        # 每档 43 万 ⇒ 算出来 0.36 手，四舍五入是 0 手 ⇒ 整段不交易，回测空跑。
+        # 期货不能下 0.36 手，所以「买不起也至少下 1 手」是这个口径的定义，
+        # 代价是低资金账户的实际杠杆会**高于**设定杠杆（43 万预算买 120 万货）。
+        # 要按保证金口径（整手、钱不够就不做）请用 `capital`。
+        per = price * mult
+        if per <= 0:
+            return 0.0
+        return float(max(1, int(round(float(cfg.budget or 0.0) / per))))
     if mode == "capital":
         per = price * mult * float(cfg.margin_rate or 0)
         if per <= 0:
@@ -705,6 +730,479 @@ def run_intrabar_backtest(data: pd.DataFrame, cfg: BacktestConfig,
     return Result(equity=eq, position=ps, trades=trades, metrics=m, label=label)
 
 
+def run_level_backtest(data: pd.DataFrame, cfg: "BacktestConfig",
+                       label: str = "") -> Result:
+    """**分级仓位**：`signal` 是档位号（-N…N），不再是 -1/0/1。
+
+    网格交易要「跌一格买一格」，一次持有 1 档、2 档……N 档。老路径的 `pos`
+    只有 -1/0/1 三种取值，表达不了这个，硬塞会把 3 当成长、把 -3 当成平。
+    这里把它推广：
+
+    - `signal = k`（k>0）= 持有 k 份多头，`-k` = k 份空头，0 = 空仓；
+    - **一份的手数 = `size_lots()` 那一次的结果**，和单仓位策略的「满仓」是
+      同一份 ⇒ 实盘 `st.target = st.signal × st.lots` 与这里逐档一致；
+      一份的手数在建仓那一刻定下来，之后不再随价格漂 —— 否则每根 bar 都改
+      总仓，网格就没有「格」可言了。所以分级策略请用「固定手数」口径；
+    - 每加一份是**一条独立的腿**，减仓按**后进先出**（网格卖的正是最近买的那
+      一格），每次减仓落一笔已实现盈亏，交易记录里逐笔可见；
+    - 成交时点与老路径相同：第 T 根收盘定档位，第 T+1 根开盘成交。
+
+    只有当 `max|signal| > 1` 才走这里。全部是 ±1 的策略仍走原来那条路，
+    历史回测结果可以逐位对拍 —— 多一条执行模型不等于换掉原来那一条。
+    """
+    open_ = data["open"].to_numpy(dtype=float)
+    close = data["close"].to_numpy(dtype=float)
+    scale = (pd.to_numeric(data["price_scale"], errors="coerce").fillna(1.0).to_numpy(float)
+             if "price_scale" in data.columns else None)
+    sig = data["signal"].fillna(0).astype(int).to_numpy()
+    if cfg.long_only:
+        sig = np.maximum(sig, 0)
+    if cfg.short_only:
+        sig = np.minimum(sig, 0)
+    idx = data.index
+    note_in = _note_col(data, "entry_note")
+    note_out = _note_col(data, "exit_note")
+    n = len(data)
+    mult = float(cfg.multiplier or 1.0)
+    mode = (cfg.sizing or "unit").lower()
+
+    atr_arr = None
+    if mode == "risk":
+        atr_arr = _atr_array(close, data["high"].to_numpy(dtype=float)
+                             if "high" in data else close,
+                             data["low"].to_numpy(dtype=float)
+                             if "low" in data else close,
+                             cfg.stop_atr_n)
+
+    target = np.roll(sig, 1)
+    target[0] = 0
+
+    cash = float(cfg.initial_cash)
+    cost_total = 0.0
+    notional_total = 0.0
+    legs: list[dict] = []        # 每一份的建仓明细，同一方向
+    pos = 0
+    pos_state = np.zeros(n, dtype=int)
+    equity = np.zeros(n, dtype=float)
+    trades: list[Trade] = []
+
+    def _slip(price: float, i: int) -> float:
+        return cfg.slip_amount(price, scale[i] if scale is not None else 1.0)
+
+    def _held() -> float:
+        return sum(leg["lots"] for leg in legs)
+
+    def _open_leg(i: int, direction: int, q: float, why: str) -> None:
+        nonlocal cash, cost_total, notional_total
+        sp = _slip(open_[i], i)
+        fill = open_[i] + sp if direction > 0 else open_[i] - sp
+        fee = cfg.fee_amount(q, mult, fill)
+        cash -= fee
+        cost = fee + sp * mult * q
+        cost_total += cost
+        notional_total += q * mult * abs(fill)
+        legs.append({"lots": q * direction, "fill": float(fill),
+                     "raw": float(open_[i]), "date": idx[i], "bar": i,
+                     "why": why or label, "cost": float(cost)})
+
+    def _close_part(i: int, amount: float, why: str) -> None:
+        """从**最新的腿**开始平掉 amount 手（正数），每次落一笔交易。"""
+        nonlocal cash, cost_total, notional_total
+        left = float(amount)
+        while left > 1e-9 and legs:
+            leg = legs[-1]
+            take = min(left, abs(leg["lots"]))
+            d = 1 if leg["lots"] > 0 else -1
+            sp = _slip(open_[i], i)
+            fill = open_[i] - sp if d > 0 else open_[i] + sp
+            cash += take * d * mult * (fill - leg["fill"])
+            fee = cfg.fee_amount(take, mult, fill)
+            cash -= fee
+            close_cost = fee + sp * mult * take
+            cost_total += close_cost
+            notional_total += take * mult * abs(fill)
+            share = take / abs(leg["lots"])
+            entry_cost = leg["cost"] * share
+            trades.append(Trade(
+                entry_date=leg["date"],
+                exit_date=idx[i],
+                entry_price=float(leg["fill"]),
+                exit_price=float(fill),
+                ret=_trade_ret(d, leg["fill"], fill),
+                bars=i - leg["bar"],
+                direction=d,
+                lots=float(take),
+                # 毛盈亏用**不含滑点**的盘口价，滑点在 cost 里已经算过一次
+                gross=take * d * mult * (float(open_[i]) - float(leg["raw"])),
+                cost=float(entry_cost) + float(close_cost),
+                entry_note=leg["why"],
+                exit_note=why,
+            ))
+            if take >= abs(leg["lots"]) - 1e-9:
+                legs.pop()
+            else:
+                leg["lots"] -= take * d
+                leg["cost"] -= entry_cost
+            left -= take
+
+    unit_q = 0.0               # 一份的手数，建仓那一刻定下来
+    for i in range(n):
+        want = int(target[i])
+        want_units = abs(want)
+        want_dir = 1 if want > 0 else (-1 if want < 0 else 0)
+        dec = i - 1 if i > 0 else 0
+        held = _held()
+
+        # 方向反了 / 该清仓：先全平。平的理由从**上一根**取（这一根的动作是
+        # 上一根收盘定下的）
+        if held != 0 and (want_dir == 0 or (held > 0) != (want_dir > 0)):
+            why = (note_out[dec] if note_out is not None else "") or (
+                "信号反向" if want_dir else "信号离场")
+            _close_part(i, abs(held), why)
+            held = _held()
+
+        if want_dir != 0:
+            if not legs:
+                a = float(atr_arr[i]) if atr_arr is not None else 0.0
+                sp = _slip(open_[i], i)
+                fill = open_[i] + sp if want_dir > 0 else open_[i] - sp
+                unit_q = size_lots(cfg, fill, cash, a if a == a else 0.0)
+            want_lots = want_units * unit_q
+            cur = abs(_held())
+            if unit_q > 0 and want_lots > cur + 1e-9:
+                add = int(round((want_lots - cur) / unit_q))
+                why = (note_in[dec] if note_in is not None else "") or label
+                for _ in range(max(add, 1)):
+                    _open_leg(i, want_dir, unit_q, why)
+            elif want_lots < cur - 1e-9:
+                why = (note_out[dec] if note_out is not None else "") or "减仓"
+                _close_part(i, cur - want_lots, why)
+
+        # 注意：这句必须在 `if want_dir != 0` **之外**。放里面的话，清仓那根
+        # 不进这个分支，`pos` 会一直沿用上一个非零方向 ⇒ 持仓曲线永远回不到 0，
+        # 「14:55 是否空仓」「是否隔夜」这类只看持仓序列的检查全部失真。
+        pos = want_dir if legs else 0
+
+        eq = cash + sum(leg["lots"] * mult * (close[i] - leg["fill"]) for leg in legs)
+        pos_state[i] = pos
+        equity[i] = eq
+
+    # 未平仓的腿：逐条入账，只算开仓那一侧的成本
+    for leg in legs:
+        d = 1 if leg["lots"] > 0 else -1
+        last = float(close[-1])
+        trades.append(Trade(
+            entry_date=leg["date"],
+            exit_date=idx[-1],
+            entry_price=float(leg["fill"]),
+            exit_price=last,
+            ret=_trade_ret(d, leg["fill"], last),
+            bars=n - 1 - leg["bar"],
+            direction=d,
+            open_position=True,
+            lots=abs(float(leg["lots"])),
+            gross=float(leg["lots"]) * mult * (last - float(leg["raw"])),
+            cost=float(leg["cost"]),
+            entry_note=leg["why"],
+            exit_note="样本结束，仍持仓",
+        ))
+
+    eq_series = pd.Series(equity, index=idx, name="equity")
+    ps = pd.Series(pos_state, index=idx, name="position")
+    m = _metrics(eq_series, ps, trades, cfg.bars_per_year, base=cfg.initial_cash)
+    m["final_equity"] = float(eq_series.iloc[-1])
+    m["total_cost"] = float(cost_total)
+    m["notional"] = float(notional_total)
+    m["avg_cost"] = float(cost_total / m["n_trades"]) if m["n_trades"] else 0.0
+    m["cost_rate"] = float(cost_total / notional_total) if notional_total > 0 else 0.0
+    # 仓位数（档位）上限，绩效页能看出这张网铺到多深
+    m["max_level"] = int(np.abs(sig).max()) if n else 0
+    return Result(equity=eq_series, position=ps, trades=trades, metrics=m, label=label)
+
+
+def run_grid_intrabar(data: pd.DataFrame, cfg: "BacktestConfig",
+                      label: str = "") -> Result:
+    """网格的**挂单**成交模型：档位价上挂着限价单，K 线内触到就成交。
+
+    和 `run_level_backtest`（第 T 根收盘定档、第 T+1 根**开盘**成交）的差别只有
+    成交价与成交时点，但这一条差别对网格是决定性的：
+
+    - **建仓**：第 T 根里 `low <= 中枢 − k×格距`（多头第 k 档）就在**那个价位**
+      成交，而不是等 T+1 开盘追价。一根大阴线扫穿 3 档就一次成交 3 档 —— 这正
+      是「先挂一排限价单，价格扫下来依次成交」的真实结果。
+    - **平仓**：每条腿建仓那一刻就在**上一档**挂好止盈价（多头 = 建仓档 + 一格），
+      之后哪根 `high >= 止盈价` 就在止盈价平掉。网格赚的就是这一格的差价，不是
+      「等收盘信号说该减了再开盘追」。
+    - 限价成交的价格口径：买单 `min(开盘, 挂单价)`、卖单 `max(开盘, 挂单价)`
+      —— 跳空**只会成交得更好**，绝不会更差。这是限价单的定义，不是乐观假设。
+    - 🔴**进场当根不参与止盈**（项目铁律）：一根宽幅 bar 同时触到建仓价和止盈价
+      时，分不出先后，新腿从下一根才开始算止盈。
+    - 🔴**尾盘强平是唯一的例外**：`grid_flat` 标记的那一根之后，下一根用**开盘价**
+      一次性市价全平，不看是否触到挂单价。收盘强平本来就得出在市价上。
+    - 方向反了（跳空直接跨过中枢、止盈单来不及成交）：按开盘价市价平掉反向腿。
+
+    需要的列：`open/high/low/close`、`signal`（档位号，只用它判方向与上限）、
+    `center`（中枢）、`grid_step`（一格的价格宽度）、`grid_flat`（可选）。
+    这三列由 `strategies.strat_grid` 输出。
+    """
+    idx = data.index
+    n = len(data)
+    if n == 0:
+        return Result(equity=pd.Series(dtype=float), position=pd.Series(dtype=int),
+                      trades=[], metrics=_metrics(pd.Series(dtype=float),
+                                                  pd.Series(dtype=int), [],
+                                                  cfg.bars_per_year,
+                                                  base=cfg.initial_cash),
+                      label=label)
+    open_ = data["open"].to_numpy(dtype=float)
+    high = (data["high"].to_numpy(dtype=float) if "high" in data.columns else open_.copy())
+    low = (data["low"].to_numpy(dtype=float) if "low" in data.columns else open_.copy())
+    close = data["close"].to_numpy(dtype=float)
+    center = pd.to_numeric(data["center"], errors="coerce").to_numpy(dtype=float)
+    step = pd.to_numeric(data["grid_step"], errors="coerce").to_numpy(dtype=float)
+    scale = (pd.to_numeric(data["price_scale"], errors="coerce").fillna(1.0).to_numpy(float)
+             if "price_scale" in data.columns else None)
+    sig = data["signal"].fillna(0).astype(int).to_numpy()
+    if cfg.long_only:
+        sig = np.maximum(sig, 0)
+    if cfg.short_only:
+        sig = np.minimum(sig, 0)
+    flat = (data["grid_flat"].fillna(False).astype(bool).to_numpy()
+            if "grid_flat" in data.columns else np.zeros(n, dtype=bool))
+    note_in = _note_col(data, "entry_note")
+    # 网的深度：策略给的 `grid_cap`（= grid_n，整排挂单的档数）。没有这一列才
+    # 退回「信号最大档位」——那只是观测值，样本里价格没走到深处就会把网缩小。
+    if "grid_cap" in data.columns:
+        _capv = pd.to_numeric(data["grid_cap"], errors="coerce").dropna()
+        cap = int(_capv.iloc[0]) if len(_capv) else 1
+    else:
+        cap = int(np.abs(sig).max()) if n else 0
+    cap = max(cap, 1)
+    # 破网止损：单位是**格宽**，`0` = 关闭。由策略的 `net_stop` 参数经
+    # `grid_net_stop` 列传下来 —— 引擎只负责按 high/low 判触发，不自己定价位。
+    net_stop = 0.0
+    if "grid_net_stop" in data.columns:
+        _ns = pd.to_numeric(data["grid_net_stop"], errors="coerce").dropna()
+        net_stop = float(_ns.iloc[0]) if len(_ns) else 0.0
+    halt_day = None            # 破网止损当天不再开新网
+    # 方向几何：`grid_follow=1` 顺势 ⇒ 档位挂在**趋势那一侧**（做多挂在中心之上，
+    # 突破一档买一份，止盈再走一格）；`0` 逆势 ⇒ 挂在**回调侧**（做多挂中心之下，
+    # 止盈回到中枢那一格）。只翻信号不翻几何 = 档位永远挂在价格到不了的一侧。
+    follow = bool(pd.to_numeric(data["grid_follow"], errors="coerce").fillna(0).iloc[0]) \
+        if "grid_follow" in data.columns else False
+    mult = float(cfg.multiplier or 1.0)
+
+    cash = float(cfg.initial_cash)
+    cost_total = 0.0
+    notional_total = 0.0
+    unit_q = 0.0                      # 一份手数，建仓那一刻定死
+    legs: list[dict] = []
+    trades: list[Trade] = []
+    equity = np.zeros(n, dtype=float)
+    pos_state = np.zeros(n, dtype=int)
+    max_legs = 0
+    net_stop_hits = 0                 # 破网止损触发次数（绩效页/自检要能看见）
+    blown = False                     # 权益打穿 0 之后整段停手（见循环 ⓪）
+
+    def _slip(price: float, i: int) -> float:
+        return cfg.slip_amount(price, scale[i] if scale is not None else 1.0)
+
+    def _close_leg(i: int, leg: dict, price: float, why: str) -> None:
+        """按 price（盘口价，滑点另算）平掉整条腿，落一笔交易。"""
+        nonlocal cash, cost_total, notional_total
+        d = int(leg["dir"])
+        q = abs(float(leg["lots"]))
+        sp = _slip(price, i)
+        fill = price - sp if d > 0 else price + sp
+        cash += q * d * mult * (fill - leg["fill"])
+        fee = cfg.fee_amount(q, mult, fill)
+        cash -= fee
+        close_cost = fee + sp * mult * q
+        cost_total += close_cost
+        notional_total += q * mult * abs(fill)
+        trades.append(Trade(
+            entry_date=leg["date"], exit_date=idx[i],
+            entry_price=float(leg["fill"]), exit_price=float(fill),
+            ret=_trade_ret(d, leg["fill"], fill), bars=i - int(leg["bar"]),
+            direction=d, lots=float(q),
+            # 毛盈亏用不含滑点的挂单价：滑点在 cost 里已经算过一次
+            gross=q * d * mult * (float(price) - float(leg["raw"])),
+            cost=float(leg["cost"]) + float(close_cost),
+            entry_note=leg["why"], exit_note=why))
+
+    for i in range(n):
+        c = center[i]
+        st = step[i]
+        # ⓪ 爆仓线：上一根收盘时权益已经 <= 0，现实里就是被强平出场，不能再
+        #    接着开仓 —— 否则回测会一路亏到 −300% 这种根本不存在的净值
+        #    （AG 六档空网格遇上单边牛市就是这样）。平掉剩余腿后整段停手。
+        # ⓪ 爆仓线：上一根收盘时权益已经 <= 0，现实里就是被强平出场，不能再
+        #    接着开仓 —— 否则回测会一路亏到 −300% 这种根本不存在的净值
+        #    （AG 六档空网格遇上单边牛市就是这样）。平掉剩余腿后整段停手。
+        if not blown and i > 0 and equity[i - 1] <= 0:
+            blown = True
+        if blown:
+            if legs:
+                for leg in list(legs):
+                    _close_leg(i, leg, float(open_[i]), "爆仓强平")
+                legs.clear()
+            pos_state[i] = 0
+            equity[i] = cash
+            continue
+
+        # ① 尾盘 / 换场强平：**唯一**走「开盘市价」的一条
+        if i > 0 and flat[i - 1] and legs:
+            for leg in list(legs):
+                _close_leg(i, leg, float(open_[i]), "尾盘/换场强平")
+            legs.clear()
+
+        # 🔴**方向必须取上一根的信号**：第 i 根收盘才算出 `sig[i]`，拿它去决定
+        #    第 i 根内挂哪一侧的档位＝用当根的收盘知道该做多、再回头在开盘把单子
+        #    挂进去，是标准的前视。上一根的信号在第 i 根开盘前就已经可知，才是
+        #    实盘能拿到的信息。档位价用 `center[i]`（= `sma.shift(1)`，同样不含
+        #    当根收盘），两者一起保证「只用开盘前已知的信息」。
+        _prev_sig = int(sig[i - 1]) if i > 0 else 0
+        want = 0 if not np.isfinite(c) else int(np.sign(_prev_sig))
+        # ② 方向上翻（跳空跨过中枢，止盈单来不及成交）：市价平掉反向腿
+        if legs and want != 0 and int(legs[0]["dir"]) != want:
+            for leg in list(legs):
+                _close_leg(i, leg, float(open_[i]), "信号反向")
+            legs.clear()
+
+        # ②b 破网止损：价格越过「最外一档再走 net_stop 个格宽」⇒ 整张网全平，
+        #     当天不再开新网。挂在那个价位上的是**止损单**，所以成交价按限价单
+        #     口径：跳空只会更差（多单 `min(开盘, 止损价)`、空单 `max(...)`）——
+        #     和止盈的「只会更好」正好相反，这才是止损该有的方向。
+        #     🔴只对**上一根及更早建的腿**生效：当根刚建的腿不参与（进场当根不
+        #     出场，同 #101 那条铁律）。所以这一段放在 ③ 建仓之前。
+        if legs and net_stop > 0 and all(int(g["bar"]) < i for g in legs):
+            d0 = int(legs[0]["dir"])
+            # 🔴止损必须挂在**亏钱那一侧**（−d0 方向），两种几何的锚点不同：
+            #   · 逆势（follow=0）：网铺在中枢的**回调侧**，即 `c − d0·k·格宽`，
+            #     所以「网破」＝价格再往那个方向走 → 止损在网外 `c − d0·(cap+ns)·格宽`
+            #   · 顺势（follow=1）：网铺在**趋势侧**（`c + d0·k·格宽`），最外一档
+            #     本来就在盈利方向，往外挂是止盈不是止损 ⇒ 顺势的「网破」定义是
+            #     「价格掉回中枢另一侧」→ 止损在 `c − d0·ns·格宽`
+            # 两种都是 `c − d0·…`。写成 `c + d0·…` 会让多单止损挂到价格上方，
+            # 建仓下一根就「止损」且还是赚的（实测 SR 5287 建仓、5290 止损）。
+            if follow:
+                stop_px = c - d0 * net_stop * st
+            else:
+                stop_px = c - d0 * (cap + net_stop) * st
+            hit = (np.isfinite(stop_px) and
+                   ((d0 > 0 and low[i] <= stop_px) or (d0 < 0 and high[i] >= stop_px)))
+            if hit:
+                px = min(float(open_[i]), float(stop_px)) if d0 > 0 \
+                    else max(float(open_[i]), float(stop_px))
+                for leg in list(legs):
+                    _close_leg(i, leg, px, "破网止损")
+                legs.clear()
+                halt_day = pd.Timestamp(idx[i]).date()
+                net_stop_hits += 1
+
+        # ③ 建仓（限价挂单）：中枢已算出、当根允许开网、且不是刚强平完的那根
+        flat_now = bool(i > 0 and flat[i - 1])
+        halted = halt_day is not None and pd.Timestamp(idx[i]).date() == halt_day
+        if (want != 0 and np.isfinite(c) and np.isfinite(st) and st > 0
+                and not flat_now and not halted):
+            if not legs:
+                unit_q = float(size_lots(cfg, c, cash, 0.0))
+            if unit_q > 0:
+                taken = {int(leg["level"]) for leg in legs}
+                why = (note_in[i] if note_in is not None else "") or label
+                # `side` = 档位相对中枢的偏移方向：+1 挂在上方、−1 挂在下方。
+                # 顺势跟着仓位方向挂（做多在上面，突破才成交），逆势反着挂
+                # （做多挂在下面，跌下来才成交）。止盈也按同一条轴：
+                # 顺势再走一格（k+1），逆势回中枢一格（k−1）。
+                side = want if follow else -want
+                for k in range(1, cap + 1):
+                    if k in taken:
+                        continue
+                    lvl = c + side * k * st
+                    if not np.isfinite(lvl) or lvl <= 0:
+                        continue
+                    if side > 0:
+                        if high[i] < lvl:
+                            continue          # 没扫到这一档，单子继续挂着
+                        px = max(float(open_[i]), float(lvl))
+                    else:
+                        if low[i] > lvl:
+                            continue
+                        px = min(float(open_[i]), float(lvl))
+                    sp = _slip(px, i)
+                    fill = px + sp if want > 0 else px - sp
+                    fee = cfg.fee_amount(unit_q, mult, fill)
+                    cash -= fee
+                    cost = fee + sp * mult * unit_q
+                    cost_total += cost
+                    notional_total += unit_q * mult * abs(fill)
+                    # 止盈价建仓那一刻定死：顺势再走一格、逆势回中枢那一格
+                    off = (k + 1) if follow else (k - 1)
+                    tp = c + side * off * st
+                    legs.append({"dir": want, "lots": unit_q * want,
+                                 "raw": float(px), "fill": float(fill),
+                                 "tp": float(tp), "level": k,
+                                 "cost": float(cost), "date": idx[i],
+                                 "bar": i, "why": why})
+
+        # ④ 止盈（限价）。放在建仓之后，但 🔴**同一根 K 线绝不进出**：
+        #    建仓那一根从下一根才开始判止盈。理由和 `intrabar_samebar_stop`
+        #    是同一条铁律 —— 一根 bar 只有 OHLC，high 完全可能出现在砸下去之前，
+        #    「先成交买、再成交卖」是拿 OHLC 编出来的来回，不是盘口事实。
+        #    实测这个假设值多少钱：铁矿 5m 放宽（允许同根来回）= +25.3%，
+        #    一收紧 = −21.0%，**46 个百分点的差额全在路径假设上**。
+        #    这条不做成开关：它不是「悲观/乐观偏好」，是「这根 bar 承载不了这个
+        #    判断」。要更多来回只能降周期（1m），不能靠放宽假设。
+        if legs:
+            alive = []
+            for leg in legs:
+                if int(leg["bar"]) == i:
+                    alive.append(leg)
+                    continue
+                d = int(leg["dir"])
+                tp = float(leg["tp"])
+                if d > 0 and high[i] >= tp:
+                    _close_leg(i, leg, max(float(open_[i]), tp), "止盈(一格)")
+                elif d < 0 and low[i] <= tp:
+                    _close_leg(i, leg, min(float(open_[i]), tp), "止盈(一格)")
+                else:
+                    alive.append(leg)
+            legs = alive
+
+        max_legs = max(max_legs, len(legs))
+        pos_state[i] = 0 if not legs else int(legs[0]["dir"])
+        equity[i] = cash + sum(leg["lots"] * mult * (close[i] - leg["fill"])
+                               for leg in legs)
+
+    # 未平仓的腿：逐条入账，只算开仓那一侧的成本（与其它路径口径一致）
+    for leg in legs:
+        d = int(leg["dir"])
+        last = float(close[-1])
+        trades.append(Trade(
+            entry_date=leg["date"], exit_date=idx[-1],
+            entry_price=float(leg["fill"]), exit_price=last,
+            ret=_trade_ret(d, leg["fill"], last), bars=n - 1 - int(leg["bar"]),
+            direction=d, open_position=True, lots=abs(float(leg["lots"])),
+            gross=float(leg["lots"]) * mult * (last - float(leg["raw"])),
+            cost=float(leg["cost"]), entry_note=leg["why"],
+            exit_note="样本结束，仍持仓"))
+
+    eq_series = pd.Series(equity, index=idx, name="equity")
+    ps = pd.Series(pos_state, index=idx, name="position")
+    m = _metrics(eq_series, ps, trades, cfg.bars_per_year, base=cfg.initial_cash)
+    m["final_equity"] = float(eq_series.iloc[-1])
+    m["total_cost"] = float(cost_total)
+    m["notional"] = float(notional_total)
+    m["avg_cost"] = float(cost_total / m["n_trades"]) if m["n_trades"] else 0.0
+    m["cost_rate"] = float(cost_total / notional_total) if notional_total > 0 else 0.0
+    # 这张网最多同时铺了几档（信号上限是 cap，实际铺到的深度才是真的）
+    m["max_level"] = int(max_legs)
+    m["grid_depth_cap"] = int(cap)
+    m["net_stop"] = float(net_stop)
+    m["net_stop_hits"] = int(net_stop_hits)
+    return Result(equity=eq_series, position=ps, trades=trades, metrics=m, label=label)
+
+
 def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str = "") -> Result:
     """按 signal 列执行回测。df 需含 open/close 与 signal（取值 -1/0/1）。
 
@@ -721,6 +1219,19 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
         raise ValueError("缺少 signal 列")
     if "entry_long" in data.columns or "entry_short" in data.columns:
         return run_intrabar_backtest(data, cfg, label=label)
+    # 分级仓位（网格那一族）：signal 是档位号而不是 -1/0/1。判断放在这里、
+    # 而不是让老循环去兼容 3 / -3 —— 老循环里 `pos = want` 之后到处按 pos==1
+    # 判多空，-3 会被当成「非多头」走进空头分支，算出来的东西是错的也不报错。
+    # 全部是 ±1 时一行都不进这条分支，历史结果逐位不变
+    _sig = data["signal"].fillna(0).astype(int).to_numpy()
+    if len(_sig) and int(np.abs(_sig).max()) > 1:
+        # 网格那一族有两套成交模型：**挂单（K 线内）** 与 收盘定档/次日开盘成交。
+        # 只要策略输出了 `grid_step`（一格的价格宽度）就说明它是一张「档位挂单
+        # 表」，走挂单模型；没有这一列（老的自造档位信号）仍走原来那条，历史
+        # 结果逐位不变。
+        if cfg.grid_intrabar and "grid_step" in data.columns:
+            return run_grid_intrabar(data, cfg, label=label)
+        return run_level_backtest(data, cfg, label=label)
 
     open_ = data["open"].to_numpy(dtype=float)
     close = data["close"].to_numpy(dtype=float)
