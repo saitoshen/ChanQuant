@@ -2952,6 +2952,67 @@ def _run() -> tuple[bool, list[str]]:
 
     check("实盘信号走因子过滤", _live_rule_filter)
 
+    def _align_lock():
+        """锁仓（多空双开）必须被看见，而且能被一键对齐平掉。
+
+        净仓口径会把「多 4 空 4」压成 0，和空仓长得一模一样。2026-11-11 的
+        实盘就是这样：ag2612 多 4 空 4、cu2612 多 1 空 1、lc2701 多 1 空 1，
+        合计 47 万保证金占着，监控器报「一致」，一键对齐一笔都不发。
+        """
+        from ttrade import strategy_store as SStore
+        from ttrade.strategy_runner import PortfolioRunner, SlotState
+
+        class P:
+            def __init__(self, lo, sh):
+                self.pos_long, self.pos_short = lo, sh
+                for s, v in (("long", lo), ("short", sh)):
+                    setattr(self, f"pos_{s}_his", v)
+                    setattr(self, f"pos_{s}_today", 0)
+                    setattr(self, f"volume_{s}_his", v)
+                    setattr(self, f"volume_{s}_today", 0)
+
+        # 绕过 __init__：它要建日期额度台账、持仓账本目录，自检不该留这些垃圾
+        r = PortfolioRunner.__new__(PortfolioRunner)
+        r._log_fn = None
+        r._mm_cache, r._mm_ts = [], 0.0
+        r._align_ts = 0.0
+        r.api = object()
+        r._slots = {}
+        st = SlotState(cfg=SStore.StrategyConfig(sid="t", name="jd", period="1h"))
+        st.running, st.underlying, st.target = True, "DCE.jd2612", -24
+        r._slots["t"] = st
+        r._align_slot = SlotState(cfg=SStore.StrategyConfig(
+            sid="__align__", name="一键对齐", period="1d"))
+        r._pos = {"SHFE.ag2612": P(4, 4), "DCE.jd2612": P(0, 24)}
+
+        rows = r.mismatch(fresh=True)
+        syms = [x["symbol"] for x in rows]
+        if syms != ["SHFE.ag2612"]:
+            raise RuntimeError(f"锁仓没露出来：{syms}（jd 净额一致，不该报）")
+        row = rows[0]
+        if not row["locked"] or (row["a_long"], row["a_short"]) != (4, 4):
+            raise RuntimeError(f"锁仓标记不对：{row}")
+        if row["target"] != 0 or row["actual"] != 0 or row["delta"] != 0:
+            raise RuntimeError(f"净额口径该是 0/0/0：{row}")
+
+        # 对齐要发两笔（卖平多 + 买平空），不能因为净差额 0 就一笔不发
+        sent = []
+        r._send = lambda s, sym, delta, closeable=None: (
+            sent.append((sym, delta)) or s.pending.append("x") or 1)
+        r._sync_after_align = lambda sym: None
+        n = r.align(close_orphans=True)
+        if sorted(sent) != [("SHFE.ag2612", -4), ("SHFE.ag2612", 4)] or n != 2:
+            raise RuntimeError(f"锁仓该拆成两笔平仓，实发 {sent}")
+
+        # 平完之后必须判一致
+        r._pos = {"SHFE.ag2612": P(0, 0), "DCE.jd2612": P(0, 24)}
+        r._mm_ts = 0.0
+        if r.mismatch(fresh=True):
+            raise RuntimeError("平完还报不一致")
+        return "净 0 的锁仓能看见，对齐拆成卖平多 + 买平空两笔"
+
+    check("一键对齐看得见锁仓（多空双开）", _align_lock)
+
     def _factor_reverse():
         """逐因子反转：分数严格取负，仓位严格对调。"""
         import numpy as np

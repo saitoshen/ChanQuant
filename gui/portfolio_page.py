@@ -49,6 +49,33 @@
 「哪个合约、现在几手、变成几手」一条条列出来，确认了才发单。
 `align(close_orphans=False)` 保留「只补托管」的老行为，给脚本用。
 
+## 为什么按两条腿比对，不按净仓
+
+策略的 `target` 是个净数（正多负空），落成目标只能是「只多」或「只空」；
+账户那边多空可以**同时**非零，也就是锁仓。净仓把锁仓压成 0 ——
+多 4 空 4 和「什么仓都没有」算出来一模一样。
+
+2026-11-11 的实盘就是这么漏的：`ag2612` 多 4 空 4、`cu2612` 多 1 空 1、
+`lc2701` 多 1 空 1，三笔合起来 47 万保证金占着，监控器报「一致」，
+一键对齐一笔都不发。所以 `mismatch()` 比的是 `(多, 空)` 两条腿，
+`align()` 也按腿发单：真要平两边时拆成「卖平多 + 买平空」两笔 ——
+它们各自只动自己那一侧，同时发是安全的；换成「先平后开」就不行，
+第二笔会把第一笔还没成交的量重复算进可平量，发出去就是超量平仓。
+
+锁仓是**会自己长出来**的，不是脏数据：策略反手时，可平量按「自己账本上那部分」
+算（`_closeable`），账户里属于别人的反向仓一概不碰。假设账户已有 4 手空、
+某个 held=0 的策略要开 4 手多，`closeable=0`，`_legs` 的可平量被压成 0，
+这 4 手只能发成 OPEN —— 账户就成了「多 4 空 4」。净额 0、保证金翻倍。
+这类仓位只能靠一键对齐收掉，所以它必须被看见。
+
+## 为什么持仓没同步时不让点
+
+`mismatch()` 在 `_pos is None`（刚连上、持仓还没推过来）时一定返回空。
+那是「还不知道」，不是「一致」。这时候点一键对齐，等于拿「账户是空的」
+去算差额，会把整个理论仓位重新开一遍。所以快照里带 `pos_ready`，
+界面分开提示、`align()` 直接拒。同理，没挂策略的账户根本没有连接，
+它的持仓一律不在比对范围 —— 标签里会点名，不能让「一致」两个字蒙过去。
+
 ## 为什么策略列表里没有「实际仓位」
 
 账户是**一个**，策略是**一群**。同一个品种完全可能被两条策略同时交易，账户里的
@@ -128,6 +155,35 @@ def _int(v) -> int:
         return int(v)
     except (TypeError, ValueError):
         return 0
+
+
+def _pos_text(actual, r: dict) -> str:
+    """账户持仓写成一行。锁仓要带两条腿，不然 `0` 看不出有仓。"""
+    if r.get("locked"):
+        return f"{actual}（多{r.get('a_long')} 空{r.get('a_short')}）"
+    return f"{actual:+d} 手"
+
+
+def _delta_text(r: dict) -> str:
+    """监控器「差额」一栏的文字。
+
+    不能只写净额：锁仓（多 4 空 4）净差额是 0，一栏 `+0` 会让人以为不用动。
+    按两条腿分别算，写成「平多4　平空4」这样一眼能对上单子。
+    """
+    a_long, a_short = _int(r.get("a_long")), _int(r.get("a_short"))
+    t_long, t_short = _int(r.get("t_long")), _int(r.get("t_short"))
+    bits = []
+    if a_long > t_long:
+        bits.append(f"平多{a_long - t_long}")
+    elif a_long < t_long:
+        bits.append(f"开多{t_long - a_long}")
+    if a_short > t_short:
+        bits.append(f"平空{a_short - t_short}")
+    elif a_short < t_short:
+        bits.append(f"开空{t_short - a_short}")
+    if not bits:
+        return "0"
+    return "　".join(bits)
 
 
 # ------------------------------------------------------------------ 线程层
@@ -1985,16 +2041,24 @@ class PortfolioPage(QWidget):
         # 内容没变就不重建。重建一次要给每格新建 QTableWidgetItem，
         # 几十个合约不一致的时候这活儿一秒干一次，主线程就废了
         sig = tuple((k, r["symbol"], r["target"], r["actual"], r["delta"],
-                     bool(r.get("managed"))) for k, r in rows)
+                     bool(r.get("managed")), int(r.get("a_long") or 0),
+                     int(r.get("a_short") or 0)) for k, r in rows)
         if sig != self._mon_sig:
             self._mon_sig = sig
             m.setRowCount(len(rows))
             for i, (key, r) in enumerate(rows):
                 managed = bool(r.get("managed"))
+                locked = bool(r.get("locked"))
+                have = str(r["actual"])
+                if locked:
+                    # 净 0 但两条腿都有仓。只写 0 等于什么都没说
+                    have = (f"{r['actual']}（多{r['a_long']} 空{r['a_short']}）")
+                note = "策略持仓" if managed else "未托管（策略已停或手工开仓）"
+                if locked:
+                    note += " · 锁仓，两条腿都要平"
                 vals = [
-                    key, r["symbol"], str(r["target"]), str(r["actual"]),
-                    f"{r['delta']:+d}",
-                    "策略持仓" if managed else "未托管（策略已停或手工开仓）",
+                    key, r["symbol"], str(r["target"]), have,
+                    _delta_text(r), note,
                 ]
                 for j, v in enumerate(vals):
                     item = QTableWidgetItem(v)
@@ -2016,8 +2080,23 @@ class PortfolioPage(QWidget):
             self.lbl_limit.setText("")
 
         aligning = sum(int(v.get("aligning") or 0) for v in self._snaps.values())
+        # 跑起来的账户（有策略绑在它上面）才有连接、才看得到持仓。剩下的账户
+        # 无论有没有仓，这里都是**瞎的** —— 不能笼统说「一致」
+        idle = [s.name for s in self._accounts if s.name not in self._snaps]
+        idle_txt = ""
+        if idle and (self.ctl.running or self._snaps):
+            idle_txt = ("\n" + "、".join(idle)
+                        + " 没有策略在跑，它们的持仓不在比对范围（先给该账户挂一条策略）。")
+        # `_pos` 还没拉到时 `mismatch()` 必定为空。那不是一致，是还不知道
+        blind = [k for k, v in self._snaps.items() if not v.get("pos_ready", True)]
         if not self.ctl.running:
             self.lbl_mon.setText("未启动。策略跑起来之后这里才会比对。")
+            self.lbl_mon.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+        elif blind:
+            self.lbl_mon.setText(
+                "、".join(blind) + " 的账户持仓还没同步（刚连上），这会儿的比对结果不作数，"
+                "稍等几秒再点「一键对齐」。"
+            )
             self.lbl_mon.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
         elif aligning:
             self.lbl_mon.setText(
@@ -2026,19 +2105,22 @@ class PortfolioPage(QWidget):
             )
             self.lbl_mon.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
         elif not rows:
-            self.lbl_mon.setText("账户仓位与策略理论持仓一致。")
+            self.lbl_mon.setText("账户仓位与策略理论持仓一致。" + idle_txt)
             self.lbl_mon.setStyleSheet(f"color: {C_OK}; font-size: 11px;")
         else:
             n_managed = sum(1 for _k, r in rows if r.get("managed"))
             n_orphan = len(rows) - n_managed
+            n_lock = sum(1 for _k, r in rows if r.get("locked"))
             bits = []
             if n_managed:
                 bits.append(f"{n_managed} 个合约与策略理论持仓不一致")
             if n_orphan:
                 bits.append(f"{n_orphan} 个合约没有策略在管")
+            if n_lock:
+                bits.append(f"{n_lock} 个是锁仓（多空双开、净额 0，只按净额看是看不见的）")
             self.lbl_mon.setText(
                 "，".join(bits) + "。「一键对齐」会把账户摆成和策略列表一致，\n"
-                "未托管的仓位也会被平掉（会先列出来让你确认）。"
+                "未托管的仓位也会被平掉（会先列出来让你确认）。" + idle_txt
             )
             self.lbl_mon.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
 
@@ -2234,6 +2316,11 @@ class PortfolioPage(QWidget):
             # 这时候再发一轮就是「平了又开、开了又平」。
             self._on_failed("上一轮对齐还在执行（等成交或撤单），稍后再点")
             return
+        blind = [k for k, v in self._snaps.items() if not v.get("pos_ready", True)]
+        if blind:
+            self._on_failed("、".join(blind) + " 的账户持仓还没同步，等几秒再点"
+                            "（现在对齐会拿「账户是空的」去算差额，把仓位重开一遍）")
+            return
         rows = [r for snap in self._snaps.values() for r in (snap.get("mismatch") or [])]
         if not rows:
             self._on_log("账户仓位与策略理论持仓已经一致，不用对齐")
@@ -2248,20 +2335,26 @@ class PortfolioPage(QWidget):
         if managed:
             lines.append(f"按策略理论持仓调整 {len(managed)} 个合约：")
             for r in managed[:10]:
-                lines.append(f"　{r['symbol']}　{r['actual']} → {r['target']}"
-                             f"（{r['delta']:+d} 手）")
+                lines.append(f"　{r['symbol']}　{_pos_text(r['actual'], r)} → "
+                             f"{r['target']}（{_delta_text(r)}）")
             if len(managed) > 10:
                 lines.append(f"　…… 还有 {len(managed) - 10} 个")
         if orphans:
             lines.append("")
             lines.append(f"平掉 {len(orphans)} 个没有策略在管的合约：")
             for r in orphans[:10]:
-                lines.append(f"　{r['symbol']}　持有 {r['actual']:+d} 手 → 0")
+                lines.append(f"　{r['symbol']}　持有 {_pos_text(r['actual'], r)} "
+                             f"→ 0（{_delta_text(r)}）")
             if len(orphans) > 10:
                 lines.append(f"　…… 还有 {len(orphans) - 10} 个")
             lines.append("")
             lines.append("这些仓位多半是策略停掉之后留下的，或者手工开的。"
                          "平掉之后无法撤销。")
+        n_lock = sum(1 for r in rows if r.get("locked"))
+        if n_lock:
+            lines.append("")
+            lines.append(f"其中 {n_lock} 个是锁仓（多空双开）：净额是 0，但两条腿都占着"
+                         "保证金，会拆成「卖平多 + 买平空」两笔一起发。")
 
         ans = QMessageBox.question(
             self, "一键对齐", "\n".join(lines) + "\n\n继续下发委托？",

@@ -1610,6 +1610,20 @@ class PortfolioRunner:
         except (TypeError, ValueError):
             return 0
 
+    def _side_pair(self, symbol: str) -> tuple[int, int]:
+        """(多头手数, 空头手数)。**锁仓时两边都非零**。
+
+        只用 `_net_pos` 看账户是不够的：多 4 空 4 的净仓是 0，和「什么仓都没有」
+        长得一模一样。2026-11-11 的实盘就是这样 —— ag2612 多 4 空 4、cu2612 多 1
+        空 1、lc2701 多 1 空 1，三笔共 47 万保证金占着，监控器却报「一致」，
+        一键对齐点下去一笔都不发。要判断仓位对不对得上，必须看两条腿。
+        """
+        if self._pos is None:
+            return 0, 0
+        if symbol not in self._pos:
+            return 0, 0
+        return self._side_pos(symbol, "long"), self._side_pos(symbol, "short")
+
     def _rebalance(self, st: SlotState) -> None:
         if not st.underlying:
             return
@@ -2120,6 +2134,12 @@ class PortfolioRunner:
         但仓位还留着」，或者是用户手工开的仓。界面靠这个标记把两类分开显示 ——
         前者是策略自己没跟上，后者得先让人看清楚再动。
 
+        **比对的是两条腿，不是净仓。** 策略理论仓位是个净数（`target`，正多负空），
+        落成目标只能是「只多」或「只空」：`target>0 → (target, 0)`。账户那边
+        多空可以同时非零（锁仓），净仓会把它压成 0 —— 早先只看净仓，于是
+        「多 4 空 4」被判成「没有仓」，既不上报也平不掉。现在按
+        `(多, 空) == (目标多, 目标空)` 判，锁仓一定会露出来。
+
         结果缓存 `MISMATCH_GAP` 秒：快照 0.4 秒推一次，每次都重算纯属空转。
         `fresh=True` 绕过缓存 —— 真正要下单（`align()`）时必须用当下的持仓，
         拿 5 秒前的旧数去补仓，补出来的量就是错的。
@@ -2131,18 +2151,27 @@ class PortfolioRunner:
         theo = self.theoretical()
         keys = set(theo)
         if self._pos is not None:
-            for sym, p in self._pos.items():
-                if int(getattr(p, "pos_long", 0) or 0) or int(getattr(p, "pos_short", 0) or 0):
+            for sym in list(self._pos):
+                if any(self._side_pair(sym)):
                     keys.add(sym)
         out = []
         for sym in sorted(keys):
             want = int(theo.get(sym, 0))
             have = self._net_pos(sym)
-            if want != have:
-                out.append({
-                    "symbol": sym, "target": want, "actual": have,
-                    "delta": want - have, "managed": sym in theo,
-                })
+            a_long, a_short = self._side_pair(sym)
+            # 目标落成两条腿。want 是净数，只能占一边
+            t_long, t_short = (want, 0) if want > 0 else (0, -want)
+            if (a_long, a_short) == (t_long, t_short):
+                continue
+            out.append({
+                "symbol": sym, "target": want, "actual": have,
+                "delta": want - have, "managed": sym in theo,
+                "t_long": t_long, "t_short": t_short,
+                "a_long": a_long, "a_short": a_short,
+                # 多空双开。界面据此把「账户实际」写成 `0（多4 空4）`，
+                # 否则一行 `0 / 0 / +0` 摆在那里，谁都不知道要动什么
+                "locked": bool(a_long and a_short),
+            })
         self._mm_cache = out
         self._mm_ts = now
         return [dict(r) for r in out]
@@ -2152,6 +2181,7 @@ class PortfolioRunner:
 
         - 托管合约（有策略在跑）：补到理论净仓，多了减、少了加
         - 未托管合约（没有策略在管）：`close_orphans=True` 时平到 0
+        - **锁仓（多空双开）**：两条腿各自减到目标，见 `_send_row`
 
         第二类是「策略停掉之后留下的仓」和「手工开的仓」。默认平掉是因为
         用户对这个按钮的预期就是「一键把账户摆成策略列表的样子」；但这是
@@ -2163,6 +2193,11 @@ class PortfolioRunner:
         会变成一个每秒十几次的死循环。
         """
         if self.api is None:
+            return 0
+        if self._pos is None:
+            # 持仓还没同步就发单，等于拿着「账户是空的」去算差额 —— 会把
+            # 整个理论仓位重新开一遍。宁可让用户再点一次
+            self._log("账户持仓还没同步，等连上再点一键对齐")
             return 0
         if self._align_slot.pending:
             self._log("上一轮对齐还没落地，等它成交或撤掉再点")
@@ -2179,10 +2214,7 @@ class PortfolioRunner:
             if not row["managed"] and not close_orphans:
                 continue
             sym = row["symbol"]
-            delta = row["delta"]
-            if delta == 0:
-                continue
-            sent = self._send(self._align_slot, sym, delta)
+            sent = self._send_row(self._align_slot, row)
             if sent:
                 # 对齐的目标就是 `sum(target)`，所以发完之后各策略的账本正好
                 # 是「自己的 target」。不跟着摆的话：停掉的策略留着 -11 的账本，
@@ -2193,6 +2225,32 @@ class PortfolioRunner:
         if n:
             self._log(f"对齐已下发 {n} 笔，剩下的交给追单")
         return n
+
+    def _send_row(self, st: SlotState, row: dict) -> int:
+        """按「多边 / 空边」各发一笔，返回发出的笔数。
+
+        净额口径表达不了锁仓：多 4 空 4、目标 0，`delta` 算出来是 0，
+        `_send(st, sym, 0)` 一笔都不发 —— 这正是 2026-11-11 那三笔平不掉的原因。
+
+        两条边都要减的时候拆成两笔：SELL 平多、BUY 平空。它们各自只动自己那一
+        侧（`_send` 按方向反推可平量），互不占用额度，所以同时发是安全的；
+        不像「先平后开」，那样第二笔会把第一笔还没成交的量重复算进可平量，
+        发出去就是超量平仓、被交易所打回。
+        """
+        sym = row["symbol"]
+        a_long = int(row.get("a_long") or 0)
+        a_short = int(row.get("a_short") or 0)
+        t_long = int(row.get("t_long") or 0)
+        t_short = int(row.get("t_short") or 0)
+        close_long = max(0, a_long - t_long)
+        close_short = max(0, a_short - t_short)
+        if close_long and close_short:
+            n = self._send(st, sym, -close_long)     # SELL 平多
+            n += self._send(st, sym, close_short)    # BUY 平空
+            if n:
+                st.last_action = f"平锁仓：卖 {close_long} + 买 {close_short} 手"
+            return n
+        return self._send(st, sym, int(row["delta"]))
 
     def _sync_after_align(self, sym: str) -> None:
         """对齐发出去之后，把各策略的账本摆成「对齐完成时的样子」。
@@ -2335,6 +2393,10 @@ class PortfolioRunner:
             "connected": self.alive,
             "error": self.last_error,
             "account": self.spec.label(),
+            # 账户持仓是否已经拉到手。为 False 时 `mismatch()` 一定返回空 ——
+            # 那不是「一致」，是「还不知道」。界面必须分开说，否则用户点一键对齐
+            # 会毫无反应，还以为是按钮坏了
+            "pos_ready": self._pos is not None,
             "slots": slots,
             "mismatch": self.mismatch(),
             # `want_bars()` 点名的策略才带，其余时候是空字典
