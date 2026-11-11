@@ -1774,7 +1774,15 @@ class PortfolioPage(QWidget):
         view.show_result(rp.df, rp.raw, rp.res, rp.bh, self._ctx(cfg, rp))
         # 记下本地历史这份「底」，实时段每 5 秒往上拼一次。存 df 而不是重读库：
         # 库里那份要解码几万行，5 秒重读一次等于白烧
-        self._live_cfg, self._live_base, self._live_sid = cfg, raw, cfg.sid
+        #
+        # 🔴 `raw` 可能是 `_prepare` 的原始 payload，也就是 `(行情, 跨周期行情)`
+        # 这种**两元组**（配了跨周期因子时才有第二份，但为了形状统一，没配也是
+        # 两元组）。直接把它当 DataFrame 存下去，`merge_live` 里 `local.empty`
+        # 就会抛 `AttributeError: 'tuple' object has no attribute 'empty'` ——
+        # 界面顶部那行「实时 K 线刷新失败」红字，5 秒刷一次，图永远不动。
+        # 拆包只有 `run_replay_job` 做了，这里和 `show_config` 都漏了。
+        self._live_cfg, self._live_base, self._live_sid = (
+            cfg, raw[0] if isinstance(raw, tuple) else raw, cfg.sid)
         self._live_busy = False
         self._live_timer.start()
         # cfg.title() 已经含「品种 · 策略」，别再拼一遍 key 和策略名

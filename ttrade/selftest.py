@@ -4492,15 +4492,28 @@ def _run() -> tuple[bool, list[str]]:
                 time.sleep(0.02)
             done = pp._view_thread is None
             on_view = pp.stack.currentIndex() == 1
-            view_ok = threaded and done and on_view
-            view_info = (f"起线程={threaded} 算完={done} 切到结果页={on_view}")
+
+            # 实时 K 线的「底料」必须是**行情本身**，不能是 `_prepare` 那个
+            # `(行情, 跨周期行情)` 两元组。落到 `_live_base` 里还留着元组的话，
+            # `merge_live` 的 `local.empty` 会抛
+            # `AttributeError: 'tuple' object has no attribute 'empty'`，
+            # 界面顶部红字「实时 K 线刷新失败」，5 秒一刷，图永远不往前动。
+            # 拆包只有 `run_replay_job` 做了，`_present_single` 曾经漏了两处。
+            base = pp._live_base
+            live_ok = isinstance(base, pd.DataFrame)
+            if live_ok:
+                from ttrade.tqlive import merge_live as _merge_live
+                _merge_live(base, base.tail(1).copy())   # 拼得上才算通
+            view_ok = threaded and done and on_view and live_ok
+            view_info = (f"起线程={threaded} 算完={done} 切到结果页={on_view} "
+                         f"实时底料={type(base).__name__}")
             pp.shutdown()
         except Exception as exc:  # noqa: BLE001
             view_info = f"{type(exc).__name__}: {exc}"
         if not view_ok:
             raise RuntimeError(
                 f"组合页「查看回测」没跑在后台（{view_info}）：点下去应该立刻返回、"
-                "线程在后台算，算完自己切到结果页"
+                "线程在后台算，算完自己切到结果页；实时底料还必须是 DataFrame"
             )
 
         # ---- 侧边栏宽度：控件不该被挤到右边看不见
