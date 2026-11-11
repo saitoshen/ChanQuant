@@ -3355,12 +3355,14 @@ def _run() -> tuple[bool, list[str]]:
     check("网格三种方向结构（只多/只空/多空都做）", _grid_side_modes)
 
     def _grid_symbol_defaults():
-        """分品种默认值：表外品种兜底 = **逆势 + 震荡过滤**，表内定稿一个字不改。
+        """分品种默认值：表外品种兜底 = **逆势 + 不做震荡过滤**，表内定稿一字不改。
 
-        这是回归保险。2026-11-11 之前兜底方向是「顺势」，等于把股指的口径套到
-        72 个非股指品种上 —— 全市场 78 个品种只有 7 个正收益、中位累计 −43.9%
-        （换逆势后 −16.5%，再开震荡过滤爆仓数从 4 降到 0）。判据只认结构：
-        表外品种必须解析成 `grid_follow=0`，股指定稿必须还是 `1`。
+        这是回归保险，盯的是两件曾经踩过的事：
+        ① 兜底方向曾经是「顺势」，等于把股指口径套到 72 个非股指品种上 —— 全市场
+           78 个品种只有 7 个正收益、中位累计 −43.9%（换逆势后 −16.5%）。
+        ② `flat_pct` 默认为 **0 = 不做过滤**（用户定的）：过滤能把爆仓压到 0、回撤
+           收到 −22%，但中位收益反而略降、还拖坏 13 个品种，所以只做成可选开关。
+           判据用「默认的零信号率必须与显式 0 逐位相同，且严格低于开 1% 时」。
         """
         import numpy as np
         import pandas as pd
@@ -3379,30 +3381,34 @@ def _run() -> tuple[bool, list[str]]:
         d = pd.DataFrame({"open": px, "high": px + 0.3, "low": px - 0.3,
                           "close": px, "volume": [1000] * nb}, index=idx)
 
-        def run_default(sym):
-            d.attrs["symbol"] = sym
-            o = run_strategy(d, "grid_trade", {})
-            return float(pd.to_numeric(o["grid_follow"], errors="coerce").iloc[0]), o
+        def zrate(o):
+            return float((pd.to_numeric(o["signal"], errors="coerce") == 0).mean())
 
-        f_rb, o_rb = run_default("RB")
-        f_im, _ = run_default("IM")
+        d.attrs["symbol"] = "RB"
+        o_def = run_strategy(d, "grid_trade", {})
+        o_off = run_strategy(d, "grid_trade", {"flat_pct": 0.0})
+        o_on = run_strategy(d, "grid_trade", {"flat_pct": 1.0})
+        f_rb = float(pd.to_numeric(o_def["grid_follow"], errors="coerce").iloc[0])
+        d.attrs["symbol"] = "IM"
+        f_im = float(pd.to_numeric(run_strategy(d, "grid_trade", {})["grid_follow"],
+                                   errors="coerce").iloc[0])
+
         if f_rb != 0.0:
             raise RuntimeError(f"表外品种兜底方向不是逆势（拿到 {f_rb}）——"
                                f"整批非股指品种会被股指口径拖死")
         if f_im != 1.0:
             raise RuntimeError(f"股指定稿的顺势被兜底改掉了（拿到 {f_im}）")
-
-        d.attrs["symbol"] = "RB"
-        o_off = run_strategy(d, "grid_trade", {"flat_pct": 0.0})
-        z_on = float((pd.to_numeric(o_rb["signal"], errors="coerce") == 0).mean())
-        z_off = float((pd.to_numeric(o_off["signal"], errors="coerce") == 0).mean())
+        z_def, z_off, z_on = zrate(o_def), zrate(o_off), zrate(o_on)
+        if abs(z_def - z_off) > 1e-12:
+            raise RuntimeError(f"震荡过滤不是默认关闭（默认零信号 {z_def:.1%} "
+                               f"vs 显式 0 的 {z_off:.1%}）")
         if not z_on > z_off:
-            raise RuntimeError(f"表外品种默认没开震荡过滤"
-                               f"（零信号 {z_on:.1%} vs 关掉 {z_off:.1%}）")
-        return (f"RB 兜底 逆势+过滤（零信号 {z_on:.0%} vs 关掉 {z_off:.0%}）；"
+            raise RuntimeError(f"震荡过滤开关失效（开 1% 零信号 {z_on:.1%} "
+                               f"没有多于关掉 {z_off:.1%}）")
+        return (f"RB 兜底 逆势+不过滤（零信号 {z_def:.0%}，开 1% 是 {z_on:.0%}）；"
                 f"IM 仍顺势")
 
-    check("网格分品种默认值（表外逆势+过滤 / 表内定稿不动）", _grid_symbol_defaults)
+    check("网格分品种默认值（表外逆势 / 过滤默认不做 / 表内定稿不动）", _grid_symbol_defaults)
 
 
 
