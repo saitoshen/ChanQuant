@@ -361,8 +361,13 @@ def _atr_array(close: np.ndarray, high: np.ndarray, low: np.ndarray, n: int) -> 
     return pd.Series(tr).rolling(n, min_periods=n).mean().to_numpy(dtype=float)
 
 
-def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float = 0.0) -> float:
+def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float = 0.0,
+              share: float = 1.0) -> float:
     """这一笔该下多少手。
+
+    `share`：这笔单子要跟几个方向**分**同一份预算（网格的中间震荡带里多空各挂
+    一张网时是 2）。只对「按钱定手数」的口径（`budget` / `capital` / `risk`）
+    生效 —— `fixed` 是「每格固定 N 手」，本来就是按份数定的，不摊。
 
     `unit` 口径返回的是**手数**（可以是小数，名义敞口 = 权益），其余口径返回整数手。
     手数为 0 表示这笔不做（钱不够一手保证金）；例外是 `budget`（按分配资金定手数，
@@ -382,7 +387,7 @@ def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float
         per = float(cfg.stop_mult or 0) * float(atr_value or 0) * mult
         if per <= 0:
             return 1.0                      # ATR 还没暖起来：先 1 手，别裸奔
-        return float(max(1, int(float(cfg.risk_amount or 0) / per)))
+        return float(max(1, int(float(cfg.risk_amount or 0) / max(share, 1e-9) / per)))
     if mode == "budget":
         # 「按分配资金定手数」：手数 = 分配的钱 ÷ 这一手要花的钱（价格×乘数），
         # **四舍五入**，且**不足一手按 1 手**。
@@ -394,7 +399,7 @@ def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float
         per = price * mult
         if per <= 0:
             return 0.0
-        return float(max(1, int(round(float(cfg.budget or 0.0) / per))))
+        return float(max(1, int(round(float(cfg.budget or 0.0) / max(share, 1e-9) / per))))
     if mode == "capital":
         per = price * mult * float(cfg.margin_rate or 0)
         if per <= 0:
@@ -402,7 +407,7 @@ def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float
         # 分配资金 ÷ 每手保证金，**固定用分配的那笔钱**，不随盈亏变。
         # 按当前权益收口就变成复利了：50 万赚到 80 万会自己加到 80 万的仓，
         # 亏到 30 万又自动减到 30 万 —— 那是另一套策略，不是用户要的「单利」
-        return float(max(int(cfg.budget / per), 0))
+        return float(max(int(cfg.budget / max(share, 1e-9) / per), 0))
     # 名义敞口 = **本金**（固定）。原来是「当前权益」，权益从 10 万涨到 34 万，
     # 手数跟着放大 3.4 倍 —— 那是复利，和其余三种口径不是一套东西：双均线 /
     # 唐奇安 / 海龟 / 通道突破 / MACD 这几条老策略因此会跑出「越赚越猛」的曲线，
@@ -990,6 +995,13 @@ def run_grid_intrabar(data: pd.DataFrame, cfg: "BacktestConfig",
     # 止盈回到中枢那一格）。只翻信号不翻几何 = 档位永远挂在价格到不了的一侧。
     follow = bool(pd.to_numeric(data["grid_follow"], errors="coerce").fillna(0).iloc[0]) \
         if "grid_follow" in data.columns else False
+    # 中间震荡带：这一根**多空两张网同时挂**（`strat_grid` 的 `grid_side=2`）。
+    # 没有这一列 = 老的单边网，行为逐位不变。
+    dual = (pd.to_numeric(data["grid_dual"], errors="coerce").fillna(0)
+            .astype(bool).to_numpy()) if "grid_dual" in data.columns \
+        else np.zeros(n, dtype=bool)
+    # 双向时每个方向只能分到一半预算 —— 中间带里两条腿同时挂着，名义敞口是两倍。
+    n_sides = 2.0 if bool(dual.any()) else 1.0
     mult = float(cfg.multiplier or 1.0)
 
     cash = float(cfg.initial_cash)
@@ -1001,6 +1013,7 @@ def run_grid_intrabar(data: pd.DataFrame, cfg: "BacktestConfig",
     equity = np.zeros(n, dtype=float)
     pos_state = np.zeros(n, dtype=int)
     max_legs = 0
+    mixed_bars = 0                    # 多空同时持有的根数（中间震荡带的判据）
     net_stop_hits = 0                 # 破网止损触发次数（绩效页/自检要能看见）
     blown = False                     # 权益打穿 0 之后整段停手（见循环 ⓪）
 
@@ -1063,11 +1076,28 @@ def run_grid_intrabar(data: pd.DataFrame, cfg: "BacktestConfig",
         #    当根收盘），两者一起保证「只用开盘前已知的信息」。
         _prev_sig = int(sig[i - 1]) if i > 0 else 0
         want = 0 if not np.isfinite(c) else int(np.sign(_prev_sig))
-        # ② 方向上翻（跳空跨过中枢，止盈单来不及成交）：市价平掉反向腿
-        if legs and want != 0 and int(legs[0]["dir"]) != want:
-            for leg in list(legs):
+        # ② 这一根允许几个方向：
+        #    · `grid_dual` = 上一根落在中间震荡带里 ⇒ **多空两张网同时挂**
+        #    · 否则只允许信号指的那一侧（老行为）
+        #    · 信号为 0 且不在带里 ⇒ `allow=None` = 「不知道」，已有腿一律不动
+        #      （老代码里 `want==0` 也是不动的，这里必须保住：不能把「收盘价刚好
+        #      落在中枢上」当成平仓信号）
+        _dual = bool(dual[i - 1]) if i > 0 else False
+        if _dual:
+            allow = (1, -1)
+        elif want != 0:
+            allow = (want,)
+        else:
+            allow = None
+        # ②a 方向上翻 / 出了中间带（跳空跨过中枢，止盈单来不及成交）：
+        #     只平掉**不再允许**的那一侧，不是无脑全平 —— 双向时另一侧本来就该留着。
+        #     逆势几何下被平掉的这一侧通常正在浮盈（止盈价在中枢附近还没碰到），
+        #     所以这条在震荡带边缘扮演的是「兑现」而不是「止损」。
+        if legs and allow is not None:
+            bad = [g for g in legs if int(g["dir"]) not in allow]
+            for leg in bad:
                 _close_leg(i, leg, float(open_[i]), "信号反向")
-            legs.clear()
+                legs.remove(leg)
 
         # ②b 破网止损：价格越过「最外一档再走 net_stop 个格宽」⇒ 整张网全平，
         #     当天不再开新网。挂在那个价位上的是**止损单**，所以成交价按限价单
@@ -1075,75 +1105,86 @@ def run_grid_intrabar(data: pd.DataFrame, cfg: "BacktestConfig",
         #     和止盈的「只会更好」正好相反，这才是止损该有的方向。
         #     🔴只对**上一根及更早建的腿**生效：当根刚建的腿不参与（进场当根不
         #     出场，同 #101 那条铁律）。所以这一段放在 ③ 建仓之前。
-        if legs and net_stop > 0 and all(int(g["bar"]) < i for g in legs):
-            d0 = int(legs[0]["dir"])
-            # 🔴止损必须挂在**亏钱那一侧**（−d0 方向），两种几何的锚点不同：
-            #   · 逆势（follow=0）：网铺在中枢的**回调侧**，即 `c − d0·k·格宽`，
-            #     所以「网破」＝价格再往那个方向走 → 止损在网外 `c − d0·(cap+ns)·格宽`
-            #   · 顺势（follow=1）：网铺在**趋势侧**（`c + d0·k·格宽`），最外一档
-            #     本来就在盈利方向，往外挂是止盈不是止损 ⇒ 顺势的「网破」定义是
-            #     「价格掉回中枢另一侧」→ 止损在 `c − d0·ns·格宽`
-            # 两种都是 `c − d0·…`。写成 `c + d0·…` 会让多单止损挂到价格上方，
-            # 建仓下一根就「止损」且还是赚的（实测 SR 5287 建仓、5290 止损）。
-            if follow:
-                stop_px = c - d0 * net_stop * st
-            else:
-                stop_px = c - d0 * (cap + net_stop) * st
-            hit = (np.isfinite(stop_px) and
-                   ((d0 > 0 and low[i] <= stop_px) or (d0 < 0 and high[i] >= stop_px)))
-            if hit:
-                px = min(float(open_[i]), float(stop_px)) if d0 > 0 \
-                    else max(float(open_[i]), float(stop_px))
-                for leg in list(legs):
-                    _close_leg(i, leg, px, "破网止损")
-                legs.clear()
-                halt_day = pd.Timestamp(idx[i]).date()
-                net_stop_hits += 1
+        if legs and net_stop > 0:
+            # 🔴双向时**按方向分组各判各的**：两组腿的「网外」方向相反，拿
+            #    `legs[0]` 当唯一方向会把另一组当成同向（止损价挂反，触发即亏）。
+            for _d in sorted({int(g["dir"]) for g in legs}):
+                grp = [g for g in legs if int(g["dir"]) == _d]
+                # 🔴只对**上一根及更早建的腿**生效：当根刚建的腿不参与（进场当根
+                #    不出场，同 #101 那条铁律）。所以这一段放在 ③ 建仓之前。
+                if not all(int(g["bar"]) < i for g in grp):
+                    continue
+                # 🔴止损必须挂在**亏钱那一侧**（−d0 方向），两种几何的锚点不同：
+                #   · 逆势（follow=0）：网铺在中枢的**回调侧**，即 `c − d0·k·格宽`，
+                #     所以「网破」＝价格再往那个方向走 → 止损在网外 `c − d0·(cap+ns)·格宽`
+                #   · 顺势（follow=1）：网铺在**趋势侧**（`c + d0·k·格宽`），最外一档
+                #     本来就在盈利方向，往外挂是止盈不是止损 ⇒ 顺势的「网破」定义是
+                #     「价格掉回中枢另一侧」→ 止损在 `c − d0·ns·格宽`
+                # 两种都是 `c − d0·…`。写成 `c + d0·…` 会让多单止损挂到价格上方，
+                # 建仓下一根就「止损」且还是赚的（实测 SR 5287 建仓、5290 止损）。
+                if follow:
+                    stop_px = c - _d * net_stop * st
+                else:
+                    stop_px = c - _d * (cap + net_stop) * st
+                hit = (np.isfinite(stop_px) and
+                       ((_d > 0 and low[i] <= stop_px) or (_d < 0 and high[i] >= stop_px)))
+                if hit:
+                    px = min(float(open_[i]), float(stop_px)) if _d > 0 \
+                        else max(float(open_[i]), float(stop_px))
+                    for leg in grp:
+                        _close_leg(i, leg, px, "破网止损")
+                        legs.remove(leg)
+                    halt_day = pd.Timestamp(idx[i]).date()
+                    net_stop_hits += 1
 
         # ③ 建仓（限价挂单）：中枢已算出、当根允许开网、且不是刚强平完的那根
         flat_now = bool(i > 0 and flat[i - 1])
         halted = halt_day is not None and pd.Timestamp(idx[i]).date() == halt_day
-        if (want != 0 and np.isfinite(c) and np.isfinite(st) and st > 0
+        if (allow is not None and np.isfinite(c) and np.isfinite(st) and st > 0
                 and not flat_now and not halted):
             if not legs:
-                unit_q = float(size_lots(cfg, c, cash, 0.0))
+                # `share=n_sides`：中间带里两个方向各占一半预算，否则两条腿叠起来
+                # 的名义敞口就是设定杠杆的两倍（单边网时 n_sides=1，逐位不变）。
+                unit_q = float(size_lots(cfg, c, cash, 0.0, share=n_sides))
             if unit_q > 0:
-                taken = {int(leg["level"]) for leg in legs}
+                # `taken` 必须带方向：双向时多头第 1 档和空头第 1 档是两个不同价位
+                taken = {(int(leg["dir"]), int(leg["level"])) for leg in legs}
                 why = (note_in[i] if note_in is not None else "") or label
                 # `side` = 档位相对中枢的偏移方向：+1 挂在上方、−1 挂在下方。
                 # 顺势跟着仓位方向挂（做多在上面，突破才成交），逆势反着挂
                 # （做多挂在下面，跌下来才成交）。止盈也按同一条轴：
                 # 顺势再走一格（k+1），逆势回中枢一格（k−1）。
-                side = want if follow else -want
-                for k in range(1, cap + 1):
-                    if k in taken:
-                        continue
-                    lvl = c + side * k * st
-                    if not np.isfinite(lvl) or lvl <= 0:
-                        continue
-                    if side > 0:
-                        if high[i] < lvl:
-                            continue          # 没扫到这一档，单子继续挂着
-                        px = max(float(open_[i]), float(lvl))
-                    else:
-                        if low[i] > lvl:
+                for _d in allow:
+                    side = _d if follow else -_d
+                    for k in range(1, cap + 1):
+                        if (_d, k) in taken:
                             continue
-                        px = min(float(open_[i]), float(lvl))
-                    sp = _slip(px, i)
-                    fill = px + sp if want > 0 else px - sp
-                    fee = cfg.fee_amount(unit_q, mult, fill)
-                    cash -= fee
-                    cost = fee + sp * mult * unit_q
-                    cost_total += cost
-                    notional_total += unit_q * mult * abs(fill)
-                    # 止盈价建仓那一刻定死：顺势再走一格、逆势回中枢那一格
-                    off = (k + 1) if follow else (k - 1)
-                    tp = c + side * off * st
-                    legs.append({"dir": want, "lots": unit_q * want,
-                                 "raw": float(px), "fill": float(fill),
-                                 "tp": float(tp), "level": k,
-                                 "cost": float(cost), "date": idx[i],
-                                 "bar": i, "why": why})
+                        lvl = c + side * k * st
+                        if not np.isfinite(lvl) or lvl <= 0:
+                            continue
+                        if side > 0:
+                            if high[i] < lvl:
+                                continue      # 没扫到这一档，单子继续挂着
+                            px = max(float(open_[i]), float(lvl))
+                        else:
+                            if low[i] > lvl:
+                                continue
+                            px = min(float(open_[i]), float(lvl))
+                        sp = _slip(px, i)
+                        fill = px + sp if _d > 0 else px - sp
+                        fee = cfg.fee_amount(unit_q, mult, fill)
+                        cash -= fee
+                        cost = fee + sp * mult * unit_q
+                        cost_total += cost
+                        notional_total += unit_q * mult * abs(fill)
+                        # 止盈价建仓那一刻定死：顺势再走一格、逆势回中枢那一格
+                        off = (k + 1) if follow else (k - 1)
+                        tp = c + side * off * st
+                        legs.append({"dir": _d, "lots": unit_q * _d,
+                                     "raw": float(px), "fill": float(fill),
+                                     "tp": float(tp), "level": k,
+                                     "cost": float(cost), "date": idx[i],
+                                     "bar": i, "why": why})
 
         # ④ 止盈（限价）。放在建仓之后，但 🔴**同一根 K 线绝不进出**：
         #    建仓那一根从下一根才开始判止盈。理由和 `intrabar_samebar_stop`
@@ -1170,7 +1211,14 @@ def run_grid_intrabar(data: pd.DataFrame, cfg: "BacktestConfig",
             legs = alive
 
         max_legs = max(max_legs, len(legs))
-        pos_state[i] = 0 if not legs else int(legs[0]["dir"])
+        # 同一根上多空两条腿并存了几根。这是「中间震荡带真的双向在做」的判据 ——
+        # 光看笔数分不出「先后做过多和空」与「同时挂着两张网」。
+        if len({int(g["dir"]) for g in legs}) > 1:
+            mixed_bars += 1
+        # 双向时 `legs` 里多空并存，持仓方向只能按**净头寸**报（图上的多空色块
+        # 只分得清一边）。这不影响绩效 —— 权益是逐腿带符号累加的。
+        _net = sum(float(g["lots"]) for g in legs)
+        pos_state[i] = 0 if abs(_net) < 1e-12 else int(np.sign(_net))
         equity[i] = cash + sum(leg["lots"] * mult * (close[i] - leg["fill"])
                                for leg in legs)
 
@@ -1200,6 +1248,11 @@ def run_grid_intrabar(data: pd.DataFrame, cfg: "BacktestConfig",
     m["grid_depth_cap"] = int(cap)
     m["net_stop"] = float(net_stop)
     m["net_stop_hits"] = int(net_stop_hits)
+    # 中间震荡带：同时挂两个方向的根数占比，以及每方向分到的预算份数。
+    # 「两个方向都真的成交过」= 网格的震荡收益到底有没有吃到，看这个。
+    m["dual_bars"] = int(dual.sum())
+    m["n_sides"] = float(n_sides)
+    m["mixed_bars"] = int(mixed_bars)
     return Result(equity=eq_series, position=ps, trades=trades, metrics=m, label=label)
 
 

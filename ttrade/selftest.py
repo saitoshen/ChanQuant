@@ -3276,6 +3276,84 @@ def _run() -> tuple[bool, list[str]]:
 
     check("网格挂单模型：不许用当根收盘定方向（前视）", _grid_no_lookahead)
 
+    def _grid_side_modes():
+        """三种方向结构：只做多头 / 只做空头 / 多空都做（中间带同时挂两张网）。
+
+        判据全是**结构性不变量**，不看收益：
+        ① `grid_side=0` 只出多单、`=1` 只出空单；
+        ② `grid_side=2, mid_band=0` 必须退化成原单边网 —— 多空**交替**出现但
+           **从不同时持有**（`mixed_bars=0`）、`n_sides=1`（手数不摊）；
+        ③ `grid_side=2, mid_band` 很大时中间带里两个方向要**真的同时挂着**
+           （`mixed_bars>0`）、`n_sides=2`；
+        ④ `sizing=fixed` 的手数不受摊薄影响（每格固定 N 手是定义，不是预算）。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade.backtest import BacktestConfig, run_backtest
+        from ttrade.strategies import run_strategy
+
+        rng = np.random.default_rng(11)
+        day_min = list(range(540, 691, 5)) + list(range(810, 896, 5))
+        stamps = []
+        for k in range(14):
+            base = pd.Timestamp("2024-03-04") + pd.Timedelta(days=k)
+            stamps += [base + pd.Timedelta(minutes=m) for m in day_min]
+        idx = pd.DatetimeIndex(stamps)
+        n = len(idx)
+        # 明显来回摆：中间带内上下都要被扫到，否则「同时双向」测不出来
+        px = 100.0 + 6.0 * np.sin(np.arange(n) / 45.0) + np.cumsum(rng.normal(0, 0.04, n))
+        d = pd.DataFrame({"open": px, "high": px + 0.30, "low": px - 0.30,
+                          "close": px, "volume": [1000] * n}, index=idx)
+        # 逆势（跌买涨卖）：多空分居中枢两侧，最方便判「有没有同时持有」
+        base_prm = {"ma_n": 24, "grid_n": 3, "grid_pct": 0.3, "flat_pct": 0.0,
+                    "flat_min": 895, "night": 0, "follow": 0,
+                    "grid_mode": 0, "hold": 0, "net_stop": 0.0}
+        cfg = BacktestConfig(initial_cash=1_000_000, sizing="fixed", volume=1,
+                             multiplier=10, margin_rate=0.1, fee_rate=0.0001)
+
+        def run(sid, mb):
+            p = dict(base_prm)
+            p["grid_side"] = sid
+            p["mid_band"] = mb
+            return run_backtest(run_strategy(d, "grid_trade", p), cfg)
+
+        lo, sh = run(0, 0.0), run(1, 0.0)
+        if any(t.direction < 0 for t in lo.trades):
+            raise RuntimeError("grid_side=0 出了空单 —— 只做多头没生效")
+        if any(t.direction > 0 for t in sh.trades):
+            raise RuntimeError("grid_side=1 出了多单 —— 只做空头没生效")
+        if not lo.trades or not sh.trades:
+            raise RuntimeError("只多/只空样本里一笔没成交，夹具太短")
+
+        one = run(2, 0.0)
+        if int(one.metrics["mixed_bars"]) != 0:
+            raise RuntimeError(f"mid_band=0 竟然多空同时持有 "
+                               f"{one.metrics['mixed_bars']} 根 —— 没退化成单边网")
+        if float(one.metrics["n_sides"]) != 1.0:
+            raise RuntimeError("mid_band=0 手数却被摊成两半了")
+        dirs = {t.direction for t in one.trades}
+        if dirs != {1, -1}:
+            raise RuntimeError(f"单边网只出了 {dirs} 一个方向 —— 夹具没覆盖到另一侧")
+
+        both = run(2, 99.0)
+        if int(both.metrics["mixed_bars"]) == 0:
+            raise RuntimeError("mid_band=99 多空从来没有同时持有 —— 双向没生效")
+        if float(both.metrics["n_sides"]) != 2.0:
+            raise RuntimeError("双向模式下预算没摊成两份")
+        if {t.direction for t in both.trades} != {1, -1}:
+            raise RuntimeError("双向模式只出了一个方向")
+
+        # ④ 摊薄只对「按钱定手数」的口径生效：`fixed` 是「每格固定 N 手」，
+        #    双向时也不能变成半手/两倍手。
+        if any(abs(float(t.lots) - 1.0) > 1e-9 for t in both.trades if t.lots):
+            raise RuntimeError("fixed 口径（每格 1 手）被协议摊薄改掉了")
+        return (f"只多 {len(lo.trades)} 笔 / 只空 {len(sh.trades)} 笔；"
+                f"带=0 同时持有 0 根(n_sides=1)；带=∞ 同时持有 "
+                f"{both.metrics['mixed_bars']} 根(n_sides=2)")
+
+    check("网格三种方向结构（只多/只空/多空都做）", _grid_side_modes)
+
 
 
 

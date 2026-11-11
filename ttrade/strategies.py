@@ -1160,7 +1160,8 @@ def strat_grid(df: pd.DataFrame, ma_n: int = -1, grid_n: int = -1,
                follow: int = -1, hold: int = -1,
                grid_mode: int = -1, atr_n: int = 300,
                atr_nd: int = 10, atr_mult: float = -1.0,
-               net_stop: float = 0.0) -> pd.DataFrame:
+               net_stop: float = 0.0, grid_side: int = 2,
+               mid_band: float = 0.0) -> pd.DataFrame:
     """网格交易：一格一档。**默认顺势**（中枢之上做多、之下做空）。**为日内 5 分钟设计**。
 
     规则来自网格交易的标准定义，只把「起始价」换成了滚动中枢：
@@ -1215,6 +1216,30 @@ def strat_grid(df: pd.DataFrame, ma_n: int = -1, grid_n: int = -1,
       就把整张网全平、当天不再开新网。`0` = 关闭（老行为）。
     - **日线及以上自动跳过整段约束**：日线的时间戳是当天零点，套「日盘」判据
       会把信号整条清零。判据是相邻 bar 的中位间隔（>= 1 天即视为非日内）。
+
+    ## 三种方向结构（`grid_side`）
+
+    原来的划分只有两块：价格站的那一侧算「多头区」、另一侧算「空头区」，同一时刻
+    只有一个方向有网。但网格真正赚钱的地方是**震荡** —— 中枢附近来回抽的时候，
+    上面挂着卖、下面挂着买，两个方向都能收一格。所以把原划分**中间切出一段**
+    做无方向网格：
+
+    - `grid_side=0` **只做多头**：只有多头区有网（等价于把空头信号清零）。跌下来
+      接、回到中枢止盈，价格在另一侧时干等。适合「只做多」的产品约束。
+    - `grid_side=1` **只做空头**：镜像。
+    - `grid_side=2` **多空都做**（默认）：`|收盘 − 中枢| < mid_band × 格宽` 的
+      **中间带**里，多空两张网同时挂着（`grid_dual=1`）；出了中间带只留原先那一
+      侧的网，另一侧市价平掉。⚠️`mid_band` **默认 0 = 中间带关闭**，也就是「按
+      价格位置在两个方向之间轮换」的原行为 —— 实测把带拉开（≥2 格）在股指上
+      一律变差，只有白糖在 1~3 格时略好，所以这一条是**opt-in**，不是默认。
+      🔴**逆势几何下这条「出带平掉另一侧」是赚钱的动作**：价格往下走出带时，上方
+      那排空腿全在浮盈里（它们的止盈价在中枢附近，还没碰到），出带正好把浮盈兑现；
+      否则要等价格涨回来才止盈，等于把已经赚到的让回去。顺势几何下反过来 —— 出带
+      平掉的是亏的那一侧，等于一层趋势止损。
+
+    `mid_band` 单位是**格宽**（不是百分比），`3.0` = 中枢上下三格以内双向。`0`
+    （默认）= **关闭中间带**，退化成原来的单边网、结果逐位不变；给很大的数等于
+    全程双向（等于不做方向判断）。
     """
     # ---- 方向：`follow` 取 1 / 0 / -1（按品种自动）----
     # 中枢之外的第二个决策点：同一套档位规则，方向反了就是另一条策略 ——
@@ -1306,6 +1331,29 @@ def strat_grid(df: pd.DataFrame, ma_n: int = -1, grid_n: int = -1,
         sig = np.where(below, lv_long, -lv_short)
     sig = np.where(valid, sig, 0).astype(int)
 
+    # ---- 三种方向结构（`grid_side`）：只多 / 只空 / 带中间震荡带的多空都做 ----
+    # `dev` = 价格偏离中枢几个格宽（带符号，正 = 在中枢上方）。中间带按它划。
+    # 🔴用**未取整**的 `dev` 而不是档位号：档位号在 ±1 格内恒为 0，拿它判「在不在
+    #    中枢附近」会把整个中间带压成一条线。
+    with np.errstate(invalid="ignore", divide="ignore"):
+        dev = (close - out["center"]) / step
+    dev_np = dev.to_numpy(dtype=float)
+    _sid = int(grid_side)
+    # 「中间带」= 价格还没走远的这一段，多空两张网一起挂。
+    # 🔴`mid_band=0` 必须是**干干净净的关闭**（退化成原单边网，逐位不变）：
+    #    写成 `<=` 时 `dev` 恰好等于 0 的那几根会翻成双向 —— 手数随之被摊成一半，
+    #    整条曲线就变了（实测 SR 31.11% → 15.22%，只因为几根 `close == center`）。
+    dual = (np.isfinite(dev_np) & (np.abs(dev_np) < float(mid_band)) & valid
+            if float(mid_band) > 0 else np.zeros(len(sig), dtype=bool))
+    if _sid == 0:
+        # 只做多头：把空头信号整条清零。留 `dual=False`，否则出带规则会把
+        # 本来就不存在的空腿当成「该平的反向腿」。
+        sig = np.maximum(sig, 0).astype(int)
+        dual = np.zeros(len(sig), dtype=bool)
+    elif _sid == 1:
+        sig = np.minimum(sig, 0).astype(int)
+        dual = np.zeros(len(sig), dtype=bool)
+
     # 震荡过滤：中枢自己在这一段里的变化率。趋势段不开网
     calm = None
     if float(flat_pct) > 0:
@@ -1378,6 +1426,12 @@ def strat_grid(df: pd.DataFrame, ma_n: int = -1, grid_n: int = -1,
     #    来源，也是 `flat_pct` 过滤治不了的那一块。
     # 由回测引擎执行（它才有 high/low 路径），策略只负责把参数传下去。
     out["grid_net_stop"] = float(max(float(net_stop), 0.0))
+    # 中间震荡带：这一根允许**多空两张网同时挂着**（`grid_side=2` 才有意义）。
+    # 回测引擎读它决定「这一根建几个方向的腿」，以及「另一侧该不该市价平掉」。
+    out["grid_dual"] = dual.astype(float)
+    # 方向结构（0 只多 / 1 只空 / 2 多空都做）。回测只用来算手数摊薄：双向时每个
+    # 方向分到一半预算，不然中间带里两条腿叠起来的名义敞口就是两倍。
+    out["grid_side"] = float(_sid)
     grid_flat = np.zeros(len(out), dtype=bool)
     if total and step_min < 1440 and not int(hold):
         grid_flat = force.copy()
@@ -1505,7 +1559,7 @@ STRATEGIES: dict[str, StrategySpec] = {
         params={"ma_n": -1, "grid_n": -1, "grid_pct": 0.6, "flat_pct": 0.0,
                 "flat_min": 895, "night": 0, "follow": -1, "hold": -1,
                 "grid_mode": -1, "atr_n": 300, "atr_nd": 10, "atr_mult": -1.0,
-                "net_stop": 0.0},
+                "net_stop": 0.0, "grid_side": 2, "mid_band": 0.0},
         param_meta={
             "ma_n": (-1, 120, 1),
             "grid_n": (-1, 20, 1),
@@ -1520,6 +1574,8 @@ STRATEGIES: dict[str, StrategySpec] = {
             "atr_nd": (2, 60, 1),
             "atr_mult": (-1.0, 4.0, 0.1),
             "net_stop": (0.0, 5.0, 0.5),
+            "grid_side": (0, 2, 1),
+            "mid_band": (0.0, 12.0, 0.5),
         },
         param_labels={"ma_n": "中枢周期(-1按品种)", "grid_n": "网格档数(-1按品种)",
                       "grid_pct": "每格间距(%)", "flat_pct": "震荡阈值(%)",
@@ -1529,13 +1585,19 @@ STRATEGIES: dict[str, StrategySpec] = {
                       "grid_mode": "格宽口径(-1按品种/0百分比/1五分钟ATR/2日线ATR)",
                       "atr_n": "5mATR根数", "atr_nd": "日线ATR天数",
                       "atr_mult": "ATR倍数(-1按品种)",
-                      "net_stop": "破网止损(格宽,0=关)"},
+                      "net_stop": "破网止损(格宽,0=关)",
+                      "grid_side": "方向结构(0只多/1只空/2多空都做)",
+                      "mid_band": "中间震荡带宽度(格宽)"},
         desc="一格一档，**为日内 5 分钟设计**：`ma_n` 均线当中枢。\n"
              "「顺势(1)/逆势(0)」**默认 1 = 顺势**：价格在中枢**之上**做多头网格"
              "（档位挂在中心之上，突破一档买一份，止盈再走一格），**之下**做空头"
              "镜像。逆势(0) 是教科书网格「跌买涨卖」，档位挂回调侧、止盈回中枢。"
              "🔴两种不只是信号取负，档位挂在哪一侧要一起翻 —— 只翻信号会变成"
              "「顺势方向 + 逆势价位」，单子永远挂不到价（实测中证 1000 两年 53 笔）。\n"
+             "「方向结构」三选一：**0 只做多头 / 1 只做空头 / 2 多空都做**。多空都做"
+             "时，中枢附近 `中间带宽度` 格以内**两张网同时挂**（上面卖、下面买，"
+             "震荡区间两头都收一格），出了中间带只留原先那一侧、另一侧市价平掉。"
+             "逆势几何下出带平掉的正好是浮盈中的那一侧，等于把震荡带的利润兑现。\n"
              "「平仓(分)」默认 895 = **14:55 清仓**，按「下一根开盘成交」自动前推"
              "一根（即 14:50 那根出平仓信号）；夜盘转日盘、日盘转夜盘一律不留仓，"
              "午休可以持仓。「做夜盘(0/1)」默认 0 = 只做日盘。\n"
