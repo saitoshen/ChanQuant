@@ -709,6 +709,26 @@ class PortfolioRunner:
                   f"（每个分到 {kids[0].principal / 10000:g} 万）")
         return first
 
+    def add_or_update(self, cfg: SStore.StrategyConfig) -> None:
+        """引擎已经认识这条就只更新配置，不认识才新建槽位。
+
+        「界面新加了一条策略，让正在跑的连接把它接上」只能走这里 —— 另外两个
+        方法在这个场景下都是错的：
+
+        - `add()` 无条件重建 `SlotState`（`_add_one` 里直接 `self._slots[sid] = st`），
+          对已经在跑的槽位等于把 running / 挂单 / 目标仓全抹掉；
+        - `update()` 反过来，槽位不存在时直接 return，什么都不做。
+
+        2026-11-11 用户报的「新加的策略点启动/停止没反应」就是后者：从「策略研究」
+        页勾「加入策略交易」或组合页「导入策略」加进来的只写了磁盘，没有推给引擎，
+        于是 `enable()` 一路走到 `self._slots.get(sid) is None` 然后**静默 return**，
+        界面既不报错也没变化。
+        """
+        if cfg.sid in self._slots or cfg.sid in self._groups:
+            self.update(cfg)
+            return
+        self.add(cfg)
+
     def _remove_one(self, sid: str) -> None:
         st = self._slots.pop(sid, None)
         if st is not None:

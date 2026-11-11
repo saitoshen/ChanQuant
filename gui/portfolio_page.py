@@ -469,6 +469,13 @@ class PortfolioController(QObject):
     def running(self) -> bool:
         return bool(self._workers)
 
+    def is_running(self, key: str) -> bool:
+        """这个账户的连接在不在跑。单条启停要看账户粒度，不能只看整体。"""
+        return key in self._workers
+
+    def keys(self) -> list[str]:
+        return list(self._workers)
+
     def start(self, spec, cfgs: list, chase) -> None:
         key = spec.name
         if key in self._workers:
@@ -522,6 +529,14 @@ class PortfolioController(QObject):
 
     def add(self, key: str, cfg) -> bool:
         return self._submit(key, lambda r: r.add(cfg))
+
+    def add_or_update(self, key: str, cfg) -> bool:
+        """让引擎把这条接上：已有就只更新配置，没有才建槽位。
+
+        界面新加的策略只写了磁盘，`add()` 会重建槽位把正在跑的抹掉，
+        `update()` 又对不存在的槽位直接返回 —— 两个都不能用来「补挂」。
+        """
+        return self._submit(key, lambda r: r.add_or_update(cfg))
 
     def remove(self, key: str, sid: str) -> bool:
         return self._submit(key, lambda r: r.remove(sid))
@@ -1190,6 +1205,10 @@ class PortfolioPage(QWidget):
 
         btn_toggle = QPushButton("启动 / 停止")
         btn_toggle.setObjectName("Ghost")
+        btn_toggle.setToolTip(
+            "只启停选中的这一条。\n"
+            "账户的连接还没起来时，会**只**把它拉起来（不等「启动全部」）；\n"
+            "判断依据是它此刻在不在跑，不是存盘的开关键。")
         btn_toggle.clicked.connect(self._toggle_selected)
         head.addWidget(btn_toggle)
 
@@ -1210,7 +1229,8 @@ class PortfolioPage(QWidget):
 
         hint = QLabel(
             "双击一行 = 打开它的 K 线与绩效。按住 Ctrl 多选后点「组合报告」，"
-            "看这几条策略等权组合的资金曲线。启停请用上面的按钮。"
+            "看这几条策略等权组合的资金曲线。\n"
+            "「启动 / 停止」只作用于选中的那一条：账户还没连上时会把它的账户单独连上。"
         )
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
@@ -1996,7 +2016,16 @@ class PortfolioPage(QWidget):
             # 状态列只放短标签，「买了 2 手 @ 3046」这种细节放 tooltip ——
             # 塞进表格会把列挤成一团，横向滚动条一起来就没人看了。
             if not slot:
-                text, color, tip = "未连接", C_IDLE, "还没启动"
+                if cfg.enabled and self.ctl.is_running(self._account_of(cfg)):
+                    # 账户连接在跑、但引擎还没推来这一条的快照。两种可能：刚点完
+                    # 启动正在连（几秒），或者从别处加进来后一直没推给引擎。
+                    # 只说「未接入」会让人以为按钮没生效，去连点第二下
+                    text, color = "接入中", C_MUTED
+                    tip = ("账户连接在跑，这条的首份快照还没到。\n"
+                           "刚点过启动的话等几秒；一直这样就是没接上，"
+                           "再点一次「启动 / 停止」")
+                else:
+                    text, color, tip = "未连接", C_IDLE, "还没启动"
             elif slot.get("error") and "暂不支持实盘" in str(slot["error"]):
                 # 截面这一类「引擎结构上跑不了」的，不该显示成红字「错误」——
                 # 那不是故障，是这一条本来就只能回测。原因留在 tooltip 里
@@ -2147,9 +2176,6 @@ class PortfolioPage(QWidget):
     # ---------------------------------------------------------- 起停
 
     def _start_all(self) -> None:
-        if self.ctl.running:
-            self._on_failed("已经在运行，先停止再重新启动")
-            return
         if not self._items:
             self._on_failed("组合里还没有策略，先「从策略库添加」")
             return
@@ -2168,14 +2194,24 @@ class PortfolioPage(QWidget):
                 return
             groups.setdefault(name, []).append(cfg)
 
+        # 允许在「已经单独启动过某一条」的情况下再点：把其余补齐，不逼用户先停止全部
+        newly = 0
         for name, cfgs in groups.items():
+            if self.ctl.is_running(name):
+                for cfg in cfgs:
+                    if not cfg.enabled:
+                        continue
+                    if cfg.sid not in self._slot_view:
+                        self.ctl.add_or_update(name, cfg)
+                    self.ctl.enable(name, cfg.sid, True)
+                continue
             self.ctl.start(self._spec(name), cfgs, self._chase)
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.lbl_dot.setStyleSheet(f"color: {C_OK}; font-size: 15px;")
-        self.lbl_conn.setText(f"运行中 · {len(groups)} 个账户 / {len(self._items)} 条策略")
-        self.lbl_conn.setStyleSheet(f"color: {C_OK}; font-size: 11px;")
-        self._on_log(f"启动 {len(groups)} 个账户的连接")
+            newly += 1
+        if newly:
+            self._on_log(f"启动 {newly} 个账户的连接")
+        else:
+            self._on_log("连接本来就在跑，已把其余启用的策略补进来")
+        self._refresh_conn_label()
 
     def _stop_all(self) -> None:
         if not self.ctl.running:
@@ -2211,21 +2247,99 @@ class PortfolioPage(QWidget):
             return None
         return cfgs[0]
 
+    @staticmethod
+    def _want_on(slot: dict) -> bool:
+        """「启动 / 停止」此刻该往哪个方向走 —— 看引擎里在不在跑。
+
+        不能看存盘的 `cfg.enabled`：停止全部只断连接、不清这个开关，于是
+        「开关是开的但什么都没跑」是最常见的一态，按 `not enabled` 取反第一下
+        点出来就是「关」（提示「标记为停止，启动后生效」），要连点两下。
+        """
+        return not bool((slot or {}).get("running"))
+
     def _toggle_selected(self) -> None:
         cfg = self._single_or_warn()
         if cfg is None:
             return
-        on = not cfg.enabled
-        cfg.enabled = on
-        SStore.update_portfolio(cfg)
         key = self._account_of(cfg)
-        if self.ctl.running:
-            if not self.ctl.enable(key, cfg.sid, on):
-                self._on_failed(f"账户「{key}」没在运行，改完要重新启动才生效")
+        slot = self._slot_view.get(cfg.sid) or {}
+        # 🔴 判据是「引擎里真实在不在跑」，不是存盘的 `enabled` 开关。
+        on = self._want_on(slot)
+
+        if on:
+            cfg.enabled = True
+            SStore.update_portfolio(cfg)
+            if not self.ctl.is_running(key):
+                # 这个账户的连接还没起来 —— **只把这一个策略拉起来**，不是「启动全部」
+                spec = self._spec(key)
+                if spec is None:
+                    cfg.enabled = False
+                    SStore.update_portfolio(cfg)
+                    self._on_failed(f"账户「{key}」已不存在，请重新绑定")
+                    return
+                self.ctl.start(spec, [cfg], self._chase)
+                self._on_log(f"已单独启动「{cfg.title()}」（账户 {key}）")
+                self._warn_solo_start(key, cfg)
+            else:
+                # 连接在跑，但引擎可能根本不认识这一条：从「策略研究」页勾「加入
+                # 策略交易」、组合页「导入策略」、或 ChanAgent 送过来的策略，加进
+                # 组合时只写了磁盘，没有推给正在跑的连接。这时 `enable()` 会一路走到
+                # `PortfolioRunner.enable()` 的 `self._slots.get(sid) is None` 然后
+                # **静默 return** —— 点了没反应，也不报错。
+                #
+                # 不能无条件 `add()`：它重建槽位，正在跑的那条会被抹掉 running 和挂单。
+                if cfg.sid not in self._slot_view:
+                    self.ctl.add_or_update(key, cfg)
+                if not self.ctl.enable(key, cfg.sid, True):
+                    self._on_failed(f"账户「{key}」的连接没了，请再点一次")
+                    return
+                self._on_log(f"「{cfg.title()}」已启动")
         else:
-            self._on_log(f"{cfg.title()}：{'标记为运行' if on else '标记为停止'}，启动后生效")
+            cfg.enabled = False
+            SStore.update_portfolio(cfg)
+            if not self.ctl.enable(key, cfg.sid, False):
+                self._on_failed(f"账户「{key}」没在运行，没有可停的策略")
+                return
+            self._on_log(f"「{cfg.title()}」已停止"
+                         + ("（这个账户上已经没有策略在跑，连接还留着）"
+                            if self._no_enabled_left(key) else ""))
+        self._refresh_conn_label()
         self._fill_strategies()
         self._render()
+
+    def _no_enabled_left(self, key: str) -> bool:
+        """这个账户上还有没有别的已启用策略。"""
+        return not any(self._account_of(c) == key and c.enabled and c.sid
+                       for c in self._items)
+
+    def _warn_solo_start(self, key: str, cfg) -> None:
+        """单独只启动一条时提醒一下：其它策略没进引擎，一键对齐会把它们的仓平掉。"""
+        others = [c for c in self._items
+                  if self._account_of(c) == key and c.sid != cfg.sid and c.enabled]
+        if not others:
+            return
+        self._on_log(
+            f"注意：账户「{key}」上还有 {len(others)} 条已启用的策略没进引擎，"
+            "它们的持仓会被「一键对齐」当成无主仓位。要全部跑起来点「启动全部」。")
+
+    def _refresh_conn_label(self) -> None:
+        """按真实连接状态重刷顶部状态灯 —— 单条启停之后也要跟着变。"""
+        keys = self.ctl.keys()
+        if not keys:
+            self.lbl_dot.setStyleSheet(f"color: {C_IDLE}; font-size: 15px;")
+            self.lbl_conn.setText("已停止")
+            self.lbl_conn.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+            return
+        n = sum(1 for c in self._items
+                if c.enabled and self._account_of(c) in keys)
+        self.lbl_dot.setStyleSheet(f"color: {C_OK}; font-size: 15px;")
+        self.lbl_conn.setText(f"运行中 · {len(keys)} 个账户 / {n} 条策略")
+        self.lbl_conn.setStyleSheet(f"color: {C_OK}; font-size: 11px;")
+        # 只单独启动过一条时，「启动全部」还要能用 —— 它会把剩下的补齐
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(True)
 
     # ---------------------------------------------------------- 增删改
 
@@ -2247,6 +2361,11 @@ class PortfolioPage(QWidget):
         item.account = self.cb_acct.currentData() or ""
         SStore.update_portfolio(item)
         self.reload()
+        # 连接在跑就让引擎先接上（默认不开仓，`enabled` 仍是 False）。不推的话
+        # 状态列显示「未连接」，用户点「启动 / 停止」还得靠 `_toggle_selected`
+        # 补挂一次 —— 能补上，但少一个来回总是好的。
+        if self.ctl.running:
+            self.ctl.add_or_update(self._account_of(item), item)
         self._on_log(f"已加入组合：{item.title()}")
 
     def _edit_selected(self) -> None:

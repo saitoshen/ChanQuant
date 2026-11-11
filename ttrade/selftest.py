@@ -3013,6 +3013,86 @@ def _run() -> tuple[bool, list[str]]:
 
     check("一键对齐看得见锁仓（多空双开）", _align_lock)
 
+    def _add_or_update():
+        """新加进组合的策略要能被「启动 / 停止」接上。
+
+        2026-11-11 用户报：组合页新加一条策略，点「启动 / 停止」没反应。根因是
+        加进组合只写了磁盘、从没推给引擎，而 `PortfolioRunner.enable()` 对不认识
+        的 sid 是 `self._slots.get(sid) is None` 然后**静默 return** —— 不报错、
+        不变化。`add()` 又不能拿来补挂：它无条件重建 SlotState，正在跑的槽位会
+        被抹掉 running / 目标仓 / 挂单。
+        """
+        from ttrade import strategy_store as SStore
+        from ttrade.strategy_runner import PortfolioRunner, SlotState
+
+        class _Spec:
+            def label(self):
+                return "__selftest__"       # positionbook.load 只读，不落台账
+
+        r = PortfolioRunner.__new__(PortfolioRunner)
+        r._slots, r._groups, r._parents, r._child_of = {}, {}, {}, {}
+        r._log = lambda *_a, **_k: None
+        r._cancel_all = lambda st: None
+        r.spec = _Spec()
+
+        # ① 已经在跑的槽位：必须原对象原状态，不能被重建
+        old = SStore.StrategyConfig(sid="old", name="旧", period="1h")
+        st = SlotState(cfg=old)
+        # `signal × lots` 要自洽：`update()` 按 `target = signal * max(1, lots)` 重算
+        # 目标仓（改手数立刻生效，这是对的），夹具写矛盾值就成了假失败
+        st.running, st.signal, st.lots, st.target = True, -1, 3, -3
+        r._slots["old"] = st
+        r.add_or_update(old)
+        if r._slots.get("old") is not st or not st.running or st.target != -3:
+            raise RuntimeError("add_or_update 重建了正在跑的槽位，running/target 丢了")
+
+        # ② 新加的策略：补挂之后 `enable()` 才不会提前 return
+        new = SStore.StrategyConfig(sid="new", name="新", period="1h")
+        if r.get("new") is not None:
+            raise RuntimeError("新策略不该已经在引擎里（前提就不成立）")
+        r.add_or_update(new)
+        if r.get("new") is None:
+            raise RuntimeError("add_or_update 没把新策略接进来，enable 还是会静默返回")
+
+        # ③ 反证：`add()` 就会把状态抹掉 —— 所以补挂只能走 add_or_update
+        r.add(old)
+        if r._slots.get("old") is st or r._slots["old"].running:
+            raise RuntimeError("add() 本该重建槽位，这条自检没有意义了")
+        return "跑着的槽位原样保留（running/target 不动），新策略能补挂；add() 会重建（已反证）"
+
+    check("新加的策略能被启停接上（add_or_update）", _add_or_update)
+
+    def _want_on_rule():
+        """「启动 / 停止」的方向要按真实运行状态判，不能按存盘的 enabled 开关。
+
+        2026-11-11 用户报：停止全部之后选一条点按钮，提示「标记为停止，启动后生效」，
+        怎么点都起不来。原因是 `停止全部` 只断连接、不清 `enabled`，按 `not cfg.enabled`
+        取反，第一下算出来是「关」—— 得连点两下才变「开」，而且那一下本来也没启动
+        任何东西（当时 `ctl.running` 已是 False，只写了标记）。
+        """
+        from gui.portfolio_page import PortfolioPage
+
+        for slot, want, why in [
+            ({}, True, "没有槽位（停止全部之后就是这样）"),
+            ({"running": False}, True, "槽位在但没跑"),
+            ({"running": True}, False, "正在跑"),
+        ]:
+            got = PortfolioPage._want_on(slot)
+            if got != want:
+                raise RuntimeError(f"{why}：应为 {want}，实得 {got}")
+
+        # 反证：旧口径在同一种状态（enabled=True 但什么都没跑）会判成「停止」
+        enabled_after_stop_all = True
+        old_rule = not enabled_after_stop_all
+        new_rule = PortfolioPage._want_on({})
+        if old_rule == new_rule:
+            raise RuntimeError(f"旧口径 {old_rule} 该与新口径 {new_rule} 相反")
+        return "无槽位/未跑→启动、在跑→停止；旧口径（not enabled）会判成停止"
+
+    check("启停按钮按真实运行状态判方向", _want_on_rule)
+
+
+
     def _factor_reverse():
         """逐因子反转：分数严格取负，仓位严格对调。"""
         import numpy as np
