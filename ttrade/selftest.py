@@ -3405,8 +3405,21 @@ def _run() -> tuple[bool, list[str]]:
         if not z_on > z_off:
             raise RuntimeError(f"震荡过滤开关失效（开 1% 零信号 {z_on:.1%} "
                                f"没有多于关掉 {z_off:.1%}）")
-        return (f"RB 兜底 逆势+不过滤（零信号 {z_def:.0%}，开 1% 是 {z_on:.0%}）；"
-                f"IM 仍顺势")
+
+        # hold：表外品种兜底 **持过夜**（`grid_flat` 全 False = 没有任何一根被
+        # 时段规则强制平仓）；股指还是日内强平（必须有被强平的那几根）。
+        d.attrs["symbol"] = "RB"
+        flat_rb = int(pd.to_numeric(run_strategy(d, "grid_trade", {})["grid_flat"],
+                                    errors="coerce").fillna(0).sum())
+        d.attrs["symbol"] = "IM"
+        flat_im = int(pd.to_numeric(run_strategy(d, "grid_trade", {})["grid_flat"],
+                                    errors="coerce").fillna(0).sum())
+        if flat_rb != 0:
+            raise RuntimeError(f"表外品种兜底不是过夜（有 {flat_rb} 根被时段强平）")
+        if flat_im == 0:
+            raise RuntimeError("股指定稿的日内强平丢了（一根强平都没有）")
+        return (f"RB 兜底 逆势+过夜+不过滤（零信号 {z_def:.0%}，开 1% 是 {z_on:.0%}，"
+                f"强平 0 根）；IM 仍 顺势+日内（强平 {flat_im} 根）")
 
     check("网格分品种默认值（表外逆势 / 过滤默认不做 / 表内定稿不动）", _grid_symbol_defaults)
 
