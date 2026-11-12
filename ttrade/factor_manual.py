@@ -152,6 +152,24 @@ DATA_GUIDE = """## 一、行情数据是怎么来的
 「标的期货当天结算价」当 Black-76 的 F，而股指期权的标的是**指数**。
 两套口径（Tushare 结算价 / 天勤收盘价）不合并：同一品种只用其中一个源。
 
+**分钟线上的 IV 按 bar 周期取档**（`option_iv.period`：`1d` / `1h` / `5m`）：
+
+- 5m bar 配 5m 的 IV、1h bar 配 1h 的，取不到才**往粗档退**（1h → 日频）
+- 退档不引入未来信息：每根 bar 取的是「严格早于它」的最后一条快照
+  （`merge_asof(allow_exact_matches=False)`）。允许精确匹配就等于拿当根收盘
+  算出来的 IV 决定当根怎么下单，IC 会好看、实盘拿不到
+- 库里各档覆盖差别很大，所以有**覆盖度闸门**：某档最晚一条比日频落后一个月
+  以上就直接跳过。IO 的 5m 只到 2020-11、MO 没有 5m，现在都自动走 1h
+- 档位窗口之外**不沿用**最后一条快照，缺口用日频补 —— 否则 2020 年的 IV 会被
+  一路搬到今天，图上是一条水平线
+- 有 `opt_*.csv` 的商品仍然只用 Tushare 日频。同一个品种不能换个周期就换源，
+  不然 1d 和 5m 两张图的 `iv_atm` 水平不一样，看着像「换周期策略变强了」
+
+**波动率类因子的年化跟着 bar 密度走**：日线固定 `sqrt(252)`，分钟线是
+`sqrt(252 × 每天根数)`（`factors._ann_scale`）。1h 上写死 `sqrt(252)` 会让
+`vol_20` 只有真实年化的 1/2.8、5m 只有 1/9.6，于是 `iv_rv = iv_near − vol_20`
+在分钟线上恒正偏大 —— 看着有值，其实只是量纲错了。
+
 ### 复权
 
 - 期货日线：`adj_factor` 是**绝对累计因子**（锚定上市日、与查询窗口无关），
@@ -184,7 +202,9 @@ DATA_GUIDE = """## 一、行情数据是怎么来的
 | 期货分钟线抓取 | `ttrade/tqfetch.py` | `write_main_many()`（主连）、`write_contracts()`（真实合约） |
 | 期货分钟线本地读取 | `ttrade/tqdata.py` | `load_main()`（DuckDB + 复权 + 合并） |
 | 主力切换表 / 复权因子 | `ttrade/tqfetch.py` | `ensure_switch()`、`refresh_all()` |
-| 衍生列并进 DataFrame | `ttrade/auxdata.py` | `attach()` |
+| 衍生列并进 DataFrame | `ttrade/auxdata.py` | `attach()`（日线）/ `attach_intraday()`（分钟） |
+| 期权 IV 取哪一档（日频 / 1h / 5m） | `ttrade/auxdata.py` | `_use_iv_period()`、`_iv_period_for()` |
+| 期货品种 ↔ 期权品种映射 | `ttrade/optstore.py` | `opt_variety()`、`iv_candidates()` |
 
 改完行情口径要同步检查两件事：`adj_factor` 是否还对得上，以及 `smoke_test_tq`
 里的「1h 因子与切换表逐根一致」那一项（它专门守复权）。

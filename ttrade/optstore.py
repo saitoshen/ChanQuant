@@ -157,8 +157,38 @@ def iv_candidates(symbol: str) -> list[str]:
     return [base, base.lower()]
 
 
+def iv_span(symbol: str, period: str = "1d"):
+    """这个品种 / 周期在库里的 IV 覆盖：`(行数, 最早, 最晚)`；没有返回 None。
+
+    只做聚合查询，**不拉数据** —— 判「分钟 bar 该用哪一档」时会连问好几档，
+    每档都 `load_iv()` 一遍就是几百毫秒起步。判覆盖度必须看「最晚到哪天」：
+    库里 5m 档各家差别很大（IO 只到 2020-11、HO 一直到 2026-10、MO 没有），
+    只看「有没有」会挑到一个停更五年的档。
+    """
+    if not exists():
+        return None
+    for v in iv_candidates(symbol):
+        try:
+            with connect(read_only=True) as con:
+                row = con.execute(
+                    "SELECT count(*), min(dt), max(dt) FROM option_iv"
+                    " WHERE variety = ? AND period = ?",
+                    [v, period],
+                ).fetchone()
+        except Exception:      # noqa: BLE001 - 库正被写、文件不在，都当「没有」
+            return None
+        if row and row[0]:
+            return (int(row[0]), pd.Timestamp(row[1]), pd.Timestamp(row[2]))
+    return None
+
+
+def has_iv(symbol: str, period: str = "1d") -> bool:
+    """库里这个品种 / 周期有没有 IV 摘要（`iv_span` 的布尔版）。"""
+    return iv_span(symbol, period) is not None
+
+
 def load_iv_for(symbol: str, period: str = "1d", **kw) -> pd.DataFrame:
-    """按**期货品种**取 IV 摘要。
+    """按**期货品种**取 IV 摘要（`period` 档：`1d` / `1h` / `5m`）。
 
     返回 `index=dt`、列正好 `IV_COLS` 的表（`variety` / `period` 这两个键列
     去掉）—— 和 `auxdata.load_opt()` 读 Tushare 那份 CSV 的形状一致，可以直接

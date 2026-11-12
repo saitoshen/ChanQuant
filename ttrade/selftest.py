@@ -1896,6 +1896,105 @@ def _run() -> tuple[bool, list[str]]:
 
     check("股指期货 ↔ 期权品种映射（IF→IO）", _index_opt_map)
 
+    def _opt_iv_period():
+        """分钟级期权 IV：按 bar 周期取档 + 无前视 + `vol_20` 年化按密度。
+
+        这三处都是**不报错但结果全错**的类型：取错档只让日内台阶变粗、asof
+        允许精确匹配只让 IC 好看、年化系数写死 252 只让 `iv_rv` 恒正 —— 图上看
+        都像正常因子。所以必须逐条断言，不能只看「有没有数」。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import auxdata as A
+        from ttrade import factors as F
+        from ttrade import optstore as OS
+
+        # ① bar 周期识别：六档 + 日线。用相邻间隔的中位数，别用「每天几根」
+        base = pd.Timestamp("2026-01-05 09:00")
+        for step, want in ((5, "5m"), (15, "15m"), (30, "30m"),
+                           (60, "1h"), (120, "2h"), (240, "4h")):
+            idx = pd.DatetimeIndex([base + pd.Timedelta(minutes=step * i)
+                                    for i in range(40)])
+            df = pd.DataFrame({"close": np.arange(40.0)}, index=idx)
+            got = A.bar_period(df)
+            if got != want:
+                raise RuntimeError(f"{step} 分钟的 bar 认成 {got}，应为 {want}")
+        didx = pd.DatetimeIndex(pd.bdate_range("2026-01-05", periods=40))
+        got = A.bar_period(pd.DataFrame({"close": np.arange(40.0)}, index=didx))
+        if got != "1d":
+            raise RuntimeError(f"日线认成 {got}，应为 1d")
+
+        # ② 无前视：IV 快照与 bar 同刻，**同刻那条不能出现在当根 bar 上**
+        grid = pd.DatetimeIndex([base, base + pd.Timedelta(hours=1),
+                                 base + pd.Timedelta(hours=2)])
+        iv = pd.DataFrame({"iv_near": [1.0, 2.0, 3.0]}, index=grid)
+        bars = pd.DataFrame(
+            {"close": [10.0, 11.0, 12.0, 13.0]},
+            index=grid.append(pd.DatetimeIndex([base + pd.Timedelta(days=63)])),
+        )
+        vals = A._join_bar_asof(bars, iv)["iv_near"].to_numpy(dtype=float)
+        if not np.isnan(vals[0]):
+            raise RuntimeError(f"第一根 bar 不该有 IV，实际 {vals[0]}")
+        if not (vals[1] == 1.0 and vals[2] == 2.0):
+            raise RuntimeError(f"同刻快照被提前用了：{list(vals[:3])}，应为 nan/1/2")
+        if not np.isnan(vals[3]):
+            raise RuntimeError(f"覆盖窗口外仍在沿用最后一条快照：{vals[3]}")
+
+        # ③ 档位选择：不能挑到停更的档（IO 的 5m 只到 2020-11）
+        picked = "IF 取档未验（期权库未下载）"
+        if OS.exists():
+            dspan = OS.iv_span("IF", "1d")
+            if dspan is None:
+                raise RuntimeError("IF 在期权库里没有日频 IV")
+            i5 = pd.DatetimeIndex([base + pd.Timedelta(minutes=5 * i)
+                                   for i in range(120)])
+            p = A._iv_period_for(pd.DataFrame({"close": np.arange(120.0)},
+                                              index=i5), "IF")
+            if p == "1d":
+                raise RuntimeError("IF 有分钟档，5m bar 不该退到日频")
+            sp = OS.iv_span("IF", p)
+            if sp is None:
+                raise RuntimeError(f"IF 挑到了没有数据的档 {p}")
+            if sp[2] < dspan[2] - pd.Timedelta(days=30):
+                raise RuntimeError(
+                    f"IF 挑到停更的档 {p}（到 {sp[2].date()}，日频到 {dspan[2].date()}）")
+            # 有 aux 文件的商品必须锁死日频，否则换周期就换了数据源
+            cu = A._use_iv_period(data_dir("aux"), "CU", "SHFE",
+                                  pd.DataFrame({"close": np.arange(120.0)}, index=i5))
+            if cu != "1d":
+                raise RuntimeError(f"CU 有 aux 文件却用了日内档 {cu}")
+            picked = f"IF 5m bar → {p}（{sp[0]} 行）"
+
+        # ④ vol_20 年化：日线必须逐位不变（历史基线和 IC 都按 252 算过）
+        rng = np.random.default_rng(7)
+        d = pd.DataFrame(
+            {"close": 100 * np.exp(np.cumsum(rng.normal(0, 0.01, 300)))},
+            index=pd.bdate_range("2025-01-06", periods=300),
+        )
+        want = (d["close"].pct_change().rolling(20, min_periods=20).std(ddof=1)
+                * np.sqrt(F.TRADING_DAYS)).to_numpy()
+        got = F.FACTORS["vol_20"].func(d).to_numpy()
+        if not np.allclose(got, want, equal_nan=True, rtol=0, atol=1e-15):
+            raise RuntimeError("日线 vol_20 被改了口径（必须仍是 sqrt(252)）")
+        # 分钟线按「一年多少根」放缩：10 天 × 6 根 → sqrt(252 × 6)
+        hrs = pd.DatetimeIndex([pd.Timestamp("2026-01-05") + pd.Timedelta(days=i)
+                                + pd.Timedelta(hours=h)
+                                for i in range(10) for h in (9, 10, 11, 13, 14, 15)])
+        hi = pd.DataFrame(
+            {"close": 100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(hrs))))},
+            index=hrs,
+        )
+        sc = F._ann_scale(hi)
+        want_sc = float(np.sqrt(F.TRADING_DAYS * 6))
+        if abs(sc - want_sc) > 1e-9:
+            raise RuntimeError(f"1h 的年化系数 {sc:.4f}，应为 {want_sc:.4f}")
+        if abs(F._ann_scale(d) - float(np.sqrt(F.TRADING_DAYS))) > 1e-12:
+            raise RuntimeError("日线年化系数被分钟逻辑带偏了")
+        return f"6 档周期识别 + 无前视；{picked}；1h 年化 ×{sc / np.sqrt(F.TRADING_DAYS):.2f}"
+
+    check("分钟级期权 IV（取档 / 无前视 / 年化）", _opt_iv_period)
+
     def _factor_metrics():
         from ttrade import factor_metrics as M
         from ttrade import factors as F

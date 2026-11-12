@@ -644,10 +644,37 @@ def f_stoch_14(df: pd.DataFrame) -> pd.Series:
 
 
 # ---------------------------------------------------------------- 波动率
+def _ann_scale(df: pd.DataFrame) -> float:
+    """波动年化系数：日线固定 `sqrt(252)`，分钟线按「一年多少根」推。
+
+    分钟 bar 上用 `sqrt(252)` 是错的：1h 一年约 1260 根、5m 约 12000 根，
+    年化要乘 `sqrt(252 × 每天根数)`。不修的话 1h 的 `vol_20` 只有真实年化的
+    1/2.8、5m 只有 1/9.6 —— 而 `iv_rv = iv_near − vol_20` 在 1h/5m 上就变成
+    「0.18 − 0.02 ≈ 0.16」这种恒正偏置，看着有值其实没信息。
+
+    **日线必须逐位不变**（历史基线和 IC 都按 252 算过），所以只有每交易日
+    明显多于 1 根时才按密度放缩。
+    """
+    idx = df.index
+    if not isinstance(idx, pd.DatetimeIndex) or len(idx) < 2:
+        return float(np.sqrt(TRADING_DAYS))
+    nd = idx.normalize().nunique()
+    if nd < 2:
+        return float(np.sqrt(TRADING_DAYS))
+    bpd = len(idx) / float(nd)
+    if bpd <= 1.5:                       # 日线 / 更粗：维持原口径
+        return float(np.sqrt(TRADING_DAYS))
+    return float(np.sqrt(TRADING_DAYS * bpd))
+
+
 def f_vol_20(df: pd.DataFrame) -> pd.Series:
-    """20 日已实现波动率（年化）。低波动因子的原料。"""
+    """20 根已实现波动率（年化）。日线上是 20 日，分钟线上是 20 根。
+
+    年化系数按 bar 密度算（见 `_ann_scale`）：日线仍是 `sqrt(252)`，
+    1h / 5m 会乘上每天根数，跨周期才可比。
+    """
     r = df["close"].pct_change()
-    return r.rolling(20, min_periods=20).std(ddof=1) * np.sqrt(TRADING_DAYS)
+    return r.rolling(20, min_periods=20).std(ddof=1) * _ann_scale(df)
 
 
 def f_vol_ratio(df: pd.DataFrame) -> pd.Series:
