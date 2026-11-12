@@ -112,6 +112,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -130,10 +131,13 @@ from PySide6.QtWidgets import (
 
 from gui.pickers import SymbolPicker
 from gui.result_view import PERIOD_LABEL, ResultView, ViewCtx, set_tab_visible
+from gui.workspace_bar import AllocDialog, WorkspaceBar
 from ttrade import replay
 from ttrade import cross as cross_engine
+from ttrade import portfolio_plan as PL
 from ttrade import strategy_store as SStore
 from ttrade import tqlive
+from ttrade import workspace_store as WS
 from ttrade.tqlive import merge_live
 from ttrade.backtest import combine, combine_trades
 from ttrade.strategies import STRATEGIES, param_label
@@ -239,6 +243,55 @@ class ReplayWorker(QObject):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
             return
         self.done.emit(out)
+
+
+class MeasureWorker(QObject):
+    """在后台量「这条策略实际压了多少钱」。
+
+    为什么必须后台：一条 5m 十年的策略回测要几秒到几十秒，工作区里几十条，
+    同步跑窗口会「未响应」。这和「组合报告」那条线程分开 —— 量占用只关心
+    `res.position` 和行情，不需要出图。
+
+    占用口径和 `ttrade/portfolio_plan.py` 的 `measure()` 是同一份实现，
+    这里一行算法都不重写：两处各算一套的话，界面显示的占用和配权用的占用
+    迟早会不一样。
+    """
+
+    progress = Signal(int, int, str)
+    done = Signal(object)      # ([PL.Usage], [没量出来的说明])
+    failed = Signal(str)
+
+    def __init__(self, jobs: list) -> None:
+        super().__init__()
+        self.jobs = list(jobs)
+
+    def run(self) -> None:
+        out, bad = [], []
+        try:
+            for i, (cfg, kind, payload) in enumerate(self.jobs, 1):
+                self.progress.emit(i, len(self.jobs), cfg.title())
+                try:
+                    rp = run_replay_job(cfg, kind, payload, with_bh=False)
+                    if not rp.ok:
+                        bad.append(f"{cfg.title()}（{rp.error[:40]}）")
+                        continue
+                    # 占用要「持仓 × 收盘」，所以得有一份和 `res.position` 同索引
+                    # 的行情。单品种用回测真正吃进去的那份（`rp.raw`），
+                    # 多品种 / 截面是逐品种拼出来的组合曲线，没有单一收盘价 ——
+                    # 传 None，`measure()` 会退回「只按波动率配权」并留一句备注
+                    frame = getattr(rp, "raw", None)
+                    if frame is None and kind == "single":
+                        frame = payload[0] if isinstance(payload, tuple) else payload
+                    mk = replay.market_of(cfg)
+                    bt = replay.make_bt(mk, replay.default_allow_short(cfg), cfg)
+                    out.append(PL.measure(cfg, frame, rp.res,
+                                          bt.multiplier, bt.margin_rate))
+                except Exception as exc:           # noqa: BLE001
+                    bad.append(f"{cfg.title()}（{type(exc).__name__}: {exc}）")
+        except Exception as exc:                   # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.done.emit((out, bad))
 
 
 class DataWorker(QObject):
@@ -796,13 +849,24 @@ class EditDialog(QDialog):
             )
             form.addRow("", self.chk_reverse)
 
-        self.cb_acct = QComboBox()
-        self.cb_acct.addItem("跟随默认账户", "")
+        # 多账户：勾几个就在几个账户上各跑一份。**一个都不勾 = 跟随默认账户**，
+        # 和老配置（只有 `account` 一个字段）的语义完全一致
+        self.lst_acct = QListWidget()
+        self.lst_acct.setMaximumHeight(104)
+        self.lst_acct.setToolTip(
+            "勾几个就在几个账户上同时跑这一条策略。\n"
+            "一个都不勾 = 跟随顶部的默认账户。\n\n"
+            "每个账户各算各的手数（各自的本金、各自的保证金），策略参数只有一份 ——\n"
+            "所以不用为每个账户复制一遍策略。")
+        chosen = list(cfg.accounts or ([cfg.account] if cfg.account else []))
         for a in accounts:
-            self.cb_acct.addItem(a, a)
-        idx = self.cb_acct.findData(cfg.account or "")
-        self.cb_acct.setCurrentIndex(max(idx, 0))
-        form.addRow("交易账户", self.cb_acct)
+            it = QListWidgetItem(a)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked if a in chosen else Qt.Unchecked)
+            self.lst_acct.addItem(it)
+        form.addRow("交易账户", self.lst_acct)
+        if not accounts:
+            form.addRow("", _hint("还没有交易账户，先到「账户透视和交易」页添加"))
 
         # ---- 策略参数 ----
         # 小数参数（vol_ratio 0.4、stop_mult 2.5）必须用 QDoubleSpinBox：
@@ -918,7 +982,11 @@ class EditDialog(QDialog):
         cfg.volume = self.sp_vol.value()
         cfg.note = "short" if self.chk_short.isChecked() else ""
         cfg.short_only = bool(self.chk_no_long.isChecked() and self.chk_short.isChecked())
-        cfg.account = self.cb_acct.currentData() or ""
+        picked = [self.lst_acct.item(i).text()
+                  for i in range(self.lst_acct.count())
+                  if self.lst_acct.item(i).checkState() == Qt.Checked]
+        cfg.accounts = picked
+        cfg.account = picked[0] if picked else ""
         if self.sp_params:
             cfg.rule_params = {k: sp.value() for k, sp in self.sp_params.items()}
         if self.chk_reverse is not None:
@@ -954,11 +1022,29 @@ class PortfolioPage(QWidget):
         # universe(market) -> list[dict]。改品种要用：设置参数里那个勾选面板得知道
         # 这个市场有哪些品种。和 loader 一样由主窗口递进来，这一页不自己扫盘
         self._universe = universe
-        self._items = SStore.load_portfolio()
+        # 策略池：`portfolio.json` 里那一份，参数只有这一处。工作区只记
+        # 「谁在里面、分到多少本金」，见 `ttrade/workspace_store.py`
+        self._pool = SStore.load_portfolio()
+        self._wss = WS.load_workspaces(self._pool)
+        self._ws = self._active_ws()
+        self._items = []
+        # 实测占用：sid -> PL.Usage。「量一下占用」之后才有，切工作区不清空 ——
+        # 同一条策略换个工作区，它**历史回测里**平均压多少钱是不变的
+        self._usages: dict = {}
+        self._measure_done = 0
+        self._measure_bad: list[str] = []
+        # 量占用的后台线程（它和「查看回测」是两条独立的路，不共线程）
+        self._ms_thread: QThread | None = None
+        self._ms_worker = None
         self._accounts = tqlive.load_accounts()
         self._chase = SStore.load_chase()
         self._snaps: dict[str, dict] = {}
-        self._slot_view: dict[str, dict] = {}     # sid -> 快照里的 slot
+        # sid -> 快照里的 slot（单账户时的主来源）
+        self._slot_view: dict[str, dict] = {}
+        # sid -> {账户: slot}。多账户策略在每个账户上各有一个槽位，`_slot_view`
+        # 只会留下最后写进来的那个 —— 想显示「这条策略在每个账户上分别多少手」
+        # 就得留着这份。单账户时两个结构内容一致
+        self._slot_multi: dict[str, dict] = {}
         self._render_ts = 0.0                     # 上次重画两张表的时刻
         self._mon_sig = None                      # 监控表上次画的内容
         # 单策略视图的实时 K 线。`_live_base` 是本地库里的历史，实时段每 5 秒
@@ -1214,11 +1300,27 @@ class PortfolioPage(QWidget):
 
         btn_del = QPushButton("删除")
         btn_del.setObjectName("Ghost")
+        btn_del.setToolTip("只把它从**当前工作区**拿掉。别的分页还在用它时，策略池里留着")
         btn_del.clicked.connect(self._del_selected)
         head.addWidget(btn_del)
 
+        # 工作区分页 + 资金分配。放在策略表**上面**：先选是哪个组合，再看组合里
+        # 有哪几条 —— 顺序反过来的话，切一次分页就要在上面和下面之间来回找
+        self.ws_bar = WorkspaceBar()
+        self.ws_bar.switched.connect(self._ws_switch)
+        self.ws_bar.create.connect(self._ws_create)
+        self.ws_bar.rename.connect(self._ws_rename)
+        self.ws_bar.remove.connect(self._ws_remove)
+        self.ws_bar.measure.connect(self._measure_usages)
+        self.ws_bar.preview.connect(self._alloc_preview)
+        self.ws_bar.total_changed.connect(self._ws_total)
+        self.ws_bar.mode_changed.connect(self._ws_mode)
+        self.ws_bar.basis_changed.connect(self._ws_basis)
+        lay.addWidget(self.ws_bar)
+
         self.tbl_strat = self._table(
-            ["名称", "标的", "策略", "仓位", "账户", "理论", "状态"]
+            ["名称", "标的", "策略", "仓位", "账户", "理论", "状态",
+             "平均占用", "峰值占用", "利用率"]
         )
         # 多选是为了组合报告。双击原来是「启动 / 停止」，但那个动作有同名按钮，
         # 而「看一眼这条策略的历史表现」没有别的入口 —— 双击给后者更值。
@@ -1359,11 +1461,276 @@ class PortfolioPage(QWidget):
 
     def reload(self) -> None:
         """从磁盘重读组合与账户。切回本页时调，能看到「策略研究」里刚加的那条。"""
-        self._items = SStore.load_portfolio()
+        self._pool = SStore.load_portfolio()
+        self._wss = WS.load_workspaces(self._pool)
+        self._ws = self._active_ws()
+        self._sync_ws()
         self._accounts = tqlive.load_accounts()
         self._reload_accounts()
         self._fill_strategies()
         self._render()
+
+    # ---------------------------------------------------------- 工作区
+
+    def _active_ws(self):
+        """当前分页对应的那个工作区。文件里记的那个 id 找不到就退回第一个。"""
+        if not self._wss:
+            self._wss = [WS.new_workspace(WS.DEFAULT_NAME)]
+        cur = WS.active_id()
+        for w in self._wss:
+            if w.id and w.id == cur:
+                return w
+        return self._wss[0]
+
+    def _ws_index(self) -> int:
+        for i, w in enumerate(self._wss):
+            if w is self._ws:
+                return i
+        return 0
+
+    def _sync_ws(self) -> None:
+        """把「当前工作区」摊成 `_items`，并刷新工具条。
+
+        `_items` 是**解析出来的副本**：`principal` 用工作区给的那份，不是策略池
+        里那份。后面所有渲染 / 回放 / 启动读的都是它，所以「这个工作区分了多少钱」
+        全页只有一个来源。
+        """
+        if self._ws is None:
+            self._ws = self._active_ws()
+        cfgs, missing = WS.resolve(self._ws, self._pool)
+        # 本工作区是否参与运行 = 策略自己的开关 ∧ 成员的开关
+        for c in cfgs:
+            m = self._ws.find(str(getattr(c, "sid", "") or ""))
+            if m is not None:
+                c.enabled = bool(c.enabled and m.enabled)
+        self._items = cfgs
+        if missing:
+            self._on_log(f"有 {len(missing)} 条策略已不在策略池里，本工作区跳过")
+        bar = getattr(self, "ws_bar", None)
+        if bar is not None:
+            bar.set_workspaces([w.name or "未命名" for w in self._wss], self._ws_index())
+            bar.set_state(self._ws.live_total(self._pool), self._ws.mode, self._ws.basis)
+
+    def _save_ws(self) -> None:
+        WS.save_workspaces(self._wss, self._ws.id if self._ws else "")
+
+    def _ws_switch(self, i: int) -> None:
+        if not (0 <= i < len(self._wss)):
+            return
+        if self._wss[i] is self._ws:
+            return
+        self._ws = self._wss[i]
+        self._save_ws()
+        self._sync_ws()
+        self._fill_strategies()
+        self._render()
+        # 引擎不跟着切：运行是**按账户**合并所有工作区的，切页签只是换个视角。
+        # 这里提醒一句，免得用户以为「切走了就等于停了」
+        if self.ctl.running:
+            self._on_log(f"已切到「{self._ws.name}」。运行中的策略不受影响 —— "
+                         "启动是跨工作区按账户合并的")
+
+    def _ws_create(self) -> None:
+        name, ok = QInputDialog.getText(self, "新建工作区", "名字", text="新组合")
+        if not ok:
+            return
+        w = WS.new_workspace((name or "").strip() or "新组合",
+                             total=float(self._ws.live_total(self._pool)) if self._ws else 0.0)
+        self._wss.append(w)
+        self._ws = w
+        self._save_ws()
+        self._sync_ws()
+        self._fill_strategies()
+        self._render()
+        self._on_log(f"已新建工作区「{w.name}」。切换分页后用「从策略库添加」往里加策略")
+
+    def _ws_rename(self) -> None:
+        if self._ws is None:
+            return
+        name, ok = QInputDialog.getText(self, "工作区改名", "名字",
+                                        text=self._ws.name or "")
+        if not ok or not (name or "").strip():
+            return
+        self._ws.name = name.strip()
+        self._save_ws()
+        self._sync_ws()
+
+    def _ws_remove(self) -> None:
+        if self._ws is None:
+            return
+        if len(self._wss) <= 1:
+            self._on_failed("至少留一个工作区")
+            return
+        n = len(self._ws.members)
+        msg = (f"删除工作区「{self._ws.name}」？\n"
+               f"里面有 {n} 条策略的本金分配。\n"
+               "策略本身还在策略池里：如果别的分页也在用它，那边不受影响；"
+               "没有任何分页再用它时才会从池子里清掉。")
+        if QMessageBox.question(self, "删除工作区", msg) != QMessageBox.Yes:
+            return
+        dead = self._ws
+        self._wss = [w for w in self._wss if w is not dead]
+        self._ws = self._wss[0]
+        # 被删工作区独占的策略，从池子里一并清掉（没人用了）
+        used = set()
+        for w in self._wss:
+            used.update(w.sids())
+        for sid in dead.sids():
+            if sid and sid not in used:
+                SStore.remove_from_portfolio(sid)
+        self._save_ws()
+        self.reload()
+        self._on_log(f"已删除工作区「{dead.name}」")
+
+    def _ws_total(self, v: float) -> None:
+        if self._ws is None:
+            return
+        self._ws.total = float(v or 0)
+        self._save_ws()
+        self._ws_hint()
+
+    def _ws_mode(self, mode: str) -> None:
+        if self._ws is None:
+            return
+        self._ws.mode = str(mode or "equal")
+        self._save_ws()
+        self._ws_hint()
+
+    def _ws_basis(self, basis: str) -> None:
+        if self._ws is None:
+            return
+        self._ws.basis = str(basis or "principal")
+        self._save_ws()
+        self._ws_hint()
+
+    def _ws_hint(self) -> None:
+        """工具条右边那句提示：本金合计 / 已量几条 / 校准口径是否可用。"""
+        bar = getattr(self, "ws_bar", None)
+        if bar is None or self._ws is None:
+            return
+        tot = self._ws.live_total(self._pool)
+        n = len(self._items)
+        prin = sum(float(getattr(c, "principal", 0) or 0) for c in self._items)
+        bits = [f"{n} 条", f"本金合计 {prin / 10000:,.1f} 万"]
+        if tot > 0 and prin > 0:
+            bits.append(f"= 总资金的 {prin / tot:.2f} 倍")
+        if self._usages:
+            bits.append(f"已量 {len(self._usages)} 条占用")
+        bad = str(self._ws.basis) != "principal" and not self._usages
+        if bad:
+            bits.append("⚠ 没量占用，校准会退回按分配额")
+        if self._measure_bad:
+            bits.append(f"⚠ {len(self._measure_bad)} 条没量出来")
+        bar.hint("　·　".join(bits), bad=bad)
+
+    # ---------------------------------------------------------- 资金分配
+
+    def _measure_usages(self) -> None:
+        """把当前工作区的策略逐条跑一遍历史回测，量出实际占用。
+
+        和「组合报告」共用 `_prepare` / `run_replay_job` —— 同一份行情、同一套
+        成本档，量出来的占用才是这条策略真实会压的钱，而不是另算一套。
+
+        取数在主线程（`DataStore` 是主线程的缓存），计算放后台线程：几十条策略
+        各自一遍回测，同步跑窗口会「未响应」。
+        """
+        if getattr(self, "_ms_thread", None) is not None:
+            self._on_failed("上一次「量占用」还在跑，等它结束")
+            return
+        cfgs = list(self._items)
+        if not cfgs:
+            self._on_failed("这个工作区还没有策略")
+            return
+        jobs, bad = [], []
+        for cfg in cfgs:
+            try:
+                kind, payload, why = self._prepare(cfg)
+            except Exception as exc:               # noqa: BLE001
+                kind, payload, why = "single", None, f"{type(exc).__name__}: {exc}"
+            if payload is None:
+                bad.append(f"{cfg.title()}（{why}）")
+                continue
+            jobs.append((cfg, kind, payload))
+        if not jobs:
+            self._on_failed("一条都取不到行情：" + "；".join(bad[:3]))
+            return
+        self._measure_bad = bad
+        self._on_log(f"开始量占用：{len(jobs)} 条"
+                     + (f"（{len(bad)} 条取不到数据，跳过）" if bad else ""))
+        if hasattr(self, "ws_bar"):
+            self.ws_bar.btn_measure.setEnabled(False)
+        self._ms_thread = QThread(self)
+        self._ms_worker = MeasureWorker(jobs)
+        self._ms_worker.moveToThread(self._ms_thread)
+        self._ms_thread.started.connect(self._ms_worker.run)
+        self._ms_worker.progress.connect(self._on_measure_progress)
+        self._ms_worker.done.connect(self._on_measure_done)
+        self._ms_worker.failed.connect(self._on_measure_failed)
+        self._ms_thread.start()
+
+    def _on_measure_progress(self, i: int, n: int, label: str) -> None:
+        self.lbl_msg.setText(f"量占用 {i}/{n}：{label}")
+
+    def _on_measure_failed(self, msg: str) -> None:
+        self._close_measure()
+        self._on_failed(f"量占用失败：{msg}")
+
+    def _close_measure(self) -> None:
+        th, wk = getattr(self, "_ms_thread", None), getattr(self, "_ms_worker", None)
+        self._ms_thread = self._ms_worker = None
+        if hasattr(self, "ws_bar"):
+            self.ws_bar.btn_measure.setEnabled(True)
+        if wk is not None:
+            wk.deleteLater()
+        if th is not None:
+            th.quit()
+            th.wait(3000)
+            th.deleteLater()
+        self.lbl_msg.setText("")
+
+    def _on_measure_done(self, payload) -> None:
+        usages, bad = payload
+        self._close_measure()
+        self._usages.update({u.sid: u for u in usages})
+        self._measure_bad = list(bad)
+        empty = [u.name for u in usages if u.avg_margin <= 0]
+        msg = f"量完 {len(usages)} 条占用"
+        if empty:
+            msg += f"（其中 {len(empty)} 条一路空仓，平均占用 0）"
+        if bad:
+            msg += f"；{len(bad)} 条没量出来：{'；'.join(bad[:2])}"
+        self._on_log(msg)
+        self._fill_strategies()
+        self._render()
+        self._ws_hint()
+
+    def _alloc_preview(self) -> None:
+        """按当前分配方式算一遍，弹预览。点「应用分配」才写回工作区。"""
+        if self._ws is None:
+            return
+        shares = WS.allocate_workspace(self._ws, self._pool, self._usages or None)
+        if not shares:
+            self._on_failed("这个工作区还没有策略，或者总资金是 0")
+            return
+        dlg = AllocDialog(shares, self._ws.live_total(self._pool),
+                          basis=self._ws.basis, measured=bool(self._usages), parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        n = WS.apply_shares(self._ws, dlg.shares)
+        # 手动口径下把这次的金额记下来，下次打开还是同一套比例
+        if str(self._ws.mode) == "manual":
+            self._ws.manual = {s.sid: float(s.new_principal) for s in dlg.shares
+                               if s.new_principal > 0}
+        self._save_ws()
+        self._sync_ws()
+        self._fill_strategies()
+        self._render()
+        after = sum(float(getattr(c, "principal", 0) or 0) for c in self._items)
+        tot = self._ws.live_total(self._pool)
+        self._on_log(
+            f"已应用分配：{n} 条策略本金已更新，合计 {after / 10000:,.1f} 万"
+            + (f"（总资金的 {after / tot:.2f} 倍）" if tot > 0 else "")
+            + "。正在跑的连接不会自动改用新本金，需停止后重新启动")
 
     def _reload_accounts(self) -> None:
         cur = self.cb_acct.currentData()
@@ -1386,6 +1753,41 @@ class PortfolioPage(QWidget):
     def _account_of(self, cfg) -> str:
         """这条策略实际用哪个账户。空 = 跟随默认账户。"""
         return cfg.account or (self.cb_acct.currentData() or "")
+
+    def _accounts_of(self, cfg) -> list[str]:
+        """这条策略要跑的全部账户（多账户在这里展开）。"""
+        return cfg.account_list(self.cb_acct.currentData() or "")
+
+    def _save_cfg(self, cfg) -> None:
+        """把一条策略写回磁盘。**参数和本金分两处写**。
+
+        `principal` 是**工作区**的东西，不是策略的：同一条策略在「实盘组合」里
+        分 50 万、在「新策略试跑」里分 5 万，两个都对。所以：
+
+        - 参数（规则 / 因子 / 品种 / 仓位口径 / 账户 / 开关）→ `portfolio.json`
+        - 本金 → 当前工作区的成员（`workspaces.json`）
+
+        只写参数那份时，要把 `principal` 换回池子里那条的原值，否则会被当前
+        工作区的钱覆盖 —— 换个分页看，默认本金就变了。
+        """
+        sid = str(getattr(cfg, "sid", "") or "")
+        ws_p = float(getattr(cfg, "principal", 0) or 0)
+        pool_p = 0.0
+        for c in self._pool:
+            if str(getattr(c, "sid", "") or "") == sid:
+                pool_p = float(getattr(c, "principal", 0) or 0)
+                break
+        save = cfg.clone() if hasattr(cfg, "clone") else cfg
+        save.sid = sid                      # clone 会换 sid，写回要认原 sid
+        save.principal = pool_p or ws_p
+        SStore.update_portfolio(save)
+        if self._ws is not None and sid:
+            self._ws.set_principal(sid, ws_p)
+            m = self._ws.find(sid)
+            if m is not None:
+                m.enabled = bool(getattr(cfg, "enabled", True))
+            self._save_ws()
+        self._pool = SStore.load_portfolio()
 
     def _universe_of(self, cfg) -> list[dict]:
         """这条策略能挑的品种清单。
@@ -1410,12 +1812,16 @@ class PortfolioPage(QWidget):
         try:
             t.setRowCount(len(self._items))
             for i, cfg in enumerate(self._items):
+                accs = cfg.account_list(self.cb_acct.currentData() or "")
+                acc_txt = ("默认" if not accs else
+                           (accs[0] if len(accs) == 1 else
+                            f"{accs[0]} 等 {len(accs)} 个"))
                 vals = [
                     cfg.name.strip() or cfg.title(),
                     _sym_text(cfg),
                     cfg.strategy_label(),
                     cfg.size_text(),
-                    cfg.account or "默认",
+                    acc_txt,
                 ]
                 for j, v in enumerate(vals):
                     item = QTableWidgetItem(v)
@@ -1426,7 +1832,14 @@ class PortfolioPage(QWidget):
                 it = t.item(i, 1)
                 if it is not None:
                     it.setToolTip(_sym_tip(cfg))
-                for j in (5, 6):
+                if len(accs) > 1:
+                    it4 = t.item(i, 4)
+                    if it4 is not None:
+                        it4.setToolTip(
+                            "同一条策略挂在这些账户上：\n　" + "\n　".join(accs)
+                            + "\n每个账户各算各的手数（各自的本金和保证金），"
+                              "策略参数只有一份")
+                for j in (5, 6, 7, 8, 9):
                     t.setItem(i, j, QTableWidgetItem("—"))
             if keep:
                 for i in range(t.rowCount()):
@@ -1436,6 +1849,7 @@ class PortfolioPage(QWidget):
         finally:
             t.blockSignals(False)
         self._sync_buttons()
+        self._ws_hint()
 
     def _selected_sids(self) -> list[str]:
         model = self.tbl_strat.selectionModel()
@@ -1893,7 +2307,10 @@ class PortfolioPage(QWidget):
     def _on_snapshot(self, key: str, snap: dict) -> None:
         self._snaps[key] = snap
         for slot in snap.get("slots", []):
-            self._slot_view[slot["sid"]] = slot
+            sid = str(slot.get("sid") or "")
+            self._slot_view[sid] = slot
+            if sid:
+                self._slot_multi.setdefault(sid, {})[key] = slot
         bars = snap.get("bars") or {}
         if bars:
             self._apply_live(bars)
@@ -1953,13 +2370,71 @@ class PortfolioPage(QWidget):
         # 每 5 秒被拖住一次，Windows 直接标成「未响应」
         view.update_kline(rp.df)
 
+    def _render_diag(self, t, i: int, cfg) -> None:
+        """三列资金占用：平均保证金占用 / 峰值保证金占用 / 利用率。
+
+        和「仓位」那一列是两件事：仓位写的是 `capital_pct%`（开仓那一刻用多少），
+        这三列写的是**逐根平均**真的压了多少钱。日内策略一天只有两三根有仓，
+        所以常见的情形是「仓位 30%、利用率 1%」—— 这两个数摆在一起才看得懂。
+
+        没量过写「—」不写 0：0 会被读成「这条策略不用钱」。
+        """
+        u = self._usages.get(str(cfg.sid))
+        if u is None:
+            for j in (7, 8, 9):
+                self._set_cell(t, i, j, "—", C_MUTED)
+            it = t.item(i, 7)
+            if it is not None:
+                it.setToolTip("还没量。点上面的「量一下占用」跑一遍历史回测")
+            return
+        if u.avg_margin <= 0:
+            for j in (7, 8, 9):
+                self._set_cell(t, i, j, "—", C_MUTED)
+            it = t.item(i, 7)
+            if it is not None:
+                it.setToolTip(
+                    "量不出来：" + (u.note or "回测里一路空仓，没有持仓可算占用"))
+            return
+        # 金额一律用「万」：26 条策略的占用从几千到几十万，写元位没人读得出量级
+        self._set_cell(t, i, 7, f"{u.avg_margin / 10000:,.2f} 万", C_TEXT)
+        self._set_cell(t, i, 8, f"{u.peak_margin / 10000:,.2f} 万", C_TEXT)
+        self._set_cell(t, i, 9, f"{u.util * 100:.2f}%",
+                       C_BAD if u.util > 0.5 else C_TEXT)
+        it = t.item(i, 7)
+        if it is not None:
+            it.setToolTip(
+                f"平均名义敞口 {u.avg_notional / 10000:,.2f} 万 "
+                f"× 保证金率 = 平均占用 {u.avg_margin / 10000:,.2f} 万\n"
+                f"口径：|手数| × 收盘 × 乘数 × 保证金率，逐根算再取均值\n"
+                f"（不按开仓价 —— 持仓期间保证金跟结算价走）\n"
+                f"本金 {u.principal / 10000:,.1f} 万，"
+                f"开仓预算 {u.capital / 10000:,.1f} 万")
+        it = t.item(i, 8)
+        if it is not None:
+            it.setToolTip(
+                f"峰值名义敞口 {u.peak_notional / 10000:,.2f} 万 "
+                f"（峰值率 {u.peak_margin / u.principal * 100:.1f}% 本金）"
+                if u.principal > 0 else
+                f"峰值名义敞口 {u.peak_notional / 10000:,.2f} 万")
+        it = t.item(i, 9)
+        if it is not None:
+            it.setToolTip(
+                "平均占用 ÷ 本金。这是**实际压着的钱**占分配额的比例。\n"
+                "日内策略常见 1~3%：一天只有两三根有仓，其余时间空仓。\n"
+                "要让这条策略真正吃满分配额，用上面的「校准 = 按平均占用」.")
+
     def _render(self) -> None:
         self._render_ts = time.monotonic()
         t = self.tbl_strat
         for i, cfg in enumerate(self._items):
-            slot = self._slot_view.get(cfg.sid) or {}
+            slots = self._slots_of(cfg)
+            # 多账户时「这条策略的目标仓」不是唯一的一个数（每个账户一个），
+            # 塞其中一个进这一列就是错的 —— 交给右下监控器逐合约列出
+            many = len(slots) > 1
+            slot = {} if many else next(iter(slots.values()), {})
             if i >= t.rowCount():
                 break
+            self._render_diag(t, i, cfg)
             theo = _int(slot.get("target"))
             multi = _int(slot.get("multi"))
             # 仓位列写「口径 → 实际算出来的手数」。手数依赖价格和每手保证金，
@@ -1984,7 +2459,19 @@ class PortfolioPage(QWidget):
             # target，继续显示 -11 会让人以为它还在管这 -11 手；而监控器按 running
             # 汇总，那边是 0 /「未托管」—— 同一页两处就打架了。停机时显示「—」，
             # 把残值放进 tooltip。
-            if slot.get("running") and multi:
+            if many:
+                # 多账户：每个账户一个槽位，目标仓不唯一
+                self._set_cell(t, i, 5, "—", C_MUTED)
+                it5 = t.item(i, 5)
+                if it5 is not None:
+                    bits = [f"{k or '默认'}：目标 {_int(v.get('target')):+d} 手"
+                            + ("" if v.get("running") else "（未运行）")
+                            for k, v in slots.items()]
+                    it5.setToolTip(
+                        f"这条策略挂在 {len(slots)} 个账户上，各算各的手数：\n　"
+                        + "\n　".join(bits)
+                        + "\n逐合约的持仓在右下监控器里")
+            elif slot.get("running") and multi:
                 # 多品种没有「一个」目标仓：19 个品种各有一个，加起来是 19 个
                 # 不同合约的手数之和，没有任何意义。逐合约的去监控器看
                 self._set_cell(t, i, 5, "—", C_MUTED)
@@ -2175,40 +2662,89 @@ class PortfolioPage(QWidget):
 
     # ---------------------------------------------------------- 起停
 
+    def _slots_of(self, cfg) -> dict:
+        """这条策略在各账户上的槽位（键 = 账户名）。
+
+        多账户策略在每个账户上各有一个槽位（各算各的手数），所以「这条策略的
+        目标仓」不是唯一的一个数。单账户时这里只有一个元素，行为和以前一样。
+        """
+        by = self._slot_multi.get(str(getattr(cfg, "sid", "") or "")) or {}
+        if by:
+            return by
+        one = self._slot_view.get(str(getattr(cfg, "sid", "") or ""))
+        return {"": one} if one else {}
+
+    def _live_plan(self) -> tuple[dict, list]:
+        """**所有工作区**里启用的成员 → `{账户: [配置]}`。
+
+        运行不按工作区分，按**账户**合并：一个账户一条天勤连接，跑该账户下所有
+        工作区里启用的策略。两个工作区用同一个账户时不会开两条连接去抢同一个仓。
+
+        同一条策略在两个工作区里都被分到同一个账户、本金却不一样时，一个槽位
+        没法同时满足两个数 —— 取先遇到的那个，并回一句告警（不静默）。
+        """
+        plan: dict[str, list] = {}
+        seen: dict[tuple[str, str], float] = {}
+        warn: list[str] = []
+        default = self.cb_acct.currentData() or ""
+        for w in self._wss:
+            cfgs, _missing = WS.resolve(w, self._pool)
+            for c in cfgs:
+                m = w.find(str(getattr(c, "sid", "") or ""))
+                if m is not None and not m.enabled:
+                    continue
+                if not getattr(c, "enabled", False):
+                    continue
+                p = float(getattr(c, "principal", 0) or 0)
+                for acct in c.account_list(default):
+                    k = (acct, str(c.sid))
+                    if k in seen:
+                        if abs(seen[k] - p) > 1.0:
+                            warn.append(
+                                f"「{c.title()}」在账户 {acct} 上被多个工作区分了"
+                                f"不同的本金（{seen[k] / 10000:g} 万 / {p / 10000:g} 万），"
+                                "取先遇到的那个")
+                        continue
+                    seen[k] = p
+                    plan.setdefault(acct, []).append(c)
+        return plan, warn
+
     def _start_all(self) -> None:
-        if not self._items:
-            self._on_failed("组合里还没有策略，先「从策略库添加」")
+        if not self._pool:
+            self._on_failed("还没有策略，先在某个工作区里「从策略库添加」")
             return
         if not self._accounts:
             self._on_failed("还没有交易账户，请先到「账户透视和交易」页添加")
             return
 
-        groups: dict[str, list] = {}
-        for cfg in self._items:
-            name = self._account_of(cfg)
+        groups, warn = self._live_plan()
+        for msg in warn:
+            self._on_log(f"注意：{msg}")
+        if not groups:
+            self._on_failed("所有工作区里都没有启用的策略")
+            return
+        for name in list(groups):
             if not name:
-                self._on_failed(f"「{cfg.title()}」没有可用账户")
+                self._on_failed("有策略没有可用账户（既没绑账户，也没有默认账户）")
                 return
             if self._spec(name) is None:
                 self._on_failed(f"账户「{name}」已不存在，请重新绑定")
                 return
-            groups.setdefault(name, []).append(cfg)
 
         # 允许在「已经单独启动过某一条」的情况下再点：把其余补齐，不逼用户先停止全部
         newly = 0
         for name, cfgs in groups.items():
             if self.ctl.is_running(name):
                 for cfg in cfgs:
-                    if not cfg.enabled:
-                        continue
-                    if cfg.sid not in self._slot_view:
+                    if str(cfg.sid) not in self._slot_view:
                         self.ctl.add_or_update(name, cfg)
                     self.ctl.enable(name, cfg.sid, True)
                 continue
             self.ctl.start(self._spec(name), cfgs, self._chase)
             newly += 1
         if newly:
-            self._on_log(f"启动 {newly} 个账户的连接")
+            self._on_log(f"启动 {newly} 个账户的连接，共 "
+                         f"{sum(len(v) for v in groups.values())} 条策略")
         else:
             self._on_log("连接本来就在跑，已把其余启用的策略补进来")
         self._refresh_conn_label()
@@ -2233,6 +2769,7 @@ class PortfolioPage(QWidget):
         self.lbl_conn.setText("已停止")
         self.lbl_conn.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
         self._slot_view.clear()
+        self._slot_multi.clear()
         self._snaps.clear()
         self._render()
 
@@ -2261,26 +2798,33 @@ class PortfolioPage(QWidget):
         cfg = self._single_or_warn()
         if cfg is None:
             return
-        key = self._account_of(cfg)
-        slot = self._slot_view.get(cfg.sid) or {}
+        accts = self._accounts_of(cfg)
+        if not accts:
+            self._on_failed("这条策略没有可用账户（既没绑账户，也没有默认账户）")
+            return
+        slots = self._slots_of(cfg)
         # 🔴 判据是「引擎里真实在不在跑」，不是存盘的 `enabled` 开关。
-        on = self._want_on(slot)
+        # 多账户时只要有一个账户在跑，这一下就是「停」——全部停下来才叫停
+        live = [a for a in accts if (slots.get(a) or {}).get("running")]
+        on = not live
+        sid = str(cfg.sid)
 
         if on:
             cfg.enabled = True
-            SStore.update_portfolio(cfg)
-            if not self.ctl.is_running(key):
-                # 这个账户的连接还没起来 —— **只把这一个策略拉起来**，不是「启动全部」
-                spec = self._spec(key)
-                if spec is None:
-                    cfg.enabled = False
-                    SStore.update_portfolio(cfg)
-                    self._on_failed(f"账户「{key}」已不存在，请重新绑定")
-                    return
-                self.ctl.start(spec, [cfg], self._chase)
-                self._on_log(f"已单独启动「{cfg.title()}」（账户 {key}）")
-                self._warn_solo_start(key, cfg)
-            else:
+            self._save_cfg(cfg)
+            for key in accts:
+                if not self.ctl.is_running(key):
+                    # 这个账户的连接还没起来 —— **只把这一个策略拉起来**，不是「启动全部」
+                    spec = self._spec(key)
+                    if spec is None:
+                        cfg.enabled = False
+                        self._save_cfg(cfg)
+                        self._on_failed(f"账户「{key}」已不存在，请重新绑定")
+                        return
+                    self.ctl.start(spec, [cfg], self._chase)
+                    self._on_log(f"已单独启动「{cfg.title()}」（账户 {key}）")
+                    self._warn_solo_start(key, cfg)
+                    continue
                 # 连接在跑，但引擎可能根本不认识这一条：从「策略研究」页勾「加入
                 # 策略交易」、组合页「导入策略」、或 ChanAgent 送过来的策略，加进
                 # 组合时只写了磁盘，没有推给正在跑的连接。这时 `enable()` 会一路走到
@@ -2288,34 +2832,40 @@ class PortfolioPage(QWidget):
                 # **静默 return** —— 点了没反应，也不报错。
                 #
                 # 不能无条件 `add()`：它重建槽位，正在跑的那条会被抹掉 running 和挂单。
-                if cfg.sid not in self._slot_view:
+                if sid not in (self._slot_multi.get(sid) or {}):
                     self.ctl.add_or_update(key, cfg)
-                if not self.ctl.enable(key, cfg.sid, True):
+                if not self.ctl.enable(key, sid, True):
                     self._on_failed(f"账户「{key}」的连接没了，请再点一次")
                     return
-                self._on_log(f"「{cfg.title()}」已启动")
+                self._on_log(f"「{cfg.title()}」已启动（账户 {key}）")
         else:
             cfg.enabled = False
-            SStore.update_portfolio(cfg)
-            if not self.ctl.enable(key, cfg.sid, False):
-                self._on_failed(f"账户「{key}」没在运行，没有可停的策略")
-                return
-            self._on_log(f"「{cfg.title()}」已停止"
-                         + ("（这个账户上已经没有策略在跑，连接还留着）"
-                            if self._no_enabled_left(key) else ""))
+            self._save_cfg(cfg)
+            for key in (live or accts):
+                if not self.ctl.enable(key, sid, False):
+                    self._on_failed(f"账户「{key}」没在运行，没有可停的策略")
+                    return
+                self._on_log(f"「{cfg.title()}」已停止（账户 {key}）"
+                             + ("，这个账户上已经没有策略在跑，连接还留着"
+                                if self._no_enabled_left(key) else ""))
         self._refresh_conn_label()
         self._fill_strategies()
         self._render()
 
     def _no_enabled_left(self, key: str) -> bool:
-        """这个账户上还有没有别的已启用策略。"""
-        return not any(self._account_of(c) == key and c.enabled and c.sid
-                       for c in self._items)
+        """这个账户上还有没有别的已启用策略（跨所有工作区）。
+
+        `_live_plan` 里已经只有启用的，所以直接看清单空不空 —— 刚停掉的那条
+        此刻已经从池子里读成 `enabled=False` 了。
+        """
+        plan, _warn = self._live_plan()
+        return not (plan.get(key) or [])
 
     def _warn_solo_start(self, key: str, cfg) -> None:
         """单独只启动一条时提醒一下：其它策略没进引擎，一键对齐会把它们的仓平掉。"""
-        others = [c for c in self._items
-                  if self._account_of(c) == key and c.sid != cfg.sid and c.enabled]
+        plan, _warn = self._live_plan()
+        others = [c for c in plan.get(key, [])
+                  if str(getattr(c, "sid", "")) != str(getattr(cfg, "sid", ""))]
         if not others:
             return
         self._on_log(
@@ -2332,8 +2882,8 @@ class PortfolioPage(QWidget):
             self.btn_start.setEnabled(True)
             self.btn_stop.setEnabled(False)
             return
-        n = sum(1 for c in self._items
-                if c.enabled and self._account_of(c) in keys)
+        n = sum(1 for _a, cs in self._live_plan()[0].items() if _a in keys
+                for c in cs)
         self.lbl_dot.setStyleSheet(f"color: {C_OK}; font-size: 15px;")
         self.lbl_conn.setText(f"运行中 · {len(keys)} 个账户 / {n} 条策略")
         self.lbl_conn.setStyleSheet(f"color: {C_OK}; font-size: 11px;")
@@ -2360,13 +2910,20 @@ class PortfolioPage(QWidget):
         item = SStore.add_to_portfolio(src)
         item.account = self.cb_acct.currentData() or ""
         SStore.update_portfolio(item)
+        # 加进**当前工作区**，本金按工作区的等分给（总资金 ÷ 人数），不照抄
+        # 模板里那份 —— 模板的本金是「单独跑这条策略时」的规模，和工作区无关
+        total = self._ws.live_total(self._pool) if self._ws else 0.0
+        n = len(self._ws.members) + 1 if self._ws else 1
+        self._ws.add(item.sid, (total / n) if total > 0 else item.principal)
+        self._save_ws()
         self.reload()
         # 连接在跑就让引擎先接上（默认不开仓，`enabled` 仍是 False）。不推的话
         # 状态列显示「未连接」，用户点「启动 / 停止」还得靠 `_toggle_selected`
         # 补挂一次 —— 能补上，但少一个来回总是好的。
         if self.ctl.running:
-            self.ctl.add_or_update(self._account_of(item), item)
-        self._on_log(f"已加入组合：{item.title()}")
+            for acct in self._accounts_of(item):
+                self.ctl.add_or_update(acct, item)
+        self._on_log(f"已加入工作区「{self._ws.name}」：{item.title()}")
 
     def _edit_selected(self) -> None:
         cfg = self._single_or_warn()
@@ -2379,7 +2936,7 @@ class PortfolioPage(QWidget):
         old_acct = self._account_of(cfg)
         old_syms = list(cfg.symbols or [])
         dlg.apply_to(cfg)
-        SStore.update_portfolio(cfg)
+        self._save_cfg(cfg)
         self._fill_strategies()
         self._render()          # 重建表格会把理论/实际重置成「—」，立刻补回来
         if self.ctl.running and self._account_of(cfg) != old_acct:
@@ -2406,6 +2963,11 @@ class PortfolioPage(QWidget):
         item.account = self.cb_acct.currentData() or ""
         item.enabled = True
         SStore.update_portfolio(item)
+        if self._ws is not None:
+            total = self._ws.live_total(self._pool)
+            n = len(self._ws.members) + 1
+            self._ws.add(item.sid, (total / n) if total > 0 else item.principal)
+            self._save_ws()
         self.reload()
         if not self.ctl.running:
             msg = f"已加入组合：{item.title()}。点「启动全部」开始交易"
@@ -2422,14 +2984,25 @@ class PortfolioPage(QWidget):
         cfg = self._single_or_warn()
         if cfg is None:
             return
-        msg = f"从组合里删除「{cfg.title()}」？\n策略库里的模板不受影响。"
+        others = [w.name for w in self._wss
+                  if w is not self._ws and str(cfg.sid) in w.sids()]
+        msg = f"把「{cfg.title()}」从工作区「{self._ws.name}」里拿掉？\n策略库里的模板不受影响。"
+        if others:
+            msg += ("\n\n它还在这 %d 个工作区里：%s\n那些分页不受影响。"
+                    % (len(others), "、".join(others)))
+        else:
+            msg += "\n没有别的分页用它，策略池里那份也一并清掉。"
         if QMessageBox.question(self, "删除策略", msg) != QMessageBox.Yes:
             return
-        if self.ctl.running:
-            self.ctl.remove(self._account_of(cfg), cfg.sid)
-        SStore.remove_from_portfolio(cfg.sid)
+        for acct in self._accounts_of(cfg):
+            if self.ctl.running:
+                self.ctl.remove(acct, cfg.sid)
+        self._ws.drop(cfg.sid)
+        if not others:
+            SStore.remove_from_portfolio(cfg.sid)
+        self._save_ws()
         self.reload()
-        self._on_log(f"已删除：{cfg.title()}")
+        self._on_log(f"已从「{self._ws.name}」移除：{cfg.title()}")
 
     # ---------------------------------------------------------- 对齐
 
@@ -2666,3 +3239,7 @@ class PortfolioPage(QWidget):
             # 退出码上 —— 和 v2.6.3 那次自检翻车同一个坑
             self._view_thread.quit()
             self._view_thread.wait(3000)
+        if getattr(self, "_ms_thread", None) is not None:
+            # 量占用同样是纯计算，同一条理由
+            self._ms_thread.quit()
+            self._ms_thread.wait(3000)

@@ -2226,6 +2226,164 @@ def _run() -> tuple[bool, list[str]]:
 
     check("组合工作区资金分配（ERC / 三种口径）", _portfolio_plan)
 
+    def _occupancy_diag():
+        """绩效页的「资金占用」三列：平均占用 / 峰值占用 / 利用率。
+
+        这一层也是「不报错但数错」的类型：占用忘了乘合约乘数、忘了乘保证金率、
+        拿开仓价而不是收盘算、组合层把各成分峰值直接相加当成真实峰值。
+        全部用**能手算的假数据**钉死，真数据上的对拍另跑 `check_diag.py`。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import backtest as BT
+
+        # ① 单品种：4 根，持仓 [0, 2, -1, 0]，收盘 100/200/300/400
+        #    名义 = |手数| × 收盘 × 乘数(10)
+        #         = [0, 2×200×10=4000, 1×300×10=3000, 0]
+        #    平均名义 = 1750、峰值名义 = 4000
+        #    保证金率 0.1 → 平均占用 175、峰值 400
+        idx = pd.date_range("2024-01-01", periods=4, freq="D")
+        close = pd.Series([100.0, 200.0, 300.0, 400.0], index=idx)
+        pos = pd.Series([0.0, 2.0, -1.0, 0.0], index=idx)
+        eq = pd.Series([100_000.0, 100_500.0, 100_800.0, 101_000.0], index=idx)
+        m = BT._metrics(eq, pos, [], base=100_000.0,
+                        price=close, mult=10.0, margin_rate=0.1)
+        for k, want in (("avg_notional", 1750.0), ("peak_notional", 4000.0),
+                        ("avg_margin", 175.0), ("peak_margin", 400.0)):
+            if abs(float(m[k]) - want) > 1e-9:
+                raise RuntimeError(f"{k} 应为 {want}，实际 {m[k]}")
+        if abs(float(m["util"]) - 175.0 / 100_000.0) > 1e-15:
+            raise RuntimeError(f"利用率应为 175/100000，实际 {m['util']}")
+
+        # ② 不传价格 → 恒 0（组合层/老路径走这里，绩效页显示「—」而不是假数）
+        m0 = BT._metrics(eq, pos, [], base=100_000.0)
+        if any(float(m0[k]) != 0.0 for k in
+               ("avg_notional", "peak_notional", "avg_margin", "peak_margin", "util")):
+            raise RuntimeError("没传价格时占用必须是 0，不能凭空给数")
+        # 保证金率为 0 时同样不参与（除零陷阱）
+        m0 = BT._metrics(eq, pos, [], base=100_000.0,
+                         price=close, mult=10.0, margin_rate=0.0)
+        if float(m0["avg_margin"]) != 0.0:
+            raise RuntimeError("保证金率为 0 时占用必须是 0")
+
+        # ③ 空仓到底：占用必须是 0，哪怕价格在涨
+        mz = BT._metrics(eq, pd.Series(0.0, index=idx), [], base=100_000.0,
+                         price=close, mult=10.0, margin_rate=0.1)
+        if float(mz["avg_margin"]) != 0.0 or float(mz["peak_margin"]) != 0.0:
+            raise RuntimeError("全程空仓却有占用")
+        # 峰值 ≥ 平均，这条恒成立
+        if not float(m["peak_margin"]) >= float(m["avg_margin"]):
+            raise RuntimeError("峰值占用小于平均占用")
+
+        # ④ 键必须进 `_METRIC_KEYS`：老报告缺这一项时按 0 补齐，
+        #    否则绩效页 `m.get(...)` 拿到 None 会写成「—」而不是 0
+        for k in ("avg_notional", "peak_notional", "avg_margin", "peak_margin", "util"):
+            if k not in BT._METRIC_KEYS:
+                raise RuntimeError(f"{k} 没进 _METRIC_KEYS")
+
+        # ⑤ 组合层：平均占用**可加**（精确），峰值只能给**上限**
+        #    成分 a：本金 100、平均占用 10、峰值 50
+        #    成分 b：本金 200、平均占用 30、峰值 70
+        #    组合 300 万等权 → 平均 = (10/100 + 30/200)/2 × 300 = 37.5
+        #                        峰值上限 = (50/100 + 70/200)/2 × 300 = 127.5
+        idx2 = pd.date_range("2024-01-01", periods=4, freq="D")
+        flat = pd.Series(0.0, index=idx2)
+
+        def mk(series, am, pm):
+            return BT.Result(equity=pd.Series(series, index=idx2, dtype=float),
+                             position=flat, trades=[],
+                             metrics={"avg_margin": am, "peak_margin": pm,
+                                      "total_cost": 0.0, "notional": 0.0},
+                             label="x")
+
+        r1 = mk([100.0, 101, 102, 103], 10.0, 50.0)
+        r2 = mk([200.0, 202, 204, 206], 30.0, 70.0)
+        pc = BT.combine([r1, r2], initial_cash=300.0)
+        want = (10.0 / 100.0 + 30.0 / 200.0) / 2 * 300.0
+        want_pk = (50.0 / 100.0 + 70.0 / 200.0) / 2 * 300.0
+        if abs(float(pc.metrics["avg_margin"]) - want) > 1e-9:
+            raise RuntimeError(
+                f"组合平均占用应为 {want}，实际 {pc.metrics['avg_margin']}")
+        if abs(float(pc.metrics["peak_margin"]) - want_pk) > 1e-9:
+            raise RuntimeError(
+                f"组合峰值占用应为 {want_pk}，实际 {pc.metrics['peak_margin']}")
+        if abs(float(pc.metrics["util"]) - want / 300.0) > 1e-12:
+            raise RuntimeError("组合利用率的分母不是组合总资金")
+        if float(pc.metrics.get("peak_is_bound") or 0) != 1.0:
+            raise RuntimeError("组合峰值没有标成「上限」，界面会把它当精确值")
+        # 上限性质：峰值之和必须 ≥ 各成分峰值（真峰值在两者之间）
+        if float(pc.metrics["peak_margin"]) < max(50.0, 70.0):
+            raise RuntimeError("组合峰值上限低于单个成分的峰值，不可能")
+
+    check("资金占用诊断（平均/峰值/利用率）", _occupancy_diag)
+
+    def _workspace_resolve():
+        """工作区解析：本金用工作区的、sid 不变、原对象不被改、多账户展开。
+
+        这几条都是「不报错但结果错」：`clone()` 会换 sid（写回策略池时就写到
+        另一条上了）、忘了还原就是把工作区的钱写进策略池的默认值、`accounts`
+        写成字符串会被按字符遍历成三个账户。
+        """
+        from ttrade import strategy_store as SStore
+        from ttrade import workspace_store as WS
+
+        def cfg(sid, principal, acc=""):
+            c = SStore.StrategyConfig(sid=sid, name=sid, symbol="RB", period="1d",
+                                      rule_key="ma_cross", principal=principal)
+            c.account = acc
+            if acc:
+                c.accounts = [acc]
+            return c
+
+        pool = [cfg("a", 100_000.0, "sim"), cfg("b", 1_000_000.0)]
+        w = WS.new_workspace("t", total=0.0)
+        w.add("a", 400_000.0)
+        w.add("zzz", 50_000.0)              # 池子里没有 → 应当报 missing
+
+        cfgs, missing = WS.resolve(w, pool)
+        if [c.sid for c in cfgs] != ["a"]:
+            raise RuntimeError(f"解析出的 sid 不对：{[c.sid for c in cfgs]}")
+        if missing != ["zzz"]:
+            raise RuntimeError(f"找不到的 sid 没报出来：{missing}")
+        if abs(float(cfgs[0].principal) - 400_000.0) > 1e-9:
+            raise RuntimeError(
+                f"本金用的是策略池的 {cfgs[0].principal}，不是工作区的 400000")
+        if float(pool[0].principal) != 100_000.0:
+            raise RuntimeError("解析把策略池里那份本金改了 —— 必须只改副本")
+        if cfgs[0] is pool[0]:
+            raise RuntimeError("解析返回的是原对象，不是副本")
+
+        # 成员本金为 0（没分配过）时退回策略自己那份，不能变成 0 本金
+        w2 = WS.new_workspace("t2")
+        w2.add("a", 0.0)
+        c2, _m = WS.resolve(w2, pool)
+        if abs(float(c2[0].principal) - 100_000.0) > 1e-9:
+            raise RuntimeError("成员本金为 0 时没有退回策略自己的本金")
+
+        # ---- 多账户 ----
+        m = cfg("m", 100_000.0)
+        m.accounts = ["sim", "real", "sim", ""]        # 重复 + 空名要消毒
+        m = SStore.StrategyConfig.from_dict(m.to_dict())
+        if m.accounts != ["sim", "real"]:
+            raise RuntimeError(f"accounts 没去重/去空：{m.accounts}")
+        if m.account != "sim":
+            raise RuntimeError(f"account 没跟 accounts[0] 同步：{m.account}")
+        if m.account_list("默认") != ["sim", "real"]:
+            raise RuntimeError(f"account_list 展开不对：{m.account_list('默认')}")
+        # 空 = 跟随默认账户
+        m2 = SStore.StrategyConfig.from_dict({"sid": "n", "symbol": "RB"})
+        m2.account, m2.accounts = "", []
+        if m2.account_list("默认") != ["默认"]:
+            raise RuntimeError("没绑账户时应当跟随默认账户")
+        # 手写 JSON 把 accounts 写成字符串：不能按字符拆成 s/i/m
+        m3 = SStore.StrategyConfig.from_dict({"sid": "s", "symbol": "RB",
+                                              "accounts": "sim"})
+        if m3.accounts != ["sim"]:
+            raise RuntimeError(f"字符串 accounts 被拆成了 {m3.accounts}")
+
+    check("组合工作区解析（本金/sid/多账户）", _workspace_resolve)
+
     def _factor_metrics():
         from ttrade import factor_metrics as M
         from ttrade import factors as F

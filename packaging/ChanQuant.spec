@@ -32,7 +32,7 @@ APP_NAME = "ChanQuant"
 BUNDLE_ID = "com.chanquant.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "3.4.0"
+VERSION = "3.5.0"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
@@ -147,6 +147,11 @@ HIDDEN = [
     # 静态分析本来扫得到，但它们是最近才拆出来的模块，列在这里免得以后挪成
     # 函数内 import 时忘了补 —— 那时表现是「双击策略没反应」
     "gui.result_view",
+    # 组合工作区：分页工具条 + 资金分配（成本 / 占用 / ERC 配权）。
+    # 和上面同一条理由 —— 这几块是这次新拆的模块，显式列出来
+    "gui.workspace_bar",
+    "ttrade.workspace_store",
+    "ttrade.portfolio_plan",
     # 策略验证页：在 `_build_ui` 里函数内 import（页面栈按顺序建，顶层 import 会
     # 变成环）。PyInstaller 的静态分析看不到函数内 import，漏了就是**启动即崩**
     # —— 建窗口时 ImportError，自检那一步会红，而且报错还看不出是打包的问题

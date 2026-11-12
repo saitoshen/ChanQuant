@@ -223,6 +223,7 @@ class Result:
 _METRIC_KEYS = (
     "total_return", "cagr", "ann_vol", "sharpe", "max_dd", "calmar",
     "exposure", "long_exposure", "short_exposure",
+    "avg_notional", "peak_notional", "avg_margin", "peak_margin", "util",
     "n_trades", "n_long", "n_short",
     "win_rate", "avg_trade", "profit_factor", "payoff", "avg_win", "avg_loss",
     "avg_bars", "best_trade", "worst_trade",
@@ -231,7 +232,9 @@ _METRIC_KEYS = (
 
 def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
              bars_per_year: float = float(TRADING_DAYS),
-             base: float | None = None) -> dict:
+             base: float | None = None,
+             price: pd.Series | None = None,
+             mult: float = 1.0, margin_rate: float = 1.0) -> dict:
     """绩效指标。**全套单利口径**：本金（= 期初权益）固定不变。
 
     系统的回测框架是单利框架 —— 本金和使用的资金是给定的，赚到的钱不会自动
@@ -322,6 +325,28 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
         win_rate = avg_trade = profit_factor = avg_bars = best = worst = 0.0
         avg_win = avg_loss = payoff = 0.0
 
+    # ---- 资金占用诊断（绩效页的三列）----
+    #
+    # 和「分配了多少本金」是两回事：`capital_pct=30%` 只说「开仓那一刻用 30%」，
+    # 而日内策略大部分时间空仓 —— 实测一个 24 条策略的组合，名义本金 500 万，
+    # 平均占用只有 8.3 万（1.66%）、峰值 83 万（16.6%）。不把这两个数摆出来，
+    # 用户会以为 500 万都在干活。
+    #
+    # 口径：`|手数| × 收盘 × 乘数 × 保证金率`。**不按开仓价** —— 持仓期间保证金
+    # 跟着结算价走，用开仓价会在趋势行情里系统性低估。
+    avg_notional = peak_notional = avg_margin = peak_margin = util = 0.0
+    if price is not None and float(margin_rate or 0) > 0:
+        px = pd.to_numeric(price, errors="coerce").reindex(equity.index).ffill()
+        notional = pos.abs().to_numpy(dtype=float) * px.to_numpy(dtype=float) * float(mult or 1.0)
+        ok = np.isfinite(notional)
+        if ok.any():
+            avg_notional = float(notional[ok].mean())
+            peak_notional = float(notional[ok].max())
+            mr = float(margin_rate)
+            avg_margin = avg_notional * mr
+            peak_margin = peak_notional * mr
+            util = avg_margin / base if base > 0 else 0.0
+
     return {
         "total_return": float(total),
         "cagr": float(cagr),
@@ -334,6 +359,12 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
         "exposure": long_expo + short_expo,
         "long_exposure": long_expo,
         "short_exposure": short_expo,
+        # 资金占用：平均 / 峰值 / 利用率（平均占用 ÷ 本金）
+        "avg_notional": avg_notional,
+        "peak_notional": peak_notional,
+        "avg_margin": avg_margin,
+        "peak_margin": peak_margin,
+        "util": float(util),
         "n_trades": n,
         "n_long": sum(1 for t in closed if t.direction == 1),
         "n_short": sum(1 for t in closed if t.direction == -1),
@@ -725,7 +756,9 @@ def run_intrabar_backtest(data: pd.DataFrame, cfg: BacktestConfig,
 
     eq = pd.Series(equity, index=idx, name="equity")
     ps = pd.Series(pos_state, index=idx, name="position")
-    m = _metrics(eq, ps, trades, cfg.bars_per_year, base=cfg.initial_cash)
+    m = _metrics(eq, ps, trades, cfg.bars_per_year, base=cfg.initial_cash,
+                 price=pd.Series(close, index=idx), mult=mult,
+                 margin_rate=cfg.margin_rate)
     m["final_equity"] = float(eq.iloc[-1])
     m["total_cost"] = float(cost_total)
     m["notional"] = float(notional_total)
@@ -914,7 +947,9 @@ def run_level_backtest(data: pd.DataFrame, cfg: "BacktestConfig",
 
     eq_series = pd.Series(equity, index=idx, name="equity")
     ps = pd.Series(pos_state, index=idx, name="position")
-    m = _metrics(eq_series, ps, trades, cfg.bars_per_year, base=cfg.initial_cash)
+    m = _metrics(eq_series, ps, trades, cfg.bars_per_year, base=cfg.initial_cash,
+                 price=pd.Series(close, index=idx), mult=mult,
+                 margin_rate=cfg.margin_rate)
     m["final_equity"] = float(eq_series.iloc[-1])
     m["total_cost"] = float(cost_total)
     m["notional"] = float(notional_total)
@@ -1237,7 +1272,9 @@ def run_grid_intrabar(data: pd.DataFrame, cfg: "BacktestConfig",
 
     eq_series = pd.Series(equity, index=idx, name="equity")
     ps = pd.Series(pos_state, index=idx, name="position")
-    m = _metrics(eq_series, ps, trades, cfg.bars_per_year, base=cfg.initial_cash)
+    m = _metrics(eq_series, ps, trades, cfg.bars_per_year, base=cfg.initial_cash,
+                 price=pd.Series(close, index=idx), mult=mult,
+                 margin_rate=cfg.margin_rate)
     m["final_equity"] = float(eq_series.iloc[-1])
     m["total_cost"] = float(cost_total)
     m["notional"] = float(notional_total)
@@ -1445,7 +1482,9 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
 
     eq = pd.Series(equity, index=idx, name="equity")
     ps = pd.Series(pos_state, index=idx, name="position")
-    m = _metrics(eq, ps, trades, cfg.bars_per_year, base=cfg.initial_cash)
+    m = _metrics(eq, ps, trades, cfg.bars_per_year, base=cfg.initial_cash,
+                 price=pd.Series(close, index=idx), mult=mult,
+                 margin_rate=cfg.margin_rate)
     m["final_equity"] = float(eq.iloc[-1])
     # 成本单列出来：手续费和滑点已经扣进权益里了，但用户要能回答「这些钱花在哪」
     m["total_cost"] = float(cost_total)
@@ -1501,7 +1540,9 @@ def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None,
         gross=held * mult * (float(close[-1]) - float(open_[0])),
         cost=float(fee0) + abs(float(price - open_[0]) * q * mult),
     )
-    m = _metrics(eq, ps, [trade], cfg.bars_per_year, base=cfg.initial_cash)
+    m = _metrics(eq, ps, [trade], cfg.bars_per_year, base=cfg.initial_cash,
+                 price=pd.Series(close, index=d.index), mult=mult,
+                 margin_rate=cfg.margin_rate)
     m["final_equity"] = float(eq.iloc[-1])
     # 基准只有一次开仓（而且一直没平），成本就是这么一点 —— 正好当对照：
     # 策略那条如果成本是这个数的几十倍，说明换手才是真正的敌人
@@ -1577,6 +1618,11 @@ def combine(results: list[Result], label: str = "组合",
     # 成交额也按同样的份额折一次：成本率是「成本 ÷ 成交额」，两个比例相除
     # 正好把「每条成分占 1/n」约掉，和直接拿金额相除是同一个数
     notional_pcts: list[float] = []
+    # 保证金占用同理：各成分的占用折成「占自己本金的比例」，再按 1/n 折到组合。
+    # 平均占用是**精确**的（均值可加：Σ 各成分日均 ÷ n 就是组合日均），
+    # 峰值占用不是 —— 各成分的峰值在不同时刻发生，求和只是**上限**
+    margin_pcts: list[float] = []
+    peak_pcts: list[float] = []
     for r in results:
         eq = _to_daily(r.equity)
         if len(eq) < 2:
@@ -1606,6 +1652,10 @@ def combine(results: list[Result], label: str = "组合",
                          if base > 0 else 0.0)
         notional_pcts.append(float(r.metrics.get("notional") or 0.0) / base
                              if base > 0 else 0.0)
+        margin_pcts.append(float(r.metrics.get("avg_margin") or 0.0) / base
+                           if base > 0 else 0.0)
+        peak_pcts.append(float(r.metrics.get("peak_margin") or 0.0) / base
+                         if base > 0 else 0.0)
 
     if not curves:
         blank = pd.Series(dtype=float)
@@ -1632,6 +1682,14 @@ def combine(results: list[Result], label: str = "组合",
         if notional_pcts else 0.0
     m["notional"] = float(total_notional)
     m["cost_rate"] = float(total_cost / total_notional) if total_notional > 0 else 0.0
+    # 组合的资金占用：平均占用可加，精确；峰值占用是各成分峰值之和，是**上限**
+    n_pct = len(margin_pcts)
+    if n_pct:
+        m["avg_margin"] = sum(margin_pcts) / n_pct * float(initial_cash)
+        m["peak_margin"] = sum(peak_pcts) / n_pct * float(initial_cash)
+        m["util"] = (m["avg_margin"] / float(initial_cash)
+                     if float(initial_cash) > 0 else 0.0)
+        m["peak_is_bound"] = 1.0
     # 亏光的成分个数：等权组合看到 -47% 时，用户需要知道是「20 个品种本金亏光」
     # 还是「每个都亏一点」，这两种情况的处理方式完全不同
     m["n_wiped"] = float(blown)

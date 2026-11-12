@@ -254,6 +254,15 @@ class StrategyConfig:
     volume: int = 1                 # 仅 sizing="fixed" 时生效
 
     account: str = ""          # 账户名（AccountSpec.name），空表示用当前连接
+    # 多账户：同一条策略同时挂在几个账户上。
+    #
+    # 为什么不让人「复制一份改账户」：参数就有两份，改一处漏一处，回测对不上实盘。
+    # 这里只记账户名列表，策略参数仍然一份。运行时按账户各建一个槽位（每账户一条
+    # 天勤连接、各算各的手数），但用户在界面上只看到、只维护一条策略。
+    #
+    # `account` 和 `accounts` 的关系：`accounts` 非空就以它为准（`account` 是其中
+    # 第一个，留着给老代码和标题显示读）；`accounts` 为空 = 跟随默认账户。
+    accounts: list = field(default_factory=list)
     enabled: bool = False
     # `note == "short"` 就是「允许做空」。原来是自由文本，现在只剩这一个取值
     note: str = ""
@@ -492,8 +501,26 @@ class StrategyConfig:
             f"{head} {self.period}｜{self.strategy_label()}"
             f"｜{self.size_text()}"
             + ("｜只做空" if getattr(self, "short_only", False) else "")
-            + (f"｜账户 {self.account}" if self.account else "")
+            + (f"｜账户 {'/'.join(self.accounts or [self.account])}"
+               if (self.accounts or self.account) else "")
         )
+
+    def account_list(self, default: str = "") -> list[str]:
+        """这条策略要跑的账户清单（已去重、去掉空名）。
+
+        空 = 跟随 `default`（界面顶部那个默认账户）。**多账户在这里展开成一份
+        清单，而不是复制配置** —— 参数只有一份，运行层按账户各建一个槽位。
+        """
+        out = [str(a).strip() for a in (self.accounts or []) if str(a).strip()]
+        if not out:
+            d = str(default or self.account or "").strip()
+            out = [d] if d else []
+        seen, uniq = set(), []
+        for a in out:
+            if a not in seen:
+                seen.add(a)
+                uniq.append(a)
+        return uniq
 
     # ---- 序列化 ----
 
@@ -566,6 +593,24 @@ class StrategyConfig:
             cfg.factor_keys = []
         # 截面策略那组字段同样要消毒：手改 JSON 写成字符串 / 0 / 负数时不能让
         # 回测直接除零或者永远不调仓
+        # ---- 多账户 ----
+        # 手改 JSON 写成一个字符串 / None / 重复名称时都要消毒，否则运行层会
+        # 按「字符」去遍历账户名（"sim" → "s","i","m"），建出一堆不存在的槽位
+        if not isinstance(cfg.accounts, list):
+            cfg.accounts = [cfg.accounts] if cfg.accounts else []
+        seen, acc = set(), []
+        for a in cfg.accounts:
+            s = str(a or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                acc.append(s)
+        cfg.accounts = acc
+        # 两个字段必须自洽：`accounts` 非空就以它为准，`account` 跟第一个走；
+        # `accounts` 空则 `account` 就是「跟随默认账户」那个值（可能也是空）
+        if acc:
+            cfg.account = acc[0]
+        elif cfg.account:
+            cfg.accounts = [cfg.account]
         for f in ("cross_symbols", "multi_symbols", "timing_factor_keys"):
             if not isinstance(getattr(cfg, f), list):
                 setattr(cfg, f, [])
