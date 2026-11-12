@@ -186,6 +186,27 @@ def bar_period(df: pd.DataFrame) -> str:
     return f"{int(round(minutes / 60))}h"
 
 
+def _pick_iv_tier(cands: list[str], spans: dict, day_span
+                  ) -> str:
+    """从候选档里挑第一个「够新 + 够深」的；都不合格返回 `1d`。
+
+    抽成纯函数是为了能单测：闸门条件写错不会报错，只会悄悄用一个烂档，
+    表现是图上一条水平线或者精度前后跳 —— 靠看数据发现不了。
+    """
+    for p in cands:
+        span = spans.get(p)
+        if span is None:
+            continue
+        # 在更：最晚一条比日频晚不到一个月
+        if day_span is not None and span[2] < day_span[2] - pd.Timedelta(days=30):
+            continue
+        # 深度：天数至少覆盖日频的一半
+        if day_span is not None and span[3] < day_span[3] * 0.5:
+            continue
+        return p
+    return "1d"
+
+
 def _iv_period_for(df: pd.DataFrame, symbol: str) -> str:
     """这份 bar 该用哪一档 IV：先同档，再往粗档退，都没有返回 `1d`。"""
     from . import optstore as OS
@@ -210,18 +231,8 @@ def _iv_period_for(df: pd.DataFrame, symbol: str) -> str:
     # 同档 → 比它粗的。粗档覆盖更长，退档时不会突然只剩几个月有数
     cands = [own] + list(_IV_PERIODS[slot + 1:])
     day_span = OS.iv_span(symbol, "1d")
-    picked = "1d"
-    for p in cands:
-        span = OS.iv_span(symbol, p)
-        if span is None:
-            continue
-        # 覆盖度闸门：最晚一条比日频晚不到一个月才算「在更」。库里 IO 的 5m
-        # 只到 2020-11（日频到 2026），拿它当主档的话 2020 年那八个月是 5m 精度、
-        # 剩下六年全靠日频兜底，精度跳跃还不如统一用 1h。
-        if day_span is not None and span[2] < day_span[2] - pd.Timedelta(days=30):
-            continue
-        picked = p
-        break
+    spans = {p: OS.iv_span(symbol, p) for p in cands}
+    picked = _pick_iv_tier(cands, spans, day_span)
     _ivp_cache[key] = (stamp, picked)
     return picked
 

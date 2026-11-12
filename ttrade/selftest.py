@@ -1959,12 +1959,33 @@ def _run() -> tuple[bool, list[str]]:
             if sp[2] < dspan[2] - pd.Timedelta(days=30):
                 raise RuntimeError(
                     f"IF 挑到停更的档 {p}（到 {sp[2].date()}，日频到 {dspan[2].date()}）")
+            if sp[3] < dspan[3] * 0.5:
+                raise RuntimeError(
+                    f"IF 挑到太浅的档 {p}（只有 {sp[3]} 天，日频 {dspan[3]} 天）")
             # 有 aux 文件的商品必须锁死日频，否则换周期就换了数据源
             cu = A._use_iv_period(data_dir("aux"), "CU", "SHFE",
                                   pd.DataFrame({"close": np.arange(120.0)}, index=i5))
             if cu != "1d":
                 raise RuntimeError(f"CU 有 aux 文件却用了日内档 {cu}")
-            picked = f"IF 5m bar → {p}（{sp[0]} 行）"
+            picked = f"IF 5m bar → {p}（{sp[0]} 行 / {sp[3]} 天）"
+
+        # ⑤ 取档闸门本身（纯函数，用构造的覆盖数据，不依赖库里的现状）
+        day = (1000, pd.Timestamp("2026-01-01"), pd.Timestamp("2026-11-01"), 900)
+        deep_new = (5000, pd.Timestamp("2024-01-02"), pd.Timestamp("2026-10-30"), 800)
+        stale = (7000, pd.Timestamp("2020-03-23"), pd.Timestamp("2020-11-16"), 155)
+        thin = (400, pd.Timestamp("2026-09-01"), pd.Timestamp("2026-10-30"), 40)
+        gate = [
+            ("够新够深 → 选中", {"5m": deep_new}, ["5m", "1h"], "5m"),
+            ("停更五年 → 跳过", {"5m": stale, "1h": deep_new}, ["5m", "1h"], "1h"),
+            ("只回补两个月 → 跳过（深度闸门）",
+             {"5m": thin, "1h": deep_new}, ["5m", "1h"], "1h"),
+            ("全都不合格 → 回日频", {"5m": thin, "1h": stale}, ["5m", "1h"], "1d"),
+            ("没有这档 → 往下退", {"1h": deep_new}, ["5m", "1h"], "1h"),
+        ]
+        for why, spans, cands, want_p in gate:
+            got_p = A._pick_iv_tier(cands, spans, day)
+            if got_p != want_p:
+                raise RuntimeError(f"取档闸门「{why}」判成 {got_p}，应为 {want_p}")
 
         # ④ vol_20 年化：日线必须逐位不变（历史基线和 IC 都按 252 算过）
         rng = np.random.default_rng(7)

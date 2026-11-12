@@ -158,12 +158,17 @@ def iv_candidates(symbol: str) -> list[str]:
 
 
 def iv_span(symbol: str, period: str = "1d"):
-    """这个品种 / 周期在库里的 IV 覆盖：`(行数, 最早, 最晚)`；没有返回 None。
+    """这个品种 / 周期在库里的 IV 覆盖：`(行数, 最早, 最晚, 天数)`；没有返回 None。
 
     只做聚合查询，**不拉数据** —— 判「分钟 bar 该用哪一档」时会连问好几档，
-    每档都 `load_iv()` 一遍就是几百毫秒起步。判覆盖度必须看「最晚到哪天」：
-    库里 5m 档各家差别很大（IO 只到 2020-11、HO 一直到 2026-10、MO 没有），
-    只看「有没有」会挑到一个停更五年的档。
+    每档都 `load_iv()` 一遍就是几百毫秒起步。判覆盖度必须看两个维度：
+
+    - **最晚到哪天**：库里 5m 档各家差别很大（IO 只到 2020-11、HO 一直到 2026-10、
+      MO 没有），只看「有没有」会挑到一个停更五年的档
+    - **一共多少天**（第 4 个元素）：`download_options.py --periods 5m` 只能从
+      天勤回补约两个月，补完之后「最晚一条」是新的、看着完全合格，但历史深度
+      只有 40 来天。只判新旧的闸门会放它进来，于是前面两个月 5m、后面四年日频，
+      精度前后不一致 —— 这正是 `_iv_period_for` 要拦的东西
     """
     if not exists():
         return None
@@ -171,14 +176,16 @@ def iv_span(symbol: str, period: str = "1d"):
         try:
             with connect(read_only=True) as con:
                 row = con.execute(
-                    "SELECT count(*), min(dt), max(dt) FROM option_iv"
+                    "SELECT count(*), min(dt), max(dt),"
+                    " count(DISTINCT CAST(dt AS DATE)) FROM option_iv"
                     " WHERE variety = ? AND period = ?",
                     [v, period],
                 ).fetchone()
         except Exception:      # noqa: BLE001 - 库正被写、文件不在，都当「没有」
             return None
         if row and row[0]:
-            return (int(row[0]), pd.Timestamp(row[1]), pd.Timestamp(row[2]))
+            return (int(row[0]), pd.Timestamp(row[1]), pd.Timestamp(row[2]),
+                    int(row[3]))
     return None
 
 
