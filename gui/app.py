@@ -1098,6 +1098,79 @@ class BacktestJob:
     reverse: bool = False
 
 
+# 左侧状态栏（`Hint`，固定 360 px）只放「几个、哪几个、为什么」。
+# 多品种失败清单是**逐品种**一条的：「AD 铸造铝合金　有色：选中的因子在该标的
+# 上都没有足够数据（如美股无持仓量）」—— 40 个品种就是 40 段同样的原因，
+# 整栏被撑到占满侧边栏、下面的图挤成一条，用户翻十屏只读到同一句话。
+_REASON_TAG = (
+    ("没有行情", "无行情"),
+    ("没有产生信号", "无信号"),
+    ("足够数据", "因子无数据"),
+)
+
+
+def _short_reason(reason: str, limit: int = 12) -> str:
+    """把失败原因压成短标签：能归到已知几类就用标签，否则截断。"""
+    r = str(reason or "").strip()
+    for key, tag in _REASON_TAG:
+        if key in r:
+            return tag
+    return r if len(r) <= limit else r[:limit] + "…"
+
+
+def split_failed(item: str) -> tuple[str, str]:
+    """「品种标签：原因」→ `(品种, 原因)`。
+
+    只在**第一个**全角冒号处切 —— 原因自己可能带冒号
+    （如「跨周期因子缺行情：日线（mom_20）」），从右边切会把品种名切走。
+    """
+    name, sep, reason = str(item).partition("：")
+    return (name, reason) if sep else (str(item), "")
+
+
+def brief_failed(failed, max_names: int = 4,
+                 max_reasons: int = 2) -> tuple[str, str]:
+    """逐品种失败清单 → `(短句, 完整 tooltip)`。
+
+    短句只留总数、前几个品种名和原因归类：
+      - 原因都一样：`缺 40 个（因子无数据）：AD、AL、AO、BR…`
+      - 原因不止一种：`缺 3 个（2 种原因）：AD（因子无数据）、AL（无信号）…`
+    tooltip 保留逐条原文（一条一行）：想追到底时鼠标一悬停就有，
+    不用为了看一眼「哪个品种因为什么失败」把侧边栏翻十屏。
+    """
+    items = [str(x) for x in (failed or []) if str(x).strip()]
+    if not items:
+        return "", ""
+    pairs = [split_failed(x) for x in items]
+    # 短名：`job.label` 是「AD 铸造铝合金　有色」，状态栏里只留代码
+    short = [(str(n).split("　")[0].strip() or str(n), r) for n, r in pairs]
+    tags: list[str] = []
+    for _, r in short:
+        tag = _short_reason(r)
+        if tag and tag not in tags:
+            tags.append(tag)
+    head = "、".join(n for n, _ in short[:max_names])
+    if len(short) > max_names:
+        head += "…"
+    if len(tags) <= 1:
+        why = f"（{tags[0]}）" if tags else ""
+        brief = f"缺 {len(short)} 个{why}：{head}"
+    else:
+        shown, used = [], []
+        for n, r in short:
+            tag = _short_reason(r)
+            if tag in used:
+                continue
+            used.append(tag)
+            shown.append(f"{n}（{tag}）" if tag else n)
+            if len(shown) >= max_reasons:
+                break
+        brief = (f"缺 {len(short)} 个（{len(tags)} 种原因）："
+                 + "、".join(shown) + "…")
+    full = "\n".join(f"{n}：{r}" if r else n for n, r in pairs)
+    return brief, full
+
+
 def run_backtest_job(job: BacktestJob, progress=None, cancel=None):
     """跑一个品种，返回 `Result`；没有信号时返回 None。
 
@@ -5490,6 +5563,8 @@ class MainWindow(QMainWindow):
         会当成 `df_override=False` 传进去，后面 `df.empty` 就炸了。
         """
         self._pending = False
+        # 上一批的失败清单还挂在状态栏 tooltip 上会把新结果说成失败，先清
+        self._set_status_tip("")
         self.run_analysis()
 
     def _on_auto_run_toggled(self, on: bool) -> None:
@@ -6108,7 +6183,11 @@ class MainWindow(QMainWindow):
         failed = list(failed) + [f"{m}：没有行情数据" for m in missing]
         if not results:
             self._show_single_view()
-            self._clear_chart("多品种回测没有结果：" + "；".join(failed))
+            brief, full = brief_failed(failed)
+            # 全失败时也不能把 40 条原文糊到图上：图里的字和侧边栏是同一件事，
+            # 两边都撑满就等于两边都读不了
+            self._clear_chart("多品种回测没有结果 —— " + (brief or "没有可用的品种"))
+            self._set_status_tip(full)
             return
 
         # 反向要写在标题里：同一批品种、同一套参数，正着跑和反着跑的两条曲线
@@ -6159,11 +6238,15 @@ class MainWindow(QMainWindow):
         if blown:
             blown_txt = (f"　本金亏光 {len(blown)} 个："
                          + "、".join(blown[:4]) + ("…" if len(blown) > 4 else ""))
+        # 「缺哪些品种」压成一句，完整清单进 tooltip：原文是逐品种一条，
+        # 四十个品种会把固定 360 px 的状态栏撑到占满整栏，把图挤成一条缝
+        brief, full = brief_failed(failed) if failed else ("", "")
         self.lbl_status.setText(
             f"{head} · {res.label} · 累计 {res.metrics['total_return'] * 100:+.1f}%"
             + idle_txt + blown_txt
-            + (f"　缺：{'、'.join(failed)}" if failed else "")
+            + (f"　{brief}" if brief else "")
         )
+        self._set_status_tip(full)
         self._publish_port(res, head, period, bpy)
 
     def _pick_usable_single(self, key: str, frames: dict,
@@ -6372,13 +6455,20 @@ class MainWindow(QMainWindow):
         # 杠杆下净值可能被亏穿。钉在 0 之后曲线还在，但那已经不是「回撤」而是
         # 「本金没了」—— 不说清楚，用户只会看到一条贴地的线
         blown_txt = "　已爆仓（净值归零）" if float(out.equity.min()) <= 0 else ""
+        # 截面一次几十个品种，缺行情的那几个也要压：原样列出来同样撑爆侧边栏
+        miss_txt = ""
+        if missing:
+            miss_txt = (f"　缺 {len(missing)} 个："
+                        + "、".join(str(x).split("　")[0] for x in missing[:4])
+                        + ("…" if len(missing) > 4 else ""))
         self.lbl_status.setText(
             f"{label} · 累计 {m['total_return'] * 100:+.1f}%"
             f" · 年化 {m['cagr'] * 100:+.2f}% · 回撤 {m['max_dd'] * 100:.1f}%"
             f" · 调仓 {m['n_trades']} 次"
             + blown_txt
-            + (f"　缺：{'、'.join(missing)}" if missing else "")
+            + miss_txt
         )
+        self._set_status_tip("\n".join(str(x) for x in missing))
         self._publish_port(res, label, period, bt.bars_per_year)
 
     def _start_cross_worker(self, frames, ccfg, bt, label: str, period: str,
@@ -6602,6 +6692,17 @@ class MainWindow(QMainWindow):
             selected_keys=self._selected_factor_keys(),
             outcome=self.factor_outcome,
         )
+
+    def _set_status_tip(self, text: str) -> None:
+        """状态栏的完整清单挂在 tooltip 上；空串就清掉。
+
+        侧边栏只有 360 px，几十个品种的原文塞不进正文 —— 正文留汇总，
+        鼠标一悬停看逐条。**每次重跑都要先清**，否则上一批的清单会挂在新结果
+        上，看起来像是这一批也失败了。
+        """
+        if not hasattr(self, "lbl_status"):
+            return
+        self.lbl_status.setToolTip(str(text or ""))
 
     def _clear_chart(self, msg: str) -> None:
         """没有数据时把图清空并写一句话。

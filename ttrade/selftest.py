@@ -3836,15 +3836,64 @@ def _run() -> tuple[bool, list[str]]:
 
     check("CTP 会话层（交易页后端）", _ctp_live)
 
+    def _many_failed(n: int = 40) -> list[str]:
+        """造一批「同一原因、不同品种」的失败清单。
+
+        多品种回测的真实输出就是这形状：每个失败品种各一条
+        「AD 铸造铝合金　有色：选中的因子在该标的上都没有足够数据」。
+        """
+        one = "选中的因子在该标的上都没有足够数据（如美股无持仓量）"
+        codes = (list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") * 2)[:n]
+        return [f"{c} 品种{i}　化工：{one}" for i, c in enumerate(codes)]
+
+    def _status_brief():
+        """多品种失败清单的压缩口径（纯函数部分）。
+
+        `brief_failed` 只负责「总数 / 归类 / 取前几个」，高度在
+        「构建主窗口」那项里用真实 `Hint` 样式量。
+        """
+        from gui.app import brief_failed, split_failed
+
+        brief, full = brief_failed(_many_failed())
+        if "缺 40 个" not in brief:
+            raise RuntimeError(f"没报总数：{brief}")
+        if "因子无数据" not in brief:
+            raise RuntimeError(f"原因没归类：{brief}")
+        if len(brief) > 60:
+            raise RuntimeError(f"短句还是太长（{len(brief)} 字）：{brief}")
+        if len(full.splitlines()) != 40:
+            raise RuntimeError(f"tooltip 没保留逐条原文：{len(full.splitlines())} 行")
+
+        # 原因自己带全角冒号：只在**第一个**冒号处切，品种名不能被切走
+        name, reason = split_failed(
+            "RB 螺纹钢　黑色：跨周期因子缺行情：日线（mom_20）")
+        if name != "RB 螺纹钢　黑色" or not reason.startswith("跨周期因子缺行情："):
+            raise RuntimeError(f"切分错了：{name!r} / {reason!r}")
+
+        # 原因不止一种：要写出「几种原因」，每种给一个代表品种
+        mixed = ["AD 铸造铝合金　有色：" + "选中的因子在该标的上都没有足够数据",
+                 "FU 燃料油　能源：没有产生信号",
+                 "P 棕榈油　农产品：这段行情只有 60 根，太短了算不出因子"]
+        b2, f2 = brief_failed(mixed)
+        if "3 种原因" not in b2 or "无信号" not in b2 or "AD" not in b2:
+            raise RuntimeError(f"混原因没归好：{b2}")
+        if len(f2.splitlines()) != 3:
+            raise RuntimeError("混原因的 tooltip 行数不对")
+
+        if brief_failed([]) != ("", ""):
+            raise RuntimeError("空清单应当返回两个空串")
+        return f"40 条压成 {len(brief)} 字「{brief}」，混原因「{b2}」"
+
     def _window():
         """真正把主窗口搭起来，验证 UI 代码在打包后也能跑通。"""
-        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication, QLabel
 
         from gui.app import (
             COL_PERIOD,
             FAMILY_RULE,
             STYLE_SHEET,
             MainWindow,
+            brief_failed,
             setup_light_palette,
         )
 
@@ -5571,6 +5620,26 @@ def _run() -> tuple[bool, list[str]]:
         if not trig_ok:
             raise RuntimeError(f"触发面板异常：{trig_info}")
 
+        # ---- 状态栏不能被几十条失败清单撑爆 ----
+        # 多品种回测里「一个因子在 N 个品种上都没数据」是逐品种写一条的，
+        # 四十条原文会把 360 px 的侧边栏撑满整栏、把右边的图挤成一条缝。
+        # 这里用真实 `Hint` 样式量高度：压缩后必须不到原文的 1/3，且不超过
+        # 三行左右 —— 文案对不对上面那项纯函数检查管，这项只管「会不会挤」。
+        _bs, _full = brief_failed(_many_failed())
+        _probe = QLabel()
+        _probe.setObjectName("Hint")
+        _probe.setWordWrap(True)
+        _probe.setFixedWidth(360)
+        _probe.setText("　".join(_many_failed()))
+        _h_raw = _probe.sizeHint().height()
+        _probe.setText(_bs)
+        _h_new = _probe.sizeHint().height()
+        _probe.deleteLater()
+        if not (_h_new * 3 <= _h_raw and _h_new <= 90):
+            raise RuntimeError(
+                f"状态栏没压住：原文 {_h_raw}px → 压缩后 {_h_new}px（{_bs}）")
+        status_info = f"多品种失败清单 {_h_raw}→{_h_new}px"
+
         return (f"{n} 个标的，K 线/绩效/因子页已渲染，{k_info}，"
                 f"{factor_info}，滚轮缩放 {wheel_info}，策略验证 {verify_info}，"
                 f"波幅突破 {brk_info}，"
@@ -5580,9 +5649,11 @@ def _run() -> tuple[bool, list[str]]:
                 f"组合页回测 {view_info}，"
                 f"{side_info}，触发 {trig_info}，"
                 f"回测区间 {range_info}，合成周期 {md_info}，实时开关已复位，"
+                f"{status_info}，"
                 f"数据管理页就绪（期权回溯区间 {opt_range_info}），手册 {manual_info}，输出 {out_info}，"
                 f"对话渲染 {chat_info}，能力包 {skill_info}")
 
+    check("多品种失败清单压成一句（不撑爆侧边栏）", _status_brief)
     check("构建主窗口（端到端）", _window)
 
     # K 线与信号页的持仓映射：这一项 import 了 Qt，放在窗口之后跑
