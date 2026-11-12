@@ -100,6 +100,78 @@ def ensure_icon() -> None:
     subprocess.run([sys.executable, os.path.join(PACK, "make_icon.py")], cwd=ROOT, check=True)
 
 
+def ensure_native_dll_path() -> bool:
+    """把 conda 的 DLL 目录塞进 PATH，让 PyInstaller 能解析出 Qt / Pillow 的依赖。
+
+    这是 **conda 环境专有的坑**，pip 环境不需要这一步：
+
+    - pip 轮子的 PySide6 把 `Qt6Core.dll` / `shiboken6.*.dll` 摆在
+      `site-packages/PySide6/` 里，紧接着 .pyd，PyInstaller 的 hook 就按这个布局找；
+    - conda 装的是另一套布局：Qt 的 DLL 全在 `<prefix>/Library/bin`，
+      `site-packages/PySide6/` 里只剩 .pyd。
+
+    解析不到时 PyInstaller **只打一行 WARNING 就继续**，于是打出一个缺 DLL 的包 ——
+    双击能起来（主程序没 import Qt），一进界面就
+    `ImportError: DLL load failed while importing Shiboken`，Pillow 的 `_imaging`
+    是同一种表现。本地实测：自检 52 项过、8 项挂在 Qt / matplotlib 上。
+
+    PyInstaller 的依赖解析会查 `PATH`（实测补上之后
+    `bindepend.get_imports('QtWidgets.cp314-win_amd64.pyd')` 就能把
+    `Qt6Core.dll` 解析到 `Library/bin`），所以放进去就够了；它会把解析到的 DLL
+    一并复制进包，装机后不依赖 conda。非 conda 环境没有这个目录，这里什么都不做。
+
+    返回 True 表示这次**临时改了 PATH** —— 调用方要据此清一次分析缓存，见
+    `run_pyinstaller`。
+    """
+    if not IS_WIN:
+        return False
+    prefix = os.path.abspath(sys.prefix)
+    cand = [os.path.join(prefix, "Library", "bin"),
+            os.path.join(prefix, "Library", "mingw-w64", "bin"),
+            os.path.join(prefix, "DLLs"),
+            prefix]
+    add = [p for p in cand if os.path.isdir(p)]
+    if not add:
+        return False
+    cur = os.environ.get("PATH", "")
+    parts = [p for p in cur.split(os.pathsep) if p]
+    new = [p for p in add if p not in parts]
+    if not new:
+        return False
+    os.environ["PATH"] = os.pathsep.join(new + parts)
+    log(f"补 conda 的 DLL 搜索路径：{len(new)} 个目录")
+    return True
+
+
+# 打包后**必须**在包里的原生库。少一个就说明 PyInstaller 的依赖解析没打通，
+# 而它的症状是「能启动、一进界面就崩」或者「图上没有中文」，装机之后才发现。
+BUNDLE_REQUIRED = [
+    ("Qt6Core.dll", "PySide6 的 Qt 运行时"),
+    ("shiboken6", "PySide6 的 C++ 绑定层"),
+]
+
+
+def verify_bundle(target: str) -> list[str]:
+    """验一遍关键 DLL 在不在产物里。返回缺失项（空 = 通过）。"""
+    internal = (os.path.join(target, "Contents", "Frameworks") if IS_MAC
+                else os.path.join(target, "_internal"))
+    if not os.path.isdir(internal):
+        internal = target
+    names = set()
+    for base, _dirs, files in os.walk(internal):
+        for fn in files:
+            names.add(fn.lower())
+    missing = []
+    for key, why in BUNDLE_REQUIRED:
+        k = key.lower()
+        if not any(k in n for n in names):
+            missing.append(f"{key}（{why}）")
+    # Pillow 的 _imaging 是 matplotlib 画图的实际入口，缺了「图上一片空白」
+    if not any(n.startswith("_imaging") and n.endswith(".pyd") for n in names):
+        missing.append("_imaging.pyd（Pillow 画图）")
+    return missing
+
+
 def clean() -> None:
     for d in (BUILD, DIST):
         if os.path.isdir(d):
@@ -107,8 +179,10 @@ def clean() -> None:
             shutil.rmtree(d, ignore_errors=True)
 
 
-def run_pyinstaller() -> int:
+def run_pyinstaller(clean_analysis: bool = False) -> int:
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", SPEC]
+    if clean_analysis:
+        cmd.insert(3, "--clean")
     log("执行：" + " ".join(cmd))
     return subprocess.run(cmd, cwd=ROOT).returncode
 
@@ -283,7 +357,15 @@ def main() -> int:
     if args.clean:
         clean()
 
-    rc = run_pyinstaller()
+    # 临时补了 PATH 就必须让 PyInstaller 重做一遍分析：`build/` 里存的是上一次
+    # 的依赖图，而 PATH 不在它的缓存判据里。上一次如果在没补 PATH 的环境下跑过，
+    # 缓存里就记着「Qt6Core.dll 解析不到」，这次会原样复用 —— 表现是「明明补了
+    # PATH、构建日志也没报错，产物里还是没有 Qt 的 DLL」。清一次就重算了。
+    need_clean = ensure_native_dll_path() and os.path.isdir(BUILD)
+    if need_clean:
+        log("补了 DLL 路径，清一次分析缓存（build/）保证依赖重新解析")
+
+    rc = run_pyinstaller(clean_analysis=need_clean)
     if rc != 0:
         log(f"打包失败，PyInstaller 退出码 {rc}")
         return rc
@@ -306,6 +388,17 @@ def main() -> int:
             # 不算致命错误：包里其它功能都正常，只是机器学习少了 XGBoost。
             # 但要吼一声，否则又会变成「CI 绿了、用户那边模型少一个」。
             log("  ! XGBoost 在 macOS 上可能不可用，详见上面的提示")
+
+    missing = verify_bundle(target)
+    if missing:
+        log("")
+        log("!" * 62)
+        log("打包产物缺原生库，装到用户机器上会「能启动、一进界面就崩」：")
+        for m in missing:
+            log(f"  - {m}")
+        log("多半是 PyInstaller 的依赖解析没找到 DLL（conda 布局见 ensure_native_dll_path）")
+        log("!" * 62)
+        return 1
 
     size = dir_size(target)
     log("")
