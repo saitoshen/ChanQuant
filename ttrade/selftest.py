@@ -2049,6 +2049,86 @@ def _run() -> tuple[bool, list[str]]:
 
     check("分钟级期权 IV（取档 / 无前视 / 年化）", _opt_iv_period)
 
+    def _factor_window_days():
+        """标准化窗口的单位是**交易日**，不是 bar 根数。
+
+        按根算的错法不报错、只让结论不可比：同一个 252 在 5m 上只有 5 天
+        （估的是「最近五天的波动」，符号一天翻 0.8 次），在周线上是五年
+        （选「近 1 年」全空）。所以逐档钉死换算结果，并且日线必须逐位不变。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factors as F
+
+        days = pd.bdate_range("2024-01-01", periods=70)
+        d1 = pd.DatetimeIndex(days)
+        h1 = pd.DatetimeIndex([d + pd.Timedelta(hours=h)
+                               for d in days for h in (9, 10, 11, 13, 14, 15)])
+        m5 = pd.DatetimeIndex([d + pd.Timedelta(minutes=5 * i)
+                               for d in days for i in range(48)])
+        wk = pd.DatetimeIndex([days[0] + pd.Timedelta(weeks=i) for i in range(80)])
+
+        # ① 各档换算：日线 1:1、1h ×6、5m ×48、周线 ÷5（一周 5 个交易日）
+        for name, idx, lo, hi in (
+            ("日线", d1, 252, 252),
+            ("1h", h1, 252 * 6, 252 * 6),
+            ("5m", m5, 252 * 48, 252 * 48),
+            ("周线", wk, 49, 51),
+        ):
+            got = F.window_bars(252, idx)
+            if not (lo <= got <= hi):
+                raise RuntimeError(
+                    f"{name} 的 252 个交易日换算成 {got} 根，应在 {lo}~{hi}")
+
+        # ② 日线必须**逐位不变**：历史 IC 基线和所有日线结论都按 252 根算的
+        rng = np.random.default_rng(23)
+        s = pd.Series(rng.normal(size=400).cumsum(),
+                      index=pd.bdate_range("2023-01-02", periods=400))
+        want = ((s - s.rolling(252, min_periods=63).mean())
+                / s.rolling(252, min_periods=63).std(ddof=1)).clip(-4, 4)
+        got = F.standardize(s, window=252, method="z")
+        if not np.allclose(got.to_numpy(), want.to_numpy(), equal_nan=True,
+                           rtol=0, atol=1e-12):
+            raise RuntimeError("日线标准化被「按天」改动带偏了（必须逐位不变）")
+
+        # ③ 5m 的预热期是 63 个交易日（3024 根），不是 63 根
+        s5 = pd.Series(np.arange(len(m5), dtype=float), index=m5)
+        z5 = F.standardize(s5, window=252, method="z")
+        first = int(z5.notna().to_numpy().argmax())      # 0-based
+        nb = F.window_bars(252, m5)
+        if first != nb // 4 - 1:
+            raise RuntimeError(
+                f"5m 的首个有效值在第 {first + 1} 根，应为第 {nb // 4} 根"
+                f"（{nb} 根窗口的 1/4）")
+        if first < 3000:
+            raise RuntimeError(f"5m 的窗口还是按根算的（首值第 {first + 1} 根）")
+
+        # ④ IC / 分桶窗口走同一套换算，否则「标准化按天、IC 按根」会打架
+        from ttrade import factor_metrics as M
+        raw5 = pd.Series(rng.normal(size=len(m5)).cumsum(), index=m5)
+        fwd5 = raw5.pct_change().shift(-1)
+        w60 = F.window_bars(60, m5)
+        if w60 != 60 * 48:
+            raise RuntimeError(f"5m 上 60 个交易日算成 {w60} 根，应为 2880")
+        ic5 = M.ic_series(raw5, fwd5, 60)
+        first_ic = int(ic5.notna().to_numpy().argmax())      # 0-based
+        if int(ic5.notna().sum()) == 0:
+            raise RuntimeError("IC 序列整列为空：滚动窗口没跟着按天换算")
+        if first_ic < 1400:
+            raise RuntimeError(
+                f"IC 第一个有效值在第 {first_ic + 1} 根，窗口还在按根算"
+                f"（按天算要等到第 {w60 // 2} 根）")
+        q = M.quantile_returns(raw5, fwd5, 5, 60)
+        if len(q) != 5:
+            raise RuntimeError(f"分位收益只有 {len(q)} 桶，应为 5")
+
+        return (f"日线 252 根（逐位不变）/ 1h {F.window_bars(252, h1)} / "
+                f"5m {nb}（预热 {first + 1} 根）/ 周线 {F.window_bars(252, wk)}；"
+                "IC、分位同口径")
+
+    check("因子窗口按交易日（不是根）", _factor_window_days)
+
     def _factor_metrics():
         from ttrade import factor_metrics as M
         from ttrade import factors as F
@@ -2920,8 +3000,13 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError("小样本模型被判成退化模型")
 
         # 2. 走一遍 walk-forward：稀疏采样 + 小量纲标签，最后一折不能丢
+        #
+        # 基准是**日线**：这里的参数（训练窗口 300）本来就是「交易日」，
+        # 换成 24 小时连续的 5min 假数据会让「60 个交易日」变成 17280 根，
+        # 1200 根的样本一根都出不了信号 —— 那不是策略的问题，是假数据
+        # 没有真实的交易时段（真 5m 一天只有 48~68 根）。
         n = 1200
-        idx = pd.date_range("2020-01-01", periods=n, freq="5min")
+        idx = pd.bdate_range("2020-01-01", periods=n)
         r = (np.sin(np.arange(n) / 25.0) * 0.01
              + np.random.default_rng(11).normal(0, 0.004, n))
         close = pd.Series(100 * np.exp(np.cumsum(r)), index=idx)

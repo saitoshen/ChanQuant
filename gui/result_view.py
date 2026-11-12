@@ -2328,7 +2328,7 @@ class ResultView(QObject):
         n_ok = int(rep["t"].notna().sum()) if "t" in rep else 0
         n_sig = int((rep["t"].abs() > 2).sum()) if "t" in rep else 0
         self.lbl_frep.setText(
-            f"{len(rep)} 个因子 · 前向 {cfg.horizon} 日 · 标准化窗口 {cfg.window} 日\n"
+            f"{len(rep)} 个因子 · 前向 {cfg.horizon} 根 · 标准化窗口 {cfg.window} 个交易日\n"
             f"|t|>2 的因子 {n_sig} 个（Newey-West 调整后），有效评估 {n_ok} 个"
         )
 

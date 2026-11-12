@@ -108,7 +108,10 @@ def _clean_tiers(tiers) -> list[list[float]]:
 @dataclass
 class FactorConfig:
     # 因子构造
-    window: int = 252            # 标准化窗口（也是 IC 统计窗口）
+    # window 是**交易日**（252 ≈ 近一年），不是 bar 根数：日线 252 根、1h 约
+    # 1260 根、5m 约 12000 根。换算见 `factors.window_bars()`。同一个参数在
+    # 各周期上的含义必须一样，否则「5m 上 IC 更好」只是因为窗口缩到了五天。
+    window: int = 252            # 标准化窗口（也是 IC 统计窗口，单位：交易日）
     method: str = "z"            # z / rank
     horizon: int = 5             # 预测/评估的前向收益期数
 
@@ -454,9 +457,12 @@ def _orientation_frame(
     elif cfg.orient == "long_low":
         ori = pd.DataFrame(-1.0, index=fmat.index, columns=fmat.columns)
     else:
+        # `min_obs` 是**根数**（expanding 的起始样本量），要按 bar 密度换算：
+        # 5m 上 126 根只有两天半，两天半的 IC 定方向等于抛硬币
+        min_obs = max(120, F.window_bars(max(1, int(cfg.window) // 2), fmat.index))
         ori = pd.DataFrame(
             {
-                c: pit_orientation(fmat[c], fwd, cfg.horizon, max(120, cfg.window // 2))
+                c: pit_orientation(fmat[c], fwd, cfg.horizon, min_obs)
                 for c in fmat.columns
             },
             index=fmat.index,
@@ -483,14 +489,19 @@ def _reverse_note(cfg: FactorConfig, keys: list[str]) -> str:
 def _warmup_note(score: pd.Series | None, n_bars: int, cfg: FactorConfig) -> str:
     """分数整列 NaN 时说清原因，别让人以为策略坏了。
 
-    标准化窗口是**根**，不是「天」。同一个 252 在 5 分钟上只占两天，在周线上
-    是五年 —— 周线策略选「近 1 年」只有五十来根，分数全空、信号全 0，界面上
-    就是一条不交易的策略，看不出是样本不够。
+    标准化窗口是**交易日**：252 个在日线上是 252 根、1h 上约 1260 根、5m 上
+    约 12000 根。所以「近 1 年」的 5m 回测只有一半样本能出分（预热要 63 个
+    交易日），周线反而宽松 —— 提示里两个单位都写出来，别让人拿「根」去对。
     """
     if score is None or len(score) == 0 or int(score.notna().sum()) > 0:
         return ""
-    return (f"分数全空：这段行情只有 {int(n_bars)} 根，而标准化窗口要 "
-            f"{int(cfg.window)} 根 —— 把回测区间拉长，或者把窗口调小")
+    bpd = max(1e-9, F.bars_per_day(score.index))
+    days = int(round(int(n_bars) / bpd))
+    nb = F.window_bars(cfg.window, score.index)
+    need = int(min(nb, max(60, nb // 4)))
+    return (f"分数全空：这段行情只有 {int(n_bars)} 根（约 {days} 个交易日），"
+            f"而标准化窗口 {int(cfg.window)} 个交易日至少要 {need} 根"
+            " —— 把回测区间拉长，或者把窗口调小")
 
 
 def _orient_note(ori: pd.DataFrame | None, cfg: FactorConfig) -> str:
@@ -610,8 +621,8 @@ def rolling_ic_weights(fmat: pd.DataFrame, fwd: pd.Series, cfg: FactorConfig
     权重不是逐根变的：每 `ic_rebal` 根更新一次，中间沿用上一次的值。IC 的日间
     噪声本来就大，每根都跟着抖会把换手率顶起来。
     """
-    win = int(max(20, cfg.window))
-    mp = max(20, win // 4)
+    win = max(20, F.window_bars(cfg.window, fmat.index))
+    mp = int(min(win, max(20, win // 4)))
     cols = {}
     for c in fmat.columns:
         ic = fmat[c].rolling(win, min_periods=mp).corr(fwd).shift(int(cfg.horizon))
@@ -1269,10 +1280,13 @@ def build_score(
         # 另一种是**行情太短**，所有因子都凑不出有效值。合成周期把第二种放大
         # 了 —— 周线「近 1 年」只有五十来根，看着像「因子没数据」，其实是样本
         # 不够，用户照着提示去换因子只会白折腾
-        if len(df) < max(60, int(cfg.window) // 2):
+        nb = F.window_bars(cfg.window, df.index)
+        need = int(min(nb, max(60, nb // 4)))
+        if len(df) < need:
             raise ValueError(
-                f"这段行情只有 {len(df)} 根，太短了算不出因子（标准化窗口要 "
-                f"{int(cfg.window)} 根）—— 把回测区间拉长，或者把窗口调小")
+                f"这段行情只有 {len(df)} 根，太短了算不出因子（标准化窗口 "
+                f"{int(cfg.window)} 个交易日，至少要 {need} 根）"
+                " —— 把回测区间拉长，或者把窗口调小")
         raise ValueError("选中的因子在该标的上都没有足够数据（如美股无持仓量）")
 
     fwd = M.forward_return(df, cfg.horizon)
@@ -1364,7 +1378,7 @@ def build_score(
             )
         elif wmode == "ic":
             pack.notes.append(
-                f"权重按过去 {int(cfg.window)} 根的 |IC| 定，每 "
+                f"权重按过去 {int(cfg.window)} 个交易日的 |IC| 定，每 "
                 f"{int(cfg.ic_rebal)} 根更新一次（滞后 {int(cfg.horizon)} 期，无未来信息）"
             )
         elif wmode == "and":
@@ -1989,9 +2003,13 @@ def _pit_vol(df: pd.DataFrame, window: int) -> pd.Series:
     合并训练时各品种的标签必须同尺度：铁矿一天动 2%、玉米动 0.5%，直接拿原始
     前向收益去训，模型会几乎只拟合高波动的那几个品种。除以自己的波动率之后，
     「涨了一个标准差」在所有品种上是同一件事。rolling 只回头看，没有未来信息。
+
+    `window` 是**交易日**，按 bar 密度换成根数：5m 上 252 根只有五天，
+    除的是「最近五天波动」，标签噪音会大到模型学不到东西。
     """
     r = pd.Series(pd.to_numeric(df["close"], errors="coerce")).pct_change()
-    return r.rolling(int(max(20, window)), min_periods=20).std()
+    w = max(20, F.window_bars(window, df.index))
+    return r.rolling(w, min_periods=int(min(w, 20))).std()
 
 
 def pooled_score(

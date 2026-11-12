@@ -999,6 +999,75 @@ def raw_frame(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     return pd.DataFrame({k: raw(df, k) for k in keys}, index=df.index)
 
 
+def bars_per_day(idx) -> float:
+    """平均每个交易日几根 bar。日线 1、1h 约 5~9、5m 约 48~68（含夜盘）。
+
+    数「每个自然日落了多少根」而不是从相邻间隔反推：夜盘、半天交易日（春节前）、
+    停牌都会把间隔统计拉偏，而「这一天里有几根」是能直接数出来的。
+    """
+    try:
+        di = pd.DatetimeIndex(idx)
+    except (TypeError, ValueError):
+        return 1.0
+    if len(di) < 2:
+        return 1.0
+    nd = int(di.normalize().nunique())
+    if nd <= 0:
+        return 1.0
+    return len(di) / float(nd)
+
+
+def _bar_gap_days(idx) -> float:
+    """相邻 bar 的中位间隔（**日历天**）。周线约 7、月线约 30。"""
+    di = pd.DatetimeIndex(idx)
+    if len(di) < 3:
+        return 1.0
+    gaps = pd.Series(di).diff().dt.total_seconds().dropna()
+    if gaps.empty:
+        return 1.0
+    return float(gaps.median()) / 86400.0
+
+
+def window_bars(days, idx) -> int:
+    """**交易日窗口 → bar 根数**。所有「窗口」参数的唯一换算口。
+
+    `window=252` 的语义是「近一年」，不是「252 根」：
+
+    | 周期 | 252 根等于 | 换算后 |
+    |---|---|---|
+    | 日线 | 252 个交易日 | 252 根（不变） |
+    | 1h | 50 个交易日（2.4 个月） | 约 1260 根 |
+    | 5m | **5.3 个交易日** | 约 12000 根 |
+
+    按根算的话 5m 上估的是「最近五天」的标准差和 IC —— 样本少、噪声大，
+    而且同一个 `window` 在日线和 5m 上完全不是一件事，跨周期没法比。
+    实测 5m 上 `mom_20` 的窗口从 252 根换成 252 个交易日后，IC 只动 0.01 上下，
+    说明它不是「让因子变强」，而是把「近一年」这个口径在各周期上对齐。
+
+    日线及**更粗**的周期也会换算：周线一根≈5 个交易日，所以 252 个交易日
+    约 50 根；不换算的话 252 根周线是五年，选「近 1 年」（52 根）会全空。
+
+    ⚠️ 换算结果取决于**这段数据的密度**，不是常数。同一个品种取「近1年」和
+    取「近5年」，算出来的根数会有几个点的差异 —— 这没关系，因为窗口本来就
+    只是「近似一年」，不参与任何跨样本比较。
+    """
+    d = int(max(1, int(days)))
+    try:
+        di = pd.DatetimeIndex(idx)
+    except (TypeError, ValueError):
+        return d
+    if len(di) < 3:
+        return d
+    bpd = bars_per_day(di)
+    if bpd > 1.5:
+        # 日内：一天落了 bpd 根，一年就是 252 × bpd 根
+        return int(max(d, round(d * bpd)))
+    # 日线及更粗：按相邻间隔把交易日折回根数。1 周 = 5 个交易日（不是 7）
+    gap = _bar_gap_days(di)
+    per = max(1.0, round(gap * 5.0 / 7.0)) if gap > 1.5 else 1.0
+    return int(max(1, round(d / per)))
+
+
 def standardize(
     s: pd.Series,
     window: int = 252,
@@ -1006,6 +1075,10 @@ def standardize(
     clip: float = 4.0,
 ) -> pd.Series:
     """滚动标准化。**PIT 的核心**：统计量只取 ≤T 的窗口。
+
+    `window` 单位是**交易日**（`252` = 近一年），不是 bar 根数 —— 分钟线上
+    由 `window_bars()` 换成根数。写死根数的话 5m 上的 252 根只有 5 天，
+    标准差估的是「最近五天的波动」，和日线的 252 天完全不是一件事。
 
     两种口径**都落在 [−4, +4]**，所以进场阈值、离场阈值、稀疏触发的档位在
     两种口径之间可以照抄 —— 换口径不用重调一遍参数。
@@ -1021,8 +1094,12 @@ def standardize(
     不用全样本均值/标准差 —— 那是把未来的分布信息泄漏到今天。
     """
     window = int(window)
-    mp = max(20, window // 4)
-    roll = s.rolling(window, min_periods=mp)
+    nb = window_bars(window, s.index)
+    # 最小样本量按窗口的 1/4，但**不能超过窗口本身**：月线 252 个交易日只折出
+    # 12 根，写死 `max(20, ...)` 会让窗口永远凑不满、整列 NaN（不报错，只是
+    # 因子凭空消失）。
+    mp = int(min(nb, max(20, nb // 4)))
+    roll = s.rolling(nb, min_periods=mp)
     if method == "rank":
         # rank(pct=True) 落在 (0, 1]，减 0.5 再乘 8 就是 ±4。
         # 分位天然免疫极端值（一个 10σ 的毛刺和 3σ 排同一档），
