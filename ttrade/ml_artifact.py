@@ -72,6 +72,23 @@ from dataclasses import dataclass, field, replace as _replace
 import numpy as np
 import pandas as pd
 
+def _replace_retry(tmp: str, dst: str, tries: int = 6) -> None:
+    """os.replace 加个小重试：Windows 上杀软会短暂占住刚写完的文件。
+
+    症状是 PermissionError: [WinError 5] 拒绝访问: x.pkl.tmp -> x.pkl，
+    而且只发生在**进程里第一次**写这种文件时（后面扫描器已经认得它了），
+    所以看起来像「训练产物那一项偶尔红」。不是权限问题，重试几十毫秒就过去了。
+    """
+    for i in range(tries):
+        try:
+            os.replace(tmp, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(0.05 * (i + 1))
+
+
 from ttrade import factor_metrics as M
 from ttrade import factor_strategy as fstrat
 from ttrade import factors as F
@@ -382,7 +399,7 @@ class MlArtifact:
         with open(tmp, "wb") as fh:
             pickle.dump(self, fh, protocol=pickle.HIGHEST_PROTOCOL)
         # 先写临时文件再改名：写到一半崩了不会留下半个坏产物
-        os.replace(tmp, p)
+        _replace_retry(tmp, p)
         return p
 
     @classmethod
@@ -1262,7 +1279,7 @@ class FoldSet:
             tmp = p + ".tmp"
             with open(tmp, "wb") as fh:
                 pickle.dump(fa, fh, protocol=pickle.HIGHEST_PROTOCOL)
-            os.replace(tmp, p)
+            _replace_retry(tmp, p)
         master.folds_meta = [
             {"index": fa.index, "file": os.path.basename(fold_path(master.sid, fa.index)),
              "t_from": fa.t_from, "t_to": fa.t_to, "n_train": fa.n_train,
