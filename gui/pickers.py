@@ -608,12 +608,17 @@ class ContractPicker(QWidget):
                 "或者命令行跑 download_options.py"
             )
             return
-        mine = df[df["variety"].astype(str).str.lower() == self._symbol.lower()]
+        # 品种名要先过映射：股指期货叫 IF / IH / IM，期权叫 IO / HO / MO
+        # （期权的标的是指数不是期货）。按名字直接匹配永远配不上，那三个品种
+        # 的期权就只能落到「列出全库」那一档。
+        want = OS.opt_variety(self._symbol).lower()
+        mine = df[df["variety"].astype(str).str.lower() == want]
+        if mine.empty and want != self._symbol.lower():
+            mine = df[df["variety"].astype(str).str.lower() == self._symbol.lower()]
         fallback = mine.empty
         if fallback:
-            # **IO / MO / HO 没有对应的期货品种**：品种池里只有 IF/IH/IC/IM
-            # 四个股指期货，股指期权是挂在指数上的。这时候不能只回一句
-            # 「没有」，否则这几个品种的期权永远点不到 —— 直接列出全库的链，
+            # 确实没有对应期权（如 IC 中证500 至今没有场内期权）：不能只回一句
+            # 「没有」，否则这类品种的期权永远点不到 —— 直接列出全库的链，
             # 标签里带上品种名让用户自己挑
             mine = df
         # 用库里实际那个写法（`IO` / `br`），后面查行权价要原样带回去

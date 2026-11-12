@@ -112,7 +112,43 @@ def _tq_curve_path(symbol: str, exchange: str) -> str:
 
 
 def load_opt(aux_dir: str, symbol: str, exchange: str) -> pd.DataFrame:
-    return _read(opt_path(aux_dir, symbol, exchange), OPT_COLS)
+    """期权 IV 摘要。aux 文件没有时回退到本地天勤期权库。
+
+    **为什么会有回退**：Tushare 那条链路（`opt_daily` + `settle_map`）要靠
+    「标的期货当天结算价」当 Black-76 里的 F，而**股指期权的标的是指数**
+    （沪深300 / 上证50 / 中证1000），不是期货合约 —— 于是
+    `data_futures_aux/opt_IF_*.csv` 从来就没生成过，IF / IH / IM 的 5 个 IV 因子
+    一直是空的。本地天勤库有这三家的 IV 摘要（IO / HO / MO），只是品种名和期货
+    不一样（见 `optstore.INDEX_FUT_OPT`），映射过来就能用。
+
+    两套数据口径不同（Tushare 用结算价、天勤用收盘价），所以**不做合并**：
+    aux 有就用 aux，没有才回退，同一个品种永远只吃一个源。
+    """
+    df = _read(opt_path(aux_dir, symbol, exchange), OPT_COLS)
+    if not df.empty:
+        return df
+    return _opt_local(symbol)
+
+
+def _opt_local(symbol: str) -> pd.DataFrame:
+    """本地期权库兜底，按期权库文件的 mtime 缓存（下载完要能立刻看到新值）。"""
+    from . import optstore as OS
+
+    db = OS.db_path()
+    try:
+        mtime = os.path.getmtime(db)
+    except OSError:
+        return pd.DataFrame()
+    key = f"local::{symbol}"
+    hit = _cache.get(key)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    df = OS.load_iv_for(symbol)
+    if df.empty:
+        return df
+    _cache[key] = (mtime, df)
+    return df
+
 
 
 def attach(

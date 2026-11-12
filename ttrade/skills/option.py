@@ -64,15 +64,21 @@ def _split_symbol(symbol: str) -> str:
 
 
 def _match_variety(symbol: str, varieties: list[str]) -> str | None:
-    """大小写不敏感匹配品种代码 → 期权库里的写法。
+    """品种代码 → 期权库里的写法，先过「期货→期权」映射再比大小写。
 
-    库里商品期权是小写（`rb` / `m` / `cu`），股指期权是大写（`IO` / `MO` / `HO`），
-    研报代号是 `RB_SHFE` / `M_DCE`。按 lower() 匹配就能对上。
+    库里商品期权是小写（`rb` / `m` / `cu`），郑商所和股指期权是大写
+    （`CF` / `IO` / `MO` / `HO`），研报代号是 `RB_SHFE` / `M_DCE`。
+
+    **股指必须走映射**：期货叫 IF / IH / IM，期权叫 IO / HO / MO（标的是
+    指数不是期货），光按名字匹配永远配不上，Agent 就会回「这个品种没有期权」。
     """
-    sym_lower = symbol.lower()
-    for v in varieties:
-        if str(v).lower() == sym_lower:
-            return str(v)
+    from ttrade import optstore as OS
+
+    want = [OS.opt_variety(symbol).lower(), symbol.lower()]
+    for w in want:
+        for v in varieties:
+            if str(v).lower() == w:
+                return str(v)
     return None
 
 

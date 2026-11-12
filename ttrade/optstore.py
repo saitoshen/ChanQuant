@@ -117,6 +117,67 @@ def exists() -> bool:
     return os.path.isfile(db_path())
 
 
+# 期货品种 → 期权品种。绝大多数同名，只有股指三家**完全不一样**：
+#   沪深300 期货 IF ↔ 期权 IO（标的指数 000300）
+#   上证50  期货 IH ↔ 期权 HO（000016）
+#   中证1000 期货 IM ↔ 期权 MO（000852）
+# 名字对不上的根源是命名口径不同：期货按**合约**命名，期权按**标的指数**命名。
+# 中证500（IC）至今没有对应的场内期权，所以不在这张表里。
+INDEX_FUT_OPT = {"IF": "IO", "IH": "HO", "IM": "MO"}
+
+
+def _base_symbol(symbol: str) -> str:
+    """`IF_CFFEX` / `if` / `IF` → `IF`。交易所后缀和大小写都按品种代码归一。
+
+    🔴 必须先判有没有下划线：`"IF".rpartition("_")` 返回 `("", "", "IF")`，
+    照 `ex` 那一支剥下去就把整个品种切空了（返回空串，所有品种都查不到数据）。
+    """
+    s = str(symbol or "").strip()
+    if "_" in s:
+        sym, _, ex = s.rpartition("_")
+        if ex and ex.isalpha() and ex.isupper():
+            s = sym
+    return s.upper()
+
+
+def opt_variety(symbol: str) -> str:
+    """期货品种名 → 期权品种名（股指走映射，商品原样返回大写）。"""
+    return INDEX_FUT_OPT.get(_base_symbol(symbol), _base_symbol(symbol))
+
+
+def iv_candidates(symbol: str) -> list[str]:
+    """按期货品种给出**库里可能用的**期权品种写法，按优先级排好。
+
+    股指只有映射那一档；商品库里的写法不统一 —— 大商所 / 上期所 / 能源中心
+    是小写（`cu` / `m` / `sc`），郑商所是大写（`CF` / `MA`），所以两种都试。
+    """
+    base = _base_symbol(symbol)
+    if base in INDEX_FUT_OPT:
+        return [INDEX_FUT_OPT[base]]      # 股指：IO / HO / MO，别再去试 IF
+    return [base, base.lower()]
+
+
+def load_iv_for(symbol: str, period: str = "1d", **kw) -> pd.DataFrame:
+    """按**期货品种**取 IV 摘要。
+
+    返回 `index=dt`、列正好 `IV_COLS` 的表（`variety` / `period` 这两个键列
+    去掉）—— 和 `auxdata.load_opt()` 读 Tushare 那份 CSV 的形状一致，可以直接
+    顶替。找不到数据返回空表，不报错。
+
+    存在的理由：股指期权的标的是**指数**不是期货合约，Tushare 那条
+    `opt_daily + settle_map` 的链路拿不到 F，于是 `data_futures_aux/opt_IF_*.csv`
+    根本不会生成 —— 股指期货的 IV 因子一直是空的。本地天勤库有 IO / HO / MO，
+    只是名字对不上，映射一下就能用。
+    """
+    for v in iv_candidates(symbol):
+        df = load_iv(varieties=[v], period=period, **kw)
+        if not df.empty:
+            return (df.set_index("dt")[list(IV_COLS)]
+                    .sort_index().drop_duplicates())
+    return pd.DataFrame()
+
+
+
 @contextmanager
 def connect(read_only: bool = False):
     import duckdb

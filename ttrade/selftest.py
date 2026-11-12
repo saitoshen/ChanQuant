@@ -1830,6 +1830,72 @@ def _run() -> tuple[bool, list[str]]:
 
     check("衍生数据（展期 / 期权因子）", _aux_data)
 
+    def _index_opt_map():
+        """股指期货 ↔ 股指期权的品种名映射（IF→IO / IH→HO / IM→MO）。
+
+        期货按**合约**命名、期权按**标的指数**命名，两边永远对不上：
+        Tushare 那条 `opt_daily + settle_map` 链路也就建不出
+        `opt_IF_*.csv`，股指期货的 5 个 IV 因子一直是空的。
+        """
+        from ttrade import auxdata as A
+        from ttrade import factors as F
+        from ttrade import optstore as OS
+        from ttrade import tqdata as T
+        from ttrade.skills.option import _match_variety
+
+        import pandas as pd
+
+        # 归一化：带交易所后缀、裸代码、小写都要认（`"IF".rpartition("_")`
+        # 那支坑过一次，会把品种切空）
+        want = {"IF": "IO", "IF_CFFEX": "IO", "if": "IO",
+                "IH": "HO", "IM": "MO",
+                "IC": "IC",           # 中证500 没有场内期权，不能乱映射
+                "CU": "CU", "RB_SHFE": "RB", "CF": "CF"}
+        for k, v in want.items():
+            got = OS.opt_variety(k)
+            if got != v:
+                raise RuntimeError(f"{k} 的期权品种应当是 {v}，实际 {got!r}")
+
+        if not OS.exists():
+            return "期权库未下载，只验了映射"
+
+        # 走 aux 回退：股指三家必须拿到 IV，且列要和 aux 那份同构
+        need = list(OS.IV_COLS)
+        got_rows = {}
+        for sym in ("IF", "IH", "IM"):
+            df = A.load_opt(data_dir("aux"), sym, "CFFEX")
+            if df.empty:
+                raise RuntimeError(f"{sym} 取不到期权 IV（映射没生效）")
+            miss = [c for c in need if c not in df.columns]
+            if miss:
+                raise RuntimeError(f"{sym} 的 IV 表缺列 {miss}")
+            if not isinstance(df.index, pd.DatetimeIndex):
+                raise RuntimeError(f"{sym} 的 IV 表索引不是日期")
+            got_rows[sym] = len(df)
+        # 商品那条路不能被改道：CU 有 aux 文件，必须还是读 aux
+        cu = A.load_opt(data_dir("aux"), "CU", "SHFE")
+        if cu.empty:
+            raise RuntimeError("CU 的期权 IV 丢了（回退把 aux 顶掉了）")
+
+        # 因子层：股指期货日线上 IV 因子真算得出值
+        bars = T.load_main("IF", "CFFEX", "1d", adjust="hfq")
+        n_iv = 0
+        if not bars.empty:
+            out = A.attach(bars, "IF", "CFFEX")
+            n_iv = int(pd.Series(F.FACTORS["iv_atm"].func(out)).notna().sum())
+            if n_iv < 200:
+                raise RuntimeError(f"IF 的 iv_atm 只有 {n_iv} 个有效值")
+
+        if _match_variety("IF", ["IO", "cu", "rb"]) != "IO":
+            raise RuntimeError("技能层的品种匹配没走映射")
+        if _match_variety("IC", ["IO", "cu", "rb"]) is not None:
+            raise RuntimeError("IC 不该匹配到任何期权品种")
+        return (f"IF→IO / IH→HO / IM→MO；IV 行数 "
+                + "、".join(f"{k} {v}" for k, v in got_rows.items())
+                + f"；IF 日线 iv_atm {n_iv} 个值")
+
+    check("股指期货 ↔ 期权品种映射（IF→IO）", _index_opt_map)
+
     def _factor_metrics():
         from ttrade import factor_metrics as M
         from ttrade import factors as F
