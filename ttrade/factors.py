@@ -276,6 +276,149 @@ def f_roll_change_o6(df: pd.DataFrame) -> pd.Series:
     return _roll_change(df, "o6_")
 
 
+# ---------------------------------------------------------------- 主力次主力：选腿
+#
+# 中国商品期货的主力月份是跳跃的（螺纹/热卷/铁矿只做 1/5/10，豆粕/棕榈/豆油
+# 只做 1/5/9），所以「近月」不能按到期日排 —— 排出来的第一个经常是持仓只占
+# 全品种 0.1% 的空壳合约。主力/次主力口径两端都由**持仓量**决定：近端取持仓
+# 最大的腿，远端取它之后持仓最大的腿，第三腿再往后取一条。
+#
+# 选腿和计算拆开：选腿只做一遍，收益率 / 年化 / 曲率 / 变化 / 持仓占比五个
+# 因子共用同一份结果。选腿本身和以前内联的版本逐位一致 —— 老输出不能变。
+@dataclass(frozen=True)
+class _MainLegs:
+    """按持仓量选出的三条腿。价格、到期天数、持仓各一组。"""
+
+    c_main: pd.Series
+    c_next: pd.Series
+    c_third: pd.Series
+    dte_main: pd.Series
+    dte_next: pd.Series
+    dte_third: pd.Series
+    oi_main: pd.Series
+    oi_sum: pd.Series
+    # 曲率回退用：次主力正好是最后一腿时，「主力与次主力之间」那条腿。
+    # 有第三腿时这一组是 NaN（用不上），见 `_roll_main_raw`。
+    c_mid: pd.Series
+    dte_mid: pd.Series
+
+
+def _main_legs(df: pd.DataFrame, pre: str) -> _MainLegs:
+    """从 3 条腿里按持仓量挑主力 / 次主力 / 第三腿。
+
+    `pre` 是列前缀（`o6_` / `o3_` / `c`）。缺失的腿用 -inf 占位让 `argmax`
+    跳过；整行都缺时对应字段是 NaN，下游 `filter_available()` 会把它剔掉。
+
+    **ok 只看 close 和 oi，不看 dte**：只下过基础档衍生数据的品种没有到期天数，
+    但价差照样算得出来 —— 那种情况下收益率因子有效、年化/曲率才是 NaN。
+    要是把 dte 也算进 ok，这些品种会连收益率一起丢掉。
+    """
+    close = np.column_stack([
+        _col(df, f"{pre}{i}_close").to_numpy(dtype=float) for i in (1, 2, 3)
+    ])
+    oi = np.column_stack([
+        _col(df, f"{pre}{i}_oi").to_numpy(dtype=float) for i in (1, 2, 3)
+    ])
+    dte = np.column_stack([
+        _col(df, f"{pre}{i}_dte").to_numpy(dtype=float) for i in (1, 2, 3)
+    ])
+    ok = np.isfinite(close) & np.isfinite(oi)
+    rows = np.arange(len(df))
+    idx = np.arange(3)[None, :]
+
+    # 用 -inf 占位，argmax 就会跳过缺失的腿；全缺时 has_* 把结果打成 NaN
+    i_main = np.where(ok, oi, -np.inf).argmax(axis=1)
+    has_main = ok.any(axis=1)
+    # 次主力：必须落在主力**之后**（更远月），不能又选回主力那条
+    after1 = (idx > i_main[:, None]) & ok
+    v1 = np.where(after1, oi, -np.inf)
+    has_next = np.isfinite(v1).any(axis=1)
+    i_next = v1.argmax(axis=1)
+    # 第三腿：再往后一条，供曲率用。has_next 为假时把下标推到 3（越界），
+    # 保证 after2 全 False，不会误取到主力那条
+    after2 = (idx > np.where(has_next, i_next, 3)[:, None]) & ok
+    v2 = np.where(after2, oi, -np.inf)
+    has_third = np.isfinite(v2).any(axis=1)
+    i_third = v2.argmax(axis=1)
+
+    def take(mat, i, mask):
+        return pd.Series(np.where(mask, mat[rows, i], np.nan), index=df.index)
+
+    first2 = has_main & has_next
+    first3 = first2 & has_third
+    # 曲率三点：主力 → 次主力 → 其后那条。次主力已经是最后一腿时（RB 上占
+    # 七成），退成「主力 → 中间那条 → 次主力」—— 三点仍按到期日单调，仍是
+    # 一条曲线的三段，只是中间点不按持仓选。不做这一步，曲率只有 24% 的
+    # 样本有值，因子分析页上的 IC 会建立在一小撮日子上。
+    gap = i_next - i_main
+    use_mid = first2 & ~has_third & (gap >= 2)
+    i_mid = np.where(use_mid, i_main + 1, i_next)
+    return _MainLegs(
+        c_main=take(close, i_main, has_main),
+        c_next=take(close, i_next, first2),
+        c_third=take(close, i_third, first3),
+        dte_main=take(dte, i_main, has_main),
+        dte_next=take(dte, i_next, first2),
+        dte_third=take(dte, i_third, first3),
+        oi_main=take(oi, i_main, has_main),
+        # 分母取「可见的那几条腿」之和，缺腿按 0 计
+        oi_sum=pd.Series(np.where(ok, oi, 0.0).sum(axis=1), index=df.index),
+        c_mid=take(close, i_mid, use_mid),
+        dte_mid=take(dte, i_mid, use_mid),
+    )
+
+
+def _day_roll_mean(df: pd.DataFrame, s: pd.Series, n: int = 5,
+                   minp: int = 3) -> pd.Series:
+    """按**交易日**取 n 日均值，再映射回每根 bar。
+
+    日线上 `s.rolling(n)` 就是 n 天，没问题；5 分钟线上 `rolling(5)` 只有
+    25 分钟，等于没平滑。衍生数据本身是「一天一个快照」，由
+    `auxdata.attach_intraday` 铺到当天每根 bar 上，所以必须先压成日频。
+
+    和 `_day_diff` 同一个口径，两处都不能改成 bar 口径 —— 那会让同一个因子
+    在日线和分钟线上变成两个不同的东西。
+    """
+    day = _trade_day(df)
+    if len(day) == len(day.unique()):
+        return s.rolling(n, min_periods=minp).mean()
+    daily = s.groupby(day).last()
+    m = daily.rolling(n, min_periods=minp).mean()
+    return pd.Series(np.asarray(day.map(m), dtype=float), index=s.index)
+
+
+def _main_legs_auto(df: pd.DataFrame) -> _MainLegs:
+    """先试 o6_，整列取不到就退 o3_ —— 只下了基础档衍生数据的品种只有 o3_。"""
+    legs = _main_legs(df, "o6_")
+    if legs.c_main.notna().sum() == 0:
+        legs = _main_legs(df, "o3_")
+    return legs
+
+
+def _roll_main_raw(df: pd.DataFrame) -> tuple:
+    """主力次主力口径的三个原始量：(价差率, 年化, 曲率)，**都不平滑**。
+
+    单独抽出来是给 `f_roll_main_change` 用的：变化要在**原始**年化值上做差分，
+    拿平滑过的再差分等于平滑两遍，滞后会叠加，换月之后要好几周才跟上。
+    """
+    g = _main_legs_auto(df)
+    ry = _safe_div(g.c_main - g.c_next, g.c_next)
+    gap1 = (g.dte_next - g.dte_main).clip(lower=1.0)
+    ann = ry * 365.0 / gap1
+    # 曲率的三点自适应：有第三腿就用 (主力, 次主力, 第三腿)；没有就用
+    # (主力, 中间腿, 次主力) —— 见 `_main_legs` 里的说明
+    has3 = g.c_third.notna()
+    b_close = g.c_next.where(has3, g.c_mid)
+    b_dte = g.dte_next.where(has3, g.dte_mid)
+    e_close = g.c_third.where(has3, g.c_next)
+    e_dte = g.dte_third.where(has3, g.dte_next)
+    l1 = _safe_log_ratio(g.c_main, b_close)
+    l2 = _safe_log_ratio(b_close, e_close)
+    gap2 = (e_dte - b_dte).clip(lower=1.0)
+    curv = (l2 / gap2 - l1 / gap1) * 365.0
+    return ry, ann, curv
+
+
 def f_roll_main_oi(df: pd.DataFrame) -> pd.Series:
     """主力/次主力价差率：近端取持仓最大的腿，远端取它**之后**持仓最大的腿。
 
@@ -288,33 +431,69 @@ def f_roll_main_oi(df: pd.DataFrame) -> pd.Series:
 
     最后做 5 日均值：单日价差在换腿当天会跳一下，平滑之后才是「期限结构的陡峭度」
     而不是「今天轮到哪个合约」。
-    """
-    def pick(pre: str):
-        close = np.column_stack([
-            _col(df, f"{pre}{i}_close").to_numpy(dtype=float) for i in (1, 2, 3)
-        ])
-        oi = np.column_stack([
-            _col(df, f"{pre}{i}_oi").to_numpy(dtype=float) for i in (1, 2, 3)
-        ])
-        ok = np.isfinite(close) & np.isfinite(oi)
-        # 用 -inf 占位，argmax 就会跳过缺失的腿；全缺时 has_* 负责把结果打成 NaN
-        i_main = np.where(ok, oi, -np.inf).argmax(axis=1)
-        has_main = ok.any(axis=1)
-        after = (np.arange(3)[None, :] > i_main[:, None]) & ok
-        far = np.where(after, oi, -np.inf)
-        has_far = np.isfinite(far).any(axis=1)
-        i_far = far.argmax(axis=1)
-        rows = np.arange(len(df))
-        near = pd.Series(np.where(has_main, close[rows, i_main], np.nan), index=df.index)
-        nextm = pd.Series(
-            np.where(has_main & has_far, close[rows, i_far], np.nan), index=df.index
-        )
-        return near, nextm
 
-    near, nextm = pick("o6_")
-    if near.notna().sum() == 0:
-        near, nextm = pick("o3_")
-    return _safe_div(near - nextm, nextm).rolling(5, min_periods=3).mean()
+    选腿逻辑现在抽在 `_main_legs` 里，和年化/曲率/变化/占比共用一份。
+    """
+    ry, _, _ = _roll_main_raw(df)
+    return ry.rolling(5, min_periods=3).mean()
+
+
+def f_roll_main_annual(df: pd.DataFrame) -> pd.Series:
+    """展期年化收益率·主力次主力：把主力-次主力价差按两者到期间隔折算成年化。
+
+    为什么必须年化：主力合约和次主力之间隔多久，各品种差得很远 —— 螺纹主力
+    换月后次主力通常是 4 个月后，而有些品种只隔一个月。同样是 2% 的价差，
+    隔 30 天和隔 120 天完全是两个机会。
+
+    同样做 5 日均值，理由和 `f_roll_main_oi` 一样（换腿当天有台阶）。
+    """
+    _, ann, _ = _roll_main_raw(df)
+    return _day_roll_mean(df, ann, 5, 3)
+
+
+def f_roll_main_curv(df: pd.DataFrame) -> pd.Series:
+    """展期曲率·主力次主力：后一段的年化斜率减去前一段的，刻画曲线往哪边弯。
+
+    三点首选「主力 → 次主力 → 其后的腿」；次主力已经是最远那条时，退回
+    「主力 → 主力与次主力之间那条 → 次主力」。退回来的版本首尾仍是主力/次主力，
+    只是中间点按到期日而不是按持仓选。
+
+    曲率为负＝近端更陡（近月紧张、现货挤），为正＝远端更陡（远期预期更强）。
+    用「斜率之差」而不是三点二阶差分，是因为三条腿的到期间隔通常不等距，
+    直接差分会被间隔差异污染 —— 和 `_roll_curv` 同一个理由。
+
+    曲线形态在不同品种上含义不同：back 结构下主力最贵，曲率通常为正；
+    近月逼仓时近端被拉陡，曲率转负。它是**形态**信号，不是**水平**信号，
+    和 `f_roll_main_oi` 一起看才知道是「整条曲线陡」还是「近端翘」。
+    """
+    _, _, curv = _roll_main_raw(df)
+    return _day_roll_mean(df, curv, 5, 3)
+
+
+def f_roll_main_change(df: pd.DataFrame) -> pd.Series:
+    """展期变化·主力次主力：年化展期收益率的 20 交易日变化。
+
+    水平告诉你现在 backwardation 有多深，变化告诉你在往哪个方向走 ——
+    两者经常背离：深度 contango 但正在快速修复，和浅 contango 继续恶化，
+    后面的行情完全不一样。
+
+    差分用**未平滑**的年化值（见 `_roll_main_raw` 的说明），换月后能立刻跟上；
+    按交易日而不是自然日差分，分钟线上才是「20 个交易日」。
+    """
+    _, ann, _ = _roll_main_raw(df)
+    return _day_diff(df, ann, 20)
+
+
+def f_roll_main_share(df: pd.DataFrame) -> pd.Series:
+    """主力腿持仓 / 三条腿持仓之和。
+
+    和 `near_oi_share`（近月/次近月，只在原口径提供）不是一回事：这里的分子
+    是**持仓最大的那条腿**，分母是能看见的全部三条腿。它衡量「资金集中度」——
+    接近 1 说明整个品种的交易都在一个合约上，远月还没起来；偏低说明主力已经
+    分散到多个合约，或者这个品种本身就没有明显的主力月。
+    """
+    g = _main_legs_auto(df)
+    return _safe_div(g.oi_main, g.oi_sum)
 
 
 # ---------------------------------------------------------------- 期权 / 波动率曲面
@@ -668,6 +847,16 @@ _reg(FactorSpec("roll_change_o6", "展期变化·OI6", f_roll_change_o6, "展期
 # 归在「展期」里（用户自己建的那条也在这类），但依赖 o6_ 那套列，没有时退回 o3_
 _reg(FactorSpec("roll_main_oi", "展期收益率·主力次主力（持仓量口径）", f_roll_main_oi, "展期",
                 "近端取持仓最大的腿、远端取其后持仓最大的腿，5 日均值。正值=backwardation。", markets=("cn",)))
+# 主力次主力的另外三个：和 c / OI3 / OI6 三套一样凑齐「收益率→年化→曲率→变化」
+# 一整套，外加一个持仓集中度。四个都读同一份选腿结果（见 `_main_legs`）。
+_reg(FactorSpec("roll_main_annual", "展期年化·主力次主力", f_roll_main_annual, "展期",
+                "主力-次主力价差按两者到期间隔年化，跨品种可比。正值=近端贵。", markets=("cn",)))
+_reg(FactorSpec("roll_main_curv", "展期曲率·主力次主力", f_roll_main_curv, "展期",
+                "次主力→第三腿与主力→次主力的年化斜率之差，刻画曲线弯曲方向。", markets=("cn",)))
+_reg(FactorSpec("roll_main_change", "展期变化·主力次主力", f_roll_main_change, "展期",
+                "年化展期收益率的 20 交易日变化，反映曲线陡峭度的动量。", markets=("cn",)))
+_reg(FactorSpec("roll_main_share", "主力持仓占比 3 腿", f_roll_main_share, "展期",
+                "持仓最大的腿 / 三腿持仓之和，衡量资金集中在一个合约上的程度。", markets=("cn",)))
 
 # 期权：需要期权日线反解出的波动率曲面，来自 data_futures_aux —— 期货专属
 _reg(FactorSpec("iv_atm", "平值 IV", f_iv_atm, "期权",

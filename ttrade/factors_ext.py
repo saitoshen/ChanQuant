@@ -426,6 +426,33 @@ def _fund(df: pd.DataFrame, cat: str, lag: int = 1) -> pd.Series:
     return _asof(s, df.index, lag_days=lag)
 
 
+def _pct_rank(df: pd.DataFrame, s: pd.Series, n: int = 750,
+              minp: int = 250) -> pd.Series:
+    """滚动分位（0~1）：当前值排在**过去 n 个交易日**里的第几成。
+
+    为什么基本面要用分位而不是原始值：仓单 800 手和 40 万吨都是「仓单数量」，
+    原始值跨品种差四个数量级，直接进横截面等于让大品种主导排序。分位把
+    「绝对值」换成「相对自己历史的贵贱」，才是可比的。
+
+    窗口 750 个交易日约三年：太短会被一个交割季带偏（仓单本身有强季节性），
+    太长则新品种（碳酸锂、氧化铝上市不满三年）整列 NaN。
+
+    **窗口必须按交易日算，不能按 bar 算**：5 分钟线上一根日线快照被铺到几十
+    根 bar 上，直接 `s.rolling(750)` 量到的是「最近 15 个交易日」，出来的是
+    两周内的排名，不是三年分位 —— 而且它不会报错，只是悄悄变成另一个因子。
+    做法和 `_day_diff` 一样：压成日频算完再映射回去。
+
+    只用向后看的 rolling rank，不用全样本 —— 全样本分位会把未来的分布
+    泄露到今天的因子值里，是最隐蔽的一类未来函数。
+    """
+    day = _day(df)
+    if len(day) == len(day.unique()):        # 日线：一天一根，直接滚
+        return s.rolling(n, min_periods=minp).rank(pct=True)
+    daily = s.groupby(day).last()
+    r = daily.rolling(n, min_periods=minp).rank(pct=True)
+    return pd.Series(np.asarray(day.map(r), dtype=float), index=s.index)
+
+
 def f_war_chg_1(df):
     """仓单数量 1 日变化率。仓单增加 = 现货往交易所流 = 供应宽松。"""
     s = _fund(df, "warehouse")
@@ -447,6 +474,31 @@ def f_war_oi(df):
     s = _fund(df, "warehouse")
     oi = _oi(df)
     return _safe_div(s, oi.where(oi > 0))
+
+
+def f_war_val(df):
+    """仓单数量的绝对水平（T-1 口径，单位随品种：手 / 吨）。
+
+    「仓库里注册了多少货」的最原始读数。跨品种不可比 —— 和 `profit_val` 同理，
+    它的用处只有两个：同一品种的时序对比（比上个月多还是少），以及配合
+    `f_war_pct` 看现在处在历史什么位置。
+
+    想进横截面就用 `f_war_pct`，别用这一列。
+    """
+    return _fund(df, "warehouse")
+
+
+def f_war_pct(df):
+    """仓单数量的三年滚动分位（0~1）。高分位＝仓单堆到历史高位。
+
+    仓单是**显性库存**，方向通常是反向的：仓单高企＝现货充裕、近月不缺货，
+    对价格偏空；仓单被大量注销（分位快速下滑）往往是现货开始紧张的先行信号。
+    注意它和 `war_chg` 那一组是两个维度：变化率看「这周在增还是在减」，
+    分位看「增到了一个什么位置」。
+
+    周频指标，铺到日线上是阶梯状 —— 几天不变是正常的，不是数据没更新。
+    """
+    return _pct_rank(df, _fund(df, "warehouse"))
 
 
 def f_spot_basis(df):
@@ -486,6 +538,21 @@ def f_inv_chg_5(df):
     """期货库存 5 日变化率。和仓单类似但口径更宽（含非注册仓单）。"""
     s = _fund(df, "inventory")
     return s.pct_change(5)
+
+
+def f_inv_val(df):
+    """期货库存的绝对水平（T-1 口径）。
+
+    口径比仓单宽：仓单只算**已注册**的，库存含交易所统计的全部在库货物。
+    所以库存通常大于同级仓单，两者的差（未注册部分）本身也有信息量，但
+    EDB 给的是两条独立序列，相减之前先确认单位一致。原始值跨品种不可比。
+    """
+    return _fund(df, "inventory")
+
+
+def f_inv_pct(df):
+    """期货库存的三年滚动分位（0~1）。高分位＝在库货物堆到历史高位。"""
+    return _pct_rank(df, _fund(df, "inventory"))
 
 
 def f_deliv_chg_30(df):
@@ -710,11 +777,15 @@ FORMULAS = {
     "term_near_far": "(P_1 − P_3) / P_1",
     "war_chg_1": "WAR_t / WAR_{t−1} − 1（T−1 口径）",
     "war_chg_5": "WAR_t / WAR_{t−5} − 1（T−1 口径）",
+    "war_val": "WAR（原始数量，T−1）",
+    "war_pct": "rank_pct(WAR, 750 日滚动)",
     "war_oi": "WAR / OI（均为 T−1）",
     "spot_basis": "(Spot − Fut) / Fut（均为 T−1）",
     "spot_basis_chg_5": "Basis_t − Basis_{t−5}",
     "profit_val": "Profit（元/吨，T−1）",
     "profit_chg_5": "(Profit_t − Profit_{t−5}) / |Profit_{t−5}|",
+    "inv_val": "INV（原始数量，T−1）",
+    "inv_pct": "rank_pct(INV, 750 日滚动)",
     "inv_chg_5": "INV_t / INV_{t−5} − 1（T−1 口径）",
     "deliv_chg_30": "DLV_t / DLV_{t−30} − 1（月频，T−1 口径）",
     "sector_mom_10": "Σ_{10} r_sector，r_sector 为板块指数日收益",
@@ -768,6 +839,10 @@ def register_into(FACTORS, FactorSpec) -> int:
          "仓单数量 1 日变化率，仓单增加＝供应宽松。", -1),
         ("war_chg_5", "仓单变化 5 日", f_war_chg_5, "基本面",
          "仓单数量 5 日变化率。", -1),
+        ("war_val", "仓单数量", f_war_val, "基本面",
+         "仓单绝对水平（T−1），跨品种不可比，只用于同品种时序对比。"),
+        ("war_pct", "仓单分位 3 年", f_war_pct, "基本面",
+         "仓单在过去 750 个交易日中的分位，高＝显性库存堆到历史高位。", -1),
         ("war_oi", "仓单持仓比", f_war_oi, "基本面",
          "仓单 / 期货持仓，可交割库存相对盘面规模，低＝易挤仓。"),
         ("spot_basis", "现货基差率", f_spot_basis, "基本面",
@@ -778,6 +853,10 @@ def register_into(FACTORS, FactorSpec) -> int:
          "加工利润绝对水平（元/吨），跨品种不可比，同品种时序可比。"),
         ("profit_chg_5", "加工利润变化 5 日", f_profit_chg_5, "基本面",
          "加工利润 5 日变化率，分母取绝对值，利润为负时符号不翻。"),
+        ("inv_val", "库存数量", f_inv_val, "基本面",
+         "期货库存绝对水平（T−1），口径比仓单宽，跨品种不可比。"),
+        ("inv_pct", "库存分位 3 年", f_inv_pct, "基本面",
+         "库存在过去 750 个交易日中的分位，高＝在库货物堆到历史高位。", -1),
         ("inv_chg_5", "库存变化 5 日", f_inv_chg_5, "基本面",
          "期货库存 5 日变化率，口径比仓单宽。", -1),
         ("deliv_chg_30", "交割量变化 30 日", f_deliv_chg_30, "基本面",
