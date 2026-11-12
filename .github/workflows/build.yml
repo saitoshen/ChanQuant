@@ -122,13 +122,22 @@ jobs:
       - name: 自检（验证包内资源与 Qt 插件）
         shell: bash
         run: |
+          # 失败时把 [FAIL] 那几行**发成 annotation**：job 日志要 API token 才能
+          # 读，annotation 匿名就能读，排查打包环境独有的失败时这是唯一线索。
+          emit() {
+            grep -m5 "\[FAIL\]" "$1" | while IFS= read -r l; do
+              echo "::error title=selftest::${l}"
+            done
+          }
           if [ "$RUNNER_OS" = "Windows" ]; then
-            ./dist/ChanQuant/ChanQuant.exe --selftest || { cat "$LOCALAPPDATA/ChanQuant/logs/selftest.log"; exit 1; }
-            cat "$LOCALAPPDATA/ChanQuant/logs/selftest.log"
+            log="$LOCALAPPDATA/ChanQuant/logs/selftest.log"
+            ./dist/ChanQuant/ChanQuant.exe --selftest || { cat "$log"; emit "$log"; exit 1; }
+            cat "$log"
           else
+            log="$HOME/Library/Application Support/ChanQuant/logs/selftest.log"
             ./dist/ChanQuant.app/Contents/MacOS/ChanQuant --selftest || {
-              cat "$HOME/Library/Application Support/ChanQuant/logs/selftest.log"; exit 1; }
-            cat "$HOME/Library/Application Support/ChanQuant/logs/selftest.log"
+              cat "$log"; emit "$log"; exit 1; }
+            cat "$log"
           fi
 
       - name: 列出产物
