@@ -145,30 +145,45 @@ def ensure_native_dll_path() -> bool:
 
 # 打包后**必须**在包里的原生库。少一个就说明 PyInstaller 的依赖解析没打通，
 # 而它的症状是「能启动、一进界面就崩」或者「图上没有中文」，装机之后才发现。
+# 关键原生库的「名字特征」。**不能写死扩展名**：同一个东西三个平台三种文件名 ——
+#   · PySide6 的 Qt 运行时：Windows `Qt6Core.dll`、
+#     macOS `QtCore.framework/Versions/A/QtCore` 或 `libQt6Core.6.dylib`；
+#   · Pillow 的 `_imaging`：Windows `.pyd`、macOS `.so`。
+# 第一版把 Windows 的名字原样写死，于是 v3.3.1 的 macOS 两个 job 全红、Windows
+# 反而绿 —— 校验逻辑自己成了发版障碍。宁可松一点：它的用途是抓「整套 Qt 没进包」，
+# 不是精确数文件。
 BUNDLE_REQUIRED = [
-    ("Qt6Core.dll", "PySide6 的 Qt 运行时"),
-    ("shiboken6", "PySide6 的 C++ 绑定层"),
+    (("qt6core", "qtcore"), "PySide6 的 Qt 运行时"),
+    (("shiboken6",), "PySide6 的 C++ 绑定层"),
 ]
+
+# Pillow 的 `_imaging` 单独判：它必须匹配 `_imaging.` 开头（`_imagingcms` /
+# `_imagingft` 这些子模块不算数），扩展名照样不限定（.pyd / .so 都行）
+PIL_CORE_PREFIX = "_imaging."
 
 
 def verify_bundle(target: str) -> list[str]:
-    """验一遍关键 DLL 在不在产物里。返回缺失项（空 = 通过）。"""
+    """验一遍关键原生库在不在产物里。返回缺失项（空 = 通过）。"""
     internal = (os.path.join(target, "Contents", "Frameworks") if IS_MAC
                 else os.path.join(target, "_internal"))
     if not os.path.isdir(internal):
         internal = target
-    names = set()
+    names: list[str] = []
     for base, _dirs, files in os.walk(internal):
         for fn in files:
-            names.add(fn.lower())
+            names.append(fn.lower())
     missing = []
-    for key, why in BUNDLE_REQUIRED:
-        k = key.lower()
-        if not any(k in n for n in names):
-            missing.append(f"{key}（{why}）")
-    # Pillow 的 _imaging 是 matplotlib 画图的实际入口，缺了「图上一片空白」
-    if not any(n.startswith("_imaging") and n.endswith(".pyd") for n in names):
-        missing.append("_imaging.pyd（Pillow 画图）")
+    for needles, why in BUNDLE_REQUIRED:
+        if not any(nd in n for n in names for nd in needles):
+            missing.append(f"{'/'.join(needles)}（{why}）")
+    # 缺了 Pillow 的 _imaging 不会崩，但 matplotlib 一画图就空白 —— 同样静默
+    if not any(n.startswith(PIL_CORE_PREFIX) for n in names):
+        missing.append(f"{PIL_CORE_PREFIX}*（Pillow 画图）")
+    if missing:
+        # 把相关文件名打出来：这个检查只在 CI（另一个平台）才会红，拿不到日志时
+        # 这行样本就是唯一的线索
+        sample = sorted({n for n in names if "qt" in n or "imaging" in n})[:8]
+        log(f"  （包里 Qt / Pillow 相关文件名样本：{sample}）")
     return missing
 
 
