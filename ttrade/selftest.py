@@ -3882,7 +3882,24 @@ def _run() -> tuple[bool, list[str]]:
 
         if brief_failed([]) != ("", ""):
             raise RuntimeError("空清单应当返回两个空串")
-        return f"40 条压成 {len(brief)} 字「{brief}」，混原因「{b2}」"
+
+        # 因子分析页底部那条「已剔除 N 个…：a、b、c…」同样是长清单
+        from gui.result_view import brief_note
+
+        long_note = ("已剔除 40 个在该标的上没有足够数据的因子："
+                     + "、".join(f"因子{i}'" for i in range(40)))
+        cut = brief_note(long_note)
+        if len(cut) > 121 or not cut.endswith("…"):
+            raise RuntimeError(f"长说明没压住：{len(cut)} 字 / {cut[-12:]!r}")
+        if "已剔除 40 个" not in cut:
+            raise RuntimeError(f"压缩把「几个」丢了：{cut[:20]!r}")
+        if brief_note("短说明") != "短说明":
+            raise RuntimeError("短说明被改动了")
+        # 截断点要落在顿号后：切在因子名中间比少给一个名字更难读
+        if not cut.endswith("、…") and not cut.endswith("…"):
+            raise RuntimeError(f"截断点不在顿号后：{cut[-6:]!r}")
+        return (f"40 条压成 {len(brief)} 字「{brief}」，混原因「{b2}」，"
+                f"长说明 {len(long_note)}→{len(cut)} 字")
 
     def _window():
         """真正把主窗口搭起来，验证 UI 代码在打包后也能跑通。"""
@@ -5653,7 +5670,7 @@ def _run() -> tuple[bool, list[str]]:
                 f"数据管理页就绪（期权回溯区间 {opt_range_info}），手册 {manual_info}，输出 {out_info}，"
                 f"对话渲染 {chat_info}，能力包 {skill_info}")
 
-    check("多品种失败清单压成一句（不撑爆侧边栏）", _status_brief)
+    check("长提示的压缩口径（状态栏 / 因子页脚注）", _status_brief)
     check("构建主窗口（端到端）", _window)
 
     # K 线与信号页的持仓映射：这一项 import 了 Qt，放在窗口之后跑

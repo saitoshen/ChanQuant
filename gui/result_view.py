@@ -141,6 +141,26 @@ def set_tab_visible(tabs, title: str, on: bool) -> None:
             return
 
 
+def brief_note(text: str, limit: int = 120) -> str:
+    """把一条说明压到 `limit` 字以内，完整原文由调用方挂 tooltip。
+
+    因子勾得多的时候「已剔除 N 个在该标的上没有足够数据的因子：动量20日、
+    反转5日、持仓量…」能写出几百字，因子分析页底部那条 `Hint` 会被挤成
+    五六行，把四格图压小。界面上留「已剔除 12 个…：动量、反转、持仓量…」
+    就够用 —— 想逐个核对，鼠标一悬停就是原文。
+
+    截断点尽量落在顿号上：切在因子名中间（「动量2…」）比少给一个名字更难读。
+    """
+    s = str(text or "").strip()
+    if len(s) <= limit:
+        return s
+    cut = s[:limit]
+    j = cut.rfind("、")
+    if j >= limit - 20:           # 顿号就在尾巴附近：切在它后面更整齐
+        cut = cut[:j + 1]
+    return cut.rstrip("，,、 ") + "…"
+
+
 def _money_unit(market) -> tuple[str, str]:
     """(单位词, 金额前缀)。美股 `$`，国内（期货 / A 股）`元` / `¥`。
 
@@ -2437,7 +2457,11 @@ class ResultView(QObject):
             "口径：IC 为秩相关；ICIR=滚动IC均值/标准差；t 值经 Newey-West 调整"
             "（滚动窗口重叠会严重高估显著性）；分位与方向均按 PIT 滚动计算"
         )
-        self.lbl_fnote.setText(" · ".join(n for n in notes if n))
+        notes = [n for n in notes if n]
+        # 「已剔除 N 个…：a、b、c…」这类说明能写到几百字，原样铺在四格图下面
+        # 会把它挤矮。正文只留前一段，逐条原文进 tooltip（一条一行）。
+        self.lbl_fnote.setText(" · ".join(brief_note(n) for n in notes))
+        self.lbl_fnote.setToolTip("\n".join(str(n) for n in notes))
 
     # ---------------------------------------------------------- 截面因子分析
 
