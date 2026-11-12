@@ -625,7 +625,11 @@ def rolling_ic_weights(fmat: pd.DataFrame, fwd: pd.Series, cfg: FactorConfig
     # 权重全 0 会让分数整段 NaN，界面上就是「策略没信号」，查起来毫无线索
     dead = ~(w.sum(axis=1, skipna=True) > 0)
     if bool(dead.any()):
-        w.loc[dead, :] = 1.0
+        # 🔴 同 auxdata._join_bar_asof：「布尔行掩码 + 整行切片 + 标量」在
+        # pandas 3.0.6 + numpy 2.5.4 上会抛 IndexError（_setitem_single_block
+        # 传了 3 元索引），逐列 mask 才稳。
+        for c in w.columns:
+            w[c] = w[c].mask(dead, 1.0)
     return w
 
 

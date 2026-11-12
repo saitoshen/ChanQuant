@@ -451,7 +451,12 @@ def _join_bar_asof(out: pd.DataFrame, part: pd.DataFrame) -> pd.DataFrame:
     hi = right["_ts"].max() + pd.Timedelta(days=1)
     idx = pd.DatetimeIndex(out.index)
     keep = (idx >= lo) & (idx <= hi)
-    vals.loc[~keep, :] = float("nan")
+    # 🔴 别写成 `vals.loc[~keep, :] = nan`：pandas 3.0.6 + numpy 2.5.4 下这种
+    # 「布尔行掩码 + 整行切片 + 标量」会走 `_setitem_single_block`，numpy 拿到的
+    # 是 3 元索引、直接抛 `IndexError: array is 2-dimensional, but 3 were indexed`
+    # （3.0.3 上偏偏不炸，于是本地全绿、CI 三平台全红）。逐列 `where` 不碰这条路径。
+    for c in vals.columns:
+        vals[c] = vals[c].where(keep)
     return out.join(vals)
 
 
