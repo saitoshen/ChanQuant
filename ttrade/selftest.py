@@ -2129,6 +2129,103 @@ def _run() -> tuple[bool, list[str]]:
 
     check("因子窗口按交易日（不是根）", _factor_window_days)
 
+    def _portfolio_plan():
+        """组合工作区的资金分配：ERC / 三种口径 / 缩放。
+
+        这一层全是「不报错但结果错」的类型：ERC 用错迭代会把权重推到角点
+        （看着解出来了，其实只留两条策略）；`fixed` 口径被放大而手数根本不动；
+        `usage` 口径忘了按实测占用反推，本金就只是被均分了。所以逐条钉死。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import portfolio_plan as PL
+
+        # ① ERC：风险贡献份额必须**完全相等**
+        rng = np.random.default_rng(31)
+        for n in (1, 2, 5, 12):
+            a = rng.normal(size=(n, n))
+            cov = a @ a.T / n + np.eye(n) * 0.2
+            d = np.sqrt(np.diag(cov))
+            cov = cov / np.outer(d, d)
+            w = PL.erc_weights(cov)
+            if abs(float(w.sum()) - 1.0) > 1e-12:
+                raise RuntimeError(f"n={n} 的 ERC 权重和不等于 1（{w.sum()}）")
+            rc = w * (cov @ w)
+            share = rc / rc.sum()
+            if float(np.max(np.abs(share - 1.0 / n))) > 1e-6:
+                raise RuntimeError(
+                    f"n={n} 的 ERC 风险贡献不相等：{np.round(share, 6)}，"
+                    f"应全为 {1.0 / n:.6f}")
+            # 完美共线也不能炸
+            one = np.ones((n, n))
+            w2 = PL.erc_weights(one)
+            if not np.all(np.isfinite(w2)) or abs(float(w2.sum()) - 1.0) > 1e-9:
+                raise RuntimeError("完全共线时 ERC 权重不是有限值/和为 1")
+
+        # ② 造三条策略：占用率故意拉开，才能看出「按占用」和「按本金」的区别
+        def mk(sid, principal, avg, peak, vol, sizing="capital"):
+            return PL.Usage(sid=sid, name=sid, sizing=sizing, principal=principal,
+                            capital=principal * 0.3, avg_margin=avg,
+                            peak_margin=peak, avg_notional=avg * 10,
+                            peak_notional=peak * 10, util=avg / principal,
+                            vol=vol, ret=0.5, max_dd=0.2, bars=1000)
+
+        us = [mk("A", 100_000, 1_000, 20_000, 0.20),
+              mk("B", 100_000, 5_000, 25_000, 0.40),
+              mk("C", 100_000, 500, 5_000, 0.10, sizing="fixed")]
+        total = 300_000.0
+
+        # ②a 按分配额：本金正好被均分，且合计 = 总资金
+        sh = PL.allocate(us, total, "equal", basis="principal")
+        if abs(sum(s.new_principal for s in sh) - total) > 1e-6:
+            raise RuntimeError("按分配额的本金合计不等于总资金")
+        if any(abs(s.weight - 1 / 3) > 1e-12 for s in sh):
+            raise RuntimeError("资金等权的权重不是 1/3")
+
+        # ②b 按平均占用：缩放后预计占用 == 目标（固定手数那条除外）
+        sh = PL.allocate(us, total, "equal", basis="usage")
+        for s in sh:
+            if s.sid == "C":
+                if abs(s.new_principal - 100_000) > 1e-6:
+                    raise RuntimeError("固定手数那条被改了本金 —— 手数根本不会动")
+                if "固定手数" not in s.note:
+                    raise RuntimeError("固定手数那条没有备注")
+                continue
+            if abs(s.est_avg - s.target) > 1e-6:
+                raise RuntimeError(
+                    f"{s.sid} 按平均占用校准后预计占用 {s.est_avg:.2f} ≠ 目标 {s.target:.2f}")
+
+        # ②c 按峰值占用：对齐的是峰值，平均占用不该等于目标
+        sh = PL.allocate(us, total, "equal", basis="peak")
+        if abs(sh[0].est_avg - sh[0].target) < 1.0:
+            raise RuntimeError("按峰值口径算出来的却是平均占用对齐")
+        if abs(sh[0].scale - (sh[0].target / 20_000.0)) > 1e-9:
+            raise RuntimeError("按峰值的缩放系数不对")
+
+        # ③ 风险平价：波动大的权重小，且权重和为 1
+        w = PL.weights("risk", us)
+        if abs(float(w.sum()) - 1.0) > 1e-12:
+            raise RuntimeError("风险平价权重和不为 1")
+        if not (w[1] < w[0] < w[2]):
+            raise RuntimeError(f"波动率越大权重该越小，实际 {np.round(w, 4)}")
+
+        # ④ 手动：按金额占比归一
+        w = PL.weights("manual", us, manual={"A": 1, "B": 2, "C": 1})
+        if not np.allclose(w, [0.25, 0.5, 0.25]):
+            raise RuntimeError(f"手动设置没按比例归一：{np.round(w, 4)}")
+
+        # ⑤ 顺序一致：权重的下标要和 usages 对齐（错位会把钱分给别的策略）
+        sh = PL.allocate(us, total, "manual", manual={"A": 1, "B": 0, "C": 0},
+                         basis="principal")
+        if abs(sh[0].new_principal - total) > 1e-6 or sh[1].new_principal > 1e-6:
+            raise RuntimeError("手动分配的顺序错位了")
+
+        return ("ERC 风险贡献等权（n=1/2/5/12，误差 <1e-6）；"
+                "按本金/按平均占用/按峰值三种口径；固定手数不缩放；手动按比例")
+
+    check("组合工作区资金分配（ERC / 三种口径）", _portfolio_plan)
+
     def _factor_metrics():
         from ttrade import factor_metrics as M
         from ttrade import factors as F
