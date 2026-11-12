@@ -1941,6 +1941,39 @@ def _run() -> tuple[bool, list[str]]:
         if not np.isnan(vals[3]):
             raise RuntimeError(f"覆盖窗口外仍在沿用最后一条快照：{vals[3]}")
 
+        # ②b 退档（1h 快照挂 5m bar）：**快照所属的 1h bar 必须已经收盘**。
+        # 库里 1h 的 dt 是起始时间，收盘在 dt+1h —— 用同一合约收盘价反推证实过
+        # （dt=09:00 的 close 等于 5m 里 09:55 那根的 close）。只判 `dt < t` 的话
+        # 09:30 这根 5m bar 会拿到 09:00 那条（含 09:30~10:00 的成交），前视半小时。
+        s5 = pd.DatetimeIndex([base + pd.Timedelta(minutes=30 * i)
+                               for i in range(6)])
+        bars5 = pd.DataFrame({"close": np.arange(6.0)}, index=s5)
+        h1 = pd.DataFrame(
+            {"iv_near": [0.5, 1.0, 2.0]},
+            index=pd.DatetimeIndex([base - pd.Timedelta(hours=1), base,
+                                    base + pd.Timedelta(hours=1)]),
+        )
+        got_c = A._join_bar_asof(bars5, h1,
+                                 coarse=A.period_gap("1h"))["iv_near"]
+        got_c = got_c.to_numpy(dtype=float)
+        # dt: 08:00→0.5 09:00→1.0 10:00→2.0，各自在 +1h 之后才可见
+        want_c = np.array([0.5, 0.5, 1.0, 1.0, 2.0, 2.0])
+        if not np.allclose(got_c, want_c, equal_nan=True):
+            raise RuntimeError(
+                f"退档用了未收盘的 1h 快照：{list(got_c)}，应为 {list(want_c)}"
+                "（09:30 只能拿到 08:00 那条；09:00 那条含 09:00~10:00 的成交，"
+                "要到 10:00 才可见）")
+        # 同档（5m 快照挂 5m bar）：后移 5 分钟后与「dt 严格早于 bar」逐位等价
+        grid5 = pd.DatetimeIndex([base + pd.Timedelta(minutes=5 * i)
+                                  for i in range(30)])
+        iv5 = pd.DataFrame({"iv_near": np.arange(30.0) / 10.0}, index=grid5)
+        same = A._join_bar_asof(bars5, iv5, coarse=A.period_gap("5m"))
+        old = A._join_bar_asof(bars5, iv5)          # coarse=None → 原语义
+        if not np.allclose(same["iv_near"].to_numpy(dtype=float),
+                           old["iv_near"].to_numpy(dtype=float),
+                           equal_nan=True, rtol=0, atol=0):
+            raise RuntimeError("同档退档改动把 5m→5m 的结果改了（IH 会掉数）")
+
         # ③ 档位选择：不能挑到停更的档（IO 的 5m 只到 2020-11）
         picked = "IF 取档未验（期权库未下载）"
         if OS.exists():

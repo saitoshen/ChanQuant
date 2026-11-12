@@ -163,6 +163,19 @@ def _opt_local(symbol: str, period: str = "1d") -> pd.DataFrame:
 # 全都没有才退回日频那套「D-1 快照铺满当天」。
 _IV_PERIODS = ("5m", "15m", "30m", "1h", "2h", "4h")
 
+# 每档一根 bar 的长度。库里 `option_iv.dt` 存的是**起始时间**，收盘在
+# `dt + 该周期`；退档对齐时这决定「这条快照什么时候才算可见」。
+_PERIOD_GAP = {
+    "5m": pd.Timedelta(minutes=5), "15m": pd.Timedelta(minutes=15),
+    "30m": pd.Timedelta(minutes=30), "1h": pd.Timedelta(hours=1),
+    "2h": pd.Timedelta(hours=2), "4h": pd.Timedelta(hours=4),
+}
+
+
+def period_gap(label: str) -> pd.Timedelta:
+    """档位标签 → 一根 bar 的长度；认不出来当 0（等价于「dt 即收盘」）。"""
+    return _PERIOD_GAP.get(str(label or ""), pd.Timedelta(0))
+
 
 def bar_period(df: pd.DataFrame) -> str:
     """从 bar 间隔猜周期：`5m` / `15m` / … / `1h` / `2h` / `4h`；日线返回 `1d`。
@@ -352,7 +365,9 @@ def attach_intraday(
     if ivp == "1d" or opt.empty:
         out = _join_day_snapshot(out, opt, day)
     else:
-        out = _join_bar_asof(out, opt)
+        # `period_gap(ivp)`：退档时快照要等它所属的粗档 bar 收盘才可见，
+        # 否则 09:30 的 5m bar 会吃进 09:00 那条 1h 快照（含 10:00 的价）
+        out = _join_bar_asof(out, opt, coarse=period_gap(ivp))
         # 日内档的**覆盖窗口**各家不一样（IO 的 5m 只到 2020-11、MO 根本没有
         # 5m），窗口外不能沿用最后一条快照 —— 那会把几年前的 IV 一路搬到今天，
         # 图上是一条水平线，因子里还当成有效值。缺口用日频补回来。
@@ -420,15 +435,27 @@ def _join_day_snapshot(out: pd.DataFrame, part: pd.DataFrame,
     return out.join(_daily_snapshot(part, day, cols, out.index))
 
 
-def _join_bar_asof(out: pd.DataFrame, part: pd.DataFrame) -> pd.DataFrame:
-    """分钟级衍生列 → 每根 bar 取**严格早于它**的最后一条快照。
+def _join_bar_asof(out: pd.DataFrame, part: pd.DataFrame,
+                   coarse: pd.Timedelta | None = None) -> pd.DataFrame:
+    """分钟级衍生列 → 每根 bar 取**已收盘**的最后一条快照。
 
-    `allow_exact_matches=False` 不是细节：库里 1h 的 IV 快照时间戳和期货 1h
-    bar 的时间戳是同几个整点，允许精确匹配就等于「用当根收盘算出来的 IV
-    决定当根怎么下单」，回测会好看、实盘拿不到。
+    判据不是「快照的 `dt` 早于 bar」，而是「**快照所属的那根 bar 已经走完**」，
+    即 `dt + 档位周期 ≤ t`。两者在**同档**时等价（5m 快照挂 5m bar）：
+    `dt + 5m ≤ t` ⇔ `dt < t`，因为 bar 时间戳本身是 5 分钟的整数倍。
 
-    退档（1h IV 挂到 5m bar 上）也走这条：拿到的还是「之前最近一小时」的读数，
-    只是日内台阶粗一点，不会引入未来信息。
+    🔴 **退档时差别就大了**：1h 档的 `dt` 是起始时间，收盘在 `dt + 1h`
+    （用同一合约的收盘价反推验证过：`dt=09:00` 的 close 等于 5m 里 09:55
+    那根的 close，也就是 10:00 的价）。只要求 `dt < t` 的话，09:30 这根 5m
+    bar 会拿到 09:00 那条快照 —— 而那条快照里含 09:30~10:00 的成交，**前视
+    最多 55 分钟**，一天 48 根里有 44 根中招。做法是把右表 `_ts` 整体后移
+    `coarse`，再允许精确匹配：后移后「等于」正好对应「刚收盘」，不早不晚。
+
+    `allow_exact_matches` 在同档时仍必须是 True（后移 5m 之后 `dt+5m == t`
+    就是「上一根刚收盘」，本来就该用），所以这里恒为 True，靠**后移**而不是
+    靠关闭精确匹配来挡未来。
+
+    `coarse=None`（不认识档位）时退回最保守的「快照 `dt` 必须早于 bar」：
+    同档下少用掉「刚收盘那条」，但绝不会前视。
     """
     if part.empty:
         return out
@@ -436,17 +463,28 @@ def _join_bar_asof(out: pd.DataFrame, part: pd.DataFrame) -> pd.DataFrame:
             if c not in out.columns and pd.api.types.is_numeric_dtype(part[c])]
     if not cols:
         return out
-    right = part[cols].sort_index()
-    right = right[~right.index.duplicated(keep="last")].reset_index()
-    right = right.rename(columns={right.columns[0]: "_ts"})
-    left = pd.DataFrame({"_ts": pd.DatetimeIndex(out.index)})
+    exact = coarse is not None
+    gap = coarse if exact else pd.Timedelta(0)
+    snap = part[cols].sort_index()
+    snap = snap[~snap.index.duplicated(keep="last")]
+    # 🔴 两边的 `_ts` 必须是同一个 datetime 单位：行情库读出来是 `datetime64[ns]`，
+    # 期权库里 `dt` 是 `TIMESTAMP` 走 us，`merge_asof` 会直接抛
+    # `MergeError: incompatible merge keys [0] dtype('<M8[us]') and dtype('<M8[ns]')`
+    right = pd.DataFrame(
+        {"_ts": pd.DatetimeIndex(snap.index).as_unit("ns") + gap})
+    for c in cols:
+        right[c] = snap[c].to_numpy()
+    right = right.sort_values("_ts", kind="mergesort")
+    left = pd.DataFrame(
+        {"_ts": pd.DatetimeIndex(out.index).as_unit("ns")})
     left = left.sort_values("_ts", kind="mergesort")
     merged = pd.merge_asof(left, right, on="_ts", direction="backward",
-                           allow_exact_matches=False)
+                           allow_exact_matches=exact)
     vals = merged.set_index("_ts")[cols].reindex(pd.DatetimeIndex(out.index))
     # 覆盖窗口之外一律不填：`merge_asof` 的 backward 会**无限**沿用最后一条
     # 快照，而库里的日内档覆盖差别很大（IO 的 5m 只到 2020-11、MO 没有 5m）。
-    # 不设这道闸，2020 年那条 IV 会被一直搬到 2026 年。
+    # 不设这道闸，2020 年那条 IV 会被一直搬到 2026 年。上界也要按后移后的
+    # `_ts` 算：`dt+gap` 之后的 bar 才算「这条快照可见」。
     lo = right["_ts"].min()
     hi = right["_ts"].max() + pd.Timedelta(days=1)
     idx = pd.DatetimeIndex(out.index)
