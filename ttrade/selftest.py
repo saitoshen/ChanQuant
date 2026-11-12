@@ -4280,9 +4280,11 @@ def _run() -> tuple[bool, list[str]]:
             and n_cols_f == 5
             and period_ok
             and win.chk_frev is not None
-            # 权重口径三档（等权 / 不等权 / 滚动 IC）+ 打分范围说明 + 出场规则入口
+            # 权重 / 合成口径五档（等权 / 因子与 / 因子或 / 不等权 / 滚动 IC）
+            # + 打分范围说明 + 出场规则入口。因子与、因子或是「合成口径」而不是
+            # 权重，两档都不读 weights，但必须和另外三档并列在同一个下拉里。
             and {win.cb_fweight.itemData(i) for i in range(win.cb_fweight.count())}
-            == {"equal", "custom", "ic"}
+            == {"equal", "custom", "ic", "and", "or"}
             # 标准化口径两档（z-score / 分位）—— 两档都映射到 ±4，
             # 少一档就只能用 z，极端值敏感的那批品种没得换
             and {win.cb_fmethod.itemData(i) for i in range(win.cb_fmethod.count())}
@@ -5210,6 +5212,56 @@ def _run() -> tuple[bool, list[str]]:
             if float((_ic.score - _c.score).abs().max(skipna=True)) < 1e-6:
                 raise RuntimeError("滚动 IC 加权和等权算出来一模一样，权重没生效")
 
+            # ---- 因子与 / 因子或：必须和「逐因子比阈值再全部 / 任一」逐根一致 ----
+            #
+            # 这两档不走加权平均，合成分数只是一个能骗过阈值状态机的等价量
+            # （与 = 取最弱那个，或 = 取最响那个）。既然是个等价量，就必须拿
+            # 原始因子分数按同一套阈值自己判一遍来对，否则「取最弱」写错成
+            # 「取最强」在图上完全看不出来，只是信号变多变少。
+            _e = 1.0
+            for _wm in ("and", "or"):
+                _p = _FS.build_score(_syn, "multi", _keys,
+                                     _FS.FactorConfig(weight_mode=_wm,
+                                                      entry_z=_e, exit_z=0.3))
+                _m = _p.fmat * _p.orient        # 逐因子 PIT 取号后的分数
+                if _wm == "and":
+                    # 「与」没有歧义：每个因子都得过线。缺数当「没确认」
+                    _want = {1.0: (_m > _e).all(axis=1),
+                             -1.0: (_m < -_e).all(axis=1)}
+                else:
+                    # 「或」必须在**方向冲突**上做规定：一根里 A 说多、B 说空，
+                    # 「任一满足」两边都成立，而仓位不可能同时多空。口径定的是
+                    # 「谁 |z| 大听谁的」，所以基准得挑最响的因子看它站哪边，
+                    # 写成简单的 `any` 会在冲突行上判成两个方向同时成立
+                    _arr = _m.to_numpy(dtype=float)
+                    _ab = np.where(np.isnan(_arr), -np.inf, np.abs(_arr))
+                    _ref = _arr[np.arange(len(_arr)), _ab.argmax(axis=1)]
+                    _ref = pd.Series(
+                        np.where(np.isnan(_arr).all(axis=1), np.nan, _ref),
+                        index=_m.index)
+                    _want = {1.0: (_ref > _e), -1.0: (_ref < -_e)}
+                for _side in (1.0, -1.0):
+                    _have = ((_p.score > _e) if _side > 0
+                             else (_p.score < -_e)).fillna(False)
+                    _w = _want[_side].fillna(False)
+                    _bad = int((_w.to_numpy() != _have.to_numpy()).sum())
+                    if _bad:
+                        raise RuntimeError(
+                            f"「{_wm}」合成口径与逐因子判定不一致：{_bad} 根对不上"
+                            f"（方向 {'多' if _side > 0 else '空'}）")
+                if _wm == "and":
+                    # 与的信号必须不严于等权：最靠近零的那个因子的幅度，不会
+                    # 超过这几个因子的平均幅度（正负混杂时它直接记 0）
+                    _z = pd.concat([_p.score.abs().rename("a"),
+                                    _c.score.abs().rename("b")], axis=1).dropna()
+                    if len(_z) and bool((_z.a > _z.b + 1e-9).any()):
+                        raise RuntimeError("「因子与」的分数幅度跑到了等权之上，取错极端了")
+                if _wm == "or":
+                    _z = pd.concat([_p.score.abs().rename("a"),
+                                    _c.score.abs().rename("b")], axis=1).dropna()
+                    if len(_z) and bool((_z.a < _z.b - 1e-9).any()):
+                        raise RuntimeError("「因子或」的分数幅度落到了等权之下，取错极端了")
+
             # ---- 标准化口径：z-score / 分位 ----
             #
             # 分位这一档以前映射到 ±0.5，而阈值滑杆最小 0.3、最大 3.0 —— 阈值一
@@ -5480,7 +5532,8 @@ def _run() -> tuple[bool, list[str]]:
             trig_info = ("「不用」两项都在（切市场后仍在），反转开关跟着触发源灰 / 亮，"
                          "规则触发参数能进配置且换规则不串，"
                          "稀疏采样存得进策略库也载得回来，"
-                         "权重三档（等权/自定/IC）都真起作用且能往返，"
+                         "五档合成口径（等权/自定/IC/因子与/因子或）都真起作用且能往返，"
+                         "「与」「或」与逐因子判定逐根一致，"
                          "分位口径也映射到 ±4、对毛刺免疫且能往返，"
                          "分档回撤比绝对回撤更早平仓、独立止损与各口径叠加且不跟浮盈抬、"
                          "只勾止损也能往返、出场规则能往返、"

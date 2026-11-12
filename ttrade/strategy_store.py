@@ -441,7 +441,8 @@ class StrategyConfig:
             # 会少一大截。不写出来，列表里两条看起来像重复项
             wm = str(cfg.get("weight_mode") or "equal")
             bits.append({"equal": "等权", "custom": "自定权重",
-                         "ic": "IC 加权"}.get(wm, wm))
+                         "ic": "IC 加权", "and": "因子与",
+                         "or": "因子或"}.get(wm, wm))
         if str(cfg.get("exit_mode") or "score") != "score":
             bits.append({"tier": "分档回撤出场", "abs": "ATR 回撤出场",
                          "box": "箱体出场"}.get(str(cfg.get("exit_mode")), "ATR 出场"))

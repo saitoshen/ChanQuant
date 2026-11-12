@@ -194,7 +194,15 @@ class FactorConfig:
     #   ic    ：滚动 IC 加权。每 `ic_rebal` 根，用过去一个窗口的 IC 绝对值
     #           当权重 —— 方向仍由 `orient` 决定，所以这里只取强度不取符号，
     #           不然「自动定向已经翻过一次号」再乘一次负权重，等于反两次
-    weight_mode: str = "equal"       # equal / custom / ic
+    #   and   ：因子与。不设权重，每个因子各自比阈值，**都**过线才成立。
+    #           合成分数取最靠近零的那个因子（见 `_score_and`），下游阈值状态机
+    #           一行都不用改，判出来的就是「全部满足」
+    #   or    ：因子或。不设权重，**任一**因子过线就成立。合成分数取 |分数|
+    #           最大的那个因子（见 `_score_or`），方向打架时听强度大的
+    #
+    # 注意 and / or 不是「权重口径」而是「合成口径」，沿用它是因为界面上
+    # 这三档和它们本来是同一排选项、同一份配置字段。两档都不读 `weights`。
+    weight_mode: str = "equal"       # equal / custom / ic / and / or
     weights: dict = field(default_factory=dict)   # 因子键 -> 权重（custom 用）
     ic_rebal: int = 60               # 滚动 IC 加权：多少根重算一次权重
 
@@ -334,7 +342,7 @@ class FactorConfig:
         # 权重：只认正数。负权重等于「这个因子反着用」，那件事该由「反转」
         # 勾选框表达 —— 两个地方都能翻方向，出问题时根本查不出是谁翻的
         c.weight_mode = str(c.weight_mode or "equal")
-        if c.weight_mode not in ("equal", "custom", "ic"):
+        if c.weight_mode not in ("equal", "custom", "ic", "and", "or"):
             c.weight_mode = "equal"
         c.weights = {str(k): float(v) for k, v in dict(c.weights or {}).items()
                      if float(v) > 0}
@@ -526,6 +534,66 @@ def _weighted_mean(mat: pd.DataFrame, w) -> pd.Series:
     den = wm.sum(axis=1, skipna=True)
     num = (mat.fillna(0.0) * wm.fillna(0.0)).sum(axis=1)
     return (num / den.where(den > 0)).rename("score")
+
+
+def _row_extremes(signed: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """逐行取最大 / 最小，跳过 NaN；整行都没数的返回 NaN。
+
+    不用 `np.nanmax`：全 NaN 的行会打 RuntimeWarning 并返回 NaN，日志里全是
+    「All-NaN slice encountered」，看不出真问题在哪。
+    """
+    if signed.shape[1] == 0:
+        z = pd.Series(np.nan, index=signed.index, dtype=float)
+        return z, z
+    mat = signed.to_numpy(dtype=float)
+    ok = ~np.isnan(mat)
+    any_ok = ok.any(axis=1)
+    pos = np.where(ok, mat, -np.inf).max(axis=1)
+    neg = np.where(ok, mat, np.inf).min(axis=1)
+    pos = np.where(any_ok, pos, np.nan)
+    neg = np.where(any_ok, neg, np.nan)
+    return (pd.Series(pos, index=signed.index, dtype=float),
+            pd.Series(neg, index=signed.index, dtype=float))
+
+
+def _score_and(signed: pd.DataFrame) -> pd.Series:
+    """「因子与」的合成分数 —— 短板说了算。
+
+    语义是「每个因子各自比阈值，**都**过线才算数」。合成分数取这几个因子里
+    最靠近零的那个（全部看多取最小、全部看空取最大），于是下游那套
+    「分数 > entry 开多 / 分数 < −entry 开空」的阈值状态机不用动，判出来的
+    就是「所有因子都过了 entry」。
+
+    正负混杂时记 0：一半看多一半看空，「都满足」根本不成立，不能挑一个说事。
+    有因子缺数（预热期没走完、展期 / 期权这类稀疏因子有洞）也记 0 —— 合取
+    缺一项就是没确认。记 0 而不是 NaN：NaN 在状态机里等于「这根没数据」，
+    会把平仓也一起跳过，缺数反而变成「拿着不动」。
+
+    等价性依赖 `entry_z ≥ 0`（`_norm` 里已经钳过）——阈值取负时「全都过线」
+    就不再是「最弱者过线」，那时这个标量近似不成立。
+    """
+    pos, neg = _row_extremes(signed)
+    out = np.where(neg > 0, neg, np.where(pos < 0, pos, 0.0))
+    if signed.shape[1] > 1:
+        full = ~signed.isna().any(axis=1).to_numpy()
+        out = np.where(full, out, 0.0)
+    out = np.where(np.isnan(pos), np.nan, out)
+    return pd.Series(out, index=signed.index, dtype=float).rename("score")
+
+
+def _score_or(signed: pd.DataFrame) -> pd.Series:
+    """「因子或」的合成分数 —— 谁喊得最响听谁的。
+
+    语义是「任意一个因子过了阈值就跟着它」。合成分数取绝对值最大的那个因子
+    （符号一起带上），于是「分数 > entry 开多」等价于「至少有一个因子看多且
+    过线」，做空同理。
+
+    多空冲突（有因子看多、有因子看空）时按强度定：|z| 大的那一边胜出。
+    """
+    pos, neg = _row_extremes(signed)
+    out = np.where(pos >= -neg, pos, neg)      # pos + neg ≥ 0 → 多头那边更响
+    out = np.where(np.isnan(pos), np.nan, out)
+    return pd.Series(out, index=signed.index, dtype=float).rename("score")
 
 
 def rolling_ic_weights(fmat: pd.DataFrame, fwd: pd.Series, cfg: FactorConfig
@@ -1245,10 +1313,12 @@ def build_score(
         signed = fmat * ori
         wmode = str(cfg.weight_mode or "equal")
         wdesc = "等权"
+        wjoin = "等权合成"
         if wmode == "ic":
             w = rolling_ic_weights(fmat, fwd, cfg)
             score = _weighted_mean(signed, w)
             wdesc = f"滚动 IC 加权 · 每 {int(cfg.ic_rebal)} 根重算"
+            wjoin = "按滚动 IC 加权合成"
         elif wmode == "custom":
             w = pd.Series({k: cfg.weight_of(k) for k in signed.columns}, dtype=float)
             w = w.where(w > 0, 0.0)
@@ -1257,6 +1327,15 @@ def build_score(
                 notes.append("权重全填了 0，已退回等权")
             score = _weighted_mean(signed, w)
             wdesc = "自定权重"
+            wjoin = "按自定权重合成"
+        elif wmode == "and":
+            score = _score_and(signed)
+            wdesc = "因子与"
+            wjoin = "取最弱那一个因子（全部过线才成立）"
+        elif wmode == "or":
+            score = _score_or(signed)
+            wdesc = "因子或"
+            wjoin = "取最强那一个因子（任一过线就成立）"
         else:
             score = signed.mean(axis=1, skipna=True).rename("score")
         n_rev = sum(1 for k in keys if cfg.is_reversed(k))
@@ -1267,7 +1346,7 @@ def build_score(
         )
         pack.notes.extend(notes)      # 「剔除了哪几个因子」这类说明
         if cfg.orient == "auto":
-            pack.notes.append(f"各因子先按自身 PIT 方向取号，再{wdesc}合成")
+            pack.notes.append(f"各因子先按自身 PIT 方向取号，再{wjoin}")
             onote = _orient_note(ori, cfg)
             if onote:
                 pack.notes.append(onote)
@@ -1283,6 +1362,20 @@ def build_score(
             pack.notes.append(
                 f"权重按过去 {int(cfg.window)} 根的 |IC| 定，每 "
                 f"{int(cfg.ic_rebal)} 根更新一次（滞后 {int(cfg.horizon)} 期，无未来信息）"
+            )
+        elif wmode == "and":
+            pack.notes.append(
+                "「因子与」：合成分数取这几个因子里最靠近零的那个 —— "
+                "它都越过了阈值，说明每一个因子都越过了。\n"
+                "正负混杂（有因子看多、有因子看空）时分数记 0，「都满足」不成立。\n"
+                "不设权重，因子表里的权重列不显示。"
+            )
+        elif wmode == "or":
+            pack.notes.append(
+                "「因子或」：合成分数取绝对值最大的那个因子，"
+                "于是「任一因子越过阈值」就等于「合成分数越过阈值」。\n"
+                "多个因子方向打架时按强度定 —— 谁 |分数| 大听谁的。\n"
+                "不设权重，因子表里的权重列不显示。"
             )
         note = _reverse_note(cfg, keys)
         if note:
