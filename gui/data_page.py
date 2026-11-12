@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import date, timedelta
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -168,6 +169,21 @@ class TqWorker(QObject):
     def cancel(self) -> None:
         self._cancel = True
 
+    def range_start(self) -> "date":
+        """界面上的「回溯区间」→ 起点日期。
+
+        **期权、真实合约、主连共用这一个区间** —— 用户看到「近 1 天」，那这一轮
+        就该只碰最近一天的数据，而不是「主连 1 天、期权 20 年」。
+
+        起点不早于天勤数据的最早年份（`OPT.DEFAULT_START`，2016-01-01）：
+        「近 20 年」算出来是 2006 年，直接用会把 `_chain_start` 的「到期前 400
+        天」口径整体往前挪，白白多下几段取不到的空区间。
+        """
+        from ttrade import optfetch as OPT
+
+        raw = date.today() - timedelta(days=int(self.days or 7300))
+        return max(OPT.DEFAULT_START, raw)
+
     def run(self) -> None:
         try:
             from ttrade import tqcurve
@@ -236,8 +252,11 @@ class TqWorker(QObject):
                         # **免费账户不再跳过期权**。没有 `tq_dl` 就走逐合约
                         # `get_kline_serial`（`OPT.update` 自己判断走哪条路）：
                         # 已摘牌合约照样有数据，1d 一个合约一次请求就覆盖它的
-                        # 整个挂牌期。代价是串行 —— 实测 0.45 秒/合约，
-                        # 全量 21.3 万个约 27 小时，所以必须说清 ETA。
+                        # 整个挂牌期。代价是串行 —— 实测 0.45 秒/合约。
+                        #
+                        # 起点跟**界面上的回溯区间**走（不再是写死的「全部历史」）：
+                        # 选「近 1 天」就只补最近一天，整条链在窗口之前的老链
+                        # （库里七成）会被直接筛掉，不再白跑两千多条
                         if free_mode:
                             # 三个周期的量级差太多，笼统写「约 27 小时」会吓跑
                             # 只想补 5m 股指期权的人
@@ -245,13 +264,15 @@ class TqWorker(QObject):
                                     "1h": "全量约 19 小时",
                                     "5m": "5m 只有中金所 IO/MO/HO，约十几分钟"
                                     }.get(self.period, "全量要几小时")
+                            if self.days <= 92:
+                                hint = "只补窗口内的链，通常几分钟"
                             self.progress.emit(
                                 0, 0,
                                 f"期权：免费账户 → 逐合约 get_kline_serial，"
                                 f"{hint}；可随时取消，再点一次续传")
                         o = OPT.update(
                             sess, periods=(self.period,),
-                            start=OPT.DEFAULT_START,
+                            start=self.range_start(),
                             progress=lambda a, b, m: self.progress.emit(a, b, m),
                             cancel=lambda: self._cancel,
                         ).get(self.period, {})
@@ -259,6 +280,8 @@ class TqWorker(QObject):
                         if free_mode:
                             opt_note = ("　【期权】免费账户：逐合约取最近 %d 根"
                                         % TQ.RECENT_BARS)
+                            if o.get("too_old"):
+                                opt_note += f"，窗口外老链跳过 {o['too_old']} 条"
                             if o.get("skipped"):
                                 opt_note += f"，已是最新跳过 {o['skipped']} 条链"
                     except Exception as exc:      # noqa: BLE001
@@ -782,7 +805,10 @@ class DataPage(QWidget):
         self.cb_tq_range.setCurrentIndex(len(TQ_RANGES) - 1)
         self.cb_tq_range.setToolTip(
             "只补这一段，库里已有的部分不会重下。\n"
-            "「近 20 年」对 5 分钟等于全部历史（天勤 5m 最早约 2016 年）。"
+            "主连、真实合约、**期权**共用这一个区间 —— 选「近 1 天」，期权也只补\n"
+            "最近一天，整条链都在窗口之前的已摘牌合约直接跳过。\n"
+            "「近 20 年」对 5 分钟等于全部历史（天勤 5m 最早约 2016 年），\n"
+            "期权也就是全量回填。"
         )
         lay.addWidget(self.cb_tq_range)
 
@@ -819,8 +845,12 @@ class DataPage(QWidget):
             "算平值 IV / 偏度 / 曲率 / 看跌看涨比，写 data_tq/option.duckdb\n"
             "（和行情库分开），并导出 data_tq/option_iv/tq_iv_<周期>.csv。\n\n"
             "口径与 Tushare 那条不同：天勤只有收盘价、没有结算价，两套 IV 不能混用。\n\n"
-            "免费账户也能下：没有 tq_dl 就退到逐合约 get_kline_serial（已摘牌合约\n"
-            "照样有数据），只是串行取数 —— 全量约 21 万个合约，1d 约 27 小时。\n"
+            "**取数区间跟上面的「回溯区间」走**：\n"
+            "  · 近 1 天 / 近 1 周：只补窗口内的链，通常几分钟；\n"
+            "  · 近 20 年：等于全量回填，免费账户约 27 小时（1d）、19 小时（1h）。\n"
+            "整条链都在窗口之前的已摘牌合约会被直接跳过，不会空跑。\n\n"
+            "免费账户也能下：没有 tq_dl 就退到逐合约 get_kline_serial\n"
+            "（已摘牌合约照样有数据），只是串行取数。\n"
             "专业账户走 DataDownloader 批量。两条路都支持中断续传。"
         )
         lay.addWidget(self.chk_tq_options)
@@ -1750,6 +1780,7 @@ class DataPage(QWidget):
         self._log(
             f"—— 天勤补齐 {label}（{span}）"
             + ("，含真实合约与展期因子" if contracts else "，只补主连")
+            + ("，期权按同一区间" if options else "")
         )
         self.btn_update.setText("取消")
         self.btn_update.setEnabled(True)

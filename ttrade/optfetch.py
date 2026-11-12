@@ -34,6 +34,11 @@
 实测 1d 0.45 秒/合约、1h 0.33 秒/合约。全量 21.3 万个合约（2936 条链）约 27 / 19
 小时，**可中断、可续传**；之后每天增量只有当天新挂的几百个合约，几分钟。
 
+**全量只发生在「近 20 年」那一档。** `start` 现在跟界面上的回溯区间走：选
+「近 1 天」就只补最近一天，整条链都在窗口之前的已摘牌合约会在 `_plan()` 里被
+筛掉（库里七成是这种），不再白跑两千多条链。`start` 同时也把 `_chain_start`
+的「到期前 400 天」夹在窗口内，所以不会出现「只要 1 天、却把整条链翻一遍」。
+
 - 1d：一个合约一次请求就能覆盖它的**整个挂牌期**（期权寿命 ~250 个交易日
   < 上限根数），所以免费账户拿 1d 几乎是完整的
 - 1h：约 3 年内的链完整，更老的链只剩「最后 N 根」
@@ -536,11 +541,21 @@ def _chain_start(start: date, expiry) -> date:
 
 
 def _plan(chains: dict[str, list[str]], period: str,
-          varieties: list[str] | None) -> dict[str, list[str]]:
+          varieties: list[str] | None,
+          known_expiry: dict | None = None, start: date | None = None
+          ) -> dict[str, list[str]]:
     """挑出这一轮要下的链。
 
     `5m` 只做中金所三个股指期权（IO/MO/HO）—— 商品期权 5m 十年是几百 GB，
     而用户要的 5m 只用来做股指期权的日内研究。
+
+    **回溯窗口也在这里生效**：`start` 是界面上的「回溯区间」起点，整条链到期日
+    都在它之前的直接不排 —— 它们的行情全部落在窗口之外，下了也用不上。
+    这类老链占库里七成，不筛的话「只补最近 1 天」要空跑两千多条链。
+
+    `known_expiry` 是 `optstore.chain_expiries()` 的结果（离线查到的到期日）。
+    传了就按它先筛；查不到的老链仍会在拿到 `chain_info` 之后再判一次，所以这里
+    筛漏了也不会下错数据。
     """
     want = set(varieties) if varieties else None
     out: dict[str, list[str]] = {}
@@ -551,6 +566,10 @@ def _plan(chains: dict[str, list[str]], period: str,
                 continue
         elif period == "5m" and v not in CFFEX_5M:
             continue
+        if start is not None and known_expiry:
+            exp = known_expiry.get(key)
+            if exp is not None and pd.Timestamp(exp).date() < start:
+                continue
         out[key] = members
     return out
 
@@ -618,6 +637,9 @@ def update_free(sess, periods: tuple[str, ...] = ("1d", "1h"),
     end = end or date.today()
     api = sess.get() if hasattr(sess, "get") else sess
     chains = list_options(api)
+    # 离线能判掉的「老链」先判掉：判断一条链到期日原本要发一个 get_quote，
+    # 两千多条已摘牌链光跳过就要好几分钟
+    known = OS.chain_expiries() if start else {}
     stats: dict[str, dict] = {}
     since = 0
 
@@ -629,11 +651,12 @@ def update_free(sess, periods: tuple[str, ...] = ("1d", "1h"),
         since = 0
 
     for period in periods:
-        plan = _plan(chains, period, varieties)
+        plan = _plan(chains, period, varieties, known, start)
         done = OS.done_contracts(period) if incremental else {}
         empty_known = _meta_without_bars(period) if incremental else set()
         st = {"period": period, "chains": len(plan), "rows": 0, "skipped": 0,
-              "failed": 0, "empty": 0, "iv": 0, "free": True}
+              "failed": 0, "empty": 0, "iv": 0, "free": True,
+              "too_old": max(0, len(chains) - len(plan))}
         stats[period] = st
         total = len(plan)
         # 已处理合约数 / 开始时间，用来算 ETA
@@ -662,6 +685,11 @@ def update_free(sess, periods: tuple[str, ...] = ("1d", "1h"),
                 continue
 
             exp = pd.Timestamp(info["expiry"])
+            # 窗口之外的老链：`_chain_start` 会退化成 start，但整条链的行情都在
+            # 到期日之前，取了也是空 —— 直接算跳过，别把请求浪费在这上面
+            if start and exp.date() < start:
+                st["too_old"] = st.get("too_old", 0) + 1
+                continue
             need = []
             for c in members:
                 if c in done and pd.Timestamp(done[c]) >= exp - pd.Timedelta(days=1):
@@ -783,13 +811,15 @@ def update(sess, periods: tuple[str, ...] = ("1d", "1h"),
                            cancel=cancel)
     tmp = tmpdir or os.path.join(os.path.dirname(OS.db_path()), "opt_tmp")
     chains = list_options(api0)
+    known = OS.chain_expiries() if start else {}
     stats: dict[str, dict] = {}
 
     for period in periods:
-        plan = _plan(chains, period, varieties)
+        plan = _plan(chains, period, varieties, known, start)
         done = OS.done_contracts(period) if incremental else {}
         st = {"chains": len(plan), "rows": 0, "skipped": 0,
-              "failed": 0, "iv": 0, "period": period}
+              "failed": 0, "iv": 0, "period": period,
+              "too_old": max(0, len(chains) - len(plan))}
         stats[period] = st
         total = len(plan)
         since_recycle = 0
@@ -818,6 +848,10 @@ def update(sess, periods: tuple[str, ...] = ("1d", "1h"),
                 st["failed"] += 1
                 continue
             exp = pd.Timestamp(info["expiry"])
+            # 整条链都在回溯窗口之前 → 没有可取的行情，算跳过
+            if start and exp.date() < start:
+                st["too_old"] = st.get("too_old", 0) + 1
+                continue
             need = [c for c in members
                     if c not in done or pd.Timestamp(done[c]) < exp - pd.Timedelta(days=1)]
             if not need:

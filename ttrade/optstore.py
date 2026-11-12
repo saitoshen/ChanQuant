@@ -251,6 +251,36 @@ def done_contracts(period: str) -> dict[str, pd.Timestamp]:
     return {c: pd.Timestamp(d) for c, d in rows if d is not None}
 
 
+def chain_expiries() -> dict[str, pd.Timestamp]:
+    """每条链（= 标的合约）的到期日：`{'CZCE.ZC406': 2024-06-05, ...}`。
+
+    **离线一次查询**，用来在联网之前就把「整条链都在回溯窗口之前」的筛掉。
+
+    为什么值得单独一个函数：库里 2939 条链里有两千多条是已摘牌的，而判断一条链
+    老不老原本只能 `get_quote` 问一次天勤（`chain_info`）—— 「只补最近 1 天」的
+    情形下，光是为了跳过它们就要发两千多个网络请求。这份表在下载时已经写进
+    `option_meta` 了，直接查就行。
+
+    查不到（库不存在 / 表还空 / 被写锁占着）就返回空字典，调用方退回「每条链都
+    联网问一次」的老路径 —— 少一个优化，不影响正确性。
+    """
+    if not exists():
+        return {}
+    try:
+        with connect(read_only=True) as con:
+            rows = con.execute(
+                "SELECT underlying, max(expiry) FROM option_meta "
+                "WHERE underlying IS NOT NULL GROUP BY 1"
+            ).fetchall()
+    except Exception:  # noqa: BLE001 - 锁被占 / 表还没建：当作没有
+        return {}
+    out: dict[str, pd.Timestamp] = {}
+    for u, e in rows:
+        if isinstance(u, str) and u and e is not None:
+            out[u] = pd.Timestamp(e)
+    return out
+
+
 def load_meta(con=None, varieties: list[str] | None = None) -> pd.DataFrame:
     if con is not None:
         sql = "SELECT * FROM option_meta"

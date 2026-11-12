@@ -3903,6 +3903,29 @@ def _run() -> tuple[bool, list[str]]:
         src_tq = dp is not None and dp.cb_source.currentData() == "tq"
         tq_vis = is_us or not src_tq
 
+        # 回溯区间必须真的传到期权那条线（`TqWorker.range_start`）。
+        # 这两个值错了的后果很不对称：
+        #   · 永远取全量 → 点了「近 1 天」还是要跑 27 小时，两千多条已摘牌老链
+        #     一条不落地扫（这就是用户报的那个现象）；
+        #   · 反过来把「近 20 年」也算成一天 → 首轮全量回填被悄悄掐成一天，
+        #     而且不报错，只是库里永远只有最近几天的 IV。
+        opt_range_info = ""
+        opt_range_ok = True
+        try:
+            from datetime import date as _d, timedelta as _td
+
+            from gui.data_page import TqWorker as _TqW
+            from ttrade import optfetch as _OPT
+
+            _near = _TqW("1d", 1).range_start()
+            _all = _TqW("1d", 7300).range_start()
+            opt_range_ok = (_near == _d.today() - _td(days=1)
+                            and _all == _OPT.DEFAULT_START)
+            opt_range_info = f"近1天→{_near} / 近20年→{_all}"
+        except Exception as _exc:      # noqa: BLE001
+            opt_range_ok = False
+            opt_range_info = f"{type(_exc).__name__}: {_exc}"
+
         def _form_order_ok(d) -> bool:
             """「开始补充」必须紧跟在下载项之后，成本和定时不许混进来。
 
@@ -4635,6 +4658,11 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError("主窗口未完成首次回测")
         if not has_upd:
             raise RuntimeError("数据管理页缺失或初始状态异常")
+        if not opt_range_ok:
+            raise RuntimeError(
+                f"回溯区间没接到期权（{opt_range_info}）：选「近 1 天」期权也该只补"
+                "最近一天，选「近 20 年」该等于全量回填"
+            )
         if not trade_ok:
             raise RuntimeError(
                 f"账户透视页异常（{trade_info}）：账户列表 / 资金账户列 / 时间列缺失"
@@ -5552,7 +5580,7 @@ def _run() -> tuple[bool, list[str]]:
                 f"组合页回测 {view_info}，"
                 f"{side_info}，触发 {trig_info}，"
                 f"回测区间 {range_info}，合成周期 {md_info}，实时开关已复位，"
-                f"数据管理页就绪，手册 {manual_info}，输出 {out_info}，"
+                f"数据管理页就绪（期权回溯区间 {opt_range_info}），手册 {manual_info}，输出 {out_info}，"
                 f"对话渲染 {chat_info}，能力包 {skill_info}")
 
     check("构建主窗口（端到端）", _window)
