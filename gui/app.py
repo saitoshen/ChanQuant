@@ -2519,10 +2519,18 @@ class MainWindow(QMainWindow):
         for text, years in [("近 1 年", 1), ("近 2 年", 2), ("近 3 年", 3),
                             ("近 5 年", 5), ("近 10 年", 10), ("全部历史", 0)]:
             self.cb_range.addItem(text, years)
-        self.cb_range.setCurrentIndex(2)
+        # 默认「全部历史」，和策略库里 `range_years=0` 的语义对齐。
+        #
+        # 以前默认 index=2（近 3 年），和组合页加载出来的配置不是同一段数据 ——
+        # 同一条策略在两个页面显示不同笔数、不同收益，用户只会认为算错了。
+        # 实测（IC / TL / IM 三条 5m 策略）：区间=全部时两页**逐位相同**；
+        # 一边近 3 年一边全部，笔数 204 vs 641、125 vs 177，差得没边。
+        # 想跑快一点仍然可以手动选近 N 年，只是不再默认替用户裁数据。
+        self.cb_range.setCurrentIndex(self.cb_range.findData(0))
         self.cb_range.setToolTip(
             "策略和回测都只算这一段（起点前多留 250 根让均线预热，图上不显示）。\n"
-            "5 分钟十年是 26 万根，跑因子评估 / 机器学习时选短一点快很多。"
+            "默认「全部历史」—— 和策略库/组合页的口径一致，两处数字才对得上。\n"
+            "5 分钟十年是 26 万根，跑因子评估 / 机器学习时可以选短一点，快很多。"
         )
         cl.addWidget(self.cb_range)
 
