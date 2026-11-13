@@ -2479,9 +2479,10 @@ def _run() -> tuple[bool, list[str]]:
         #    `budget` / `risk` 在 `size_lots` 里自带 `max(1, ...)`，`fixed`
         #    手数写死，这三种只写说明、不抬。
         #
-        #    🔴 判定的本金必须是**分到的**那份：实测 10 万开 1 手、分配只给
-        #    10 万的一半时，它就只有 0.5 手。拿实测本金去判会全部漏判
-        #    （实测工作区 23 条里有 4 条正是这种）。
+        #    🔴 两处判据都是被用户当场纠正过的，各钉一条：
+        #      a) 门槛是 **0.5 手**不是 1 手（`lots_round(0.5)==1`，0.49 就是 0）。
+        #         按 1.0 判会把「明明开得出来」的策略也抬一遍。
+        #      b) 判定的本金必须是**分到的**那份，而且按**最贵那一手**的价判。
         def mk_lot(sid, principal, vol, lot_avg, lot_peak, lots,
                    sizing="capital", pct=100.0):
             u = mk(sid, principal, 1_000, 9_000, vol, sizing=sizing,
@@ -2494,44 +2495,49 @@ def _run() -> tuple[bool, list[str]]:
             u.margin_rate = 0.1
             return u
 
-        # 一手均价 4 万、峰值 6 万 ⇒ 目标 5 万；实测 10 万开 1 手（1e-5 手/元）
-        # ⇒ 要开 1 手需要 5 万 ÷ 1e-5 = 12.5 万
-        s_small = mk_lot("S", 100_000, 0.30, 40_000, 60_000, 1.0)
+        # ⑩a 门槛是 0.5 手：占用 100%、最贵一手 6 万 ⇒ 只要 3 万本金就够
+        #     （3 万 ÷ 6 万 = 0.5 手 → 四舍五入 1 手）
+        s_probe = mk_lot("P", 100_000, 0.30, 40_000, 60_000, 1.0)
+        if abs(PL.lot_floor(s_probe, principal=40_000.0)[0]) > 1e-6:
+            raise RuntimeError("4 万本金按最贵一手能算 0.67 手，不该要求上调")
+        if abs(PL.lot_floor(s_probe, principal=20_000.0)[0] - 30_000.0) > 1.0:
+            raise RuntimeError(
+                f"0.5 手门槛算错了：{PL.lot_floor(s_probe, principal=20_000.0)[0]:,.0f}"
+                f" ≠ 30,000（0.5 × 60,000 ÷ 100%）")
+
+        # ⑩b 真的不够 ⇒ 抬到够，别人一分不让
+        #     占用 50% ⇒ 最贵一手 6 万只要 6 万本金；等权 10 万分 5 万 ⇒ 抬 +1 万
+        s_small = mk_lot("S", 100_000, 0.30, 40_000, 60_000, 1.0, pct=50.0)
         s_rich = mk_lot("R", 100_000, 0.20, 10_000, 10_000, 8.0)
         lot_us = [s_small, s_rich]
-        need, _why = PL.lot_floor(s_small, 0.5, principal=100_000.0)
-        if abs(need - 125_000.0) > 1.0:
-            raise RuntimeError(f"一手门槛算错了：{need:,.0f} ≠ 125,000")
-        # 等权 20 万 ⇒ 各 10 万；S 只有 0.8 手（10万×1e-5×4/5）⇒ 抬到 12.5 万
-        sh10 = PL.allocate(lot_us, 200_000.0, "equal", basis="principal")
-        if abs(sh10[0].new_principal - 125_000.0) > 1.0:
+        sh10 = PL.allocate(lot_us, 100_000.0, "equal", basis="principal")
+        if abs(sh10[0].new_principal - 60_000.0) > 1.0:
             raise RuntimeError(
-                f"开不出 1 手的没抬到 12.5 万：{sh10[0].new_principal:,.0f}")
-        if not sh10[0].lifted or abs(sh10[0].lift_extra - 25_000.0) > 1.0:
+                f"开不出 1 手的没抬到 6 万：{sh10[0].new_principal:,.0f}")
+        if not sh10[0].lifted or abs(sh10[0].lift_extra - 10_000.0) > 1.0:
             raise RuntimeError(f"上调额记错了：{sh10[0].lift_extra!r}")
-        # ① 别人一分不让：权重不变，本金还是原来的
-        if abs(sh10[1].new_principal - 100_000.0) > 1e-6:
+        if abs(sh10[1].new_principal - 50_000.0) > 1e-6:
             raise RuntimeError(
                 f"一手保底不该动别人的本金：{sh10[1].new_principal:,.0f}")
         if abs(sh10[0].weight - sh10[1].weight) > 1e-12:
             raise RuntimeError("一手保底把权重也改了 —— 它只该加本金")
-        if abs(sum(s.new_principal for s in sh10) - 225_000.0) > 1.0:
-            raise RuntimeError("本金合计该是 20 万 + 2.5 万")
-        # ② 已经够一手的条目不许抬（否则等于凭空给它加钱）
+        if abs(sum(s.new_principal for s in sh10) - 110_000.0) > 1.0:
+            raise RuntimeError("本金合计该是 10 万 + 1 万")
         if sh10[1].lifted or sh10[1].lot_need > 0:
             raise RuntimeError("够一手的条目被抬了")
-        # ③ 上限：单条**上调额**不超过总资金的 LOT_LIFT_CAP_SHARE，到顶就停并写明
-        s_huge = mk_lot("H", 100_000, 0.30, 10_000_000, 10_000_000, 0.01)
+        # ⑩c 上限：单条**上调额**不超过总资金的 LOT_LIFT_CAP_SHARE，到顶就停并写明
+        s_huge = mk_lot("H", 100_000, 0.30, 10_000_000, 10_000_000, 0.01,
+                        pct=1.0)
         sh11 = PL.allocate([s_huge, mk_lot("Q", 100_000, 0.20, 10_000, 10_000, 8.0)],
-                           300_000.0, "equal", basis="principal")
-        room = 300_000.0 * PL.LOT_LIFT_CAP_SHARE
+                           100_000.0, "equal", basis="principal")
+        room = 100_000.0 * PL.LOT_LIFT_CAP_SHARE
         if abs(sh11[0].lift_extra - room) > 1.0:
             raise RuntimeError(
                 f"上调额没顶在 {room:,.0f}：{sh11[0].lift_extra:,.0f}")
         if "仍不足一手" not in (sh11[0].floor_note or ""):
             raise RuntimeError(
                 f"顶到上限却没说「仍不足一手」：{sh11[0].floor_note!r}")
-        # ④ 自带保底 1 手的口径不抬，但要写清楚
+        # ⑩d 自带保底 1 手的口径不抬，但要写清楚
         b_risk = mk_lot("K", 100_000, 0.30, 40_000, 60_000, 0.0, sizing="risk")
         sh12 = PL.allocate([b_risk, mk_lot("Q", 100_000, 0.20, 10_000, 10_000, 8.0)],
                            20_000.0, "equal", basis="principal")
@@ -2539,11 +2545,11 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError("risk 口径自带保底 1 手，不该再抬本金")
         if "保底" not in (sh12[0].floor_note or ""):
             raise RuntimeError(f"risk 口径没写清楚为什么没抬：{sh12[0].floor_note!r}")
-        # ⑤ 关掉开关就一条都不抬（给「我就是要按权重硬分」的人留后路）
-        off = PL.allocate(lot_us, 200_000.0, "equal", basis="principal", lift=False)
+        # ⑩e 关掉开关就一条都不抬（给「我就是要按权重硬分」的人留后路）
+        off = PL.allocate(lot_us, 100_000.0, "equal", basis="principal", lift=False)
         if any(s.lifted for s in off):
             raise RuntimeError("lift=False 还在抬")
-        if abs(off[0].new_principal - 100_000.0) > 1e-6:
+        if abs(off[0].new_principal - 50_000.0) > 1e-6:
             raise RuntimeError("lift=False 的本金被改了")
 
         return ("ERC 风险贡献等权（n=1/2/5/12，误差 <1e-6）；"
@@ -2553,9 +2559,9 @@ def _run() -> tuple[bool, list[str]]:
                 f"盈利因子≥{PL.PF_FLOOR:g} 拿更多，低于 {PL.PF_FLOOR:g} 或不足半年"
                 "落最低档但不清零；亏穿不再额外降档 —— 波动率含翻负段按真值配权、"
                 "杠杆由利用率体现）；"
-                f"一手保底（开不出 1 手的抬到「均价~峰值」中间那一手，差额只加总本金、"
-                f"不动别人；单条上限 {PL.LOT_LIFT_CAP_SHARE:.0%} 总资金，到顶写明仍不足；"
-                "budget/risk 自带保底 1 手不抬）；"
+                f"一手保底（按 **0.5 手**门槛 × **最贵那一手**算所需本金；开不出的抬到够，"
+                f"差额只加总本金、不动别人；单条上调额上限 {PL.LOT_LIFT_CAP_SHARE:.0%} 总资金，"
+                "到顶写明仍不足；budget/risk 自带保底 1 手不抬）；"
                 "实测占用按当前配置折算（应用分配后本金(前)是真值、再折不自乘）")
 
     check("组合工作区资金分配（ERC / 三种口径）", _portfolio_plan)
