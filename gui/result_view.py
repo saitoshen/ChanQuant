@@ -183,6 +183,17 @@ def _lots_text(v: float) -> str:
     return f"{v:,.0f}" if abs(v - round(v)) < 1e-6 else f"{v:,.2f}"
 
 
+def _all_positive(series) -> bool:
+    """这条曲线能不能画在对数轴上（每个点都得 > 0）。
+
+    缺值先剔掉再判：`NaN > 0` 是 False，直接把 `all()` 打成 False —— 净值序列
+    中间夹一个 NaN（停牌、拼接断档）就会莫名其妙退回线性轴，而线本身还是画得
+    出来的。空序列按「不行」处理，没有数据就别选对数。
+    """
+    v = pd.to_numeric(pd.Series(series), errors="coerce").dropna()
+    return bool(len(v)) and bool((v > 0).all())
+
+
 def cumulative_pnl(trades) -> list[float]:
     """逐笔的累计盈亏，**金额**，按行序累加。
 
@@ -441,6 +452,10 @@ class ResultView(QObject):
         self._k_start = 0
         self._k_last_draw = 0.0
         self._k_pending = False
+        # 资金曲线的纵轴：默认线性。对数留给需要看等比例涨跌的曲线
+        # （复权后的净值、跨一两个数量级的组合），等权组合用对数会把
+        # 大部分时间的横向波动压平，反而不直观
+        self._yscale_log = False
         # 藏着的时候收到的重画请求：画布 -> (画法, 参数)，露面时补一帧
         self._pending_draw: dict = {}
         # 十字光标：双击开/关，鼠标扫到哪根读哪根
@@ -563,13 +578,15 @@ class ResultView(QObject):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 8, 8)
 
-        # 多品种才有「切到某个品种」这回事。放在页首而不是表格顶上：换的不只是
-        # 右边那张指标表，左边的资金曲线和回撤也跟着换
+        # 页首横条：左边「看哪一条腿」，右边「纵轴怎么画」。两个都只换这张图，
+        # 所以摆在一起，不占表格的地儿
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 2)
         self.cb_leg = None
         self.lbl_leg = None
         if self.kind != "single":
-            top = QHBoxLayout()
-            top.setContentsMargins(0, 0, 0, 2)
+            # 多品种才有「切到某个品种」这回事。放在页首而不是表格顶上：换的
+            # 不只是右边那张指标表，左边的资金曲线和回撤也跟着换
             lab = QLabel("品种")
             lab.setStyleSheet("font-size: 11px; color: #6b7280;")
             self.lbl_leg = lab
@@ -579,8 +596,24 @@ class ResultView(QObject):
             self.cb_leg.addItem("全部组合（各品种合计）", "")
             self.cb_leg.currentIndexChanged.connect(self._on_leg_changed)
             top.addWidget(self.cb_leg)
-            top.addStretch(1)
-            lay.addLayout(top)
+        top.addStretch(1)
+        # 纵轴口径：默认线性。等权组合的净值就在 1 附近走，线性才能看出
+        # 「这一段跌了多少」；对数轴把 0.9~1.1 这一段拉平、把后面的暴涨拉开，
+        # 看着像根本没波动。需要看等比例涨跌（复权净值、跨数量级的曲线）再切对数
+        ylab = QLabel("纵轴")
+        ylab.setStyleSheet("font-size: 11px; color: #6b7280;")
+        top.addWidget(ylab)
+        self.cb_yscale = QComboBox()
+        self.cb_yscale.setMinimumWidth(150)
+        self.cb_yscale.addItem("线性", 0)
+        self.cb_yscale.addItem("对数", 1)
+        self.cb_yscale.setCurrentIndex(0 if not self._yscale_log else 1)
+        self.cb_yscale.setToolTip(
+            "线性：净值差多少就画多少，回调看得最清楚（默认）\n"
+            "对数：等比例的涨跌画成等距，适合复权净值 / 跨数量级的曲线")
+        self.cb_yscale.currentIndexChanged.connect(self._on_yscale_changed)
+        top.addWidget(self.cb_yscale)
+        lay.addLayout(top)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -669,6 +702,27 @@ class ResultView(QObject):
     def _on_leg_changed(self, _i: int = 0) -> None:
         self._update_table()
         self._draw_perf()
+
+    def _on_yscale_changed(self, _i: int = 0) -> None:
+        """切纵轴口径。只重画左边那张图，指标表不受影响。"""
+        cb = getattr(self, "cb_yscale", None)
+        self._yscale_log = bool(cb is not None and cb.currentData() == 1)
+        self._draw_perf()
+
+    def _set_log_available(self, ok: bool) -> None:
+        """当前这条曲线画不成对数时，把「对数」那一项置灰。
+
+        只把轴悄悄退回线性、下拉框还写着「对数」，用户会以为点了没生效。
+        置灰 + tooltip 才是明说「这段数据不支持」，和图上那行小字一起看。
+        """
+        cb = getattr(self, "cb_yscale", None)
+        if cb is None:
+            return
+        item = cb.model().item(1)
+        if item is None:
+            return
+        item.setEnabled(bool(ok))
+        item.setToolTip("" if ok else "净值里出现过 ≤ 0 的点，对数轴画不出来")
 
     # ---- 因子分析
 
@@ -1827,14 +1881,27 @@ class ResultView(QObject):
         ax.fill_between(eq_s.index, 1, eq_s.values,
                         where=eq_s.values < 1, color="#dc2626", alpha=0.06)
         ax.axhline(1.0, color="#cbd5e1", lw=0.8, ls="--")
-        # 权益可能被亏穿成负数（回测不再强平，见 `backtest.run_backtest`）。
-        # 负数在对数轴上没有位置：matplotlib 会把这一段直接丢掉，曲线看着像
-        # 「亏光那天就停了」—— 又变回强平的效果。有非正值就退回线性轴
-        positive = bool((eq_s > 0).all()) and (
-            bh is None or bool((eq_b > 0).all()))
-        if positive:
+        # 纵轴口径由页首那个下拉框决定，默认线性。
+        # 但「选了对数」不等于「画得成对数」：权益可能被亏穿成负数（回测不再
+        # 强平，见 `backtest.run_backtest`），负数在对数轴上没有位置，matplotlib
+        # 会把这一段直接丢掉，曲线看着像「亏光那天就停了」—— 又变回强平的效果。
+        # 所以先验一遍有没有非正值，有就退回线性，并在图上写明原因
+        positive = _all_positive(eq_s) and (bh is None or _all_positive(eq_b))
+        want_log = bool(getattr(self, "_yscale_log", False))
+        use_log = want_log and positive
+        if use_log:
             ax.set_yscale("log")
-        ax.set_ylabel("净值（对数）" if positive else "净值", fontsize=9, color=C_MUTED)
+        ax.set_ylabel("净值（对数）" if use_log else "净值", fontsize=9, color=C_MUTED)
+        self._set_log_available(positive)
+        if want_log and not positive:
+            # 摆在标题那一行的右端（坐标框上方），不和曲线抢地方 —— 曲线往下
+            # 走到负数时右下角正好是它路过的地方
+            ax.text(
+                1.0, 1.015,
+                "净值里出现过 ≤ 0 的点，对数轴画不出来 → 已按线性显示",
+                transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=8, color="#b45309",
+            )
         if bh is not None:
             title = "策略 vs 买入持有 · 资金曲线"
         elif self._leg_picked():

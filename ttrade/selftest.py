@@ -1033,6 +1033,88 @@ def _run() -> tuple[bool, list[str]]:
                 f"开仓 {len(ent)} 个、平仓 {len(ext)} 个、"
                 f"手数 3/5 手带到图上、区间前开仓延续、连线到右边缘")
 
+    def _perf_yscale():
+        """资金曲线纵轴的「线性 / 对数」开关（绩效页页首那个下拉框）。
+
+        默认必须是**线性**：等权组合的净值就在 1 附近走，对数轴把 0.9~1.1
+        这一段压成平线、把后面的涨幅拉开，看着像「前半段根本没波动」。对数
+        留给要读等比例涨跌的曲线（复权净值、跨数量级）。
+
+        四件事钉住：① 默认线性、ylabel 不写「对数」；② 切过去真是 log 轴；
+        ③ 净值里有 ≤ 0 的点（亏穿）时对数画不出来 —— matplotlib 会把那一段
+        直接丢掉、看着像「亏光那天就停了」，所以必须退回线性、把选项置灰、
+        并在图上写明原因；④ 用户的选择要跟着重画和换腿走，不能自己掉回线性。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade.backtest import _METRIC_KEYS, Result
+
+        from gui.result_view import ResultView, ViewCtx
+
+        def mk(eq, label="X", legs=None):
+            m = {k: 0.0 for k in _METRIC_KEYS}
+            m.update({"initial_cash": 100_000.0, "final_equity": 120_000.0,
+                      "cagr": 0.2, "max_dd": -0.1, "sharpe": 1.0,
+                      "n_trades": 5})
+            return Result(equity=eq, position=pd.Series(0.0, index=eq.index),
+                          trades=[], metrics=m, label=label, legs=legs or {})
+
+        idx = pd.date_range("2022-01-03", periods=300, freq="B")
+        good = pd.Series(np.linspace(1.0, 1.8, len(idx)) + 0.02, index=idx)
+        bad = pd.Series(np.linspace(1.0, -0.4, len(idx)), index=idx)
+
+        def ax_of(v):
+            return v.canvas_p.figure.axes[0]
+
+        v = ResultView(kind="portfolio")
+        v.show_result(None, None, mk(good), None, ViewCtx(label="组合"))
+        cb, ax = v.cb_yscale, ax_of(v)
+        if cb is None:
+            raise RuntimeError("绩效页没有纵轴下拉框（单策略也必须能切）")
+        if cb.currentData() != 0 or ax.get_yscale() != "linear":
+            raise RuntimeError(
+                f"默认不是线性：选中 {cb.currentData()}、轴 {ax.get_yscale()}")
+        if "对数" in ax.get_ylabel():
+            raise RuntimeError(f"线性轴上还写着对数：{ax.get_ylabel()!r}")
+        if not cb.model().item(1).isEnabled():
+            raise RuntimeError("全正净值时「对数」却被置灰了")
+
+        cb.setCurrentIndex(1)
+        if ax_of(v).get_yscale() != "log" or "对数" not in ax_of(v).get_ylabel():
+            raise RuntimeError("切到对数没生效")
+        v._draw_perf()                     # 重画一次，状态不能丢
+        if ax_of(v).get_yscale() != "log" or v.cb_yscale.currentData() != 1:
+            raise RuntimeError("重画之后纵轴自己掉回线性了")
+
+        # 亏穿：对数画不出来，必须退回线性并说明
+        v.show_result(None, None, mk(bad), None, ViewCtx(label="亏穿"))
+        ax = ax_of(v)
+        if cb.model().item(1).isEnabled():
+            raise RuntimeError("净值有负值时「对数」还能选（点了会以为没生效）")
+        if ax.get_yscale() != "linear":
+            raise RuntimeError(f"亏穿时还用了对数轴：{ax.get_yscale()}")
+        if not any("对数轴画不出来" in t.get_text() for t in ax.texts):
+            raise RuntimeError("亏穿时退回线性却没写原因，用户只会以为点了没反应")
+
+        # 换腿：全组合正、某条腿亏穿 —— 各判各的，用户选的「对数」别被偷偷改掉
+        v2 = ResultView(kind="portfolio")
+        v2.show_result(None, None, mk(good, legs={"亏穿腿": mk(bad)}), None,
+                       ViewCtx(label="组合"))
+        v2.cb_yscale.setCurrentIndex(1)
+        keys = [v2.cb_leg.itemData(i) for i in range(v2.cb_leg.count())]
+        v2.cb_leg.setCurrentIndex(keys.index("亏穿腿"))
+        if ax_of(v2).get_yscale() != "linear":
+            raise RuntimeError("切到亏穿那条腿没退回线性")
+        if v2.cb_yscale.currentData() != 1:
+            raise RuntimeError("换腿把用户选的「对数」改成了线性")
+        v2.cb_leg.setCurrentIndex(0)
+        if ax_of(v2).get_yscale() != "log":
+            raise RuntimeError("切回全组合没恢复对数")
+
+        return ("默认线性 / 切对数真变 log / 亏穿退回线性并置灰＋说明 / "
+                "重画与换腿都保住选择")
+
     # 注意：`check()` 是立即执行的，这一项 import 了 Qt，
     # 要等下面的 `_window` 把 QApplication 建起来之前再验（见文件末尾的 check）
 
@@ -7141,6 +7223,7 @@ def _run() -> tuple[bool, list[str]]:
 
     # K 线与信号页的持仓映射：这一项 import 了 Qt，放在窗口之后跑
     check("K线与信号：持仓与交易记录同源（含手数）", _chart_from_trades)
+    check("资金曲线纵轴（线性 / 对数 / 亏穿退回）", _perf_yscale)
 
     return ok, lines
 
