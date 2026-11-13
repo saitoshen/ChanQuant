@@ -2329,17 +2329,26 @@ def _run() -> tuple[bool, list[str]]:
         #    `ann_vol` 标成 NaN，而 `1/vol` 会让 **所有** 权重变 nan ——
         #    界面上权重 / 目标占用 / 缩放 / 本金(后) / 预计占用整列都是 nan，
         #    用户看不出是其中一条爆仓策略干的（实测工作区 27 条全 nan）。
+        # 🔴 3.6.1 起「亏穿」不再压最低档：亏穿主要是**杠杆过高**的产物
+        #    （`capital_pct` 打满、名义敞口是本金十几倍），拿它当风险平价的
+        #    惩罚等于按杠杆罚两次；而且标了 NaN 就说明连真实波动都量不到。
+        #    现在它和「压根没量过（vol=0）」走同一条路：组合典型风险、不降档。
         bad = us + [mk("X", 200_000, 100, 50_000, float("nan"))]
+        zero = us + [mk("X", 200_000, 100, 50_000, 0.0)]
         w = PL.risk_parity(bad)
+        wz = PL.risk_parity(zero)
         if not np.all(np.isfinite(w)):
             raise RuntimeError(f"NaN 波动率把权重全带成 nan 了：{np.round(w, 4)}")
         if abs(float(w.sum()) - 1.0) > 1e-12:
             raise RuntimeError("混入 NaN 之后权重和不为 1")
-        # 亏穿的那条「风险已知极大」⇒ 必须拿到最小的一档（= 风险分数最高那条的
-        # 权重），而不是被当成典型策略、更不是被静默判 0
-        if abs(w[3] - float(np.min(w))) > 1e-9 or w[3] >= w[2]:
+        # 两条路必须给出**逐位相同**的权重（等价性），而且都不是最小那一档
+        if float(np.max(np.abs(w - wz))) > 1e-12:
             raise RuntimeError(
-                f"亏穿的策略该按最高风险配权，实际 {np.round(w, 4)}")
+                f"「亏穿」和「没量过」该走同一条路，实际 "
+                f"{np.round(w, 4)} vs {np.round(wz, 4)}")
+        if abs(w[3] - float(np.min(w))) < 1e-9:
+            raise RuntimeError(
+                f"亏穿的策略不该再被压到最小一档，实际 {np.round(w, 4)}")
         sh = PL.allocate(bad, total, "risk", basis="usage")
         if not all(np.isfinite([s.weight, s.target, s.scale, s.new_principal,
                                 s.est_avg]).all() for s in sh):
@@ -2396,22 +2405,26 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError("固定手数那条被 rebase 折了 —— 手数根本不会变")
 
         # ⑨ 风险平价的三把尺子：利用率 / 盈利因子 / 回测时长
-        # ⑨a 盈利因子低于 1.3 ⇒ 最低档（= 组合里风险最高那一档的权重）。
-        #     不判 0：判 0 等于静默把策略从组合里删掉，那是替用户做决定
+        # ⑨a 盈利因子低于门槛（`PF_FLOOR`，现在 1.1）⇒ 最低档（= 组合里风险最高
+        #     那一档的权重）。不判 0：判 0 等于静默把策略从组合里删掉，那是替
+        #     用户做决定
         pfu = [mk("OK", 100_000, 50_000, 60_000, 0.10, pf=2.0),
                mk("HI", 100_000, 50_000, 60_000, 0.40, pf=2.0),
-               mk("LO", 100_000, 50_000, 60_000, 0.05, pf=1.20)]
+               mk("LO", 100_000, 50_000, 60_000, 0.05, pf=1.05)]
         w = PL.risk_parity(pfu)
         if abs(w[2] - w[1]) > 1e-12 or w[2] <= 0:
             raise RuntimeError(
-                f"盈利因子 1.2 < 1.3 该落到最低档（= 波动最大那条的权重），"
-                f"实际 {np.round(w, 4)}")
-        # 反过来：1.3 以上不罚
-        ok = [mk("A", 100_000, 50_000, 60_000, 0.10, pf=1.31),
+                f"盈利因子 1.05 < {PL.PF_FLOOR:g} 该落到最低档"
+                f"（= 波动最大那条的权重），实际 {np.round(w, 4)}")
+        # 反过来：门槛以上不罚。用 1.15 —— 它低于旧的 1.3、高于现在的 1.1，
+        # 门槛一旦被改回去这条就会红
+        ok = [mk("A", 100_000, 50_000, 60_000, 0.10, pf=1.15),
               mk("B", 100_000, 50_000, 60_000, 0.20, pf=5.0)]
         w = PL.risk_parity(ok)
         if not (w[1] < w[0] < 0.75):
-            raise RuntimeError(f"盈利因子 1.31 不该被打最低档，实际 {np.round(w, 4)}")
+            raise RuntimeError(
+                f"盈利因子 1.15 ≥ {PL.PF_FLOOR:g} 不该被打最低档，"
+                f"实际 {np.round(w, 4)}")
         # ⑨b 回测时长分档：≥3 年 > 2~3 年 > 1~2 年 > 半年~1 年，且幅度 ≤ 1.40
         sp = [mk("Y4", 100_000, 50_000, 60_000, 0.20, span=4.0),
               mk("Y2", 100_000, 50_000, 60_000, 0.20, span=2.5),
@@ -2442,14 +2455,15 @@ def _run() -> tuple[bool, list[str]]:
         sh = PL.allocate(pfu, 300_000, "risk", basis="usage")
         if "最低档" not in (sh[2].tier or ""):
             raise RuntimeError(f"最低档没在预览表点名：{sh[2].tier!r}")
-        if abs(sh[2].pf - 1.20) > 1e-9:
+        if abs(sh[2].pf - 1.05) > 1e-9:
             raise RuntimeError("预览表里的盈利因子没带到 Share 上")
 
         return ("ERC 风险贡献等权（n=1/2/5/12，误差 <1e-6）；"
                 "按本金/按平均占用/按峰值三种口径；固定手数不缩放；手动按比例；"
                 "风险平价挡住 NaN（一条爆仓不连累全体）与 vol=0（不吞掉全部资金）；"
-                "标准化风险＝波动÷利用率×时长系数（利用率高/回测长/盈利因子≥1.3 拿更多，"
-                "低于 1.3 或不足半年落最低档但不清零）；"
+                "标准化风险＝波动÷利用率×时长系数（利用率高/回测长/"
+                f"盈利因子≥{PL.PF_FLOOR:g} 拿更多，低于 {PL.PF_FLOOR:g} 或不足半年"
+                "落最低档但不清零；亏穿按典型风险、不再额外降档）；"
                 "实测占用按当前配置折算（应用分配后本金(前)是真值、再折不自乘）")
 
     check("组合工作区资金分配（ERC / 三种口径）", _portfolio_plan)
