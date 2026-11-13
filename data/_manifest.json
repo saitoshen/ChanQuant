@@ -4,12 +4,12 @@
     "name": "苹果",
     "exchange": "NASDAQ",
     "secid": "105.AAPL",
-    "rows": 5052,
-    "start": "2006-10-05",
-    "end": "2026-11-03",
+    "rows": 5051,
+    "start": "2006-10-12",
+    "end": "2026-11-10",
     "file": "AAPL.csv",
-    "source": "eastmoney",
-    "adjusted": true
+    "source": "tushare",
+    "adjusted": false
   },
   {
     "symbol": "MSFT",
