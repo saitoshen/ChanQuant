@@ -1840,12 +1840,28 @@ class PortfolioPage(QWidget):
         self._fill_strategies()
         self._render()
         after = sum(float(getattr(c, "principal", 0) or 0) for c in self._items)
+        # 一手保底抬出来的钱是**额外本金**：总资金必须跟着涨，否则「本金合计 >
+        # 总资金」这条恒等式会一直红着，用户每次打开都要重新判断到底哪个错了。
+        # 只在真的抬过、且抬完超过原总资金时才改，避免无谓地覆盖用户手填的数。
+        lift = sum(float(getattr(s, "lift_extra", 0) or 0) for s in dlg.shares)
+        raised = 0.0
+        if lift > 1e-6:
+            was = float(self._ws.live_total(self._pool) or 0)
+            # 只加「一手保底那一份」，不是把总资金改成 Σ本金：按占用校准本来
+            # 就会让本金合计大于总资金（那是口径的正常结果），一次保底不该把
+            # 它一并抹平 —— 否则用户下次看到「本金合计 = 总资金」会以为校准失效了
+            self._ws.total = round(was + lift, 2)
+            raised = lift
+            self._save_ws()
         tot = self._ws.live_total(self._pool)
         self._on_log(
             f"已应用分配：{n} 条策略本金已更新"
             + (f"、{pct_ch} 条占用百分比已更新" if pct_ch else "")
             + f"，合计 {after / 10000:,.1f} 万"
-            + (f"（总资金的 {after / tot:.2f} 倍）" if tot > 0 else "")
+            + (f"（总资金的 {after / tot:.2f} 倍）" if tot > 0 and raised <= 0 else "")
+            + (f"；其中一手保底 +{lift / 10000:,.1f} 万，总资金已同步上调 "
+               f"+{raised / 10000:,.1f} 万 至 {tot / 10000:,.1f} 万"
+               if raised > 0 else "")
             + "。正在跑的连接不会自动改用新本金，需停止后重新启动")
 
     def _reload_accounts(self) -> None:

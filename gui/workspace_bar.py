@@ -240,9 +240,13 @@ class AllocDialog(QDialog):
         lay.setContentsMargins(14, 12, 14, 12)
         lay.setSpacing(8)
 
-        head = QLabel(
+        after = sum(float(s.new_principal or 0) for s in self.shares)
+        head_txt = (
             f"总资金 {total / 10000:,.1f} 万　·　{PL.BASES.get(basis, basis)}"
             f"　·　{PL.KNOBS.get(knob, knob)}　·　{len(self.shares)} 条策略")
+        if after > total * 1.02:
+            head_txt += f"　·　本金合计 {after / 10000:,.1f} 万"
+        head = QLabel(head_txt)
         head.setStyleSheet("font-size: 13px; font-weight: 600; color: #0f172a;")
         lay.addWidget(head)
 
@@ -255,7 +259,7 @@ class AllocDialog(QDialog):
         cols = ["策略", "权重", "标准化风险", "盈利因子", "回测年数", "档位",
                 "目标占用", "实测平均", "实测峰值", "缩放",
                 "本金(前)", "本金(后)", "占用%(前)", "占用%(后)",
-                "预计占用", "说明"]
+                "预计占用", "一手保底", "说明"]
         t = QTableWidget(len(self.shares), len(cols))
         t.setHorizontalHeaderLabels(cols)
         t.verticalHeader().setVisible(False)
@@ -264,9 +268,17 @@ class AllocDialog(QDialog):
         h = t.horizontalHeader()
         for i in range(len(cols)):
             h.setSectionResizeMode(
-                i, QHeaderView.Stretch if i in (0, 5, 15)
+                i, QHeaderView.Stretch if i in (0, 5, 16)
                 else QHeaderView.ResizeToContents)
         for i, s in enumerate(self.shares):
+            # 「一手保底」列只写**加了多少钱**，长解释留在说明列 —— 这一列要能
+            # 一眼扫出「哪几条被抬了、抬了多少」
+            if getattr(s, "lifted", False):
+                lift_txt = f"↑ {s.lift_extra:,.0f}"
+            elif getattr(s, "lot_need", 0) > 0:
+                lift_txt = "缺（未抬）"
+            else:
+                lift_txt = "—"
             vals = [
                 s.name, f"{s.weight * 100:.1f}%",
                 f"{s.risk_score:.2f}" if s.risk_score > 0 else "—",
@@ -278,16 +290,18 @@ class AllocDialog(QDialog):
                 f"{s.new_principal:,.0f}",
                 f"{s.old_pct:.0f}%" if s.old_pct else "—",
                 f"{s.new_pct:.0f}%" if s.new_pct else "—",
-                f"{s.est_avg:,.0f}", s.note,
+                f"{s.est_avg:,.0f}", lift_txt, s.note,
             ]
             for j, v in enumerate(vals):
                 it = QTableWidgetItem(v)
-                if j in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14):
+                if j in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15):
                     it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if j == 15 and s.note:
+                if j == 16 and s.note:
                     it.setForeground(Qt.GlobalColor.darkYellow)
                 if j == 5 and "最低档" in (s.tier or ""):
                     it.setForeground(Qt.GlobalColor.darkYellow)
+                if j == 15 and getattr(s, "lifted", False):
+                    it.setForeground(Qt.GlobalColor.darkGreen)
                 t.setItem(i, j, it)
         lay.addWidget(t, 1)
 
@@ -313,13 +327,42 @@ class AllocDialog(QDialog):
         if not self.shares:
             return [("这个工作区还没有成员，先在策略列表「从策略库添加」", True)]
         after = sum(s.new_principal for s in self.shares)
-        if total > 0 and after > total * 1.02:
+        extra = sum(float(getattr(s, "lift_extra", 0) or 0) for s in self.shares)
+        # 一手保底抬出来的钱要**先扣掉**再判「本金放大几倍」—— 那是两回事：
+        # 一个是「按占用校准」的正常放大，一个是「补到够一手」的额外本金。
+        # 混在一起说，用户会以为按占用校准也把钱包吹了
+        base_after = after - extra
+        if total > 0 and base_after > total * 1.02:
             out.append((
-                f"本金合计 {after / 10000:,.0f} 万 = 总资金的 {after / total:.1f} 倍。"
+                f"按占用校准后的本金合计 {base_after / 10000:,.0f} 万"
+                f"（不含一手保底）= 总资金的 {base_after / total:.2f} 倍。"
                 "这是「按平均占用 / 按峰值占用」校准的正常结果，不是算错 —— "
                 "「仓位 30%」意味着一次出手只压 30% 的钱，要让平均开仓占用对齐，"
                 "本金就得放大 2~5 倍（对齐峰值时更高）。确认要这么配再点应用。",
                 False))
+        # ---- 一手保底 ----
+        lifted = [s for s in self.shares if getattr(s, "lifted", False)]
+        if lifted:
+            names = "、".join(s.name for s in lifted[:3]) + ("…" if len(lifted) > 3 else "")
+            out.append((
+                f"有 {len(lifted)} 条分到的钱历史上开不出 1 手（{names}），每手大约要 "
+                f"{(sum(float(s.lot_need) for s in lifted) / max(len(lifted), 1)) / 10000:,.1f} 万。"
+                f"已按「一手保底」上调 +{extra / 10000:,.1f} 万：这部分**不从其他条目扣**，"
+                f"应用后总资金会变成 {after / 10000:,.1f} 万（原 {total / 10000:,.1f} 万）。"
+                "上调额取「历史平均一手」到「历史最贵一手」之间一半的位置。",
+                False))
+        # 抬到上限还开不出一手：必须点名。否则这条会以「已保底」的样子继续空跑，
+        # 而它的净值、占用、波动率、盈利因子全是 0 —— 配权规则还会再罚它一次
+        short = [s for s in self.shares
+                 if "仍不足一手" in (getattr(s, "floor_note", "") or "")
+                 or "没有可上调的空间" in (getattr(s, "floor_note", "") or "")]
+        if short:
+            names = "、".join(s.name for s in short[:3]) + ("…" if len(short) > 3 else "")
+            out.append((
+                f"有 {len(short)} 条即使上调到上限也开不出 1 手（{names}）："
+                "它们历史上大部分时间是空仓，净值 / 波动率 / 盈利因子都不可信。"
+                "要么给这几条单独开户，要么把它们从组合里去掉 —— 留在组合里配权"
+                "只会让它们的权重看起来「有数」其实是零信息。", True))
         fx = [s.name for s in self.shares if "固定手数" in (s.note or "")]
         if fx:
             out.append((f"有 {len(fx)} 条是固定手数（{'、'.join(fx[:3])}"
