@@ -3568,6 +3568,163 @@ def _run() -> tuple[bool, list[str]]:
 
     check("实盘信号走因子过滤", _live_rule_filter)
 
+    def _live_aux_frame():
+        """实盘跨周期帧必须挂上衍生列，否则展期 / 期权因子被**静默剔除**。
+
+        2026-11-13 的实盘就是这样：`IM定时突破+展期美元指数过滤` 的策略在
+        `tqdata.load_main` 拿到的日线只有 10 列（OHLCV + 持仓量），
+        `roll_main_oi` 整列 NaN（研究页 78% 有值、实盘 0%），`factor_matrix`
+        把它剔掉，实盘跑的是「只有一个美元因子」的另一条策略 —— 日志里一个字
+        都没有。日线走 `attach`、分钟走 `attach_intraday`，别搞反：分钟 bar
+        用当天的期限结构就是未来信息。
+        """
+        import pandas as pd
+
+        from ttrade import auxdata
+        from ttrade.strategy_runner import PortfolioRunner as R
+
+        seen = []
+        orig = (auxdata.attach, auxdata.attach_intraday)
+
+        def _fake_daily(df, sym, ex, aux_dir=None):
+            seen.append("daily")
+            out = df.copy()
+            out["c1_oi"] = 1.0
+            return out
+
+        def _fake_intra(df, sym, ex, aux_dir=None):
+            seen.append("intra")
+            out = df.copy()
+            out["c1_oi"] = 2.0
+            return out
+
+        auxdata.attach, auxdata.attach_intraday = _fake_daily, _fake_intra
+        try:
+            day = pd.DataFrame({"close": [1.0] * 40},
+                               index=pd.bdate_range("2026-01-05", periods=40))
+            m5 = pd.DataFrame(
+                {"close": [1.0] * 200},
+                index=pd.date_range("2026-01-05 09:00", periods=200, freq="5min"))
+            a = R._aux_frame(day, "RB", "SHFE")
+            b = R._aux_frame(m5, "RB", "SHFE")
+            c = R._aux_frame(None, "RB", "SHFE")
+            # 空表也要安全返回（跨周期行情没读到是常事）
+            e = R._aux_frame(day.iloc[:0], "RB", "SHFE")
+        finally:
+            auxdata.attach, auxdata.attach_intraday = orig
+
+        if seen != ["daily", "intra"]:
+            raise RuntimeError(f"挂列的次序/选择不对：{seen}（应 daily → intra）")
+        if "c1_oi" not in a.columns or "c1_oi" not in b.columns:
+            raise RuntimeError("衍生列没挂上")
+        if c is not None or len(e) != 0:
+            raise RuntimeError("空行情应原样返回（None / 空表）")
+        return f"日线走 attach、5m 走 attach_intraday（{len(a.columns)}/{len(b.columns)} 列）"
+
+    check("实盘跨周期帧挂衍生列", _live_aux_frame)
+
+    def _live_dropped_note():
+        """因子被剔除必须吭声，且只吭一次。
+
+        静默剔除是最难查的一类：策略照跑、仓照开，只是过滤条件比回测少几票，
+        曲线上看不出异常。上面那条 `_live_aux_frame` 修的是「为什么会缺」，
+        这条钉的是「缺了要说话」。
+        """
+        import pandas as pd
+
+        from ttrade.strategy_runner import PortfolioRunner as R
+
+        class _Cfg:
+            sid = "s1"
+
+        class _St:
+            cfg = _Cfg()
+
+            def title(self):
+                return "某策略"
+
+        class _Out:
+            class pack:                      # noqa: N801 - 只做壳
+                fmat = pd.DataFrame(columns=["macro_usdcnh"])
+
+        r = object.__new__(R)
+        r._factor_warned = set()
+        logs = []
+        r._log_fn = logs.append
+
+        keys = ["roll_main_oi@1d_tq", "macro_usdcnh"]
+        r._note_dropped(_St(), keys, _Out())      # 少了 1 个 → 记一条
+        r._note_dropped(_St(), keys, _Out())      # 同一槽位不再重复
+
+        if len(logs) != 1:
+            raise RuntimeError(f"剔除提示应恰好 1 条，实际 {len(logs)} 条：{logs}")
+        if "1 个因子" not in logs[0] or "roll_main_oi@1d_tq" not in logs[0]:
+            raise RuntimeError(f"提示内容不对：{logs[0]}")
+
+        # 一个都没少时不许吭声
+        class _Full:
+            class pack:                      # noqa: N801
+                fmat = pd.DataFrame(columns=keys)
+
+        r._factor_warned.clear()
+        seen = len(logs)
+        r._note_dropped(_St(), keys, _Full())
+        if len(logs) != seen:
+            raise RuntimeError(f"没剔除还报了：{logs[seen:]}")
+        return f"剔除 1 个时报 1 条并去重：{logs[0][:30] if logs else logs}"
+
+    check("实盘因子被剔除要提示", _live_dropped_note)
+
+    def _live_error_log():
+        """槽位错误要落盘，且同一条只写一次。
+
+        GUI 的日志控件在内存里，关窗就没了；表格「错误」那格只有 tooltip 一句
+        话。2026-11-13 用户报「宏观美元策略实时报错」时，盘上没有任何记录，
+        只能靠猜 —— `live.log` 以前只有机器学习在写。
+        """
+        from ttrade.strategy_runner import PortfolioRunner as R
+
+        class _Cfg:
+            def __init__(self, sid):
+                self.sid = sid
+
+        class _St:
+            def __init__(self, sid, err):
+                self.cfg = _Cfg(sid)
+                self.error = err
+                self.running = False
+
+            def title(self):
+                return f"策略{self.cfg.sid}"
+
+        class _Diag:
+            def __init__(self):
+                self.lines = []
+
+            def write(self, tag, msg):
+                self.lines.append((tag, msg))
+
+        r = object.__new__(R)
+        r._err_logged = set()
+        r._diag = _Diag()
+        r._slots = {"a": _St("a", "ValueError: 跨周期因子缺行情"), "b": _St("b", "")}
+        r._log_errors()
+        r._log_errors()                       # 再调一次不许重复写
+        if len(r._diag.lines) != 1:
+            raise RuntimeError(f"应只写 1 行，实际 {r._diag.lines}")
+        tag, msg = r._diag.lines[0]
+        if tag != "LIVE" or "跨周期因子缺行情" not in msg:
+            raise RuntimeError(f"写的内容不对：{r._diag.lines[0]}")
+
+        # 错误变了要再写一条（换了一个故障点不是同一件事）
+        r._slots["a"].error = "TypeError: 另一件事"
+        r._log_errors()
+        if len(r._diag.lines) != 2:
+            raise RuntimeError(f"换错误应再写一条，实际 {len(r._diag.lines)} 条")
+        return f"错误落盘 {len(r._diag.lines)} 条，同一条不重复"
+
+    check("实盘错误落盘（去重）", _live_error_log)
+
     def _align_lock():
         """锁仓（多空双开）必须被看见，而且能被一键对齐平掉。
 

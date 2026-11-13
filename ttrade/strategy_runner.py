@@ -493,6 +493,10 @@ class PortfolioRunner:
         self._fresh_book = not positionbook.exists()
         self._adopted: set[str] = set()
         self._aux_warned: set[str] = set()
+        # 因子被剔除只提示一次（按 sid 去重），理由见 `_note_dropped`
+        self._factor_warned: set[str] = set()
+        # 已经落过盘的槽位错误：(sid, 错误原文)。见 `snapshot`
+        self._err_logged: set[tuple] = set()
 
     # ---- 生命周期 ----
 
@@ -1410,6 +1414,7 @@ class PortfolioRunner:
                 df, mode or "single", list(st.cfg.factor_keys or []),
                 fc, extra=self._period_extra(st, fc), base_period=st.cfg.period,
             )
+            self._note_dropped(st, list(st.cfg.factor_keys or []), out)
             sig = out.df["signal"].iloc[-1]
             return 0 if pd.isna(sig) else int(sig)
 
@@ -1426,6 +1431,7 @@ class PortfolioRunner:
             list(st.cfg.factor_keys or []), fc,
             extra=self._period_extra(st, fc), base_period=st.cfg.period,
         )
+        self._note_dropped(st, list(st.cfg.factor_keys or []), out)
         sig = out.df["signal"].iloc[-1]
         return 0 if pd.isna(sig) else int(sig)
 
@@ -1442,9 +1448,60 @@ class PortfolioRunner:
         sym, ex = st.cfg.symbol, st.cfg.exchange
         return fstrat.period_frames(
             fc, keys, st.cfg.period,
-            lambda p: tqdata.load_main(sym, ex, p, adjust="qfq"),
+            lambda p: self._aux_frame(
+                tqdata.load_main(sym, ex, p, adjust="qfq"), sym, ex),
             extra_keys=list(getattr(fc, "trigger_keys", None) or []),
         )
+
+    @staticmethod
+    def _aux_frame(df: pd.DataFrame, sym: str, ex: str) -> pd.DataFrame:
+        """给跨周期帧补上衍生列（展期 / 期权 / 基本面）。
+
+        `tqdata.load_main()` 只给 OHLCV + 持仓量。研究页那边 `DataStore.get()`
+        加载时会 `auxdata.attach()` / `attach_intraday()` 把期限结构和期权列
+        并进来；实盘这条链路自己拼 df，漏了这一步 —— `roll_main_oi`、`iv_*`、
+        `pcr` 这些因子在跨周期帧上整列 NaN，`factor_matrix` 把它们**静默剔除**，
+        于是实盘跑的是「少几个因子」的另一条策略，界面上一个字都不提示。
+        实测 IM 上 `roll_main_oi@1d_tq`：研究页 78% 有值，实盘 0%。
+
+        日线用 `attach`（那根 K 线的收盘和期限结构是同一天同一时刻算的，谁都
+        不领先谁）；分钟用 `attach_intraday`（同一天上午的 bar 不可能知道收盘后
+        才有的近远月价差，只能用上一交易日的快照）。
+        """
+        if df is None or df.empty:
+            return df
+        try:
+            from ttrade.auxdata import attach, attach_intraday, bar_period
+
+            # `bar_period` 按相邻间隔判：日线 / 2 日 / 周线都给 `1d`
+            return (attach(df, sym, ex) if bar_period(df) == "1d"
+                    else attach_intraday(df, sym, ex))
+        except Exception:      # noqa: BLE001 - 衍生数据缺了不该让策略停摆
+            return df
+
+    def _note_dropped(self, st: SlotState, keys: list, out) -> None:
+        """有因子被剔除时说一次 —— 静默剔除是最难查的一类问题。
+
+        `factor_matrix` 把「这个标的、这条链路上算不出值」的因子剔掉是合理的
+        （美股没有持仓量），但**实盘这条链路缺列**也会走到同一条路径：策略照
+        跑、仓照开，只是过滤条件比回测少几票，曲线上看不出异常，等到实盘和
+        回测对不上才发现（本次就是 `roll_main_oi@1d_tq` 在跨周期帧上整列 NaN）。
+        """
+        fmat = getattr(getattr(out, "pack", None), "fmat", None)
+        if fmat is None:
+            return
+        kept = set(getattr(fmat, "columns", []))
+        gone = [str(k) for k in keys if str(k) not in kept]
+        sid = str(getattr(st.cfg, "sid", "") or st.title())
+        # 自检里只借 `_signal` 一条路，不会走完整 __init__
+        warned = getattr(self, "_factor_warned", None)
+        if warned is None:
+            warned = self._factor_warned = set()
+        if not gone or sid in warned:
+            return
+        warned.add(sid)
+        self._log(f"{st.title()}：{len(gone)} 个因子在实盘链路上算不出值，已剔除"
+                  f"（{'、'.join(gone[:4])}）—— 过滤条件比回测少，结果会对不上")
 
     def _with_aux(self, st: SlotState, df: pd.DataFrame) -> pd.DataFrame:
         """给实时序列挂上期限结构 / 期权列。
@@ -2372,7 +2429,24 @@ class PortfolioRunner:
             })
         return out
 
+    def _log_errors(self) -> None:
+        """把槽位错误**落一次盘**（GUI 那份日志只在内存里，关窗就没了）。
+
+        表格「错误」那一格只有 tooltip 一句话，事后想查是启动校验拦下的、还是
+        tick 里抛的，盘上没有任何记录 —— 只能说「不知道」。同一条错误只记一次，
+        否则每 0.4 秒一份快照会刷满 `live.log`。
+        """
+        for st in self._slots.values():
+            if not st.error:
+                continue
+            key = (st.cfg.sid, st.error)
+            if key in self._err_logged:
+                continue
+            self._err_logged.add(key)
+            self._diag.write("LIVE", f"{st.title()}：{st.error}")
+
     def snapshot(self) -> dict:
+        self._log_errors()
         # 取一次就清掉。没清的话界面关掉 K 线之后，这份开销还每份快照都付
         want, self._want = self._want, []
         slots = [
