@@ -2192,12 +2192,15 @@ def _run() -> tuple[bool, list[str]]:
                 raise RuntimeError("完全共线时 ERC 权重不是有限值/和为 1")
 
         # ② 造三条策略：占用率故意拉开，才能看出「按占用」和「按本金」的区别
-        def mk(sid, principal, avg, peak, vol, sizing="capital"):
+        def mk(sid, principal, avg, peak, vol, sizing="capital",
+               pf=0.0, span=0.0):
+            """pf / span 默认 0 = 「不知道」，风险平价里按中性处理（不奖不罚）。"""
             return PL.Usage(sid=sid, name=sid, sizing=sizing, principal=principal,
                             capital=principal * 0.3, avg_margin=avg,
                             peak_margin=peak, avg_notional=avg * 10,
                             peak_notional=peak * 10, util=avg / principal,
-                            vol=vol, ret=0.5, max_dd=0.2, bars=1000)
+                            vol=vol, ret=0.5, max_dd=0.2, bars=1000,
+                            profit_factor=pf, span_years=span)
 
         us = [mk("A", 100_000, 1_000, 20_000, 0.20),
               mk("B", 100_000, 5_000, 25_000, 0.40),
@@ -2287,12 +2290,29 @@ def _run() -> tuple[bool, list[str]]:
             if abs(e.est_avg - e.target) > 1e-6:
                 raise RuntimeError(f"sizing={sz} 时本金没把占用校准到位")
 
-        # ③ 风险平价：波动大的权重小，且权重和为 1
-        w = PL.weights("risk", us)
+        # ③ 风险平价：权重 ∝ 1/(净值波动 ÷ 资金利用率 × 回测时长系数)
+        #
+        # 🔴 这条口径 3.6.1 改过：以前权重只看净值波动，于是「用 10% 的钱做出
+        #    20% 波动」和「用 90% 的钱做出 20% 波动」拿一样多 —— 前者每块钱
+        #    承担 200% 波动、后者只有 22%，明显该少给。所以下面分两组验：
+        #    利用率一致时看波动，波动一致时看利用率。
+        same_u = [mk("A", 100_000, 50_000, 60_000, 0.20),
+                  mk("B", 100_000, 50_000, 60_000, 0.40),
+                  mk("C", 100_000, 50_000, 60_000, 0.10)]
+        w = PL.weights("risk", same_u)
         if abs(float(w.sum()) - 1.0) > 1e-12:
             raise RuntimeError("风险平价权重和不为 1")
         if not (w[1] < w[0] < w[2]):
-            raise RuntimeError(f"波动率越大权重该越小，实际 {np.round(w, 4)}")
+            raise RuntimeError(
+                f"利用率相同时波动率越大权重该越小，实际 {np.round(w, 4)}")
+        # 波动一致、利用率 10% vs 90%：前者单位资金的风险是后者的 9 倍 ⇒ 少给
+        diff_u = [mk("L", 100_000, 10_000, 12_000, 0.20),
+                  mk("H", 100_000, 90_000, 99_000, 0.20)]
+        wu = PL.weights("risk", diff_u)
+        if not (wu[0] * 9.0 < wu[1] * 1.001 and wu[1] > wu[0]):
+            raise RuntimeError(
+                f"同样波动下利用率低的该拿更少（util 10% vs 90%），"
+                f"实际 {np.round(wu, 4)}")
 
         # ④ 手动：按金额占比归一
         w = PL.weights("manual", us, manual={"A": 1, "B": 2, "C": 1})
@@ -2315,9 +2335,9 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"NaN 波动率把权重全带成 nan 了：{np.round(w, 4)}")
         if abs(float(w.sum()) - 1.0) > 1e-12:
             raise RuntimeError("混入 NaN 之后权重和不为 1")
-        # 亏穿的那条「风险已知极大」⇒ 必须拿到最小的一档（= 波动最大那条的权重），
-        # 而不是被当成典型策略、更不是被静默判 0
-        if abs(w[3] - w[1]) > 1e-9 or w[3] >= w[0]:
+        # 亏穿的那条「风险已知极大」⇒ 必须拿到最小的一档（= 风险分数最高那条的
+        # 权重），而不是被当成典型策略、更不是被静默判 0
+        if abs(w[3] - float(np.min(w))) > 1e-9 or w[3] >= w[2]:
             raise RuntimeError(
                 f"亏穿的策略该按最高风险配权，实际 {np.round(w, 4)}")
         sh = PL.allocate(bad, total, "risk", basis="usage")
@@ -2375,9 +2395,61 @@ def _run() -> tuple[bool, list[str]]:
         if abs(PL.rebase(fx, 500_000, 30.0).avg_margin - 60_000) > 1e-6:
             raise RuntimeError("固定手数那条被 rebase 折了 —— 手数根本不会变")
 
+        # ⑨ 风险平价的三把尺子：利用率 / 盈利因子 / 回测时长
+        # ⑨a 盈利因子低于 1.3 ⇒ 最低档（= 组合里风险最高那一档的权重）。
+        #     不判 0：判 0 等于静默把策略从组合里删掉，那是替用户做决定
+        pfu = [mk("OK", 100_000, 50_000, 60_000, 0.10, pf=2.0),
+               mk("HI", 100_000, 50_000, 60_000, 0.40, pf=2.0),
+               mk("LO", 100_000, 50_000, 60_000, 0.05, pf=1.20)]
+        w = PL.risk_parity(pfu)
+        if abs(w[2] - w[1]) > 1e-12 or w[2] <= 0:
+            raise RuntimeError(
+                f"盈利因子 1.2 < 1.3 该落到最低档（= 波动最大那条的权重），"
+                f"实际 {np.round(w, 4)}")
+        # 反过来：1.3 以上不罚
+        ok = [mk("A", 100_000, 50_000, 60_000, 0.10, pf=1.31),
+              mk("B", 100_000, 50_000, 60_000, 0.20, pf=5.0)]
+        w = PL.risk_parity(ok)
+        if not (w[1] < w[0] < 0.75):
+            raise RuntimeError(f"盈利因子 1.31 不该被打最低档，实际 {np.round(w, 4)}")
+        # ⑨b 回测时长分档：≥3 年 > 2~3 年 > 1~2 年 > 半年~1 年，且幅度 ≤ 1.40
+        sp = [mk("Y4", 100_000, 50_000, 60_000, 0.20, span=4.0),
+              mk("Y2", 100_000, 50_000, 60_000, 0.20, span=2.5),
+              mk("Y1", 100_000, 50_000, 60_000, 0.20, span=1.2),
+              mk("Y0", 100_000, 50_000, 60_000, 0.20, span=0.8)]
+        w = PL.risk_parity(sp)
+        if not (w[0] > w[1] > w[2] > w[3]):
+            raise RuntimeError(f"回测越长权重该越大，实际 {np.round(w, 4)}")
+        if w[0] / w[3] > 1.40 + 1e-9:
+            raise RuntimeError(
+                f"时长的影响 {w[0] / w[3]:.2f}x 盖过了波动率本身（上限 1.40x）")
+        # ⑨c 不足半年 ⇒ 最低档
+        new = [mk("OLD", 100_000, 50_000, 60_000, 0.30, span=3.0),
+               mk("NEW", 100_000, 50_000, 60_000, 0.05, span=0.3)]
+        w = PL.risk_parity(new)
+        if abs(w[0] - w[1]) > 1e-12:
+            raise RuntimeError(
+                f"回测不足半年该落到最低档（和最高风险那条同权），"
+                f"实际 {np.round(w, 4)}")
+        # ⑨d 「不知道」不奖不罚：pf=0 / span=0 的分数必须和「3 年 + 1.8」一致
+        unk = [mk("A", 100_000, 50_000, 60_000, 0.20),
+               mk("B", 100_000, 50_000, 60_000, 0.20, pf=1.8, span=3.0)]
+        w = PL.risk_parity(unk)
+        if abs(w[0] - w[1]) > 1e-12:
+            raise RuntimeError(
+                f"没量到盈利因子/时长时该按中性处理，实际 {np.round(w, 4)}")
+        # ⑨e 档位说明必须能传到预览表上（否则用户不知道权重为什么是 1.x%）
+        sh = PL.allocate(pfu, 300_000, "risk", basis="usage")
+        if "最低档" not in (sh[2].tier or ""):
+            raise RuntimeError(f"最低档没在预览表点名：{sh[2].tier!r}")
+        if abs(sh[2].pf - 1.20) > 1e-9:
+            raise RuntimeError("预览表里的盈利因子没带到 Share 上")
+
         return ("ERC 风险贡献等权（n=1/2/5/12，误差 <1e-6）；"
                 "按本金/按平均占用/按峰值三种口径；固定手数不缩放；手动按比例；"
                 "风险平价挡住 NaN（一条爆仓不连累全体）与 vol=0（不吞掉全部资金）；"
+                "标准化风险＝波动÷利用率×时长系数（利用率高/回测长/盈利因子≥1.3 拿更多，"
+                "低于 1.3 或不足半年落最低档但不清零）；"
                 "实测占用按当前配置折算（应用分配后本金(前)是真值、再折不自乘）")
 
     check("组合工作区资金分配（ERC / 三种口径）", _portfolio_plan)

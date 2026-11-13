@@ -116,8 +116,14 @@ class WorkspaceBar(QWidget):
             self.cb_mode.addItem(v, k)
         self.cb_mode.setToolTip(
             "资金等权：每条策略分到总资金的 1/N。\n"
-            "风险平价：按各自净值波动的**相关性**做等风险贡献（ERC），\n"
-            "　　　　　波动大、跟别人同涨同跌的分得少。\n"
+            "风险平价：按**标准化风险**倒数配权，标准差越大分得越少。\n"
+            "　　　　　标准化风险 = 净值年化波动 ÷ 资金利用率 × 回测时长系数\n"
+            "　　　　　· 除以利用率：同样 20% 波动，用满 90% 本金的比只用 20% 的\n"
+            "　　　　　　更「便宜」（每块钱承担的风险低），所以利用率高的反而拿更多\n"
+            "　　　　　· 盈利因子 < 1.3 ⇒ 落到最低档（不清零，但只拿最小那份）\n"
+            "　　　　　· 回测 ≥3 年 ×1.00、2~3 年 ×1.12、1~2 年 ×1.25、半年~1 年 ×1.40；\n"
+            "　　　　　　不足半年直接最低档\n"
+            "　　　　　有净值序列时还会按相关性做等风险贡献（ERC），口径与上面一致。\n"
             "手动设置：按你填的金额比例分。")
         self.cb_mode.currentIndexChanged.connect(
             lambda _i: self.mode_changed.emit(str(self.cb_mode.currentData() or "equal")))
@@ -225,7 +231,7 @@ class AllocDialog(QDialog):
                  measured: bool = False, parent=None, knob: str = "split") -> None:
         super().__init__(parent)
         self.setWindowTitle("资金分配预览")
-        self.resize(1180, 540)
+        self.resize(1420, 560)
         self.shares = list(shares)
 
         lay = QVBoxLayout(self)
@@ -240,7 +246,12 @@ class AllocDialog(QDialog):
 
         # 「占用%(前/后)」两列不能省：`knob` 调到 pct / split 时，本金可能
         # 一动没动，全部变化都在百分比上 —— 只列本金会让人以为「没生效」
-        cols = ["策略", "权重", "目标占用", "实测平均", "实测峰值", "缩放",
+        #
+        # 「标准化风险 / 盈利因子 / 回测年数 / 档位」四列是风险平价的账本：
+        # 权重 ∝ 1/标准化风险，而标准化风险 = 波动 ÷ 利用率 × 时长系数。
+        # 不列出来的话，用户看到「这条波动只有 3% 却只分到 1.2%」根本无从追问。
+        cols = ["策略", "权重", "标准化风险", "盈利因子", "回测年数", "档位",
+                "目标占用", "实测平均", "实测峰值", "缩放",
                 "本金(前)", "本金(后)", "占用%(前)", "占用%(后)",
                 "预计占用", "说明"]
         t = QTableWidget(len(self.shares), len(cols))
@@ -251,10 +262,15 @@ class AllocDialog(QDialog):
         h = t.horizontalHeader()
         for i in range(len(cols)):
             h.setSectionResizeMode(
-                i, QHeaderView.Stretch if i in (0, 11) else QHeaderView.ResizeToContents)
+                i, QHeaderView.Stretch if i in (0, 5, 15)
+                else QHeaderView.ResizeToContents)
         for i, s in enumerate(self.shares):
             vals = [
                 s.name, f"{s.weight * 100:.1f}%",
+                f"{s.risk_score:.2f}" if s.risk_score > 0 else "—",
+                f"{s.pf:.2f}" if s.pf > 0 else "—",
+                f"{s.span:.1f}" if s.span > 0 else "—",
+                s.tier or "—",
                 f"{s.target:,.0f}", f"{s.avg_margin:,.0f}",
                 f"{s.peak_margin:,.0f}", f"{s.scale:.2f}x", f"{s.old_principal:,.0f}",
                 f"{s.new_principal:,.0f}",
@@ -264,9 +280,11 @@ class AllocDialog(QDialog):
             ]
             for j, v in enumerate(vals):
                 it = QTableWidgetItem(v)
-                if j in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
+                if j in (1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14):
                     it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if j == 11 and s.note:
+                if j == 15 and s.note:
+                    it.setForeground(Qt.GlobalColor.darkYellow)
+                if j == 5 and "最低档" in (s.tier or ""):
                     it.setForeground(Qt.GlobalColor.darkYellow)
                 t.setItem(i, j, it)
         lay.addWidget(t, 1)
@@ -315,6 +333,20 @@ class AllocDialog(QDialog):
                 + "）：权益被亏穿的按「最高风险」给了最小权重，没量过占用的按"
                 "「组合典型风险」补齐。风险平价在这里是保守估计，不是它自己的风险。",
                 False))
+        # 风险平价的账本：权重不是只由波动率定的，不给一句话说明的话，
+        # 用户看到「波动 3% 的只分到 1.2%」完全无从追问
+        tiers = [s for s in self.shares if (s.tier or "").strip()]
+        if tiers:
+            low = [s.name for s in tiers if "最低档" in (s.tier or "")]
+            msg = ("风险平价按「标准化风险」倒数分配：年化波动 ÷ 资金利用率 × 回测"
+                   "时长系数。利用率高、回测长、盈利因子 ≥1.3 的多拿。"
+                   "「标准化风险」列可以直接横向比，越大分得越少。")
+            if low:
+                msg += (f"　本次落到最低档 {len(low)} 条：{'、'.join(low[:3])}"
+                        + ("…" if len(low) > 3 else "")
+                        + "（盈利因子 <1.3 / 回测不足半年 / 净值亏穿；"
+                          "指到组合里风险最高那一档，不清零）")
+            out.append((msg, False))
         if str(basis) != "principal" and not measured:
             out.append(("还没量过占用，校准口径退回了「按分配额」。"
                         "先点「量一下占用」，再来看这一页。", True))

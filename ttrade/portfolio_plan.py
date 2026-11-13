@@ -21,6 +21,26 @@
 **让每条策略的平均开仓占用 = 组合给它的那份钱**。这就是「比较一下，相应
 调整策略的资金仓位分配」的落地方式。
 
+## 风险平价不只看净值波动
+
+`weight ∝ 1 / 标准化风险`，而
+
+    标准化风险 = 年化波动 ÷ 资金利用率 × 回测时长系数
+
+- **利用率折算**（`vol / util`，`util = 平均开仓占用 ÷ 分配额`）：同样 20% 的净值
+  波动，一条用满 90% 本金的策略和一条只用 20% 的策略，单位资金的效率差 4.5 倍。
+  不折的话杠杆小的策略会一直白拿钱 —— 它「看起来温和」只是因为钱没花出去。
+- **盈利因子门槛**（`profit_factor < 1.3`）⇒ 直接落到**最低档**。`profit_factor`
+  未知（没成交 / 没量测）不罚，按中性处理。
+- **回测时长分档**：≥3 年 ×1.00、2~3 年 ×1.12、1~2 年 ×1.25、半年~1 年 ×1.40，
+  **不足半年直接最低档**。系数乘在风险上 ⇒ 回测越短权重越小。为什么上限只到
+  1.40：波动率项在组合内的跨度通常 3~10 倍，「时长的影响约等于波动率的 1/3」
+  换算成乘数就是 `3^(1/3) ~ 10^(1/3) ≈ 1.44 ~ 2.15`，取 1.40 落在下界以内 ——
+  意思是「回测长短最多相当于 3 倍的波动率差异」，不会盖过波动率本身。
+
+「最低档」= 把它的风险分数抬到**有效组里最高**那一档，而不是判 0 —— 判 0 等于
+静默把一条策略从组合里删掉，那是替用户做决定。全部条目都触底时自然成了等权。
+
 ## 四种仓位口径对缩放的反应
 
 | `sizing` | 手数怎么来 | 放大 `principal` 会怎样 |
@@ -75,6 +95,32 @@ KNOBS = {
 # 两边不一致的话，界面算出 620% 写进去，下次加载被夹回 500% —— 手数悄悄变了。
 PCT_CAP = 500.0
 
+# ---- 风险平价的三把尺子（见模块文档「风险平价不只看净值波动」） ----
+#
+# 盈利因子门槛：低于 1.3 的策略直接落到最低档（= 组合里风险最高那一档的权重）。
+# 1.3 是用户定的线：1.0 只是不亏手续费，扣掉滑点/冲击成本后 1.3 以下基本没有
+# 安全边际。
+PF_FLOOR = 1.3
+
+# 回测时长档位：(最少年数, 风险系数, 档名)。**降序**排列，第一个命中的就是它。
+#
+# 上限为什么只到 1.40：波动率项在组合内的跨度通常 3~10 倍，而「时长的影响约
+# 等于波动率的 1/3」换算成乘数就是 3^(1/3) ~ 10^(1/3) = 1.44 ~ 2.15。取 1.40
+# 落在下界**以内** —— 意思是「回测长短最多相当于 3 倍的波动率差异」，
+# 绝不会盖过波动率本身。再大就会变成「按回测年份拍脑袋」。
+SPAN_TIERS = (
+    (3.0, 1.00, "回测≥3年"),
+    (2.0, 1.12, "回测2~3年"),
+    (1.0, 1.25, "回测1~2年"),
+    (0.5, 1.40, "回测半年~1年"),
+)
+# 不足半年 ⇒ 最低档（回测太短，什么结论都可能是运气）
+SPAN_MIN_YEARS = 0.5
+
+# 资金利用率的下限。`vol / util` 在 util 极小时会放大几十上百倍，把这条策略的
+# 权重压到 0.0x% —— 那已经是「静默删策略」了。2% 以下不再区分（界面上会点名）。
+UTIL_FLOOR = 0.02
+
 
 @dataclass
 class Usage:
@@ -98,6 +144,10 @@ class Usage:
     ret: float = 0.0              # 累计收益
     max_dd: float = 0.0           # 最大回撤（正数）
     bars: int = 0                 # 回测里的交易笔数（老版本存的是 bar 数）
+    # 盈利因子（`profit_factor`，毛利润 / 毛亏损）。0 = 没读到（没成交 / 老结果）
+    profit_factor: float = 0.0
+    # 回测区间长度（年）。0 = 不知道（没有净值曲线 / 老记录）
+    span_years: float = 0.0
     note: str = ""
     # 量测时的配置基准。和 `principal` / `capital_pct` 重复是**故意的**：
     # `rebase()` 会把 `principal` 改写成当前配置，基准得留一份原值，
@@ -139,6 +189,14 @@ class Share:
     old_pct: float = 30.0         # 占用百分比（前）
     new_pct: float = 30.0         # 占用百分比（后）
     est_avg: float = 0.0          # 缩放后的预计占用（口径同 target）
+    # 标准化风险分数（= 年化波动 ÷ 资金利用率 × 回测时长系数）。风险平价下
+    # 权重 ∝ 1/这个数；别的模式下是 0，界面按「—」显示
+    risk_score: float = 0.0
+    pf: float = 0.0               # 盈利因子（0 = 未知）
+    span: float = 0.0             # 回测区间长度（年，0 = 未知）
+    # 资质档位的一句话结论（「回测2~3年 ×1.15」「盈利因子 1.12 < 1.3 → 最低档」）。
+    # 单独一列，不和 `note` 混在一起 —— `note` 讲的是本金/百分比怎么调的
+    tier: str = ""
     # 波动率无效（`vol` 是 NaN 或 0）。风险平价下这些条目会被补齐，权重不是
     # 由它自己的风险算出来的 —— 预览表必须点名，否则「为什么 27 条权重一样」
     # 没人解释得清
@@ -164,7 +222,12 @@ def measure(cfg, frame: pd.DataFrame | None, res, mult: float = 1.0,
     最高点），所以两者口径不同，界面要写清楚。
 
     `frame` / `mult` / `margin_rate` 保留在签名里是为了兼容老调用方（早先这里
-    自己按收盘价逐根算），现在不再使用 —— 占用完全从 `res.metrics` 来。
+    自己按收盘价逐根算），现在只用来兜底「回测区间有多长」—— 占用完全从
+    `res.metrics` 来。
+
+    除了占用，这里还顺手记下**风险平价要用的另外三个数**：`util`（占用 ÷ 分配额）、
+    `profit_factor`、`span_years`。它们都必须和占用在同一次回测里量出来，否则
+    「用 A 次的收益率配权、B 次的手数下单」，两边迟早对不上。
     """
     sid = str(getattr(cfg, "sid", "") or "")
     name = str(getattr(cfg, "title", lambda: "")() or sid)
@@ -201,9 +264,41 @@ def measure(cfg, frame: pd.DataFrame | None, res, mult: float = 1.0,
     u.peak_margin = float(met.get("peak_margin") or 0.0)
     u.util = u.avg_margin / principal if principal > 0 else 0.0
     u.bars = int(met.get("n_trades") or 0)
+    try:
+        u.profit_factor = float(met.get("profit_factor") or 0.0)
+    except (TypeError, ValueError):
+        u.profit_factor = 0.0
+    if not math.isfinite(u.profit_factor) or u.profit_factor < 0:
+        # `profit_factor` 在「一笔没成交」时可能是 0 或 NaN，两种都当「未知」，
+        # 不能当成「盈利因子极差」去打最低档
+        u.profit_factor = 0.0
+    u.span_years = span_of(res, frame)
     if u.avg_margin <= 0:
         u.note = u.note or "回测里没有开过仓，量不出占用（只能按波动率配权）"
     return u
+
+
+def span_of(res, frame: pd.DataFrame | None = None) -> float:
+    """回测区间有多长（年）。取净值曲线的首尾，没有净值时退回行情索引。
+
+    为什么不从 `res.metrics` 读：`_metrics` 里压根没有时间跨度字段（只有
+    `cagr` / `avg_bars` 这种相对量）。而从 `equity.index` 首尾相减是**精确**的，
+    也天然跟着「这次回测真正跑到哪」走 —— 用户改了区间，这里立刻跟着变。
+
+    返回 0 表示「不知道」（没有净值曲线 / 索引不是时间），调用方按中性处理，
+    不能当成「回测 0 天」去打最低档。
+    """
+    for obj in (getattr(res, "equity", None), frame):
+        idx = getattr(obj, "index", None)
+        if idx is None or len(idx) < 2:
+            continue
+        try:
+            days = float((idx[-1] - idx[0]).days)
+        except (TypeError, AttributeError, ValueError):
+            continue
+        if math.isfinite(days) and days > 0:
+            return days / 365.25
+    return 0.0
 
 
 _REBASE_TAG = "实测占用已按当前配置折算"
@@ -319,6 +414,140 @@ def erc_weights(cov: np.ndarray) -> np.ndarray:
     return w / w.sum()
 
 
+def _join(a: str, b: str) -> str:
+    """把两段说明拼成「；」分隔的一句话（任一段为空就只留另一段）。"""
+    a, b = (a or "").strip(), (b or "").strip()
+    if not b:
+        return a
+    return f"{a}；{b}" if a else b
+
+
+def span_factor(years: float) -> tuple[float, str, bool]:
+    """回测时长 → (风险系数, 档名, 是否最低档)。
+
+    系数**乘在风险上**，所以越大 = 权重越小：回测越长系数越小、分到的钱越多。
+    `years <= 0`（不知道）返回 `(1.0, "", False)` —— 中性，不奖不罚。
+    """
+    try:
+        y = float(years or 0.0)
+    except (TypeError, ValueError):
+        return 1.0, "", False
+    if not math.isfinite(y) or y <= 0:
+        return 1.0, "", False
+    if y < SPAN_MIN_YEARS:
+        return (SPAN_TIERS[-1][1],
+                f"回测仅 {y * 12:.0f} 个月（不足半年）→ 最低档", True)
+    for lo, f, name in SPAN_TIERS:
+        if y >= lo:
+            return f, name, False
+    return SPAN_TIERS[-1][1], SPAN_TIERS[-1][2], False
+
+
+def risk_scores(usages: list[Usage]) -> tuple[np.ndarray, list[str]]:
+    """每条策略的**标准化风险分数**（配权用 `1/分数`）+ 每条一句说明。
+
+        分数 = 年化波动 ÷ 资金利用率 × 回测时长系数
+
+    分数**越小越安全**，所以权重 ∝ `1/分数`。全部有限、全部为正 ——
+    调用方可以放心取倒数，不会再出现 nan。
+
+    ## 三处折算，各自的「未知」都不一样
+
+    | 缺什么 | 怎么补 | 为什么不判 0 / 不判最高 |
+    |---|---|---|
+    | 利用率没量测（`util=0`） | 组合**中位数**利用率 | 不知道它压了多少，折成中位数＝不奖不罚。判 0 会把它当「几乎不用钱 ⇒ 单位风险爆炸」直接压死 |
+    | 波动没量测（`vol=0`） | 有效组**几何平均**（典型风险） | 判 0 经 `1/vol` 会吃掉全部资金（实测 4 条没数据的拿走 100%） |
+    | 波动 NaN（权益亏穿） | 有效组**最大**风险 | `_metrics` 有意标 NaN ＝「风险大到没意义」，该给最小一档，但不能判 0 |
+
+    ## 「最低档」是什么
+
+    盈利因子 < `PF_FLOOR`、回测不足半年、权益亏穿 —— 这三种一律把分数抬到
+    **有效组里最高**那一档（`s_top`），也就是拿到最小的那档权重。抬的时候取
+    `max(自己的分数, s_top)`：一个本来就比 `s_top` 更危险的策略不会被这一抬
+    反而变安全。全部条目都触底时分数全相等 ⇒ 自然成了等权；如果全部条目的风险
+    本来就一样（刚开工作区、配置全同），「最高那一档」就是大家自己，同权是对的
+    —— 外面没有更差的档可参照，硬压一个比例就等于凭空发明一个系数。
+
+    返回的说明里会点名「为什么它在最低档」，界面直接显示，不用用户猜。
+    """
+    n = len(usages)
+    if n == 0:
+        return np.zeros(0), []
+    vol = np.array([float(getattr(u, "vol", 0.0) or 0.0) for u in usages],
+                   dtype=float)
+    util = np.array([float(getattr(u, "util", 0.0) or 0.0) for u in usages],
+                    dtype=float)
+    pf = np.array([float(getattr(u, "profit_factor", 0.0) or 0.0)
+                   for u in usages], dtype=float)
+    yrs = np.array([float(getattr(u, "span_years", 0.0) or 0.0)
+                    for u in usages], dtype=float)
+    why = [""] * n
+
+    # 注意 `float('nan') or 0.0` 还是 nan（NaN 是真值），所以上面的 `or` 只
+    # 处理 None；真正的有效性判断必须走 isfinite
+    good = np.isfinite(vol) & (vol > 1e-9)
+
+    # ---- ① 资金利用率 ----
+    u_ok = np.isfinite(util) & (util > 0)
+    u_ref = float(np.median(util[u_ok])) if u_ok.any() else 1.0
+    u_eff = np.maximum(np.where(u_ok, util, u_ref), UTIL_FLOOR)
+    for i in range(n):
+        if not u_ok[i]:
+            why[i] = _join(why[i], (f"资金利用率没量测，按组合中位 {u_ref:.0%} 折算"
+                                    if u_ok.any() else "资金利用率没量测，不折算"))
+        elif util[i] < UTIL_FLOOR:
+            why[i] = _join(
+                why[i], f"资金利用率仅 {util[i]:.1%}，按 {UTIL_FLOOR:.0%} 折算")
+
+    # ---- ② 回测时长 ----
+    k_span = np.ones(n)
+    bottom = np.zeros(n, dtype=bool)
+    for i in range(n):
+        f, name, bot = span_factor(yrs[i])
+        k_span[i] = f
+        if bot:
+            bottom[i] = True
+            why[i] = _join(why[i], name)
+        elif name:
+            why[i] = _join(why[i], f"{name} ×{f:.2f}")
+
+    # ---- ③ 盈利因子门槛 ----
+    pf_ok = np.isfinite(pf) & (pf > 0)
+    for i in range(n):
+        if pf_ok[i] and pf[i] < PF_FLOOR:
+            bottom[i] = True
+            why[i] = _join(why[i], f"盈利因子 {pf[i]:.2f} < {PF_FLOOR:g} → 最低档")
+
+    # ---- 分数 ----
+    s = np.full(n, np.nan)
+    s[good] = vol[good] / u_eff[good] * k_span[good]
+    if not good.any():                       # 一条都没量过 ⇒ 无从比较，等权
+        return np.ones(n), why
+    typical = float(np.exp(np.mean(np.log(s[good]))))     # 几何平均
+    worst = float(s[good].max())
+    for i in range(n):
+        if good[i]:
+            continue
+        if math.isfinite(vol[i]):            # vol=0：风险未知
+            s[i] = typical
+            why[i] = _join(why[i], "没有波动实测，按组合典型风险")
+        else:                                # vol=NaN：风险已知极大
+            s[i] = worst
+            bottom[i] = True
+            why[i] = _join(why[i], "净值被亏穿，按最高风险")
+
+    # ---- 最低档：抬到「有效组里最高风险」那一档 ----
+    free = good & ~bottom
+    pool = s[free] if free.any() else s[np.isfinite(s)]
+    s_top = float(pool.max()) if len(pool) else worst
+    for i in np.where(bottom)[0]:
+        # 只往上抬，不往下压：本来就比 s_top 更危险的策略不能被「抬」变安全
+        if not math.isfinite(s[i]) or s[i] < s_top:
+            s[i] = s_top
+        why[i] = _join(why[i], "按最低档配权")
+    return s, why
+
+
 def risk_parity(usages: list[Usage], rets: pd.DataFrame | None = None
                 ) -> np.ndarray:
     """风险平价权重。
@@ -355,31 +584,40 @@ def risk_parity(usages: list[Usage], rets: pd.DataFrame | None = None
 
     全部无效（刚开工作区、一条都没量过）时退回等权 —— 那是唯一有依据的
     结论，也是 `weights()` 在别的模式下的一贯兜底。
+
+    ## ERC 也吃标准化（不然相关性一开，利用率/时长/盈利因子全白算）
+
+    有净值序列时走 ERC。但 ERC 只看协方差，看不见 `util` / 时长 / 盈利因子。
+    所以喂给它的**不是原始收益，而是标准化收益**：
+
+        x_i = r_i × (s_i / σ_i)          # σ_i = 这条收益序列自己的标准差
+        ⇒ σ(x_i) = s_i                   # 标准化之后，波动正好等于风险分数
+
+    ERC 在 `x` 上求「风险贡献相等」，等价于「按标准化风险等权」，和没有相关性
+    时的 `1/s` 是同一个口径。🔴 别写成 `r_i / s_i`：那是反的（波动大的反而
+    拿到更多钱），而且两种写法在图上一模一样，只能靠权重方向验。
+
+    实测波动为 0 / 非有限的条目（一条直上的净值）没法标准化，整体退回 `1/s`
+    —— 这时少了相关性修正，但权重方向仍然对。
     """
     n = len(usages)
     if n == 0:
         return np.zeros(0)
+    s, _ = risk_scores(usages)
+    if not (np.all(np.isfinite(s)) and np.all(s > 0)):     # 理论上到不了
+        return np.full(n, 1.0 / n)
     if rets is not None and rets.shape[1] == n and len(rets) > 30:
         r = rets.to_numpy(dtype=float)
         r = r[np.isfinite(r).all(axis=1)]
         if len(r) > 30:
-            cov = np.cov(r, rowvar=False)
-            if np.all(np.isfinite(cov)):
-                w = erc_weights(cov)
-                if np.all(np.isfinite(w)) and float(w.sum()) > 0:
-                    return w
-    vol = np.array([float(getattr(u, "vol", 0.0) or 0.0) for u in usages],
-                   dtype=float)
-    # 注意 `float('nan') or 0.0` 还是 nan（NaN 是真值），所以上面的 `or` 只
-    # 处理 None；真正的有效性判断必须走 isfinite
-    good = np.isfinite(vol) & (vol > 1e-9)
-    if not good.any():
-        return np.full(n, 1.0 / n)
-    typical = float(np.exp(np.mean(np.log(vol[good]))))   # 几何平均
-    worst = float(vol[good].max())
-    vol = np.where(good, vol,
-                   np.where(np.isfinite(vol), typical, worst))
-    inv = 1.0 / vol
+            sd = r.std(axis=0)
+            if np.all(np.isfinite(sd)) and np.all(sd > 0):
+                cov = np.cov(r * (s / sd), rowvar=False)
+                if np.all(np.isfinite(cov)):
+                    w = erc_weights(cov)
+                    if np.all(np.isfinite(w)) and float(w.sum()) > 0:
+                        return w
+    inv = 1.0 / s
     tot = float(inv.sum())
     if not math.isfinite(tot) or tot <= 0:      # 理论上到不了，兜底不为 nan
         return np.full(n, 1.0 / n)
@@ -393,6 +631,10 @@ def weights(mode: str, usages: list[Usage],
 
     `manual`：`{sid: 金额或百分比}`。全是百分比就和为 100%，混着写也能认 ——
     有金额就按金额占总额的比例，剩下的人分余下的。
+
+    `risk` 的口径**不是**单纯的波动率倒数，而是「标准化风险」的倒数（见
+    `risk_parity` / `risk_scores`）：波动 ÷ 资金利用率 × 回测时长系数，
+    盈利因子 <1.3 或回测不足半年的落最低档。
     """
     m = str(mode or "equal").lower()
     n = len(usages)
@@ -450,6 +692,11 @@ def allocate(usages: list[Usage], total: float, mode: str = "equal",
     权重差异全被抹掉（实测 4 条策略里 3 条撞 20 倍上限，风险平价和等权
     看起来一模一样），比不封顶更容易误导人。
 
+    `mode="risk"` 时，`Share` 会额外带上配权的账本：`risk_score`（标准化风险，
+    越大分得越少）、`pf`、`span`、`tier`（「回测2~3年 ×1.12」「盈利因子 1.12
+    < 1.3 → 最低档」）。没有这几个字段，用户看到「波动 3% 却只分到 1.2%」时
+    完全无从追问。
+
     缩放是精确的，不用迭代：`capital` / `risk` / `unit` 的手数都只跟
     `principal`（和百分比）成正比，`fixed` 除外（它在 `Usage.scalable` 里标掉）。
     """
@@ -465,13 +712,21 @@ def allocate(usages: list[Usage], total: float, mode: str = "equal",
         kn = "split"
     cap = max(1.0, float(pct_cap or PCT_CAP))
     w = weights(mode, usages, rets, manual)
-    for u, wi in zip(usages, w):
+    # 风险平价才需要把「分数 / 档位」贴到预览表上。别的模式下不显示 0 分，
+    # 否则用户会以为「标准化风险 0 = 没风险」在参与配权
+    is_risk = str(mode or "").lower() == "risk"
+    sc, why = risk_scores(usages) if is_risk else (np.zeros(n), [""] * n)
+    for k, (u, wi) in enumerate(zip(usages, w)):
         s = Share(sid=u.sid, name=u.name, weight=float(wi),
                   target=float(total) * float(wi),
                   avg_margin=u.avg_margin, peak_margin=u.peak_margin,
                   old_principal=u.principal or u.capital or 0.0,
                   old_pct=float(u.capital_pct or 0.0),
                   new_pct=float(u.capital_pct or 0.0),
+                  risk_score=float(sc[k]) if is_risk else 0.0,
+                  pf=float(u.profit_factor or 0.0),
+                  span=float(u.span_years or 0.0),
+                  tier=str(why[k] or ""),
                   vol_bad=not (math.isfinite(float(u.vol or 0.0))
                                and float(u.vol or 0.0) > 0),
                   # 把测量阶段的结论带到预览表上：风险平价里「波动率无效」
@@ -598,6 +853,9 @@ def summarize(shares: list[Share]) -> pd.DataFrame:
         rows.append({
             "策略": s.name,
             "权重": s.weight,
+            "标准化风险": s.risk_score,
+            "盈利因子": s.pf,
+            "回测年数": s.span,
             "目标占用": s.target,
             "实测平均占用": s.avg_margin,
             "实测峰值占用": s.peak_margin,
@@ -608,5 +866,6 @@ def summarize(shares: list[Share]) -> pd.DataFrame:
             "占用%(后)": s.new_pct,
             "预计占用": s.est_avg,
             "说明": s.note,
+            "档位": s.tier,
         })
     return pd.DataFrame(rows)
