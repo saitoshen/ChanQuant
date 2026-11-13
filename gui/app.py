@@ -6202,7 +6202,10 @@ class MainWindow(QMainWindow):
         # 反向要写在标题里：同一批品种、同一套参数，正着跑和反着跑的两条曲线
         # 是镜像的，标题不写清楚就只能靠翻交易记录猜
         tag = "多品种等权" + ("（反向）" if reverse else "")
-        res = combine(results, label=tag)
+        # 本金是**一个账户**的钱（每个品种各跑一遍、都拿满同一笔本金），不是各
+        # 品种之和 —— 加起来就是 N 倍。不传就会吃 `combine` 的默认 10 万。
+        base = float((results[0].metrics or {}).get("initial_cash") or 0.0)
+        res = combine(results, label=tag, initial_cash=base or 100_000.0)
         # 绩效页的「品种」下拉框读它，切到单个品种看谁在赚。标签换成品种名，
         # 腿自己的 label 原本是策略名
         res.legs = {str(k): replace(r, label=str(k)) for k, r in named}

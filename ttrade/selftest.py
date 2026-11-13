@@ -5883,6 +5883,13 @@ def _run() -> tuple[bool, list[str]]:
             ]
             text = win.portfolio_page.show_combo(cfgs)
             tabs, pv = win.portfolio_page._views.get("portfolio", (None, None))
+            # 组合的本金必须是**各策略之和**，不是 `combine` 的默认 10 万：
+            # 两条本金各 10 万的策略凑成组合，「本金」那行得写 20 万。本金是
+            # 单利口径下所有比例的分母，写错它整张绩效表都是错的
+            legs = list((getattr(pv.res, "legs", None) or {}).values())
+            sum_base = sum(float(r.metrics.get("initial_cash") or 0) for r in legs)
+            combo_base = float((getattr(pv.res, "metrics", {}) or {})
+                               .get("initial_cash") or 0)
             combo_ok = (
                 tabs is not None
                 and pv is not None
@@ -5892,9 +5899,20 @@ def _run() -> tuple[bool, list[str]]:
                 and "组合（2 条策略）" in text
                 # 「补数据」按钮：期权 / 展期数据过期时，这一页要能就地补
                 and hasattr(win.portfolio_page, "btn_data")
+                # 分策略曲线：绩效页的下拉框得能切到每一条
+                and len(legs) == 2
+                and pv.cb_leg is not None and pv.cb_leg.isEnabled()
+                and pv.cb_leg.count() == 3
+                and pv.lbl_leg is not None and pv.lbl_leg.text() == "策略"
+                # 本金 = 各策略之和（这里两条各 10 万 ⇒ 20 万，不是 10 万）
+                and sum_base > 0
+                and abs(combo_base - sum_base) < 1e-6
+                and abs(combo_base - 100_000.0) > 1.0
             )
             combo_info = (f"{tabs.count()} 页 / {pv.table.columnCount()} 列"
                           if tabs is not None else "未建出视图")
+            combo_info += (f" / 本金 {combo_base:,.0f}（{len(legs)} 条策略，"
+                           f"合计 {sum_base:,.0f}）")
         except Exception as exc:  # noqa: BLE001
             combo_info = f"{type(exc).__name__}: {exc}"
 

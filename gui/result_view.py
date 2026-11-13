@@ -369,6 +369,10 @@ class ViewCtx:
     factor_cfg: object | None = None   # fstrat.FactorConfig
     filter_active: bool = False
     selected_keys: list = field(default_factory=list)
+    # 绩效页那个下拉框叫什么：多品种组合是「品种」，多策略组合是「策略」。
+    # 两者都走 `Result.legs`，只是叫法不同 —— 组合报告里写死「品种」的话，
+    # 下拉框里列的全是策略名，用户会以为点错了东西
+    leg_noun: str = "品种"
     outcome: object | None = None      # fstrat.FactorOutcome
     # 截面策略的上下文：(frames, CrossConfig, 分数面板)。「截面因子分析」要按
     # 品种池重算一遍因子的横截面 IC，光有结果曲线画不出来
@@ -562,11 +566,13 @@ class ResultView(QObject):
         # 多品种才有「切到某个品种」这回事。放在页首而不是表格顶上：换的不只是
         # 右边那张指标表，左边的资金曲线和回撤也跟着换
         self.cb_leg = None
+        self.lbl_leg = None
         if self.kind != "single":
             top = QHBoxLayout()
             top.setContentsMargins(0, 0, 0, 2)
             lab = QLabel("品种")
             lab.setStyleSheet("font-size: 11px; color: #6b7280;")
+            self.lbl_leg = lab
             top.addWidget(lab)
             self.cb_leg = QComboBox()
             self.cb_leg.setMinimumWidth(200)
@@ -613,21 +619,29 @@ class ResultView(QObject):
         lay.addWidget(splitter)
         return w
 
-    def _sync_leg_combo(self, res) -> None:
-        """按结果重建「品种」下拉框。换策略时上一个策略的品种名不能留着 ——
-        点进去会读到另一份数据的腿。"""
+    def _sync_leg_combo(self, res, noun: str = "品种") -> None:
+        """按结果重建下拉框。换策略时上一个策略的名字不能留着 ——
+        点进去会读到另一份数据的腿。
+
+        `noun` 是这个下拉框叫什么：多品种组合叫「品种」，多策略组合叫「策略」。
+        键都来自 `Result.legs`，只是叫法不同。"""
         cb = getattr(self, "cb_leg", None)
         if cb is None:
             return
+        lab = getattr(self, "lbl_leg", None)
+        if lab is not None:
+            lab.setText(noun or "品种")
+        total = "全部组合（各品种合计）" if (noun or "品种") == "品种" \
+            else "全部策略（合计）"
         legs = sorted((getattr(res, "legs", None) or {}).keys()) if res is not None else []
         cb.blockSignals(True)
         cb.clear()
-        cb.addItem("全部组合（各品种合计）", "")
+        cb.addItem(total, "")
         for sym in legs:
             cb.addItem(sym, sym)
         cb.setCurrentIndex(0)
         cb.blockSignals(False)
-        # 没有逐品种数据（多策略等权组合、老的保存结果）时置灰，别给个点不动的空框
+        # 没有逐项数据（老的保存结果）时置灰，别给个点不动的空框
         cb.setEnabled(bool(legs))
 
     def _perf_res(self):
@@ -646,6 +660,11 @@ class ResultView(QObject):
         if cb is not None and cb.currentData():
             return cb.currentText()
         return res.label
+
+    def _leg_picked(self) -> bool:
+        """下拉框是不是切到了某一条腿（而不是「全部组合」）。"""
+        cb = getattr(self, "cb_leg", None)
+        return bool(cb is not None and cb.currentData())
 
     def _on_leg_changed(self, _i: int = 0) -> None:
         self._update_table()
@@ -895,7 +914,7 @@ class ResultView(QObject):
         self._cf_rep, self._cf_key = None, ""
 
         self.pages()          # 确保控件都建好
-        self._sync_leg_combo(res)
+        self._sync_leg_combo(res, getattr(ctx, "leg_noun", "") or "品种")
         if self.kind == "single":
             self.lbl_legend.setText(ctx.legend)
             self._draw_kline(keep_window)
@@ -1816,10 +1835,15 @@ class ResultView(QObject):
         if positive:
             ax.set_yscale("log")
         ax.set_ylabel("净值（对数）" if positive else "净值", fontsize=9, color=C_MUTED)
-        ax.set_title(
-            "策略 vs 买入持有 · 资金曲线" if bh is not None else "组合资金曲线（等权）",
-            fontsize=11.5, loc="left", color=C_TEXT, pad=8,
-        )
+        if bh is not None:
+            title = "策略 vs 买入持有 · 资金曲线"
+        elif self._leg_picked():
+            # 切到某一条腿之后画的是它自己的曲线，标题还写「组合资金曲线（等权）」
+            # 会让人以为整条组合换了个形状
+            title = f"{self._perf_name(res)} · 资金曲线"
+        else:
+            title = "组合资金曲线（等权）"
+        ax.set_title(title, fontsize=11.5, loc="left", color=C_TEXT, pad=8)
         ax.grid(True, color=C_GRID, lw=0.6, alpha=0.9)
         ax.set_axisbelow(True)
         ax.legend(loc="upper left", frameon=False, fontsize=9)
@@ -1910,7 +1934,9 @@ class ResultView(QObject):
             self.table.setHorizontalHeaderItem(1, QTableWidgetItem(name))
             cap = getattr(self, "lbl_perf_cap", None)
             if cap is not None:
-                cap.setText("组合绩效指标" if whole else f"{name} · 单品种绩效")
+                noun = getattr(self.ctx, "leg_noun", "") or "品种"
+                cap.setText("组合绩效指标" if whole
+                            else f"{name} · 单{noun}绩效")
 
         def pct(x):
             # 亏穿过之后年化波动是 NaN（见 `backtest._metrics`）：写「—」，

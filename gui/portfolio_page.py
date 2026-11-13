@@ -98,6 +98,7 @@ from __future__ import annotations
 import os
 import queue
 import time
+from dataclasses import replace
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
@@ -212,6 +213,27 @@ def run_replay_job(cfg, kind: str, payload, with_bh: bool = True):
     if kind == "multi":
         return replay.run_multi(cfg, payload, extras=extra)
     return replay.run(cfg, payload, with_bh=with_bh, extra=extra)
+
+
+def _combo_legs(reps: list) -> dict:
+    """组合报告的「分策略」明细：策略名 → 那条策略自己的 `Result`。
+
+    绩效页的下拉框读它，切进去就能单独看某一条的曲线和指标 —— 没有这一步，
+    「三条策略的组合赚 20%」这句话就只有一个合计，看不出是一条赚翻两条在亏
+    还是每条都赚一点，而这两种情况的处理方式完全相反。
+
+    🔴 键必须是**策略名**，不能用品种：同一个品种上经常挂着好几条策略（工作区里
+    5 条鸡蛋、4 条碳酸锂），用品种名会互相覆盖，下拉框里只剩一个。
+    重名的策略（策略库里允许）再加序号区分，不能悄悄吃掉一条。
+    """
+    legs, seen = {}, {}
+    for cfg, rp in reps:
+        nm = str(cfg.title() or getattr(cfg, "sid", "") or "策略")
+        seen[nm] = seen.get(nm, 0) + 1
+        if seen[nm] > 1:
+            nm = f"{nm} #{seen[nm]}"
+        legs[nm] = replace(rp.res, label=nm)
+    return legs
 
 
 class ReplayWorker(QObject):
@@ -2361,7 +2383,19 @@ class PortfolioPage(QWidget):
         # 的交易时间差几十分钟是有意义的），持仓长度也改用「根（约 N 天）」
         periods = {c.period for c, _r in reps}
         period = periods.pop() if len(periods) == 1 else ""
-        res = combine([rp.res for _c, rp in reps], label="组合")
+        # 🔴 组合的「本金」= 各策略本金之和 —— 真要把这几条一起跑，掏的就是这些钱。
+        # 以前这里吃 `combine` 的默认 100,000：27 条策略的组合在绩效页上写「本金
+        # 10 万」，而成员本金合计 100.9 万。本金是单利口径下**所有比例的分母**
+        # （累计收益 / 年化 / 最大回撤 / 平均每笔成本 / 资金利用率都除它），
+        # 它错了，右半边那张表里每一个数都跟着错。
+        base = sum(float((rp.res.metrics or {}).get("initial_cash") or 0.0)
+                   for _c, rp in reps)
+        res = combine([rp.res for _c, rp in reps], label="组合",
+                      initial_cash=base or 100_000.0)
+        # 绩效页那个下拉框读 `legs`：组合是几条策略的净值取均值，不给腿就只能看
+        # 合计，分不清「每条都赚一点」还是「一条赚翻、其余全亏」。
+        # 键用**策略名**（同一个品种上经常挂着好几条，用品种名会撞成一格）
+        res.legs = _combo_legs(reps)
         # 这里的 bars_per_year 是给 `hold_text` 换算「平均持仓 N 根」用的，取的是
         # **策略自己的** bar 频率（交易记录里的 bars 就是它）。组合曲线本身落在
         # 日频上，那个频率在 `combine` 内部算指标时用，别混用
@@ -2373,6 +2407,8 @@ class PortfolioPage(QWidget):
             market=replay.market_of(reps[0][0]), label="组合",
             price_note="净值", long_only=False, bars_per_year=bpy,
             selected_keys=[], overlay=False,
+            # 下拉框列的是策略名（见 `_combo_legs`），表头别写「品种」
+            leg_noun="策略",
         )
         # 组合是几条策略的净值合成，没有「这一条策略的实时 K 线」可言
         self._stop_live()

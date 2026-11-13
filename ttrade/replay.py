@@ -508,7 +508,14 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
             named.append((key, rp.res))
     if not results:
         return Replay(error="多品种一个都没跑出来：" + "；".join(failed[:4]))
-    res = combine(results, label=f"多品种等权 · {len(results)} 个")
+    # 🔴 组合的「本金」是**一个账户**的钱，不是各品种之和。多品种等权是「同一个
+    # 策略在 N 个品种上各跑一遍、净值取均值」，每个品种那份回测都拿满了同一笔
+    # 本金（`run()` 里 `initial_cash = principal`），把它们加起来是 N 倍本金 ——
+    # 绩效页上「本金」那一行会难看地对不上配置，而后面每一个金额列都跟着错。
+    # 以前这里吃 `combine` 的默认 100,000，配置改成本金 15 万之后页面还写 10 万。
+    base = float((results[0].metrics or {}).get("initial_cash") or 0.0)
+    res = combine(results, label=f"多品种等权 · {len(results)} 个",
+                  initial_cash=base or 100_000.0)
     # 逐品种留给绩效页的「品种」下拉框：组合是等权的，切进去看单个品种才分得清
     # 是「每个都赚一点」还是「一个赚翻、其余全亏」。标签换成品种名 —— 每条腿
     # 原本的 label 是策略名（「唐奇安」），切过去图例上写着策略名会认不出是谁
