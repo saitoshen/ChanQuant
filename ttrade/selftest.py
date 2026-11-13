@@ -2659,10 +2659,39 @@ def _run() -> tuple[bool, list[str]]:
                               "margin_rate": 0.12, "tick": 0.02, "price": 100.0}])
             if st["changed"]:
                 raise RuntimeError("同样的值刷第二遍还在写盘，判等有问题")
+            # ⑧ 手续费「按手」口径：规整的 5 分档 + 现有就是 lot ⇒ 写元/手
+            #    （au 20 / SR 2 / m 1.5 这类，交易所就是按手报的）
+            SI.set_override(sym, ex, fee_mode="lot", fee_value=3.0)
+            SYNC.apply([{"symbol": sym, "exchange": ex, "mult": 1000.0,
+                         "margin_rate": 0.12, "tick": 0.02, "price": 100.0,
+                         "commission": 10.0}])
+            got = SI.info(sym, ex)
+            if str(got["fee_mode"]) != "lot" or abs(float(got["fee_value"]) - 10.0) > 1e-12:
+                raise RuntimeError(f"按手口径没写对：{got['fee_mode']} {got['fee_value']}")
+            # ⑨ 手续费「按比例」口径：带零头的值只可能是「价 × 乘数 × 比例」
+            #    折算出来的（cu 26.285 / AG 9.3712 / IM 29.9018），必须反推成比例，
+            #    否则价格翻倍后成本还是那个死数 = 低估成本 = 策略虚假变好
+            st = SYNC.apply([{"symbol": sym, "exchange": ex, "mult": 1000.0,
+                              "margin_rate": 0.12, "tick": 0.02, "price": 100.0,
+                              "commission": 9.3712}])
+            got = SI.info(sym, ex)
+            want = 9.3712 / (100.0 * 1000.0)
+            if str(got["fee_mode"]) != "rate":
+                raise RuntimeError(f"带零头的手续费没切到 rate：{got['fee_mode']}")
+            if abs(float(got["fee_value"]) - want) > 1e-12:
+                raise RuntimeError(f"反推比例不对：{got['fee_value']} vs {want}")
+            if not st["fee_hint"]:
+                raise RuntimeError("口径 lot→rate 变了却没提示，用户看不出成本规律变了")
+            # ⑩ 同样的手续费再刷一遍不能重复写（比例是反推的，必须留容差）
+            if SYNC.apply([{"symbol": sym, "exchange": ex, "mult": 1000.0,
+                            "margin_rate": 0.12, "tick": 0.02, "price": 100.0,
+                            "commission": 9.3712}])["changed"]:
+                raise RuntimeError("手续费判等不稳，每次刷新都在重写盘")
         finally:
             SI.reset_override(sym, ex)
         return ("差异 2% 内跳过、超出写并标 live；make_bt 立刻读到新值；"
-                "主动刷新覆盖手填；0 值被拒；乘数/跳动精确比（999→1000 必刷）")
+                "主动刷新覆盖手填；0 值被拒；乘数/跳动精确比（999→1000 必刷）；"
+                "手续费按整 1 角档判按手、带零头判比例并反推；口径翻转会提示")
 
     check("从天勤刷新品种参数（乘数/保证金率 → 回测对齐）", _contract_terms)
 

@@ -193,9 +193,10 @@ class SymbolInfoDialog(QDialog):
             "（`quote.volume_multiple` / `quote.margin`）—— 保证金随结算价和交割月\n"
             "天天变，用静态表去下真实仓位会让实际杠杆和设定不符。\n"
             "　　要让「查看回测 / 量占用」和实盘对得上，点右边「从天勤刷新」：它用实盘\n"
-            "同一套字段、同一份合约（主连的 underlying）把**乘数 / 最小跳动 / 保证金率**\n"
-            "三个数刷成此刻的真实值。手续费**只提示不自动写** —— 天勤报的是「每手合计」\n"
-            "且带经纪商加收，回测是「单边各收一次」，两边口径不同，自动写会把成本改歪。")
+            "同一套字段、同一份合约（主连的 underlying）把**乘数 / 最小跳动 / 保证金率 /\n"
+            "手续费**四个数刷成此刻的真实值。手续费会按天勤给的值自动换算口径：\n"
+            "按比例收的（cu、i、AG、股指）存成比例，按手收的（au、SR、m）存成元/手 ——\n"
+            "存错口径当场看不出，价格漂移后成本才会悄悄偏低或偏高。")
         tip.setStyleSheet(_HINT)
         tip.setWordWrap(True)
         lay.addWidget(tip)
@@ -218,7 +219,7 @@ class SymbolInfoDialog(QDialog):
         # 「一键对齐实盘」：实盘下几手用的是天勤合约上的实时乘数/保证金率，
         # 这张表只喂回测。表一旦过期，组合页「查看回测」的手数就和实盘对不上，
         # 所以给一个显式按钮把表刷成「此刻的真实值」。
-        self.btn_sync = QPushButton("从天勤刷新（乘数 / 跳动 / 保证金率）")
+        self.btn_sync = QPushButton("从天勤刷新（乘数·跳动·保证金·手续费）")
         self.btn_sync.setToolTip(
             "连天勤，逐个品种取**主连 underlying 合约**的真实参数，写进这张表：\n\n"
             "  乘数       ← quote.volume_multiple\n"
@@ -395,7 +396,7 @@ class SymbolInfoDialog(QDialog):
         miss = int(st.get("missing") or 0)
         errs = list(st.get("errors") or [])
         hints = list(st.get("fee_hint") or [])
-        text = f"刷新完成：{n} 个品种已更新（乘数 / 最小跳动 / 保证金率）"
+        text = f"刷新完成：{n} 个品种已更新（乘数 / 最小跳动 / 保证金率 / 手续费）"
         if same:
             text += f"，{same} 个与现值一致（保证金率差异 <2%，跳过）"
         if miss:
@@ -404,9 +405,9 @@ class SymbolInfoDialog(QDialog):
             # 取不到的必须点名：静默少写几个品种，回测手数就静默不对
             text += "　没取到：" + "、".join(errs[:4]) + ("…" if len(errs) > 4 else "")
         if hints:
-            # 手续费故意不自动写（天勤报的是每手合计、不区分平今，回测按单边收），
-            # 但差异必须说出来，否则用户以为刷新只管乘数
-            text += (f"　手续费未改动（口径不同，只提示）："
+            # 手续费「口径」变了要单独说：这不是调了个数，是成本随价格变化的
+            # 规律变了，回测曲线形状都会不一样
+            text += ("　手续费口径变更："
                      + "；".join(hints[:3])
                      + ("…" if len(hints) > 3 else ""))
         self.lbl.setText(text)
@@ -422,7 +423,7 @@ class SymbolInfoDialog(QDialog):
                 o.deleteLater()
                 setattr(self, attr, None)
         self.btn_sync.setEnabled(True)
-        self.btn_sync.setText("从天勤刷新（乘数 / 跳动 / 保证金率）")
+        self.btn_sync.setText("从天勤刷新（乘数·跳动·保证金·手续费）")
         self.prog_sync.setVisible(False)
 
     def closeEvent(self, ev) -> None:      # noqa: N802 - Qt 命名
