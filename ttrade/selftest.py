@@ -2193,14 +2193,14 @@ def _run() -> tuple[bool, list[str]]:
 
         # ② 造三条策略：占用率故意拉开，才能看出「按占用」和「按本金」的区别
         def mk(sid, principal, avg, peak, vol, sizing="capital",
-               pf=0.0, span=0.0):
+               pf=0.0, span=0.0, blown=False):
             """pf / span 默认 0 = 「不知道」，风险平价里按中性处理（不奖不罚）。"""
             return PL.Usage(sid=sid, name=sid, sizing=sizing, principal=principal,
                             capital=principal * 0.3, avg_margin=avg,
                             peak_margin=peak, avg_notional=avg * 10,
                             peak_notional=peak * 10, util=avg / principal,
                             vol=vol, ret=0.5, max_dd=0.2, bars=1000,
-                            profit_factor=pf, span_years=span)
+                            profit_factor=pf, span_years=span, blown=blown)
 
         us = [mk("A", 100_000, 1_000, 20_000, 0.20),
               mk("B", 100_000, 5_000, 25_000, 0.40),
@@ -2325,30 +2325,43 @@ def _run() -> tuple[bool, list[str]]:
         if abs(sh[0].new_principal - total) > 1e-6 or sh[1].new_principal > 1e-6:
             raise RuntimeError("手动分配的顺序错位了")
 
-        # ⑥ 风险平价必须挡住 NaN：一条策略权益被亏穿时 `_metrics` 会把
-        #    `ann_vol` 标成 NaN，而 `1/vol` 会让 **所有** 权重变 nan ——
-        #    界面上权重 / 目标占用 / 缩放 / 本金(后) / 预计占用整列都是 nan，
-        #    用户看不出是其中一条爆仓策略干的（实测工作区 27 条全 nan）。
-        # 🔴 3.6.1 起「亏穿」不再压最低档：亏穿主要是**杠杆过高**的产物
-        #    （`capital_pct` 打满、名义敞口是本金十几倍），拿它当风险平价的
-        #    惩罚等于按杠杆罚两次；而且标了 NaN 就说明连真实波动都量不到。
-        #    现在它和「压根没量过（vol=0）」走同一条路：组合典型风险、不降档。
+        # ⑥ 亏穿：波动率按**整条曲线**的真值参与配权（3.6.2 用户要求）。
+        #
+        #    🔴 以前 `_metrics` 在 `equity.min() <= 0` 时把 `ann_vol` 标 NaN，
+        #    亏穿的策略配权只能按「组合典型风险」估一个数 —— 用户看到的正是
+        #    「波动明明很大，风险分数却不高」。现在两条都要钉住：
+        #      ⑥a `blown` 标记**不改变**权重（它只用于说明，不是评分项）
+        #      ⑥b 亏穿那条波动大 ⇒ 权重**确实更小**（真值参与排序，没被顶替）
+        #    另外 NaN 那条防线仍要留（老记录 / 取不到行情），否则 `1/vol`
+        #    会把整张表的权重全变成 nan。
+        calm = mk("K", 100_000, 50_000, 50_000, 0.20)
+        hot = mk("H", 100_000, 50_000, 50_000, 0.80)
+        calm_b = mk("K", 100_000, 50_000, 50_000, 0.20, blown=True)
+        w_plain = PL.risk_parity([calm, hot])
+        w_mark = PL.risk_parity([calm_b, hot])
+        if float(np.max(np.abs(w_plain - w_mark))) > 1e-12:
+            raise RuntimeError(
+                f"「曾经亏穿」不该改变权重，实际 {np.round(w_plain, 4)} vs "
+                f"{np.round(w_mark, 4)}")
+        # ⑥b 真亏穿的那条（波动 120%）权重必须小于温和的那条（20%）
+        blew = mk("B", 100_000, 50_000, 50_000, 1.20, blown=True)
+        w2 = PL.risk_parity([blew, calm])
+        if not w2[0] < w2[1]:
+            raise RuntimeError(
+                f"亏穿且波动大的策略权重该更小，实际 {np.round(w2, 4)} —— "
+                f"波动率被「典型风险」顶替了")
+        # 说明里必须点名，否则用户不知道为什么它权重小
+        _sc, _whys = PL.risk_scores([blew, calm])
+        if "亏穿" not in _whys[0]:
+            raise RuntimeError(f"亏穿没在说明里点名：{_whys[0]!r}")
+
+        # ⑥c NaN 防线：混进一条 NaN 不能把全体带成 nan
         bad = us + [mk("X", 200_000, 100, 50_000, float("nan"))]
-        zero = us + [mk("X", 200_000, 100, 50_000, 0.0)]
         w = PL.risk_parity(bad)
-        wz = PL.risk_parity(zero)
         if not np.all(np.isfinite(w)):
             raise RuntimeError(f"NaN 波动率把权重全带成 nan 了：{np.round(w, 4)}")
         if abs(float(w.sum()) - 1.0) > 1e-12:
             raise RuntimeError("混入 NaN 之后权重和不为 1")
-        # 两条路必须给出**逐位相同**的权重（等价性），而且都不是最小那一档
-        if float(np.max(np.abs(w - wz))) > 1e-12:
-            raise RuntimeError(
-                f"「亏穿」和「没量过」该走同一条路，实际 "
-                f"{np.round(w, 4)} vs {np.round(wz, 4)}")
-        if abs(w[3] - float(np.min(w))) < 1e-9:
-            raise RuntimeError(
-                f"亏穿的策略不该再被压到最小一档，实际 {np.round(w, 4)}")
         sh = PL.allocate(bad, total, "risk", basis="usage")
         if not all(np.isfinite([s.weight, s.target, s.scale, s.new_principal,
                                 s.est_avg]).all() for s in sh):
@@ -2460,10 +2473,11 @@ def _run() -> tuple[bool, list[str]]:
 
         return ("ERC 风险贡献等权（n=1/2/5/12，误差 <1e-6）；"
                 "按本金/按平均占用/按峰值三种口径；固定手数不缩放；手动按比例；"
-                "风险平价挡住 NaN（一条爆仓不连累全体）与 vol=0（不吞掉全部资金）；"
+                "风险平价挡住 NaN（老记录/取不到行情不连累全体）与 vol=0（不吞掉全部资金）；"
                 "标准化风险＝波动÷利用率×时长系数（利用率高/回测长/"
                 f"盈利因子≥{PL.PF_FLOOR:g} 拿更多，低于 {PL.PF_FLOOR:g} 或不足半年"
-                "落最低档但不清零；亏穿按典型风险、不再额外降档）；"
+                "落最低档但不清零；亏穿不再额外降档 —— 波动率含翻负段按真值配权、"
+                "杠杆由利用率体现）；"
                 "实测占用按当前配置折算（应用分配后本金(前)是真值、再折不自乘）")
 
     check("组合工作区资金分配（ERC / 三种口径）", _portfolio_plan)
@@ -2717,9 +2731,35 @@ def _run() -> tuple[bool, list[str]]:
 
         # ⑤ 键必须进 `_METRIC_KEYS`：老报告缺这一项时按 0 补齐，
         #    否则绩效页 `m.get(...)` 拿到 None 会写成「—」而不是 0
-        for k in ("avg_notional", "peak_notional", "avg_margin", "peak_margin", "util"):
+        for k in ("avg_notional", "peak_notional", "avg_margin", "peak_margin", "util",
+                  "blown"):
             if k not in BT._METRIC_KEYS:
                 raise RuntimeError(f"{k} 没进 _METRIC_KEYS")
+
+        # ⑤b 权益亏穿时**波动率照算**（3.6.2 按用户要求改）。
+        #     用户原话：「波动率要覆盖整个过程资金曲线，亏穿了要继续跑完得到
+        #     完整数据」「杠杆比率低，也亏不穿，这就是为什么要用资金利用率」。
+        #     所以：vol 必须是整条曲线（含翻负段）上的真值；夏普 / 卡玛仍标
+        #     NaN（净值翻号之后的「反弹」不是收益）；`blown` 单独留痕。
+        #     🔴 以前三个一起标 NaN，亏穿的策略在配权里拿不到自己的波动率，
+        #     只能被「组合典型风险」顶替 —— 表现就是「波动很大、分数却不高」。
+        neg = pd.Series([100_000.0, 60_000.0, -30_000.0, 20_000.0],
+                        index=idx, dtype=float)
+        mn = BT._metrics(neg, pos, [], base=100_000.0)
+        if not np.isfinite(float(mn["ann_vol"])) or float(mn["ann_vol"]) <= 0:
+            raise RuntimeError(f"亏穿时波动率被抹掉了：{mn['ann_vol']}")
+        # 手算：逐根盈亏 ÷ 本金 = [0, −0.40, −0.90, +0.50]
+        want_v = float(np.std([0.0, -0.40, -0.90, 0.50], ddof=1)
+                       * np.sqrt(float(BT.TRADING_DAYS)))
+        if abs(float(mn["ann_vol"]) - want_v) > 1e-9:
+            raise RuntimeError(
+                f"亏穿时波动率不是整条曲线的真值：{mn['ann_vol']:.6f} ≠ {want_v:.6f}")
+        if not (np.isnan(float(mn["sharpe"])) and np.isnan(float(mn["calmar"]))):
+            raise RuntimeError("亏穿时夏普 / 卡玛必须仍是 NaN")
+        if float(mn["blown"]) != 1.0:
+            raise RuntimeError("亏穿时 `blown` 标记没置上")
+        if float(mt["blown"]) != 0.0:
+            raise RuntimeError("没亏穿的策略 `blown` 必须是 0")
 
         # ⑤ 组合层：平均占用**可加**（精确），峰值只能给**上限**
         #    成分 a：本金 100、平均占用 10、峰值 50

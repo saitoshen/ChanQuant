@@ -229,6 +229,9 @@ _METRIC_KEYS = (
     "n_trades", "n_long", "n_short",
     "win_rate", "avg_trade", "profit_factor", "payoff", "avg_win", "avg_loss",
     "avg_bars", "best_trade", "worst_trade",
+    # 权益是否曾经翻负（1=亏穿过）。**不是**绩效指标，是给风险平价看的留痕：
+    # 波动率照常算真值，亏穿这件事只在配权说明里点名
+    "blown",
 )
 
 
@@ -318,6 +321,12 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
            else pd.Series(0.0, index=equity.index))
 
     bpy = float(bars_per_year or TRADING_DAYS)
+    # 波动率**覆盖整条资金曲线**，包含权益翻负之后那一段。`diff() ÷ 本金` 在权益
+    # 为负时照样有定义 —— 它量的是「每根 K 线的盈亏相对本金有多大」，与净值正负
+    # 无关（回测也不做爆仓强平，见模块开头第 5 条，曲线是跑到底的）。所以「亏穿」
+    # 不构成波动率算不出来的理由。3.6.2 按用户要求改：以前这里跟着标 NaN，亏穿的
+    # 策略就拿不到自己的波动率，配权只能按「组合典型风险」估一个数，表现出来就是
+    # 「波动明明很大、风险分数却不高」。
     vol = ret.std(ddof=1) * np.sqrt(bpy) if ret.std(ddof=1) > 0 else 0.0
     sharpe = (ret.mean() * bpy) / vol if vol > 0 else 0.0
 
@@ -329,10 +338,17 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
     # 卡玛：分子分母都以本金为基准
     calmar = cagr / abs(max_dd) if max_dd < 0 else 0.0
 
-    # 权益一旦被亏穿，波动 / 夏普 / 卡玛都失去意义（净值翻号后的「反弹」不是
-    # 收益），标 NaN，界面显示「—」；累计收益、最大回撤、期末资金照常给
-    if float(equity.min()) <= 0:
-        vol = sharpe = calmar = float("nan")
+    # 权益一旦被亏穿，**夏普 / 卡玛**失去意义（净值翻号之后的「反弹」不是收益，
+    # 日均收益、以及「年化 ÷ |回撤|」都失去了基准），标 NaN，界面显示「—」。
+    #
+    # 波动率**不在此列**：它逐根算、不看净值正负，照常给真值（见上面那段注释）。
+    # 但「曾经亏穿」这件事本身要留痕 —— `blown` 单独给一个 0/1，配权那边拿它
+    # 说明「这条为什么占用这么高」，而不是拿它去改波动率。亏穿本质是**杠杆**的
+    # 账，由「资金利用率」那一项去罚就够了，在波动率上抹掉数据等于罚两次还
+    # 丢信息。
+    blown = float(equity.min()) <= 0
+    if blown:
+        sharpe = calmar = float("nan")
 
     pos = position.reindex(equity.index).fillna(0)
     long_expo = float((pos > 0).mean())
@@ -418,6 +434,8 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
         "sharpe": float(sharpe),
         "max_dd": max_dd,
         "calmar": float(calmar),
+        # 1 = 整段里权益曾 <= 0（夏普/卡玛因此为 NaN）。波动率不受影响
+        "blown": 1.0 if blown else 0.0,
         "exposure": long_expo + short_expo,
         "long_exposure": long_expo,
         "short_exposure": short_expo,

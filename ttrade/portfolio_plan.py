@@ -141,10 +141,14 @@ class Usage:
     avg_margin: float = 0.0       # 平均开仓占用（名义 × 保证金率）—— 主口径
     peak_margin: float = 0.0      # 逐根最大占用
     util: float = 0.0             # avg_margin / principal（出手时用了分配额的几成）
-    vol: float = 0.0              # 年化波动（策略净值）
+    vol: float = 0.0              # 年化波动（策略净值，**含翻负段**，见 measure）
     ret: float = 0.0              # 累计收益
     max_dd: float = 0.0           # 最大回撤（正数）
     bars: int = 0                 # 回测里的交易笔数（老版本存的是 bar 数）
+    # 整段资金曲线里权益是否曾经 <= 0（爆仓 / 亏穿）。
+    # 🔴 它**不参与评分**：亏穿是杠杆的账，由 `util` 那一项去罚；这里只用来在
+    # 预览表上说清楚「这条为什么占用高 / 波动大」。波动率本身照常是真值
+    blown: bool = False
     # 盈利因子（`profit_factor`，毛利润 / 毛亏损）。0 = 没读到（没成交 / 老结果）
     profit_factor: float = 0.0
     # 回测区间长度（年）。0 = 不知道（没有净值曲线 / 老记录）
@@ -202,10 +206,21 @@ class Share:
     # 由它自己的风险算出来的 —— 预览表必须点名，否则「为什么 27 条权重一样」
     # 没人解释得清
     vol_bad: bool = False
+    # 整段曲线里权益曾经 <= 0（爆仓 / 亏穿）。波动率照常是真值，所以这一栏
+    # 只用来解释「为什么它波动这么大、权重这么小」
+    blown: bool = False
     note: str = ""
 
 
 # ---------------------------------------------------------------- 测量
+def _join(a: str, b: str) -> str:
+    """把两段说明拼成「；」分隔的一句话（任一段为空就只留另一段）。"""
+    a, b = (a or "").strip(), (b or "").strip()
+    if not b:
+        return a
+    return f"{a}；{b}" if a else b
+
+
 def measure(cfg, frame: pd.DataFrame | None, res, mult: float = 1.0,
             margin_rate: float = 1.0) -> Usage:
     """把一条策略「实际用了多少钱」量出来。
@@ -245,19 +260,29 @@ def measure(cfg, frame: pd.DataFrame | None, res, mult: float = 1.0,
         u.note = "固定手数，组合无法调整"
 
     met = dict(getattr(res, "metrics", {}) or {})
-    # 🔴 `ann_vol` 可能是 NaN（权益被亏穿时 `_metrics` 有意标的）。**必须原样
-    # 保留 NaN，不能改写成 0**：0 会被 `risk_scores` 当成「压根没量过」，
-    # NaN 保留下来才能让界面说清楚「这条是亏穿、不是没数据」。
-    # 两者在配权上走同一条路（组合典型风险，见 `risk_parity`），只是说明不同。
-    # 直接往下传也不行 —— `1/vol` 会把整张表的权重全变成 nan。
+    # 波动率：**整条资金曲线**上算出来的真值，直接采用。
+    #
+    # 🔴 3.6.2 起 `_metrics` 不再因为「权益亏穿」把 `ann_vol` 标 NaN（见那边的
+    # 注释）。理由有两条，都来自用户：① 波动率要覆盖整个过程资金曲线，亏穿了
+    # 照样跑到底、照样量得出来；② 会不会亏穿是**杠杆**的事 —— 杠杆低就亏不穿，
+    # 而杠杆高低已经由「资金利用率（`util`）」这一项进了分数。拿波动率再罚一次
+    # 等于同一个原因罚两遍，还把最有信息量的那条数据（最颠的那条）扔掉了。
+    #
+    # 但仍然保留 NaN 分支：3.6.1 及以前存下来的老记录里 `ann_vol` 可能就是
+    # NaN，而 `1/vol` 会把整张表的权重全变成 nan，那种只能按「没量到」补。
     try:
         vol = abs(float(met.get("ann_vol")))
     except (TypeError, ValueError):
         vol = float("nan")
     if not math.isfinite(vol):
         vol = float("nan")
-        u.note = "净值被亏穿（多为杠杆过高），波动率无意义（按组合典型风险配权）"
+        u.note = _join(u.note, "没有波动实测（老记录/没跑完），按组合典型风险配权")
     u.vol = vol
+    # 「曾经亏穿」：只留痕，不参与评分。老记录没有这个键 ⇒ False
+    try:
+        u.blown = float(met.get("blown") or 0.0) > 0.5
+    except (TypeError, ValueError):
+        u.blown = False
     u.ret = float(met.get("total_return") or 0.0)
     u.max_dd = abs(float(met.get("max_dd") or 0.0))
     u.avg_notional = float(met.get("avg_notional") or 0.0)
@@ -416,14 +441,6 @@ def erc_weights(cov: np.ndarray) -> np.ndarray:
     return w / w.sum()
 
 
-def _join(a: str, b: str) -> str:
-    """把两段说明拼成「；」分隔的一句话（任一段为空就只留另一段）。"""
-    a, b = (a or "").strip(), (b or "").strip()
-    if not b:
-        return a
-    return f"{a}；{b}" if a else b
-
-
 def span_factor(years: float) -> tuple[float, str, bool]:
     """回测时长 → (风险系数, 档名, 是否最低档)。
 
@@ -459,7 +476,11 @@ def risk_scores(usages: list[Usage]) -> tuple[np.ndarray, list[str]]:
     |---|---|---|
     | 利用率没量测（`util=0`） | 组合**中位数**利用率 | 不知道它压了多少，折成中位数＝不奖不罚。判 0 会把它当「几乎不用钱 ⇒ 单位风险爆炸」直接压死 |
     | 波动没量测（`vol=0`） | 有效组**几何平均**（典型风险） | 判 0 经 `1/vol` 会吃掉全部资金（实测 4 条没数据的拿走 100%） |
-    | 波动 NaN（权益亏穿） | 同上，**典型风险，不降档** | 🔴 亏穿主要是**杠杆过高**的产物（`capital_pct` 打满、名义敞口是本金的十几倍），不是「策略本身风险大」；而且 `_metrics` 一旦标 NaN 就说明连真实波动都量不到了，硬给一个「最高风险」是凭空发明。拿杠杆罚两次没有依据 |
+
+    > **波动率不再有「因为亏穿所以是 NaN」这一说**（3.6.2 改）。波动率按
+    > **整条资金曲线**算，权益翻负那段照样计入 —— 亏没亏穿是**杠杆**的事，
+    > 已经由 `util` 那一项除进去了；亏穿的策略波动率通常最大，如实给高分、
+    > 拿小权重才对。`Usage.blown` 只用来在这条说明里点名，不参与打分。
 
     ## 「最低档」是什么
 
@@ -483,6 +504,8 @@ def risk_scores(usages: list[Usage]) -> tuple[np.ndarray, list[str]]:
                    for u in usages], dtype=float)
     yrs = np.array([float(getattr(u, "span_years", 0.0) or 0.0)
                     for u in usages], dtype=float)
+    # 曾经亏穿（只用于说明，不参与打分、不降档）
+    blown = np.array([bool(getattr(u, "blown", False)) for u in usages], dtype=bool)
     why = [""] * n
 
     # 注意 `float('nan') or 0.0` 还是 nan（NaN 是真值），所以上面的 `or` 只
@@ -526,20 +549,23 @@ def risk_scores(usages: list[Usage]) -> tuple[np.ndarray, list[str]]:
     if not good.any():                       # 一条都没量过 ⇒ 无从比较，等权
         return np.ones(n), why
     typical = float(np.exp(np.mean(np.log(s[good]))))     # 几何平均
-    # 🔴 「净值被亏穿」不再压最低档（3.6.1 按用户要求去掉）。
-    # 亏穿主要是**杠杆过高**的产物 —— `capital_pct` 打到 100%、名义敞口是本金的
-    # 十几倍，价格走一个保证金比例的幅度就穿了。用它去判「策略风险大」等于按
-    # 杠杆罚两次；而且一旦亏穿 `_metrics` 就把 `ann_vol` 标成 NaN，这里本来也拿
-    # 不到真实波动，只能凭空给一个「最高风险」。
-    # 现在和「没有波动实测」走同一条路：组合典型风险，不降档。
+    # 「净值被亏穿」**不降档**（3.6.1 按用户要求去掉），3.6.2 起波动率也不再因此
+    # 置 NaN，所以亏穿的策略现在拿的是**自己真实的波动率**（含翻负段），分数会
+    # 如实偏高、权重如实偏小 —— 正是应该的。
+    # 亏穿为什么还不额外降档：它是**杠杆**的账，杠杆高低已经由 ③ 里的
+    # `vol / util` 除进去了（util = 平均占用 ÷ 本金，`vol/util` 化简后就是
+    # 「标的价波动 ÷ 保证金率」，压多少仓一目了然）。再拿它降一档等于同一个原因
+    # 罚两遍。用户原话：「杠杆比率低，也亏不穿，这就是为什么要用资金利用率」。
+    #
+    # 剩下真正要补「组合典型风险」的只有一种：`vol` 没量到（老记录 / vol=0）。
     for i in range(n):
         if good[i]:
+            if blown[i]:
+                why[i] = _join(why[i], "净值曾亏穿（波动率含翻负段，按真值配权；"
+                                        "杠杆由利用率体现）")
             continue
         s[i] = typical
-        why[i] = _join(
-            why[i],
-            "净值被亏穿（多为杠杆过高），按组合典型风险" if not math.isfinite(vol[i])
-            else "没有波动实测，按组合典型风险")
+        why[i] = _join(why[i], "没有波动实测，按组合典型风险")
 
     # ---- 最低档：抬到「有效组里最高风险」那一档 ----
     free = good & ~bottom
@@ -564,12 +590,12 @@ def risk_parity(usages: list[Usage], rets: pd.DataFrame | None = None
     ## 🔴 两个必须挡住的坑，都会让整张分配表变成 nan / 严重错配
 
     **① `ann_vol` 可能是 NaN，而 NaN 会通过 `1/vol` 污染所有人。**
-    `backtest._metrics` 对「权益被亏穿」（`equity.min() <= 0`）的策略**有意**
-    把 `ann_vol` 标成 NaN —— 净值翻号之后的波动率确实没有意义。但
     `inv = 1/vol` 里只要混进一个 NaN，`inv.sum()` 就是 NaN，于是
     **27 条策略的权重全变 NaN**，界面上权重 / 目标占用 / 缩放 / 本金(后) /
     预计占用整列都是 nan。用户只会看到「算不出来」，看不出是其中**一条**
-    爆仓策略干的。
+    策略干的。（3.6.2 之前的主要来源是「权益被亏穿 ⇒ `_metrics` 标 NaN」，
+    现在那条路已经关掉了 —— 波动率按整条曲线算。这条防线仍然要留着，
+    兜的是老记录和取不到行情的情况。）
 
     **② `ann_vol = 0` 比 NaN 更危险 —— 它不报错，直接吃掉全部资金。**
     没有回测实测的策略（取不到行情、因子缺数据、或者压根没点过「量占用」）
@@ -578,18 +604,21 @@ def risk_parity(usages: list[Usage], rets: pd.DataFrame | None = None
     实测 23 条正常 + 4 条没数据：没数据的 4 条合计拿到 **100.00%**，正常的
     23 条拿到 0.00%，而界面上一切正常、不报错。
 
-    ## 处理方式：两种「没有可用波动」都按组合典型风险补，**都不降档**
+    ## 处理方式：唯一「没有可用波动」的情况是没量到，按组合典型风险补
 
     - **`vol = 0`（没量过：取不到行情 / 因子缺数据 / 没点「量占用」）**
       ⇒ 风险**未知**，用有效组的**几何平均**（组合典型风险）。既不放大到
       垄断，也不判 0（那等于「这条不用给钱」，同样没依据）。
-    - **`vol = NaN`（权益被亏穿，`_metrics` 有意义标 NaN）**
-      ⇒ 同样按**组合典型风险**。以前这里给的是「有效组最大波动 ⇒ 最低一档」，
-      3.6.1 **按用户要求去掉**：亏穿主要是**杠杆过高**的产物（`capital_pct`
-      打满、名义敞口是本金的十几倍），不是策略本身风险大，拿它当风险平价的
-      惩罚等于按杠杆罚两次；而且标了 NaN 就说明连真实波动都量不到，硬给一个
-      「最高风险」是凭空发明。杠杆该不该降，交给 `util`（利用率）和
-      `profit_factor` 两把尺子去判，它们量的是真实的东西。
+    - **`vol = NaN`（老记录里 `_metrics` 标过 NaN，或根本没有 `ann_vol`）**
+      ⇒ 同样按**组合典型风险**。
+
+    **亏穿（`equity.min() <= 0`）不再是这里的一个分支。** 3.6.2 起波动率在
+    整条资金曲线（含翻负段）上照算，所以亏穿的策略拿的是自己真实的、通常
+    最大的波动率 ⇒ 分数本来就高 ⇒ 权重本来就小，不需要额外规则。
+    亏穿该不该发生，由 `util`（资金利用率）和 `profit_factor` 两把尺子去判：
+    用户原话是「杠杆比率低，也亏不穿，这就是为什么要用资金利用率」——
+    杠杆已经进了分母，再拿亏穿降一档就是同一个原因罚两遍。
+    `Usage.blown` 只负责在说明里点名「这条曾经亏穿」，让人知道权重小的原因。
 
     全部无效（刚开工作区、一条都没量过）时退回等权 —— 那是唯一有依据的
     结论，也是 `weights()` 在别的模式下的一贯兜底。
@@ -738,6 +767,7 @@ def allocate(usages: list[Usage], total: float, mode: str = "equal",
                   tier=str(why[k] or ""),
                   vol_bad=not (math.isfinite(float(u.vol or 0.0))
                                and float(u.vol or 0.0) > 0),
+                  blown=bool(getattr(u, "blown", False)),
                   # 把测量阶段的结论带到预览表上：风险平价里「波动率无效」
                   # 「没有回测实测」这类原因必须让人看见，否则权重为什么是
                   # 这个数完全没有解释
