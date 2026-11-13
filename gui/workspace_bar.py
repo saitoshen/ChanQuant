@@ -259,7 +259,7 @@ class AllocDialog(QDialog):
         cols = ["策略", "权重", "标准化风险", "盈利因子", "回测年数", "档位",
                 "目标占用", "实测平均", "实测峰值", "缩放",
                 "本金(前)", "本金(后)", "占用%(前)", "占用%(后)",
-                "预计占用", "一手保底", "说明"]
+                "预计占用", "本金保底", "说明"]
         t = QTableWidget(len(self.shares), len(cols))
         t.setHorizontalHeaderLabels(cols)
         t.verticalHeader().setVisible(False)
@@ -271,10 +271,12 @@ class AllocDialog(QDialog):
                 i, QHeaderView.Stretch if i in (0, 5, 16)
                 else QHeaderView.ResizeToContents)
         for i, s in enumerate(self.shares):
-            # 「一手保底」列只写**加了多少钱**，长解释留在说明列 —— 这一列要能
-            # 一眼扫出「哪几条被抬了、抬了多少」
+            # 「本金保底」列只写**加了多少钱**，长解释留在说明列 —— 这一列要能
+            # 一眼扫出「哪几条被抬了、抬了多少」。括号里是门槛种类：`capital`/
+            # `unit` 是攒够一手，`budget`/`risk` 是够冻住峰值占用，两者不能混
             if getattr(s, "lifted", False):
-                lift_txt = f"↑ {s.lift_extra:,.0f}"
+                kind = "峰值占用" if getattr(s, "lift_kind", "") == "peak" else "一手"
+                lift_txt = f"↑ {s.lift_extra:,.0f}（{kind}）"
             elif getattr(s, "lot_need", 0) > 0:
                 lift_txt = "缺（未抬）"
             else:
@@ -340,29 +342,55 @@ class AllocDialog(QDialog):
                 "「仓位 30%」意味着一次出手只压 30% 的钱，要让平均开仓占用对齐，"
                 "本金就得放大 2~5 倍（对齐峰值时更高）。确认要这么配再点应用。",
                 False))
-        # ---- 一手保底 ----
+        # ---- 本金保底 ----
+        # 两种门槛分开说：`capital`/`unit` 是「攒够一手」，`budget`/`risk` 是
+        # 「够冻住峰值占用」（那两个口径手数被 max(1,…) 兜住，本金小了占用
+        # 不跟着小 —— 实测 lc-sbbox 分到 1.19 万却要冻 3.89 万）
         lifted = [s for s in self.shares if getattr(s, "lifted", False)]
-        if lifted:
-            names = "、".join(s.name for s in lifted[:3]) + ("…" if len(lifted) > 3 else "")
+        lot_side = [s for s in lifted if getattr(s, "lift_kind", "") != "peak"]
+        peak_side = [s for s in lifted if getattr(s, "lift_kind", "") == "peak"]
+        if lot_side:
+            names = "、".join(s.name for s in lot_side[:3]) + (
+                "…" if len(lot_side) > 3 else "")
+            add = sum(float(s.lift_extra or 0) for s in lot_side)
             out.append((
-                f"有 {len(lifted)} 条分到的钱历史上开不出 1 手（{names}），每手大约要 "
-                f"{(sum(float(s.lot_need) for s in lifted) / max(len(lifted), 1)) / 10000:,.1f} 万。"
-                f"已按「一手保底」上调 +{extra / 10000:,.1f} 万：这部分**不从其他条目扣**，"
-                f"应用后总资金会变成 {after / 10000:,.1f} 万（原 {total / 10000:,.1f} 万）。"
+                f"有 {len(lot_side)} 条分到的钱历史上开不出 1 手（{names}），每手大约要 "
+                f"{(sum(float(s.lot_need) for s in lot_side) / max(len(lot_side), 1)) / 10000:,.1f} 万。"
+                f"已按「一手保底」上调 +{add / 10000:,.1f} 万：这部分**不从其他条目扣**。"
                 "上调额取「历史平均一手」到「历史最贵一手」之间一半的位置。",
                 False))
-        # 抬到上限还开不出一手：必须点名。否则这条会以「已保底」的样子继续空跑，
-        # 而它的净值、占用、波动率、盈利因子全是 0 —— 配权规则还会再罚它一次
+        if peak_side:
+            names = "、".join(s.name for s in peak_side[:3]) + (
+                "…" if len(peak_side) > 3 else "")
+            add = sum(float(s.lift_extra or 0) for s in peak_side)
+            out.append((
+                f"有 {len(peak_side)} 条是「按止损金额 / 分配资金定手」，不足一手时"
+                f"自动按 1 手（{names}）：**手数不随本金缩**，本金小于它要冻的保证金"
+                f"就等于隐性超杠杆，实盘还可能因保证金不足被拒单。已把本金上调到"
+                f"它的峰值占用，+{add / 10000:,.1f} 万，同样不从其他条目扣。",
+                False))
+        if lifted:
+            # 🔴 必须写 `total + extra`，不能写 Σ新本金：按占用/按峰值校准本来就会
+            # 让「本金合计」大于总资金，而「应用」那一步只把总资金加上保底额
+            # （见 `portfolio_page._apply_alloc`）—— 写 Σ本金会报出一个应用后
+            # 对不上的数，用户下次打开就会发现「说的和实际不一样」
+            out.append((
+                f"本金保底共上调 +{extra / 10000:,.1f} 万：这部分是**额外本金**，"
+                f"应用后总资金会从 {total / 10000:,.1f} 万上调到 "
+                f"{(total + extra) / 10000:,.1f} 万。", False))
+        # 抬到上限还够不着：必须点名。否则这条会以「已保底」的样子继续空跑 /
+        # 继续超杠杆，而它的净值、占用、波动率、盈利因子全是 0 —— 配权还会再罚它一次
         short = [s for s in self.shares
-                 if "仍不足一手" in (getattr(s, "floor_note", "") or "")
+                 if "仍不足" in (getattr(s, "floor_note", "") or "")
                  or "没有可上调的空间" in (getattr(s, "floor_note", "") or "")]
         if short:
             names = "、".join(s.name for s in short[:3]) + ("…" if len(short) > 3 else "")
             out.append((
-                f"有 {len(short)} 条即使上调到上限也开不出 1 手（{names}）："
-                "它们历史上大部分时间是空仓，净值 / 波动率 / 盈利因子都不可信。"
-                "要么给这几条单独开户，要么把它们从组合里去掉 —— 留在组合里配权"
-                "只会让它们的权重看起来「有数」其实是零信息。", True))
+                f"有 {len(short)} 条即使上调到上限也够不着门槛（{names}）："
+                "它们要么历史上大部分时间空仓（净值 / 波动率 / 盈利因子都不可信），"
+                "要么峰值占用远超组合总资金的一半。要么给这几条单独开户、加大总资金，"
+                "要么把它们从组合里去掉 —— 留在组合里配权只会让它们的权重看起来"
+                "「有数」其实是零信息。", True))
         fx = [s.name for s in self.shares if "固定手数" in (s.note or "")]
         if fx:
             out.append((f"有 {len(fx)} 条是固定手数（{'、'.join(fx[:3])}"

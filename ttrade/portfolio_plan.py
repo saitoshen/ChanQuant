@@ -53,19 +53,29 @@
 比率都是单利：手数只看本金（或分配的那部分），不看当前权益，所以
 「占用 ∝ principal」严格成立，缩放是精确的，不需要迭代。
 
-## 一手保底：分到的钱开不出一手，等于没分
+## 本金下限：分到的钱不够，等于没分
 
-风险平价、资金等权都可能给某条策略分到「不够一手」的钱。`capital` 口径下
-那就是 **0 手**：`round(预算 ÷ 每手保证金) == 0` ⇒ 整段不交易 ⇒ 净值是直线、
-占用 0、波动 0、盈利因子 0，然后以「没数据」的身份被配权规则再罚一次。
-用户看到的是一条「永远不动的曲线」，却看不出原因是钱不够。
+风险平价、资金等权都可能给某条策略分到「不够用」的钱。两种口径、两种表现：
 
-所以 `allocate()` 最后一步做一手保底（`apply_lot_floor`）：
+**`capital` / `unit`** —— 分到不够一手的钱就是 **0 手**：`round(预算 ÷ 每手
+保证金) == 0` ⇒ 整段不交易 ⇒ 净值是直线、占用 0、波动 0、盈利因子 0，然后以
+「没数据」的身份被配权规则再罚一次。用户看到的是一条「永远不动的曲线」，却
+看不出原因是钱不够。
 
-    目标一手资金 L_req = L_avg + 0.5 × (L_peak − L_avg)
-        其中 L_avg / L_peak = 按历史均价 / 区间最高价算的一手保证金
-    动用比例 k       = 这个口径每 1 元本金实际用几成（见 `deploy_ratio`）
-    需要的本金 P_req = L_req ÷ k
+**`budget` / `risk`** —— 自带 `max(1, …)` 不会空跑，但手数不由本金线性决定：
+本金砍到 1.19 万，它照样下 1 手、照样冻 3.89 万保证金（本金的 327%）。
+表现是**隐性超杠杆**，实盘还会因保证金不足被拒单。
+
+所以 `allocate()` 最后一步做本金保底（`apply_lot_floor`）：
+
+    口径 A（capital / unit）—— 够开 1 手
+        目标一手资金 L_req = L_avg + 0.5 × (L_peak − L_avg)
+            其中 L_avg / L_peak = 按历史均价 / 区间最高价算的一手保证金
+        动用比例 k       = 这个口径每 1 元本金实际用几成（见 `deploy_ratio`）
+        需要的本金 P_req = L_req ÷ k
+
+    口径 B（budget / risk）—— 够覆盖峰值占用
+        P_req = 量测时的峰值占用（`meas_peak_margin`，**不按本金比折**）
 
 🔴 **杠杆一律用解析式 `k / L_avg`，不拿实测手数反推**：实测的「平均手数 ÷ 本金」
 是**按成交时点加权**的，成交集中在便宜的年份就会高估杠杆、把门槛估低（实测
@@ -76,13 +86,12 @@
 (1 + L_avg/L_peak) ∈ [0.5, 1]` 手 —— 配合 `lots_round`（0.5 就算 1 手）刚好
 「任何时点都开得出 1 手」。ratio 调小就保不住这个性质了（见 `LOT_LIFT_RATIO`）。
 
-- **抬出来的差额不从别人身上扣**：直接加进总本金。挤别人等于让「够一手的」
-  替「不够一手的」出钱，那是另一个策略被改了仓位，用户没要求。
+- **抬出来的差额不从别人身上扣**：直接加进总本金。挤别人等于让「够用的」
+  替「不够的」出钱，那是另一个策略被改了仓位，用户没要求。
 - **上限**：单条不超过组合总资金的 `LOT_LIFT_CAP_SHARE`。到了上限还差就停下，
-  在说明里写「上调到 X 仍不足一手（需 Y）」—— 否则它会以「已保底」的样子
-  继续空跑。
-- **只对 `capital` / `unit` 生效**：`budget` / `risk` 在 `size_lots` 里本来
-  就有 `max(1, ...)`，买不起也至少 1 手；`fixed` 手数写死。
+  在说明里写「上调到 X 仍不足一手 / 峰值占用（需 Y）」—— 否则它会以「已保底」
+  的样子继续空跑。
+- `fixed` 手数写死，与本金无关，两种口径都不适用。
 """
 
 from __future__ import annotations
@@ -178,12 +187,20 @@ LOT_LIFT_RATIO = 0.5
 # 一条都抬不动）。
 LOT_LIFT_CAP_SHARE = 0.5
 
-# 这几个口径**本身就有保底 1 手**，不会出现「钱不够就整段空跑」：
-#   budget：`max(1, round(预算 ÷ 每手名义))`  —— 买不起也至少 1 手
-#   risk  ：`max(1, round(risk_amount ÷ 每手风险))`
-# 它们的资金不足表现为「实际杠杆/止损金额超出设定」，不是开不出仓，
-# 所以不参与「一手保底」上调，只在说明列写清楚。
-LOT_NO_LIFT_SIZINGS = ("budget", "risk")
+# 这几个口径在 `size_lots` 里自带 `max(1, …)`：钱不够也至少 1 手。
+# 好处是不会「整段空跑」，坏处是**手数不由本金线性决定** —— 本金砍到 1 万，
+# 它照样下 1 手，占用的保证金一分不少。实测 lc-sbbox（risk，止损 3%）：
+#
+#     本金 11,898 → 1.00 手、峰值占用 38,911 ⇒ 占用是本金 327%
+#     本金 50,000 → 1.06 手、峰值占用 38,911 ⇒  78%
+#     本金 100,000 → 1.47 手、峰值占用 83,532 ⇒  84%
+#
+# 前三行说明小本金区间是常数占用：分得越少，隐性杠杆越高，实盘还会因保证金
+# 不足被拒单。所以这两个口径的门槛不是「够一手」，而是「够它真正要冻的钱」
+# = **峰值占用**。用户原话：「lc-sbbox 这种策略是按照止损金额分配仓位和资金的，
+# 所以设置的本金不能等同于应该分配到的资金，也要设置一个上调的资金，
+# 就设置成峰值占用的资金吧」。
+LOT_PEAK_SIZINGS = ("budget", "risk")
 
 
 @dataclass
@@ -238,6 +255,12 @@ class Usage:
     # 否则第二次折算就找不到比例了（会把已折算的值再折一遍）
     meas_principal: float = 0.0
     meas_pct: float = 0.0
+    # 量测那一刻的**峰值占用**，`rebase()` 不会折它。
+    # 🔴 为什么不能折：`rebase` 假定「占用 ∝ 本金」，那对 `capital` / `unit`
+    # 成立，但 `budget` / `risk` 有 `max(1, …)` 兜底 —— 本金 10 万时 1.47 手、
+    # 砍到 1.2 万还是 1 手，占用**恒定** 38,911。按本金比折成 4,883 会把
+    # 「本金够不够冻这笔保证金」判反（`LOT_PEAK_SIZINGS` 的门槛就是它）
+    meas_peak_margin: float = 0.0
 
     @property
     def scalable(self) -> bool:
@@ -289,8 +312,15 @@ class Share:
     # 只用来解释「为什么它波动这么大、权重这么小」
     blown: bool = False
     # ---- 一手保底 ----
-    # `lot_need`：让这条策略历史上至少开得出 1 手所需的本金（0 = 不需要/算不出）
+    # `lot_need`：这条策略需要的**本金下限**（0 = 不需要/算不出）。
+    #   口径跟着 `sizing` 走，见 `lot_floor`：
+    #     `capital` / `unit`  → 够开 1 手的本金（L_req ÷ k）
+    #     `budget` / `risk`   → 够覆盖**峰值占用**的本金（手数被 max(1,…) 兜住，
+    #                           占用不随本金缩，本金小于它就等于隐性超杠杆）
     lot_need: float = 0.0
+    # 这个下限是哪一种（""/"lot"/"peak"）。界面文案要分开写，不然会把
+    # 「攒够一手」和「够冻保证金」混成一句话
+    lift_kind: str = ""
     # 真的被上调了没有 / 上调了多少（这部分钱是**额外加进总本金**的，
     # 不从别人身上扣）
     lifted: bool = False
@@ -377,6 +407,9 @@ def measure(cfg, frame: pd.DataFrame | None, res, mult: float = 1.0,
     u.peak_notional = float(met.get("peak_notional") or 0.0)
     u.avg_margin = float(met.get("avg_margin") or 0.0)
     u.peak_margin = float(met.get("peak_margin") or 0.0)
+    # 记一份量测时的峰值占用，`rebase()` 不动它（见字段注释：`budget`/`risk`
+    # 的占用不随本金线性缩放，折了会把门槛判反）
+    u.meas_peak_margin = u.peak_margin
     u.util = u.avg_margin / principal if principal > 0 else 0.0
     u.bars = int(met.get("n_trades") or 0)
     try:
@@ -608,7 +641,11 @@ def deploy_ratio(u: Usage) -> float:
 
 def lot_floor(u: Usage, ratio: float = LOT_LIFT_RATIO,
               principal: float | None = None) -> tuple[float, str]:
-    """让这条策略**历史上至少开得出 1 手**所需的本金。返回 `(需要的本金, 说明)`。
+    """这条策略**需要的本金下限**。返回 `(需要的本金, 说明)`。
+
+    下限有两种，按 `sizing` 分（见下面两节）：
+      `capital` / `unit`  → **够开 1 手**的本金
+      `budget` / `risk`   → **够覆盖峰值占用**的本金
 
     `需要的本金 = 0` 表示「不用抬」或「算不出来」，`说明` 里写为什么。
 
@@ -617,7 +654,7 @@ def lot_floor(u: Usage, ratio: float = LOT_LIFT_RATIO,
     拿实测本金去判会出现「分配只给了 1.4 万、实测时 5 万，于是判定够用」这种
     最要命的漏判（实测 23 条里有 4 条就是这样）。
 
-    ## 口径（全解析，不看成交记录）
+    ## 口径 A：`capital` / `unit` —— 够开 1 手（全解析，不看成交记录）
 
         L_avg  = 历史平均价那一手要多少钱（`lot_margin_avg`）
         L_peak = 历史最高价那一手要多少钱（`lot_margin_peak`）
@@ -637,22 +674,54 @@ def lot_floor(u: Usage, ratio: float = LOT_LIFT_RATIO,
     算 1 手），**任何时点都开得出 1 手**。门槛按「1 手」而不是「0.5 手」算，
     就是为了让它落在最贵那一根也够；按 0.5 手设门槛的话，峰值那一段又归零。
 
-    ## 为什么只对 `capital` / `unit` 生效
-
-    `budget`（网格按分配资金定手）和 `risk`（按止损金额定仓）在
-    `backtest.size_lots` 里都有 `max(1, ...)` —— 买不起也至少 1 手，不会
-    整段空跑。它们资金不足的代价是「实际杠杆 / 止损金额超出设定」，那是另一
-    件事，抬本金治不了也不该用它治。`fixed` 手数是写死的，与本金无关。
-
     `capital` 是唯一会「钱不够一手 ⇒ 0 手 ⇒ 整段不交易」的口径，也正是用户
     反馈里那批「历史上根本开不了仓」的策略。
+
+    ## 口径 B：`budget` / `risk` —— 够覆盖峰值占用
+
+    这两个口径在 `size_lots` 里自带 `max(1, ...)`：钱不够也至少 1 手，所以
+    **不会空跑**，但手数不再由本金线性决定 —— 本金砍到 1 万，它照样下 1 手，
+    要冻的保证金一分不少。实测 lc-sbbox（risk，止损 3%）在 11,898 本金下是
+    1.00 手 / 峰值占用 38,911（**本金的 327%**），隐性 3 倍杠杆，实盘还会因
+    保证金不足被拒单。所以门槛是「够它真正要冻的钱」：
+
+        P_req = 量测时的峰值占用（`meas_peak_margin`）
+
+    🔴 **不能拿 rebase 折过的 `peak_margin`**：折算是按「占用 ∝ 本金」算的，
+    而这两个口径在「本金小到只剩 1 手」那一段占用是**常数**，折一下就把门槛
+    折没了（11,898 那条会从 38,911 折成 4,883，判定「够了」但实际仍是 3 倍）。
+
+    `fixed` 手数是写死的，与本金无关，两种口径都不适用。
     """
     if not u_scalable(u.sizing):
         return 0.0, ""                      # fixed：手数写死，跟本金无关
     sz = str(u.sizing or "capital").lower()
-    if sz in LOT_NO_LIFT_SIZINGS:
-        return 0.0, f"{sz} 口径不足一手时按 1 手保底，不会空跑（代价是实际杠杆偏高）"
     p = float(u.principal if principal is None else principal)
+    if sz in LOT_PEAK_SIZINGS:
+        # 自带 1 手保底的口径：门槛是「够它真正要冻的钱」= 峰值占用。
+        # 🔴 用量测时的峰值（`meas_peak_margin`），**不是** rebase 折过的
+        # `peak_margin`：这两个口径的占用在「本金小到只剩 1 手」时是常数，
+        # 按本金比折会把它折小，于是判定「够了」而实际照样超杠杆。
+        peak = float(getattr(u, "meas_peak_margin", 0.0) or 0.0)
+        if peak <= 0:
+            # 老记录没存量测峰值：只能拿（已 rebase 的）峰值凑合，并在说明里
+            # 标注口径，别让人以为它和 capital 的一手门槛是一回事
+            peak = float(getattr(u, "peak_margin", 0.0) or 0.0)
+            stale = True
+        else:
+            stale = False
+        if peak <= 0:
+            return 0.0, (f"{sz} 口径自带 1 手保底，但没量到占用峰值，"
+                         f"判断不了本金够不够冻这笔保证金")
+        if peak <= p * (1.0 + 1e-9):
+            return 0.0, (f"{sz} 口径手数由{'止损金额' if sz == 'risk' else '分配资金'}"
+                         f"定、不足一手按 1 手保底，占用不随本金缩 —— "
+                         f"本金已覆盖峰值占用 {peak:,.0f}")
+        src = "止损金额" if sz == "risk" else "分配资金"
+        return peak, (f"{sz} 口径手数由{src}定、不足一手按 1 手保底，"
+                      f"所以本金不能小于它真正要冻的钱：峰值占用 {peak:,.0f} 元"
+                      f"（当前本金只够 {p / peak:.0%}）"
+                      + ("；峰值是折算值，想更准请重新「量一下占用」" if stale else ""))
     L_avg = float(getattr(u, "lot_margin_avg", 0.0) or 0.0)
     L_peak = float(getattr(u, "lot_margin_peak", 0.0) or 0.0)
     if L_avg <= 0 or p <= 0:
@@ -678,18 +747,23 @@ def lot_floor(u: Usage, ratio: float = LOT_LIFT_RATIO,
 def apply_lot_floor(shares: list[Share], usages: list[Usage], total: float,
                     ratio: float = LOT_LIFT_RATIO,
                     cap_share: float = LOT_LIFT_CAP_SHARE) -> dict:
-    """把「历史上开不出 1 手」的条目本金抬到够 1 手，**不动其他条目的钱**。
+    """把「本金不够」的条目抬到下限，**不动其他条目的钱**。
+
+    下限有两种，由 `lot_floor` 按 `sizing` 决定：
+      `capital` / `unit`  → 够开 1 手的本金
+      `budget` / `risk`   → 够覆盖峰值占用的本金（手数被 `max(1, …)` 兜住，
+                            占用不随本金缩，本金小于它就是隐性超杠杆）
 
     抬出来的差额不是从别人身上扣 —— 它会直接变成「总本金」的增加：
     调用方拿返回的 `extra` 去加总资金。用户明确要求这一点
     （「不挤压其余品种的权重分配，只是增加总本金」）。
 
     `cap_share` 是单条上限（占组合总资金的比例）。到了上限还差，就停下并在
-    `floor_note` 里写「上调到 X 仍不足一手（需 Y）」—— 用户要的正是这句注释，
-    否则这条策略会以「已经保底了」的样子继续空跑。
+    `floor_note` 里写「上调到 X 仍不足一手 / 峰值占用（需 Y）」—— 用户要的正是
+    这句注释，否则这条策略会以「已经保底了」的样子继续空跑。
 
     返回 `{"before": Σ本金, "after": Σ本金, "extra": 差额, "n": 抬起条数,
-    "short": [仍不足一手的名字]}`。
+    "short": [仍不够的名字]}`。
     """
     by = {str(getattr(u, "sid", "")): u for u in usages}
     before = float(sum(float(s.new_principal or 0) for s in shares))
@@ -705,6 +779,10 @@ def apply_lot_floor(shares: list[Share], usages: list[Usage], total: float,
         need, why = lot_floor(u, ratio, principal=float(s.new_principal or 0))
         s.lot_need = float(need or 0.0)
         s.floor_note = why
+        # 门槛分两种，界面文案要分开：够一手（capital/unit）vs 够峰值占用
+        # （budget/risk，手数被 max(1,…) 兜住，占用不随本金缩）
+        peak_kind = str(getattr(u, "sizing", "") or "").lower() in LOT_PEAK_SIZINGS
+        s.lift_kind = ("peak" if peak_kind else "lot") if need > 0 else ""
         if need <= 0:
             continue
         old = float(s.new_principal or 0)
@@ -728,8 +806,9 @@ def apply_lot_floor(shares: list[Share], usages: list[Usage], total: float,
         extra += s.lift_extra
         n += 1
         if give < float(need) - 1e-6:
+            what = "峰值占用" if s.lift_kind == "peak" else "一手"
             s.floor_note = _join(
-                why, f"已上调到上限 {give:,.0f} 元，仍不足一手（需 {need:,.0f}）")
+                why, f"已上调到上限 {give:,.0f} 元，仍不足{what}（需 {need:,.0f}）")
             short.append(s.name)
     after = float(sum(float(s.new_principal or 0) for s in shares))
     return {"before": before, "after": after, "extra": after - before,
@@ -1195,10 +1274,11 @@ def summarize(shares: list[Share]) -> pd.DataFrame:
             "预计占用": s.est_avg,
             "说明": s.note,
             "档位": s.tier,
-            # 一手保底：`一手门槛` 是「抬到够 1 手要多少本金」，`上调` 是实际
-            # 加了多少钱（这部分是额外进总本金的，不从别人身上扣）
-            "一手门槛": s.lot_need,
+            # 本金保底：`本金门槛` 是「抬到够用要多少本金」，`上调` 是实际加了
+            # 多少钱（这部分是额外进总本金的，不从别人身上扣）。
+            # 门槛口径随 `sizing` 变（够一手 / 够峰值占用），见 `lot_floor`
+            "本金门槛": s.lot_need,
             "上调": s.lift_extra if s.lifted else 0.0,
-            "一手保底说明": s.floor_note,
+            "保底说明": s.floor_note,
         })
     return pd.DataFrame(rows)

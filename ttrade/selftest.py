@@ -2644,14 +2644,48 @@ def _run() -> tuple[bool, list[str]]:
         if "仍不足一手" not in (sh11[0].floor_note or ""):
             raise RuntimeError(
                 f"顶到上限却没说「仍不足一手」：{sh11[0].floor_note!r}")
-        # ⑨ 自带保底 1 手的口径不抬，但要写清楚
+        # ⑨ 自带 1 手保底的口径（budget / risk）：门槛是**峰值占用**，不是「够
+        #    一手」。这两个口径手数被 `max(1, …)` 兜住 —— 本金砍到 1 万它照样
+        #    下 1 手、照样冻 3.9 万保证金（实测 lc-sbbox 是 327% 本金），所以
+        #    本金低于峰值占用 = 隐性超杠杆，实盘还会被拒单。
         b_risk = mk_lot("K", 100_000, 0.30, 40_000, 60_000, 0.0, sizing="risk")
-        sh12 = PL.allocate([b_risk, mk_lot("Q", 100_000, 0.20, 10_000, 10_000, 8.0)],
-                           20_000.0, "equal", basis="principal")
-        if sh12[0].lifted:
-            raise RuntimeError("risk 口径自带保底 1 手，不该再抬本金")
-        if "保底" not in (sh12[0].floor_note or ""):
-            raise RuntimeError(f"risk 口径没写清楚为什么没抬：{sh12[0].floor_note!r}")
+        b_risk.peak_margin = 38_911.0
+        b_risk.meas_peak_margin = 38_911.0     # 量测时的峰值占用
+        # ⑨a 分到的钱 < 峰值占用 ⇒ 抬到峰值占用，差额加总本金
+        sh_risk = PL.allocate([b_risk, mk_lot("Q2", 100_000, 0.20, 10_000, 10_000, 8.0)],
+                              60_000.0, "equal", basis="principal")
+        if abs(sh_risk[0].new_principal - 38_911.0) > 1.0:
+            raise RuntimeError(
+                f"risk 口径没抬到峰值占用：{sh_risk[0].new_principal:,.0f}")
+        if abs(sh_risk[0].lift_extra - 8_911.0) > 1.0:
+            raise RuntimeError(f"risk 上调额记错了：{sh_risk[0].lift_extra!r}")
+        if sh_risk[0].lift_kind != "peak":
+            raise RuntimeError(f"门槛种类记错了：{sh_risk[0].lift_kind!r}")
+        if abs(sh_risk[1].new_principal - 30_000.0) > 1e-6:
+            raise RuntimeError("risk 保底把钱挪给别人了")
+        # ⑨b 本金已覆盖峰值占用 ⇒ 不抬，但说明里要写清它自带 1 手保底
+        b_rich = mk_lot("K2", 100_000, 0.30, 40_000, 60_000, 0.0, sizing="risk")
+        b_rich.peak_margin = 9_000.0
+        b_rich.meas_peak_margin = 9_000.0
+        sh_r2 = PL.allocate([b_rich, mk_lot("Q3", 100_000, 0.20, 10_000, 10_000, 8.0)],
+                            60_000.0, "equal", basis="principal")
+        if sh_r2[0].lifted:
+            raise RuntimeError("本金已覆盖峰值占用，不该再抬")
+        if "保底" not in (sh_r2[0].floor_note or ""):
+            raise RuntimeError(f"没写清为什么没抬：{sh_r2[0].floor_note!r}")
+        # ⑨c 🔴 rebase 不许折 `meas_peak_margin`：折算是按「占用 ∝ 本金」算的，
+        #     而这两口径在「小到只剩 1 手」那段占用是**常数**。折一下门槛就没了
+        #     （11,898 那条会从 38,911 折成 4,883，判定够了却仍是 3 倍杠杆）
+        shrunk = PL.rebase(b_risk, 12_000.0, 10.0, capital=1_200.0, sizing="risk")
+        if abs(shrunk.peak_margin - 38_911.0 * 0.12) > 1.0:
+            raise RuntimeError("rebase 该把 peak_margin 折到当前本金口径")
+        if abs(shrunk.meas_peak_margin - 38_911.0) > 1e-6:
+            raise RuntimeError(
+                f"rebase 把量测峰值占了折掉了：{shrunk.meas_peak_margin:,.0f}"
+                " —— 门槛会被折没")
+        _n2, _ = PL.lot_floor(shrunk, 0.5, principal=12_000.0)
+        if abs(_n2 - 38_911.0) > 1.0:
+            raise RuntimeError(f"rebase 之后门槛跟着缩了：{_n2:,.0f}")
         # ⑩ 关掉开关就一条都不抬（给「我就是要按权重硬分」的人留后路）
         off = PL.allocate(lot_us, 200_000.0, "equal", basis="principal", lift=False)
         if any(s.lifted for s in off):
