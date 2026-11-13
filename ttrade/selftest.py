@@ -2305,8 +2305,48 @@ def _run() -> tuple[bool, list[str]]:
         if abs(sh[0].new_principal - total) > 1e-6 or sh[1].new_principal > 1e-6:
             raise RuntimeError("手动分配的顺序错位了")
 
+        # ⑥ 风险平价必须挡住 NaN：一条策略权益被亏穿时 `_metrics` 会把
+        #    `ann_vol` 标成 NaN，而 `1/vol` 会让 **所有** 权重变 nan ——
+        #    界面上权重 / 目标占用 / 缩放 / 本金(后) / 预计占用整列都是 nan，
+        #    用户看不出是其中一条爆仓策略干的（实测工作区 27 条全 nan）。
+        bad = us + [mk("X", 200_000, 100, 50_000, float("nan"))]
+        w = PL.risk_parity(bad)
+        if not np.all(np.isfinite(w)):
+            raise RuntimeError(f"NaN 波动率把权重全带成 nan 了：{np.round(w, 4)}")
+        if abs(float(w.sum()) - 1.0) > 1e-12:
+            raise RuntimeError("混入 NaN 之后权重和不为 1")
+        # 亏穿的那条「风险已知极大」⇒ 必须拿到最小的一档（= 波动最大那条的权重），
+        # 而不是被当成典型策略、更不是被静默判 0
+        if abs(w[3] - w[1]) > 1e-9 or w[3] >= w[0]:
+            raise RuntimeError(
+                f"亏穿的策略该按最高风险配权，实际 {np.round(w, 4)}")
+        sh = PL.allocate(bad, total, "risk", basis="usage")
+        if not all(np.isfinite([s.weight, s.target, s.scale, s.new_principal,
+                                s.est_avg]).all() for s in sh):
+            raise RuntimeError("NaN 顺着 allocate 传下去了")
+
+        # ⑦ 🔴 vol=0 比 NaN 更危险：它不报错，直接吃掉全部资金。
+        #    没量过占用的策略走默认 `vol=0`，`max(vol,1e-9)` 让 1/vol=1e9，
+        #    实测 23 条正常 + 4 条没数据时，没数据的 4 条合计拿到 100%。
+        mix = ([mk(f"N{i}", 100_000, 100, 40_000, 0.30) for i in range(6)]
+               + [mk(f"Z{i}", 100_000, 100, 1_000, 0.0) for i in range(2)])
+        w = PL.risk_parity(mix)
+        if not np.all(np.isfinite(w)) or abs(float(w.sum()) - 1.0) > 1e-12:
+            raise RuntimeError(f"缺波动率的场景权重异常：{np.round(w, 4)}")
+        tail = float(w[6:].sum())
+        if tail > 0.5:
+            raise RuntimeError(
+                f"没有波动率数据的策略拿走了 {tail:.1%} 权重（应按典型风险计）")
+        if abs(w[6] - w[0]) > 1e-9:
+            raise RuntimeError("缺数据那条该按组合典型风险配权")
+        # 全部 vol=0（刚开工作区、一条都没量过）→ 退回等权
+        zero = PL.risk_parity([mk(f"Q{i}", 100_000, 100, 1_000, 0.0) for i in range(4)])
+        if not np.allclose(zero, 0.25):
+            raise RuntimeError(f"全都缺波动率时该等权，实际 {np.round(zero, 4)}")
+
         return ("ERC 风险贡献等权（n=1/2/5/12，误差 <1e-6）；"
-                "按本金/按平均占用/按峰值三种口径；固定手数不缩放；手动按比例")
+                "按本金/按平均占用/按峰值三种口径；固定手数不缩放；手动按比例；"
+                "风险平价挡住 NaN（一条爆仓不连累全体）与 vol=0（不吞掉全部资金）")
 
     check("组合工作区资金分配（ERC / 三种口径）", _portfolio_plan)
 

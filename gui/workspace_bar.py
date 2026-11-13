@@ -305,6 +305,16 @@ class AllocDialog(QDialog):
             out.append((f"有 {len(fx)} 条是固定手数（{'、'.join(fx[:3])}"
                         + ("…" if len(fx) > 3 else "")
                         + "）：改本金不会改变手数，这几条没法按组合调仓。", False))
+        # 波动率无效 = 风险平价的权重不是由它自己的风险算出来的。不点名的话，
+        # 用户只会看到「权重怎么和别的一样 / 为什么这条这么低」，无处可查
+        bad = [s.name for s in self.shares if getattr(s, "vol_bad", False)]
+        if bad:
+            out.append((
+                f"有 {len(bad)} 条算不出波动率（{'、'.join(bad[:3])}"
+                + ("…" if len(bad) > 3 else "")
+                + "）：权益被亏穿的按「最高风险」给了最小权重，没量过占用的按"
+                "「组合典型风险」补齐。风险平价在这里是保守估计，不是它自己的风险。",
+                False))
         if str(basis) != "principal" and not measured:
             out.append(("还没量过占用，校准口径退回了「按分配额」。"
                         "先点「量一下占用」，再来看这一页。", True))

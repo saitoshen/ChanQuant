@@ -36,6 +36,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -130,6 +131,10 @@ class Share:
     old_pct: float = 30.0         # 占用百分比（前）
     new_pct: float = 30.0         # 占用百分比（后）
     est_avg: float = 0.0          # 缩放后的预计占用（口径同 target）
+    # 波动率无效（`vol` 是 NaN 或 0）。风险平价下这些条目会被补齐，权重不是
+    # 由它自己的风险算出来的 —— 预览表必须点名，否则「为什么 27 条权重一样」
+    # 没人解释得清
+    vol_bad: bool = False
     note: str = ""
 
 
@@ -165,7 +170,18 @@ def measure(cfg, frame: pd.DataFrame | None, res, mult: float = 1.0,
         u.note = "固定手数，组合无法调整"
 
     met = dict(getattr(res, "metrics", {}) or {})
-    u.vol = abs(float(met.get("ann_vol") or 0.0))
+    # 🔴 `ann_vol` 可能是 NaN（权益被亏穿时 `_metrics` 有意标的）。**必须原样
+    # 保留 NaN，不能改写成 0**：NaN 是「风险大到把本金亏光了」，0 是「压根没
+    # 量过」，两者在风险平价里该给的权重完全不同（见 `risk_parity`）。
+    # 但直接往下传也不行 —— `1/vol` 会把整张表的权重全变成 nan。
+    try:
+        vol = abs(float(met.get("ann_vol")))
+    except (TypeError, ValueError):
+        vol = float("nan")
+    if not math.isfinite(vol):
+        vol = float("nan")
+        u.note = "净值被亏穿，波动率无意义（风险平价里按最高风险计）"
+    u.vol = vol
     u.ret = float(met.get("total_return") or 0.0)
     u.max_dd = abs(float(met.get("max_dd") or 0.0))
     u.avg_notional = float(met.get("avg_notional") or 0.0)
@@ -247,6 +263,35 @@ def risk_parity(usages: list[Usage], rets: pd.DataFrame | None = None
     有净值序列就用**真 ERC**（含相关性）；没有就退回「波动率倒数」——
     那是 ERC 在相关系数为 0 时的特例，两条高度相关的策略会被它各给一半，
     而 ERC 会把它们当成同一个风险源、合起来给一份。
+
+    ## 🔴 两个必须挡住的坑，都会让整张分配表变成 nan / 严重错配
+
+    **① `ann_vol` 可能是 NaN，而 NaN 会通过 `1/vol` 污染所有人。**
+    `backtest._metrics` 对「权益被亏穿」（`equity.min() <= 0`）的策略**有意**
+    把 `ann_vol` 标成 NaN —— 净值翻号之后的波动率确实没有意义。但
+    `inv = 1/vol` 里只要混进一个 NaN，`inv.sum()` 就是 NaN，于是
+    **27 条策略的权重全变 NaN**，界面上权重 / 目标占用 / 缩放 / 本金(后) /
+    预计占用整列都是 nan。用户只会看到「算不出来」，看不出是其中**一条**
+    爆仓策略干的。
+
+    **② `ann_vol = 0` 比 NaN 更危险 —— 它不报错，直接吃掉全部资金。**
+    没有回测实测的策略（取不到行情、因子缺数据、或者压根没点过「量占用」）
+    走的是 `Usage` 默认值 `vol=0`。而 `max(vol, 1e-9)` 把 0 变成一个极小的
+    正数，`1/1e-9 = 1e9` ⇒ 这些**最不该拿到钱**的策略权重趋近 100%。
+    实测 23 条正常 + 4 条没数据：没数据的 4 条合计拿到 **100.00%**，正常的
+    23 条拿到 0.00%，而界面上一切正常、不报错。
+
+    ## 处理方式：无效的分两种，各按各的补
+
+    - **`vol = 0`（没量过：取不到行情 / 因子缺数据 / 没点「量占用」）**
+      ⇒ 风险**未知**，用有效组的**几何平均**（组合典型风险）。既不放大到
+      垄断，也不判 0（那等于「这条不用给钱」，同样没依据）。
+    - **`vol = NaN`（权益被亏穿，`_metrics` 有意标 NaN）**
+      ⇒ 风险**已知是极大的**，用有效组的**最大波动**。给它最小的一档权重，
+      但不能直接判 0 —— 那会静默把一条策略从组合里删掉，属于替用户做决定。
+
+    全部无效（刚开工作区、一条都没量过）时退回等权 —— 那是唯一有依据的
+    结论，也是 `weights()` 在别的模式下的一贯兜底。
     """
     n = len(usages)
     if n == 0:
@@ -257,10 +302,25 @@ def risk_parity(usages: list[Usage], rets: pd.DataFrame | None = None
         if len(r) > 30:
             cov = np.cov(r, rowvar=False)
             if np.all(np.isfinite(cov)):
-                return erc_weights(cov)
-    vol = np.array([max(u.vol, 1e-9) for u in usages], dtype=float)
+                w = erc_weights(cov)
+                if np.all(np.isfinite(w)) and float(w.sum()) > 0:
+                    return w
+    vol = np.array([float(getattr(u, "vol", 0.0) or 0.0) for u in usages],
+                   dtype=float)
+    # 注意 `float('nan') or 0.0` 还是 nan（NaN 是真值），所以上面的 `or` 只
+    # 处理 None；真正的有效性判断必须走 isfinite
+    good = np.isfinite(vol) & (vol > 1e-9)
+    if not good.any():
+        return np.full(n, 1.0 / n)
+    typical = float(np.exp(np.mean(np.log(vol[good]))))   # 几何平均
+    worst = float(vol[good].max())
+    vol = np.where(good, vol,
+                   np.where(np.isfinite(vol), typical, worst))
     inv = 1.0 / vol
-    return inv / inv.sum()
+    tot = float(inv.sum())
+    if not math.isfinite(tot) or tot <= 0:      # 理论上到不了，兜底不为 nan
+        return np.full(n, 1.0 / n)
+    return inv / tot
 
 
 def weights(mode: str, usages: list[Usage],
@@ -348,7 +408,13 @@ def allocate(usages: list[Usage], total: float, mode: str = "equal",
                   avg_margin=u.avg_margin, peak_margin=u.peak_margin,
                   old_principal=u.principal or u.capital or 0.0,
                   old_pct=float(u.capital_pct or 0.0),
-                  new_pct=float(u.capital_pct or 0.0))
+                  new_pct=float(u.capital_pct or 0.0),
+                  vol_bad=not (math.isfinite(float(u.vol or 0.0))
+                               and float(u.vol or 0.0) > 0),
+                  # 把测量阶段的结论带到预览表上：风险平价里「波动率无效」
+                  # 「没有回测实测」这类原因必须让人看见，否则权重为什么是
+                  # 这个数完全没有解释
+                  note=str(getattr(u, "note", "") or ""))
         if b == "principal":
             s.new_principal = s.target
             s.scale = (s.target / s.old_principal) if s.old_principal > 0 else 0.0
