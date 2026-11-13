@@ -55,6 +55,25 @@ BASES = {
     "peak": "按峰值占用",
 }
 
+# 调哪个旋钮把占用调到目标值。
+#
+# 🔴 「本金」和「占用百分比」是**相乘**的两个因子：
+#        平均占用 ≈ 本金 × 占用百分比 × 保证金率 × （仓位节奏系数）
+# 所以「把占用放大 k 倍」有无数种拆法。三种拆法的区别只在**本金会不会膨胀**：
+#
+#   principal：pct 不动，本金 ×k。占用对了，但本金合计往往 3~8 倍于总资金
+#   pct      ：本金不动，pct ×k。钱包不膨胀，但 pct 会顶到 500% 上限
+#   split    ：本金先归位到「分到的钱」，剩下交给 pct。两边都不极端（默认推荐）
+KNOBS = {
+    "split": "本金归位＋占用百分比补",
+    "principal": "只调本金",
+    "pct": "只调占用百分比",
+}
+
+# `capital_pct` 的存盘上限，和 `strategy_store._clamp_pct` 保持一致。
+# 两边不一致的话，界面算出 620% 写进去，下次加载被夹回 500% —— 手数悄悄变了。
+PCT_CAP = 500.0
+
 
 @dataclass
 class Usage:
@@ -65,6 +84,7 @@ class Usage:
     sizing: str = "capital"
     principal: float = 0.0        # 分配额（当前配置）
     capital: float = 0.0          # 开仓预算 = principal × capital_pct%
+    capital_pct: float = 30.0     # 占用百分比（只有 sizing="capital" 时起作用）
     avg_notional: float = 0.0     # 平均**开仓**名义敞口（|手数| × 开仓价 × 乘数）
     peak_notional: float = 0.0    # 逐根最大名义敞口（含持仓浮动）
     avg_margin: float = 0.0       # 平均开仓占用（名义 × 保证金率）—— 主口径
@@ -98,12 +118,18 @@ class Share:
     sid: str
     name: str
     weight: float = 0.0           # 组合内的权重（和为 1）
-    target: float = 0.0           # 目标平均占用（= 总资金 × weight）
+    # 目标占用（= 总资金 × weight）。**口径跟着 basis 走**：basis=usage 时是
+    # 目标「平均开仓占用」，basis=peak 时是目标「峰值占用」。列名别写死成
+    # 「平均」，否则按峰值校准时那一列会被当成平均值去读
+    target: float = 0.0
     avg_margin: float = 0.0       # 实测平均占用（按当前 principal）
-    scale: float = 1.0            # principal 的缩放系数
+    peak_margin: float = 0.0      # 实测峰值占用（按当前 principal）
+    scale: float = 1.0            # 总缩放系数（= 本金系数 × 百分比系数）
     old_principal: float = 0.0
     new_principal: float = 0.0
-    est_avg: float = 0.0          # 缩放后的预计平均占用
+    old_pct: float = 30.0         # 占用百分比（前）
+    new_pct: float = 30.0         # 占用百分比（后）
+    est_avg: float = 0.0          # 缩放后的预计占用（口径同 target）
     note: str = ""
 
 
@@ -133,7 +159,8 @@ def measure(cfg, frame: pd.DataFrame | None, res, mult: float = 1.0,
     u = Usage(sid=sid, name=name,
               sizing=str(getattr(cfg, "sizing", "") or "capital"),
               principal=principal,
-              capital=float(getattr(cfg, "capital", 0) or 0))
+              capital=float(getattr(cfg, "capital", 0) or 0),
+              capital_pct=float(getattr(cfg, "capital_pct", 0) or 0))
     if not u.scalable:
         u.note = "固定手数，组合无法调整"
 
@@ -263,8 +290,10 @@ def allocate(usages: list[Usage], total: float, mode: str = "equal",
              rets: pd.DataFrame | None = None,
              manual: dict | None = None,
              basis: str = "principal",
-             max_scale: float | None = None) -> list[Share]:
-    """把组合工作区的 `total` 分下去，给出每条策略的新 `principal`。
+             max_scale: float | None = None,
+             knob: str = "split",
+             pct_cap: float = PCT_CAP) -> list[Share]:
+    """把组合工作区的 `total` 分下去，给出每条策略的新 `principal` 与新占用百分比。
 
     `basis` 决定「用多少钱」按哪一层对齐：
 
@@ -274,18 +303,32 @@ def allocate(usages: list[Usage], total: float, mode: str = "equal",
     | `usage` | 让**平均开仓占用**等于分到的那份 | 想让每条策略出手时真正压一样多的钱 |
     | `peak` | 同上，但对齐**峰值占用**（逐根最大值） | 比 `usage` 保守：问的是「最坏那一刻压多少钱」 |
 
-    🔴 `usage` / `peak` 往往会让 `本金合计 > 总资金`，因为 `capital_pct=30%`
-    只是「开仓那一刻用 30%」—— 平均开仓占用通常只有分配额的 20%~40%
-    （满仓的策略也可能接近 100%）。对齐「平均开仓占用」意味着本金放大 2~5 倍；
-    对齐「峰值占用」时倍数还可能更高（持仓期间价格涨上去，保证金跟着涨）。
-    所以这两个口径要配着「本金合计 / 总资金」的告警一起看，默认用 `principal`。
+    `knob` 决定这个倍数**记在哪个参数上**（见 `KNOBS`）：
+
+        k = 目标占用 ÷ 实测占用            # 总共要放大/缩小多少
+        平均占用 ≈ 本金 × 占用百分比 × 保证金率 × 仓位节奏
+
+    - `split`（默认）：先把本金归位到「分到的那份」（`本金合计 = 总资金`，
+      钱包不膨胀），剩下的差异交给占用百分比。两边的幅度都不极端。
+    - `principal`：占用百分比不动，全压在**本金**上。占用能对准，但本金会
+      放大 2~8 倍 —— 这时「本金合计 / 总资金」那一栏会报警。
+    - `pct`：本金不动，全压在**占用百分比**上。适合「本金就是账户真实规模、
+      不能动」的场景；百分比顶到 `pct_cap` 之后剩下的才转到本金。
+
+    🔴 三种拆法给出**同一个占用**，区别只在本金和百分比怎么分。所以预览表里
+    必须同时列出「本金(前→后)」和「占用%(前→后)」，否则用户只看到本金没变，
+    会以为没生效 —— 而实际是百分比从 30% 变成了 90%。
+
+    🔴 只有 `sizing="capital"` 的策略，占用百分比才有意义。`risk` 用的是
+    `risk_pct`、`fixed` 用的 `volume`、`unit` 用的是本金 —— 对这几种，`knob`
+    自动退回「只调本金」，并在 `note` 里写明，绝不假装调过百分比。
 
     `max_scale=None` 表示**不封顶**：封顶会把几条策略压成同一个倍数，
     权重差异全被抹掉（实测 4 条策略里 3 条撞 20 倍上限，风险平价和等权
     看起来一模一样），比不封顶更容易误导人。
 
-    缩放是精确的，不用迭代：四种仓位口径的手数都只跟 `principal` 成正比
-    （`fixed` 除外，它在 `Usage.scalable` 里已经标掉）。
+    缩放是精确的，不用迭代：`capital` / `risk` / `unit` 的手数都只跟
+    `principal`（和百分比）成正比，`fixed` 除外（它在 `Usage.scalable` 里标掉）。
     """
     n = len(usages)
     out: list[Share] = []
@@ -294,12 +337,18 @@ def allocate(usages: list[Usage], total: float, mode: str = "equal",
     b = str(basis or "principal").lower()
     if b not in BASES:
         b = "principal"
+    kn = str(knob or "split").lower()
+    if kn not in KNOBS:
+        kn = "split"
+    cap = max(1.0, float(pct_cap or PCT_CAP))
     w = weights(mode, usages, rets, manual)
     for u, wi in zip(usages, w):
         s = Share(sid=u.sid, name=u.name, weight=float(wi),
                   target=float(total) * float(wi),
-                  avg_margin=u.avg_margin,
-                  old_principal=u.principal or u.capital or 0.0)
+                  avg_margin=u.avg_margin, peak_margin=u.peak_margin,
+                  old_principal=u.principal or u.capital or 0.0,
+                  old_pct=float(u.capital_pct or 0.0),
+                  new_pct=float(u.capital_pct or 0.0))
         if b == "principal":
             s.new_principal = s.target
             s.scale = (s.target / s.old_principal) if s.old_principal > 0 else 0.0
@@ -323,21 +372,78 @@ def allocate(usages: list[Usage], total: float, mode: str = "equal",
             s.est_avg = u.avg_margin * s.scale
             s.note = "没有实测占用，按分配额直接设"
         else:
-            s.scale = s.target / measured
-            if max_scale is not None and s.scale > float(max_scale):
+            k = s.target / measured
+            if max_scale is not None and k > float(max_scale):
                 s.note = f"缩放封顶 {float(max_scale):g} 倍"
-                s.scale = float(max_scale)
-            s.new_principal = u.principal * s.scale
-            s.est_avg = u.avg_margin * s.scale
+                k = float(max_scale)
+            s.scale = k
+            kprin, kpct = _split_scale(u, s, k, kn, cap)
+            s.new_principal = u.principal * kprin
+            if abs(kpct - 1.0) > 1e-12 and abs(u.capital_pct) > 0:
+                s.new_pct = min(u.capital_pct * kpct, cap)
+                if kpct > 1.0 and u.capital_pct * kpct > cap + 1e-9:
+                    s.note = ((s.note + "；") if s.note else "") + \
+                        f"占用百分比顶到 {cap:g}%，余下的落在本金"
+            # 预计值必须按**同一口径**给：按峰值校准就要报预计峰值，拿平均值
+            # 去和峰值目标比，永远差 40%，看着像没调准
+            s.est_avg = measured * kprin * kpct
         out.append(s)
     return out
+
+
+def _split_scale(u: Usage, s: Share, k: float, knob: str,
+                 cap: float) -> tuple[float, float]:
+    """把总缩放 `k` 拆成（本金系数, 百分比系数），两者相乘等于 `k`。
+
+    - `principal`：全给本金
+    - `pct`：先全给百分比，顶到 `cap` 之后剩下的转本金
+    - `split`：本金先归位到目标额，剩下的给百分比，百分比再顶就还给本金
+
+    🔴 非 `capital` 口径一律 `(k, 1)`：那几种的手数压根不看 `capital_pct`，
+    硬拆给百分比会算出一个「看起来调过、实际没动」的结果。
+    """
+    pct = float(u.capital_pct or 0.0)
+    if knob == "principal" or pct <= 0 or not _pct_effective(u.sizing):
+        return k, 1.0
+    room = max(1.0, cap / pct)               # 百分比还最多能放大几倍
+    if knob == "pct":
+        kpct = min(k, room)
+        return k / kpct, kpct
+    # split：本金归位到目标额（s.target），百分比承担剩余
+    base = float(s.old_principal or 0.0)
+    if base <= 0:
+        return k, 1.0
+    kprin = float(s.target) / base           # 本金先对准「分到的钱」
+    if kprin <= 0:
+        return k, 1.0
+    kpct = k / kprin
+    if kpct > room:                          # 百分比顶住，剩下的还给本金
+        kpct = room
+        kprin = k / kpct
+    if kpct < 1e-9:
+        return k, 1.0
+    return kprin, kpct
+
+
+def _pct_effective(sizing: str) -> bool:
+    """`capital_pct` 对这个仓位口径有没有用（只有 `capital` 有用）。"""
+    return str(sizing or "capital").lower() == "capital"
 
 
 def apply_shares(items: list, shares: list[Share]) -> list:
     """按分配结果生成新配置（**不改原对象，也不落盘**）。
 
-    只动 `principal`：`capital_pct` / `risk_pct` / `sizing` 是策略自己的仓位
-    决定方式，组合不该覆盖 —— 一覆盖就变成「组合改了策略的性格」。
+    写回两样东西：`principal` 和 `capital_pct`。
+
+    🔴 以前这里只写 `principal`，理由是「`capital_pct` 是策略自己的仓位性格，
+    组合不该覆盖」。这个说法在 `basis="principal"` 下成立，但一旦按**实际占用**
+    校准就不成立了：占用 ≈ 本金 × 百分比 × 保证金率，只动本金意味着为了让
+    「30% 仓位」的策略压满分到的钱，本金得放大 3 倍以上 —— 钱包凭空膨胀，
+    「本金合计 = 总资金」这条基本约定就破了。所以百分比也要参与。
+
+    到底调哪个、各调多少，由 `allocate(knob=...)` 决定，这里只负责照写；
+    并且**只在 `sizing="capital"` 时才写百分比** —— 其余口径手数不看它，
+    写进去只会让配置看起来变了而手数没变。
     """
     bysid = {s.sid: s for s in shares}
     out = []
@@ -348,23 +454,30 @@ def apply_shares(items: list, shares: list[Share]) -> list:
             continue
         n = c.clone() if hasattr(c, "clone") else c
         n.principal = round(float(s.new_principal), 2)
+        if (_pct_effective(getattr(c, "sizing", "capital"))
+                and float(s.new_pct or 0) > 0
+                and abs(float(s.new_pct) - float(getattr(c, "capital_pct", 0) or 0)) > 1e-9):
+            n.capital_pct = round(min(float(s.new_pct), PCT_CAP), 4)
         out.append(n)
     return out
 
 
 def summarize(shares: list[Share]) -> pd.DataFrame:
-    """给界面用的表：权重 / 目标 / 实测占用 / 缩放 / 本金前后。"""
+    """给界面用的表：权重 / 目标 / 实测占用 / 缩放 / 本金前后 / 占用% 前后。"""
     rows = []
     for s in shares:
         rows.append({
             "策略": s.name,
             "权重": s.weight,
-            "目标平均占用": s.target,
+            "目标占用": s.target,
             "实测平均占用": s.avg_margin,
+            "实测峰值占用": s.peak_margin,
             "缩放": s.scale,
             "本金(前)": s.old_principal,
             "本金(后)": s.new_principal,
-            "预计平均占用": s.est_avg,
+            "占用%(前)": s.old_pct,
+            "占用%(后)": s.new_pct,
+            "预计占用": s.est_avg,
             "说明": s.note,
         })
     return pd.DataFrame(rows)

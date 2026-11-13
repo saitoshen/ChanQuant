@@ -59,6 +59,7 @@ class WorkspaceBar(QWidget):
     total_changed = Signal(float)
     mode_changed = Signal(str)
     basis_changed = Signal(str)
+    knob_changed = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -138,6 +139,26 @@ class WorkspaceBar(QWidget):
             lambda _i: self.basis_changed.emit(str(self.cb_basis.currentData() or "principal")))
         lay.addWidget(self.cb_basis)
 
+        # 校准倍数记在哪个参数上。和「校准」一格一体两面：
+        #   「校准」决定**调到多少**，「调整方式」决定**记在哪个旋钮上**。
+        lay.addWidget(QLabel("调整"))
+        self.cb_knob = QComboBox()
+        for k, v in PL.KNOBS.items():
+            self.cb_knob.addItem(v, k)
+        self.cb_knob.setToolTip(
+            "「校准」算出要放大几倍之后，这个倍数记在哪个参数上。\n\n"
+            "占用 ≈ 本金 × 占用百分比 × 保证金率，两个旋钮相乘 —— 同样的占用\n"
+            "有无数种拆法，区别只在本金会不会膨胀：\n\n"
+            "本金归位＋占用百分比补（推荐）：先把本金设成「分到的那份」，\n"
+            "　使本金合计 = 总资金，剩下的差异交给占用百分比。\n"
+            "只调本金：百分比不动，本金放大 2~8 倍。本金合计会远超总资金。\n"
+            "只调占用百分比：本金不动，百分比放大（上限 500%），顶住之后余下转本金。\n\n"
+            "只有「按资金分配」的策略，占用百分比才有意义。按止损金额（用 risk_pct）、\n"
+            "固定手数（用 volume）、按本金全额 这几种会自动退回「只调本金」。")
+        self.cb_knob.currentIndexChanged.connect(
+            lambda _i: self.knob_changed.emit(str(self.cb_knob.currentData() or "split")))
+        lay.addWidget(self.cb_knob)
+
         self.btn_measure = QPushButton("量一下占用")
         self.btn_measure.setObjectName("Ghost")
         self.btn_measure.setToolTip(
@@ -173,12 +194,14 @@ class WorkspaceBar(QWidget):
         finally:
             self.tabs.blockSignals(False)
 
-    def set_state(self, total: float, mode: str, basis: str) -> None:
+    def set_state(self, total: float, mode: str, basis: str,
+                  knob: str = "split") -> None:
         for w, v in ((self.sp_total, float(total or 0) / 10000.0),):
             w.blockSignals(True)
             w.setValue(v)
             w.blockSignals(False)
-        for cb, val in ((self.cb_mode, mode), (self.cb_basis, basis)):
+        for cb, val in ((self.cb_mode, mode), (self.cb_basis, basis),
+                        (self.cb_knob, knob)):
             cb.blockSignals(True)
             i = cb.findData(val)
             cb.setCurrentIndex(i if i >= 0 else 0)
@@ -199,10 +222,10 @@ class AllocDialog(QDialog):
     """
 
     def __init__(self, shares: list, total: float, basis: str = "principal",
-                 measured: bool = False, parent=None) -> None:
+                 measured: bool = False, parent=None, knob: str = "split") -> None:
         super().__init__(parent)
         self.setWindowTitle("资金分配预览")
-        self.resize(1000, 520)
+        self.resize(1180, 540)
         self.shares = list(shares)
 
         lay = QVBoxLayout(self)
@@ -211,12 +234,15 @@ class AllocDialog(QDialog):
 
         head = QLabel(
             f"总资金 {total / 10000:,.1f} 万　·　{PL.BASES.get(basis, basis)}"
-            f"　·　{len(self.shares)} 条策略")
+            f"　·　{PL.KNOBS.get(knob, knob)}　·　{len(self.shares)} 条策略")
         head.setStyleSheet("font-size: 13px; font-weight: 600; color: #0f172a;")
         lay.addWidget(head)
 
-        cols = ["策略", "权重", "目标平均占用", "实测平均占用", "缩放",
-                "本金(前)", "本金(后)", "预计平均占用", "说明"]
+        # 「占用%(前/后)」两列不能省：`knob` 调到 pct / split 时，本金可能
+        # 一动没动，全部变化都在百分比上 —— 只列本金会让人以为「没生效」
+        cols = ["策略", "权重", "目标占用", "实测平均", "实测峰值", "缩放",
+                "本金(前)", "本金(后)", "占用%(前)", "占用%(后)",
+                "预计占用", "说明"]
         t = QTableWidget(len(self.shares), len(cols))
         t.setHorizontalHeaderLabels(cols)
         t.verticalHeader().setVisible(False)
@@ -225,19 +251,22 @@ class AllocDialog(QDialog):
         h = t.horizontalHeader()
         for i in range(len(cols)):
             h.setSectionResizeMode(
-                i, QHeaderView.Stretch if i in (0, 8) else QHeaderView.ResizeToContents)
+                i, QHeaderView.Stretch if i in (0, 11) else QHeaderView.ResizeToContents)
         for i, s in enumerate(self.shares):
             vals = [
                 s.name, f"{s.weight * 100:.1f}%",
                 f"{s.target:,.0f}", f"{s.avg_margin:,.0f}",
-                f"{s.scale:.2f}x", f"{s.old_principal:,.0f}",
-                f"{s.new_principal:,.0f}", f"{s.est_avg:,.0f}", s.note,
+                f"{s.peak_margin:,.0f}", f"{s.scale:.2f}x", f"{s.old_principal:,.0f}",
+                f"{s.new_principal:,.0f}",
+                f"{s.old_pct:.0f}%" if s.old_pct else "—",
+                f"{s.new_pct:.0f}%" if s.new_pct else "—",
+                f"{s.est_avg:,.0f}", s.note,
             ]
             for j, v in enumerate(vals):
                 it = QTableWidgetItem(v)
-                if j in (1, 2, 3, 4, 5, 6, 7):
+                if j in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
                     it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if j == 8 and s.note:
+                if j == 11 and s.note:
                     it.setForeground(Qt.GlobalColor.darkYellow)
                 t.setItem(i, j, it)
         lay.addWidget(t, 1)

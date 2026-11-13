@@ -137,6 +137,48 @@ class UpdateWorker(QObject):
         self.done.emit(res)
 
 
+class MacroWorker(QObject):
+    """后台线程里跑 `ttrade.macro.update()`。
+
+    单独一个 worker 而不是塞进 `TqWorker`：宏观走 Tushare + 东方财富，
+    **和天勤账户毫无关系**。塞进 TqWorker 会有两个副作用 —— 免费账户被
+    `free_mode` 分支带着走一遍、A 股市场下整张卡被藏起来就再也点不到。
+    三个市场（美股 / 期货 / A 股）的宏观完全一样，做成页面级的独立入口。
+
+    打包后的 exe 里没有 .py 文件，`python download_macro.py` 那条命令行走不通，
+    这里是成品里唯一的更新入口。
+    """
+
+    progress = Signal(int, int, str)
+    done = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, full: bool = False, only: list[str] | None = None) -> None:
+        super().__init__()
+        self.full = full
+        self.only = only
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        try:
+            from ttrade import macro as MAC
+
+            self.progress.emit(0, 0, "宏观因子：读取本地库…")
+            st = MAC.update(
+                codes=self.only,
+                incremental=not self.full,
+                progress=lambda a, b, m: self.progress.emit(a, b, m),
+                cancel=lambda: self._cancel,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.done.emit(st)
+
+
 class TqWorker(QObject):
     """在后台线程里跑天勤补行情。
 
@@ -581,6 +623,8 @@ class DataPage(QWidget):
         self._upd_thread: QThread | None = None
         self._tq_worker: TqWorker | None = None
         self._tq_thread: QThread | None = None
+        self._macro_worker: MacroWorker | None = None
+        self._macro_thread: QThread | None = None
         self._auto_run = False          # 这一轮是不是定时任务起的（决定弹不弹窗）
         self._auto_last: dict[str, str] = {}   # 每条日程上次跑的日期（YYYY-MM-DD）
         self._auto_queue: list[str] = []       # 定时任务还要跑的市场
@@ -625,7 +669,8 @@ class DataPage(QWidget):
         self._log(f"—— 市场切到{info.get('label', market)}")
 
     def busy(self) -> bool:
-        return self._upd_thread is not None or self._tq_thread is not None
+        return (self._upd_thread is not None or self._tq_thread is not None
+                or self._macro_thread is not None)
 
     # ---- 构建 ----
 
@@ -669,6 +714,9 @@ class DataPage(QWidget):
         # 数据源卡是藏起来的 —— 凭据要是跟着数据源卡一起藏，下 A 股的时候
         # 就找不到「配置 Tushare token」了，而那正是它最需要的场景。
         outer.addWidget(self._build_cred_bar())
+        # 宏观因子也是全市场共用的一条独立链路（Tushare + 东方财富），
+        # 和凭据横条同理：放在页级而不是塞进某张卡，三个市场下都点得到。
+        outer.addWidget(self._build_macro_bar())
 
         body = QHBoxLayout()
         body.setSpacing(12)
@@ -750,6 +798,120 @@ class DataPage(QWidget):
 
         self._sync_cred_labels()
         return bar
+
+    def _build_macro_bar(self) -> QWidget:
+        """宏观因子横条：状态 + 更新按钮。
+
+        `macro_<code>` 这类因子（美元指数、USDCNH、SHIBOR、美债、CPI…）在策略里
+        是按「发布日」对齐的日频数据。它跟三个市场都有关，跟天勤账户无关，
+        所以做成页级入口：任何市场下都在，也不受免费账户影响。
+
+        状态文字里必须带**序列条数 / 起止 / 上次更新**：这三样是判断「宏观因子
+        为什么是空」的第一现场。给策略加宏观因子后信号没变化，八成是库里没数据。
+        """
+        bar = QFrame()
+        bar.setObjectName("Card")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(10)
+
+        title = QLabel("宏观因子")
+        title.setObjectName("SectionTitle")
+        lay.addWidget(title)
+
+        self.lbl_macro_stats = QLabel("")
+        self.lbl_macro_stats.setObjectName("Hint")
+        self.lbl_macro_stats.setWordWrap(True)
+        self.lbl_macro_stats.setToolTip(
+            "23 条宏观序列，写 data_tq/edb.duckdb 的 macro_series 表。\n\n"
+            "数据源：Tushare（SHIBOR / 美债收益率 / 外汇 / 全球指数 / CPI·PPI·M / 社融 / GDP）\n"
+            "＋ 东方财富（制造业 PMI）；美元指数按 ICE 官方公式用六种货币合成。\n"
+            "**LPR 1 年 / 5 年没有数据源**（中国货币网接口已下线），只保留定义，不造假数据。\n\n"
+            "频率：日频 15 条、月频 7 条、季频 1 条。日频每交易日盘后更新一次即可，\n"
+            "月频/季频在公布日更新。增量会从库里最后一天往前推 400 天重抓，\n"
+            "覆盖 GDP 初值/终值、社融这类会被修订的指标。\n\n"
+            "**不会用到未来数据**：入库时间 = 发布日，因子层再滞后 1 个日历日，\n"
+            "5m / 1h 当天所有 bar 只能看到 T-1 及更早的宏观值。"
+        )
+        lay.addWidget(self.lbl_macro_stats, 1)
+
+        self.btn_macro = QPushButton("更新宏观因子")
+        self.btn_macro.setToolTip(
+            "抓全部 23 条序列（增量）。全量约 6.8 万行、3 MB，第一次十几秒。\n"
+            "已经是增量：只补库里最后一天之后的部分，并回看 400 天覆盖修订。"
+        )
+        self.btn_macro.clicked.connect(self._start_macro)
+        lay.addWidget(self.btn_macro)
+
+        self._refresh_macro_stats()
+        return bar
+
+    def _refresh_macro_stats(self) -> None:
+        if not hasattr(self, "lbl_macro_stats"):
+            return
+        try:
+            from ttrade import macro as MAC
+
+            st = MAC.stats()
+            if not st.get("exists") or not st.get("codes"):
+                self.lbl_macro_stats.setText(
+                    "本地还没有宏观数据 —— 点右边「更新宏观因子」补一遍（十几秒）")
+                return
+            last_up = MAC.last_update_text() if hasattr(MAC, "last_update_text") else ""
+            self.lbl_macro_stats.setText(
+                f"{st['codes']} 条序列 · {st['rows']:,} 行 · "
+                f"{st['first']} → {st['last']}"
+                + (f" · 上次更新 {last_up}" if last_up else "")
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.lbl_macro_stats.setText(f"读取失败：{type(exc).__name__}: {exc}")
+
+    def _start_macro(self) -> None:
+        if self.busy():
+            self._log("还有任务在跑，先等它结束或点「取消」")
+            return
+        self._macro_worker = MacroWorker()
+        self._macro_thread = QThread(self)
+        self._macro_worker.moveToThread(self._macro_thread)
+        self._macro_thread.started.connect(self._macro_worker.run)
+        self._macro_worker.progress.connect(self._on_progress)
+        self._macro_worker.done.connect(self._on_macro_done)
+        self._macro_worker.failed.connect(self._on_update_failed)
+        self._macro_worker.done.connect(self._macro_thread.quit)
+        self._macro_worker.failed.connect(self._macro_thread.quit)
+        self._macro_thread.finished.connect(self._on_thread_done)
+
+        self.prog_update.setRange(0, 0)
+        self.prog_update.setVisible(True)
+        self.lbl_upd.setVisible(True)
+        self.lbl_upd.setText("准备更新宏观因子…")
+        self.btn_macro.setEnabled(False)
+        self._log("—— 更新宏观因子（23 条序列，Tushare + 东方财富）")
+        self._macro_thread.start()
+
+    def _on_macro_done(self, st: dict) -> None:
+        self.btn_macro.setEnabled(True)
+        rows = int(st.get("rows") or 0)
+        ok = int(st.get("ok") or 0)
+        codes = int(st.get("codes") or 0)
+        detail = st.get("detail") or {}
+        # `empty` / `failed` 是**计数**，具体是哪几条在 `detail` 里。按计数拼字符串
+        # 会在 `"、".join(int)` 上崩掉，所以这里一律从 detail 里挑 code。
+        empty = [c for c, v in detail.items() if v == "无数据"]
+        bad = [c for c, v in detail.items() if str(v).startswith("失败")]
+
+        text = f"宏观因子完成：{ok}/{codes} 条序列，写入 {rows:,} 行"
+        if empty:
+            # LPR 两条本来就没有源（中国货币网接口已下线）。点名比让用户猜
+            # 「为什么只有 21 条」好得多，也顺便说明这里不造假数据。
+            text += "；无数据源：" + "、".join(empty)
+        if bad:
+            text += "；抓取失败：" + "、".join(bad)
+        if not rows and ok:
+            text += "（增量：库里已是最新，没有新日期）"
+        self.lbl_upd.setText(text)
+        self._log(text)
+        self._refresh_macro_stats()
 
     def _build_form(self) -> QWidget:
         card = QFrame()
@@ -836,6 +998,7 @@ class DataPage(QWidget):
             "日子，要按日对齐在读取时做。"
         )
         lay.addWidget(self.chk_tq_edb)
+
 
         # 期权。5m 只有中金所三个股指期权（IO/MO/HO）—— 商品期权 5m 十年
         # 是几百 GB，而 5m 期权的用途只有股指日内，没必要全下。
@@ -975,7 +1138,11 @@ class DataPage(QWidget):
         self.btn_cost.clicked.connect(self._open_cost_dialog)
         row_cost.addWidget(self.btn_cost)
         self.btn_sym = QPushButton("品种信息…")
-        self.btn_sym.setToolTip("最小跳动、合约乘数、保证金率、手续费、交易时段")
+        self.btn_sym.setToolTip(
+            "最小跳动、合约乘数、保证金率、手续费、交易时段 —— **回测口径**。\n\n"
+            "乘数与保证金率只影响回测；实盘以天勤合约上的实时值为准\n"
+            "（quote.volume_multiple / quote.margin），这里填什么都不会改变实盘手数。\n"
+            "实盘运行后会把看到的真实值自动回写进来，让回测对齐；手填过的格子不被覆盖。")
         self.btn_sym.clicked.connect(self._open_symbol_dialog)
         row_cost.addWidget(self.btn_sym)
         lay.addLayout(row_cost)
@@ -1845,12 +2012,12 @@ class DataPage(QWidget):
             QMessageBox.warning(self, "数据更新失败", message)
 
     def _on_thread_done(self) -> None:
-        for attr in ("_upd_thread", "_tq_thread"):
+        for attr in ("_upd_thread", "_tq_thread", "_macro_thread"):
             t = getattr(self, attr)
             if t is not None:
                 t.deleteLater()
                 setattr(self, attr, None)
-        for attr in ("_upd_worker", "_tq_worker"):
+        for attr in ("_upd_worker", "_tq_worker", "_macro_worker"):
             w = getattr(self, attr)
             if w is not None:
                 w.deleteLater()
@@ -1862,6 +2029,8 @@ class DataPage(QWidget):
             return
         self.btn_update.setText("开始补充")
         self.btn_update.setEnabled(True)
+        if hasattr(self, "btn_macro"):
+            self.btn_macro.setEnabled(True)
         self.prog_update.setVisible(False)
         if hasattr(self, "btn_stock_run"):
             self.btn_stock_run.setEnabled(True)

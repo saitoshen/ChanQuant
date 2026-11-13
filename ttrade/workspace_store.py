@@ -67,6 +67,8 @@ class Workspace:
     total: float = 0.0
     mode: str = "equal"          # equal / risk / manual
     basis: str = "principal"     # principal / usage / peak
+    # 校准倍数记在哪个参数上：split / principal / pct（见 PL.KNOBS）
+    knob: str = "split"
     manual: dict = field(default_factory=dict)     # sid -> 金额（mode=manual）
     members: list = field(default_factory=list)    # [Member]
     account: str = ""            # 建议的账户（空 = 不指定）
@@ -122,7 +124,7 @@ class Workspace:
     def to_dict(self) -> dict:
         return {
             "id": self.id, "name": self.name, "total": float(self.total),
-            "mode": self.mode, "basis": self.basis,
+            "mode": self.mode, "basis": self.basis, "knob": self.knob,
             "manual": {k: float(v) for k, v in (self.manual or {}).items()},
             "members": [m.to_dict() for m in self.members],
             "account": self.account, "note": self.note, "created": self.created,
@@ -137,6 +139,7 @@ class Workspace:
             total=float(d.get("total") or 0.0),
             mode=str(d.get("mode") or "equal"),
             basis=str(d.get("basis") or "principal"),
+            knob=str(d.get("knob") or "split"),
             manual=dict(d.get("manual") or {}),
             account=str(d.get("account") or ""),
             note=str(d.get("note") or ""),
@@ -273,11 +276,13 @@ def allocate_workspace(ws: Workspace, pool: list,
                          sizing=str(getattr(c, "sizing", "") or "capital"),
                          principal=float(getattr(c, "principal", 0) or 0),
                          capital=float(getattr(c, "capital", 0) or 0),
+                         capital_pct=float(getattr(c, "capital_pct", 0) or 0),
                          note="没有回测实测")
         us.append(u)
     basis = ws.basis if (basis_ok(ws.basis) and usages) else "principal"
     return PL.allocate(us, total, ws.mode,
-                       manual=ws.manual or None, basis=basis)
+                       manual=ws.manual or None, basis=basis,
+                       knob=str(getattr(ws, "knob", "") or "split"))
 
 
 def basis_ok(basis: str) -> bool:

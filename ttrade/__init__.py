@@ -4,4 +4,4 @@
 会校验（见 `.github/workflows/build.yml` 的「校验版本号与 tag 一致」）。
 """
 
-__version__ = "3.5.2"
+__version__ = "3.6.0"

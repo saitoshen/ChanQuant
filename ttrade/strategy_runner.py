@@ -1586,7 +1586,17 @@ class PortfolioRunner:
 
     @staticmethod
     def _margin_per_lot(q, price: float, mult: float, symbol: str) -> float:
-        """每手保证金。优先用交易所给的 `quote.margin`，没有才按乘数 × 保证金率估。"""
+        """每手保证金。**实盘一律以交易所给的 `quote.margin` 为准。**
+
+        拿不到（断线、非交易时段、模拟环境没推这个字段）才按乘数 × 类别默认
+        保证金率估一个，只为「别算出 0 手」。兜底**故意不读「数据管理 → 品种
+        信息」里那张表**：那张表是回测口径（用户为了对历史回测填的，可能还带
+        经纪商加收），拿它决定实盘下几手，等于让回测设置去改真实仓位 ——
+        仓位错方向的代价远大于「兜底率差 1 个百分点」。
+
+        两边不一致是**必然且合理**的：回测要可复现（用固定参数），实盘要跟
+        交易所走（保证金天天随结算价变）。界面上的那张表因此只对回测生效。
+        """
         m = float(getattr(q, "margin", 0) or 0) if q is not None else 0.0
         if m > 0 and math.isfinite(m):
             return m
@@ -1612,6 +1622,13 @@ class PortfolioRunner:
         - `risk`：手数 = 本金 × 止损比例 / (止损距离 × 合约乘数)。止损距离 =
           倍数 × ATR，和策略自己的止损口径一致，所以「打止损就亏 1% 本金」
           是真的 1%。
+        - `budget`：「按分配资金定手数」，手数 = 分配资金 ÷ **名义价值**
+          （价格 × 乘数），四舍五入且最少 1 手。网格策略用这个口径（股指一手
+          名义就 80~120 万，按保证金算会算出 0 手），回测里一直是这么算的 ——
+          实盘以前漏了这一支，会掉进 `capital` 分支，两边手数差一个保证金率
+          的倒数。
+        - `unit`：名义敞口 = 本金（`principal`，不是分配资金）。实盘只能整手，
+          所以四舍五入取整并保底 1 手；回测里它可以是小数。
         - `fixed`：老行为，固定手数。
         """
         cfg = st.cfg
@@ -1630,6 +1647,20 @@ class PortfolioRunner:
             return max(1, int(float(cfg.risk_amount or 0) / per_lot))
 
         per_margin = self._margin_per_lot(q, price, mult, cfg.symbol)
+
+        if mode == "budget":
+            # 名义口径：和 `backtest.size_lots` 的 budget 分支逐字对齐
+            per = price * mult
+            if per <= 0:
+                return 1
+            budget = float(cfg.capital or 0) or float(cfg.principal or 0)
+            return max(1, int(round(budget / per)))
+        if mode == "unit":
+            per = price * mult
+            if per <= 0:
+                return 1
+            return max(1, int(round(float(cfg.principal or 0) / per)))
+
         if per_margin <= 0:
             return 1
         return max(1, int(float(cfg.capital or 0) / per_margin))

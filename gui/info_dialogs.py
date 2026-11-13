@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -126,6 +127,44 @@ class CostDialog(QDialog):
         self.accept()
 
 
+class _SymSyncWorker(QObject):
+    """后台连天勤取真实合约参数（乘数 / 保证金率）并写进品种信息表。
+
+    为什么后台：78~87 个品种要先订阅主连、再等第一帧行情，实测几十秒。
+    同步跑会把整个窗口卡住，连「取消」都点不动。
+
+    为什么自建天勤会话：数据管理页那条补行情的会话是按需建的，弹这个框的
+    时候未必在。`tqfetch.Session` 有连接复用和退出清理，自己建一份比借来借去
+    安全 —— 借的那份随时可能被上层 reset。
+    """
+
+    progress = Signal(int, int, str)
+    done = Signal(object)          # (统计 dict, 取到的行)
+    failed = Signal(str)
+
+    def __init__(self, pairs: list) -> None:
+        super().__init__()
+        self.pairs = list(pairs or [])
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        try:
+            from ttrade import symsync as SYNC
+
+            st = SYNC.refresh(
+                self.pairs,
+                progress=lambda a, b, m: self.progress.emit(a, b, m),
+                cancel=lambda: self._cancel,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+        self.done.emit(st)
+
+
 class SymbolInfoDialog(QDialog):
     """品种基本信息：tick、乘数、保证金率、手续费、交易时段。
 
@@ -148,8 +187,15 @@ class SymbolInfoDialog(QDialog):
         tip = QLabel(
             "手续费填两列之一：按成交额比例（‱，万分之几）或按手固定（元/手）。"
             "两列都填时**按手**优先，和回测引擎的判定一致。\n"
-            "留空的格子继续吃默认值；「恢复默认」只清当前选中的那几行。"
-        )
+            "留空的格子继续吃默认值；「恢复默认」只清当前选中的那几行。\n\n"
+            "⚠ 乘数与保证金率是**回测口径**：它们决定策略研究页和组合页回测下几手。\n"
+            "实盘下几手**不用这张表**，一律读天勤合约上的实时值"
+            "（`quote.volume_multiple` / `quote.margin`）—— 保证金随结算价和交割月\n"
+            "天天变，用静态表去下真实仓位会让实际杠杆和设定不符。\n"
+            "　　要让「查看回测 / 量占用」和实盘对得上，点右边「从天勤刷新」：它用实盘\n"
+            "同一套字段、同一份合约（主连的 underlying）把**乘数 / 最小跳动 / 保证金率**\n"
+            "三个数刷成此刻的真实值。手续费**只提示不自动写** —— 天勤报的是「每手合计」\n"
+            "且带经纪商加收，回测是「单边各收一次」，两边口径不同，自动写会把成本改歪。")
         tip.setStyleSheet(_HINT)
         tip.setWordWrap(True)
         lay.addWidget(tip)
@@ -168,6 +214,30 @@ class SymbolInfoDialog(QDialog):
         btn_def = QPushButton("恢复默认（选中行）")
         btn_def.clicked.connect(self._reset_rows)
         row.addWidget(btn_def)
+
+        # 「一键对齐实盘」：实盘下几手用的是天勤合约上的实时乘数/保证金率，
+        # 这张表只喂回测。表一旦过期，组合页「查看回测」的手数就和实盘对不上，
+        # 所以给一个显式按钮把表刷成「此刻的真实值」。
+        self.btn_sync = QPushButton("从天勤刷新（乘数 / 跳动 / 保证金率）")
+        self.btn_sync.setToolTip(
+            "连天勤，逐个品种取**主连 underlying 合约**的真实参数，写进这张表：\n\n"
+            "  乘数       ← quote.volume_multiple\n"
+            "  保证金率   ← quote.margin ÷ (最新价 × 乘数)\n\n"
+            "和实盘下几手用的是同一套字段、同一份合约（实盘也走 main_symbol 订主连），\n"
+            "刷完之后组合页「查看回测」和量占用得到的手数就与实盘一致。\n\n"
+            "只写差异超过 2% 的项（保证金随结算价天天微调，全表重写没意义）。\n"
+            "**会覆盖手填值** —— 这是你主动点的，按真实值来。\n\n"
+            "⚠ 交易所只报「每手多少元」，历史逐日的保证金率拿不到，所以这是\n"
+            "「此刻的值」。回测拿它跑全历史，等于假设保证金率不变。")
+        self.btn_sync.clicked.connect(self._sync_from_tq)
+        row.addWidget(self.btn_sync)
+
+        self.prog_sync = QProgressBar()
+        self.prog_sync.setVisible(False)
+        self.prog_sync.setMinimumWidth(160)
+        self.prog_sync.setTextVisible(False)
+        row.addWidget(self.prog_sync)
+
         row.addStretch(1)
         self.lbl = QLabel("")
         self.lbl.setStyleSheet(_HINT)
@@ -282,6 +352,85 @@ class SymbolInfoDialog(QDialog):
             symbols_info.reset_override(it.get("symbol", ""), it.get("exchange", ""))
         self._fill()
         self.lbl.setText(f"已恢复 {len(rows)} 行")
+
+    # ---- 从天勤刷新 ----
+
+    def _sync_from_tq(self) -> None:
+        if not self._items:
+            self.lbl.setText("没有品种可刷新")
+            return
+        if getattr(self, "_sync_thread", None) is not None:
+            return
+        pairs = [(it.get("symbol", ""), it.get("exchange", "")) for it in self._items
+                 if it.get("symbol")]
+        self._sync_worker = _SymSyncWorker(pairs)
+        self._sync_thread = QThread(self)
+        self._sync_worker.moveToThread(self._sync_thread)
+        self._sync_thread.started.connect(self._sync_worker.run)
+        self._sync_worker.progress.connect(self._on_sync_progress)
+        self._sync_worker.done.connect(self._on_sync_done)
+        self._sync_worker.failed.connect(self._on_sync_failed)
+        self._sync_worker.done.connect(self._sync_thread.quit)
+        self._sync_worker.failed.connect(self._sync_thread.quit)
+        self._sync_thread.finished.connect(self._sync_cleanup)
+
+        self.btn_sync.setEnabled(False)
+        self.btn_sync.setText("正在取…")
+        self.prog_sync.setVisible(True)
+        self.prog_sync.setRange(0, 0)
+        self.lbl.setText("连接天勤，逐个品种取实时乘数与保证金率…")
+        self._sync_thread.start()
+
+    def _on_sync_progress(self, done: int, total: int, msg: str) -> None:
+        if total > 0:
+            self.prog_sync.setRange(0, total)
+            self.prog_sync.setValue(done)
+        self.lbl.setText(msg)
+
+    def _on_sync_done(self, st) -> None:
+        st = st or {}
+        self._fill()          # 表里已经写进去了，直接重读
+        n = int(st.get("changed") or 0)
+        same = int(st.get("same") or 0)
+        miss = int(st.get("missing") or 0)
+        errs = list(st.get("errors") or [])
+        hints = list(st.get("fee_hint") or [])
+        text = f"刷新完成：{n} 个品种已更新（乘数 / 最小跳动 / 保证金率）"
+        if same:
+            text += f"，{same} 个与现值一致（保证金率差异 <2%，跳过）"
+        if miss:
+            text += f"，{miss} 个没取到"
+        if errs:
+            # 取不到的必须点名：静默少写几个品种，回测手数就静默不对
+            text += "　没取到：" + "、".join(errs[:4]) + ("…" if len(errs) > 4 else "")
+        if hints:
+            # 手续费故意不自动写（天勤报的是每手合计、不区分平今，回测按单边收），
+            # 但差异必须说出来，否则用户以为刷新只管乘数
+            text += (f"　手续费未改动（口径不同，只提示）："
+                     + "；".join(hints[:3])
+                     + ("…" if len(hints) > 3 else ""))
+        self.lbl.setText(text)
+        self.lbl.setToolTip(text)
+
+    def _on_sync_failed(self, msg: str) -> None:
+        self.lbl.setText(f"刷新失败：{msg}")
+
+    def _sync_cleanup(self) -> None:
+        for attr in ("_sync_thread", "_sync_worker"):
+            o = getattr(self, attr, None)
+            if o is not None:
+                o.deleteLater()
+                setattr(self, attr, None)
+        self.btn_sync.setEnabled(True)
+        self.btn_sync.setText("从天勤刷新（乘数 / 跳动 / 保证金率）")
+        self.prog_sync.setVisible(False)
+
+    def closeEvent(self, ev) -> None:      # noqa: N802 - Qt 命名
+        """关窗时让后台线程收手，别让它在窗口析构之后还发信号。"""
+        w = getattr(self, "_sync_worker", None)
+        if w is not None:
+            w.cancel()
+        super().closeEvent(ev)
 
 
 class RuleParamsDialog(QDialog):

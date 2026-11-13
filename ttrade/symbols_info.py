@@ -108,7 +108,20 @@ _DEFAULT = {
     "fee_mode": "rate",   # rate：按成交额比例；lot：按手固定
     "fee_value": 0.0001,
     "session": S_DAY,
+    # 这两个字段是**来源标记**，不是数值：`"user"` = 在「数据管理 → 品种信息」
+    # 里手工填的；`"live"` = 实盘从天勤 `quote.margin` / `quote.volume_multiple`
+    # 回写的。空 = 吃 `specs` 的默认值。
+    #
+    # 🔴 为什么要记来源：回写是**自动**的（每品种每进程一次），手填是**用户意图**。
+    # 没有标记的话，交易所把保证金从 12% 调到 14%，自动回写就会把用户特意填的
+    # 20%（比如想按加了经纪商加收的口径算）悄悄盖掉 —— 而且不报错，只在下次
+    # 回测时手数变了。有了标记，回写遇到 `user` 就让路。
+    "mult_src": "",
+    "margin_src": "",
 }
+
+# 只允许写"数值"的字段：`*_src` 是字符串，不能被 `float()` 强转
+_NUMERIC = ("tick", "mult", "margin", "fee_value")
 
 
 def session_of(symbol: str, exchange: str) -> str:
@@ -190,19 +203,31 @@ def info(symbol: str, exchange: str) -> dict:
     for k, v in (load_overrides().get(key) or {}).items():
         if k in out:
             try:
-                out[k] = float(v) if k in ("tick", "mult", "margin", "fee_value") else v
+                out[k] = float(v) if k in _NUMERIC else v
             except (TypeError, ValueError):
                 continue
     return out
 
 
-def set_override(symbol: str, exchange: str, **fields) -> None:
+def set_override(symbol: str, exchange: str, manual: bool = True,
+                 **fields) -> None:
+    """写覆盖。`manual=True`（默认）表示**用户在界面上填的**，会给相应字段
+    打上 `*_src="user"` 标记；`manual=False` 是程序自动回写（见
+    `remember_contract`），标记成 `"live"`。
+
+    `src` 只用来在界面上区分「这个数是人手填的」还是「从天勤刷下来的」。
+    **它不阻止任何写入**：刷新是用户主动点的，就该按真实值覆盖；实盘运行
+    时也不会偷偷改这张表（见 `symsync` 的模块说明）。
+    """
     key = f"{symbol}_{exchange}" if exchange else symbol
     d = load_overrides()
     cur = d.get(key) or {}
+    src = "user" if manual else "live"
     for k, v in fields.items():
         if k in _DEFAULT:
             cur[k] = v
+            if k in ("mult", "margin"):
+                cur[f"{k}_src"] = src
     d[key] = cur
     save_overrides(d)
 

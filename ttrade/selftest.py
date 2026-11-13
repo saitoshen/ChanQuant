@@ -2224,12 +2224,68 @@ def _run() -> tuple[bool, list[str]]:
                 raise RuntimeError(
                     f"{s.sid} 按平均占用校准后预计占用 {s.est_avg:.2f} ≠ 目标 {s.target:.2f}")
 
-        # ②c 按峰值占用：对齐的是峰值，平均占用不该等于目标
+        # ②c 按峰值占用：对齐的是**峰值**。`est_avg` 现在是「同口径预计值」
+        #     （按峰值校准就是预计峰值），所以它必须等于目标；而平均占用
+        #     本身不该被拉到目标（那才是按平均口径做的事）
         sh = PL.allocate(us, total, "equal", basis="peak")
-        if abs(sh[0].est_avg - sh[0].target) < 1.0:
-            raise RuntimeError("按峰值口径算出来的却是平均占用对齐")
+        if abs(sh[0].est_avg - sh[0].target) > 1e-6:
+            raise RuntimeError(
+                f"按峰值口径的预计占用 {sh[0].est_avg:.2f} ≠ 目标 {sh[0].target:.2f}")
         if abs(sh[0].scale - (sh[0].target / 20_000.0)) > 1e-9:
             raise RuntimeError("按峰值的缩放系数不对")
+        if sh[0].avg_margin >= sh[0].target:
+            raise RuntimeError("按峰值校准不该把平均占用也拉到目标额")
+
+        # ②d 三个旋钮给出**同一个占用**，区别只在本金 / 占用百分比怎么分
+        got = {}
+        for knob in ("principal", "pct", "split"):
+            got[knob] = PL.allocate(us, total, "equal", basis="usage", knob=knob)
+            for s in got[knob]:
+                if s.sid == "C":
+                    continue
+                if abs(s.est_avg - s.target) > 1e-6:
+                    raise RuntimeError(
+                        f"knob={knob} 的 {s.sid} 预计占用 {s.est_avg:.2f} ≠ 目标 {s.target:.2f}")
+        # 只调本金：本金膨胀、百分比不动
+        if abs(got["principal"][1].new_pct - got["principal"][1].old_pct) > 1e-12:
+            raise RuntimeError("knob=principal 不该改占用百分比")
+        if got["principal"][1].new_principal <= got["principal"][1].old_principal:
+            raise RuntimeError("knob=principal 该把本金放大")
+        # 只调百分比：百分比没顶到上限时本金必须一动不动（顶到了就必然外溢到
+        # 本金 —— 否则占用根本调不到位，那才是真的错）
+        if (abs(got["pct"][1].new_pct - PL.PCT_CAP) > 1e-9
+                and abs(got["pct"][1].new_principal - got["pct"][1].old_principal) > 1e-6):
+            raise RuntimeError("knob=pct 在百分比没顶到上限时改了本金")
+        if got["pct"][1].new_pct <= got["pct"][1].old_pct:
+            raise RuntimeError("knob=pct 该把占用百分比放大")
+        # split：先由百分比承担（本金往目标额上归位），本金膨胀必须**小于**
+        # 纯本金口径。百分比顶到上限时本金仍会超目标 —— 那是数学上躲不掉的，
+        # 因为「占用 = 分配额」等于要求保证金用满
+        sp = [s for s in got["split"] if s.sid != "C"]
+        for s, p in zip(sp, [s for s in got["principal"] if s.sid != "C"]):
+            if s.new_principal > p.new_principal + 1e-6:
+                raise RuntimeError(
+                    f"{s.sid} 的 split 本金 {s.new_principal:,.0f} 比纯本金口径 "
+                    f"{p.new_principal:,.0f} 还大 —— 拆分方向反了")
+        # 百分比顶到上限之后，余下的必须落回本金，否则占用准不了
+        cap_us = [mk("D", 100_000, 500, 40_000, 0.2)]
+        cap_us[0].capital_pct = 5.0
+        sc = PL.allocate(cap_us, 300_000, "equal", basis="usage", knob="pct",
+                         pct_cap=20.0)[0]
+        if sc.new_pct > 20.0 + 1e-9:
+            raise RuntimeError(f"占用百分比超过了上限：{sc.new_pct}")
+        if abs(sc.est_avg - sc.target) > 1e-6:
+            raise RuntimeError("百分比顶到上限后没有把余下的差异转到本金")
+
+        # ②e 非 capital 口径：百分比不该被动（手数压根不看它）
+        for sz in ("risk", "unit"):
+            u = mk("E", 100_000, 1_000, 20_000, 0.2, sizing=sz)
+            u.capital_pct = 30.0
+            e = PL.allocate([u], 300_000, "equal", basis="usage", knob="pct")[0]
+            if abs(e.new_pct - 30.0) > 1e-12:
+                raise RuntimeError(f"sizing={sz} 时不该改占用百分比")
+            if abs(e.est_avg - e.target) > 1e-6:
+                raise RuntimeError(f"sizing={sz} 时本金没把占用校准到位")
 
         # ③ 风险平价：波动大的权重小，且权重和为 1
         w = PL.weights("risk", us)
@@ -2309,13 +2365,44 @@ def _run() -> tuple[bool, list[str]]:
         if abs(float(m2["avg_margin"]) - want) > 1e-9:
             raise RuntimeError(f"加了笔数后平均值应为 {want}，实际 {m2['avg_margin']}")
 
-        # ② 峰值走**逐根**：名义 [0, 2×200×10=4000, 1×300×10=3000, 0]
-        #    → 峰值名义 4000、峰值占用 400
-        for k, want in (("peak_notional", 4000.0), ("peak_margin", 400.0)):
-            if abs(float(m[k]) - want) > 1e-9:
-                raise RuntimeError(f"{k} 应为 {want}，实际 {m[k]}")
-        if float(m["peak_margin"]) < float(m["avg_margin"]):
-            raise RuntimeError("峰值占用小于平均开仓占用")
+        # ② 峰值走**逐根**，而且必须按**真实手数**算。
+        #
+        #    🔴 `position` 只是方向（±1），不是手数。以前的实现拿 `|pos| × 价格 ×
+        #    乘数` 当峰值名义，等于按「1 手」算 —— 手数大于 1 时峰值被系统性
+        #    低估，还会出现「平均占用 > 峰值占用」。这条用例就是钉死这个口径：
+        #    5 手拿着，峰值名义必须是 5×400×10=20000，不是 4000。
+        pos_dir = pd.Series([0.0, 1.0, 1.0, 0.0], index=idx)
+        big = [BT.Trade(entry_date=idx[0], exit_date=idx[3], entry_price=200.0,
+                        exit_price=300.0, ret=0.0, bars=3, lots=5.0)]
+        mb = BT._metrics(eq, pos_dir, big, base=100_000.0,
+                         price=close, mult=10.0, margin_rate=0.1)
+        for k, want in (("peak_notional", 20_000.0), ("peak_margin", 2_000.0)):
+            if abs(float(mb[k]) - want) > 1e-9:
+                raise RuntimeError(
+                    f"{k} 应为 {want}，实际 {mb[k]} —— 峰值没按真实手数算")
+        if float(mb["avg_margin"]) >= float(mb["peak_margin"]):
+            raise RuntimeError("平均开仓占用不该大于等于峰值占用")
+
+        # ②b 多笔重叠时手数要**相加**（多空两边都占保证金），不是取最大
+        two = [BT.Trade(entry_date=idx[0], exit_date=idx[3], entry_price=200.0,
+                        exit_price=300.0, ret=0.0, bars=3, lots=3.0,
+                        direction=1),
+               BT.Trade(entry_date=idx[0], exit_date=idx[3], entry_price=200.0,
+                        exit_price=300.0, ret=0.0, bars=3, lots=2.0,
+                        direction=-1)]
+        mt = BT._metrics(eq, pos_dir, two, base=100_000.0,
+                         price=close, mult=10.0, margin_rate=0.1)
+        if abs(float(mt["peak_notional"]) - 20_000.0) > 1e-9:
+            raise RuntimeError(
+                f"两条腿重叠时峰值名义应为 (3+2)×400×10=20000，实际 {mt['peak_notional']}")
+
+        # ②c 交易记录不带手数（老结果 / 外部构造）时退回方向序列，不能变成 0
+        bare = [BT.Trade(entry_date=idx[0], exit_date=idx[1], entry_price=200.0,
+                         exit_price=200.0, ret=0.0, bars=1)]
+        mbr = BT._metrics(eq, pos_dir, bare, base=100_000.0,
+                          price=close, mult=10.0, margin_rate=0.1)
+        if float(mbr["peak_notional"]) <= 0:
+            raise RuntimeError("没有手数信息时峰值占用不该归零")
 
         # ③ 平均**不依赖行情序列**（只要交易记录），峰值才依赖价格。
         #    组合层 / 老结果没传 price 时，平均值该照样给出来
@@ -2440,6 +2527,144 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"字符串 accounts 被拆成了 {m3.accounts}")
 
     check("组合工作区解析（本金/sid/多账户）", _workspace_resolve)
+
+    def _macro_pit():
+        """宏观因子的「只用 T-1 及更早」这条（5m / 1h 不前视）。
+
+        ## 为什么单列一条自检
+
+        宏观序列是**日频**、按**发布日**入库的。5m 一根 bar 是 5 分钟，
+        如果不做滞后，当天盘的每一根都能看到当天盘后才知道的数字 —— 这类
+        前视不会报错、不会让回测崩，只会把结果抬得好看，且**只在分钟周期
+        上出现**（日线上看不出来）。所以必须有一个人守着的断言。
+
+        验证分两半：
+          ① `_asof(lag_days=1)` 把 D 的值推到 D+1 才可见
+          ② 反证：同一份数据用 `lag_days=0` 时 D 当天就能看到 —— 说明这个
+             断言真的能抓到前视，而不是恒真
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factors_macro as FM
+
+        D = pd.Timestamp("2026-10-21")
+        s = pd.Series([42.0], index=pd.DatetimeIndex([D]))
+        bars = pd.date_range("2026-10-20 09:00", "2026-10-22 15:00", freq="5min")
+        idx = pd.DatetimeIndex(bars)
+
+        got = FM._asof(s, idx, lag_days=1)
+        by_day = pd.DataFrame({"d": idx.normalize(), "v": got.to_numpy()}) \
+            .groupby("d")["v"].last()
+        if not pd.isna(by_day.loc[D]):
+            raise RuntimeError(
+                f"发布日当天就用到了当天的宏观值（前视）：{by_day.loc[D]}")
+        if float(by_day.loc[pd.Timestamp("2026-10-22")]) != 42.0:
+            raise RuntimeError("D 的值在 D+1 没露出来 —— 滞后过头或对齐错了")
+
+        # 反证：lag_days=0 时 D 当天就该看到（否则上一条恒真，是假断言）
+        raw = FM._asof(s, idx, lag_days=0)
+        by_day0 = pd.DataFrame({"d": idx.normalize(), "v": raw.to_numpy()}) \
+            .groupby("d")["v"].last()
+        if pd.isna(by_day0.loc[D]):
+            raise RuntimeError("lag_days=0 在当天也看不到 —— 这条断言抓不到前视")
+
+        # 日内所有 bar 必须同值（宏观是日频，不该在一天里变）
+        if pd.Series(got.to_numpy()[~np.isnan(got.to_numpy())]).nunique() > 1:
+            raise RuntimeError("同一个发布值在日内出现了多个取值")
+
+        n_codes = len(FM._LABEL)
+        if n_codes < 20:
+            raise RuntimeError(f"注册的宏观因子只有 {n_codes} 个，序列表被改小了")
+        return (f"{n_codes} 个宏观因子；发布日当天零可见、D+1 可见；"
+                f"反证 lag=0 立刻可见（断言有效）")
+
+    check("宏观因子的发布日对齐（5m/1h 不前视）", _macro_pit)
+
+    def _contract_terms():
+        """「从天勤刷新品种参数」这条通路：取到的真值要能写进表、回测要读到。
+
+        ## 为什么必须验
+
+        回测的每手保证金 = 价格 × 乘数 × 保证金率，而那张表里的默认值是
+        按类别拍的（商品 10% / 股指 12% / 国债 3%）。实测同一笔分配资金下，
+        白银交易所 22.7% ⇒ 回测手数是实盘的 2.3 倍；白糖 6.1% ⇒ 0.6 倍。
+        公式是同一条，差在参数来源，所以必须有一条「把真实值刷进表」的通路，
+        而且刷完回测要立刻读到 —— 否则组合页的「查看回测」永远和实盘对不上。
+
+        用 `ZZTEST` 这种不存在的品种做，跑完删掉 —— 绝不去碰用户真实配置。
+        """
+        from ttrade import replay
+        from ttrade import strategy_store as SStore
+        from ttrade import symbols_info as SI
+        from ttrade import symsync as SYNC
+
+        sym, ex = "ZZTEST", "TEST"
+
+        def row(mult, rate):
+            return [{"symbol": sym, "exchange": ex, "contract": "ZZTEST2601",
+                     "mult": mult, "margin": rate * 100.0 * mult,
+                     "margin_rate": rate, "price": 100.0}]
+
+        try:
+            SI.reset_override(sym, ex)
+            base = SI.info(sym, ex)
+            # ① 差异小于 2% 不写（保证金随结算价天天微调，全表重写没意义）
+            st = SYNC.apply(row(1.0, float(base["margin"]) * 1.01))
+            if st["changed"]:
+                raise RuntimeError("1% 的差异不该触发刷新")
+            # ② 差异大就写，且标成 live
+            st = SYNC.apply(row(1.0, 0.227))
+            if st["changed"] != 1:
+                raise RuntimeError(f"22.7% 没被写进表：{st}")
+            if abs(float(SI.info(sym, ex)["margin"]) - 0.227) > 1e-12:
+                raise RuntimeError("刷新之后 info() 读到的还是旧值")
+            if str(SI.info(sym, ex)["margin_src"]) != "live":
+                raise RuntimeError("刷新没标成 live，界面上分不出是谁填的")
+            # ③ 回测侧要真的跟着变：make_bt 的 margin_rate 来自 symbols_info
+            cfg = SStore.StrategyConfig(symbol=sym, exchange=ex, sizing="capital",
+                                        principal=200_000.0, capital_pct=30.0)
+            bt = replay.make_bt("cn", True, cfg)
+            if abs(float(bt.margin_rate) - 0.227) > 1e-12:
+                raise RuntimeError(
+                    f"回测没读到刷新后的保证金率：{bt.margin_rate}（应为 0.227）")
+            # ④ 显式刷新**允许覆盖手填值**（这是用户主动点的，不是后台偷偷改）
+            SI.set_override(sym, ex, margin=0.30)
+            if str(SI.info(sym, ex)["margin_src"]) != "user":
+                raise RuntimeError("set_override 默认没有标成 user")
+            if not SYNC.apply(row(1.0, 0.12))["changed"]:
+                raise RuntimeError("手填值挡住了主动刷新 —— 这条通路就失效了")
+            if abs(float(SI.info(sym, ex)["margin"]) - 0.12) > 1e-12:
+                raise RuntimeError("刷新没有把表改成真实值")
+            # ⑤ 非法值（0 / NaN）一律不写，绝不能把配置写成 0
+            if SYNC.apply(row(0.0, 0.0))["changed"]:
+                raise RuntimeError("0 值不该被写进表")
+            # ⑥ 乘数必须**精确**比：9999 → 10000 只差 0.01%，套 2% 容差会永远刷不掉。
+            #    `specs.multiplier()` 从成交额反推时就会留下这种零头（真实 T 是
+            #    10000 反推成 9999，AU 1000 → 999，SC 1000 → 999），不精确比
+            #    的结果是「点了刷新、表里还是 999」，看起来像功能没生效。
+            SI.reset_override(sym, ex)
+            SI.set_override(sym, ex, mult=999.0, tick=1.0)
+            st = SYNC.apply([{"symbol": sym, "exchange": ex, "mult": 1000.0,
+                              "margin_rate": 0.12, "tick": 0.02, "price": 100.0}])
+            if st["changed"] != 1:
+                raise RuntimeError(f"999→1000 被当成「没变化」跳过了：{st}")
+            got = SI.info(sym, ex)
+            if abs(float(got["mult"]) - 1000.0) > 1e-9:
+                raise RuntimeError(f"乘数没刷成 1000：{got['mult']}")
+            if abs(float(got["tick"]) - 0.02) > 1e-12:
+                raise RuntimeError(f"最小跳动没写进表：{got['tick']}")
+            # ⑦ 再刷一次必须变成「无变化」—— 否则说明判等永远不成立，每次都重写盘
+            st = SYNC.apply([{"symbol": sym, "exchange": ex, "mult": 1000.0,
+                              "margin_rate": 0.12, "tick": 0.02, "price": 100.0}])
+            if st["changed"]:
+                raise RuntimeError("同样的值刷第二遍还在写盘，判等有问题")
+        finally:
+            SI.reset_override(sym, ex)
+        return ("差异 2% 内跳过、超出写并标 live；make_bt 立刻读到新值；"
+                "主动刷新覆盖手填；0 值被拒；乘数/跳动精确比（999→1000 必刷）")
+
+    check("从天勤刷新品种参数（乘数/保证金率 → 回测对齐）", _contract_terms)
 
     def _factor_metrics():
         from ttrade import factor_metrics as M

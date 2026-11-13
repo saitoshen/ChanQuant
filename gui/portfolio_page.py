@@ -1316,6 +1316,7 @@ class PortfolioPage(QWidget):
         self.ws_bar.total_changed.connect(self._ws_total)
         self.ws_bar.mode_changed.connect(self._ws_mode)
         self.ws_bar.basis_changed.connect(self._ws_basis)
+        self.ws_bar.knob_changed.connect(self._ws_knob)
         lay.addWidget(self.ws_bar)
 
         self.tbl_strat = self._table(
@@ -1509,7 +1510,8 @@ class PortfolioPage(QWidget):
         bar = getattr(self, "ws_bar", None)
         if bar is not None:
             bar.set_workspaces([w.name or "未命名" for w in self._wss], self._ws_index())
-            bar.set_state(self._ws.live_total(self._pool), self._ws.mode, self._ws.basis)
+            bar.set_state(self._ws.live_total(self._pool), self._ws.mode,
+                          self._ws.basis, getattr(self._ws, "knob", "split"))
 
     def _save_ws(self) -> None:
         WS.save_workspaces(self._wss, self._ws.id if self._ws else "")
@@ -1605,6 +1607,14 @@ class PortfolioPage(QWidget):
         self._save_ws()
         self._ws_hint()
 
+    def _ws_knob(self, knob: str) -> None:
+        """校准倍数记在哪个参数上（本金 / 占用百分比 / 两者分摊）。"""
+        if self._ws is None:
+            return
+        self._ws.knob = str(knob or "split")
+        self._save_ws()
+        self._ws_hint()
+
     def _ws_hint(self) -> None:
         """工具条右边那句提示：本金合计 / 已量几条 / 校准口径是否可用。"""
         bar = getattr(self, "ws_bar", None)
@@ -1626,6 +1636,37 @@ class PortfolioPage(QWidget):
         bar.hint("　·　".join(bits), bad=bad)
 
     # ---------------------------------------------------------- 资金分配
+
+    def _warn_stale_terms(self, jobs: list) -> None:
+        """回测用的乘数/保证金率如果还是「分类默认值」，提醒去刷一次。
+
+        实盘下几手读的是天勤合约上的实时值，回测读的是品种信息表 —— 两张口径
+        分开是**故意**的（研究页要可复现）。代价是表一旦没刷过，回测手数和实盘
+        就差一倍（实测白银 22.7% vs 默认 10% ⇒ 2.3 倍）。
+
+        这里不替用户改表（静默改配置比数字不准更糟），只在日志里点名。判断依据是
+        `margin_src`：空 = 从没刷过，`live` = 刷过，`user` = 手填。
+        """
+        try:
+            from ttrade import symbols_info as SI
+
+            stale = []
+            for cfg, _kind, _payload in jobs:
+                sym = str(getattr(cfg, "symbol", "") or "")
+                if not sym or (getattr(cfg, "sizing", "") or "") != "capital":
+                    continue
+                if str(SI.info(sym, getattr(cfg, "exchange", "")).get("margin_src") or ""):
+                    continue
+                if sym not in stale:
+                    stale.append(sym)
+            if stale:
+                self._on_log(
+                    f"注意：{len(stale)} 个品种的保证金率还是分类默认值"
+                    f"（{'、'.join(stale[:6])}{'…' if len(stale) > 6 else ''}），"
+                    "回测手数会和实盘不一致 —— 去「数据管理 → 品种信息 → "
+                    "从天勤刷新」刷一次即可")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _measure_usages(self) -> None:
         """把当前工作区的策略逐条跑一遍历史回测，量出实际占用。
@@ -1657,6 +1698,7 @@ class PortfolioPage(QWidget):
             self._on_failed("一条都取不到行情：" + "；".join(bad[:3]))
             return
         self._measure_bad = bad
+        self._warn_stale_terms(jobs)
         self._on_log(f"开始量占用：{len(jobs)} 条"
                      + (f"（{len(bad)} 条取不到数据，跳过）" if bad else ""))
         if hasattr(self, "ws_bar"):
@@ -1715,10 +1757,27 @@ class PortfolioPage(QWidget):
             self._on_failed("这个工作区还没有策略，或者总资金是 0")
             return
         dlg = AllocDialog(shares, self._ws.live_total(self._pool),
-                          basis=self._ws.basis, measured=bool(self._usages), parent=self)
+                          basis=self._ws.basis, measured=bool(self._usages), parent=self,
+                          knob=getattr(self._ws, "knob", "split"))
         if dlg.exec() != QDialog.Accepted:
             return
         n = WS.apply_shares(self._ws, dlg.shares)
+        # 占用百分比是**策略自己的**属性（按 sid 存，不按工作区隔离），所以要写回
+        # 策略库那份配置。不写的话：工作区本金改了、百分比还是旧的，回测和实盘
+        # 读到的口径就不一样 —— 而预览表上写着「已调到 90%」，实际压根没生效。
+        pct_ch = 0
+        bysid = {s.sid: s for s in dlg.shares}
+        for c in self._pool:
+            s = bysid.get(str(getattr(c, "sid", "") or ""))
+            if s is None:
+                continue
+            old = float(getattr(c, "capital_pct", 0) or 0)
+            new = float(s.new_pct or 0)
+            if (PL._pct_effective(getattr(c, "sizing", "capital"))      # noqa: SLF001
+                    and new > 0 and abs(new - old) > 1e-9):
+                c.capital_pct = round(min(new, PL.PCT_CAP), 4)
+                SStore.update_portfolio(c.clone() if hasattr(c, "clone") else c)
+                pct_ch += 1
         # 手动口径下把这次的金额记下来，下次打开还是同一套比例
         if str(self._ws.mode) == "manual":
             self._ws.manual = {s.sid: float(s.new_principal) for s in dlg.shares
@@ -1730,7 +1789,9 @@ class PortfolioPage(QWidget):
         after = sum(float(getattr(c, "principal", 0) or 0) for c in self._items)
         tot = self._ws.live_total(self._pool)
         self._on_log(
-            f"已应用分配：{n} 条策略本金已更新，合计 {after / 10000:,.1f} 万"
+            f"已应用分配：{n} 条策略本金已更新"
+            + (f"、{pct_ch} 条占用百分比已更新" if pct_ch else "")
+            + f"，合计 {after / 10000:,.1f} 万"
             + (f"（总资金的 {after / tot:.2f} 倍）" if tot > 0 else "")
             + "。正在跑的连接不会自动改用新本金，需停止后重新启动")
 

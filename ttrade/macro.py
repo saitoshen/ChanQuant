@@ -607,6 +607,34 @@ def stats() -> dict:
             "first": first, "last": last}
 
 
+def last_update_text() -> str:
+    """`macro_last_update` 的「距现在多久」，界面用。
+
+    只报时间戳没用 —— 用户真正要判断的是「这份宏观数据是不是过期了」。
+    日频序列（SHIBOR / 美元指数 / 美债）隔一个交易日没更新就说明链路断了；
+    月频/季频隔半个月没更新是正常的。所以这里只说「多久之前」，不做对错判断。
+    """
+    try:
+        with _connect(read_only=True) as con:
+            row = con.execute(
+                "SELECT v FROM edb_meta_kv WHERE k='macro_last_update'").fetchone()
+    except Exception:  # noqa: BLE001
+        return ""
+    if not row or not row[0]:
+        return ""
+    raw = str(row[0])
+    try:
+        ts = pd.Timestamp(raw)
+    except Exception:  # noqa: BLE001
+        return raw
+    delta = pd.Timestamp.now() - ts
+    days = int(delta.total_seconds() // 86400)
+    if days <= 0:
+        hours = max(1, int(delta.total_seconds() // 3600))
+        return f"{raw}（{hours} 小时前）"
+    return f"{raw}（{days} 天前）"
+
+
 def coverage() -> pd.DataFrame:
     """每个 code 有多少行、覆盖到哪天。界面和体检都用它。"""
     rows = []

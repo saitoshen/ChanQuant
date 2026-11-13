@@ -230,6 +230,46 @@ _METRIC_KEYS = (
 )
 
 
+def _lots_by_bar(index: pd.DatetimeIndex, trades: list) -> np.ndarray:
+    """把逐笔的 `lots` 摊回逐根 bar，用于算**峰值**占用。
+
+    🔴 峰值占用**绝不能**用 `res.position`：那里的值只是**方向**（±1）。乘上
+    价格和乘数得到的是「1 手的名义敞口」，手数一旦大于 1（按资金定仓基本都
+    大于 1），峰值就被系统性低估 —— 表现是同一张表里出现「平均占用 > 峰值
+    占用」这种逻辑上不可能的数字。
+
+    做法是区间叠加：每笔在 `[entry_date, exit_date]` 之间的 bar 上记 `|lots|`，
+    多条腿同时持有时相加（多空两边都占保证金）。用差分数组，O(T log N)。
+
+    为什么从这里反推，而不是让四个引擎各传一份逐根手数：`avg_margin` 也是从
+    `trades` 算的，峰值走同一份数据才能保证两个数永远可比。引擎里的逐根手数
+    只在「有没有仓」这一件事上有信息，逐根手数本身没有单独存。
+    """
+    n = len(index)
+    if n == 0:
+        return np.zeros(0, dtype=float)
+    diff = np.zeros(n + 1, dtype=float)
+    idx = pd.DatetimeIndex(index)
+    for t in trades:
+        lots = abs(float(getattr(t, "lots", 0) or 0.0))
+        if lots <= 0:
+            continue
+        try:
+            i0 = int(idx.searchsorted(pd.Timestamp(t.entry_date), side="left"))
+            i1 = int(idx.searchsorted(pd.Timestamp(t.exit_date), side="right"))
+        except (TypeError, ValueError):
+            continue
+        i0 = max(0, min(i0, n))
+        i1 = max(0, min(i1, n))
+        if i1 <= i0:
+            # 进出场落在同一根（日线级别的日内交易，或者 bar 被裁掉）：至少记一根，
+            # 否则这根真的压着保证金，峰值里却看不见
+            i1 = min(n, i0 + 1)
+        diff[i0] += lots
+        diff[i1] -= lots
+    return np.cumsum(diff[:n])
+
+
 def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
              bars_per_year: float = float(TRADING_DAYS),
              base: float | None = None,
@@ -354,7 +394,14 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
             util = avg_margin / base if base > 0 else 0.0
     if price is not None and mr > 0:
         px = pd.to_numeric(price, errors="coerce").reindex(equity.index).ffill()
-        notional = pos.abs().to_numpy(dtype=float) * px.to_numpy(dtype=float) * float(mult or 1.0)
+        # 逐根手数从 trades 反推（见 `_lots_by_bar`）。拿不到手数的路径（老
+        # `Result`、外部手工构造的 trades）退回方向序列 —— 那时候峰值只能按
+        # 「1 手」算，至少不会变成 0
+        abs_pos = pos.abs().to_numpy(dtype=float)
+        lots_bar = _lots_by_bar(equity.index, trades)
+        if float(lots_bar.sum()) > 0:
+            abs_pos = np.where(lots_bar > 0, lots_bar, abs_pos)
+        notional = abs_pos * px.to_numpy(dtype=float) * float(mult or 1.0)
         ok = np.isfinite(notional)
         if ok.any():
             peak_notional = float(notional[ok].max())
