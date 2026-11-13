@@ -2479,10 +2479,9 @@ def _run() -> tuple[bool, list[str]]:
         #    `budget` / `risk` 在 `size_lots` 里自带 `max(1, ...)`，`fixed`
         #    手数写死，这三种只写说明、不抬。
         #
-        #    🔴 两处判据都是被用户当场纠正过的，各钉一条：
-        #      a) 门槛是 **0.5 手**不是 1 手（`lots_round(0.5)==1`，0.49 就是 0）。
-        #         按 1.0 判会把「明明开得出来」的策略也抬一遍。
-        #      b) 判定的本金必须是**分到的**那份，而且按**最贵那一手**的价判。
+        #    🔴 判定的本金必须是**分到的**那份：实测 10 万开 1 手、分配只给
+        #    10 万的一半时，它就只有 0.5 手。拿实测本金去判会全部漏判
+        #    （实测工作区 23 条里有 4 条正是这种）。
         def mk_lot(sid, principal, vol, lot_avg, lot_peak, lots,
                    sizing="capital", pct=100.0):
             u = mk(sid, principal, 1_000, 9_000, vol, sizing=sizing,
@@ -2495,49 +2494,44 @@ def _run() -> tuple[bool, list[str]]:
             u.margin_rate = 0.1
             return u
 
-        # ⑩a 门槛是 0.5 手：占用 100%、最贵一手 6 万 ⇒ 只要 3 万本金就够
-        #     （3 万 ÷ 6 万 = 0.5 手 → 四舍五入 1 手）
-        s_probe = mk_lot("P", 100_000, 0.30, 40_000, 60_000, 1.0)
-        if abs(PL.lot_floor(s_probe, principal=40_000.0)[0]) > 1e-6:
-            raise RuntimeError("4 万本金按最贵一手能算 0.67 手，不该要求上调")
-        if abs(PL.lot_floor(s_probe, principal=20_000.0)[0] - 30_000.0) > 1.0:
-            raise RuntimeError(
-                f"0.5 手门槛算错了：{PL.lot_floor(s_probe, principal=20_000.0)[0]:,.0f}"
-                f" ≠ 30,000（0.5 × 60,000 ÷ 100%）")
-
-        # ⑩b 真的不够 ⇒ 抬到够，别人一分不让
-        #     占用 50% ⇒ 最贵一手 6 万只要 6 万本金；等权 10 万分 5 万 ⇒ 抬 +1 万
-        s_small = mk_lot("S", 100_000, 0.30, 40_000, 60_000, 1.0, pct=50.0)
+        # 一手均价 4 万、峰值 6 万 ⇒ 目标 5 万；实测 10 万开 1 手（1e-5 手/元）
+        # ⇒ 要开 1 手需要 5 万 ÷ 1e-5 = 12.5 万
+        s_small = mk_lot("S", 100_000, 0.30, 40_000, 60_000, 1.0)
         s_rich = mk_lot("R", 100_000, 0.20, 10_000, 10_000, 8.0)
         lot_us = [s_small, s_rich]
-        sh10 = PL.allocate(lot_us, 100_000.0, "equal", basis="principal")
-        if abs(sh10[0].new_principal - 60_000.0) > 1.0:
+        need, _why = PL.lot_floor(s_small, 0.5, principal=100_000.0)
+        if abs(need - 125_000.0) > 1.0:
+            raise RuntimeError(f"一手门槛算错了：{need:,.0f} ≠ 125,000")
+        # 等权 20 万 ⇒ 各 10 万；S 只有 0.8 手（10万×1e-5×4/5）⇒ 抬到 12.5 万
+        sh10 = PL.allocate(lot_us, 200_000.0, "equal", basis="principal")
+        if abs(sh10[0].new_principal - 125_000.0) > 1.0:
             raise RuntimeError(
-                f"开不出 1 手的没抬到 6 万：{sh10[0].new_principal:,.0f}")
-        if not sh10[0].lifted or abs(sh10[0].lift_extra - 10_000.0) > 1.0:
+                f"开不出 1 手的没抬到 12.5 万：{sh10[0].new_principal:,.0f}")
+        if not sh10[0].lifted or abs(sh10[0].lift_extra - 25_000.0) > 1.0:
             raise RuntimeError(f"上调额记错了：{sh10[0].lift_extra!r}")
-        if abs(sh10[1].new_principal - 50_000.0) > 1e-6:
+        # ① 别人一分不让：权重不变，本金还是原来的
+        if abs(sh10[1].new_principal - 100_000.0) > 1e-6:
             raise RuntimeError(
                 f"一手保底不该动别人的本金：{sh10[1].new_principal:,.0f}")
         if abs(sh10[0].weight - sh10[1].weight) > 1e-12:
             raise RuntimeError("一手保底把权重也改了 —— 它只该加本金")
-        if abs(sum(s.new_principal for s in sh10) - 110_000.0) > 1.0:
-            raise RuntimeError("本金合计该是 10 万 + 1 万")
+        if abs(sum(s.new_principal for s in sh10) - 225_000.0) > 1.0:
+            raise RuntimeError("本金合计该是 20 万 + 2.5 万")
+        # ② 已经够一手的条目不许抬（否则等于凭空给它加钱）
         if sh10[1].lifted or sh10[1].lot_need > 0:
             raise RuntimeError("够一手的条目被抬了")
-        # ⑩c 上限：单条**上调额**不超过总资金的 LOT_LIFT_CAP_SHARE，到顶就停并写明
-        s_huge = mk_lot("H", 100_000, 0.30, 10_000_000, 10_000_000, 0.01,
-                        pct=1.0)
+        # ③ 上限：单条**上调额**不超过总资金的 LOT_LIFT_CAP_SHARE，到顶就停并写明
+        s_huge = mk_lot("H", 100_000, 0.30, 10_000_000, 10_000_000, 0.01)
         sh11 = PL.allocate([s_huge, mk_lot("Q", 100_000, 0.20, 10_000, 10_000, 8.0)],
-                           100_000.0, "equal", basis="principal")
-        room = 100_000.0 * PL.LOT_LIFT_CAP_SHARE
+                           300_000.0, "equal", basis="principal")
+        room = 300_000.0 * PL.LOT_LIFT_CAP_SHARE
         if abs(sh11[0].lift_extra - room) > 1.0:
             raise RuntimeError(
                 f"上调额没顶在 {room:,.0f}：{sh11[0].lift_extra:,.0f}")
         if "仍不足一手" not in (sh11[0].floor_note or ""):
             raise RuntimeError(
                 f"顶到上限却没说「仍不足一手」：{sh11[0].floor_note!r}")
-        # ⑩d 自带保底 1 手的口径不抬，但要写清楚
+        # ④ 自带保底 1 手的口径不抬，但要写清楚
         b_risk = mk_lot("K", 100_000, 0.30, 40_000, 60_000, 0.0, sizing="risk")
         sh12 = PL.allocate([b_risk, mk_lot("Q", 100_000, 0.20, 10_000, 10_000, 8.0)],
                            20_000.0, "equal", basis="principal")
@@ -2545,11 +2539,11 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError("risk 口径自带保底 1 手，不该再抬本金")
         if "保底" not in (sh12[0].floor_note or ""):
             raise RuntimeError(f"risk 口径没写清楚为什么没抬：{sh12[0].floor_note!r}")
-        # ⑩e 关掉开关就一条都不抬（给「我就是要按权重硬分」的人留后路）
-        off = PL.allocate(lot_us, 100_000.0, "equal", basis="principal", lift=False)
+        # ⑤ 关掉开关就一条都不抬（给「我就是要按权重硬分」的人留后路）
+        off = PL.allocate(lot_us, 200_000.0, "equal", basis="principal", lift=False)
         if any(s.lifted for s in off):
             raise RuntimeError("lift=False 还在抬")
-        if abs(off[0].new_principal - 50_000.0) > 1e-6:
+        if abs(off[0].new_principal - 100_000.0) > 1e-6:
             raise RuntimeError("lift=False 的本金被改了")
 
         return ("ERC 风险贡献等权（n=1/2/5/12，误差 <1e-6）；"
@@ -2559,9 +2553,9 @@ def _run() -> tuple[bool, list[str]]:
                 f"盈利因子≥{PL.PF_FLOOR:g} 拿更多，低于 {PL.PF_FLOOR:g} 或不足半年"
                 "落最低档但不清零；亏穿不再额外降档 —— 波动率含翻负段按真值配权、"
                 "杠杆由利用率体现）；"
-                f"一手保底（按 **0.5 手**门槛 × **最贵那一手**算所需本金；开不出的抬到够，"
-                f"差额只加总本金、不动别人；单条上调额上限 {PL.LOT_LIFT_CAP_SHARE:.0%} 总资金，"
-                "到顶写明仍不足；budget/risk 自带保底 1 手不抬）；"
+                f"一手保底（开不出 1 手的抬到「均价~峰值」中间那一手，差额只加总本金、"
+                f"不动别人；单条上调额上限 {PL.LOT_LIFT_CAP_SHARE:.0%} 总资金，到顶写明仍不足；"
+                "budget/risk 自带保底 1 手不抬）；"
                 "实测占用按当前配置折算（应用分配后本金(前)是真值、再折不自乘）")
 
     check("组合工作区资金分配（ERC / 三种口径）", _portfolio_plan)
@@ -2681,9 +2675,16 @@ def _run() -> tuple[bool, list[str]]:
                         f"手数取整 {x} → {got}，应为 {exp}（四舍五入，不是截断/"
                         f"银行家舍入）")
             per = px * 10_000.0 * 0.02
-            # (手数理论值, 回测应为, 实盘应为)。0.6 手那一组两边**故意不同**：
-            # 回测是「钱不够一手就不做」，实盘是「保底 1 手」（0 手等于策略静默不动）
-            for raw_n, exp_bt, exp_live in ((4.77, 5, 5), (1.4, 1, 1), (0.6, 0, 1)):
+            # (手数理论值, 回测应为, 实盘应为)。
+            # 🔴 0.6 那一组**两边必须一样给 1 手**：`lots_round(0.6)==1`，
+            # 0.5 就是四舍五入的分界。以前回测在 `raw < 1` 时直接判 0 手
+            # （外面多了一层 `if raw >= 1` 的门槛），把分界线挪到了 1.0 手，
+            # 于是「够 0.6 手」的策略在回测里整段空仓、实盘却会下 1 手 ——
+            # 用户当场追问「够 0.5 手为什么不算 1 手」，就是这条。
+            # 真正会分叉的只有 <0.5 手：回测 0 手（四舍五入到 0），
+            # 实盘保底 1 手（0 手等于策略静默不动）。
+            for raw_n, exp_bt, exp_live in ((4.77, 5, 5), (1.4, 1, 1),
+                                            (0.6, 1, 1), (0.45, 0, 1)):
                 c = mk(capital=per * raw_n)
                 b = replay.make_bt("cn", False, c)
                 g_bt = BT.size_lots(b, px, b.initial_cash)
@@ -2699,7 +2700,8 @@ def _run() -> tuple[bool, list[str]]:
                 "（capital / budget）；改保证金率两边同步变；表里缺失时兜底一致；"
                 "乘数缺失实盘守 1 手；算手数全程不碰天勤行情；"
                 "取整一律四舍五入（4.77→5、2.5→3，不是截断也不是银行家舍入），"
-                "回测「钱不够一手→0 手」而实盘保底 1 手")
+                "0.6 手两边都给 1 手（分界点是 0.5，不是 1.0）；"
+                "只有 <0.5 手才分叉：回测 0 手、实盘保底 1 手")
 
     check("实盘与回测手数同源（品种信息表）", _lots_same_source)
 
