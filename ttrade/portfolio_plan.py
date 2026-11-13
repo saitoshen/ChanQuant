@@ -64,7 +64,17 @@
 
     目标一手资金 L_req = L_avg + 0.5 × (L_peak − L_avg)
         其中 L_avg / L_peak = 按历史均价 / 区间最高价算的一手保证金
-    需要的本金 P_req = (L_req ÷ L_avg) ÷ (手数 ÷ 本金)
+    动用比例 k       = 这个口径每 1 元本金实际用几成（见 `deploy_ratio`）
+    需要的本金 P_req = L_req ÷ k
+
+🔴 **杠杆一律用解析式 `k / L_avg`，不拿实测手数反推**：实测的「平均手数 ÷ 本金」
+是**按成交时点加权**的，成交集中在便宜的年份就会高估杠杆、把门槛估低（实测
+集运被抬到 37,014 后，最贵那一手只有 0.48 手，照样开不出）。解析式只跟价格
+和口径有关，与哪一年成交无关。
+
+补一个不变量：`ratio = 0.5` 时，**最贵那一根**正好 `L_req / L_peak = 0.5 ×
+(1 + L_avg/L_peak) ∈ [0.5, 1]` 手 —— 配合 `lots_round`（0.5 就算 1 手）刚好
+「任何时点都开得出 1 手」。ratio 调小就保不住这个性质了（见 `LOT_LIFT_RATIO`）。
 
 - **抬出来的差额不从别人身上扣**：直接加进总本金。挤别人等于让「够一手的」
   替「不够一手的」出钱，那是另一个策略被改了仓位，用户没要求。
@@ -154,6 +164,10 @@ UTIL_FLOOR = 0.02
 #   0 = 历史均价那一手的钱（便宜的时候能开，贵的年份开不出）
 #   1 = 历史最贵那一手（任何时候都开得出，但金额可能翻几倍）
 # 0.5 = 折中。用户原话「取平均一手到峰值一手中间的资金可能合适」。
+#
+# 🔴 0.5 不只是「折中」，它和「门槛按 1 手算」是一对：最贵那一根能开出
+# L_req/L_peak = 0.5×(1 + L_avg/L_peak) ∈ [0.5, 1] 手，四舍五入正好 1 手。
+# 调小（比如 0.2）就保不住「最贵也开得出」这个性质了，见 `lot_floor`。
 LOT_LIFT_RATIO = 0.5
 
 # 一手保底**每条最多往上加多少**：不超过组合总资金的这个比例。
@@ -207,8 +221,10 @@ class Usage:
     # 0 = 没量到（没有行情 / 乘数缺失）
     lot_margin_avg: float = 0.0
     lot_margin_peak: float = 0.0
-    # 历史上平均每笔开几手（从成交记录算）。<1 就说明「大部分时候开不出整手」。
-    # 0 = 一次都没开过 —— 这时只能按口径解析式反推
+    # 历史上平均每笔开几手（从成交记录算）。**只作诊断参考**：
+    # 一手保底的杠杆率改走解析式 `deploy_ratio`（见 `lot_floor`），不再拿它
+    # 反推 —— 它是按成交时点加权的，成交集中在便宜年份会把杠杆算高。
+    # 0 = 一次都没开过
     avg_lots: float = 0.0
     # 保证金率（`unit` 口径反推手数要用；其余口径用不到）
     margin_rate: float = 0.0
@@ -565,6 +581,31 @@ def span_factor(years: float) -> tuple[float, str, bool]:
     return SPAN_TIERS[-1][1], SPAN_TIERS[-1][2], False
 
 
+def deploy_ratio(u: Usage) -> float:
+    """这个仓位口径**每 1 元本金实际动用几成**（`k`）。0 = 算不出。
+
+    `capital`：开仓预算 = 本金 × `capital_pct`% ⇒ `k = capital_pct / 100`
+    `unit`   ：名义敞口 = 本金。一手名义 = 价 × 乘数 = 一手保证金 ÷ 保证金率
+               ⇒ 「每 1 元本金开 k ÷ 一手保证金 手」里 `k = 保证金率`
+
+    这个比例**和价格无关**，所以乘一手保证金就还原成手数：
+    `手数 = 本金 × k ÷ 一手保证金`——五种口径（`budget` / `risk` 除外，它们
+    本来就有 `max(1, …)`）都是这一条，只是 `k` 的来历不同。
+    """
+    sz = str(u.sizing or "capital").lower()
+    if sz == "unit":
+        return max(0.0, float(getattr(u, "margin_rate", 0.0) or 0.0))
+    pct = float(getattr(u, "capital_pct", 0.0) or 0.0)
+    if pct > 0:
+        return pct / 100.0
+    # `capital_pct` 没记下（老记录）时用金额反推：预算 ÷ 本金
+    p = float(getattr(u, "principal", 0.0) or 0.0)
+    cap = float(getattr(u, "capital", 0.0) or 0.0)
+    if p > 0 and cap > 0:
+        return cap / p
+    return 0.0
+
+
 def lot_floor(u: Usage, ratio: float = LOT_LIFT_RATIO,
               principal: float | None = None) -> tuple[float, str]:
     """让这条策略**历史上至少开得出 1 手**所需的本金。返回 `(需要的本金, 说明)`。
@@ -576,18 +617,25 @@ def lot_floor(u: Usage, ratio: float = LOT_LIFT_RATIO,
     拿实测本金去判会出现「分配只给了 1.4 万、实测时 5 万，于是判定够用」这种
     最要命的漏判（实测 23 条里有 4 条就是这样）。
 
-    ## 口径
+    ## 口径（全解析，不看成交记录）
 
         L_avg  = 历史平均价那一手要多少钱（`lot_margin_avg`）
         L_peak = 历史最高价那一手要多少钱（`lot_margin_peak`）
         L_req  = L_avg + ratio × (L_peak − L_avg)      # 平均到峰值之间取值
-        手数 ∝ 本金                                   # 五种口径都是单利定手
-        lev    = 手数 ÷ 本金                          # 单位本金能开几手
-        P_req  = (L_req ÷ L_avg) ÷ lev
+        k      = 每 1 元本金动用几成（`deploy_ratio`）
+        手数   = 本金 × k ÷ 一手保证金                  # 五种口径都是单利定手
+        P_req  = L_req ÷ k
 
-    `lev` 优先用**实测**的（`avg_lots ÷ 实测本金`）：它把取整、`share` 分摊、
-    ATR 高低这些真实情况全含进去了，比任何解析式都准。一次都没开过仓时才退回
-    解析式 —— 而那时恰好也是「最想知道到底差多少」的时候。
+    🔴 **杠杆率必须用解析式 `k / L_avg`，不能用实测的「平均手数 ÷ 本金」。**
+    后者是**按成交时点加权**的：成交集中在便宜的年份（那几年 1/L 特别大），
+    平均手数被抬高 ⇒ 杠杆被高估 ⇒ 门槛估低 ⇒ 抬完还是开不出。实测集运被抬到
+    37,014 后，最贵那一手只有 **0.48 手**（不到 0.5 仍是 0 手），而解析式给
+    53,654。解析式只跟价格和口径有关，跟哪一年成交无关。
+
+    `ratio = 0.5` 还白送一个不变量：最贵那一根 `L_req / L_peak =
+    0.5 × (1 + L_avg/L_peak) ∈ [0.5, 1]` 手 —— 配合 `lots_round`（0.5 就
+    算 1 手），**任何时点都开得出 1 手**。门槛按「1 手」而不是「0.5 手」算，
+    就是为了让它落在最贵那一根也够；按 0.5 手设门槛的话，峰值那一段又归零。
 
     ## 为什么只对 `capital` / `unit` 生效
 
@@ -611,32 +659,18 @@ def lot_floor(u: Usage, ratio: float = LOT_LIFT_RATIO,
         return 0.0, "没有行情或合约乘数，算不出一手要多少钱"
     r = max(0.0, min(1.0, float(ratio)))
     L_req = L_avg + r * max(0.0, L_peak - L_avg)
-    if u.avg_lots > 0 and float(u.principal or 0) > 0:
-        # 实测杠杆：单位本金能开几手。**与分配额无关**，是个比率
-        lev = float(u.avg_lots) / float(u.principal)
-        src = f"实测平均 {u.avg_lots:.2f} 手/笔"
-    elif sz == "capital":
-        # 开仓预算 = 本金 × 占用%，手数 = 预算 ÷ 每手保证金
-        budget = float(getattr(u, "capital", 0.0) or 0.0)
-        if budget <= 0:
-            budget = float(u.principal) * float(u.capital_pct or 0) / 100.0
-        lev = budget / L_avg if L_avg > 0 else 0.0
-        src = "按开仓预算解析"
-    elif sz == "unit":
-        # `unit` 是「名义敞口 = 本金」⇒ 手数 = 本金 ÷ 每手名义
-        mr = float(getattr(u, "margin_rate", 0.0) or 0.0)
-        if mr <= 0:
-            return 0.0, "没有保证金率，算不出 unit 口径的手数"
-        lev = mr / L_avg
-        src = "按名义敞口解析"
-    else:
-        return 0.0, f"{sz} 口径算不出杠杆，一手门槛无法估算"
-    if not math.isfinite(lev) or lev <= 0:
-        return 0.0, "算不出杠杆，一手门槛无法估算"
-    need = (L_req / L_avg) / lev
+    k = deploy_ratio(u)
+    if not math.isfinite(k) or k <= 0:
+        return 0.0, f"{sz} 口径算不出动用本金的几成，一手门槛无法估算"
+    # 手数 = 本金 × k ÷ 一手保证金 ⇒ 要 1 手，本金就得是 L ÷ k
+    need = L_req / k
+    if not math.isfinite(need) or need <= 0:
+        return 0.0, "算不出一手门槛"
     if need <= p * (1.0 + 1e-9):
         return 0.0, ""                      # 已经够 1 手
-    can = p * lev * (L_avg / L_req)
+    can = p * k / L_req
+    src = (f"{sz} 口径动用本金 {k * 100:.0f}%" if sz != "unit"
+           else f"名义敞口 = 本金，保证金率 {k * 100:.1f}%")
     return need, (f"一手约 {L_req:,.0f} 元（均价 {L_avg:,.0f} / 峰值 {L_peak:,.0f}），"
                   f"这份本金只够 {can:.2f} 手（{src}）")
 
