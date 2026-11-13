@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import math
+
 import numpy as np
 import pandas as pd
 
@@ -452,6 +454,29 @@ def _atr_array(close: np.ndarray, high: np.ndarray, low: np.ndarray, n: int) -> 
     return pd.Series(tr).rolling(n, min_periods=n).mean().to_numpy(dtype=float)
 
 
+def lots_round(x: float) -> int:
+    """手数取整：**四舍五入**。回测、实盘、K 线内三条路都用这一个函数。
+
+    🔴 三件事必须说清楚：
+
+    1. **为什么不是向下取整**（原来就是 `int()`）。`int(4.77)` = 4 手，系统性
+       少配 0.5 手。手数小的时候这不是小事：预算 10.5 万、每手 2.2 万，向下
+       取整是 4 手（用掉 77% 的预算），四舍五入是 5 手（用掉 95%）。十几条策略
+       累起来就是整体仓位被削掉一成多，而且**偏差方向永远一致**（永远偏少），
+       不会自己抵消 —— 这就是「隐形欠配」。
+
+    2. **为什么不用内置 `round()`**。它是**银行家舍入**（round half to even）：
+       `round(2.5) == 2`、`round(3.5) == 4`。恰好在 .5 上时有时进有时不进，
+       同一个策略改个参数手数就跳一下，用户拿着「四舍五入」四个字没法预测。
+
+    3. **为什么不用 `ceil`**。什么都往上进，0.4 手也算 1 手，小资金账户会被
+       迫超配一倍 —— 那是另一个方向的错误。
+
+    数学上就是 `floor(x + 0.5)`。手数恒非负，不用管负数方向的对称性。
+    """
+    return int(math.floor(float(x) + 0.5))
+
+
 def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float = 0.0,
               share: float = 1.0) -> float:
     """这一笔该下多少手。
@@ -478,7 +503,11 @@ def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float
         per = float(cfg.stop_mult or 0) * float(atr_value or 0) * mult
         if per <= 0:
             return 1.0                      # ATR 还没暖起来：先 1 手，别裸奔
-        return float(max(1, int(float(cfg.risk_amount or 0) / max(share, 1e-9) / per)))
+        # 四舍五入：向下取整会让「打止损就亏 risk_amount」这一条永远偏保守，
+        # 手数小的时候（2.4 手 → 2 手）实际风险比设定少 17%，看起来像策略
+        # 比设定更安全 —— 偏差方向和 capital 口径一样，都是「永远偏少」
+        return float(max(1, lots_round(float(cfg.risk_amount or 0)
+                                       / max(share, 1e-9) / per)))
     if mode == "budget":
         # 「按分配资金定手数」：手数 = 分配的钱 ÷ 这一手要花的钱（价格×乘数），
         # **四舍五入**，且**不足一手按 1 手**。
@@ -490,15 +519,21 @@ def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float
         per = price * mult
         if per <= 0:
             return 0.0
-        return float(max(1, int(round(float(cfg.budget or 0.0) / max(share, 1e-9) / per))))
+        return float(max(1, lots_round(float(cfg.budget or 0.0)
+                                       / max(share, 1e-9) / per)))
     if mode == "capital":
         per = price * mult * float(cfg.margin_rate or 0)
         if per <= 0:
             return 1.0
         # 分配资金 ÷ 每手保证金，**固定用分配的那笔钱**，不随盈亏变。
         # 按当前权益收口就变成复利了：50 万赚到 80 万会自己加到 80 万的仓，
-        # 亏到 30 万又自动减到 30 万 —— 那是另一套策略，不是用户要的「单利」
-        return float(max(int(cfg.budget / max(share, 1e-9) / per), 0))
+        # 亏到 30 万又自动减到 30 万 —— 那是另一套策略，不是用户要的「单利」。
+        #
+        # 取整**四舍五入**（见 `lots_round`）。但「钱不够一手」仍然是 0 手：
+        # 0.4 手四舍五入是 0，1 手都买不起就不该开仓 —— 这条下限和 `budget`
+        # 的「保底 1 手」不同，两个口径的语义本来就不同（见 `budget` 的说明）
+        raw = cfg.budget / max(share, 1e-9) / per
+        return float(max(lots_round(raw), 0)) if raw >= 1 else 0.0
     # 名义敞口 = **本金**（固定）。原来是「当前权益」，权益从 10 万涨到 34 万，
     # 手数跟着放大 3.4 倍 —— 那是复利，和其余三种口径不是一套东西：双均线 /
     # 唐奇安 / 海龟 / 通道突破 / MACD 这几条老策略因此会跑出「越赚越猛」的曲线，
@@ -528,8 +563,8 @@ def size_lots_intrabar(cfg: BacktestConfig, price: float, equity: float,
     if mode == "risk" and _finite(stop_dist) and float(stop_dist) > 0:
         per = float(stop_dist) * float(mult or 1.0)
         if per > 0:
-            # 和 `size_lots` 同一个下限：至少 1 手，凑不出 1 手就不做
-            return float(max(1, int(float(cfg.risk_amount or 0) / per)))
+            # 和 `size_lots` 同一个下限与同一个取整：至少 1 手，凑不出 1 手就不做
+            return float(max(1, lots_round(float(cfg.risk_amount or 0) / per)))
     a = 0.0
     if _finite(stop_dist) and float(cfg.stop_mult or 0) > 0:
         a = float(stop_dist) / float(cfg.stop_mult)

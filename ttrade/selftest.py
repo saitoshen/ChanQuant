@@ -2435,10 +2435,11 @@ def _run() -> tuple[bool, list[str]]:
                 return NoTq._size(inst, NS(cfg=cfg, lots=0, underlying="CFFEX.T2603"),
                                   price, 0.0)
 
-            # ① 同一张表 ⇒ 两边一样
+            # ① 同一张表 ⇒ 两边一样（取整都走 lots_round：四舍五入）
             cfg = mk()
             bt = replay.make_bt("cn", False, cfg)
-            want = int(105_033.4 / (px * 10_000.0 * 0.02))
+            raw = 105_033.4 / (px * 10_000.0 * 0.02)
+            want = BT.lots_round(raw)          # 4.77 手 → 5 手
             n_bt = BT.size_lots(bt, px, bt.initial_cash)
             n_live, why = live_n(cfg)
             if abs(n_bt - want) > 1e-9 or n_live != want:
@@ -2484,12 +2485,37 @@ def _run() -> tuple[bool, list[str]]:
             if abs(n_bt_b - n_live_b) > 1e-9:
                 raise RuntimeError(
                     f"budget 口径两边不一致：回测 {n_bt_b} 手、实盘 {n_live_b} 手")
+
+            # ⑥ 取整口径必须是**四舍五入**。三个对照组都不能错：
+            #    截断会系统性少配半手（4.77→4，只用掉 77% 预算，且永远偏少不抵消）；
+            #    Python 的 `round()` 是银行家舍入（2.5→2、3.5→4），在 .5 上
+            #    有时进有时不进，用户拿「四舍五入」四个字没法预测
+            for x, exp in ((4.77, 5), (4.4, 4), (2.5, 3), (3.5, 4), (0.49, 0)):
+                got = BT.lots_round(x)
+                if got != exp:
+                    raise RuntimeError(
+                        f"手数取整 {x} → {got}，应为 {exp}（四舍五入，不是截断/"
+                        f"银行家舍入）")
+            per = px * 10_000.0 * 0.02
+            # (手数理论值, 回测应为, 实盘应为)。0.6 手那一组两边**故意不同**：
+            # 回测是「钱不够一手就不做」，实盘是「保底 1 手」（0 手等于策略静默不动）
+            for raw_n, exp_bt, exp_live in ((4.77, 5, 5), (1.4, 1, 1), (0.6, 0, 1)):
+                c = mk(capital=per * raw_n)
+                b = replay.make_bt("cn", False, c)
+                g_bt = BT.size_lots(b, px, b.initial_cash)
+                g_live, _ = live_n(c)
+                if abs(g_bt - exp_bt) > 1e-9 or g_live != exp_live:
+                    raise RuntimeError(
+                        f"预算 {raw_n:.2f} 手（{per * raw_n:,.0f} 元）：回测给 "
+                        f"{g_bt} 手（应 {exp_bt}）、实盘给 {g_live} 手（应 {exp_live}）")
         finally:
             SI.info = real_info
 
         return ("同一张品种信息表：回测 size_lots 与实盘 _size 同输入同手数"
                 "（capital / budget）；改保证金率两边同步变；表里缺失时兜底一致；"
-                "乘数缺失实盘守 1 手；算手数全程不碰天勤行情")
+                "乘数缺失实盘守 1 手；算手数全程不碰天勤行情；"
+                "取整一律四舍五入（4.77→5、2.5→3，不是截断也不是银行家舍入），"
+                "回测「钱不够一手→0 手」而实盘保底 1 手")
 
     check("实盘与回测手数同源（品种信息表）", _lots_same_source)
 

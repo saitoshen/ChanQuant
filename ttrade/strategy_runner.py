@@ -55,6 +55,7 @@ from ttrade import replay
 from ttrade import daylimit, orderbook, positionbook, topup, tqdata
 from ttrade import strategy_store as SStore
 from ttrade import specs, symbols_info
+from ttrade.backtest import lots_round
 from ttrade.strategies import STRATEGIES, next_levels, run_strategy
 from ttrade.tqfetch import PERIOD_SEC
 from ttrade.tqlive import AccountSpec, bars_from_serial, merge_live
@@ -1222,7 +1223,7 @@ class PortfolioRunner:
             d = float(lv["stop_dist"])
             m = self._volume_multiple(st)
             if d == d and d > 0 and m > 0:
-                st.lots = max(1, int(float(st.cfg.risk_amount or 0) / (d * m)))
+                st.lots = max(1, lots_round(float(st.cfg.risk_amount or 0) / (d * m)))
         st.ib_fired = False
         st.ib_armed = True
 
@@ -1670,7 +1671,7 @@ class PortfolioRunner:
             if stop_px <= 0 or mult <= 0:
                 return 1, "拿不到 ATR / 乘数：先 1 手，别裸奔"
             per_lot = stop_px * mult
-            n = max(1, int(float(cfg.risk_amount or 0) / per_lot))
+            n = max(1, lots_round(float(cfg.risk_amount or 0) / per_lot))
             return n, (f"risk 口径，止损额 {float(cfg.risk_amount or 0):,.0f} ÷ "
                        f"(止损距离 {stop_px:.4g} × 乘数 {mult:g}，{src})")
 
@@ -1682,23 +1683,38 @@ class PortfolioRunner:
             if per <= 0:
                 return 1, "拿不到价格 / 乘数：先 1 手"
             budget = float(cfg.capital or 0) or float(cfg.principal or 0)
-            n = max(1, int(round(budget / per)))
+            n = max(1, lots_round(budget / per))
             return n, (f"budget 口径，预算 {budget:,.0f} ÷ 名义 {per:,.0f}"
                        f"（乘数 {mult:g}，价 {price:.3f}）")
         if mode == "unit":
             per = price * mult
             if per <= 0:
                 return 1, "拿不到价格 / 乘数：先 1 手"
-            n = max(1, int(round(float(cfg.principal or 0) / per)))
+            n = max(1, lots_round(float(cfg.principal or 0) / per))
             return n, (f"unit 口径，本金 {float(cfg.principal or 0):,.0f} ÷ "
                        f"名义 {per:,.0f}（乘数 {mult:g}，价 {price:.3f}）")
 
         if per_margin <= 0:
             return 1, f"算不出每手保证金（{src}）：先 1 手"
-        n = max(1, int(float(cfg.capital or 0) / per_margin))
-        return n, (f"capital 口径，预算 {float(cfg.capital or 0):,.0f} ÷ "
-                   f"每手保证金 {per_margin:,.0f}"
-                   f"（{src}：乘数 {mult:g} × 价 {price:.3f} × 保证金率 {rate:.2%}）")
+        # 取整和回测**同一个函数**（`backtest.lots_round` = 四舍五入）。
+        # 以前这里和 `size_lots` 都是 `int()` 截断，一手不到就少配半手；
+        # 两边各写一份取整，还会在「谁改了谁没改」上再分叉一次
+        raw = float(cfg.capital or 0) / per_margin
+        n = max(1, lots_round(raw))
+        why = (f"capital 口径，预算 {float(cfg.capital or 0):,.0f} ÷ "
+               f"每手保证金 {per_margin:,.0f}"
+               f"（{src}：乘数 {mult:g} × 价 {price:.3f} × 保证金率 {rate:.2%}）")
+        if raw < 1:
+            # 回测在这是 0 手（钱不够一手就不做），实盘保底 1 手而不是不动 ——
+            # 但这一手会超出预算，必须说出来，否则就是「开了但不知道为什么被拒」
+            why += f"；预算只够 {raw:.2f} 手，按 1 手兜底，可能因保证金不足被拒"
+        elif n > raw:
+            # 四舍五入会略微超出预算（4.77 手 → 5 手 = 多占 4.8%）。这是这个
+            # 取整口径的必然代价，写清楚才不会让人以为占用算错了
+            over = n * per_margin / max(float(cfg.capital or 0), 1e-9) - 1.0
+            why += (f"；四舍五入进位，占用 {n * per_margin:,.0f}，"
+                    f"超预算 {over:.1%}")
+        return n, why
 
     # ---- 调仓 ----
 
