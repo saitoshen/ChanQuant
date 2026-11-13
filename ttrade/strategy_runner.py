@@ -1630,11 +1630,24 @@ class PortfolioRunner:
         - `unit`：名义敞口 = 本金（`principal`，不是分配资金）。实盘只能整手，
           所以四舍五入取整并保底 1 手；回测里它可以是小数。
         - `fixed`：老行为，固定手数。
+
+        🔴 手数一变就记一行**凭什么**（`_lots_why`）：实盘和回测的每手保证金
+        来源不同 —— 实盘取天勤 `quote.margin`（含经纪商加收），回测取「数据管理
+        → 品种信息」里的比例。同一条策略实盘 1 手、回测 4 手是完全可能的，
+        但界面上两个数并排放着，不把这两个来源写进日志，用户没法对账。
         """
+        n, why = self._size(st, price, atr_value)
+        if int(n) != int(getattr(st, "lots", 0) or 0):
+            self._log(f"{st.title()}：{int(n)} 手 —— {why}")
+        return int(n)
+
+    def _size(self, st: SlotState, price: float, atr_value: float) -> tuple[int, str]:
+        """算手数，并返回「这个数是怎么来的」（给 `_lots` 记日志用）。"""
         cfg = st.cfg
         mode = (cfg.sizing or "capital").lower()
         if mode == "fixed":
-            return max(1, int(cfg.volume or 1))
+            n = max(1, int(cfg.volume or 1))
+            return n, f"固定手数 {n}"
 
         q = self._contract_quote(st.underlying)
         mult = self._volume_multiple(st)
@@ -1642,28 +1655,41 @@ class PortfolioRunner:
         if mode == "risk":
             stop_px = max(0.0, float(cfg.stop_mult or 0)) * float(atr_value or 0)
             if stop_px <= 0 or mult <= 0:
-                return 1                     # 拿不到 ATR / 乘数：先 1 手，别裸奔
+                return 1, "拿不到 ATR / 乘数：先 1 手，别裸奔"
             per_lot = stop_px * mult
-            return max(1, int(float(cfg.risk_amount or 0) / per_lot))
+            n = max(1, int(float(cfg.risk_amount or 0) / per_lot))
+            return n, (f"risk 口径，止损额 {float(cfg.risk_amount or 0):,.0f} ÷ "
+                       f"(止损距离 {stop_px:.4g} × 乘数 {mult:g})")
 
         per_margin = self._margin_per_lot(q, price, mult, cfg.symbol)
+        src = "天勤 quote.margin" if (q is not None
+                                     and float(getattr(q, "margin", 0) or 0) > 0) \
+            else f"兜底率 {default_margin_rate(cfg.symbol):.1%}"
+        rate = (per_margin / (price * mult)) if (price > 0 and mult > 0) else 0.0
 
         if mode == "budget":
             # 名义口径：和 `backtest.size_lots` 的 budget 分支逐字对齐
             per = price * mult
             if per <= 0:
-                return 1
+                return 1, "拿不到价格 / 乘数：先 1 手"
             budget = float(cfg.capital or 0) or float(cfg.principal or 0)
-            return max(1, int(round(budget / per)))
+            n = max(1, int(round(budget / per)))
+            return n, (f"budget 口径，预算 {budget:,.0f} ÷ 名义 {per:,.0f}"
+                       f"（乘数 {mult:g}，价 {price:.3f}）")
         if mode == "unit":
             per = price * mult
             if per <= 0:
-                return 1
-            return max(1, int(round(float(cfg.principal or 0) / per)))
+                return 1, "拿不到价格 / 乘数：先 1 手"
+            n = max(1, int(round(float(cfg.principal or 0) / per)))
+            return n, (f"unit 口径，本金 {float(cfg.principal or 0):,.0f} ÷ "
+                       f"名义 {per:,.0f}（乘数 {mult:g}，价 {price:.3f}）")
 
         if per_margin <= 0:
-            return 1
-        return max(1, int(float(cfg.capital or 0) / per_margin))
+            return 1, "拿不到每手保证金：先 1 手"
+        n = max(1, int(float(cfg.capital or 0) / per_margin))
+        return n, (f"capital 口径，预算 {float(cfg.capital or 0):,.0f} ÷ "
+                   f"每手保证金 {per_margin:,.0f}（{src}，折算率 {rate:.2%}；"
+                   f"乘数 {mult:g}，价 {price:.3f}）")
 
     # ---- 调仓 ----
 

@@ -1030,6 +1030,11 @@ class PortfolioPage(QWidget):
         self._items = []
         # 实测占用：sid -> PL.Usage。「量一下占用」之后才有，切工作区不清空 ——
         # 同一条策略换个工作区，它**历史回测里**平均压多少钱是不变的
+        #
+        # 🔴 但「不变」的只是**占用金额的绝对值**，而它是在**量测那一刻**的本金
+        # 下量出来的。本金/占用百分比后来改了（应用分配、切工作区、手改），这份
+        # 快照就跟不上，切工作区或应用分配后必须走 `_rebase_usages()` 折算 ——
+        # 否则预览表和策略表都会显示上一轮的「本金(前)」，看着像没保存
         self._usages: dict = {}
         self._measure_done = 0
         self._measure_bad: list[str] = []
@@ -1507,6 +1512,7 @@ class PortfolioPage(QWidget):
         self._items = cfgs
         if missing:
             self._on_log(f"有 {len(missing)} 条策略已不在策略池里，本工作区跳过")
+        self._rebase_usages()
         bar = getattr(self, "ws_bar", None)
         if bar is not None:
             bar.set_workspaces([w.name or "未命名" for w in self._wss], self._ws_index())
@@ -1515,6 +1521,31 @@ class PortfolioPage(QWidget):
 
     def _save_ws(self) -> None:
         WS.save_workspaces(self._wss, self._ws.id if self._ws else "")
+
+    def _rebase_usages(self) -> None:
+        """把内存里的实测占用折算到**当前配置**（本金 / 占用百分比）。
+
+        为什么要单列一步：`_usages` 是「量占用」那一刻的快照，里面记的
+        `principal` / `capital_pct` 是**当时**的配置。应用分配之后配置变了，
+        快照不会自己变 —— 直接拿它算预览，「本金(前)」永远是应用前的值，用户
+        看到的就是「点了应用没保存、下次又回到原来的」。
+
+        `PL.rebase()` 幂等（折算完会把基准更新成当前值），所以这里可以放心地
+        在 `_sync_ws()` 里反复调用：切工作区、改本金、应用分配之后都会走到。
+        """
+        us = getattr(self, "_usages", None)
+        if not us:
+            return
+        for c in self._items:
+            sid = str(getattr(c, "sid", "") or "")
+            u = us.get(sid)
+            if u is None:
+                continue
+            us[sid] = PL.rebase(
+                u, float(getattr(c, "principal", 0) or 0),
+                float(getattr(c, "capital_pct", 0) or 0),
+                capital=float(getattr(c, "capital", 0) or 0),
+                sizing=str(getattr(c, "sizing", "") or "capital"))
 
     def _ws_switch(self, i: int) -> None:
         if not (0 <= i < len(self._wss)):

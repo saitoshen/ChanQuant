@@ -2344,9 +2344,41 @@ def _run() -> tuple[bool, list[str]]:
         if not np.allclose(zero, 0.25):
             raise RuntimeError(f"全都缺波动率时该等权，实际 {np.round(zero, 4)}")
 
+        # ⑧ 🔴 「应用分配」之后预览表还显示应用前的「本金(前)」——
+        #    用户的原话是「点了应用，参数没保存，下次又恢复成原来的」。
+        #    根因：`_alloc_preview` 传给 `allocate_workspace` 的是「量占用」那一刻
+        #    的 `_usages` 快照，里面的 `principal` / `capital_pct` 是应用前的。
+        #    不折算的话 `knob=split` 的 `kprin = 目标 ÷ 本金(前)` 也拿旧值当分母。
+        u0 = mk("A", 100_000, 60_000, 87_000, 0.20)
+        u0.meas_principal, u0.meas_pct = 100_000, 30.0
+        # 应用了一次：本金 10 万 → 33.3 万、百分比 30% → 50%（占用 ×5.56）
+        u1 = PL.rebase(u0, 333_333.33, 50.0)
+        if abs(u1.principal - 333_333.33) > 1e-6 or abs(u1.capital_pct - 50.0) > 1e-9:
+            raise RuntimeError("rebase 没把本金/占用百分比更新成当前配置")
+        if abs(u1.avg_margin - 333_333.33) > 1.0:
+            raise RuntimeError(
+                f"实测占用没按配置折算：{u1.avg_margin:,.0f}，应 ≈ 333,333")
+        # 幂等：再折一次不能又乘一遍
+        u2 = PL.rebase(u1, 333_333.33, 50.0)
+        if abs(u2.avg_margin - u1.avg_margin) > 1e-6:
+            raise RuntimeError("rebase 不幂等：同一配置折算两遍值又变了")
+        # 而且折算之后 `allocate` 必须说「不用改」（缩放 1.00x）
+        sh = PL.allocate([u1], 333_333.33, "equal", basis="usage", knob="split")
+        if abs(sh[0].scale - 1.0) > 1e-6:
+            raise RuntimeError(
+                f"折算到当前配置后缩放应为 1.00x，实际 {sh[0].scale:.4f}x")
+        if abs(sh[0].old_principal - 333_333.33) > 1e-6:
+            raise RuntimeError("预览表的「本金(前)」不是刚应用后的值")
+        # 固定手数不许折：手数不跟本金走，硬乘等于凭空加杠杆
+        fx = mk("F", 100_000, 60_000, 87_000, 0.20, sizing="fixed")
+        fx.meas_principal = 100_000
+        if abs(PL.rebase(fx, 500_000, 30.0).avg_margin - 60_000) > 1e-6:
+            raise RuntimeError("固定手数那条被 rebase 折了 —— 手数根本不会变")
+
         return ("ERC 风险贡献等权（n=1/2/5/12，误差 <1e-6）；"
                 "按本金/按平均占用/按峰值三种口径；固定手数不缩放；手动按比例；"
-                "风险平价挡住 NaN（一条爆仓不连累全体）与 vol=0（不吞掉全部资金）")
+                "风险平价挡住 NaN（一条爆仓不连累全体）与 vol=0（不吞掉全部资金）；"
+                "实测占用按当前配置折算（应用分配后本金(前)是真值、再折不自乘）")
 
     check("组合工作区资金分配（ERC / 三种口径）", _portfolio_plan)
 

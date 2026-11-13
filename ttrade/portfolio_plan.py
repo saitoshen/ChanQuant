@@ -37,7 +37,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pandas as pd
@@ -83,7 +83,10 @@ class Usage:
     sid: str
     name: str
     sizing: str = "capital"
-    principal: float = 0.0        # 分配额（当前配置）
+    # 分配额。🔴 语义是「**量测那一刻**的配置」，不是「现在的配置」：`measure()`
+    # 跑一次完整回测要几秒到几分钟，不可能每次打开预览都重量。配置后来又变了
+    # 的话，`avg_margin` 这些绝对值也是按老本金量的 —— 必须用 `rebase()` 折算
+    principal: float = 0.0
     capital: float = 0.0          # 开仓预算 = principal × capital_pct%
     capital_pct: float = 30.0     # 占用百分比（只有 sizing="capital" 时起作用）
     avg_notional: float = 0.0     # 平均**开仓**名义敞口（|手数| × 开仓价 × 乘数）
@@ -96,6 +99,11 @@ class Usage:
     max_dd: float = 0.0           # 最大回撤（正数）
     bars: int = 0                 # 回测里的交易笔数（老版本存的是 bar 数）
     note: str = ""
+    # 量测时的配置基准。和 `principal` / `capital_pct` 重复是**故意的**：
+    # `rebase()` 会把 `principal` 改写成当前配置，基准得留一份原值，
+    # 否则第二次折算就找不到比例了（会把已折算的值再折一遍）
+    meas_principal: float = 0.0
+    meas_pct: float = 0.0
 
     @property
     def scalable(self) -> bool:
@@ -161,11 +169,14 @@ def measure(cfg, frame: pd.DataFrame | None, res, mult: float = 1.0,
     sid = str(getattr(cfg, "sid", "") or "")
     name = str(getattr(cfg, "title", lambda: "")() or sid)
     principal = float(getattr(cfg, "principal", 0) or 0)
+    pct = float(getattr(cfg, "capital_pct", 0) or 0)
     u = Usage(sid=sid, name=name,
               sizing=str(getattr(cfg, "sizing", "") or "capital"),
               principal=principal,
               capital=float(getattr(cfg, "capital", 0) or 0),
-              capital_pct=float(getattr(cfg, "capital_pct", 0) or 0))
+              capital_pct=pct,
+              # 记下这次量测的基准，`rebase()` 靠它把实测值折到后来的配置上
+              meas_principal=principal, meas_pct=pct)
     if not u.scalable:
         u.note = "固定手数，组合无法调整"
 
@@ -193,7 +204,59 @@ def measure(cfg, frame: pd.DataFrame | None, res, mult: float = 1.0,
     if u.avg_margin <= 0:
         u.note = u.note or "回测里没有开过仓，量不出占用（只能按波动率配权）"
     return u
-    return u
+
+
+_REBASE_TAG = "实测占用已按当前配置折算"
+
+
+def rebase(u: Usage, principal: float, capital_pct: float,
+           capital: float = 0.0, sizing: str = "") -> Usage:
+    """把一条实测记录折算到**当前配置**上（返回新的 `Usage`，不改入参）。
+
+    🔴 这是「点了『应用分配』，下次打开又回到原来的」的根因所在。
+
+    「量占用」是一次完整回测，不可能每次打开预览都重量，所以 `_usages` 里存的
+    是**量测那一刻**的本金和占用百分比。用户点「应用分配」之后配置变了、快照
+    没变，预览表就会一直显示应用前的「本金(前) / 占用%(前)」，看着像没保存；
+    更糟的是 `knob=split` 的 `kprin = 目标 ÷ 本金(前)`、`knob=pct` 的顶格判断
+    `room = 上限 ÷ 占用%(前)`，全都拿旧值当分母 —— 表上给的「本金(后)」也会错。
+
+    折算关系：占用 ≈ 本金 × 占用百分比 × 保证金率 × 仓位节奏，所以
+    `实测占用(当前配置) = 实测占用(量测时) × 本金比 × 百分比比`。
+    折算完 `meas_*` 同步更新成当前值，所以**反复调用是幂等的**
+    （第二次比值为 1，不会再折一遍）。
+
+    `fixed` 口径不折：它按手数下单，本金改了手数一动不动，硬乘等于凭空加杠杆。
+    """
+    p_cur = float(principal or 0.0)
+    c_cur = float(capital_pct or 0.0)
+    sz = str(sizing or u.sizing or "capital")
+    p_old = float(getattr(u, "meas_principal", 0.0) or 0.0) or float(u.principal or 0.0)
+    c_old = float(getattr(u, "meas_pct", 0.0) or 0.0) or float(u.capital_pct or 0.0)
+    rp = rc = 1.0
+    if u_scalable(sz):
+        if p_old > 0 and p_cur > 0:
+            rp = p_cur / p_old
+        if _pct_effective(sz) and c_old > 0 and c_cur > 0:
+            rc = c_cur / c_old
+    r = rp * rc
+    out = replace(u, sizing=sz, principal=p_cur, capital=float(capital or 0.0),
+                  capital_pct=c_cur, meas_principal=p_cur, meas_pct=c_cur)
+    if abs(r - 1.0) <= 1e-9:
+        return out
+    if out.avg_margin > 0 or out.peak_margin > 0:
+        out.avg_margin *= r
+        out.peak_margin *= r
+        out.avg_notional *= r
+        out.peak_notional *= r
+        out.util = out.avg_margin / p_cur if p_cur > 0 else 0.0
+        # 只留**最后一次**的折算标记：每改一次配置就调一次，不去重的话
+        # 说明列会攒成「折算 ×3.33；折算 ×1.07；折算 ×0.92…」
+        keep = [x for x in (out.note or "").split("；")
+                if x and not x.startswith(_REBASE_TAG)]
+        keep.append(f"{_REBASE_TAG} ×{r:.2f}")
+        out.note = "；".join(keep)
+    return out
 
 
 def u_scalable(sizing: str) -> bool:

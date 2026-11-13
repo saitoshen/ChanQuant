@@ -263,6 +263,11 @@ def allocate_workspace(ws: Workspace, pool: list,
 
     `usages`：`{sid: PL.Usage}`，来自回测实测。没给时 `basis` 会退回
     `principal`（没有实测占用就没法按占用校准）。
+
+    🔴 `usages` 是一份**快照**：里面记的是「量占用那一刻」的本金与占用百分比。
+    应用分配之后配置就变了，快照不会自己跟着变 —— 所以要逐条 `PL.rebase()`
+    折算到当前配置，否则预览表永远显示应用前的「本金(前)」，用户会以为
+    「点了应用没保存、下次又回到原来的」。
     """
     cfgs, _ = resolve(ws, pool)
     total = ws.live_total(pool)
@@ -270,14 +275,18 @@ def allocate_workspace(ws: Workspace, pool: list,
         return []
     us = []
     for c in cfgs:
+        # 当前配置（`resolve()` 已经把工作区那份本金贴到 clone 上）
+        cur = dict(principal=float(getattr(c, "principal", 0) or 0),
+                   capital=float(getattr(c, "capital", 0) or 0),
+                   capital_pct=float(getattr(c, "capital_pct", 0) or 0),
+                   sizing=str(getattr(c, "sizing", "") or "capital"))
         u = (usages or {}).get(str(c.sid))
         if u is None:
-            u = PL.Usage(sid=str(c.sid), name=str(getattr(c, "title", lambda: c.sid)()),
-                         sizing=str(getattr(c, "sizing", "") or "capital"),
-                         principal=float(getattr(c, "principal", 0) or 0),
-                         capital=float(getattr(c, "capital", 0) or 0),
-                         capital_pct=float(getattr(c, "capital_pct", 0) or 0),
-                         note="没有回测实测")
+            u = PL.Usage(sid=str(c.sid),
+                         name=str(getattr(c, "title", lambda: c.sid)()),
+                         note="没有回测实测", **cur)
+        else:
+            u = PL.rebase(u, **cur)
         us.append(u)
     basis = ws.basis if (basis_ok(ws.basis) and usages) else "principal"
     return PL.allocate(us, total, ws.mode,
