@@ -5,16 +5,21 @@
 | | 是什么 | 谁在用 |
 |---|---|---|
 | **分配额** `principal` | 这条策略的账户规模，也是净值曲线的起点 | `capital_pct% × principal` = 开仓预算；`risk_pct% × principal` = 每笔止损金额 |
-| **实际占用** | 逐根的 `|手数| × 收盘 × 合约乘数 × 保证金率` | 回答「它平均压了多少钱」 |
+| **实际占用** | **每笔交易开仓时**的 `|手数| × 开仓价 × 合约乘数 × 保证金率`，取均值 | 回答「它出手一次压多少钱」 |
 
-两者差得很远。`capital_pct = 30%` 只是说「**开仓那一刻**拿本金的 30%」，
-而绝大多数日内策略一天里只有两三根有仓 —— 平均占用往往只有分配额的 2%~10%。
-所以「资金等权」如果只看分配额，组合里真正吃风险的是那个恰好经常满仓的策略，
-名义上却是等权。
+两者差得很远，而且**不能用逐根均值去量**。`capital_pct = 30%` 只是说「开仓
+那一刻拿本金的 30%」；按每根 bar 摊平的话，日内策略一天只有两三根有仓，
+其余时间空仓都按 0 进分母，算出来的「平均」只有本金的 1~2% —— 那量的是
+「摊到全天每根 bar 用多少」，不是「出手时用多少」。用户要比的是后者：
+**我给它 30 万，它一开仓实际压多少**，差多少就调多少。
+
+所以「平均占用」= 逐笔开仓占用的均值。「峰值占用」仍然是逐根最大值 ——
+持仓期间保证金跟着结算价走，开仓那一刻通常不是最高点。两者口径不同，
+界面上都写清楚。
 
 `measure()` 把实际占用量出来，`allocate()` 用它反过来把分配额调到位：
-**让每条策略的实际平均占用 = 组合给它的那份钱**。这就是「比较一下，相应调整
-策略的资金仓位分配」的落地方式。
+**让每条策略的平均开仓占用 = 组合给它的那份钱**。这就是「比较一下，相应
+调整策略的资金仓位分配」的落地方式。
 
 ## 四种仓位口径对缩放的反应
 
@@ -60,15 +65,15 @@ class Usage:
     sizing: str = "capital"
     principal: float = 0.0        # 分配额（当前配置）
     capital: float = 0.0          # 开仓预算 = principal × capital_pct%
-    avg_notional: float = 0.0     # 平均名义敞口（|手数| × 收盘 × 乘数）
-    peak_notional: float = 0.0
-    avg_margin: float = 0.0       # 平均占用（名义 × 保证金率）—— 主口径
-    peak_margin: float = 0.0
-    util: float = 0.0             # avg_margin / principal
+    avg_notional: float = 0.0     # 平均**开仓**名义敞口（|手数| × 开仓价 × 乘数）
+    peak_notional: float = 0.0    # 逐根最大名义敞口（含持仓浮动）
+    avg_margin: float = 0.0       # 平均开仓占用（名义 × 保证金率）—— 主口径
+    peak_margin: float = 0.0      # 逐根最大占用
+    util: float = 0.0             # avg_margin / principal（出手时用了分配额的几成）
     vol: float = 0.0              # 年化波动（策略净值）
     ret: float = 0.0              # 累计收益
     max_dd: float = 0.0           # 最大回撤（正数）
-    bars: int = 0                 # 有效 bar 数
+    bars: int = 0                 # 回测里的交易笔数（老版本存的是 bar 数）
     note: str = ""
 
     @property
@@ -107,11 +112,20 @@ def measure(cfg, frame: pd.DataFrame | None, res, mult: float = 1.0,
             margin_rate: float = 1.0) -> Usage:
     """把一条策略「实际用了多少钱」量出来。
 
-    `frame` 要有 `close` 且索引和 `res.position` 对得上（通常就是回放用的
-    原始行情）；`mult` / `margin_rate` 从品种信息来（`replay.make_bt` 里那份）。
+    🔴 **占用口径只有一处实现**：`backtest._metrics()` 算完放进
+    `res.metrics`，这里只读。两处各算一套的话，绩效页显示的占用和配权用的
+    占用迟早会不一样，而且不会报错。
 
-    占用按 `|手数| × 收盘 × 乘数 × 保证金率` 逐根算再取均值。**不按开仓价算**：
-    持仓期间保证金跟着结算价走，用开仓价会在趋势行情里系统性低估。
+    平均占用 = **每笔交易开仓时**的保证金，取均值（`|手数| × 开仓价 × 乘数
+    × 保证金率`）。不是逐根 bar 的均值 —— 那个会把空仓时间算进分母，日内
+    策略一天两三根有仓，摊出来的「平均」只有本金的 1~2%，看着像「这条策略
+    不用钱」，其实每次出手都用满了 `capital_pct`。
+
+    峰值占用是逐根的最大值（持仓期间保证金跟结算价走，开仓那一刻通常不是
+    最高点），所以两者口径不同，界面要写清楚。
+
+    `frame` / `mult` / `margin_rate` 保留在签名里是为了兼容老调用方（早先这里
+    自己按收盘价逐根算），现在不再使用 —— 占用完全从 `res.metrics` 来。
     """
     sid = str(getattr(cfg, "sid", "") or "")
     name = str(getattr(cfg, "title", lambda: "")() or sid)
@@ -127,26 +141,15 @@ def measure(cfg, frame: pd.DataFrame | None, res, mult: float = 1.0,
     u.vol = abs(float(met.get("ann_vol") or 0.0))
     u.ret = float(met.get("total_return") or 0.0)
     u.max_dd = abs(float(met.get("max_dd") or 0.0))
-
-    pos = getattr(res, "position", None)
-    if pos is None or frame is None or "close" not in getattr(frame, "columns", []):
-        u.note = u.note or "没有持仓/行情序列，只能按波动率配权"
-        return u
-    idx = pd.DatetimeIndex(pos.index)
-    qty = pd.Series(np.asarray(pos, dtype=float), index=idx).abs()
-    close = pd.to_numeric(frame["close"], errors="coerce").reindex(idx).ffill()
-    ok = np.isfinite(qty.to_numpy()) & np.isfinite(close.to_numpy())
-    if not ok.any():
-        u.note = u.note or "持仓与行情对不上"
-        return u
-    notional = (qty * close * float(mult or 1.0)).to_numpy()[ok]
-    margin = notional * float(margin_rate or 1.0)
-    u.bars = int(notional.size)
-    u.avg_notional = float(notional.mean())
-    u.peak_notional = float(notional.max())
-    u.avg_margin = float(margin.mean())
-    u.peak_margin = float(margin.max())
+    u.avg_notional = float(met.get("avg_notional") or 0.0)
+    u.peak_notional = float(met.get("peak_notional") or 0.0)
+    u.avg_margin = float(met.get("avg_margin") or 0.0)
+    u.peak_margin = float(met.get("peak_margin") or 0.0)
     u.util = u.avg_margin / principal if principal > 0 else 0.0
+    u.bars = int(met.get("n_trades") or 0)
+    if u.avg_margin <= 0:
+        u.note = u.note or "回测里没有开过仓，量不出占用（只能按波动率配权）"
+    return u
     return u
 
 
@@ -268,13 +271,14 @@ def allocate(usages: list[Usage], total: float, mode: str = "equal",
     | basis | 含义 | 什么时候用 |
     |---|---|---|
     | `principal`（默认） | 分到多少就设成多少本金 | 正常组合管理。总资金 ÷ N，可预期，永远不会超 |
-    | `usage` | 让**平均保证金占用**等于分到的那份 | 想让每条策略真正吃一样多的钱。实测占用率常只有 1%，本金会被放大几十~几百倍 |
-    | `peak` | 同上，但对齐**峰值占用** | 比 `usage` 保守：问的是「最坏那一刻压多少钱」 |
+    | `usage` | 让**平均开仓占用**等于分到的那份 | 想让每条策略出手时真正压一样多的钱 |
+    | `peak` | 同上，但对齐**峰值占用**（逐根最大值） | 比 `usage` 保守：问的是「最坏那一刻压多少钱」 |
 
-    🔴 `usage` / `peak` 会让 `本金合计 ≫ 总资金`。这不是 bug：`capital_pct=30%`
-    只是「开仓那一刻用 30%」，日内策略大部分时间空仓，平均占用往往只有
-    分配额的 1%，对齐它就是要求它平均持仓放大 300 倍。所以这两个口径必须
-    配着「本金合计 / 总资金」的告警一起看，默认不要开。
+    🔴 `usage` / `peak` 往往会让 `本金合计 > 总资金`，因为 `capital_pct=30%`
+    只是「开仓那一刻用 30%」—— 平均开仓占用通常只有分配额的 20%~40%
+    （满仓的策略也可能接近 100%）。对齐「平均开仓占用」意味着本金放大 2~5 倍；
+    对齐「峰值占用」时倍数还可能更高（持仓期间价格涨上去，保证金跟着涨）。
+    所以这两个口径要配着「本金合计 / 总资金」的告警一起看，默认用 `principal`。
 
     `max_scale=None` 表示**不封顶**：封顶会把几条策略压成同一个倍数，
     权重差异全被抹掉（实测 4 条策略里 3 条撞 20 倍上限，风险平价和等权

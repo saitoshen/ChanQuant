@@ -45,6 +45,37 @@ def _run() -> tuple[bool, list[str]]:
     lines.append(f"log_dir     = {log_dir()}")
     lines.append("")
 
+    def _store_isolated():
+        """自检绝不能读写用户的组合 / 策略库。
+
+        这一条是补一次真实事故：自检会搭真窗口，里面有切页签、加策略这些动作，
+        它们在生产里就该落盘 —— 结果跑一轮自检就把用户的 `portfolio.json` 删掉
+        一条、二十几条本金重排了。`run()` 现在把整个存储目录重定向到临时目录，
+        这里钉死它确实生效。
+        """
+        from ttrade import strategy_store as S2
+
+        cur = S2.store_dir()
+        if os.path.abspath(cur) == os.path.abspath(user_dir()):
+            raise RuntimeError(
+                f"存储目录还是用户目录（{cur}）—— 自检会改坏用户数据")
+        if not os.path.isdir(cur):
+            raise RuntimeError(f"重定向到的目录不存在：{cur}")
+        # 写一次再读回来，确认落的是临时目录
+        probe = "selftest_probe.json"
+        S2._save(probe, {"x": 1})                      # noqa: SLF001
+        hit = os.path.join(cur, probe)
+        ok = os.path.exists(hit)
+        try:
+            os.remove(hit)
+        except OSError:
+            pass
+        if not ok:
+            raise RuntimeError(f"写盘没落在重定向目录里：{hit}")
+        return f"存储目录 → {cur}（不是用户目录）"
+
+    check("自检不碰用户数据（存储目录已重定向）", _store_isolated)
+
     def _count(market: str) -> str:
         d = data_dir(market)
         if not os.path.isdir(d):
@@ -2049,12 +2080,13 @@ def _run() -> tuple[bool, list[str]]:
 
     check("分钟级期权 IV（取档 / 无前视 / 年化）", _opt_iv_period)
 
-    def _factor_window_days():
-        """标准化窗口的单位是**交易日**，不是 bar 根数。
+    def _factor_window_bars():
+        """标准化窗口的单位是 **bar 根数**，不做周期换算。
 
-        按根算的错法不报错、只让结论不可比：同一个 252 在 5m 上只有 5 天
-        （估的是「最近五天的波动」，符号一天翻 0.8 次），在周线上是五年
-        （选「近 1 年」全空）。所以逐档钉死换算结果，并且日线必须逐位不变。
+        曾经按交易日换算过一版（5m 上 252 = 12000 根），后来改回来了。要钉住的
+        是三件事：① 同一个 252 在任何周期上都是 252 根；② 日线逐位不变（历史
+        IC 基线都按 252 根算的）；③ 5m 的第一个有效值落在第 63 根，不是第
+        3024 根 —— 后者会让回测窗口前两个月因子全空，过滤条件形同不存在。
         """
         import numpy as np
         import pandas as pd
@@ -2069,17 +2101,13 @@ def _run() -> tuple[bool, list[str]]:
                                for d in days for i in range(48)])
         wk = pd.DatetimeIndex([days[0] + pd.Timedelta(weeks=i) for i in range(80)])
 
-        # ① 各档换算：日线 1:1、1h ×6、5m ×48、周线 ÷5（一周 5 个交易日）
-        for name, idx, lo, hi in (
-            ("日线", d1, 252, 252),
-            ("1h", h1, 252 * 6, 252 * 6),
-            ("5m", m5, 252 * 48, 252 * 48),
-            ("周线", wk, 49, 51),
-        ):
-            got = F.window_bars(252, idx)
-            if not (lo <= got <= hi):
-                raise RuntimeError(
-                    f"{name} 的 252 个交易日换算成 {got} 根，应在 {lo}~{hi}")
+        # ① 各档都是 252 根：窗口参数不跟着周期变长度
+        for name, idx in (("日线", d1), ("1h", h1), ("5m", m5), ("周线", wk)):
+            got = F.win_bars(252)
+            if got != 252:
+                raise RuntimeError(f"{name} 的窗口算成 {got} 根，应为 252 根")
+            if F.win_bars(0) != 1:
+                raise RuntimeError("窗口 0 应钳到 1 根（rolling(0) 会抛异常）")
 
         # ② 日线必须**逐位不变**：历史 IC 基线和所有日线结论都按 252 根算的
         rng = np.random.default_rng(23)
@@ -2092,42 +2120,42 @@ def _run() -> tuple[bool, list[str]]:
                            rtol=0, atol=1e-12):
             raise RuntimeError("日线标准化被「按天」改动带偏了（必须逐位不变）")
 
-        # ③ 5m 的预热期是 63 个交易日（3024 根），不是 63 根
+        # ③ 5m 的预热是 63 根（252 的 1/4），和日线一模一样
         s5 = pd.Series(np.arange(len(m5), dtype=float), index=m5)
         z5 = F.standardize(s5, window=252, method="z")
         first = int(z5.notna().to_numpy().argmax())      # 0-based
-        nb = F.window_bars(252, m5)
+        nb = F.win_bars(252)
         if first != nb // 4 - 1:
             raise RuntimeError(
-                f"5m 的首个有效值在第 {first + 1} 根，应为第 {nb // 4} 根"
-                f"（{nb} 根窗口的 1/4）")
-        if first < 3000:
-            raise RuntimeError(f"5m 的窗口还是按根算的（首值第 {first + 1} 根）")
+                f"5m 的首个有效值在第 {first + 1} 根，应为第 {nb // 4} 根")
+        if first > 200:
+            raise RuntimeError(
+                f"5m 的窗口又被按交易日换算了（首值第 {first + 1} 根，"
+                "按天算会是 3024 根）")
 
-        # ④ IC / 分桶窗口走同一套换算，否则「标准化按天、IC 按根」会打架
+        # ④ IC / 分桶窗口同一个口径，否则「标准化按根、IC 按天」会打架
         from ttrade import factor_metrics as M
         raw5 = pd.Series(rng.normal(size=len(m5)).cumsum(), index=m5)
         fwd5 = raw5.pct_change().shift(-1)
-        w60 = F.window_bars(60, m5)
-        if w60 != 60 * 48:
-            raise RuntimeError(f"5m 上 60 个交易日算成 {w60} 根，应为 2880")
+        w60 = F.win_bars(60)
+        if w60 != 60:
+            raise RuntimeError(f"窗口 60 算成 {w60} 根，应为 60 根")
         ic5 = M.ic_series(raw5, fwd5, 60)
         first_ic = int(ic5.notna().to_numpy().argmax())      # 0-based
         if int(ic5.notna().sum()) == 0:
-            raise RuntimeError("IC 序列整列为空：滚动窗口没跟着按天换算")
-        if first_ic < 1400:
+            raise RuntimeError("IC 序列整列为空：滚动窗口没跟上")
+        if first_ic > 200:
             raise RuntimeError(
-                f"IC 第一个有效值在第 {first_ic + 1} 根，窗口还在按根算"
-                f"（按天算要等到第 {w60 // 2} 根）")
+                f"IC 第一个有效值在第 {first_ic + 1} 根，窗口被按天算过"
+                f"（按根算第 {w60 // 2} 根就该出值）")
         q = M.quantile_returns(raw5, fwd5, 5, 60)
         if len(q) != 5:
             raise RuntimeError(f"分位收益只有 {len(q)} 桶，应为 5")
 
-        return (f"日线 252 根（逐位不变）/ 1h {F.window_bars(252, h1)} / "
-                f"5m {nb}（预热 {first + 1} 根）/ 周线 {F.window_bars(252, wk)}；"
-                "IC、分位同口径")
+        return (f"各周期都是 252 根（日线逐位不变）/ 5m 首值第 {first + 1} 根 / "
+                f"IC 首值第 {first_ic + 1} 根；分位同口径")
 
-    check("因子窗口按交易日（不是根）", _factor_window_days)
+    check("因子窗口按根（不是交易日）", _factor_window_bars)
 
     def _portfolio_plan():
         """组合工作区的资金分配：ERC / 三种口径 / 缩放。
@@ -2227,56 +2255,85 @@ def _run() -> tuple[bool, list[str]]:
     check("组合工作区资金分配（ERC / 三种口径）", _portfolio_plan)
 
     def _occupancy_diag():
-        """绩效页的「资金占用」三列：平均占用 / 峰值占用 / 利用率。
+        """绩效页的「资金占用」三列：平均开仓占用 / 峰值占用 / 利用率。
 
-        这一层也是「不报错但数错」的类型：占用忘了乘合约乘数、忘了乘保证金率、
-        拿开仓价而不是收盘算、组合层把各成分峰值直接相加当成真实峰值。
-        全部用**能手算的假数据**钉死，真数据上的对拍另跑 `check_diag.py`。
+        这一层也是「不报错但数错」的类型：
+        - 占用忘了乘合约乘数 / 忘了乘保证金率
+        - **平均用逐根 bar 算而不是逐笔开仓算** —— 这是最隐蔽的一个，算出来的
+          数「看起来合理」（本金的百分之几），但量的根本不是「出手时用多少钱」，
+          而且会随空仓时间长短变化（同一套仓位，交易越稀疏这个数越小）
+        - 组合层把各成分峰值直接相加当成真实峰值
+
+        全部用**能手算的假数据**钉死。
         """
         import numpy as np
         import pandas as pd
 
         from ttrade import backtest as BT
 
-        # ① 单品种：4 根，持仓 [0, 2, -1, 0]，收盘 100/200/300/400
-        #    名义 = |手数| × 收盘 × 乘数(10)
-        #         = [0, 2×200×10=4000, 1×300×10=3000, 0]
-        #    平均名义 = 1750、峰值名义 = 4000
-        #    保证金率 0.1 → 平均占用 175、峰值 400
         idx = pd.date_range("2024-01-01", periods=4, freq="D")
         close = pd.Series([100.0, 200.0, 300.0, 400.0], index=idx)
         pos = pd.Series([0.0, 2.0, -1.0, 0.0], index=idx)
         eq = pd.Series([100_000.0, 100_500.0, 100_800.0, 101_000.0], index=idx)
-        m = BT._metrics(eq, pos, [], base=100_000.0,
+
+        def tr(lots, px):
+            return BT.Trade(entry_date=idx[0], exit_date=idx[1],
+                            entry_price=float(px), exit_price=float(px),
+                            ret=0.0, bars=1, lots=float(lots))
+
+        # ① 平均 = **逐笔开仓**占用的均值，乘数 10、保证金率 0.1
+        #    2 手 @200 → 2×200×10×0.1 = 400
+        #    1 手 @300 → 300
+        #    0.5 手 @400 → 200
+        #    平均 = 300、平均名义 = 3000
+        trades = [tr(2, 200), tr(1, 300), tr(0.5, 400)]
+        m = BT._metrics(eq, pos, trades, base=100_000.0,
                         price=close, mult=10.0, margin_rate=0.1)
-        for k, want in (("avg_notional", 1750.0), ("peak_notional", 4000.0),
-                        ("avg_margin", 175.0), ("peak_margin", 400.0)):
+        for k, want in (("avg_margin", 300.0), ("avg_notional", 3000.0)):
             if abs(float(m[k]) - want) > 1e-9:
                 raise RuntimeError(f"{k} 应为 {want}，实际 {m[k]}")
-        if abs(float(m["util"]) - 175.0 / 100_000.0) > 1e-15:
-            raise RuntimeError(f"利用率应为 175/100000，实际 {m['util']}")
+        if abs(float(m["util"]) - 300.0 / 100_000.0) > 1e-15:
+            raise RuntimeError(f"利用率应为 300/100000，实际 {m['util']}")
 
-        # ② 不传价格 → 恒 0（组合层/老路径走这里，绩效页显示「—」而不是假数）
-        m0 = BT._metrics(eq, pos, [], base=100_000.0)
-        if any(float(m0[k]) != 0.0 for k in
-               ("avg_notional", "peak_notional", "avg_margin", "peak_margin", "util")):
-            raise RuntimeError("没传价格时占用必须是 0，不能凭空给数")
-        # 保证金率为 0 时同样不参与（除零陷阱）
-        m0 = BT._metrics(eq, pos, [], base=100_000.0,
-                         price=close, mult=10.0, margin_rate=0.0)
-        if float(m0["avg_margin"]) != 0.0:
-            raise RuntimeError("保证金率为 0 时占用必须是 0")
+        # ①b **不能是逐根均值**：逐根算出来是 175（[0,4000,3000,0]×0.1 的均值），
+        #     和逐笔的 300 差得远。这条断言就是防回退。
+        if abs(float(m["avg_margin"]) - 175.0) < 1e-9:
+            raise RuntimeError("平均占用退化成了逐根 bar 的均值")
 
-        # ③ 空仓到底：占用必须是 0，哪怕价格在涨
-        mz = BT._metrics(eq, pd.Series(0.0, index=idx), [], base=100_000.0,
+        # ①c 交易越稠密不该改变「出手时用多少」：再插 3 笔同样大小的开仓，
+        #     平均还是 300 —— 逐根均值会跟着空仓比例漂
+        dense = trades + [tr(2, 200), tr(2, 200), tr(2, 200)]
+        m2 = BT._metrics(eq, pos, dense, base=100_000.0,
                          price=close, mult=10.0, margin_rate=0.1)
-        if float(mz["avg_margin"]) != 0.0 or float(mz["peak_margin"]) != 0.0:
-            raise RuntimeError("全程空仓却有占用")
-        # 峰值 ≥ 平均，这条恒成立
-        if not float(m["peak_margin"]) >= float(m["avg_margin"]):
-            raise RuntimeError("峰值占用小于平均占用")
+        want = (400 * 4 + 300 + 200) / 6.0
+        if abs(float(m2["avg_margin"]) - want) > 1e-9:
+            raise RuntimeError(f"加了笔数后平均值应为 {want}，实际 {m2['avg_margin']}")
 
-        # ④ 键必须进 `_METRIC_KEYS`：老报告缺这一项时按 0 补齐，
+        # ② 峰值走**逐根**：名义 [0, 2×200×10=4000, 1×300×10=3000, 0]
+        #    → 峰值名义 4000、峰值占用 400
+        for k, want in (("peak_notional", 4000.0), ("peak_margin", 400.0)):
+            if abs(float(m[k]) - want) > 1e-9:
+                raise RuntimeError(f"{k} 应为 {want}，实际 {m[k]}")
+        if float(m["peak_margin"]) < float(m["avg_margin"]):
+            raise RuntimeError("峰值占用小于平均开仓占用")
+
+        # ③ 平均**不依赖行情序列**（只要交易记录），峰值才依赖价格。
+        #    组合层 / 老结果没传 price 时，平均值该照样给出来
+        m0 = BT._metrics(eq, pos, trades, base=100_000.0, mult=10.0, margin_rate=0.1)
+        if abs(float(m0["avg_margin"]) - 300.0) > 1e-9:
+            raise RuntimeError("没传价格时平均开仓占用被清零了 —— 它只需要交易记录")
+        if float(m0["peak_margin"]) != 0.0:
+            raise RuntimeError("没传价格时峰值占用必须是 0，不能凭空给数")
+
+        # ④ 没开过仓 / 保证金率为 0 → 必须是 0，不能凭空给数（除零陷阱）
+        for kw in ({"price": close, "mult": 10.0, "margin_rate": 0.1},
+                   {"price": close, "mult": 10.0, "margin_rate": 0.0}):
+            mz = BT._metrics(eq, pos, [], base=100_000.0, **kw)
+            if any(float(mz[k]) != 0.0 for k in
+                   ("avg_notional", "avg_margin", "util")):
+                raise RuntimeError("没开过仓 / 保证金率为 0 时占用必须是 0")
+
+        # ⑤ 键必须进 `_METRIC_KEYS`：老报告缺这一项时按 0 补齐，
         #    否则绩效页 `m.get(...)` 拿到 None 会写成「—」而不是 0
         for k in ("avg_notional", "peak_notional", "avg_margin", "peak_margin", "util"):
             if k not in BT._METRIC_KEYS:
@@ -6242,11 +6299,44 @@ def run() -> int:
     """执行自检并返回退出码。"""
     from ttrade.paths import log_dir
 
+    # 🔴 自检会把**真实主窗口**搭起来，里面有切页签、加策略、改本金这些模拟
+    # 动作。它们在生产里本来就该落盘，但跑自检时绝不能改用户的组合 —— 实测
+    # 跑一轮就把 `portfolio.json` 里一条策略删没了、二十几条本金被重排。
+    #
+    # 所以整个存储目录重定向到临时目录（先把现有 json 复制一份当快照）。
+    # 日志不在这个目录里，`selftest.log` 的位置不变，CI 仍然找得到。
+    tmp = ""
+    try:
+        import tempfile
+
+        from ttrade import strategy_store as _SStore
+
+        tmp = tempfile.mkdtemp(prefix="cq_selftest_")
+        _SStore.set_store_dir(tmp, seed=True)
+    except Exception:  # noqa: BLE001 - 重定向失败也要把自检跑完
+        tmp = ""
+
     try:
         ok, lines = _run()
     except Exception:  # noqa: BLE001 - 连路径都取不到时的兜底
         ok = False
         lines = ["自检初始化失败：", traceback.format_exc()]
+    finally:
+        if tmp:
+            try:
+                from ttrade import strategy_store as _SStore
+
+                _SStore.set_store_dir("")       # 恢复默认目录
+            except Exception:  # noqa: BLE001
+                pass
+            # 全绿就把临时目录删掉；有红的话留着，好让人去里面翻现场
+            if ok:
+                try:
+                    import shutil
+
+                    shutil.rmtree(tmp, ignore_errors=True)
+                except Exception:  # noqa: BLE001
+                    pass
 
     text = "\n".join(lines)
     try:

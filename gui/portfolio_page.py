@@ -1320,7 +1320,7 @@ class PortfolioPage(QWidget):
 
         self.tbl_strat = self._table(
             ["名称", "标的", "策略", "仓位", "账户", "理论", "状态",
-             "平均占用", "峰值占用", "利用率"]
+             "平均开仓占用", "峰值占用", "利用率"]
         )
         # 多选是为了组合报告。双击原来是「启动 / 停止」，但那个动作有同名按钮，
         # 而「看一眼这条策略的历史表现」没有别的入口 —— 双击给后者更值。
@@ -1520,7 +1520,9 @@ class PortfolioPage(QWidget):
         if self._wss[i] is self._ws:
             return
         self._ws = self._wss[i]
-        self._save_ws()
+        # 只记「停在哪个分页」，不重写整个文件 —— 二十几条本金为了一个 id
+        # 整份重写一遍，写一半崩了就是配置全丢
+        WS.set_active(self._ws.id)
         self._sync_ws()
         self._fill_strategies()
         self._render()
@@ -1696,7 +1698,7 @@ class PortfolioPage(QWidget):
         empty = [u.name for u in usages if u.avg_margin <= 0]
         msg = f"量完 {len(usages)} 条占用"
         if empty:
-            msg += f"（其中 {len(empty)} 条一路空仓，平均占用 0）"
+            msg += f"（其中 {len(empty)} 条一笔都没开过，量不出占用）"
         if bad:
             msg += f"；{len(bad)} 条没量出来：{'；'.join(bad[:2])}"
         self._on_log(msg)
@@ -2371,11 +2373,14 @@ class PortfolioPage(QWidget):
         view.update_kline(rp.df)
 
     def _render_diag(self, t, i: int, cfg) -> None:
-        """三列资金占用：平均保证金占用 / 峰值保证金占用 / 利用率。
+        """三列资金占用：平均开仓占用 / 峰值保证金占用 / 利用率。
 
-        和「仓位」那一列是两件事：仓位写的是 `capital_pct%`（开仓那一刻用多少），
-        这三列写的是**逐根平均**真的压了多少钱。日内策略一天只有两三根有仓，
-        所以常见的情形是「仓位 30%、利用率 1%」—— 这两个数摆在一起才看得懂。
+        **平均 = 每笔交易开仓时压的钱**，取均值。不是逐根 bar 的均值 ——
+        逐根会把空仓时间算进分母（日内策略一天只有两三根有仓），算出来只有
+        本金的 1~2%，量的是「摊到每根 bar 用多少」而不是「出手一次用多少」。
+        要跟「组合给它分了多少钱」比，必须用后者。
+
+        峰值是逐根最大值（持仓期间保证金跟结算价走），和平均不是同一口径。
 
         没量过写「—」不写 0：0 会被读成「这条策略不用钱」。
         """
@@ -2393,35 +2398,38 @@ class PortfolioPage(QWidget):
             it = t.item(i, 7)
             if it is not None:
                 it.setToolTip(
-                    "量不出来：" + (u.note or "回测里一路空仓，没有持仓可算占用"))
+                    "量不出来：" + (u.note or "回测里一笔都没开过，没有占用可算"))
             return
         # 金额一律用「万」：26 条策略的占用从几千到几十万，写元位没人读得出量级
         self._set_cell(t, i, 7, f"{u.avg_margin / 10000:,.2f} 万", C_TEXT)
         self._set_cell(t, i, 8, f"{u.peak_margin / 10000:,.2f} 万", C_TEXT)
         self._set_cell(t, i, 9, f"{u.util * 100:.2f}%",
-                       C_BAD if u.util > 0.5 else C_TEXT)
+                       C_BAD if u.util > 0.9 else C_TEXT)
         it = t.item(i, 7)
         if it is not None:
             it.setToolTip(
-                f"平均名义敞口 {u.avg_notional / 10000:,.2f} 万 "
-                f"× 保证金率 = 平均占用 {u.avg_margin / 10000:,.2f} 万\n"
-                f"口径：|手数| × 收盘 × 乘数 × 保证金率，逐根算再取均值\n"
-                f"（不按开仓价 —— 持仓期间保证金跟结算价走）\n"
+                f"每笔开仓时平均压 {u.avg_margin / 10000:,.2f} 万"
+                f"（名义敞口 {u.avg_notional / 10000:,.2f} 万 × 保证金率）\n"
+                "口径：|手数| × 开仓价 × 乘数 × 保证金率，**逐笔取均值**\n"
+                "（不是逐根 bar 的均值 —— 那个会被空仓时间稀释成 1~2%）\n"
                 f"本金 {u.principal / 10000:,.1f} 万，"
-                f"开仓预算 {u.capital / 10000:,.1f} 万")
+                f"开仓预算 {u.capital / 10000:,.1f} 万，"
+                f"共 {u.bars} 笔")
         it = t.item(i, 8)
         if it is not None:
             it.setToolTip(
-                f"峰值名义敞口 {u.peak_notional / 10000:,.2f} 万 "
-                f"（峰值率 {u.peak_margin / u.principal * 100:.1f}% 本金）"
-                if u.principal > 0 else
-                f"峰值名义敞口 {u.peak_notional / 10000:,.2f} 万")
+                f"持仓期间压过的最高占用 {u.peak_margin / 10000:,.2f} 万"
+                f"（逐根最大值，含持仓浮动；名义峰值 "
+                f"{u.peak_notional / 10000:,.2f} 万）"
+                + (f"\n= 本金的 {u.peak_margin / u.principal * 100:.1f}%"
+                   if u.principal > 0 else ""))
         it = t.item(i, 9)
         if it is not None:
             it.setToolTip(
-                "平均占用 ÷ 本金。这是**实际压着的钱**占分配额的比例。\n"
-                "日内策略常见 1~3%：一天只有两三根有仓，其余时间空仓。\n"
-                "要让这条策略真正吃满分配额，用上面的「校准 = 按平均占用」.")
+                "平均开仓占用 ÷ 本金 = **出手时用了分配额的几成**。\n"
+                "`仓位` 那列写的 capital_pct% 就是这个数的上限：\n"
+                "30% 仓位 + 利用率 28% → 它每次都几乎用满；\n"
+                "利用率只有 8% 说明大部分开仓是被止损/风险口径卡住了手数。")
 
     def _render(self) -> None:
         self._render_ts = time.monotonic()

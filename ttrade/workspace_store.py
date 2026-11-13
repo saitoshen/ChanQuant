@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -32,7 +33,7 @@ from dataclasses import dataclass, field
 from . import portfolio_plan as PL
 from . import strategy_store as SStore
 
-FILE = "workspaces.json"
+FILE = SStore.WS_FILE
 DEFAULT_NAME = "默认组合"
 
 
@@ -166,7 +167,20 @@ def load_workspaces(pool: list | None = None) -> list[Workspace]:
     return [_migrate(pool)]
 
 
+def _writable() -> bool:
+    """永远可写 —— 隔离靠 `strategy_store.set_store_dir()`，不靠开关。
+
+    早先这里用一个 `CQ_NO_SAVE` 环境变量把写操作变成 no-op，用来防自检改用户
+    数据。那个办法不行：自检里有「写完读回来」的用例，一刀切成 no-op 会把它们
+    一起打红；而且调用点十几处，漏一个就是静默的数据事故。现在改成整目录重定向
+    （自检写临时目录，读的是真实数据的快照），这里不需要再挡。
+    """
+    return True
+
+
 def save_workspaces(items: list[Workspace], active: str = "") -> None:
+    if not _writable():
+        return
     for w in items:
         if not w.id:
             w.id = uuid.uuid4().hex[:12]
@@ -182,6 +196,13 @@ def active_id() -> str:
 
 
 def set_active(wid: str) -> None:
+    """只记「停在哪个分页」。
+
+    切页签不该重写整个文件：`items` 里有二十几条本金，为了记一个 id 把整份
+    重写一遍，写一半崩了就是配置全丢。这里只改 `active` 一个字段。
+    """
+    if not _writable():
+        return
     raw = _raw()
     raw["active"] = str(wid or "")
     SStore._save(FILE, raw)             # noqa: SLF001

@@ -89,17 +89,18 @@ def newey_west_t(x: np.ndarray, lags: int | None = None) -> float:
 def ic_series(
     factor: pd.Series, fwd: pd.Series, window: int = 252
 ) -> pd.Series:
-    """滚动 IC 序列。`window` 单位是**交易日**（`252` = 近一年）。
+    """滚动 IC 序列。`window` 单位是 **bar 根数**（`F.win_bars`）。
 
     用滚动 Pearson（因子已标准化，与秩相关差别很小），因为滚动 Spearman
     要对每个窗口重新排序，5000 根 × 252 窗口会慢到没法在 GUI 里用。
     单点 IC（`ic_full`）仍然是严格的 Spearman。
 
-    窗口必须先按 bar 密度换成根数：5m 上 252 根只有 5 天，滚动 IC 会变成
-    「最近五天的相关系数」，抖得没法看，而且和日线的 252 天不可比。
+    窗口就是根数，和 `standardize` 同一个口径：5m 上 252 根 = 最近五个交易日
+    的 IC。和标准化窗口同长度才说得通 ——「用最近 N 根估分布的 z 值，
+    再用另一个长度估 IC」会变成两个时间尺度混在一起。
     """
-    w = F.window_bars(window, factor.index)
-    # 同 `standardize`：min_periods 不许超过窗口（月线折出来只有 12 根）
+    w = F.win_bars(window)
+    # 同 `standardize`：min_periods 不许超过窗口（窗口调得很小时会凑不满）
     mp = int(min(w, max(30, w // 2)))
     d = pd.concat([factor.rename("f"), fwd.rename("r")], axis=1)
     return d["f"].rolling(w, min_periods=mp).corr(d["r"])
@@ -137,7 +138,7 @@ def ic_stats(
 
     # 方向胜率：因子符号与前向收益符号一致的比例（用滚动中位数去中心，避免
     # 因子整体偏正时胜率被系统性拉高）
-    wmed = F.window_bars(window, d.index)
+    wmed = F.win_bars(window)
     med = d["f"].rolling(wmed, min_periods=int(min(wmed, 30))).median()
     sgn_f = np.sign(d["f"] - med)
     sgn_r = np.sign(d["r"])
@@ -170,12 +171,10 @@ def quantile_returns(
     """PIT 分桶后的各组平均前向收益。
 
     分位用滚动窗口算，因此每一桶的成员随日期变化，不会泄漏未来分布。
-    `window` 单位是**交易日**，靠 `F.window_bars()` 换成根数 —— 直接用
-    根数的话 5m 上只有五天，分桶实际上是在「最近五天里排序」，桶均值的
-    统计意义就没了。
+    `window` 单位是 **bar 根数**（`F.win_bars`），与 `standardize` 同一口径。
     """
     n = int(n_buckets)
-    w = F.window_bars(window, factor.index)
+    w = F.win_bars(window)
     mp = int(min(w, max(30, w // 4)))
     pct = factor.rolling(w, min_periods=mp).rank(pct=True)
     # 0~1 → 1~n

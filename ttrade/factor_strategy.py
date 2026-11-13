@@ -108,10 +108,10 @@ def _clean_tiers(tiers) -> list[list[float]]:
 @dataclass
 class FactorConfig:
     # 因子构造
-    # window 是**交易日**（252 ≈ 近一年），不是 bar 根数：日线 252 根、1h 约
-    # 1260 根、5m 约 12000 根。换算见 `factors.window_bars()`。同一个参数在
-    # 各周期上的含义必须一样，否则「5m 上 IC 更好」只是因为窗口缩到了五天。
-    window: int = 252            # 标准化窗口（也是 IC 统计窗口，单位：交易日）
+    # window 是 **bar 根数**，不做任何周期换算（见 `factors.win_bars`）。
+    # 日线 252 根 ≈ 一年；5m 上 252 根 ≈ 五个交易日 —— 量的是「本周期自己的
+    # 近期状态」，日内策略就该跟着这五天走，而不是去和日线的「一年」对齐。
+    window: int = 252            # 标准化窗口（也是 IC 统计窗口，单位：根）
     method: str = "z"            # z / rank
     horizon: int = 5             # 预测/评估的前向收益期数
 
@@ -457,9 +457,9 @@ def _orientation_frame(
     elif cfg.orient == "long_low":
         ori = pd.DataFrame(-1.0, index=fmat.index, columns=fmat.columns)
     else:
-        # `min_obs` 是**根数**（expanding 的起始样本量），要按 bar 密度换算：
-        # 5m 上 126 根只有两天半，两天半的 IC 定方向等于抛硬币
-        min_obs = max(120, F.window_bars(max(1, int(cfg.window) // 2), fmat.index))
+        # `min_obs` 是**根数**（expanding 的起始样本量），取窗口的一半：
+        # 半个窗口的 IC 定方向已经够用，再短就是拿噪声定正负
+        min_obs = max(120, int(cfg.window) // 2)
         ori = pd.DataFrame(
             {
                 c: pit_orientation(fmat[c], fwd, cfg.horizon, min_obs)
@@ -489,18 +489,18 @@ def _reverse_note(cfg: FactorConfig, keys: list[str]) -> str:
 def _warmup_note(score: pd.Series | None, n_bars: int, cfg: FactorConfig) -> str:
     """分数整列 NaN 时说清原因，别让人以为策略坏了。
 
-    标准化窗口是**交易日**：252 个在日线上是 252 根、1h 上约 1260 根、5m 上
-    约 12000 根。所以「近 1 年」的 5m 回测只有一半样本能出分（预热要 63 个
-    交易日），周线反而宽松 —— 提示里两个单位都写出来，别让人拿「根」去对。
+    标准化窗口是 **bar 根数**：252 根在日线上是 252 天、在 5m 上是五个交易日。
+    所以「近 1 年」的日线回测要 63 根预热就够，而 5m 上 63 根只有一天多 ——
+    提示里把「根」和「约几个交易日」都写出来，别让人拿「天」去对根数。
     """
     if score is None or len(score) == 0 or int(score.notna().sum()) > 0:
         return ""
     bpd = max(1e-9, F.bars_per_day(score.index))
     days = int(round(int(n_bars) / bpd))
-    nb = F.window_bars(cfg.window, score.index)
+    nb = F.win_bars(cfg.window)
     need = int(min(nb, max(60, nb // 4)))
     return (f"分数全空：这段行情只有 {int(n_bars)} 根（约 {days} 个交易日），"
-            f"而标准化窗口 {int(cfg.window)} 个交易日至少要 {need} 根"
+            f"而标准化窗口 {int(cfg.window)} 根至少要 {need} 根"
             " —— 把回测区间拉长，或者把窗口调小")
 
 
@@ -621,7 +621,7 @@ def rolling_ic_weights(fmat: pd.DataFrame, fwd: pd.Series, cfg: FactorConfig
     权重不是逐根变的：每 `ic_rebal` 根更新一次，中间沿用上一次的值。IC 的日间
     噪声本来就大，每根都跟着抖会把换手率顶起来。
     """
-    win = max(20, F.window_bars(cfg.window, fmat.index))
+    win = max(20, F.win_bars(cfg.window))
     mp = int(min(win, max(20, win // 4)))
     cols = {}
     for c in fmat.columns:
@@ -1280,12 +1280,12 @@ def build_score(
         # 另一种是**行情太短**，所有因子都凑不出有效值。合成周期把第二种放大
         # 了 —— 周线「近 1 年」只有五十来根，看着像「因子没数据」，其实是样本
         # 不够，用户照着提示去换因子只会白折腾
-        nb = F.window_bars(cfg.window, df.index)
+        nb = F.win_bars(cfg.window)
         need = int(min(nb, max(60, nb // 4)))
         if len(df) < need:
             raise ValueError(
                 f"这段行情只有 {len(df)} 根，太短了算不出因子（标准化窗口 "
-                f"{int(cfg.window)} 个交易日，至少要 {need} 根）"
+                f"{int(cfg.window)} 根，至少要 {need} 根）"
                 " —— 把回测区间拉长，或者把窗口调小")
         raise ValueError("选中的因子在该标的上都没有足够数据（如美股无持仓量）")
 
@@ -1378,7 +1378,7 @@ def build_score(
             )
         elif wmode == "ic":
             pack.notes.append(
-                f"权重按过去 {int(cfg.window)} 个交易日的 |IC| 定，每 "
+                f"权重按过去 {int(cfg.window)} 根的 |IC| 定，每 "
                 f"{int(cfg.ic_rebal)} 根更新一次（滞后 {int(cfg.horizon)} 期，无未来信息）"
             )
         elif wmode == "and":
@@ -2004,11 +2004,11 @@ def _pit_vol(df: pd.DataFrame, window: int) -> pd.Series:
     前向收益去训，模型会几乎只拟合高波动的那几个品种。除以自己的波动率之后，
     「涨了一个标准差」在所有品种上是同一件事。rolling 只回头看，没有未来信息。
 
-    `window` 是**交易日**，按 bar 密度换成根数：5m 上 252 根只有五天，
-    除的是「最近五天波动」，标签噪音会大到模型学不到东西。
+    `window` 是 **bar 根数**（同 `standardize`）：量的是本品种近期自己的波动，
+    5m 上 252 根 = 最近五个交易日，跟着行情走就够了。
     """
     r = pd.Series(pd.to_numeric(df["close"], errors="coerce")).pct_change()
-    w = max(20, F.window_bars(window, df.index))
+    w = max(20, F.win_bars(window))
     return r.rolling(w, min_periods=int(min(w, 20))).std()
 
 

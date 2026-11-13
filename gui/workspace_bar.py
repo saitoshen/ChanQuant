@@ -129,10 +129,11 @@ class WorkspaceBar(QWidget):
         self.cb_basis.setToolTip(
             "决定「分到多少钱」怎么换算成策略的本金。\n"
             "按分配额：分到 20 万就设成本金 20 万。可预期，本金合计恰好等于总资金。\n"
-            "按平均占用：让它的**平均保证金占用**等于分到的那份。\n"
+            "按平均占用：让它的**平均开仓占用**等于分到的那份。\n"
             "按峰值占用：让它的**峰值占用**等于分到的那份（更保守）。\n\n"
-            "⚠ 后两种会把本金放大几十到几百倍 —— 日内策略大部分时间空仓，\n"
-            "平均占用往往只有本金的 1%。一定要先「量一下占用」再点。")
+            "⚠ 后两种会把本金放大 2~5 倍（满仓策略也可能不放大）——\n"
+            "「仓位 30%」意味着一次出手只压 30% 的钱，平均下来大约 20~40%。\n"
+            "先「量一下占用」再点，预览里会写出倍数。")
         self.cb_basis.currentIndexChanged.connect(
             lambda _i: self.basis_changed.emit(str(self.cb_basis.currentData() or "principal")))
         lay.addWidget(self.cb_basis)
@@ -140,10 +141,10 @@ class WorkspaceBar(QWidget):
         self.btn_measure = QPushButton("量一下占用")
         self.btn_measure.setObjectName("Ghost")
         self.btn_measure.setToolTip(
-            "把本工作区每条策略跑一遍历史回测，量出它**实际**压了多少钱\n"
-            "（|手数| × 收盘 × 乘数 × 保证金率，逐根取均值）。\n\n"
-            "和「分配了多少本金」是两回事：capital_pct=30% 只说开仓那一刻\n"
-            "用 30%，日内策略大部分时间空仓，实测平均占用常只有本金的 1~3%。")
+            "把本工作区每条策略跑一遍历史回测，量出它**开仓时**实际压了多少钱\n"
+            "（|手数| × 开仓价 × 乘数 × 保证金率，逐笔取均值）。\n\n"
+            "不是逐根 bar 的均值：那个会把空仓时间算进分母，日内策略摊出来只有\n"
+            "本金的 1~2%，量的是「摊到每根 bar 用多少」而不是「出手一次用多少」。")
         self.btn_measure.clicked.connect(self.measure.emit)
         lay.addWidget(self.btn_measure)
 
@@ -266,8 +267,10 @@ class AllocDialog(QDialog):
         if total > 0 and after > total * 1.02:
             out.append((
                 f"本金合计 {after / 10000:,.0f} 万 = 总资金的 {after / total:.1f} 倍。"
-                "这是「按占用 / 按峰值」校准的正常结果，不是算错 —— 平均占用只有"
-                "本金的 1~3%，对齐它就得把本金放大几十倍。确认要这么配再点应用。", False))
+                "这是「按平均占用 / 按峰值占用」校准的正常结果，不是算错 —— "
+                "「仓位 30%」意味着一次出手只压 30% 的钱，要让平均开仓占用对齐，"
+                "本金就得放大 2~5 倍（对齐峰值时更高）。确认要这么配再点应用。",
+                False))
         fx = [s.name for s in self.shares if "固定手数" in (s.note or "")]
         if fx:
             out.append((f"有 {len(fx)} 条是固定手数（{'、'.join(fx[:3])}"

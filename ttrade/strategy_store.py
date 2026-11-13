@@ -38,6 +38,9 @@ RISK_SIZED = {"sbbox_mini", "sbbox_ib"}
 LIB_FILE = "strategy_lib.json"
 PORT_FILE = "portfolio.json"
 LAST_FILE = "last_config.json"
+# 组合工作区。放在这里是为了让 `set_store_dir()` 一处就能把它们一起重定向 ——
+# 常量分散在两个模块里，早晚会漏掉一个（漏掉的正好就是用户数据）
+WS_FILE = "workspaces.json"
 
 # 截面策略「腿内怎么分钱」的中文名。策略库表格里要显示，界面下拉也用它，
 # 放一处免得两边慢慢走偏
@@ -687,7 +690,52 @@ class StrategyConfig:
 # ------------------------------------------------------------------ 读写
 
 
+_DIR_OVERRIDE = ""
+
+
+def set_store_dir(path: str, seed: bool = True) -> str:
+    """把策略库 / 组合 / 工作区的读写目录改到别处（自检用）。
+
+    🔴 自检会把**真实主窗口**搭起来（「构建主窗口（端到端）」），里面有切页签、
+    加策略、改本金这些模拟动作 —— 它们在生产里本来就该落盘。不重定向的话，
+    跑一轮自检就把用户的组合改了：实测丢过一条策略、二十几条本金被重排。
+    `CQ_NO_SAVE` 那种「写操作变 no-op」的土办法不行：自检里有「写完读回来」
+    的用例，一刀切成 no-op 会连那些一起打红。
+
+    `seed=True` 时先把现有 json 复制一份过去 —— 自检看到的是真实数据的快照，
+    改动只落在临时目录里。
+
+    日志不走这儿（那是 `paths.log_dir()`），CI 仍然找得到 `selftest.log`。
+    返回实际使用的目录；`path` 传空表示恢复默认（用户目录）。
+    """
+    global _DIR_OVERRIDE
+    if not path:
+        _DIR_OVERRIDE = ""
+        return user_dir()
+    path = os.path.abspath(path)
+    os.makedirs(path, exist_ok=True)
+    if seed:
+        import shutil
+
+        for name in (LIB_FILE, PORT_FILE, LAST_FILE, CHASE_FILE, WS_FILE):
+            src = os.path.join(user_dir(), name)
+            if os.path.exists(src):
+                try:
+                    shutil.copy2(src, os.path.join(path, name))
+                except OSError:
+                    pass
+    _DIR_OVERRIDE = path
+    return path
+
+
+def store_dir() -> str:
+    """当前存储目录（自检期间是临时目录，平时是用户目录）。"""
+    return _DIR_OVERRIDE or user_dir()
+
+
 def _path(name: str) -> str:
+    if _DIR_OVERRIDE:
+        return os.path.join(_DIR_OVERRIDE, name)
     return os.path.join(user_dir(), name)
 
 

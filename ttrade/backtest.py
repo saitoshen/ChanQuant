@@ -327,25 +327,38 @@ def _metrics(equity: pd.Series, position: pd.Series, trades: list[Trade],
 
     # ---- 资金占用诊断（绩效页的三列）----
     #
-    # 和「分配了多少本金」是两回事：`capital_pct=30%` 只说「开仓那一刻用 30%」，
-    # 而日内策略大部分时间空仓 —— 实测一个 24 条策略的组合，名义本金 500 万，
-    # 平均占用只有 8.3 万（1.66%）、峰值 83 万（16.6%）。不把这两个数摆出来，
-    # 用户会以为 500 万都在干活。
+    # 🔴 **平均占用 = 每笔交易开仓时用的钱，取均值** —— 不是逐根 bar 的均值。
     #
-    # 口径：`|手数| × 收盘 × 乘数 × 保证金率`。**不按开仓价** —— 持仓期间保证金
-    # 跟着结算价走，用开仓价会在趋势行情里系统性低估。
+    # 这个区别很要紧。逐根算的话，日内策略一天只有两三根有仓，其余时间空仓都
+    # 按 0 计进分母，算出来的「平均占用」只有本金的 1~2%：那不是「出手时用多少」，
+    # 那是「摊到全天每一分钟用多少」。用户要的是前者 —— 「我给它 30 万，它每次
+    # 出手实际压多少」，用来和组合分给它的钱比，决定该调多少。
+    #
+    # 峰值走**逐根**，不是开仓口径：持仓期间保证金跟着结算价走，开仓那一刻通常
+    # 不是最高点。所以两者口径不同，界面上要写清楚（平均 = 出手时，峰值 = 最坏
+    # 那一刻含持仓浮动）。
+    #
+    # 口径：`|手数| × 开仓价 × 合约乘数 × 保证金率`。开仓价含滑点 —— 那是实际
+    # 成交的价，保证金就是按它冻结的。
     avg_notional = peak_notional = avg_margin = peak_margin = util = 0.0
-    if price is not None and float(margin_rate or 0) > 0:
+    mr = float(margin_rate or 0.0)
+    if mr > 0:
+        mult_f = float(mult or 1.0)
+        # 未平仓的那笔也算：它确实开了仓，占着保证金
+        entry = [abs(float(t.lots or 0.0)) * float(t.entry_price or 0.0) * mult_f * mr
+                 for t in trades
+                 if abs(float(t.lots or 0.0)) > 0 and float(t.entry_price or 0.0) > 0]
+        if entry:
+            avg_margin = float(np.mean(entry))
+            avg_notional = avg_margin / mr
+            util = avg_margin / base if base > 0 else 0.0
+    if price is not None and mr > 0:
         px = pd.to_numeric(price, errors="coerce").reindex(equity.index).ffill()
         notional = pos.abs().to_numpy(dtype=float) * px.to_numpy(dtype=float) * float(mult or 1.0)
         ok = np.isfinite(notional)
         if ok.any():
-            avg_notional = float(notional[ok].mean())
             peak_notional = float(notional[ok].max())
-            mr = float(margin_rate)
-            avg_margin = avg_notional * mr
             peak_margin = peak_notional * mr
-            util = avg_margin / base if base > 0 else 0.0
 
     return {
         "total_return": float(total),
