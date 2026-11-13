@@ -54,6 +54,7 @@ from ttrade import ml_artifact
 from ttrade import replay
 from ttrade import daylimit, orderbook, positionbook, topup, tqdata
 from ttrade import strategy_store as SStore
+from ttrade import specs, symbols_info
 from ttrade.strategies import STRATEGIES, next_levels, run_strategy
 from ttrade.tqfetch import PERIOD_SEC
 from ttrade.tqlive import AccountSpec, bars_from_serial, merge_live
@@ -113,16 +114,11 @@ MISMATCH_GAP = 5.0
 def default_margin_rate(symbol: str) -> float:
     """品种的默认保证金率。杠杆 = 1 / 保证金率。
 
-    只在拿不到交易所实时保证金时兜底（`quote.margin` 一般都有）。商品、股指
-    约 10 倍，国债 30~50 倍 —— 国债波动小、保证金低，同样的钱能铺更多手，
-    这正是不该用「固定几手」的理由。
+    只在「数据管理 → 品种信息」里那一格是空/0 时兜底 —— 正常路径一律读表
+    （见 `_terms`）。**同一个实现放在 `specs.margin_rate`**，回测也用它，
+    两边兜底率必须一样，否则表里漏填一个数就又是两套手数。
     """
-    s = (symbol or "").upper()
-    if s in ("T", "TF", "TS", "TL"):
-        return 0.03            # 国债期货：约 33 倍
-    if s in ("IF", "IH", "IC", "IM"):
-        return 0.12            # 股指期货：约 8 倍
-    return 0.10                # 商品期货：约 10 倍
+    return specs.margin_rate(symbol)
 
 
 def atr(df: pd.DataFrame, n: int = 14) -> float:
@@ -1585,32 +1581,50 @@ class PortfolioRunner:
             return 0.0
 
     @staticmethod
-    def _margin_per_lot(q, price: float, mult: float, symbol: str) -> float:
-        """每手保证金。**实盘一律以交易所给的 `quote.margin` 为准。**
+    def _terms(cfg) -> tuple[float, float, str]:
+        """乘数 / 保证金率 —— **实盘和回测只读「数据管理 → 品种信息」那一张表**。
 
-        拿不到（断线、非交易时段、模拟环境没推这个字段）才按乘数 × 类别默认
-        保证金率估一个，只为「别算出 0 手」。兜底**故意不读「数据管理 → 品种
-        信息」里那张表**：那张表是回测口径（用户为了对历史回测填的，可能还带
-        经纪商加收），拿它决定实盘下几手，等于让回测设置去改真实仓位 ——
-        仓位错方向的代价远大于「兜底率差 1 个百分点」。
+        🔴 以前实盘走天勤合约上的 `quote.volume_multiple` / `quote.margin`，
+        回测走这张表，两边天生对不上，而实盘那一侧还有一串不确定性：
 
-        两边不一致是**必然且合理**的：回测要可复现（用固定参数），实盘要跟
-        交易所走（保证金天天随结算价变）。界面上的那张表因此只对回测生效。
+        - 主连（`KQ.m@`）压根没有 `margin`，恒 0；
+        - 模拟 / 快照环境不推这个字段，也恒 0；
+        - 真合约的 `margin` 按**当日结算价**天天变，同一天里价格一动比例就漂；
+        - 上面任一情况都掉进「每手保证金 = 0 → 保底 1 手」，**不报错**。
+
+        实测同一条 T 策略一天之内手数可以在 1~4 手之间跳，而回测永远是 4~5 手 ——
+        用户没法解释、也没法对账。
+
+        现在两边同源：**表的维护只有一个入口**（「从天勤刷新」一次写进来，或者
+        手填），下多少手事先就能算出来，历史回测也能复现。代价是保证金率不再
+        跟交易所逐日变动 —— 所以表里该填**实盘真实冻结**的比例（含经纪商加收），
+        而不是交易所裸标准，否则实盘会因为保证金不足被拒单。
+
+        返回 `(乘数, 保证金率, 来源说明)`。表里没维护（0）才兜底，并写进说明里，
+        免得「保底 1 手」再次变成静默失败。
         """
-        m = float(getattr(q, "margin", 0) or 0) if q is not None else 0.0
-        if m > 0 and math.isfinite(m):
-            return m
-        if mult <= 0 or price <= 0:
-            return 0.0
-        return price * mult * default_margin_rate(symbol)
+        sym = str(getattr(cfg, "symbol", "") or "")
+        ex = str(getattr(cfg, "exchange", "") or "")
+        si = symbols_info.info(sym, ex)
+        try:
+            mult = float(si.get("mult") or 0)
+            rate = float(si.get("margin") or 0)
+        except (TypeError, ValueError):
+            mult, rate = 0.0, 0.0
+        bits = []
+        if mult <= 0:
+            bits.append("乘数没维护")
+        elif mult < 2:
+            bits.append(f"乘数 {mult:g} 可疑（国内期货不会这么小），去品种信息页刷一下")
+        if rate <= 0:
+            rate = default_margin_rate(sym)
+            bits.append(f"保证金率没维护，按 {rate:.1%} 兜底")
+        src = "品种信息表" + ("｜" + "；".join(bits) if bits else "")
+        return mult, rate, src
 
     def _volume_multiple(self, st: SlotState) -> float:
-        """这个合约每手多少单位（合约乘数）。拿不到返回 0 —— 调用方自己兜底。"""
-        q = self._contract_quote(st.underlying)
-        try:
-            return float(getattr(q, "volume_multiple", 0) or 0) if q is not None else 0.0
-        except (TypeError, ValueError):
-            return 0.0
+        """这个合约每手多少单位（合约乘数）。和回测同源（读品种信息表）。"""
+        return self._terms(st.cfg)[0]
 
     def _lots(self, st: SlotState, price: float, atr_value: float) -> int:
         """这条策略满仓该下几手。
@@ -1631,10 +1645,10 @@ class PortfolioRunner:
           所以四舍五入取整并保底 1 手；回测里它可以是小数。
         - `fixed`：老行为，固定手数。
 
-        🔴 手数一变就记一行**凭什么**（`_lots_why`）：实盘和回测的每手保证金
-        来源不同 —— 实盘取天勤 `quote.margin`（含经纪商加收），回测取「数据管理
-        → 品种信息」里的比例。同一条策略实盘 1 手、回测 4 手是完全可能的，
-        但界面上两个数并排放着，不把这两个来源写进日志，用户没法对账。
+        🔴 手数一变就记一行**凭什么**：手数的四个输入（预算 / 乘数 / 价格 /
+        保证金率）里，乘数和保证金率现在**和回测同源**（品种信息表），所以
+        回测报 4 手、实盘下 1 手这种「对不上账」不该再出现；真出现了，日志这
+        一行会直接指出是哪个数不同（价格另算，实盘是实时价、回测是收盘价）。
         """
         n, why = self._size(st, price, atr_value)
         if int(n) != int(getattr(st, "lots", 0) or 0):
@@ -1649,8 +1663,7 @@ class PortfolioRunner:
             n = max(1, int(cfg.volume or 1))
             return n, f"固定手数 {n}"
 
-        q = self._contract_quote(st.underlying)
-        mult = self._volume_multiple(st)
+        mult, rate, src = self._terms(cfg)
 
         if mode == "risk":
             stop_px = max(0.0, float(cfg.stop_mult or 0)) * float(atr_value or 0)
@@ -1659,13 +1672,9 @@ class PortfolioRunner:
             per_lot = stop_px * mult
             n = max(1, int(float(cfg.risk_amount or 0) / per_lot))
             return n, (f"risk 口径，止损额 {float(cfg.risk_amount or 0):,.0f} ÷ "
-                       f"(止损距离 {stop_px:.4g} × 乘数 {mult:g})")
+                       f"(止损距离 {stop_px:.4g} × 乘数 {mult:g}，{src})")
 
-        per_margin = self._margin_per_lot(q, price, mult, cfg.symbol)
-        src = "天勤 quote.margin" if (q is not None
-                                     and float(getattr(q, "margin", 0) or 0) > 0) \
-            else f"兜底率 {default_margin_rate(cfg.symbol):.1%}"
-        rate = (per_margin / (price * mult)) if (price > 0 and mult > 0) else 0.0
+        per_margin = price * mult * rate if (price > 0 and mult > 0) else 0.0
 
         if mode == "budget":
             # 名义口径：和 `backtest.size_lots` 的 budget 分支逐字对齐
@@ -1685,11 +1694,11 @@ class PortfolioRunner:
                        f"名义 {per:,.0f}（乘数 {mult:g}，价 {price:.3f}）")
 
         if per_margin <= 0:
-            return 1, "拿不到每手保证金：先 1 手"
+            return 1, f"算不出每手保证金（{src}）：先 1 手"
         n = max(1, int(float(cfg.capital or 0) / per_margin))
         return n, (f"capital 口径，预算 {float(cfg.capital or 0):,.0f} ÷ "
-                   f"每手保证金 {per_margin:,.0f}（{src}，折算率 {rate:.2%}；"
-                   f"乘数 {mult:g}，价 {price:.3f}）")
+                   f"每手保证金 {per_margin:,.0f}"
+                   f"（{src}：乘数 {mult:g} × 价 {price:.3f} × 保证金率 {rate:.2%}）")
 
     # ---- 调仓 ----
 

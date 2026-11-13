@@ -2382,6 +2382,117 @@ def _run() -> tuple[bool, list[str]]:
 
     check("组合工作区资金分配（ERC / 三种口径）", _portfolio_plan)
 
+    def _lots_same_source():
+        """实盘和回测的手数必须**同一个式子、同一张表**。
+
+        以前实盘读天勤合约上的 `quote.margin` / `quote.volume_multiple`，回测读
+        「数据管理 → 品种信息」。两边天生对不上，而实盘那一侧还有一串不确定性：
+        主连（`KQ.m@`）压根没有 `margin`（恒 0）、模拟/快照环境不推这个字段、
+        真合约的 `margin` 按当日结算价天天漂。任一条命中就掉进「每手保证金 = 0
+        → 保底 1 手」，**不报错**。实测同一条 T 策略一天之内手数在 1~4 手之间跳，
+        回测却始终 4~5 手 —— 用户没法解释也没法对账。
+
+        所以这里钉三件事：
+        ① 同一张表 + 同一个价格 ⇒ 两边手数一模一样（含 `budget` 口径）；
+        ② 表里改保证金率，两边**同步**变（不是只变一边）；
+        ③ 算手数时**不许再去问天勤行情**（用会抛异常的子类反证）。
+        """
+        from types import SimpleNamespace as NS
+
+        from ttrade import backtest as BT
+        from ttrade import replay, symbols_info as SI
+        from ttrade import strategy_runner as SR
+
+        real_info = SI.info
+        table = {"T": {"mult": 10000.0, "margin": 0.02, "tick": 0.005,
+                       "fee_mode": "lot", "fee_value": 3.0}}
+        try:
+            SI.info = lambda sym, ex="": dict(
+                table.get(str(sym).upper()) or {"mult": 1.0, "margin": 0.03,
+                                                "tick": 1.0, "fee_mode": "rate",
+                                                "fee_value": 0.0001})
+
+            class NoTq(SR.PortfolioRunner):
+                """算手数时一旦回头去问天勤行情就炸 —— 这正是要禁掉的那条路。"""
+
+                def _contract_quote(self, *a, **k):   # noqa: D102
+                    raise AssertionError("算手数时又去问天勤 quotes 了")
+
+            inst = NoTq.__new__(NoTq)
+
+            def mk(**kw):
+                base = dict(symbol="T", exchange="CFFEX", sizing="capital",
+                            capital=105_033.4, principal=104_407.0,
+                            capital_pct=100.6, volume=1, stop_mult=5.0,
+                            risk_amount=20_000.0, note="", cost_profile=None,
+                            short_only=False, factor_cfg={})
+                base.update(kw)
+                return NS(**base)
+
+            px = 110.065
+
+            def live_n(cfg, price=px):
+                return NoTq._size(inst, NS(cfg=cfg, lots=0, underlying="CFFEX.T2603"),
+                                  price, 0.0)
+
+            # ① 同一张表 ⇒ 两边一样
+            cfg = mk()
+            bt = replay.make_bt("cn", False, cfg)
+            want = int(105_033.4 / (px * 10_000.0 * 0.02))
+            n_bt = BT.size_lots(bt, px, bt.initial_cash)
+            n_live, why = live_n(cfg)
+            if abs(n_bt - want) > 1e-9 or n_live != want:
+                raise RuntimeError(
+                    f"同表不同步：回测 {n_bt} 手、实盘 {n_live} 手，按表应为 {want} 手")
+            if "品种信息表" not in why:
+                raise RuntimeError(f"实盘手数没说明来源：{why}")
+
+            # ② 表里改保证金率，两边必须同步变（只变一边就是又分叉了）
+            table["T"]["margin"] = 0.05
+            bt5 = replay.make_bt("cn", False, cfg)
+            n_bt5 = BT.size_lots(bt5, px, bt5.initial_cash)
+            n_live5, _ = live_n(cfg)
+            if n_bt5 != n_live5 or n_live5 == n_live:
+                raise RuntimeError(
+                    f"改表后两边没同步：回测 {n_bt5} 手、实盘 {n_live5} 手"
+                    f"（原来是 {n_live} 手）")
+
+            # ③ 表里没填 → 两边都用同一个兜底率，并且说明里点名
+            table["T"]["margin"] = 0.0
+            bt0 = replay.make_bt("cn", False, cfg)
+            n_bt0 = BT.size_lots(bt0, px, bt0.initial_cash)
+            n_live0, why0 = live_n(cfg)
+            if n_bt0 != n_live0:
+                raise RuntimeError(
+                    f"保证金率缺失时兜底不一致：回测 {n_bt0} 手、实盘 {n_live0} 手")
+            if "兜底" not in why0:
+                raise RuntimeError(f"兜底没有在日志里点名：{why0}")
+
+            # ④ 乘数没维护：实盘**保底 1 手**（宁可少开，不能凭空放几千手），
+            #    并且明确写出来；回测那边按 1 算出来的数不可信，不该被抄过来
+            table["T"]["mult"] = 0.0
+            n_live_m, why_m = live_n(cfg)
+            if n_live_m != 1 or "乘数没维护" not in why_m:
+                raise RuntimeError(f"乘数缺失时实盘没守住 1 手：{n_live_m} 手（{why_m}）")
+
+            # ⑤ `budget` 名义口径也同源
+            table["T"].update({"mult": 10000.0, "margin": 0.02})
+            cfg_b = mk(sizing="budget", capital=1_000_000.0)
+            bt_b = replay.make_bt("cn", False, cfg_b)
+            n_bt_b = BT.size_lots(bt_b, px, bt_b.initial_cash)
+            n_live_b, _ = live_n(cfg_b)
+            if abs(n_bt_b - n_live_b) > 1e-9:
+                raise RuntimeError(
+                    f"budget 口径两边不一致：回测 {n_bt_b} 手、实盘 {n_live_b} 手")
+        finally:
+            SI.info = real_info
+
+        return ("同一张品种信息表：回测 size_lots 与实盘 _size 同输入同手数"
+                "（capital / budget）；改保证金率两边同步变；表里缺失时兜底一致；"
+                "乘数缺失实盘守 1 手；算手数全程不碰天勤行情")
+
+    check("实盘与回测手数同源（品种信息表）", _lots_same_source)
+
     def _occupancy_diag():
         """绩效页的「资金占用」三列：平均开仓占用 / 峰值占用 / 利用率。
 

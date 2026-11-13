@@ -1139,10 +1139,14 @@ class DataPage(QWidget):
         row_cost.addWidget(self.btn_cost)
         self.btn_sym = QPushButton("品种信息…")
         self.btn_sym.setToolTip(
-            "最小跳动、合约乘数、保证金率、手续费、交易时段 —— **回测口径**。\n\n"
-            "乘数与保证金率只影响回测；实盘以天勤合约上的实时值为准\n"
-            "（quote.volume_multiple / quote.margin），这里填什么都不会改变实盘手数。\n"
-            "实盘运行后会把看到的真实值自动回写进来，让回测对齐；手填过的格子不被覆盖。")
+            "最小跳动、合约乘数、保证金率、手续费、交易时段。\n\n"
+            "**实盘和回测都按这张表算手数**——乘数、保证金率只在这一处维护。\n"
+            "手数 = 本金×占用% ÷ (价格 × 乘数 × 保证金率)，所以改了比例，\n"
+            "回测的历史手数和实盘下一次调仓的手数会同时变。\n"
+            "表里没填的格子才退回按品种类别的默认值（商品 10% / 股指 12% / 国债 3%）。\n"
+            "「从天勤刷新」把天勤那边的真实值一次写进来（会覆盖手填值，刷新后会点名）。\n\n"
+            "⚠ 保证金率要填**实盘真实冻结**的比例（含经纪商加收），不是交易所裸标准，\n"
+            "否则按它算出来的手数实盘会因保证金不足被拒单。")
         self.btn_sym.clicked.connect(self._open_symbol_dialog)
         row_cost.addWidget(self.btn_sym)
         lay.addLayout(row_cost)

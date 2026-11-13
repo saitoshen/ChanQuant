@@ -3,22 +3,26 @@
 
 ## 为什么要有这个模块
 
-实盘下几手是 `分配资金 ÷ 每手保证金`，而每手保证金 = 价格 × 乘数 × 保证金率。
-乘数和保证金率**只有交易所说得准**（保证金还随结算价、临近交割调整），所以
-实盘一律用天勤合约上的 `quote.volume_multiple` / `quote.margin`，不查任何静态表。
+下几手是 `分配资金 ÷ 每手保证金`，而每手保证金 = 价格 × 乘数 × 保证金率。
+乘数和保证金率**只有交易所说得准**（保证金还随结算价、临近交割调整）。
 
-但「数据管理 → 品种信息」那张表是**回测**的输入：研究页要比不同品种、不同年份，
-参数必须**可复现** —— 用实时值的话，今天跑和明天跑结果不一样，横向比较就废了。
-所以两张口径分开是对的：
+🔴 **现在实盘和回测共用「数据管理 → 品种信息」这一张表**（见
+`strategy_runner._terms`）。早先是分开的：实盘读天勤 `quote.volume_multiple` /
+`quote.margin`，回测读表。那样两边天生对不上，而且实盘那一侧有一串不确定性 ——
+主连（`KQ.m@`）压根没有 `margin`、模拟/快照环境不推这个字段、真合约的 `margin`
+按当日结算价天天漂；任一条命中就掉进「每手保证金 = 0 → 保底 1 手」，还不报错。
+实测同一条 T 策略一天之内手数在 1~4 手之间跳，回测却永远是 4~5 手。
 
-| | 乘数 / 保证金率从哪来 | 为什么 |
-|---|---|---|
-| 实盘（下几手） | 天勤 `quote` 实时值 | 要跟交易所走，否则挂单被拒 / 实际杠杆不符 |
-| 组合页「查看回测」/ 量占用 | 品种信息表 | 要和实盘资金分配对得上 |
-| 策略研究页回测 | 品种信息表 | 要可复现 |
+所以现在只有一个口径：**表是唯一来源**，本模块负责把天勤那边的真值写进表里。
+表可复现、可预期，代价是保证金率不再逐日变动 —— 所以这里写进去的是天勤的
+（含经纪商加收）值，不是交易所裸标准：填小了实盘会因为保证金不足被拒单。
 
-代价是表会过期 —— 过期之后组合页的手数和实盘就对不上了。这个模块就是那座桥：
-一次性把表刷成「此刻的真实值」（乘数、最小跳动、保证金率、手续费）。
+## 会写什么
+
+一次性把表刷成「此刻的真实值」：乘数、最小跳动、保证金率、手续费。
+**会覆盖手填值**（这是用户主动点的，就该按真实值来），但被覆盖的条目会在
+界面上点名（`overrode`）—— 表是唯一的手数来源，静默改表等于静默改仓位。
+来源标记 `*_src`：手填 = `"user"`，刷新写进来的 = `"live"`，用来在界面上分清。
 
 ## 取哪个合约
 
@@ -235,6 +239,7 @@ def apply(rows: list[dict], only_diff: bool = True) -> dict:
     tol = 0.02
     tol_fee = 1e-3
     changed, same, skipped, hints = 0, 0, [], []
+    overrode: list[str] = []          # 手填值被刷掉的具体条目（要在界面上点名）
     for r in rows:
         sym, ex = str(r.get("symbol") or ""), str(r.get("exchange") or "")
         if not sym:
@@ -256,6 +261,13 @@ def apply(rows: list[dict], only_diff: bool = True) -> dict:
             if old > 0 and abs(val - old) <= rel * old:
                 continue
             fields[key] = val
+            # 手填值被刷掉必须点名：表是**唯一**的手数来源，用户填 2%（交易所
+            # 标准）被刷成 3.5%（含经纪商加收）之后，回测和实盘的手数会同时变，
+            # 不点名就成了「昨天 4 手今天 2 手，谁也说不出为什么」
+            if old > 0 and str(ov.get(f"{key}_src") or "") == "user":
+                name = {"mult": "乘数", "tick": "跳动", "margin": "保证金率"}[key]
+                f = (lambda x: f"{x:.2%}") if key == "margin" else (lambda x: f"{x:g}")
+                overrode.append(f"{sym} {name} {f(old)}→{f(val)}")
 
         # ---- 手续费：判口径 → 换算 → 与现值比 ----
         comm = float(r.get("commission") or 0)
@@ -300,7 +312,7 @@ def apply(rows: list[dict], only_diff: bool = True) -> dict:
         except Exception as exc:  # noqa: BLE001
             skipped.append(f"{sym}（{type(exc).__name__}: {exc}）")
     return {"rows": len(rows), "changed": changed, "same": same,
-            "failed": skipped, "fee_hint": hints}
+            "failed": skipped, "fee_hint": hints, "overrode": overrode[:8]}
 
 
 def refresh(pairs: list[tuple[str, str]] | None = None, api=None,

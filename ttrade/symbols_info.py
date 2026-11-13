@@ -109,13 +109,12 @@ _DEFAULT = {
     "fee_value": 0.0001,
     "session": S_DAY,
     # 这两个字段是**来源标记**，不是数值：`"user"` = 在「数据管理 → 品种信息」
-    # 里手工填的；`"live"` = 实盘从天勤 `quote.margin` / `quote.volume_multiple`
-    # 回写的。空 = 吃 `specs` 的默认值。
+    # 里手工填的；`"live"` = 点「从天勤刷新」时写进来的。空 = 吃 `specs` 的默认值。
     #
-    # 🔴 为什么要记来源：回写是**自动**的（每品种每进程一次），手填是**用户意图**。
-    # 没有标记的话，交易所把保证金从 12% 调到 14%，自动回写就会把用户特意填的
-    # 20%（比如想按加了经纪商加收的口径算）悄悄盖掉 —— 而且不报错，只在下次
-    # 回测时手数变了。有了标记，回写遇到 `user` 就让路。
+    # 🔴 为什么要记来源：这张表现在同时决定**实盘和回测**的手数，改一个数
+    # 两边仓位就一起变。刷新会整表覆盖，所以被覆盖的手填值必须在界面上点名
+    # （见 `symsync.apply()` 的 `overrode`）—— 不能让人第二天发现手数变了
+    # 却查不出是谁改的。
     "mult_src": "",
     "margin_src": "",
 }
@@ -212,12 +211,16 @@ def info(symbol: str, exchange: str) -> dict:
 def set_override(symbol: str, exchange: str, manual: bool = True,
                  **fields) -> None:
     """写覆盖。`manual=True`（默认）表示**用户在界面上填的**，会给相应字段
-    打上 `*_src="user"` 标记；`manual=False` 是程序自动回写（见
-    `remember_contract`），标记成 `"live"`。
+    打上 `*_src="user"` 标记；`manual=False` 是「从天勤刷新」写进来的，
+    标记成 `"live"`。
 
     `src` 只用来在界面上区分「这个数是人手填的」还是「从天勤刷下来的」。
     **它不阻止任何写入**：刷新是用户主动点的，就该按真实值覆盖；实盘运行
-    时也不会偷偷改这张表（见 `symsync` 的模块说明）。
+    时也不会偷偷改这张表。
+
+    🔴 这张表是**唯一**的手数来源（实盘和回测共用，见 `strategy_runner._terms`），
+    所以「谁在什么时候改了它」必须可查 —— 实盘跑着跑着表被后台改了，
+    用户就没法解释「昨天 4 手今天 1 手」。
     """
     key = f"{symbol}_{exchange}" if exchange else symbol
     d = load_overrides()
