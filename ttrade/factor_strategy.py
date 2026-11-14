@@ -112,7 +112,21 @@ class FactorConfig:
     # 日线 252 根 ≈ 一年；5m 上 252 根 ≈ 五个交易日 —— 量的是「本周期自己的
     # 近期状态」，日内策略就该跟着这五天走，而不是去和日线的「一年」对齐。
     window: int = 252            # 标准化窗口（也是 IC 统计窗口，单位：根）
-    method: str = "z"            # z / rank
+    method: str = "z"            # z / rank —— 全局默认口径
+    # 逐因子覆盖：`{因子键: "z" | "rank"}`，没列到的走 `method`。
+    #
+    # 为什么是逐因子而不是一个全局开关：一个组合里常常「仓单要分位、动量要 z」。
+    # 实测依据见 `_tools/sector_sweep/s6_norm.py`（22 品种 × 5 周期 × 8 因子，
+    # 1270 个配对）：右偏极重的 `war_chg_5`（偏度 9.6、峰度 122）滚动 z 之后
+    # **88% 的样本被压进 ±1**，`entry_z=1.0` 时大量格子笔数不足 15、根本过不了
+    # 扫描门槛；换滚动分位后笔数中位 39 → 125。
+    #
+    # 但**不是「分位一律更好」**：分位把两端等距化，「涨 2% 和涨 20% 同分」，
+    # 动量/波动这类本来就接近正态的因子会丢掉幅度信息；实测在「开仓频率对齐」
+    # 之后，z 的卡玛峰值反而更高（CU 1d `war_chg_5` 69 笔时 z 1.46 vs 分位 0.95）。
+    # 分位真正的价值是**阈值不敏感**——同一条曲线在 0.5~1.4 上都平，而 z 从
+    # 0.3 涨到 0.5 就掉一半。扫描上百格时「不用逐格调阈值」才是它省下来的东西。
+    method_of: dict = field(default_factory=dict)
     horizon: int = 5             # 预测/评估的前向收益期数
 
     # 阈值信号
@@ -298,6 +312,21 @@ class FactorConfig:
         p = str(dict(self.factor_periods or {}).get(str(key), "") or "")
         return p or str(base or "")
 
+    def method_for(self, key: str) -> str:
+        """这个因子实例该用哪种标准化口径。
+
+        先按实例 id 查（`war_chg_5@1h`），再退回纯键 —— 同一个因子在不同周期
+        上应当同一口径，否则「跨周期那一份没换」会让对比结论失真。
+
+        认几个别名（`pct` / `percentile` / `quantile`），省得界面上写错一个词
+        就**静默退回 z**。静默退回是最难查的那种错：策略照跑、数字照出，只是
+        口径和你以为的不是一回事。
+        """
+        m = dict(self.method_of or {})
+        hit = m.get(key) or m.get(F.split_spec(key)[0]) or ""
+        s = str(hit or self.method or "z").strip().lower()
+        return "rank" if s in ("rank", "pct", "percentile", "quantile") else "z"
+
     def is_reversed(self, key: str) -> bool:
         """这个实例要不要反着用。
 
@@ -354,6 +383,16 @@ class FactorConfig:
         # 「这个因子到底是不是跨周期」这件事变得要多判一次
         c.factor_periods = {str(k): str(v) for k, v in dict(c.factor_periods or {}).items()
                             if str(v or "").strip()}
+        # 标准化口径：全局那个也要归一化（老配置里可能写着 "pct"）。
+        c.method = "rank" if str(c.method or "").strip().lower() in (
+            "rank", "pct", "percentile", "quantile") else "z"
+        # 逐因子那张表：认不出的词**归一到 z，而不是丢掉这个键** —— 全局
+        # `method` 可能是 rank，此时显式写 z 是一条有效覆盖，丢了就变成
+        # 「这个因子悄悄跟着全局走分位」。空串才丢（等于没配）。
+        c.method_of = {str(k): ("rank" if str(v).strip().lower() in
+                                ("rank", "pct", "percentile", "quantile") else "z")
+                       for k, v in dict(c.method_of or {}).items()
+                       if str(v or "").strip()}
         # 出场规则
         c.exit_mode = str(c.exit_mode or "score")
         if c.exit_mode not in ("score", "tier", "abs", "box"):
@@ -1198,7 +1237,10 @@ def factor_matrix(
                 gone.append(spec)
                 continue
             r = F.raw(frame, base)
-            z = F.standardize(r, window=cfg.window, method=cfg.method)
+            # 逐因子口径：`war_chg_5` 这类右偏重的走分位，动量/波动走 z
+            # （依据见 `FactorConfig.method_of` 的注释）。传 `spec` 而不是
+            # `base`：允许「周线那一份单独设」这种精细配置，方法内部会退回纯键。
+            z = F.standardize(r, window=cfg.window, method=cfg.method_for(spec))
             if cross:
                 r = align_to_base(r, df.index, base_period, p)
                 z = align_to_base(z, df.index, base_period, p)

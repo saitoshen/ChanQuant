@@ -7439,6 +7439,69 @@ def _run() -> tuple[bool, list[str]]:
 
     check("板块两层映射（L1 9 / L2 16 严格对齐）", _sector_maps)
 
+    def _factor_method_of():
+        """逐因子标准化口径（`FactorConfig.method_of`）。
+
+        「仓单走分位、动量走 z」就是靠这张表表达的（依据见
+        `_tools/sector_sweep/s6_norm.py`）。它失效的方式**不报错** ——
+        `method_for` 认不出键就静默退回全局 `method`，策略照跑、数字照出，
+        只是所有因子都用了同一个口径。所以这里用两条反证：指定 rank 的列
+        必须与单独用 rank 算的逐位相等，同时必须与 z 算的**不相等**。
+        只查前者会被「全走 z」蒙过去。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factors as F
+        from ttrade.factor_strategy import FactorConfig, factor_matrix
+
+        cfg = FactorConfig(window=252, method="z",
+                           method_of={"mom_20": "rank"}).normalized()
+        if cfg.method_for("mom_20") != "rank":
+            raise RuntimeError("指定 rank 的因子没走分位")
+        if cfg.method_for("vol_20") != "z":
+            raise RuntimeError("没指定的因子没跟全局 z")
+        if cfg.method_for("mom_20@1h") != "rank":
+            raise RuntimeError("带周期的实例 id 没退回纯键")
+        for alias in ("pct", "percentile", "quantile"):
+            if FactorConfig(method_of={"x": alias}).method_for("x") != "rank":
+                raise RuntimeError(f"别名 {alias} 没被认成分位")
+        # 全局 rank 时显式写 z 必须能覆盖（最容易被「只留 rank」写坏的一条）
+        c2 = FactorConfig(method="rank", method_of={"vol_20": "z"}).normalized()
+        if c2.method_for("vol_20") != "z" or c2.method_for("mom_20") != "rank":
+            raise RuntimeError("全局 rank + 逐因子 z 的覆盖失效")
+        # 归一化：认不出的词 → z 且**保留键**（全局 rank 时它是有效覆盖），
+        # 空串才丢键
+        c3 = FactorConfig(method_of={"a": "pct", "b": "zscore", "c": ""}).normalized()
+        if c3.method_of != {"a": "rank", "b": "z"}:
+            raise RuntimeError(f"归一化结果不对：{c3.method_of}")
+
+        # 真实入口：两个因子混口径不能串味。只用 OHLCV 因子 —— 仓单类要读外部
+        # EDB 库，自检环境不一定有数据，拿不到会静默变成整列 NaN 被滤掉
+        n = 900
+        idx = pd.date_range("2020-01-01", periods=n, freq="D")
+        rng = np.random.default_rng(7)
+        px = 100 * np.cumprod(1 + rng.normal(0, 0.01, n))
+        df = pd.DataFrame({"open": px, "high": px * 1.005, "low": px * 0.995,
+                           "close": px, "volume": 1000.0}, index=idx)
+        keys = ["mom_20", "vol_20"]
+        fmat, _raw, kept, _gone, _miss = factor_matrix(df, keys, cfg)
+        if set(kept) != set(keys):
+            raise RuntimeError(f"因子没算全：kept={kept}（合成数据缺列？）")
+        for k in keys:
+            m = cfg.method_for(k)
+            want = F.standardize(F.raw(df, k), window=cfg.window, method=m)
+            other = F.standardize(F.raw(df, k), window=cfg.window,
+                                  method="z" if m == "rank" else "rank")
+            if not np.allclose(fmat[k].values, want.values, equal_nan=True):
+                raise RuntimeError(f"{k} 的分数不等于「按自己的口径单独算」—— 串味了")
+            if np.allclose(want.values, other.values, equal_nan=True):
+                raise RuntimeError(f"{k} 两种口径算出完全相同的结果（口径没生效）")
+        return ("逐因子口径生效：mom_20 走分位、vol_20 跟全局 z，两列各自逐位相等且"
+                "与另一口径不等；带周期 id 退回纯键；全局 rank + 逐因子 z 可覆盖")
+
+    check("逐因子标准化口径（method_of：仓单分位 / 动量 z 可混用）", _factor_method_of)
+
     check("存入策略库的动作（strategy_save）", _strategy_save_action)
     check("K线与信号：持仓与交易记录同源（含手数）", _chart_from_trades)
     check("资金曲线纵轴（线性 / 对数 / 亏穿退回）", _perf_yscale)
