@@ -154,7 +154,7 @@ FactorConfig(window=252, method="z",
   **IC 不受影响** —— `spearman` 是秩相关，单调变换不改变秩，所以
   `weight_mode="ic"` 的权重不会因为换口径而变。换口径只动**阈值信号的分布**。
 
-自检新增第 80 项「逐因子标准化口径」（79 项全绿 → 80 项全绿），用
+自检新增「逐因子标准化口径」（本机 79 项全绿），用
 「指定 rank 的列必须与单独 rank 逐位相等 **且** 必须与 z 不相等」两条反证 ——
 只查前者会被「全走 z」蒙过去。
 
@@ -164,6 +164,45 @@ FactorConfig(window=252, method="z",
 `capital`，而且**笔数对拍抓不到**（笔数一样，只是每手保证金口径变了）。
 `factor_cfg` 是整 dict 存取、没有字段白名单，所以这次是安全的 —— 但「读了代码
 觉得安全」和「跑过一遍」是两件事。
+
+### 七之二、界面（3.7.4）
+
+框架支持了混用，界面不跟上等于没用。策略研究页改成两层：
+
+| 位置 | 控件 | 作用 |
+|---|---|---|
+| 「因子参数」区 | `cb_fmethod` 下拉，文案 **默认**标准化口径 | 全局兜底 |
+| 「因子选择」表格第 5 列 | 口径 `QComboBox`，三态 `跟` `z` `分` | 逐因子覆盖 |
+
+默认「跟」不是装饰：**「跟」= 空值，不写进 `method_of`**。如果把全局值抄进每一行，
+之后改全局下拉时这些格不会跟着动，看着就像全局框坏了。
+
+两个必须各自 `blockSignals` 的地方 —— `QTableWidget.blockSignals()` **管不到**
+`cellWidget()` 里的控件，132 行各自触发一次就是 132 次回测：
+
+```python
+mcell.blockSignals(True)          # 载入策略时
+mcell.setCurrentIndex(...)
+mcell.blockSignals(False)
+cb.blockSignals(True); cb.setCurrentIndex(i); cb.blockSignals(False)   # 全局框同理
+```
+
+口径列只有 40px，第一版直接把全局 `QComboBox` 样式搬过来 —— `padding: 3px 8px`
+加上 18px 的箭头区，内容区只剩 4px，**渲染出来是一片空白**（不是没数据，是没地方画）。
+本项目的下拉框本来就不画三角（全局 `::drop-down` 只设了 `border:none`、没有
+`image`），所以箭头区纯属占位，压到 4px 就行：
+
+```css
+QComboBox#MethodCell { padding: 0px 1px; min-height: 17px; font-size: 10px; }
+QComboBox#MethodCell::drop-down { width: 4px; border: none; }
+```
+
+验证截图：`norm_gui_window.png`（整窗）/ `norm_gui_sidebar.png`（左栏裁剪）/
+`norm_gui_table.png`（表格特写）/ `norm_gui_method.png`（下拉框特写）。
+
+**判断布局只能用整窗 `win.grab()`**：`QWidget.grab()` 只返回该 widget 的矩形，
+落在同一区域的**兄弟控件会被一起渲染**——第一版拍 `box_fsel.grab()` 出来是
+「下方滑块叠进表格、表格出现两组」，看着像布局 bug，实际是截图方式的问题。
 
 ---
 
@@ -195,6 +234,18 @@ C:/ProgramData/anaconda3/python.exe s7_analyze.py   # 默认阈值对比
 C:/ProgramData/anaconda3/python.exe s8_plot.py      # 四张图
 ```
 
+界面截图（3.7.4，需 base 环境，`grab()` 在 fq 里没 Qt）：
+
+```bash
+C:/ProgramData/anaconda3/python.exe D:/_tools/shoot_norm_col.py
+```
+
+自检（含「逐因子标准化口径」与界面 132 行×6 列 / 口径往返）：
+
+```bash
+cd /d/ChanQuant-Dev && C:/ProgramData/anaconda3/python.exe launcher.py --selftest
+```
+
 ---
 
 ## 十、自己踩的坑（都发生在这一轮）
@@ -209,6 +260,11 @@ C:/ProgramData/anaconda3/python.exe s8_plot.py      # 四张图
    0.00（一半以上格子恰好是 0），看着像「全都不行」。
 5. **`io.open(p, "w", newline="\n")` 会先截断文件**：参数校验失败时文件已被清空，
    实测把 `ttrade/selftest.py` 清成 0 字节（从 git 恢复）。写文件一律用编辑工具。
+6. **`QTableWidget.blockSignals()` 管不到 `cellWidget()`**：132 行各接一次
+   `currentIndexChanged`，载入策略时会白排 132 次回测。cell 里的控件要自己拦。
+7. **`QWidget.grab()` 不是「截图这个控件」**：它只给该 widget 的矩形，兄弟控件
+   落在同一区域就被一起渲染。第一版拍出来像布局重叠，其实布局是好的 ——
+   要判断布局只能用整窗 `win.grab()` 再裁剪。
 6. **`selftest.py` 里没有全局 `pd`**：函数内必须自己 `import pandas`，否则
    自检那一项 FAIL 而单元测试（有全局 pd）看不出来。
 7. **s7 补算脚本的字典键漏了 `entry`**：同格 7 个阈值互相覆盖，只剩最后一个，

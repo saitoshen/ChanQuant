@@ -5501,7 +5501,11 @@ def _run() -> tuple[bool, list[str]]:
         from PySide6.QtWidgets import QApplication, QLabel
 
         from gui.app import (
+            COL_METHOD,
+            COL_NAME,
             COL_PERIOD,
+            COL_USE,
+            COL_W,
             FAMILY_RULE,
             STYLE_SHEET,
             MainWindow,
@@ -5949,6 +5953,28 @@ def _run() -> tuple[bool, list[str]]:
         except Exception as exc:  # noqa: BLE001
             period_info = f"{type(exc).__name__}: {exc}"
 
+        # 「口径」列：每行一个三态下拉（跟 / z / 分），**默认必须是「跟」**。
+        # 出厂就替用户选好「分位」有两个坏处：他自己不知道被动过，而且以后
+        # 改全局默认口径时这一格会不跟着动（显式覆盖 ≠ 跟随）。
+        method_ok = False
+        method_info = ""
+        try:
+            _mc = win.tbl_fmulti.cellWidget(0, COL_METHOD)
+            _opts = {_mc.itemData(i) for i in range(_mc.count())}
+            _n_combos = sum(
+                1 for r in range(win.tbl_fmulti.rowCount())
+                if type(win.tbl_fmulti.cellWidget(r, COL_METHOD)).__name__ == "QComboBox"
+            )
+            method_ok = (type(_mc).__name__ == "QComboBox"
+                         and _opts == {"", "z", "rank"}
+                         and (_mc.currentData() or "") == ""
+                         and _n_combos == win.tbl_fmulti.rowCount())
+            method_info = (f"{_n_combos}/{win.tbl_fmulti.rowCount()} 行有下拉，"
+                           f"选项 {sorted(str(o) for o in _opts)}，"
+                           f"默认 {(_mc.currentData() or '跟')!r}")
+        except Exception as exc:  # noqa: BLE001
+            method_info = f"{type(exc).__name__}: {exc}"
+
         factor_ok = (
             fams == {"rule", "factor", "cross"}
             and modes == {"single", "multi", "ml"}
@@ -5957,12 +5983,14 @@ def _run() -> tuple[bool, list[str]]:
             and orients == {"auto", "long_high", "long_low"}
             and n_factors >= 47
             and n_models >= 4
-            # 多因子表要 47 行 × 5 列（因子 / 周期 / 用 / 反 / 权重），少了「反」
-            # 列就没法逐因子反转，少了「权重」列「不等权」就是空话，少了「周期」
-            # 列就没法跨周期引用
+            # 多因子表要 47 行 × 6 列（因子 / 周期 / 用 / 反 / 口径 / 权重），
+            # 少了「反」列就没法逐因子反转，少了「权重」列「不等权」就是空话，
+            # 少了「周期」列就没法跨周期引用，少了「口径」列就只能在整条策略上
+            # 统一用一种标准化方法（仓单要分位、动量要 z 就做不到）
             and n_rows_f >= 47
-            and n_cols_f == 5
+            and n_cols_f == 6
             and period_ok
+            and method_ok
             and win.chk_frev is not None
             # 权重 / 合成口径五档（等权 / 因子与 / 因子或 / 不等权 / 滚动 IC）
             # + 打分范围说明 + 出场规则入口。因子与、因子或是「合成口径」而不是
@@ -6042,7 +6070,63 @@ def _run() -> tuple[bool, list[str]]:
             pick_info = f"{type(exc).__name__}: {exc}"
         factor_ok = factor_ok and pick_ok
         factor_info = (f"{len(fams)} 族 / {len(modes)} 模式 / {n_factors} 因子 / "
-                       f"{n_models} 模型 / 勾选 {pick_info}")
+                       f"{n_models} 模型 / 勾选 {pick_info} / "
+                       f"表 {n_rows_f}行×{n_cols_f}列 / 周期 {period_info} / "
+                       f"口径 {method_info}")
+
+        # 逐因子口径的**端到端往返**：界面上把一个因子改成「分」→ `_factor_cfg()`
+        # 必须把它收进 `method_of` → `_apply_factor_keys()` 读回来还是「分」。
+        #
+        # 为什么非要走窗口：`FactorConfig.method_of` 本身在别处已验过（第 80 项），
+        # 但界面这一层最容易「存了没读 / 读了没存」—— #135 就是 `_norm` 白名单
+        # 漏字段，配置读回后静默变成另一个口径，而笔数对拍完全看不出来。
+        gauge_ok = False
+        gauge_info = ""
+        try:
+            from PySide6.QtCore import Qt as _Qt
+
+            _st = win._multi_state()
+            _pers = win._factor_periods()      # 改动前抓，往返要用原样带回去
+            _k0 = next(iter(_st))
+            _mc0 = win.tbl_fmulti.cellWidget(0, COL_METHOD)
+            _backup = _mc0.currentData()
+            _mc0.blockSignals(True)
+            _mc0.setCurrentIndex(_mc0.findData("rank"))
+            _mc0.blockSignals(False)
+            _cfg1 = win._factor_cfg()
+            _got = dict(_cfg1.method_of or {})
+            # 再走一遍「载入策略」的路径：应该把这一格恢复成「分」，
+            # 其余没配的落回「跟」
+            # `_factor_cfg()` 给的是 `FactorConfig`（只有因子配置，没有 keys），
+            # 键清单得从表格读；周期也用改动前的快照带回去，否则这趟往返会把
+            # 跨周期设置清成「本周期」，后面几项检查会看到莫名其妙的变化
+            _used = [k for k, v in _st.items() if v[0]]
+            _rev = {k: True for k, v in _st.items() if v[1]}
+            win._apply_factor_keys(_used, _rev, _pers, _got)
+            _after = (_mc0.currentData() or "")
+            _others = {str(win.tbl_fmulti.cellWidget(r, COL_METHOD).currentData() or "")
+                       for r in range(win.tbl_fmulti.rowCount())
+                       if win.tbl_fmulti.cellWidget(r, COL_METHOD) is not None
+                       and win.tbl_fmulti.item(r, COL_NAME) is not None
+                       and str(win.tbl_fmulti.item(r, COL_NAME).data(_Qt.UserRole))
+                       != _k0}
+            gauge_ok = (_got == {_k0: "rank"} and _after == "rank"
+                        and _others <= {""})
+            gauge_info = (f"{_k0} 收集 {_got} / 读回 {_after!r} / "
+                          f"其余格 {sorted(str(o) for o in _others)}")
+            # 还原：口径回原值，勾选按备份恢复（`_apply_factor_keys` 会把
+            # 不在 keys 里的行取消勾选，不还原会影响后面的检查）
+            _mc0.blockSignals(True)
+            _mi = _mc0.findData(_backup or "")
+            _mc0.setCurrentIndex(_mi if _mi >= 0 else 0)
+            _mc0.blockSignals(False)
+            win._apply_factor_keys(
+                _used, _rev, _pers, {k: v[4] for k, v in _st.items() if v[4]})
+        except Exception as exc:  # noqa: BLE001
+            gauge_info = f"{type(exc).__name__}: {exc}"
+
+        if not gauge_ok:
+            raise RuntimeError(f"逐因子口径界面往返失败：{gauge_info}")
 
         # 因子分析页：表格应铺满全因子，四格图应建出 4 个轴
         win.tabs.setCurrentIndex(2)
@@ -6857,17 +6941,17 @@ def _run() -> tuple[bool, list[str]]:
             # 勾上前两行：默认勾选（`DEFAULT_MULTI`）不一定落在这个市场的因子集里，
             # 上一段稀疏采样的操作也可能把勾去掉
             for _r in range(min(2, win.tbl_fmulti.rowCount())):
-                _cell = win.tbl_fmulti.item(_r, 2)
+                _cell = win.tbl_fmulti.item(_r, COL_USE)
                 if _cell is not None:
                     _cell.setCheckState(Qt.Checked)
             app.processEvents()
             rows = [r for r in range(win.tbl_fmulti.rowCount())
-                    if win.tbl_fmulti.item(r, 2) is not None
-                    and win.tbl_fmulti.item(r, 2).checkState() == Qt.Checked]
+                    if win.tbl_fmulti.item(r, COL_USE) is not None
+                    and win.tbl_fmulti.item(r, COL_USE).checkState() == Qt.Checked]
             if len(rows) < 2:
                 raise RuntimeError("自检环境里勾中的因子不足 2 个，权重往返测不了")
-            win.tbl_fmulti.item(rows[0], 4).setText("3")
-            win.tbl_fmulti.item(rows[1], 4).setText("0.5")
+            win.tbl_fmulti.item(rows[0], COL_W).setText("3")
+            win.tbl_fmulti.item(rows[1], COL_W).setText("0.5")
             app.processEvents()
             want_w = win._factor_cfg()
             cfg_w = win._current_config()
@@ -6876,8 +6960,8 @@ def _run() -> tuple[bool, list[str]]:
                         win.tbl_fmulti.item(rows[0], 0).data(Qt.UserRole), 0)) - 3.0) < 1e-9):
                 raise RuntimeError(f"权重没进配置：{want_w.weight_mode} {want_w.weights}")
             win.cb_fweight.setCurrentIndex(win.cb_fweight.findData("equal"))
-            win.tbl_fmulti.item(rows[0], 4).setText("1")
-            win.tbl_fmulti.item(rows[1], 4).setText("1")
+            win.tbl_fmulti.item(rows[0], COL_W).setText("1")
+            win.tbl_fmulti.item(rows[1], COL_W).setText("1")
             app.processEvents()
             win.apply_config(cfg_w)
             app.processEvents()

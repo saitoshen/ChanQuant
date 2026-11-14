@@ -162,7 +162,7 @@ FAMILY_CROSS = "cross"
 
 # 多因子表格的列号。**一律用常量**：这张表从 4 列扩到 5 列时（加了「周期」），
 # 散在各处的 `item(r, 2)` 全是「反」还是「用」这种问题，靠肉眼是查不出来的
-COL_NAME, COL_PERIOD, COL_USE, COL_REV, COL_W = 0, 1, 2, 3, 4
+COL_NAME, COL_PERIOD, COL_USE, COL_REV, COL_METHOD, COL_W = 0, 1, 2, 3, 4, 5
 
 
 class _StayOpenMenu(QMenu):
@@ -484,6 +484,17 @@ QComboBox, QSpinBox, QDoubleSpinBox {
 QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover { border-color: #94a3b8; }
 QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #2563eb; }
 QComboBox::drop-down { border: none; width: 18px; }
+/* 因子表「口径」列里的三态下拉（跟 / z / 分）。
+   全局的 QComboBox 有 `padding: 3px 8px` 加 18px 的 drop-down，列宽只有
+   38px —— 内容区只剩 4px，文字直接被挤没，渲染出来是一片空白，看着像
+   控件根本没建出来（实测截图就是这样）。这里把 padding 和箭头一起压到最小 */
+QComboBox#MethodCell {
+    padding: 0px 1px; min-height: 17px; border-radius: 4px; font-size: 10px;
+}
+/* 箭头区压到 4px。本项目的下拉框本来就不画三角（全局 `::drop-down` 只设了
+   border:none，没有 image），这里再留 12px 就是在列宽里白占位置 ——
+   因子名本来就只能露五六个字，多出来的像素全给它更划算 */
+QComboBox#MethodCell::drop-down { width: 4px; border: none; }
 QComboBox QAbstractItemView {
     background: #ffffff; border: 1px solid #cbd5e1; selection-background-color: #dbeafe;
     selection-color: #1e40af; outline: none;
@@ -2290,6 +2301,7 @@ class MainWindow(QMainWindow):
             "分位把同一窗口内的排名映射到 ±4（中位 0、最高 +4、最低 −4）。"
             "换口径不用换阈值，但同一个阈值的分位含义不同：z 的 1.0 约是 84 分位，"
             "分位的 1.0 只有 62.5 分位 —— 想把频率拉平，分位取 z 的 2~2.5 倍。"
+            "多因子组合时，表格里的「口径」列可以给单个因子单独设（默认「跟」）。"
         )
         self.lbl_frange.setObjectName("Hint")
         self.lbl_frange.setWordWrap(True)
@@ -2330,18 +2342,24 @@ class MainWindow(QMainWindow):
         self.cb_fperiod.currentIndexChanged.connect(self._on_single_period_changed)
         sf.addWidget(self.cb_fperiod)
 
-        # 多因子选择：五列表 —— 因子 / 周期 / 用 / 反 / 权重。
+        # 多因子选择：六列表 —— 因子 / 周期 / 用 / 反 / 口径 / 权重。
         # 用 QTableWidget 而不是 QListWidget：每个因子需要独立开关
         # （参与合成、反向使用、权重），QListWidget 只有一列勾选框，塞不下。
         # 「权重」列只在「不等权」时露出来 —— 等权模式下摆一列全 1，
         # 只会让人以为调它有用。
         # 「周期」列是**多选**（`PeriodButton`）：一个因子勾几档周期就是几个
         # 因子实例（`mom_60` / `mom_60@1w`），各占一列一起进合成
-        self.tbl_fmulti = QTableWidget(0, 5)
+        #
+        # 「口径」列（3.7.4 新增）：逐因子覆盖标准化方法。默认「跟」
+        # 表示跟着上面那个全局下拉框走；选「z」或「分」就只对这一个因子生效。
+        # 为什么需要：一个组合里常常「仓单要分位、动量要 z」——仓单变化偏度
+        # 9.6，滚 z 之后 88% 的样本挤在 ±1 内，默认阈值根本开不出仓；而动量
+        # 类接近正态，换分位反而丢掉幅度信息（实测见 reports/factor_norm_ab.md）。
+        self.tbl_fmulti = QTableWidget(0, 6)
         self.tbl_fmulti.setObjectName("FactorTable")
         self.tbl_fmulti.setFixedHeight(176)
         self.tbl_fmulti.setHorizontalHeaderLabels(
-            ["因子", "周期", "用", "反", "权重"])
+            ["因子", "周期", "用", "反", "口径", "权重"])
         self.tbl_fmulti.verticalHeader().setVisible(False)
         # 47 行一屏放不下，行高压紧到 21px，176px 能露 8 行，剩下的滚动
         self.tbl_fmulti.verticalHeader().setDefaultSectionSize(21)
@@ -2354,16 +2372,18 @@ class MainWindow(QMainWindow):
         self.tbl_fmulti.setFocusPolicy(Qt.NoFocus)
         hh = self.tbl_fmulti.horizontalHeader()
         hh.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
-        for _c in (COL_PERIOD, COL_USE, COL_REV, COL_W):
+        for _c in (COL_PERIOD, COL_USE, COL_REV, COL_METHOD, COL_W):
             hh.setSectionResizeMode(_c, QHeaderView.Fixed)
         hh.setFixedHeight(22)
-        # 四列固定宽度，剩下全给「因子」——因子名最长能到 288px（
+        # 五列固定宽度，剩下全给「因子」——因子名最长能到 288px（
         # 「时段 · 非活跃时段反转 13:30-14:00」），而侧边栏可视宽度只有三百多，
         # 右边这几列每省一个像素，名字就多露一个字。周期 52 刚好放得下「本周期」
-        # 和「本+日」，再长由 `PeriodButton._label` 退化成「N 档」
+        # 和「本+日」，再长由 `PeriodButton._label` 退化成「N 档」。
+        # 「口径」只放 38px：显示的是单字（跟 / z / 分），再宽纯属浪费
         self.tbl_fmulti.setColumnWidth(COL_PERIOD, 52)
         self.tbl_fmulti.setColumnWidth(COL_USE, 24)
         self.tbl_fmulti.setColumnWidth(COL_REV, 24)
+        self.tbl_fmulti.setColumnWidth(COL_METHOD, 40)
         self.tbl_fmulti.setColumnWidth(COL_W, 30)
         self.tbl_fmulti.setColumnHidden(COL_W, True)
         self._fill_multi_table()
@@ -2462,19 +2482,28 @@ class MainWindow(QMainWindow):
         # 标准化口径。两种都落在 ±4，所以阈值在两者之间可以照抄 ——
         # 但**同一个阈值的含义不一样**：z 的 1.0 是 84 分位，分位的 1.0 是
         # 62.5 分位。想等价比较，分位的阈值要乘 2.5 左右（工具提示里写了）
+        #
+        # 3.7.4 起它是**默认口径**：多因子表格里可以逐因子覆盖（「口径」列）。
         self.cb_fmethod = QComboBox()
         self.cb_fmethod.addItem("z-score（±4 截断）", "z")
         self.cb_fmethod.addItem("分位（±4 映射）", "rank")
         self.cb_fmethod.setToolTip(
-            "因子分数的标准化口径。两种都落在 −4 ~ +4，进场阈值不用换算法。\n\n"
+            "**默认**标准化口径。多因子组合里可以在表格的「口径」列逐因子覆盖。\n\n"
             "z-score：减去过去 252 根的均值、除以标准差，再按 ±4 截断。\n"
             "分位：同一窗口内的排名映射到 ±4（中位 0，最高 +4，最低 −4）。\n"
             "分位对极端值免疫 —— 一个 10σ 的毛刺和 3σ 排同一档；代价是丢掉幅度，\n"
             "涨 2% 和涨 20% 的分数可能一样。\n\n"
             "注意阈值不等价：z 的 1.0 约等于 84 分位，分位的 1.0 只有 62.5 分位。\n"
             "想把交易频率拉平，分位这边的阈值取 z 的 2~2.5 倍\n"
-            "（实测 z 0.6 / 1.0 / 1.5 对应分位 1.54 / 2.31 / 2.97）。"
+            "（实测 z 0.6 / 1.0 / 1.5 对应分位 1.54 / 2.31 / 2.97）。\n\n"
+            "逐因子怎么选（22 品种 × 5 周期实测）：仓单变化、仓单水平、主力持仓这类\n"
+            "右偏重的走分位（默认阈值下的通过率 41% → 90%）；动量、波动这类接近\n"
+            "正态的保持 z。已经内置分位的因子（如「仓单分位 3 年」）二次标准化\n"
+            "优先 z —— 再套一层分位等于「秩的秩」，把细粒度排序压掉了。"
         )
+        # 之前**没连信号**：改了口径不会重算，图上还是旧的，只能手动点回测。
+        # 换口径等于换了一条策略（阈值含义都不同），不重算等于让界面说谎。
+        self.cb_fmethod.currentIndexChanged.connect(self._on_global_method_changed)
         sf.addWidget(self.cb_fmethod)
 
         # 方向口径。这一项之前只在 FactorConfig 里存在、界面没暴露，导致「反转」
@@ -3307,6 +3336,35 @@ class MainWindow(QMainWindow):
                     out[factors.make_spec(k, p)] = p
         return out
 
+    def _factor_method_of(self) -> dict[str, str]:
+        """`{因子键: "z"|"rank"}`，只收**覆盖了全局**的那些。
+
+        空值不写进去，这一点很关键：如果每个因子都存一份和全局相同的值，
+        用户下次改默认口径时这些格子**不会跟着变**（因为它们是显式覆盖），
+        界面上看起来就是「全局下拉框坏了」。
+        """
+        out: dict[str, str] = {}
+        for r in range(self.tbl_fmulti.rowCount()):
+            item = self.tbl_fmulti.item(r, COL_NAME)
+            if item is None:
+                continue
+            cb = self.tbl_fmulti.cellWidget(r, COL_METHOD)
+            if not isinstance(cb, QComboBox):
+                continue
+            v = str(cb.currentData() or "").strip()
+            if v:
+                out[str(item.data(Qt.UserRole))] = v
+        return out
+
+    def _on_global_method_changed(self, _i: int = 0) -> None:
+        """默认口径变了就把「跟」的那些重算一遍。
+
+        这一项以前**没连信号**：改了下拉框，图一动不动，要手动点回测才更新。
+        换口径等于换了一条策略（同一个阈值在两口径里含义都不同），
+        不重算等于让界面显示的是另一套参数的结果。
+        """
+        self._schedule()
+
     def _sync_single_period(self) -> None:
         """把当前单因子那一行的周期刷到下拉框上（不触发重算）。"""
         k = self.cb_fsingle.currentData()
@@ -3323,8 +3381,8 @@ class MainWindow(QMainWindow):
         self._schedule(immediate=True)
 
     def _multi_state(self) -> dict:
-        """每个因子的 (参与合成, 反转, 权重, 周期列表)。重建时用它保住勾选。"""
-        out: dict[str, tuple[bool, bool, str, list[str]]] = {}
+        """每个因子的 (参与合成, 反转, 权重, 周期列表, 口径)。重建时用它保住勾选。"""
+        out: dict[str, tuple[bool, bool, str, list[str], str]] = {}
         for r in range(self.tbl_fmulti.rowCount()):
             item = self.tbl_fmulti.item(r, COL_NAME)
             if item is None:
@@ -3335,13 +3393,51 @@ class MainWindow(QMainWindow):
             wt = self.tbl_fmulti.item(r, COL_W)
             pcell = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
             ps = pcell.periods() if isinstance(pcell, PeriodButton) else [""]
+            mcell = self.tbl_fmulti.cellWidget(r, COL_METHOD)
+            meth = (mcell.currentData() or "") if isinstance(mcell, QComboBox) else ""
             out[k] = (
                 bool(use is not None and use.checkState() == Qt.Checked),
                 bool(rev is not None and rev.checkState() == Qt.Checked),
                 ((wt.text().strip() if wt is not None else "") or "1"),
                 list(ps or [""]),
+                str(meth or ""),
             )
         return out
+
+    def _make_method_combo(self, value: str = "") -> QComboBox:
+        """一格「口径」下拉框。
+
+        `value` 为空表示跟随全局 —— 这是默认，也是绝大多数因子的处境：
+        逐因子覆盖是为了解决「仓单要分位、动量要 z」这种混搭，不是让每个
+        因子都要单独设一遍。所以空值必须是一等公民（存盘时直接不写这个键），
+        而不是存一个和全局相同的值 —— 后者在用户改全局口径时会**不动**，
+        看起来像「全局下拉坏了」。
+        """
+        cb = QComboBox()
+        cb.setObjectName("MethodCell")
+        for label, data, tip in (
+            ("跟", "", "跟随上面的「默认口径」。改全局下拉，这一格跟着变。"),
+            ("z", "z", "z-score：减均值除标准差再按 ±4 截断。保留幅度信息，"
+                      "但对右偏重的因子会把分数压扁（仓单变化 z 后 88% 落在 ±1 内）。"),
+            ("分", "rank", "分位：窗口内排名映射到 ±4。对极端值免疫，默认阈值下"
+                          "更容易开出仓；代价是两端被等距化。"),
+        ):
+            cb.addItem(label, data)
+            cb.setItemData(cb.count() - 1, tip, Qt.ToolTipRole)
+        i = cb.findData(str(value or ""))
+        cb.setCurrentIndex(i if i >= 0 else 0)
+        cb.setToolTip(
+            "这个因子用哪种标准化口径。\n\n"
+            "「跟」= 跟上方的默认口径（默认）。\n"
+            "「z」/「分」= 只对这个因子生效，其它因子不受影响。\n\n"
+            "为什么需要逐因子：仓单变化偏度 9.6，滚动 z 之后 88% 的样本挤在 ±1 内，\n"
+            "默认阈值 1.0 时八成时间开不出仓；换成分位后笔数翻三倍。而动量/波动\n"
+            "类因子接近正态，换分位反而丢掉幅度。\n"
+            "在同一个组合里「仓单分位 + 动量 z」才是对的，全换或全不换都不对。"
+        )
+        # 换口径就是换了一条策略（阈值含义都不同），必须重算
+        cb.currentIndexChanged.connect(self._on_factor_selection)
+        return cb
 
     def _multi_weights(self) -> dict[str, float]:
         """「不等权」模式下每个因子的权重。非数字当 1，负数也当 1。
@@ -3388,8 +3484,8 @@ class MainWindow(QMainWindow):
                 # 名字列默认是可编辑的，不改的话双击就能把因子名改乱
                 name.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 self.tbl_fmulti.setItem(r, COL_NAME, name)
-                use_on, rev_on, wt, pers = picked.get(
-                    k, (k in factors.DEFAULT_MULTI, False, "1", [""]))
+                use_on, rev_on, wt, pers, meth = picked.get(
+                    k, (k in factors.DEFAULT_MULTI, False, "1", [""], ""))
                 btn = PeriodButton()
                 btn.setPeriods(pers)
                 btn.changed.connect(self._on_factor_selection)
@@ -3404,6 +3500,10 @@ class MainWindow(QMainWindow):
                     cell.setTextAlignment(Qt.AlignCenter)
                     cell.setToolTip(tip)
                     self.tbl_fmulti.setItem(r, col, cell)
+                # 口径：逐因子覆盖（空 = 跟随全局）。用 cellWidget 而不是
+                # 可勾选的 item —— 三态（跟 / z / 分）塞不进一个勾选框
+                self.tbl_fmulti.setCellWidget(r, COL_METHOD,
+                                              self._make_method_combo(meth))
                 wcell = QTableWidgetItem(wt)
                 wcell.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable
                                | Qt.ItemIsEditable)
@@ -5082,7 +5182,8 @@ class MainWindow(QMainWindow):
             if m >= 0:
                 self.cb_fmode.setCurrentIndex(m)
             self._apply_factor_keys(cfg.factor_keys, cfg.factor_reverse,
-                                    (cfg.factor_cfg or {}).get("factor_periods"))
+                                    (cfg.factor_cfg or {}).get("factor_periods"),
+                                    (cfg.factor_cfg or {}).get("method_of"))
             self._apply_factor_cfg(cfg.factor_cfg)
 
         if cfg.family == FAMILY_RULE:
@@ -5099,7 +5200,8 @@ class MainWindow(QMainWindow):
                 if fm >= 0:
                     self.cb_filter_mode.setCurrentIndex(fm)
                 self._apply_factor_keys(cfg.factor_keys, cfg.factor_reverse,
-                                        (cfg.factor_cfg or {}).get("factor_periods"))
+                                        (cfg.factor_cfg or {}).get("factor_periods"),
+                                        (cfg.factor_cfg or {}).get("method_of"))
                 # `filter_mode`（否决 / 延后 / 离场）在 `_apply_factor_cfg` 里
                 self._apply_factor_cfg(cfg.factor_cfg)
             # 信号被屏蔽过，面板的显隐 / 标题要手动同步一次
@@ -5136,7 +5238,8 @@ class MainWindow(QMainWindow):
             if fm >= 0:
                 self.cb_fmode.setCurrentIndex(fm)     # 重建因子参数控件
             self._apply_factor_keys(cfg.factor_keys, cfg.factor_reverse,
-                                    (cfg.factor_cfg or {}).get("factor_periods"))
+                                    (cfg.factor_cfg or {}).get("factor_periods"),
+                                    (cfg.factor_cfg or {}).get("method_of"))
             self._apply_factor_cfg(cfg.factor_cfg)
             # 时序腿的规则参数在 `timing_rule_params` 里，和主规则参数是两套：
             # 截面对冲时用户可能在两个模式下调过不同的参数
@@ -5190,11 +5293,12 @@ class MainWindow(QMainWindow):
         # 加载一条已存的策略是显式动作：手动模式下也要立刻算一遍
         self._schedule(immediate=True, force=True)
 
-    def _apply_factor_keys(self, keys, reverse, periods=None) -> None:
+    def _apply_factor_keys(self, keys, reverse, periods=None, methods=None) -> None:
         """恢复因子选择：单因子设下拉，多因子勾表格，反向勾「反」列。
 
         `keys` 里可能是**实例**（`mom_60@1d_tq`，新写法），也可能是纯键 + 另一份
         `periods` 映射（老配置）。两种都读，老策略读回来一个字都不用改。
+        `methods` 是逐因子标准化口径（`factor_cfg["method_of"]`），没配的落回「跟」。
         """
         keys = [str(k) for k in (keys or [])]
         # 每个因子行要用到的周期集合：实例 id 自带周期，纯键去 periods 里查
@@ -5235,6 +5339,15 @@ class MainWindow(QMainWindow):
                 pcell = self.tbl_fmulti.cellWidget(r, COL_PERIOD)
                 if isinstance(pcell, PeriodButton):
                     pcell.setPeriods(want.get(k, [""]))
+                # 逐因子口径：没配的落回「跟」。`blockSignals` 必须单独挡 ——
+                # 表格那次 blockSignals 管不到 cellWidget 里的下拉框，
+                # 47 行各触发一次就排 47 次回测
+                mcell = self.tbl_fmulti.cellWidget(r, COL_METHOD)
+                if isinstance(mcell, QComboBox):
+                    mcell.blockSignals(True)
+                    mi = mcell.findData(str((methods or {}).get(k) or ""))
+                    mcell.setCurrentIndex(mi if mi >= 0 else 0)
+                    mcell.blockSignals(False)
         finally:
             self.tbl_fmulti.blockSignals(False)
         self._sync_single_period()
@@ -5261,7 +5374,12 @@ class MainWindow(QMainWindow):
             if v:
                 i = cb.findData(v)
                 if i >= 0:
+                    # 载入配置不是用户操作：必须挡住信号。`method` 那一项
+                    # 现在连着 `_on_global_method_changed`，不挡的话每次
+                    # 载入策略都白排一次回测
+                    cb.blockSignals(True)
                     cb.setCurrentIndex(i)
+                    cb.blockSignals(False)
         # 合并训练的勾选框：之前没存进配置，导致回测走合训、训练和实盘走
         # 逐品种，三者不一致。现在从 `factor_cfg` 里恢复
         if hasattr(self, "chk_ml_pool"):
@@ -5724,6 +5842,10 @@ class MainWindow(QMainWindow):
             # 所以换口径不用重算阈值（但同一阈值的分位含义不同）
             method=((self.cb_fmethod.currentData() or "z")
                     if hasattr(self, "cb_fmethod") else "z"),
+            # 逐因子覆盖（只有表格里选了 z / 分的才在里面）。组合里可以
+            # 「仓单走分位 + 动量走 z」，依据见 reports/factor_norm_ab.md
+            method_of=(self._factor_method_of()
+                       if hasattr(self, "tbl_fmulti") else {}),
             reverse={k: True for k in self._reversed_factor_keys()},
             # 跨周期因子：{因子键: 周期}，没配的因子跟策略周期走
             factor_periods=self._factor_periods(),
