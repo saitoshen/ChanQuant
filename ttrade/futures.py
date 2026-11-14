@@ -584,6 +584,18 @@ def refresh_manifest(data_dir: str) -> list[dict]:
 # ---------------------------------------------------------------- 板块分类
 # 交易所分类对策略研究意义不大，品种板块（黑色/有色/能化/农产品…）才是
 # 决定趋势性的关键维度，因此按品种代码手工归类。
+#
+# 分两层，名字里带「·」的表示是下面一层（产业板块）：
+#   L1 大类（`SECTOR_MAP`，9 个）= 宏观驱动维度，做「板块指数/品种联动」看这一层；
+#   L2 产业板块（`SECTOR_L2`，16 个）= 产业链维度，做「因子横截面扫描」看这一层。
+#
+# 为什么必须有 L2：横截面扫描的判据是「同一因子在板块内几个品种上为正」，
+# 板块越大越容易把两个不相关的假设平均成一个结论。化工 21 个品种跨聚酯 /
+# 烯烃芳烃 / 煤化工 / 橡胶纸浆四条链，上一轮「30m 偏弱、1d 最弱」本质上就是
+# 四条链平均出来的；农产品 19 个更是横跨油脂油料、软商品、鲜果、养殖谷物。
+#
+# 🔴 两层必须**严格对齐**：L2 的代码并集要等于 L1，每个代码恰好出现一次。
+# `selftest` 有一条专门查这件事（`sector_maps_ok`），改任何一边都会红。
 SECTOR_MAP = {
     "贵金属": "AU AG PT PD",
     "有色": "CU AL ZN PB NI SN AO BC AD SS",
@@ -597,9 +609,100 @@ SECTOR_MAP = {
 }
 _SECTOR_OF: dict[str, str] = {s: k for k, v in SECTOR_MAP.items() for s in v.split()}
 
+# L2 产业板块。没拆的大类 L2 名与 L1 同名（识别时先查 L1 再查 L2，结果一样）。
+# 已经退市/无流动性的老代码（ME/ZC/TC/WR/RO/RS/WH/WS/WT/PM/RI/ER/JR/LR）
+# 也照原归属放进对应链里 —— 不能让 L2 出现「谁都不认」的代码。
+SECTOR_L2 = {
+    "贵金属": "AU AG PT PD",
+    "有色": "CU AL ZN PB NI SN AO BC AD SS",
+    "黑色": "RB HC I J JM SF SM WR",
+    "能源·原油": "SC FU LU BU PG ZC TC",
+    "化工·聚酯": "TA EG PF PR PX",
+    "化工·烯烃芳烃": "L PP V EB BZ PL",
+    "化工·煤化工": "MA UR FG SA SH ME",
+    "化工·橡胶纸浆": "RU NR BR SP OP",
+    "农产·油脂油料": "A B M Y P RM OI RO RS",
+    "农产·软商品鲜果": "CF CY SR AP CJ",
+    "农产·谷物养殖": "C CS JD LH PK RR WH WS WT PM RI ER JR LR",
+    "农产·木材": "LG",
+    "金融·股指": "IF IH IC IM",
+    "金融·国债": "T TF TS TL0",
+    "新能源": "LC SI PS",
+    "航运": "EC",
+}
+L2_PARENT = {
+    "贵金属": "贵金属",
+    "有色": "有色",
+    "黑色": "黑色",
+    "能源·原油": "能源",
+    "化工·聚酯": "化工",
+    "化工·烯烃芳烃": "化工",
+    "化工·煤化工": "化工",
+    "化工·橡胶纸浆": "化工",
+    "农产·油脂油料": "农产品",
+    "农产·软商品鲜果": "农产品",
+    "农产·谷物养殖": "农产品",
+    "农产·木材": "农产品",
+    "金融·股指": "金融",
+    "金融·国债": "金融",
+    "新能源": "新能源",
+    "航运": "航运",
+}
+_L2_OF: dict[str, str] = {s: k for k, v in SECTOR_L2.items() for s in v.split()}
+
 
 def sector_of(symbol: str) -> str:
+    """品种 → L1 大类（9 个之一，认不出返回「其他」）。"""
     return _SECTOR_OF.get(symbol.upper(), "其他")
+
+
+def sector_l2_of(symbol: str) -> str:
+    """品种 → L2 产业板块（16 个之一，认不出返回「其他」）。"""
+    return _L2_OF.get(symbol.upper(), "其他")
+
+
+def l2_names(l1: str = "") -> list[str]:
+    """某个大类下的产业板块名；`l1` 空则返回全部 16 个。"""
+    if not l1:
+        return list(SECTOR_L2)
+    out = [k for k, v in L2_PARENT.items() if v == l1]
+    # 兜底：名字里带「·」的 L2 之外，同名的也算（比如 l1="新能源"）
+    return out or ([l1] if l1 in SECTOR_L2 else [])
+
+
+def l1_of_l2(l2: str) -> str:
+    return L2_PARENT.get(l2, "")
+
+
+def sector_maps_ok() -> list[str]:
+    """两层对齐自检：返回问题列表，空表示没问题。
+
+    查三件事（都是真会出错的地方）：
+    1. L2 的代码并集是否等于 L1 —— 少一个品种会让它从扫描里静默消失；
+    2. 有没有代码被两个 L2 都认领 —— 会让同一个品种在两张表里各算一次；
+    3. `L2_PARENT` 是否覆盖全部 L2，且父级真的是一个 L1。
+    """
+    bad = []
+    l1_codes = {s for v in SECTOR_MAP.values() for s in v.split()}
+    l2_codes = [s for v in SECTOR_L2.values() for s in v.split()]
+    dup = {s for s in l2_codes if l2_codes.count(s) > 1}
+    if dup:
+        bad.append("同一品种被多个产业板块认领：" + "、".join(sorted(dup)))
+    miss = l1_codes - set(l2_codes)
+    if miss:
+        bad.append("L1 有、L2 没有的品种：" + "、".join(sorted(miss)))
+    extra = set(l2_codes) - l1_codes
+    if extra:
+        bad.append("L2 有、L1 没有的品种：" + "、".join(sorted(extra)))
+    for name in SECTOR_L2:
+        if name not in L2_PARENT:
+            bad.append(f"产业板块「{name}」没有 L2_PARENT")
+        elif L2_PARENT[name] not in SECTOR_MAP:
+            bad.append(f"产业板块「{name}」的父级「{L2_PARENT[name]}」不是大类")
+    for name in L2_PARENT:
+        if name not in SECTOR_L2:
+            bad.append(f"L2_PARENT 里的「{name}」在 SECTOR_L2 里没有定义")
+    return bad
 
 
 def list_local(

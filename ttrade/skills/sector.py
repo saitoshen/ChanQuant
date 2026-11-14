@@ -10,13 +10,26 @@
 判这件事只能靠横向表：**同一个因子、同一个方向、同一个周期，在板块内所有品种上
 各跑一遍**，然后数「几个品种是正的」。单看一个品种的回测永远看不出来。
 
-## 三个动作
+## 四个动作
 
 | 动作 | 回答什么 |
 |---|---|
-| `sector_list` | 这个板块有哪些品种、本地有没有数据 |
+| `sector_list` | 这个板块有哪些品种、本地有没有数据（`level=1` 大类 / `level=2` 产业板块） |
 | `sector_scan` | 因子 × 品种 × 周期 的横向表，带 IS/OOS 切段 |
 | `sector_relation` | 品种和板块指数怎么联动（相关性 / beta / 解释力） |
+| `sector_corr` | 板块内部有多像、板块之间有多像（判「算几个独立假设」） |
+
+## 两层板块
+
+- **L1 大类（`futures.SECTOR_MAP`，9 个）**：贵金属/有色/黑色/能源/化工/农产品/金融/新能源/航运。
+  宏观驱动维度，做板块指数、品种联动、大类配权用这一层。
+- **L2 产业板块（`futures.SECTOR_L2`，16 个）**：化工拆 4（聚酯/烯烃芳烃/煤化工/橡胶纸浆）、
+  农产品拆 4（油脂油料/软商品鲜果/谷物养殖/木材）、金融拆 2（股指/国债），其余不变。
+  产业链维度，**做因子横截面扫描必须用这一层** —— 化工 21 个品种跨四条链，
+  在 L1 上数「几个品种为正」等于把四条链平均掉。
+
+实测（2016-11~2026-11 日线）：板块间平均相关 L1 0.24 → L2 0.19，
+有效独立假设数（相关矩阵参与率）5.5 → 8.3。详见 `reports/sector_l2_review.md`。
 
 ## 口径（都是踩过坑才定下来的，别改）
 
@@ -77,19 +90,43 @@ def _sector_map() -> dict:
     return SECTOR_MAP
 
 
+def _norm_name(sector: str) -> str:
+    """板块名归一：`化工-聚酯` / `化工/聚酯` / `化工·聚酯` 都认。
+
+    用户不会记得分隔符是「·」，模型也常常写成 `-`，所以在查表之前统一一次。
+    """
+    s = str(sector or "").strip()
+    for sep in ("-", "/", "／", "・", "•", "_"):
+        s = s.replace(sep, "·")
+    return s
+
+
+def _sector_codes(name: str) -> list[str]:
+    """板块名 → 代码列表。两层都认：先查 L1（9 个大类），再查 L2（16 个产业板块）。"""
+    from ttrade.futures import SECTOR_L2, SECTOR_MAP
+
+    n = _norm_name(name)
+    for table in (SECTOR_MAP, SECTOR_L2):
+        if n in table:
+            return table[n].split()
+    return []
+
+
 def _sector_keys(sector: str) -> list[str]:
     """板块名 → 品种池里的键（`MA_CZCE`）。
 
     `SECTOR_MAP` 是「板块名 → 代码串」，要拿**板块名**去查它，不能拿名字当代码比。
     （第一版就是直接把「化工」当代码去和 `symbol` 比较，于是永远 0 个品种。）
+
+    L2 产业板块（`化工·聚酯`）走同一套：代码集更小，只取落在里面的品种。
     """
-    from ttrade.futures import SECTOR_MAP, list_local
+    from ttrade.futures import list_local
     from ttrade.paths import data_dir as resolve_data_dir
 
-    name = str(sector or "").strip()
-    codes = set(SECTOR_MAP.get(name, "").split())
+    codes = set(_sector_codes(sector))
     if not codes:                      # 也允许直接传一串代码（"MA TA EG"）
-        codes = set(name.upper().split())
+        raw = str(sector or "").upper().replace(",", " ").replace("，", " ")
+        codes = {c for c in raw.split() if c}
     if not codes:
         return []
     rows = list_local(resolve_data_dir("cn"))
@@ -212,31 +249,52 @@ def _labels(ctx, keys) -> dict:
 
 
 def _sector_list(ctx, p: dict) -> SkillResult:
-    smap = _sector_map()
-    want = str(p.get("sector") or "").strip()
-    names = [want] if want else list(smap)
+    """列板块。`level=2` 时按 16 个产业板块列，并带上它属于哪个大类。
+
+    两个层级回答不同的问题：
+    - **L1 大类（9 个）**：宏观驱动，做板块指数、品种联动、大类配权用这一层；
+    - **L2 产业板块（16 个）**：产业链，做因子横截面扫描用这一层。
+      板块越大越容易把不相关的假设平均成一个结论（化工 21 个跨四条链）。
+    """
+    from ttrade.futures import L2_PARENT, SECTOR_L2, SECTOR_MAP
+
+    want = _norm_name(p.get("sector") or "")
+    level = int(p.get("level") or 1)
+    table = SECTOR_L2 if level == 2 else SECTOR_MAP
+    names = [want] if want else list(table)
     rows, total_sym = [], 0
     for name in names:
-        if name not in smap:
-            near = [k for k in smap if want and want in k]
+        if name not in table:
+            near = [k for k in table if want and want in k]
             raise RuntimeError(
-                f"没有「{name}」这个板块" +
+                f"没有「{name}」这个板块（level={level}）" +
                 (f"（相近的有：{'、'.join(near)}）" if near else
-                 f"（有的是：{'、'.join(smap)}）"))
-        codes = smap[name].split()
+                 f"（有的是：{'、'.join(table)}）"))
+        codes = table[name].split()
         keys = _sector_keys(name)
-        have = [k for k in keys]
-        total_sym += len(have)
+        total_sym += len(keys)
         missing = [c for c in codes if not any(k.startswith(c + "_") for k in keys)]
-        rows.append([name, len(codes), len(have),
-                     "、".join(k.rpartition("_")[0] for k in have) or "—",
-                     "、".join(missing) or "—"])
+        row = [name]
+        if level == 2:
+            row.append(L2_PARENT.get(name, ""))
+        row += [len(codes), len(keys),
+                "、".join(k.rpartition("_")[0] for k in keys) or "—",
+                "、".join(missing) or "—"]
+        rows.append(row)
 
-    blocks = [B.block_table(
-        ["板块", "代码数", "本地有数据", "品种", "缺数据/未下载"], rows,
-        note="「本地有数据」= 已通过活跃度与流动性筛选、可以直接回测的品种")]
+    cols = ["板块", "代码数", "本地有数据", "品种", "缺数据/未下载"]
+    if level == 2:
+        cols.insert(1, "大类")
+    note = "「本地有数据」= 已通过活跃度与流动性筛选、可以直接回测的品种"
+    if level == 2:
+        note += ("；产业板块比大类小，做 `sector_scan` 的横截面时用这一层 —— "
+                 "成分少于 3 个的（木材/航运）只适合单品种看")
+    else:
+        note += "；`level=2` 可看 16 个产业板块"
+    blocks = [B.block_table(cols, rows, note=note)]
+
     if want:
-        # 单看一个板块时把板块指数的当前状态也报出来
+        # 单看一个板块时把板块指数的当前状态也报出来（L1/L2 都适用）
         keys = _sector_keys(want)
         if keys:
             per = str(p.get("period") or "1d_tq")
@@ -250,13 +308,22 @@ def _sector_list(ctx, p: dict) -> SkillResult:
                      (f"近 {min(20, len(idx) - 1)} 根", f"{chg20:+.2f}%",
                       "good" if chg20 >= 0 else "bad"),
                      ("成分", f"{len(keys)} 个", "flat")]))
-    summary = ("、".join(f"{r[0]} {r[2]} 个" for r in rows)
-               if not want else f"{want}：{rows[0][2]} 个品种可回测")
+    i_have = cols.index("本地有数据")
+    if want:
+        summary = f"{want}：{rows[0][i_have]} 个品种可回测"
+    else:
+        summary = "、".join(f"{r[0]} {r[i_have]} 个" for r in rows)
     return SkillResult(True, summary=summary, blocks=blocks, feed=summary)
 
 
-def _sector_index(ctx, keys, period, field: str = "close") -> pd.Series | None:
-    """板块等权指数 = 各品种 close 归一化后取均值。"""
+def _sector_index(ctx, keys, period, field: str = "close",
+                  min_members: int = 2) -> pd.Series | None:
+    """板块等权指数 = 各品种 close 归一化后取均值。
+
+    `min_members` 默认 2（「指数」至少要两个成分才有意义），但 `sector_corr`
+    要算单品种板块（航运/木材）跟别人的相关，那时传 1 —— 否则它们没有指数，
+    板块间相关矩阵会静默缺一整行（实测只剩 1 对有效值，看着像「算不出来」）。
+    """
     ser = []
     for k in keys:
         try:
@@ -269,7 +336,7 @@ def _sector_index(ctx, keys, period, field: str = "close") -> pd.Series | None:
         if len(s) < 10:
             continue
         ser.append(s / float(s.iloc[0]))
-    if len(ser) < 2:
+    if len(ser) < max(1, min_members):
         return None
     return pd.concat(ser, axis=1).sort_index().ffill().mean(axis=1).dropna()
 
@@ -506,6 +573,148 @@ def _pct(v) -> str:
     return f"{100 * x:+.1f}%"
 
 
+# ------------------------------------------------------------------ sector_corr
+
+
+def _daily_returns(ctx, keys, period: str, bars: int, cache: dict) -> dict[str, pd.Series]:
+    """每品种一条日频收益率序列。
+
+    🔴 分钟周期必须**先压日频**再算相关：不同周期最后一个 bar 的时刻不同，
+    直接对齐会得到稀疏表，相关性被稀释（组合曲线那边踩过同款坑）。
+    """
+    out = {}
+    for k in keys:
+        if k in cache:
+            df = cache[k]
+        else:
+            try:
+                df = _frame(ctx, k, period)
+            except Exception:  # noqa: BLE001 - 单品种缺数据不该拖垮整张表
+                df = None
+            cache[k] = df
+        if df is None or len(df) < 30 or "close" not in df:
+            continue
+        s = pd.to_numeric(df["close"], errors="coerce").dropna()
+        if len(s) < 30:
+            continue
+        if not _is_daily(period):
+            s = s.groupby(s.index.normalize()).last()
+        if bars and len(s) > bars:
+            s = s.iloc[-bars:]
+        out[k] = s.pct_change()
+    return out
+
+
+def _is_daily(period: str) -> bool:
+    return str(period).startswith("1d") or str(period) in ("2d", "1w")
+
+
+def _avg_pair_corr(rets: dict[str, pd.Series], min_common: int = 60) -> dict:
+    """一组品种的内部相关：平均 / 最高一对 / 最低一对。"""
+    names = list(rets)
+    if len(names) < 2:
+        return {"avg": float("nan"), "hi": (float("nan"), "", ""),
+                "lo": (float("nan"), "", ""), "n": 0, "pairs": 0}
+    f = pd.DataFrame(rets).sort_index()
+    c = f.corr(min_periods=min_common)
+    vals = []
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            v = c.loc[a, b]
+            if v == v:
+                vals.append((float(v), a.rpartition("_")[0], b.rpartition("_")[0]))
+    if not vals:
+        return {"avg": float("nan"), "hi": (float("nan"), "", ""),
+                "lo": (float("nan"), "", ""), "n": len(names), "pairs": 0}
+    vals.sort()
+    return {"avg": float(np.mean([v for v, _, _ in vals])),
+            "hi": vals[-1], "lo": vals[0], "n": len(names), "pairs": len(vals)}
+
+
+def _sector_corr(ctx, p: dict) -> SkillResult:
+    """板块内部相关性 + 板块之间的相关矩阵。"""
+    from ttrade.futures import L2_PARENT, SECTOR_L2, SECTOR_MAP
+
+    level = int(p.get("level") or 2)
+    table = SECTOR_L2 if level == 2 else SECTOR_MAP
+    period = str(p.get("period") or "1d_tq")
+    bars = int(p.get("bars") or 500)
+    min_common = int(p.get("min_common") or 60)
+    only = _norm_name(p.get("sectors") or "")
+
+    names = list(table)
+    if only:
+        want = {w.strip() for w in only.replace(",", " ").replace("，", " ").split() if w.strip()}
+        names = [n for n in names if n in want]
+        if not names:
+            raise RuntimeError(f"没有这些板块：{only}（level={level} 有的是：{'、'.join(table)}）")
+
+    cache: dict = {}
+    intra, idx_rets = [], {}
+    for n in names:
+        keys = _sector_keys(n)
+        rets = _daily_returns(ctx, keys, period, bars, cache)
+        if len(rets) < 1:
+            intra.append([n, L2_PARENT.get(n, ""), 0, "—", "—", "—"])
+            continue
+        st = _avg_pair_corr(rets, min_common)
+
+        def _pair(t):
+            return "%s·%s %.2f" % (t[1], t[2], t[0]) if t[1] else "—"
+
+        row = [n]
+        if level == 2:
+            row.append(L2_PARENT.get(n, ""))
+        row += [len(rets), _f(st["avg"]), _pair(st["hi"]), _pair(st["lo"])]
+        intra.append(row)
+        # 板块指数 = 成员归一化净值的均值（和 sector_relation 同一套）
+        idx = _sector_index(ctx, keys, period, min_members=1)
+        if idx is not None and len(idx) > 30:
+            if not _is_daily(period):
+                idx = idx.groupby(idx.index.normalize()).last()
+            if bars and len(idx) > bars:
+                idx = idx.iloc[-bars:]
+            idx_rets[n] = idx.pct_change()
+
+    cols = ["板块", "成分", "内部平均相关", "最高一对", "最低一对"]
+    if level == 2:
+        cols.insert(1, "大类")
+    blocks = [B.block_table(cols, intra, note=(
+        "内部平均相关 = 板块内所有品种两两日收益相关的均值。"
+        "**这个数低就说明「板块」本身不是一个假设** —— 该板块的横截面扫描结论要打折。"
+        "一般 0.3~0.7 正常；>0.8 等于同一品种重复；<0.2 表示这批品种不该放在一个板块里"))]
+
+    # ---- 板块之间
+    if len(idx_rets) >= 2:
+        c = pd.DataFrame(idx_rets).sort_index().corr(min_periods=min_common)
+        pairs = []
+        ns = list(c.columns)
+        for i, a in enumerate(ns):
+            for b in ns[i + 1:]:
+                v = c.loc[a, b]
+                if v == v:
+                    pairs.append((float(v), a, b))
+        pairs.sort(reverse=True)
+        blocks.append(B.block_table(
+            ["相关性", "板块 A", "板块 B"], [[_f(v), a, b] for v, a, b in pairs[:12]],
+            note="相关最高的 12 对：>0.8 的两个板块在组合里等于同一个风险，配权时不能各给一份"))
+        if len(pairs) > 8:      # 板块少的时候两张表是同一批，别重复贴
+            blocks.append(B.block_table(
+                ["相关性", "板块 A", "板块 B"],
+                [[_f(v), a, b] for v, a, b in sorted(pairs)[:8]],
+                note="相关最低的 8 对：这些才是分散收益的来源 —— 加板块要加这种，"
+                     "不是加名字不一样但走势一样的东西"))
+        hi, lo = pairs[0], pairs[-1]
+        i_avg = cols.index("内部平均相关")
+        avgs = [float(r[i_avg]) for r in intra if r[i_avg] not in ("—", "nan")]
+        summary = (f"{len(intra)} 个板块（level={level}）：内部平均相关中位 "
+                   f"{np.median(avgs) if avgs else 0:.2f}；"
+                   f"板块间最高 {hi[0]:.2f}（{hi[1]}×{hi[2]}）、最低 {lo[0]:.2f}（{lo[1]}×{lo[2]}）")
+    else:
+        summary = f"{len(intra)} 个板块（level={level}）内部相关已算出，板块间样本不足"
+    return SkillResult(True, summary=summary, blocks=blocks, feed=summary)
+
+
 # ------------------------------------------------------------------ 注册
 
 
@@ -513,21 +722,27 @@ register(Tool(
     name="sector_list",
     group="sector",
     label="查板块",
-    description="列出期货板块（化工/黑色/有色/农产品…）及其成分品种、本地有没有数据",
+    description="列出期货板块（L1 大类 9 个 / L2 产业板块 16 个）及其成分品种、本地有没有数据",
     risk=RISK_READ,
     inputSchema={
         "type": "object",
         "properties": {
             "sector": {"type": "str", "default": ""},
+            "level": {"type": "int", "default": 1, "enum": [1, 2]},
             "period": {"type": "str", "default": "1d_tq"},
         },
     },
     handler=_sector_list,
     max_turns=3,
     prompt=(
-        "**查板块**：`sector_list()` 列全部板块，`sector_list(sector=\"化工\")` 看一个板块的"
-        "成分和本地数据情况。问「化工有哪些品种」「这个板块数据齐不齐」时用它，"
-        "别凭印象报品种 —— 板块归类在 `futures.SECTOR_MAP` 里，和界面的「板块」列同源。"
+        "**查板块**：`sector_list()` 列 9 个大类，`sector_list(level=2)` 列 16 个产业板块"
+        "（`化工·聚酯` 这种），`sector_list(sector=\"化工·聚酯\")` 看单个板块的成分和本地数据。\n"
+        "两层回答不同问题：**大类**是宏观驱动（做板块指数、品种联动、大类配权），"
+        "**产业板块**是产业链（做因子横截面扫描）。问「这个因子能不能推到整个板块」时"
+        "必须用 level=2 —— 化工 21 个品种跨聚酯/烯烃芳烃/煤化工/橡胶纸浆四条链，"
+        "在 L1 上数「几个品种为正」等于把四条链平均掉。\n"
+        "别凭印象报品种 —— 板块归类在 `futures.SECTOR_MAP` / `futures.SECTOR_L2` 里，"
+        "和界面的「板块」列同源。"
     ),
 ))
 
@@ -592,5 +807,36 @@ register(Tool(
         "用途：R² 高的品种可以直接吃板块级信号；R² 低的必须单独建模；"
         "相关 0.9 以上的两个品种在组合里等于同一个风险，不能当两个独立品种配权。"
         "问「这几个品种是不是一回事」「板块涨它跟不跟」时用它。"
+    ),
+))
+
+register(Tool(
+    name="sector_corr",
+    group="sector",
+    label="板块相关矩阵",
+    description="16 个产业板块（或 9 个大类）的内部平均相关 + 板块之间的相关，用来判「这些板块算几个独立假设」",
+    risk=RISK_READ,
+    max_turns=3,
+    max_result_chars=NO_LIMIT,
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "level": {"type": "int", "default": 2, "enum": [1, 2]},
+            "period": {"type": "str", "default": "1d_tq"},
+            "bars": {"type": "int", "default": 500},
+            "min_common": {"type": "int", "default": 60},
+            "sectors": {"type": "str", "default": ""},
+        },
+    },
+    handler=_sector_corr,
+    prompt=(
+        "**板块相关矩阵**：`sector_corr()` 默认按 16 个产业板块算，`level=1` 按 9 个大类算。"
+        "返回两张表：①每个板块**内部**的平均两两相关（低 = 这个板块本身不是一个假设，"
+        "横截面结论要打折）；②板块**之间**相关最高/最低的各十几对。\n"
+        "口径：分钟周期先压日频再算（不同周期最后 bar 时刻不同，直接对齐会稀释相关性）；"
+        "板块指数 = 成员归一化净值的等权均值；`bars` 控制回看根数（日线 500 ≈ 两年）。\n"
+        "用途：配权前先看这张表 —— 相关 0.8 以上的两个板块在组合里等同一个风险，"
+        "配两份等于变相加杠杆；真正能分散的是相关最低那几对。"
+        "问「这几个板块是不是一回事」「加板块有用吗」时用它。"
     ),
 ))

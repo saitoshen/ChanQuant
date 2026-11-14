@@ -7405,6 +7405,40 @@ def _run() -> tuple[bool, list[str]]:
 
     check("仓位口径存→读往返（budget/unit 不能被改写成 capital）", _sizing_roundtrip)
 
+    def _sector_maps():
+        """板块两层（L1 9 个 / L2 16 个）必须严格对齐。
+
+        这条检查存在的理由：L2 是手写映射，漏一个品种它就会从那层的扫描里
+        **静默消失**（照样跑完，只是少算了几个品种，界面上看不出来）；一个品种
+        被两个 L2 认领则会在两张表里各算一次。两种错都不会报异常。
+        """
+        from ttrade import futures as F
+
+        bad = F.sector_maps_ok()
+        if bad:
+            raise RuntimeError("板块映射不对齐：" + "；".join(bad))
+        if len(F.SECTOR_MAP) != 9:
+            raise RuntimeError(f"大类数变了（{len(F.SECTOR_MAP)}），产业板块划分要跟着改")
+        if len(F.SECTOR_L2) != 16:
+            raise RuntimeError(f"产业板块数变了（{len(F.SECTOR_L2)}），文档/提示词要跟着改")
+        # 每个大类都要能列出自己的产业板块，且合起来正好是全部 16 个
+        got = [s for l1 in F.SECTOR_MAP for s in F.l2_names(l1)]
+        if sorted(got) != sorted(F.SECTOR_L2):
+            raise RuntimeError("大类展开的产业板块集合和 SECTOR_L2 不一致：" +
+                               "、".join(sorted(set(F.SECTOR_L2) - set(got))) or "重复")
+        # 品种 → L2 → 父级 必须回到品种的 L1
+        for code, l1 in {s: k for k, v in F.SECTOR_MAP.items() for s in v.split()}.items():
+            l2 = F.sector_l2_of(code)
+            if not l2 or l2 == "其他":
+                raise RuntimeError(f"{code} 没有产业板块")
+            if F.l1_of_l2(l2) != l1:
+                raise RuntimeError(f"{code} 的大类是 {l1}，但产业板块 {l2} 挂在 "
+                                   f"{F.l1_of_l2(l2)} 下")
+        return (f"{len(F.SECTOR_MAP)} 大类 / {len(F.SECTOR_L2)} 产业板块，"
+                f"92 个品种一一对应（化工拆 4、农产品拆 4、金融拆 2）")
+
+    check("板块两层映射（L1 9 / L2 16 严格对齐）", _sector_maps)
+
     check("存入策略库的动作（strategy_save）", _strategy_save_action)
     check("K线与信号：持仓与交易记录同源（含手数）", _chart_from_trades)
     check("资金曲线纵轴（线性 / 对数 / 亏穿退回）", _perf_yscale)
