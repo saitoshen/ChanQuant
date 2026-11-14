@@ -35,6 +35,11 @@ from ttrade.paths import user_dir
 # 固定手数等于把风险敞口交给运气 —— 老配置没有 sizing 字段时按这条兜底。
 RISK_SIZED = {"sbbox_mini", "sbbox_ib"}
 
+# `backtest.size_lots` 认的五种口径。**两边必须一致** —— 用户存的是一条
+# 「按分配资金定手数」的策略，读回来变成「按保证金定手数」，曲线会整条变掉
+# 而界面上没有任何提示。`selftest` 会拿这五个值逐个存→读往返核对。
+SIZING_OK = ("capital", "fixed", "risk", "budget", "unit")
+
 LIB_FILE = "strategy_lib.json"
 PORT_FILE = "portfolio.json"
 LAST_FILE = "last_config.json"
@@ -553,7 +558,13 @@ class StrategyConfig:
             cfg.range_years = max(0.0, float(cfg.range_years or 0))
         except (TypeError, ValueError):
             cfg.range_years = 0.0
-        if cfg.sizing not in ("capital", "fixed", "risk"):
+        # 合法口径以 `backtest.size_lots` 为准，那边有五种：capital / fixed /
+        # risk / budget / unit。🔴 这里曾经只放行前三种，把 `budget` 和 `unit`
+        # **静默改写成 capital** —— json 里存的明明是 budget，读回来却变成
+        # 「按保证金定手数」，同一条策略点开跑出另一条曲线（实测 MA 1d 全史
+        # 累计 +42.4% 变成 +615%），而界面上看不出任何异常。
+        # 别再往这里加白名单式收口：口径一多就会漏，漏了还是静默的。
+        if cfg.sizing not in SIZING_OK:
             cfg.sizing = "capital"
         # 老配置里没有 sizing 字段。按止损金额定仓的策略（止损距离写在策略参数里）
         # 默认就该走 risk —— 用固定手数等于把风险敞口交给运气，和它自己的设计相反

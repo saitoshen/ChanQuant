@@ -7355,6 +7355,56 @@ def _run() -> tuple[bool, list[str]]:
         return ("存/拒/校验都对：%s 期 %s、多品种 2 个键、4 条非法参数全挡住"
                 % (got.period, got.symbol))
 
+    def _sizing_roundtrip():
+        """仓位口径存→读往返：五种 `sizing` 一个都不能被改写。
+
+        🔴 这条是补一个**真实发生过**的静默故障：`_norm` 里的白名单只有
+        `capital / fixed / risk`，而 `backtest.size_lots` 认五种。存进去的
+        `budget`（按分配资金定手数）读回来变成 `capital`（按保证金定手数），
+        json 里明明写着 budget —— 同一条策略点开跑出另一条曲线，
+        实测 MA 1d 全史累计 +42.4% 变成 +615%，而界面上没有任何提示。
+
+        必须用 `load_library()`（走磁盘 + `_norm`）验，不能用 `add_to_library`
+        的返回值：返回值是内存对象、没走归一化，这个洞在返回值上完全看不出来。
+        """
+        from ttrade import strategy_store as S
+
+        base = dict(symbol="MA", exchange="CZCE", period="1d_tq",
+                    family="factor", factor_mode="multi",
+                    factor_keys=["close_pos"],
+                    factor_cfg={"window": 252, "horizon": 5, "entry_z": 1.0,
+                                "exit_z": 0.3, "weight_mode": "equal",
+                                "ic_rebal": 60, "method": "z",
+                                "orient": "long_low"},
+                    principal=1_000_000, capital_pct=50.0)
+        made, bad = [], []
+        try:
+            for s in S.SIZING_OK:
+                c = S.StrategyConfig(name="自检用·口径·" + s, sizing=s, **base)
+                got = S.add_to_library(c, overwrite=True)
+                made.append(got.sid)
+            disk = {x.sid: x for x in S.load_library()}
+            for s in S.SIZING_OK:
+                sid = made[S.SIZING_OK.index(s)]
+                back = disk.get(sid)
+                if back is None:
+                    bad.append(f"{s} 存丢了")
+                elif back.sizing != s:
+                    bad.append(f"{s} 读回来变成 {back.sizing}")
+        finally:
+            for sid in made:
+                try:
+                    S.remove_from_library(sid)
+                except Exception:  # noqa: BLE001
+                    pass
+        if bad:
+            raise RuntimeError("仓位口径存不住：" + "；".join(bad))
+        if len(S.SIZING_OK) != 5:
+            raise RuntimeError("size_lots 的口径数变了，这条检查要跟着改")
+        return "5 种口径全部原样返回：" + " / ".join(S.SIZING_OK)
+
+    check("仓位口径存→读往返（budget/unit 不能被改写成 capital）", _sizing_roundtrip)
+
     check("存入策略库的动作（strategy_save）", _strategy_save_action)
     check("K线与信号：持仓与交易记录同源（含手数）", _chart_from_trades)
     check("资金曲线纵轴（线性 / 对数 / 亏穿退回）", _perf_yscale)
