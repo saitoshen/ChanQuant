@@ -7287,6 +7287,75 @@ def _run() -> tuple[bool, list[str]]:
     check("构建主窗口（端到端）", _window)
 
     # K 线与信号页的持仓映射：这一项 import 了 Qt，放在窗口之后跑
+    def _strategy_save_action():
+        """「存入策略库」动作：能存进去、重名会拒、参数错能当场说清。
+
+        这个动作补的是一个真实断点：`strategy` 动作注册的是规则策略的**代码**，
+        而「策略库」里带 sid 的整份配置以前没有任何动作能写 —— Agent 扫完一个
+        板块想落成条目，只能停下来让人点界面。
+
+        反证比正例重要：这条路径一旦悄悄存错（比如多品种只存了 `MA` 没有交易所、
+        或者重名把别人的条目覆盖掉），界面上看不出任何异常。
+        """
+        from ttrade import strategy_store as S
+        from ttrade.skills.base import REGISTRY
+
+        t = REGISTRY["strategy_save"]
+        p, err = t.prepare({
+            "name": "自检用·动作存库 2h", "symbol": "MA", "exchange": "CZCE",
+            "period": "2h", "factor_keys": ["war_pct", "roll_main_share"],
+            "factor_cfg": {"window": 983, "horizon": 20, "entry_z": 1.0,
+                           "orient": "long_low"},
+        })
+        if err:
+            raise RuntimeError(f"合法参数被拒：{err}")
+        r = t.handler(None, p)
+        if not r.ok:
+            raise RuntimeError(f"存库失败：{r.error}")
+        one = [c for c in S.load_library() if c.name == p["name"]]
+        if not one:
+            raise RuntimeError("存完在库里找不到")
+        got = one[0]
+
+        # 重名必须拒（`overwrite` 没开时）—— 静默覆盖别人比存不进去更糟
+        p2, _ = t.prepare(dict(p))
+        r2 = t.handler(None, p2)
+        if r2.ok:
+            raise RuntimeError("重名没被拒，会覆盖已有条目")
+
+        # 多品种：`symbols` 必须带交易所，存完回读要对得上
+        pm, err = t.prepare({
+            "name": "自检用·动作存库 多品种", "symbols": ["MA_CZCE", "TA_CZCE"],
+            "period": "2h", "factor_keys": ["sector_mom_10"],
+            "factor_cfg": {"window": 983, "horizon": 20},
+        })
+        if err:
+            raise RuntimeError(f"多品种合法参数被拒：{err}")
+        rm = t.handler(None, pm)
+        if not rm.ok:
+            raise RuntimeError(f"多品种存库失败：{rm.error}")
+        multi = [c for c in S.load_library() if c.name == pm["name"]][0]
+        if multi.multi_symbols != ["MA_CZCE", "TA_CZCE"]:
+            raise RuntimeError(f"多品种回读不对：{multi.multi_symbols}")
+
+        bad = []
+        for args, want in (
+            ({}, "name"),
+            ({"name": "x", "symbols": ["MA"], "factor_keys": ["war_pct"]}, "交易所"),
+            ({"name": "x", "symbol": "MA", "exchange": "CZCE",
+              "factor_keys": ["war_pct"], "period": "7m"}, "period"),
+            ({"name": "x", "symbol": "MA", "exchange": "CZCE"}, "factor_keys"),
+        ):
+            _pp, e = t.prepare(args)
+            if not e or want not in e:
+                bad.append(f"{args} → {e!r}")
+        if bad:
+            raise RuntimeError("参数校验漏了：" + "；".join(bad))
+
+        return ("存/拒/校验都对：%s 期 %s、多品种 2 个键、4 条非法参数全挡住"
+                % (got.period, got.symbol))
+
+    check("存入策略库的动作（strategy_save）", _strategy_save_action)
     check("K线与信号：持仓与交易记录同源（含手数）", _chart_from_trades)
     check("资金曲线纵轴（线性 / 对数 / 亏穿退回）", _perf_yscale)
 

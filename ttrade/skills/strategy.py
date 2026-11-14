@@ -195,3 +195,140 @@ register(Tool(
     ui="strategy",
     describe=describe_strategy,
 ))
+
+
+# ---------------------------------------------------------------- 存进策略库
+#
+# `strategy` 那个动作注册的是**规则策略的 Python 代码**（进 `STRATEGIES` 表），
+# 和「策略库」里那些带 sid 的整份配置是两件事。以前没有动作能存后者 —— 于是
+# 「扫完一个板块，把结论落成条目」这一步只能靠人点界面，Agent 做到一半就断了。
+#
+# 这里补上。**工具自己不跑回测** —— 跑一遍可能要几十秒，塞在确认框前面等于让人
+# 干等；「先跑再存」写在 `sector-factor-scan` 技能包里，由模型按顺序调用。
+
+PERIODS_OK = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "1d_tq",
+              "2d", "1w")
+
+
+def prepare_strategy_save(p: dict) -> tuple[dict, str]:
+    name = str(p.get("name") or "").strip()
+    if not name:
+        return p, "缺少 name（策略库里显示的名字）"
+    p["name"] = name
+
+    period = str(p.get("period") or "1d_tq").strip()
+    if period not in PERIODS_OK:
+        return p, "period 只能是 %s 之一" % " / ".join(PERIODS_OK)
+    p["period"] = period
+
+    keys = p.get("factor_keys") or []
+    if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
+        return p, "factor_keys 要是字符串数组"
+    fam = str(p.get("family") or "factor").strip()
+    if fam == "factor" and not keys:
+        return p, "family=factor 时必须给 factor_keys"
+
+    syms = p.get("symbols") or []
+    if syms and not isinstance(syms, list):
+        return p, "symbols 要是数组（写成 MA_CZCE 这种）"
+    syms = [str(s).strip().upper() for s in syms if str(s).strip()]
+    for s in syms:
+        if "_" not in s:
+            return p, "多品种要写成 品种_交易所，比如 MA_CZCE（%r 少了交易所）" % s
+    p["symbols"] = syms
+
+    if not syms:
+        sym = str(p.get("symbol") or "").strip().upper()
+        ex = str(p.get("exchange") or "").strip().upper()
+        if not sym or not ex:
+            return p, "单品种要给 symbol + exchange；多品种给 symbols"
+        p["symbol"], p["exchange"] = sym, ex
+
+    cfg = p.get("factor_cfg") or {}
+    if not isinstance(cfg, dict):
+        return p, "factor_cfg 要是一个对象（window / horizon / entry_z …）"
+    p["factor_cfg"] = cfg
+    return p, ""
+
+
+def describe_strategy_save(p: dict) -> str:
+    who = ("%d 个品种" % len(p.get("symbols") or [])) if p.get("symbols") else \
+        "%s_%s" % (p.get("symbol", ""), p.get("exchange", ""))
+    return "存进策略库「%s」（%s · %s）" % (p.get("name", ""), who, p.get("period", ""))
+
+
+def _strategy_save(ctx, p: dict) -> SkillResult:
+    from ttrade.strategy_store import NameConflict, StrategyConfig, add_to_library
+
+    cfg = StrategyConfig(
+        name=p["name"],
+        symbol=p.get("symbol", ""), exchange=p.get("exchange", ""),
+        period=p.get("period", "1d_tq"),
+        multi_symbols=list(p.get("symbols") or []),
+        family=p.get("family", "factor"),
+        factor_mode=p.get("factor_mode", "multi"),
+        factor_keys=list(p.get("factor_keys") or []),
+        factor_cfg=dict(p.get("factor_cfg") or {}),
+        sizing=p.get("sizing", "budget"),
+        principal=float(p.get("principal") or 1_000_000),
+        capital_pct=float(p.get("capital_pct") if p.get("capital_pct") is not None else 50.0),
+        note=p.get("note", "short"),
+        cost_profile=p.get("cost_profile", ""),
+    )
+    try:
+        got = add_to_library(cfg, overwrite=bool(p.get("overwrite")))
+    except NameConflict as exc:
+        # 内置撞名 / 同名已存在 —— 原话回给模型，让它自己决定改名还是 overwrite
+        return SkillResult(False, error=str(exc), feed="存不进去：%s" % exc)
+
+    feed = ("已存进策略库：%s（sid=%s，%s · %s，%s 个因子）。\n"
+            "**别直接说「策略做好了」** —— 双击跑一遍，把笔数 / 卡玛 / 回撤报给用户，"
+            "数字和扫描时不一样就直说不一样。"
+            % (got.name, got.sid, got.period,
+               ("%d 品种" % len(got.multi_symbols)) if got.multi_symbols
+               else "%s_%s" % (got.symbol, got.exchange),
+               len(got.factor_keys)))
+    return SkillResult(True, summary="已存入策略库：%s" % got.name, feed=feed)
+
+
+register(Tool(
+    name="strategy_save",
+    group="strategy",
+    label="存入策略库",
+    description="把一份完整的因子/规则配置存进策略库（带 sid，界面左侧能搜到）",
+    risk=RISK_WRITE,
+    inputSchema={
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+            "name": {"type": "str"},
+            "symbol": {"type": "str", "default": ""},
+            "exchange": {"type": "str", "default": ""},
+            "symbols": {"type": "list", "default": []},
+            "period": {"type": "str", "default": "1d_tq"},
+            "family": {"type": "str", "default": "factor"},
+            "factor_mode": {"type": "str", "default": "multi"},
+            "factor_keys": {"type": "list", "default": []},
+            "factor_cfg": {"type": "dict", "default": {}},
+            "sizing": {"type": "str", "default": "budget"},
+            "principal": {"type": "float", "default": 1000000},
+            "capital_pct": {"type": "float", "default": 50.0},
+            "note": {"type": "str", "default": "short"},
+            "cost_profile": {"type": "str", "default": ""},
+            "overwrite": {"type": "bool", "default": False},
+        },
+    },
+    prepare=prepare_strategy_save,
+    handler=_strategy_save,
+    describe=describe_strategy_save,
+    prompt=(
+        "**存进策略库**：`strategy_save(name=\"化工·甲醇(MA) 2h 低分多｜仓单分位+展期占比\", "
+        "symbol=\"MA\", exchange=\"CZCE\", period=\"2h\", factor_keys=[\"war_pct\", "
+        "\"roll_main_share\"], factor_cfg={\"window\": 983, \"horizon\": 20, \"entry_z\": 1.0})`。\n"
+        "和 `strategy` 的区别：`strategy` 注册的是**规则策略的 Python 代码**；"
+        "`strategy_save` 存的是**整份配置**（带 sid，左侧策略库列表里能搜到、能双击跑）。"
+        "给板块出一批策略时用这个。\n"
+        "`symbols` 给多品种时写 `MA_CZCE` 这种带交易所的键，别只写 `MA`。"
+        "同名已存在会报错，确认要覆盖再传 `overwrite=True`。"
+    ),
+))

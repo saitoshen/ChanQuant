@@ -80,6 +80,11 @@ GROUPS: dict[str, dict] = {
         "desc": "跑回测、看结果",
         "default_on": True,
     },
+    "sector": {
+        "label": "板块",
+        "desc": "板块成分、因子在板块内的横向一致性、品种与板块的联动",
+        "default_on": True,
+    },
     "web": {
         "label": "联网",
         "desc": "抓网页正文。**会出网**，默认关",
@@ -109,7 +114,7 @@ GROUPS: dict[str, dict] = {
 
 # 所有组的顺序（提示词里按这个顺序排，稳定输出便于命中缓存）
 GROUP_ORDER = ["data", "manual", "doc", "factor", "strategy", "backtest",
-               "web", "monitor", "delegate", "trade", "fs"]
+               "sector", "web", "monitor", "delegate", "trade", "fs"]
 
 
 @dataclass

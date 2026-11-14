@@ -47,7 +47,7 @@ CONF_FILE = "agent.json"
 # 老配置里没有 `enabled_groups` 这个键时用它兜底。等于「以前能用的动作继续能用」，
 # 新加的 `web` 不在里面 —— 会出网的能力不能靠一次升级就悄悄打开。
 LEGACY_GROUPS = ["data", "manual", "doc", "factor", "strategy", "backtest",
-                 "monitor", "trade"]
+                 "sector", "monitor", "trade"]
 
 
 # ------------------------------------------------------------------ 供应商

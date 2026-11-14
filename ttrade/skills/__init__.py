@@ -28,6 +28,7 @@ from ttrade.skills import doc  # noqa: F401
 from ttrade.skills import report  # noqa: F401
 from ttrade.skills import factor  # noqa: F401
 from ttrade.skills import strategy  # noqa: F401
+from ttrade.skills import sector  # noqa: F401
 from ttrade.skills import trade  # noqa: F401
 from ttrade.skills import web  # noqa: F401
 from ttrade.skills import monitor  # noqa: F401
