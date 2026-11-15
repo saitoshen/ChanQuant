@@ -1,0 +1,676 @@
+[
+ {
+  "label": "bar 口径 · 冠军组合 @ 1d",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.5114658695470016,
+   "ret": 0.19066557580398513,
+   "is": 0.5042206065306046,
+   "oos": 0.7078617953282803,
+   "trades": 269
+  }
+ },
+ {
+  "label": "bar 口径 · 冠军组合 @ 4h",
+  "period": "4h",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.26946523840533065,
+   "ret": 0.15021350350000476,
+   "is": 0.29516599447133623,
+   "oos": 0.1055496696511213,
+   "trades": 496
+  }
+ },
+ {
+  "label": "bar 口径 · 冠军组合 @ 2h",
+  "period": "2h",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.41174866342035854,
+   "ret": 0.132121653513083,
+   "is": 0.4932659095077142,
+   "oos": -0.05936268841324631,
+   "trades": 768
+  }
+ },
+ {
+  "label": "bar 口径 · 冠军组合 @ 1h",
+  "period": "1h",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.07324259891890972,
+   "ret": 0.030385143661825684,
+   "is": 0.5195073902762248,
+   "oos": -0.08488025612067183,
+   "trades": 1339
+  }
+ },
+ {
+  "label": "bar 口径 · 冠军组合 @ 30m",
+  "period": "30m",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.21544439576869837,
+   "ret": 0.08628453092071228,
+   "is": 0.5718780598986101,
+   "oos": 0.21288289687388037,
+   "trades": 2044
+  }
+ },
+ {
+  "label": "bar 口径 · 冠军组合 @ 15m",
+  "period": "15m",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": -0.11249549723278827,
+   "ret": -0.09064727569351985,
+   "is": 0.04095449726442194,
+   "oos": -0.2784181554039618,
+   "trades": 2851
+  }
+ },
+ {
+  "label": "eco 口径 · 冠军组合 @ 1d",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.5114658695470016,
+   "ret": 0.19066557580398513,
+   "is": 0.5042206065306046,
+   "oos": 0.7078617953282803,
+   "trades": 269
+  }
+ },
+ {
+  "label": "eco 口径 · 冠军组合 @ 4h",
+  "period": "4h",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 504,
+   "horizon": 10,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 120,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.5805129873830998,
+   "ret": 0.2274415278066243,
+   "is": 0.34601064259814657,
+   "oos": 0.3133040208972936,
+   "trades": 358
+  }
+ },
+ {
+  "label": "eco 口径 · 冠军组合 @ 2h",
+  "period": "2h",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 983,
+   "horizon": 20,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 234,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.4161658847279349,
+   "ret": 0.16320750323047234,
+   "is": 0.08256865299311116,
+   "oos": 0.33271624889605406,
+   "trades": 485
+  }
+ },
+ {
+  "label": "eco 口径 · 冠军组合 @ 1h",
+  "period": "1h",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 1764,
+   "horizon": 35,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 420,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.39866828808100124,
+   "ret": 0.21098875070112874,
+   "is": 0.2895065941193776,
+   "oos": 0.437792587354454,
+   "trades": 620
+  }
+ },
+ {
+  "label": "eco 口径 · 冠军组合 @ 30m",
+  "period": "30m",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 2822,
+   "horizon": 56,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 672,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.417395061509327,
+   "ret": 0.14937287976975716,
+   "is": 0.27966294736905717,
+   "oos": 0.1708448194402152,
+   "trades": 855
+  }
+ },
+ {
+  "label": "eco 口径 · 冠军组合 @ 15m",
+  "period": "15m",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 5544,
+   "horizon": 110,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 1320,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.38242075875875065,
+   "ret": 0.1689868450959155,
+   "is": 0.1848281332081249,
+   "oos": 0.19067134979290293,
+   "trades": 736
+  }
+ },
+ {
+  "label": "bar 口径 · 该周期最优组合 @ 1d",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "commodity_mom_10",
+   "sector_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.18163273920794698,
+   "ret": 0.06890207855563867,
+   "is": 0.06522069857389745,
+   "oos": -0.0065277292913782335,
+   "trades": 782
+  }
+ },
+ {
+  "label": "bar 口径 · 该周期最优组合 @ 4h",
+  "period": "4h",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "sector_mom_10",
+   "vol_surge",
+   "war_pct"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 1.0181663264046892,
+   "ret": 0.19949549273441336,
+   "is": 1.1385696816942068,
+   "oos": 0.15584010964937312,
+   "trades": 1719
+  }
+ },
+ {
+  "label": "bar 口径 · 该周期最优组合 @ 2h",
+  "period": "2h",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "sector_mom_10",
+   "war_pct",
+   "roll_yield"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 1.4481667767009594,
+   "ret": 0.24648110127959563,
+   "is": 1.732359596830891,
+   "oos": 0.18051704373154803,
+   "trades": 1214
+  }
+ },
+ {
+  "label": "bar 口径 · 该周期最优组合 @ 1h",
+  "period": "1h",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "spot_basis",
+   "roll_annual",
+   "roll_yield"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": -0.011950553454779776,
+   "ret": -0.00440637220795115,
+   "is": 0.04810391105175264,
+   "oos": -0.01679146531483342,
+   "trades": 1813
+  }
+ },
+ {
+  "label": "bar 口径 · 该周期最优组合 @ 30m",
+  "period": "30m",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "spot_basis",
+   "roll_annual"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.22965890666152694,
+   "ret": 0.05095147163980478,
+   "is": 0.5407342602900939,
+   "oos": 0.06348674433547688,
+   "trades": 2615
+  }
+ },
+ {
+  "label": "bar 口径 · 该周期最优组合 @ 15m",
+  "period": "15m",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "war_pct",
+   "roll_yield",
+   "roll_annual"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": -0.11054689850050448,
+   "ret": -0.052414560620994775,
+   "is": 0.1238952285434161,
+   "oos": 0.37230000619474685,
+   "trades": 3313
+  }
+ },
+ {
+  "label": "eco 口径 · 该周期最优组合 @ 1d",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "commodity_mom_10",
+   "sector_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.18163273920794698,
+   "ret": 0.06890207855563867,
+   "is": 0.06522069857389745,
+   "oos": -0.0065277292913782335,
+   "trades": 782
+  }
+ },
+ {
+  "label": "eco 口径 · 该周期最优组合 @ 4h",
+  "period": "4h",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "commodity_mom_10",
+   "sector_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 504,
+   "horizon": 10,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 120,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.7846035096116453,
+   "ret": 0.20416774920226238,
+   "is": 0.7144141890998715,
+   "oos": 0.4173928674617701,
+   "trades": 1423
+  }
+ },
+ {
+  "label": "eco 口径 · 该周期最优组合 @ 2h",
+  "period": "2h",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "sector_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 983,
+   "horizon": 20,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 234,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.2738314116176225,
+   "ret": 0.13921079656837787,
+   "is": 0.6719952391380708,
+   "oos": 0.049158367292604845,
+   "trades": 2626
+  }
+ },
+ {
+  "label": "eco 口径 · 该周期最优组合 @ 1h",
+  "period": "1h",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "sector_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 1764,
+   "horizon": 35,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 420,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.09385317045344578,
+   "ret": 0.056161807599066055,
+   "is": 0.016831276860668064,
+   "oos": 0.19546329364259193,
+   "trades": 3939
+  }
+ }
+]

@@ -1,0 +1,500 @@
+[
+ {
+  "rank": 1,
+  "name": "化工多因子#01 宏观·PPI同比+宏观·制造业PMI+商品指数动量 10",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "symbols": [
+   "MA",
+   "TA",
+   "EG",
+   "PP",
+   "L",
+   "V",
+   "EB",
+   "PF",
+   "SA",
+   "FG",
+   "UR",
+   "BU",
+   "RU",
+   "SP"
+  ],
+  "metrics": {
+   "ret": 0.19676867543088877,
+   "calmar": 0.5882159101510356,
+   "sharpe": 0.8144002474976265,
+   "dd_peak": -0.051319844978471155,
+   "is_calmar": 0.5100511476099566,
+   "oos_calmar": 0.6726861057954537,
+   "stress_calmar": 0.536401704213523
+  }
+ },
+ {
+  "rank": 2,
+  "name": "化工多因子#02 商品指数动量 10+布林带位置",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "commodity_mom_10",
+   "bb_pos_20"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "symbols": [
+   "MA",
+   "TA",
+   "EG",
+   "PP",
+   "L",
+   "V",
+   "EB",
+   "PF",
+   "SA",
+   "FG",
+   "UR",
+   "BU",
+   "RU",
+   "SP"
+  ],
+  "metrics": {
+   "ret": 0.10671931049778452,
+   "calmar": 0.36846895181815115,
+   "sharpe": 0.5168491100439384,
+   "dd_peak": -0.047276898777885976,
+   "is_calmar": 0.5249776847424023,
+   "oos_calmar": 0.6061244326781335,
+   "stress_calmar": 0.2676029038952306
+  }
+ },
+ {
+  "rank": 3,
+  "name": "化工多因子#03 宏观·PPI同比+商品指数动量 10+随机指标 14",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "commodity_mom_10",
+   "stoch_14"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "symbols": [
+   "MA",
+   "TA",
+   "EG",
+   "PP",
+   "L",
+   "V",
+   "EB",
+   "PF",
+   "SA",
+   "FG",
+   "UR",
+   "BU",
+   "RU",
+   "SP"
+  ],
+  "metrics": {
+   "ret": 0.1948955774481788,
+   "calmar": 0.6634876178640632,
+   "sharpe": 0.7672039922889382,
+   "dd_peak": -0.046162341382578784,
+   "is_calmar": 0.6486107422042271,
+   "oos_calmar": 0.4258381279764552,
+   "stress_calmar": 0.6107456824015961
+  }
+ },
+ {
+  "rank": 4,
+  "name": "化工多因子#04 宏观·制造业PMI+商品指数动量 10+板块动量 10",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10",
+   "sector_mom_10"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "symbols": [
+   "MA",
+   "TA",
+   "EG",
+   "PP",
+   "L",
+   "V",
+   "EB",
+   "PF",
+   "SA",
+   "FG",
+   "UR",
+   "BU",
+   "RU",
+   "SP"
+  ],
+  "metrics": {
+   "ret": 0.16707633161320676,
+   "calmar": 0.5094204959281289,
+   "sharpe": 0.6823108495023698,
+   "dd_peak": -0.05439798182569025,
+   "is_calmar": 0.3513411389544408,
+   "oos_calmar": 0.4289269256795047,
+   "stress_calmar": 0.4445456445214182
+  }
+ },
+ {
+  "rank": 5,
+  "name": "化工多因子#05 收盘位置+近月持仓占比 3 腿+RSI 14",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "close_pos",
+   "main_oi_share",
+   "rsi_14"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "symbols": [
+   "MA",
+   "TA",
+   "EG",
+   "PP",
+   "L",
+   "V",
+   "EB",
+   "PF",
+   "SA",
+   "FG",
+   "UR",
+   "BU",
+   "RU",
+   "SP"
+  ],
+  "metrics": {
+   "ret": 0.043771736141616946,
+   "calmar": 0.1332587510687087,
+   "sharpe": 0.31709024595845237,
+   "dd_peak": -0.05163259916502429,
+   "is_calmar": 0.32209388941033446,
+   "oos_calmar": 0.32654065418830863,
+   "stress_calmar": 0.07637683718499871
+  }
+ },
+ {
+  "rank": 6,
+  "name": "化工多因子#06 收盘位置+现货基差率+近月持仓占比 3 腿",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "close_pos",
+   "spot_basis",
+   "main_oi_share"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "symbols": [
+   "MA",
+   "TA",
+   "EG",
+   "PP",
+   "L",
+   "V",
+   "EB",
+   "PF",
+   "SA",
+   "FG",
+   "UR",
+   "BU",
+   "RU",
+   "SP"
+  ],
+  "metrics": {
+   "ret": 0.07653933517792634,
+   "calmar": 0.3486079639832201,
+   "sharpe": 0.5641153288203143,
+   "dd_peak": -0.03509450066381723,
+   "is_calmar": 0.4291862973075913,
+   "oos_calmar": 0.3191145591494236,
+   "stress_calmar": 0.26859932948446585
+  }
+ },
+ {
+  "rank": 7,
+  "name": "化工多因子#07 宏观·制造业PMI+商品指数动量 10+成交量变化 20",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_pmi_mfg",
+   "commodity_mom_10",
+   "vol_change_20"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 0.8,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "symbols": [
+   "MA",
+   "TA",
+   "EG",
+   "PP",
+   "L",
+   "V",
+   "EB",
+   "PF",
+   "SA",
+   "FG",
+   "UR",
+   "BU",
+   "RU",
+   "SP"
+  ],
+  "metrics": {
+   "ret": 0.12363250331953005,
+   "calmar": 0.5549073718404417,
+   "sharpe": 0.6278907243055528,
+   "dd_peak": -0.036335981112574856,
+   "is_calmar": 0.6444686617921134,
+   "oos_calmar": 0.32943129355914197,
+   "stress_calmar": 0.46146327098459433
+  }
+ },
+ {
+  "rank": 8,
+  "name": "化工多因子#08 宏观·PPI同比+收盘位置+近月持仓占比 3 腿",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "macro_cn_ppi_yoy",
+   "close_pos",
+   "main_oi_share"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "symbols": [
+   "MA",
+   "TA",
+   "EG",
+   "PP",
+   "L",
+   "V",
+   "EB",
+   "PF",
+   "SA",
+   "FG",
+   "UR",
+   "BU",
+   "RU",
+   "SP"
+  ],
+  "metrics": {
+   "ret": 0.11480816820600442,
+   "calmar": 0.41366467225425,
+   "sharpe": 0.5789367286932481,
+   "dd_peak": -0.04486154080141446,
+   "is_calmar": 0.2461814686270732,
+   "oos_calmar": 0.28003744475672787,
+   "stress_calmar": 0.34274567041993825
+  }
+ },
+ {
+  "rank": 9,
+  "name": "化工多因子#09 收盘位置+成交量变化 20",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "close_pos",
+   "vol_change_20"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "symbols": [
+   "MA",
+   "TA",
+   "EG",
+   "PP",
+   "L",
+   "V",
+   "EB",
+   "PF",
+   "SA",
+   "FG",
+   "UR",
+   "BU",
+   "RU",
+   "SP"
+  ],
+  "metrics": {
+   "ret": 0.036190486488590946,
+   "calmar": 0.10562390008264182,
+   "sharpe": 0.21202675800149887,
+   "dd_peak": -0.053913178684172225,
+   "is_calmar": 0.38073955381361063,
+   "oos_calmar": 0.1399246217129994,
+   "stress_calmar": 0.03672373614630663
+  }
+ },
+ {
+  "rank": 10,
+  "name": "化工多因子#10 商品指数动量 10+加工利润+成交量变化 20",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "commodity_mom_10",
+   "profit_val",
+   "vol_change_20"
+  ],
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "symbols": [
+   "MA",
+   "TA",
+   "EG",
+   "PP",
+   "L",
+   "V",
+   "EB",
+   "PF",
+   "SA",
+   "FG",
+   "UR",
+   "BU",
+   "RU",
+   "SP"
+  ],
+  "metrics": {
+   "ret": 0.07092781593888067,
+   "calmar": 0.284167132159296,
+   "sharpe": 0.4935399341027055,
+   "dd_peak": -0.0403795542430178,
+   "is_calmar": 0.3642207735673227,
+   "oos_calmar": 0.15948019255974086,
+   "stress_calmar": 0.2157957415622454
+  }
+ }
+]

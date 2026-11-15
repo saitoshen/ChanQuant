@@ -1,0 +1,1013 @@
+[
+ {
+  "sym": "MA",
+  "cn": "甲醇",
+  "period": "1d_tq",
+  "factors": [
+   "sector_mom_10",
+   "main_oi_share"
+  ],
+  "window": 252,
+  "horizon": 5,
+  "ic_rebal": 60,
+  "robust": 0.034,
+  "calmar": 0.6100584489599019,
+  "ret": 0.42658851766428046,
+  "trades": 36,
+  "is_calmar": 1.8107715225206296,
+  "oos_calmar": 0.03369267086989116,
+  "cross_pos": 8,
+  "cross_n": 13
+ },
+ {
+  "sym": "TA",
+  "cn": "PTA",
+  "period": "1d_tq",
+  "factors": [
+   "roll_main_annual",
+   "roll_annual",
+   "roll_curv_o3"
+  ],
+  "window": 252,
+  "horizon": 5,
+  "ic_rebal": 60,
+  "robust": 0.36,
+  "calmar": 0.007639138903108505,
+  "ret": 0.009554889143459033,
+  "trades": 29,
+  "is_calmar": 0.37074662589588586,
+  "oos_calmar": 0.3595601786507827,
+  "cross_pos": 3,
+  "cross_n": 13
+ },
+ {
+  "sym": "EG",
+  "cn": "乙二醇",
+  "period": "1d_tq",
+  "factors": [
+   "roll_curv_o3",
+   "roll_main_oi"
+  ],
+  "window": 252,
+  "horizon": 5,
+  "ic_rebal": 60,
+  "robust": 0.468,
+  "calmar": 0.2465935681352795,
+  "ret": 0.2763787341562533,
+  "trades": 49,
+  "is_calmar": 0.467957442836797,
+  "oos_calmar": 0.8316746955378606,
+  "cross_pos": 8,
+  "cross_n": 13
+ },
+ {
+  "sym": "PP",
+  "cn": "聚丙烯",
+  "period": "1d_tq",
+  "factors": [
+   "term_slope",
+   "roll_main_oi"
+  ],
+  "window": 252,
+  "horizon": 5,
+  "ic_rebal": 60,
+  "robust": 0.09,
+  "calmar": 0.016002526526685927,
+  "ret": 0.021533165029167082,
+  "trades": 26,
+  "is_calmar": 0.08975791998235012,
+  "oos_calmar": 0.40662286336833287,
+  "cross_pos": 6,
+  "cross_n": 13
+ },
+ {
+  "sym": "V",
+  "cn": "PVC",
+  "period": "1d_tq",
+  "factors": [
+   "vol_surge",
+   "sector_mom_10"
+  ],
+  "window": 252,
+  "horizon": 5,
+  "ic_rebal": 60,
+  "robust": 0.253,
+  "calmar": 0.5607994199875825,
+  "ret": 0.28135811223777873,
+  "trades": 63,
+  "is_calmar": 0.6290135364549685,
+  "oos_calmar": 0.2526657208783293,
+  "cross_pos": 10,
+  "cross_n": 13
+ },
+ {
+  "sym": "PF",
+  "cn": "短纤",
+  "period": "1d_tq",
+  "factors": [
+   "roll_main_change",
+   "roll_main_oi"
+  ],
+  "window": 252,
+  "horizon": 5,
+  "ic_rebal": 60,
+  "robust": 0.557,
+  "calmar": 0.5482531194966952,
+  "ret": 0.21700206071520922,
+  "trades": 31,
+  "is_calmar": 1.344044002465273,
+  "oos_calmar": 0.556892909509393,
+  "cross_pos": 3,
+  "cross_n": 13
+ },
+ {
+  "sym": "SA",
+  "cn": "纯碱",
+  "period": "1d_tq",
+  "factors": [
+   "near_oi_share",
+   "breakout_pos"
+  ],
+  "window": 252,
+  "horizon": 5,
+  "ic_rebal": 60,
+  "robust": 0.696,
+  "calmar": 0.28759879885912926,
+  "ret": 0.283709106581175,
+  "trades": 31,
+  "is_calmar": 0.6962303206519094,
+  "oos_calmar": 1.5974161766897452,
+  "cross_pos": 3,
+  "cross_n": 13
+ },
+ {
+  "sym": "FG",
+  "cn": "玻璃",
+  "period": "1d_tq",
+  "factors": [
+   "commodity_mom_10",
+   "sector_mom_10"
+  ],
+  "window": 252,
+  "horizon": 5,
+  "ic_rebal": 60,
+  "robust": 0.584,
+  "calmar": 0.5302371468757422,
+  "ret": 0.501057679509456,
+  "trades": 58,
+  "is_calmar": 0.6154561580716327,
+  "oos_calmar": 0.5841435013626368,
+  "cross_pos": 7,
+  "cross_n": 13
+ },
+ {
+  "sym": "UR",
+  "cn": "尿素",
+  "period": "1d_tq",
+  "factors": [
+   "commodity_mom_10",
+   "roll_yield"
+  ],
+  "window": 252,
+  "horizon": 5,
+  "ic_rebal": 60,
+  "robust": 0.427,
+  "calmar": 0.38413686681309306,
+  "ret": 0.2626048129494158,
+  "trades": 39,
+  "is_calmar": 0.6868583687803347,
+  "oos_calmar": 0.42699820362590424,
+  "cross_pos": 5,
+  "cross_n": 13
+ },
+ {
+  "sym": "SP",
+  "cn": "纸浆",
+  "period": "1d_tq",
+  "factors": [
+   "roll_curv_o3",
+   "ma_gap_20"
+  ],
+  "window": 252,
+  "horizon": 5,
+  "ic_rebal": 60,
+  "robust": 0.15,
+  "calmar": 0.022084811697175116,
+  "ret": 0.01623252388250339,
+  "trades": 36,
+  "is_calmar": 0.1504350932165816,
+  "oos_calmar": 0.7561223440603323,
+  "cross_pos": 6,
+  "cross_n": 13
+ },
+ {
+  "sym": "TA",
+  "cn": "PTA",
+  "period": "4h",
+  "factors": [
+   "roll_annual",
+   "roll_main_annual"
+  ],
+  "window": 504,
+  "horizon": 10,
+  "ic_rebal": 120,
+  "robust": 0.388,
+  "calmar": 0.09707317640907893,
+  "ret": 0.09045090077125095,
+  "trades": 34,
+  "is_calmar": 0.49530903892498296,
+  "oos_calmar": 0.3881123363858014,
+  "cross_pos": 3,
+  "cross_n": 13
+ },
+ {
+  "sym": "EG",
+  "cn": "乙二醇",
+  "period": "4h",
+  "factors": [
+   "roll_curv_o3",
+   "roll_main_annual"
+  ],
+  "window": 504,
+  "horizon": 10,
+  "ic_rebal": 120,
+  "robust": 0.498,
+  "calmar": 0.2399588925283524,
+  "ret": 0.2969851870939182,
+  "trades": 46,
+  "is_calmar": 0.4982414624518553,
+  "oos_calmar": 0.7245653375065365,
+  "cross_pos": 6,
+  "cross_n": 13
+ },
+ {
+  "sym": "PP",
+  "cn": "聚丙烯",
+  "period": "4h",
+  "factors": [
+   "vol_surge",
+   "commodity_mom_10",
+   "sector_mom_10"
+  ],
+  "window": 504,
+  "horizon": 10,
+  "ic_rebal": 120,
+  "robust": 0.555,
+  "calmar": 0.4257369514718147,
+  "ret": 0.1690925281016666,
+  "trades": 135,
+  "is_calmar": 0.5553759969754029,
+  "oos_calmar": 1.1194493556639349,
+  "cross_pos": 8,
+  "cross_n": 13
+ },
+ {
+  "sym": "V",
+  "cn": "PVC",
+  "period": "4h",
+  "factors": [
+   "vol_surge",
+   "roll_yield"
+  ],
+  "window": 504,
+  "horizon": 10,
+  "ic_rebal": 120,
+  "robust": 0.665,
+  "calmar": 0.3104528255549808,
+  "ret": 0.2084480223229064,
+  "trades": 159,
+  "is_calmar": 0.6650041823324845,
+  "oos_calmar": 0.6928268066671155,
+  "cross_pos": 6,
+  "cross_n": 13
+ },
+ {
+  "sym": "EB",
+  "cn": "苯乙烯",
+  "period": "4h",
+  "factors": [
+   "vol_surge",
+   "roll_main_share"
+  ],
+  "window": 504,
+  "horizon": 10,
+  "ic_rebal": 120,
+  "robust": 0.897,
+  "calmar": 0.9396758195072634,
+  "ret": 0.44338370304730607,
+  "trades": 271,
+  "is_calmar": 0.89742549109541,
+  "oos_calmar": 1.4817135561892418,
+  "cross_pos": 7,
+  "cross_n": 13
+ },
+ {
+  "sym": "PF",
+  "cn": "短纤",
+  "period": "4h",
+  "factors": [
+   "roll_main_oi",
+   "roll_main_change"
+  ],
+  "window": 504,
+  "horizon": 10,
+  "ic_rebal": 120,
+  "robust": 0.758,
+  "calmar": 0.3327873135780381,
+  "ret": 0.20126113168790843,
+  "trades": 35,
+  "is_calmar": 1.0144535952619886,
+  "oos_calmar": 0.7584301591212436,
+  "cross_pos": 5,
+  "cross_n": 13
+ },
+ {
+  "sym": "SA",
+  "cn": "纯碱",
+  "period": "4h",
+  "factors": [
+   "mom_20",
+   "commodity_mom_10",
+   "close_pos"
+  ],
+  "window": 504,
+  "horizon": 10,
+  "ic_rebal": 120,
+  "robust": 1.09,
+  "calmar": 0.4816774500391348,
+  "ret": 0.47524677575914653,
+  "trades": 58,
+  "is_calmar": 1.1248090652811078,
+  "oos_calmar": 1.0895442694711903,
+  "cross_pos": 6,
+  "cross_n": 13
+ },
+ {
+  "sym": "FG",
+  "cn": "玻璃",
+  "period": "4h",
+  "factors": [
+   "sector_mom_10",
+   "roll_curv_o3"
+  ],
+  "window": 504,
+  "horizon": 10,
+  "ic_rebal": 120,
+  "robust": 0.838,
+  "calmar": 0.6415918779114833,
+  "ret": 0.6110869710272131,
+  "trades": 63,
+  "is_calmar": 1.9627167830372347,
+  "oos_calmar": 0.8383206160879775,
+  "cross_pos": 8,
+  "cross_n": 13
+ },
+ {
+  "sym": "UR",
+  "cn": "尿素",
+  "period": "4h",
+  "factors": [
+   "sector_mom_10",
+   "mom_20"
+  ],
+  "window": 504,
+  "horizon": 10,
+  "ic_rebal": 120,
+  "robust": 1.189,
+  "calmar": 0.47517597740864487,
+  "ret": 0.3666950709485668,
+  "trades": 62,
+  "is_calmar": 1.1892965225555823,
+  "oos_calmar": 2.2209118061176656,
+  "cross_pos": 6,
+  "cross_n": 13
+ },
+ {
+  "sym": "TA",
+  "cn": "PTA",
+  "period": "2h",
+  "factors": [
+   "roll_annual",
+   "roll_main_annual"
+  ],
+  "window": 983,
+  "horizon": 20,
+  "ic_rebal": 234,
+  "robust": 0.21,
+  "calmar": 0.06011962957192227,
+  "ret": 0.07184118353887507,
+  "trades": 37,
+  "is_calmar": 0.7028230035381985,
+  "oos_calmar": 0.21001574565257455,
+  "cross_pos": 2,
+  "cross_n": 13
+ },
+ {
+  "sym": "EG",
+  "cn": "乙二醇",
+  "period": "2h",
+  "factors": [
+   "roll_curv_o3",
+   "roll_main_oi"
+  ],
+  "window": 983,
+  "horizon": 20,
+  "ic_rebal": 234,
+  "robust": 0.347,
+  "calmar": 0.33917212198314334,
+  "ret": 0.36163095181545035,
+  "trades": 61,
+  "is_calmar": 0.3470005942959327,
+  "oos_calmar": 0.40229052433283424,
+  "cross_pos": 8,
+  "cross_n": 13
+ },
+ {
+  "sym": "PP",
+  "cn": "聚丙烯",
+  "period": "2h",
+  "factors": [
+   "roll_main_oi",
+   "ma_gap_20",
+   "sector_mom_10"
+  ],
+  "window": 983,
+  "horizon": 20,
+  "ic_rebal": 234,
+  "robust": 0.697,
+  "calmar": 0.5577992353157681,
+  "ret": 0.42310329785015016,
+  "trades": 99,
+  "is_calmar": 0.8375583541182933,
+  "oos_calmar": 0.6969391307197124,
+  "cross_pos": 10,
+  "cross_n": 13
+ },
+ {
+  "sym": "V",
+  "cn": "PVC",
+  "period": "2h",
+  "factors": [
+   "sector_mom_10",
+   "near_oi_share",
+   "roll_yield"
+  ],
+  "window": 983,
+  "horizon": 20,
+  "ic_rebal": 234,
+  "robust": 0.883,
+  "calmar": 0.8401178886686052,
+  "ret": 0.3260024197623788,
+  "trades": 44,
+  "is_calmar": 0.882626770444892,
+  "oos_calmar": 0.9930470180376196,
+  "cross_pos": 7,
+  "cross_n": 13
+ },
+ {
+  "sym": "EB",
+  "cn": "苯乙烯",
+  "period": "2h",
+  "factors": [
+   "commodity_mom_10",
+   "roll_main_share"
+  ],
+  "window": 983,
+  "horizon": 20,
+  "ic_rebal": 234,
+  "robust": 0.657,
+  "calmar": 0.28458609048096456,
+  "ret": 0.28851252869699406,
+  "trades": 106,
+  "is_calmar": 0.9253059570028508,
+  "oos_calmar": 0.6568325003219291,
+  "cross_pos": 9,
+  "cross_n": 13
+ },
+ {
+  "sym": "PF",
+  "cn": "短纤",
+  "period": "2h",
+  "factors": [
+   "roll_main_change",
+   "war_chg_5"
+  ],
+  "window": 983,
+  "horizon": 20,
+  "ic_rebal": 234,
+  "robust": 0.919,
+  "calmar": 0.41677195716903287,
+  "ret": 0.1577235308026443,
+  "trades": 73,
+  "is_calmar": 1.2562789617477181,
+  "oos_calmar": 0.919106504353827,
+  "cross_pos": 3,
+  "cross_n": 13
+ },
+ {
+  "sym": "SA",
+  "cn": "纯碱",
+  "period": "2h",
+  "factors": [
+   "mom_20",
+   "ma_gap_20"
+  ],
+  "window": 983,
+  "horizon": 20,
+  "ic_rebal": 234,
+  "robust": 0.369,
+  "calmar": 0.14473434193182425,
+  "ret": 0.252935999422061,
+  "trades": 147,
+  "is_calmar": 0.7986071791235849,
+  "oos_calmar": 0.36888855528064224,
+  "cross_pos": 4,
+  "cross_n": 13
+ },
+ {
+  "sym": "FG",
+  "cn": "玻璃",
+  "period": "2h",
+  "factors": [
+   "roll_main_annual",
+   "roll_curv_o3",
+   "breakout_pos"
+  ],
+  "window": 983,
+  "horizon": 20,
+  "ic_rebal": 234,
+  "robust": 0.691,
+  "calmar": 0.2891744265468095,
+  "ret": 0.3804966617556652,
+  "trades": 41,
+  "is_calmar": 0.7354343214666685,
+  "oos_calmar": 0.6913242521109972,
+  "cross_pos": 5,
+  "cross_n": 13
+ },
+ {
+  "sym": "UR",
+  "cn": "尿素",
+  "period": "2h",
+  "factors": [
+   "mom_20",
+   "roll_yield",
+   "roll_main_oi"
+  ],
+  "window": 983,
+  "horizon": 20,
+  "ic_rebal": 234,
+  "robust": 0.633,
+  "calmar": 0.19545285437969936,
+  "ret": 0.1254475405254357,
+  "trades": 42,
+  "is_calmar": 0.6774395080848182,
+  "oos_calmar": 0.6331939601053282,
+  "cross_pos": 3,
+  "cross_n": 13
+ },
+ {
+  "sym": "BU",
+  "cn": "沥青",
+  "period": "2h",
+  "factors": [
+   "roll_yield_o3",
+   "commodity_mom_10",
+   "roll_main_share"
+  ],
+  "window": 983,
+  "horizon": 20,
+  "ic_rebal": 234,
+  "robust": 0.553,
+  "calmar": 0.14590251319190561,
+  "ret": 0.10013343146833242,
+  "trades": 43,
+  "is_calmar": 0.5534170878006728,
+  "oos_calmar": 0.8058138183563021,
+  "cross_pos": 3,
+  "cross_n": 13
+ },
+ {
+  "sym": "RU",
+  "cn": "橡胶",
+  "period": "2h",
+  "factors": [
+   "roll_main_annual",
+   "mom_60"
+  ],
+  "window": 983,
+  "horizon": 20,
+  "ic_rebal": 234,
+  "robust": 0.301,
+  "calmar": 0.12754823538746404,
+  "ret": 0.09409160378155694,
+  "trades": 48,
+  "is_calmar": 0.3010856859348655,
+  "oos_calmar": 0.5916440877145478,
+  "cross_pos": 6,
+  "cross_n": 13
+ },
+ {
+  "sym": "SP",
+  "cn": "纸浆",
+  "period": "2h",
+  "factors": [
+   "roll_curv_o3",
+   "roll_annual"
+  ],
+  "window": 983,
+  "horizon": 20,
+  "ic_rebal": 234,
+  "robust": 0.213,
+  "calmar": 0.030546207123666222,
+  "ret": 0.022057794709534385,
+  "trades": 28,
+  "is_calmar": 0.2128406662953388,
+  "oos_calmar": 1.2094942871667689,
+  "cross_pos": 5,
+  "cross_n": 13
+ },
+ {
+  "sym": "TA",
+  "cn": "PTA",
+  "period": "1h",
+  "factors": [
+   "roll_annual",
+   "roll_yield"
+  ],
+  "window": 1764,
+  "horizon": 35,
+  "ic_rebal": 420,
+  "robust": 0.179,
+  "calmar": 0.14037300573822828,
+  "ret": 0.17783782015137886,
+  "trades": 49,
+  "is_calmar": 0.17919110918563133,
+  "oos_calmar": 0.5775181983600669,
+  "cross_pos": 3,
+  "cross_n": 13
+ },
+ {
+  "sym": "EG",
+  "cn": "乙二醇",
+  "period": "1h",
+  "factors": [
+   "roll_curv_o3",
+   "roll_main_share",
+   "roll_yield_o3"
+  ],
+  "window": 1764,
+  "horizon": 35,
+  "ic_rebal": 420,
+  "robust": 0.157,
+  "calmar": 0.12468595938129352,
+  "ret": 0.13918387557385117,
+  "trades": 30,
+  "is_calmar": 0.24313046083658973,
+  "oos_calmar": 0.15669352035932987,
+  "cross_pos": 7,
+  "cross_n": 13
+ },
+ {
+  "sym": "V",
+  "cn": "PVC",
+  "period": "1h",
+  "factors": [
+   "near_oi_share",
+   "breakout_pos"
+  ],
+  "window": 1764,
+  "horizon": 35,
+  "ic_rebal": 420,
+  "robust": 0.513,
+  "calmar": 0.5767103858742243,
+  "ret": 0.2999963955387976,
+  "trades": 74,
+  "is_calmar": 0.512668486706964,
+  "oos_calmar": 0.5129286026618405,
+  "cross_pos": 5,
+  "cross_n": 13
+ },
+ {
+  "sym": "EB",
+  "cn": "苯乙烯",
+  "period": "1h",
+  "factors": [
+   "roll_annual",
+   "main_oi_share"
+  ],
+  "window": 1764,
+  "horizon": 35,
+  "ic_rebal": 420,
+  "robust": 0.099,
+  "calmar": 0.09477239489089047,
+  "ret": 0.10001866226497548,
+  "trades": 56,
+  "is_calmar": 0.14864266461094544,
+  "oos_calmar": 0.09947867721719651,
+  "cross_pos": 6,
+  "cross_n": 13
+ },
+ {
+  "sym": "PF",
+  "cn": "短纤",
+  "period": "1h",
+  "factors": [
+   "roll_main_change",
+   "roll_main_oi"
+  ],
+  "window": 1764,
+  "horizon": 35,
+  "ic_rebal": 420,
+  "robust": 0.387,
+  "calmar": 0.16017483450379277,
+  "ret": 0.10022666292937751,
+  "trades": 40,
+  "is_calmar": 0.3869682902822278,
+  "oos_calmar": 0.5030227079209447,
+  "cross_pos": 5,
+  "cross_n": 13
+ },
+ {
+  "sym": "SA",
+  "cn": "纯碱",
+  "period": "1h",
+  "factors": [
+   "breakout_pos",
+   "roll_main_annual"
+  ],
+  "window": 1764,
+  "horizon": 35,
+  "ic_rebal": 420,
+  "robust": 0.35,
+  "calmar": 0.21635516308240585,
+  "ret": 0.22924187690078024,
+  "trades": 125,
+  "is_calmar": 0.3495607320145123,
+  "oos_calmar": 0.3669175889569245,
+  "cross_pos": 4,
+  "cross_n": 13
+ },
+ {
+  "sym": "FG",
+  "cn": "玻璃",
+  "period": "1h",
+  "factors": [
+   "roll_main_oi",
+   "roll_curv_o3",
+   "breakout_pos"
+  ],
+  "window": 1764,
+  "horizon": 35,
+  "ic_rebal": 420,
+  "robust": 0.679,
+  "calmar": 0.5253174319355123,
+  "ret": 0.4888909806147332,
+  "trades": 56,
+  "is_calmar": 1.0122493540190078,
+  "oos_calmar": 0.6794119056486173,
+  "cross_pos": 4,
+  "cross_n": 13
+ },
+ {
+  "sym": "UR",
+  "cn": "尿素",
+  "period": "1h",
+  "factors": [
+   "mom_60",
+   "term_slope"
+  ],
+  "window": 1764,
+  "horizon": 35,
+  "ic_rebal": 420,
+  "robust": 0.114,
+  "calmar": 0.038463198811045166,
+  "ret": 0.05131765391324647,
+  "trades": 45,
+  "is_calmar": 0.11449786063159284,
+  "oos_calmar": 0.30004807620941665,
+  "cross_pos": 4,
+  "cross_n": 13
+ },
+ {
+  "sym": "SP",
+  "cn": "纸浆",
+  "period": "1h",
+  "factors": [
+   "roll_annual",
+   "roll_curv_o3"
+  ],
+  "window": 1764,
+  "horizon": 35,
+  "ic_rebal": 420,
+  "robust": 0.161,
+  "calmar": 0.030256400239242105,
+  "ret": 0.020690830309889746,
+  "trades": 28,
+  "is_calmar": 0.16105250420202075,
+  "oos_calmar": 0.7325081848655695,
+  "cross_pos": 7,
+  "cross_n": 13
+ },
+ {
+  "sym": "TA",
+  "cn": "PTA",
+  "period": "30m",
+  "factors": [
+   "roll_annual",
+   "roll_main_change"
+  ],
+  "window": 2822,
+  "horizon": 56,
+  "ic_rebal": 672,
+  "robust": 0.131,
+  "calmar": 0.09319527458168515,
+  "ret": 0.10778180155815044,
+  "trades": 52,
+  "is_calmar": 0.26397419028030716,
+  "oos_calmar": 0.1307743824800382,
+  "cross_pos": 5,
+  "cross_n": 13
+ },
+ {
+  "sym": "EG",
+  "cn": "乙二醇",
+  "period": "30m",
+  "factors": [
+   "roll_curv_o3",
+   "sector_mom_10"
+  ],
+  "window": 2822,
+  "horizon": 56,
+  "ic_rebal": 672,
+  "robust": 0.163,
+  "calmar": 0.43596053529115786,
+  "ret": 0.32238877617963846,
+  "trades": 177,
+  "is_calmar": 0.16319896829823766,
+  "oos_calmar": 0.5562754480626234,
+  "cross_pos": 6,
+  "cross_n": 13
+ },
+ {
+  "sym": "L",
+  "cn": "塑料",
+  "period": "30m",
+  "factors": [
+   "commodity_mom_10",
+   "breakout_pos"
+  ],
+  "window": 2822,
+  "horizon": 56,
+  "ic_rebal": 672,
+  "robust": 0.171,
+  "calmar": 0.1995597712029086,
+  "ret": 0.10950826515848422,
+  "trades": 284,
+  "is_calmar": 0.200732457617982,
+  "oos_calmar": 0.17120322826740939,
+  "cross_pos": 5,
+  "cross_n": 13
+ },
+ {
+  "sym": "V",
+  "cn": "PVC",
+  "period": "30m",
+  "factors": [
+   "profit_val",
+   "commodity_mom_10",
+   "sector_mom_10"
+  ],
+  "window": 2822,
+  "horizon": 56,
+  "ic_rebal": 672,
+  "robust": 0.941,
+  "calmar": 0.5980475525124277,
+  "ret": 0.29644819150155527,
+  "trades": 205,
+  "is_calmar": 0.9407739119460378,
+  "oos_calmar": 0.9948265269658327,
+  "cross_pos": 10,
+  "cross_n": 13
+ },
+ {
+  "sym": "EB",
+  "cn": "苯乙烯",
+  "period": "30m",
+  "factors": [
+   "commodity_mom_10",
+   "main_oi_share"
+  ],
+  "window": 2822,
+  "horizon": 56,
+  "ic_rebal": 672,
+  "robust": 0.391,
+  "calmar": 0.135322904720339,
+  "ret": 0.1535875718896296,
+  "trades": 166,
+  "is_calmar": 0.3905807636539062,
+  "oos_calmar": 0.5627077416265234,
+  "cross_pos": 8,
+  "cross_n": 13
+ },
+ {
+  "sym": "PF",
+  "cn": "短纤",
+  "period": "30m",
+  "factors": [
+   "roll_main_oi",
+   "roll_main_change"
+  ],
+  "window": 2822,
+  "horizon": 56,
+  "ic_rebal": 672,
+  "robust": 0.314,
+  "calmar": 0.30117700044278467,
+  "ret": 0.14939749083598658,
+  "trades": 37,
+  "is_calmar": 0.47292717811992085,
+  "oos_calmar": 0.3138167219198079,
+  "cross_pos": 6,
+  "cross_n": 13
+ },
+ {
+  "sym": "SA",
+  "cn": "纯碱",
+  "period": "30m",
+  "factors": [
+   "main_oi_share",
+   "mom_60"
+  ],
+  "window": 2822,
+  "horizon": 56,
+  "ic_rebal": 672,
+  "robust": 0.144,
+  "calmar": 0.41156289094505244,
+  "ret": 0.47546567178662447,
+  "trades": 66,
+  "is_calmar": 0.83033275507371,
+  "oos_calmar": 0.1439735436908753,
+  "cross_pos": 6,
+  "cross_n": 13
+ },
+ {
+  "sym": "FG",
+  "cn": "玻璃",
+  "period": "30m",
+  "factors": [
+   "roll_main_oi",
+   "roll_main_annual"
+  ],
+  "window": 2822,
+  "horizon": 56,
+  "ic_rebal": 672,
+  "robust": 0.073,
+  "calmar": 0.011214707406727267,
+  "ret": 0.016888626883037272,
+  "trades": 30,
+  "is_calmar": 0.07337456842359942,
+  "oos_calmar": 0.5387386013159314,
+  "cross_pos": 5,
+  "cross_n": 13
+ },
+ {
+  "sym": "UR",
+  "cn": "尿素",
+  "period": "30m",
+  "factors": [
+   "mom_60",
+   "term_slope"
+  ],
+  "window": 2822,
+  "horizon": 56,
+  "ic_rebal": 672,
+  "robust": 0.211,
+  "calmar": 0.04004616177215791,
+  "ret": 0.04455253565559839,
+  "trades": 54,
+  "is_calmar": 0.2418758145636576,
+  "oos_calmar": 0.21079760093569053,
+  "cross_pos": 6,
+  "cross_n": 13
+ },
+ {
+  "sym": "RU",
+  "cn": "橡胶",
+  "period": "30m",
+  "factors": [
+   "mom_20",
+   "roll_curv_o3"
+  ],
+  "window": 2822,
+  "horizon": 56,
+  "ic_rebal": 672,
+  "robust": 0.006,
+  "calmar": 0.08268580185207952,
+  "ret": 0.08988417972331238,
+  "trades": 149,
+  "is_calmar": 0.6602526461455902,
+  "oos_calmar": 0.006418924936386425,
+  "cross_pos": 5,
+  "cross_n": 13
+ }
+]

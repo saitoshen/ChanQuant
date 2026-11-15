@@ -1,0 +1,416 @@
+[
+ {
+  "label": "V PVC · 逐品种最优",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "maxdd_60",
+   "rsi_14",
+   "pv_corr"
+  ],
+  "symbol": "V",
+  "exchange": "DCE",
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.6533944703986483,
+   "ret": 0.43178154345117,
+   "is": 1.3732814979185555,
+   "oos": 1.4733691591498188,
+   "trades": 25,
+   "cross_pos": 4,
+   "cross_n": 13
+  }
+ },
+ {
+  "label": "UR 尿素 · 逐品种最优",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "commodity_mom_10",
+   "stoch_14",
+   "ma_gap_20"
+  ],
+  "symbol": "UR",
+  "exchange": "CZCE",
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.23685627841761284,
+   "ret": 0.2644373112408619,
+   "is": 1.1062312745149174,
+   "oos": 1.1984487113129039,
+   "trades": 56,
+   "cross_pos": 6,
+   "cross_n": 13
+  }
+ },
+ {
+  "label": "EB 苯乙烯 · 逐品种最优",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "commodity_mom_10",
+   "vol_change_20"
+  ],
+  "symbol": "EB",
+  "exchange": "DCE",
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 1.3694908332761677,
+   "ret": 0.6125424431419189,
+   "is": 1.2569084847647105,
+   "oos": 0.9237673989370567,
+   "trades": 41,
+   "cross_pos": 8,
+   "cross_n": 13
+  }
+ },
+ {
+  "label": "SA 纯碱 · 逐品种最优",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "near_oi_share",
+   "breakout_pos",
+   "stoch_14"
+  ],
+  "symbol": "SA",
+  "exchange": "CZCE",
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.6284820928534871,
+   "ret": 0.37432395556825304,
+   "is": 1.479612175173792,
+   "oos": 0.7620743617401443,
+   "trades": 36,
+   "cross_pos": 6,
+   "cross_n": 13
+  }
+ },
+ {
+  "label": "SP 纸浆 · 逐品种最优",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "oi_change_5",
+   "turnover_20",
+   "roll_curv"
+  ],
+  "symbol": "SP",
+  "exchange": "SHFE",
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.30900851786107797,
+   "ret": 0.15179124551547668,
+   "is": 0.7485475726531338,
+   "oos": 0.7516746838773468,
+   "trades": 30,
+   "cross_pos": 4,
+   "cross_n": 13
+  }
+ },
+ {
+  "label": "PF 短纤 · 逐品种最优",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "range_1",
+   "efficiency",
+   "close_pos"
+  ],
+  "symbol": "PF",
+  "exchange": "CZCE",
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.2167426823391515,
+   "ret": 0.12172743505841307,
+   "is": 0.7115413169474225,
+   "oos": 2.0802877357391916,
+   "trades": 39,
+   "cross_pos": 5,
+   "cross_n": 13
+  }
+ },
+ {
+  "label": "RU 橡胶 · 逐品种最优",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "downside_ratio",
+   "breakout_pos"
+  ],
+  "symbol": "RU",
+  "exchange": "SHFE",
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.19751651562639472,
+   "ret": 0.13991231974217855,
+   "is": 0.5966649660420679,
+   "oos": 2.8624336861096653,
+   "trades": 41,
+   "cross_pos": 4,
+   "cross_n": 13
+  }
+ },
+ {
+  "label": "FG 玻璃 · 逐品种最优",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "commodity_mom_10",
+   "sector_mom_10"
+  ],
+  "symbol": "FG",
+  "exchange": "CZCE",
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.48614445362050274,
+   "ret": 0.47196367573259607,
+   "is": 0.5893184484379396,
+   "oos": 0.5305996240398865,
+   "trades": 58,
+   "cross_pos": 6,
+   "cross_n": 13
+  }
+ },
+ {
+  "label": "BU 沥青 · 逐品种最优",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "oi_change_5",
+   "turnover_20",
+   "sector_corr_20"
+  ],
+  "symbol": "BU",
+  "exchange": "SHFE",
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.4415560561337119,
+   "ret": 0.2715161766924453,
+   "is": 0.5801241560888409,
+   "oos": 0.49584460290544885,
+   "trades": 28,
+   "cross_pos": 3,
+   "cross_n": 13
+  }
+ },
+ {
+  "label": "MA 甲醇 · 逐品种最优",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "spot_basis",
+   "main_oi_share"
+  ],
+  "symbol": "MA",
+  "exchange": "CZCE",
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.005378620737704648,
+   "ret": 0.010482708540715393,
+   "is": 0.4436571898699131,
+   "oos": 0.25892174751234026,
+   "trades": 39,
+   "cross_pos": 4,
+   "cross_n": 13
+  }
+ },
+ {
+  "label": "EG 乙二醇 · 逐品种最优",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "sector_mom_10",
+   "stoch_14"
+  ],
+  "symbol": "EG",
+  "exchange": "DCE",
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.3611820869451316,
+   "ret": 0.3410264216846123,
+   "is": 0.24418518122099658,
+   "oos": 0.5594686887906792,
+   "trades": 38,
+   "cross_pos": 6,
+   "cross_n": 13
+  }
+ },
+ {
+  "label": "TA PTA · 逐品种最优",
+  "period": "1d",
+  "family": "factor",
+  "factor_mode": "multi",
+  "factor_keys": [
+   "roll_annual",
+   "roll_yield"
+  ],
+  "symbol": "TA",
+  "exchange": "CZCE",
+  "factor_cfg": {
+   "window": 252,
+   "horizon": 5,
+   "entry_z": 1.0,
+   "exit_z": 0.3,
+   "weight_mode": "equal",
+   "ic_rebal": 60,
+   "method": "z",
+   "orient": "auto"
+  },
+  "sizing": "budget",
+  "principal": 1000000,
+  "capital_pct": 50.0,
+  "metrics": {
+   "calmar": 0.15306975780034857,
+   "ret": 0.1820408756566483,
+   "is": 0.22923118118944108,
+   "oos": 0.5791873197393785,
+   "trades": 50,
+   "cross_pos": 2,
+   "cross_n": 13
+  }
+ }
+]
