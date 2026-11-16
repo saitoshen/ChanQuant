@@ -6,11 +6,16 @@ numpy==2.5.4
 pandas==3.0.6
 
 # GUI。PySide6 是元包，会带上 Essentials + Addons
-PySide6==6.11.3
-# 6.12.0 别用：它在**退出路径**上有已知崩溃（Qt6Core+0x2623cc，非 WebEngine 那条），
-# 表现为自检 81 项全绿、进程退出时被信号打死（Windows 0xC0000409 / macOS 139），
-# CI 只看退出码，于是整个 Release 被跳过。6.11.3 是含修复的版本（退出码 0）。
-# 升级前先在 CI 上跑一遍 tag 构建确认三平台自检都 exit 0，别只看本地。
+# **平台分开锁**，别统一：
+#   · Windows 用 6.11.3 —— 6.12.0 在**退出路径**上有个崩溃（Qt6Core+0x2623cc），
+#     表现为自检 81 项全绿、进程退出时被信号打死（0xC0000409 / bash 里报 139），
+#     CI 只看退出码，于是整个 Release 被跳过（v3.7.4~v3.7.6 三轮都栽在这）。
+#   · macOS 用 6.12.0 —— 6.11.3 在**构建主窗口**时就段错误，连 selftest.log 都
+#     写不出来，等于 macOS 用户根本打不开程序（比退出崩严重得多）。
+# 也就是说：同一份代码，两个平台各自能用的版本不一样，只能靠环境标记分流。
+# 升级前必须看 **三平台** 的 tag 构建结果，别只看本地 Windows。
+PySide6==6.12.0; sys_platform == "darwin"
+PySide6==6.11.3; sys_platform != "darwin"
 
 # 图标生成（packaging/make_icon.py）
 Pillow==13.0.0

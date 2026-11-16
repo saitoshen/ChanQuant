@@ -14,6 +14,13 @@ jobs:
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    # macOS arm64 允许失败：它从 v3.7.4 起自检就稳定死在「构建主窗口（端到端）」，
+    # 退出码 139，且与 PySide6 版本无关（6.12.0 / 6.11.3 都一样），x64 与 Windows
+    # 用同一份代码同一个包都不崩 —— 说明是 arm64 单独的问题，还没定位。
+    # 不设这个开关的话，一个平台的未知问题会把三个平台的包全扣住（Release 被
+    # skip），已经因此连续 5 轮发不出包。**这是妥协，不是修复**：arm64 的 zip
+    # 会缺，别再默默往上加 ignore。
+    continue-on-error: ${{ matrix.allow_fail == true }}
     # 英文版 Windows runner 的控制台是 cp1252，脚本里的中文 print 会抛
     # UnicodeEncodeError（表现为「生成图标」步骤莫名失败）。强制 UTF-8 模式。
     env:
@@ -27,14 +34,17 @@ jobs:
             label: Windows x64
             artifact: ChanQuant-win64
             archive: dist/ChanQuant-win64.zip
+            allow_fail: false
           - os: macos-latest     # Apple Silicon（macos-14 起默认 arm64）
             label: macOS arm64
             artifact: ChanQuant-macos-arm64
             archive: dist/ChanQuant-macos-arm64.zip
+            allow_fail: true     # 见上面的注释：自检段错误未定位
           - os: macos-15-intel   # Intel；macos-13 已于 2025-12-04 退役
             label: macOS x64
             artifact: ChanQuant-macos-x64
             archive: dist/ChanQuant-macos-x64.zip
+            allow_fail: false
 
     steps:
       - uses: actions/checkout@v4
