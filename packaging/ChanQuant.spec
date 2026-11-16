@@ -275,6 +275,12 @@ EXCLUDES = [
     # 开发工具
     "IPython", "jupyter", "jupyter_core", "notebook", "nbconvert", "nbformat",
     "pytest", "sphinx", "docutils", "setuptools", "pip",
+    # vnpy 框架本身：我们只借 vnpy_rohon.api 那一层驱动，从不 import vnpy。
+    # 但它必须**显式排除**，因为 `vnpy_rohon/gateway/` 里有 `import vnpy`
+    # （PyInstaller 静态扫到就会想收），而 vnpy 4.5 把 pyside6 钉在 6.8.2.1 ——
+    # 真被收进包里，运行期就会加载到另一份 Qt，界面直接崩。构建机上一般
+    # 也装不了 vnpy（我们要的就是这样），这行是给「万一有人装了」兜底。
+    "vnpy",
     # PySide6 里没碰到的子模块（Qt 绑定层，剔掉不影响 Qt6 底层 DLL）
     "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtWebEngineQuick",
     "PySide6.QtWebChannel", "PySide6.QtWebSockets", "PySide6.QtWebView",
