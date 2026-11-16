@@ -811,8 +811,13 @@ class DataPage(QWidget):
         """
         bar = QFrame()
         bar.setObjectName("Card")
-        lay = QHBoxLayout(bar)
-        lay.setContentsMargins(12, 8, 12, 8)
+        # 两行：上行是状态 + 手动更新，下行是定时开关。定时放在这里而不是
+        # 塞进右下角那张「每日自动补充」卡，是因为宏观是页级数据、跟市场无关，
+        # 用户看到「上次更新」的同一眼就能顺手把自动更新打开。
+        outer = QVBoxLayout(bar)
+        outer.setContentsMargins(12, 8, 12, 8)
+        outer.setSpacing(6)
+        lay = QHBoxLayout()
         lay.setSpacing(10)
 
         title = QLabel("宏观因子")
@@ -840,8 +845,38 @@ class DataPage(QWidget):
             "抓全部 23 条序列（增量）。全量约 6.8 万行、3 MB，第一次十几秒。\n"
             "已经是增量：只补库里最后一天之后的部分，并回看 400 天覆盖修订。"
         )
-        self.btn_macro.clicked.connect(self._start_macro)
+        # 显式包一层：`clicked` 会带一个 `checked` 布尔，直接连会被当成 `auto`
+        self.btn_macro.clicked.connect(lambda: self._start_macro())
         lay.addWidget(self.btn_macro)
+        outer.addLayout(lay)
+
+        # 第二行：定时开关。宏观序列是**页级**数据（跟市场、跟天勤账户都无关），
+        # 所以不塞进右下角那张「每日自动补充」卡 —— 那张卡的每条日程都要配一个
+        # 「近 1 天 / 近 1 周」的区间下拉，而宏观走的是自己的增量逻辑（库里最后
+        # 一天往后 + 回看 400 天覆盖修订），根本没有区间可选。放这一行还有个好处：
+        # 用户在「上次更新」的同一眼就能顺手把自动更新打开，不用去别处找。
+        row_macro = QHBoxLayout()
+        row_macro.setSpacing(8)
+        self.chk_macro_auto = QCheckBox("每天自动更新")
+        self.chk_macro_auto.setToolTip(
+            "到点自动跑一遍宏观增量更新（Tushare + 东方财富，十几秒）。\n\n"
+            "为什么放上午：日频宏观（SHIBOR / 美债 / 外汇 / 全球指数）的当日值\n"
+            "要等前一个交易日晚间才落地，08:00 时昨天那根已经齐了；而且这个点\n"
+            "跟 15:30（衍生）/ 17:00（日线）两条日程不撞车。\n\n"
+            "只在本程序开着时生效；到点如果正在更新别的数据，就等这一轮跑完再补。"
+        )
+        row_macro.addWidget(self.chk_macro_auto)
+        self.time_macro_auto = QTimeEdit()
+        self.time_macro_auto.setDisplayFormat("HH:mm")
+        self.time_macro_auto.setTime(QTime(8, 0))
+        self.time_macro_auto.setToolTip(
+            "默认 08:00。宏观是日频，一天补一次就够。\n"
+            "太早拿不到昨天的最终值（数据源当天最后一根常是临时值，隔天会被修订），\n"
+            "太晚又赶不上盘前看数据。"
+        )
+        row_macro.addWidget(self.time_macro_auto)
+        row_macro.addStretch(1)
+        outer.addLayout(row_macro)
 
         self._refresh_macro_stats()
         return bar
@@ -866,10 +901,21 @@ class DataPage(QWidget):
         except Exception as exc:  # noqa: BLE001
             self.lbl_macro_stats.setText(f"读取失败：{type(exc).__name__}: {exc}")
 
-    def _start_macro(self) -> None:
+    def _start_macro(self, auto: bool = False) -> None:
+        """起宏观增量更新。
+
+        `auto=True` 是定时任务叫起来的：置上 `_auto_run` 让失败不弹模态框
+        （08:00 多半没人守着屏幕，模态框会一直挂着），并让 `_on_thread_done`
+        照常打出「定时补充结束」。宏观不排市场队列，`_auto_queue` 留空，
+        `_on_thread_done` 就不会去起 `_start_auto_next()`。
+        """
         if self.busy():
             self._log("还有任务在跑，先等它结束或点「取消」")
             return
+        if auto:
+            self._auto_run = True
+            self._auto_key = "macro"
+            self._auto_queue = []
         self._macro_worker = MacroWorker()
         self._macro_thread = QThread(self)
         self._macro_worker.moveToThread(self._macro_thread)
@@ -1741,19 +1787,27 @@ class DataPage(QWidget):
             t = QTime.fromString(str(one.get("time") or ""), "HH:mm")
             if t.isValid():
                 job["time"].setTime(t)
-            i = job["range"].findData(one.get("range") or "1d")
-            if i >= 0:
-                job["range"].setCurrentIndex(i)
+            # 宏观那条没有区间下拉（`range` 是 None），别对它调 findData
+            if job.get("range") is not None:
+                i = job["range"].findData(one.get("range") or "1d")
+                if i >= 0:
+                    job["range"].setCurrentIndex(i)
+        # 全部灌完值再接线。边灌边接会出事：第一条日程的 `setChecked` 就会触发
+        # `_save_auto_cfg`，而那时后面的日程还是默认值（未勾选），一次「打开
+        # 程序」就把它们的勾选状态按默认值写回磁盘 —— 下次启动定时任务就丢了。
+        for job in self._auto_jobs():
             job["chk"].toggled.connect(self._save_auto_cfg)
             job["time"].timeChanged.connect(self._save_auto_cfg)
-            job["range"].currentIndexChanged.connect(self._save_auto_cfg)
+            if job.get("range") is not None:
+                job["range"].currentIndexChanged.connect(self._save_auto_cfg)
 
     def _save_auto_cfg(self, *_args) -> None:
         cfg = {
             job["key"]: {
                 "enabled": job["chk"].isChecked(),
                 "time": job["time"].time().toString("HH:mm"),
-                "range": job["range"].currentData() or "1d",
+                "range": (job["range"].currentData() or "1d")
+                          if job.get("range") is not None else None,
                 "last": self._auto_last.get(job["key"], ""),
             }
             for job in self._auto_jobs()
@@ -1773,8 +1827,9 @@ class DataPage(QWidget):
 
         日期存盘而不是只放内存：半夜跑过一次之后用户重启程序，不该再补一遍。
 
-        两条日程共用这一个心跳，但各自记各自的「今天跑过了」—— 15:30 的衍生
-        数据补完不该让 17:00 的日线任务也跟着认为今天跑完了。
+        三条日程（衍生 15:30 / 日线 17:00 / 宏观 08:00）共用这一个心跳，但各自
+        记各自的「今天跑过了」—— 15:30 的衍生数据补完不该让 17:00 的日线任务
+        也跟着认为今天跑完了。
         """
         from datetime import date
 
@@ -1795,14 +1850,24 @@ class DataPage(QWidget):
                 f"—— 定时补充开始：{job['label']}"
                 f"（{job['time'].time().toString('HH:mm')}）"
             )
-            self._start_auto(job["key"])
+            if job.get("macro"):
+                # 宏观不是「补某个市场的 CSV」，是抓序列写 edb.duckdb，走自己的
+                # worker；不进 `_auto_queue`，否则 `_on_thread_done` 会去起下一个
+                # 市场，把 `_start_auto_next()` 里的 UpdateWorker 也拉起来。
+                self._start_macro(auto=True)
+            else:
+                self._start_auto(job["key"])
             return              # 一次只起一条，另一条等下一轮心跳
 
     def _auto_jobs(self) -> list[dict]:
-        """两条日程的控件与目标市场。
+        """三条日程的控件与目标市场。
 
         `markets` 是这条日程要跑的市场，按顺序跑 —— 日线那条要期货和美股都补，
         而衍生数据只有期货有。
+
+        宏观那条是**另一种活**（不是按市场补 CSV，而是抓 23 条序列写 edb.duckdb），
+        所以标 `macro: True`，并显式把 `range` 置 None：它没有「近 1 天/1 周」
+        的概念，增量范围由 `macro.update()` 自己按库里最后一天算。
         """
         return [
             {"key": "aux", "label": "期货衍生数据",
@@ -1811,6 +1876,9 @@ class DataPage(QWidget):
             {"key": "daily", "label": "日线（期货 + 美股）",
              "chk": self.chk_daily, "time": self.time_daily, "range": self.cb_daily_range,
              "markets": ["cn", "us"], "aux": False},
+            {"key": "macro", "label": "宏观因子",
+             "chk": self.chk_macro_auto, "time": self.time_macro_auto,
+             "range": None, "macro": True},
         ]
 
     def _start_auto(self, key: str) -> None:
@@ -2043,7 +2111,12 @@ class DataPage(QWidget):
         # 这一轮可能刚把轻量库换成完整库（体积、kind 都变了），重读一次
         self._sync_db_label()
         if self._auto_run:
-            self._log(f"—— 定时补充结束：{self._auto_key}")
+            # 日志里打中文标签而不是 `aux` / `daily` / `macro` 这种键名 ——
+            # 用户看日志时不该需要知道内部键叫什么
+            key = self._auto_key
+            label = next(
+                (j["label"] for j in self._auto_jobs() if j["key"] == key), key)
+            self._log(f"—— 定时补充结束：{label}")
         self._auto_run = False
         self._auto_queue = []
 
@@ -2055,7 +2128,11 @@ class DataPage(QWidget):
             self._upd_worker.cancel()
         if self._tq_worker is not None:
             self._tq_worker.cancel()
-        for attr in ("_upd_thread", "_tq_thread"):
+        # 宏观也挂上：08:00 那条日程跑起来时用户很可能正关程序去开会，
+        # `_macro_thread` 不一起收就会拖着进程不退出
+        if self._macro_worker is not None:
+            self._macro_worker.cancel()
+        for attr in ("_upd_thread", "_tq_thread", "_macro_thread"):
             t = getattr(self, attr)
             if t is not None:
                 t.quit()
