@@ -35,13 +35,20 @@ def _day(df: pd.DataFrame) -> pd.Series:
     """每根 bar 属于哪个交易日。
 
     天勤数据带 `trading_day` 列（夜盘 21:00 的 bar 归到**下一个**交易日，这是
-    交易所口径，不能拿自然日代替）；Tushare 日线没有这列，退回索引的日期。
+    交易所口径，不能拿自然日代替），优先用它。
+
+    没有这列时不能直接取自然日：**夜盘 21:00~02:30 属于下一个交易日**，按自然日
+    分组会把一个交易日劈成两段（21:00~23:00 落在 D-1、日盘落在 D），「当日开盘」
+    就会变成各自那段的首根 open，波幅突破这类跨全天的因子直接错掉。这里统一
+    `+6h` 再取日期：21:00/23:00 落到次日，09:00/15:00/02:30 留在当天，日线
+    （索引在 00:00）也不受影响。
     """
     if "trading_day" in df.columns:
         d = pd.to_datetime(df["trading_day"], errors="coerce")
         if d.notna().any():
             return d
-    return pd.Series(pd.DatetimeIndex(df.index).normalize(), index=df.index)
+    idx = pd.DatetimeIndex(df.index)
+    return pd.Series((idx + pd.Timedelta(hours=6)).normalize(), index=df.index)
 
 
 def _intraday(df: pd.DataFrame) -> bool:
