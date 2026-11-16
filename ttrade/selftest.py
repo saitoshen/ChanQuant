@@ -7828,23 +7828,24 @@ def run() -> int:
     """执行自检并返回退出码。"""
     from ttrade.paths import log_dir
 
-    # 🔴 段错误 / 栈溢出时进程直接死，`_run()` 里的 `try/except Exception` 连异常
-    # 都抓不到，`lines` 根本没机会落盘 —— CI 上 v3.7.4 / v3.7.5 两轮就是这么失败
-    # 的：退出码 139（SIGSEGV），annotation 里只有「日志文件不存在，进程可能在
-    # 启动阶段就崩了」，连崩在哪一项都不知道。
-    #
-    # faulthandler 在崩溃瞬间把**每个线程的 Python 栈**直接写 fd，不经过解释器的
-    # 正常收尾，所以就算进程是被信号打断的，栈也留得下来。CI 的失败诊断会把
-    # 这个文件一起发出来。正常跑完则把空文件删掉，免得下次被误读成"崩过"。
+    # 🔴 段错误时进程直接死，`lines` 来不及落盘，`try/except Exception` 也抓不到。
+    # faulthandler 能把崩溃瞬间的栈写下来，但它**不能常开**：它会把 Qt / 原生库
+    # 内部那些「先探一下地址再恢复」的段错误变成致命错误。实测 macOS x64 上
+    # 开了它自检反而从 exit 0 变成 exit 139（同一份代码、同一个包），关掉就恢复。
+    # 所以做成开关，默认关；要查崩溃栈时显式打开：
+    #     CHANQUANT_SELFTEST_FAULTHANDLER=1 ChanQuant --selftest
+    # 日常定位「死在哪一项」靠下面的 selftest_progress.txt —— 那个只是文件写，
+    # 不改任何信号行为，永远不会自己把进程弄崩。
     crash_path = os.path.join(log_dir(), "selftest_crash.txt")
     _crash_fh = None
-    try:
-        import faulthandler
+    if os.environ.get("CHANQUANT_SELFTEST_FAULTHANDLER") == "1":
+        try:
+            import faulthandler
 
-        _crash_fh = open(crash_path, "w", encoding="utf-8")
-        faulthandler.enable(file=_crash_fh, all_threads=True)
-    except Exception:  # noqa: BLE001 - 拿不到就不启用，不影响自检本身
-        _crash_fh = None
+            _crash_fh = open(crash_path, "w", encoding="utf-8")
+            faulthandler.enable(file=_crash_fh, all_threads=True)
+        except Exception:  # noqa: BLE001 - 拿不到就不启用，不影响自检本身
+            _crash_fh = None
 
     # 🔴 自检会把**真实主窗口**搭起来，里面有切页签、加策略、改本金这些模拟
     # 动作。它们在生产里本来就该落盘，但跑自检时绝不能改用户的组合 —— 实测
