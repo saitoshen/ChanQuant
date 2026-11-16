@@ -169,6 +169,39 @@ def f_range_break(df: pd.DataFrame) -> pd.Series:
     return (c - o0) / (hi - lo).replace(0.0, np.nan)
 
 
+def f_open_range_break(df: pd.DataFrame) -> pd.Series:
+    """波幅突破：现价相对**当日开盘**的位移，占**上一交易日**全天波幅的倍数 ÷0.4。
+
+    分数 1.0 = 突破 40%（0.4 × 昨日波幅），和规则策略 `cta_break` 的 `ratio=0.4`
+    对齐；2.5 = 走完一整个昨日波幅。正偏多、负偏空。
+
+    🔴 这个因子原来写成用户因子（公式），分子取的是**当根 bar 的 open**、分母取
+    的是**上一根 bar** 的 `high−low` —— 日线上碰巧等价，5m/1h 上两个都错，同一根
+    bar 甚至符号相反（RB 5m：旧 −0.83 / 新 +0.63）。现在挪进 Python 因子库，
+    按 `_day()` 的交易日分组算，夜盘归次日。
+
+    和本模块其他因子不同，**日线上也算得出**（退化成「收盘−开盘 / 前一日振幅」），
+    所以不套 `_intraday()` 的 NaN 门禁 —— 那是给「日线上没有意义」的量准备的。
+    """
+    g = _day(df)
+    c = pd.to_numeric(df["close"], errors="coerce")
+    o0 = pd.to_numeric(df["open"], errors="coerce").groupby(g).transform("first")
+    rng = (pd.to_numeric(df["high"], errors="coerce").groupby(g).max()
+           - pd.to_numeric(df["low"], errors="coerce").groupby(g).min())
+    prev = rng.shift(1)
+    move = c - o0
+    return move.div(g.map(prev).replace(0.0, np.nan)) / 0.4
+
+
+def f_open_range_break_clip(df: pd.DataFrame) -> pd.Series:
+    """同 `open_range_break`，把超出 ±5（= ±200%）的样本压到边界。
+
+    昨日波幅极小时原始值会炸到几十倍，做截面标准化会把整列拉歪；这一版只保留
+    突破的强度等级，牺牲极端值换稳健性。
+    """
+    return f_open_range_break(df).clip(-5.0, 5.0)
+
+
 def f_intraday_mom(df: pd.DataFrame) -> pd.Series:
     """日内动量：现价 / 当日开盘 - 1，把隔夜跳空剔掉。
 
@@ -268,6 +301,12 @@ def register_into(FACTORS, FactorSpec) -> int:
          "成交量加权的收盘位置减 0.5：量大头在高价区为正、在低价区为负。"),
         ("range_break", "日内区间突破", f_range_break, "日内",
          "收盘相对开盘的位移 / 当日已实现振幅，±1 表示收在最高/最低。"),
+        ("open_range_break", "波幅突破（原始）", f_open_range_break, "形态",
+         "现价相对**当日开盘**的位移 ÷ 上一交易日全天波幅 ÷ 0.4："
+         "1.0 = 突破 40%，2.5 = 走完一个完整波幅。"),
+        ("open_range_break_clip", "波幅突破（截断 ±200%）", f_open_range_break_clip,
+         "形态",
+         "同上，把超出 ±5（±200%）的样本压到边界，抗昨日波幅过小造成的极值。"),
         ("intraday_mom", "日内动量", f_intraday_mom, "日内",
          "现价 / 当日开盘 - 1，剔掉隔夜跳空后的日内方向。"),
         ("overnight_gap", "隔夜跳空", f_overnight_gap, "日内",

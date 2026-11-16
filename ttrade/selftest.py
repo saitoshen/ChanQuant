@@ -7678,8 +7678,19 @@ def _run() -> tuple[bool, list[str]]:
         wrong = (df["close"] - df["open"]) / df["trading_day"].map(rng) / 0.4
         if float(np.nanmax(np.abs(wrong.to_numpy() - got.to_numpy()))) < 1e-6:
             raise RuntimeError("合成行情造得太规整，证明不了当日开盘口径")
+        # 必须是**内置 Python 因子**，不是公式因子：公式因子各自在独立命名空间里
+        # 编译，既调不到公共 helper，也没法在模块里互相复用（clip 版就得抄一遍）
+        from ttrade import userfactors as _UF
+        if {f.key for f in _UF.load_all()} & {"open_range_break",
+                                              "open_range_break_clip"}:
+            raise RuntimeError("波幅突破又变回用户（公式）因子了")
+        for _k in ("open_range_break", "open_range_break_clip"):
+            _mod = getattr(F.FACTORS[_k].func, "__module__", "")
+            if _mod != "ttrade.factors_intraday":
+                raise RuntimeError(f"{_k} 不是内置因子（func 来自 {_mod!r}）")
+
         return (f"检查点只落在 10:05（{int(ent.sum())} 笔）/ 夜盘 21:30 可用；"
-                f"因子按当日开盘，偏差 {dev:.0e}")
+                f"因子按当日开盘，偏差 {dev:.0e}；两个因子都是内置 Python 实现")
 
     check("波幅突破：检查点时刻 + 当日开盘口径", _break_caliber)
 
