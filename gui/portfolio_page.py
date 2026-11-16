@@ -847,7 +847,7 @@ class EditDialog(QDialog):
         self._sync_size()
 
         self.chk_short = QCheckBox("允许做空")
-        self.chk_short.setChecked(cfg.note == "short")
+        self.chk_short.setChecked(replay.resolve_allow_short(cfg))
         form.addRow("", self.chk_short)
 
         # 和研究页那对开关同一语义：只做空要先允许做空，两个都勾等于不做，
@@ -1002,7 +1002,7 @@ class EditDialog(QDialog):
         cfg.stop_atr_n = int(self.sp_atr.value())
         cfg.stop_mult = float(self.sp_stop.value())
         cfg.volume = self.sp_vol.value()
-        cfg.note = "short" if self.chk_short.isChecked() else ""
+        cfg.note = "short" if self.chk_short.isChecked() else "long"
         cfg.short_only = bool(self.chk_no_long.isChecked() and self.chk_short.isChecked())
         picked = [self.lst_acct.item(i).text()
                   for i in range(self.lst_acct.count())

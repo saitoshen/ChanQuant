@@ -113,6 +113,38 @@ def default_allow_short(cfg) -> bool:
     return bool(MARKET_COST.get(market_of(cfg), {}).get("allow_short", False))
 
 
+def resolve_allow_short(cfg) -> bool:
+    """这条配置**能不能做空** —— 全平台唯一判据（三态）。
+
+    🔴 2026-11-16 之前这里有两个判据各说各话：
+    - 回测 `make_bt()` / 实盘 `strategy_runner`：读 `note == "short"`；
+    - 界面「允许做空」复选框：读 `note == "short" or default_allow_short(cfg)`。
+
+    期货市场默认允许做空 ⇒ 界面勾着、回测里 `long_only=True`，**显示与执行
+    不一致且不报错**。而 `note` 又被批量扫描脚本当成「批次标签」写进去
+    （`sector-pack-v3` / `-q33` / `-m5b` / `-m5` / `-v2` / 无后缀），于是
+    930 条扫出来的策略全部静默只剩多头：实测 417 条抽样里 86% 空头笔数=0、
+    合计空头只占 7%，多头盈亏 1.31 亿 vs 空头 1.26 千万。
+
+    `note` 三态（它是**备注**，但现在承担方向标记）：
+    - `"short"`：显式允许做空；
+    - `"long"`：显式只做多（界面取消勾选时写这个值）；
+    - 其他（批次标签 / 空）：**按市场默认** —— 期货允许、A 股与美股不允许。
+
+    关键在最后一档：批次标签不再有方向语义，所以「扫出来的策略」自动跟着市场
+    默认走；而用户手动取消勾选仍然有效（写 `long`）。`short_only`（只做空）
+    本身当然要允许做空，否则「只做空」会被 `long_only` 二次砍成不做。
+    """
+    if bool(getattr(cfg, "short_only", False)):
+        return True
+    note = str(getattr(cfg, "note", "") or "").strip()
+    if note == "short":
+        return True
+    if note == "long":
+        return False
+    return default_allow_short(cfg)
+
+
 def split_key(key: str, market: str = "") -> tuple[str, str]:
     """`StrategyConfig.key()` 的逆运算：把 `RB_SHFE` / `SSE.600000` / `AAPL`
     拆回 (代号, 交易所)。
@@ -135,7 +167,9 @@ def split_key(key: str, market: str = "") -> tuple[str, str]:
 
 def make_bt(market: str, allow_short: bool = False,
             cfg=None) -> BacktestConfig:
-    """按市场成本建一份回测配置。`allow_short` 来自配置里的 `note == "short"`。
+    """按市场成本建一份回测配置。`allow_short` 请传 `resolve_allow_short(cfg)`
+    —— 别再自己写 `note == "short"`：`note` 只是备注，被批量脚本当成批次标签
+    用过，照它判方向会让整批策略静默变成只做多（#145）。
 
     传了 `cfg`（`StrategyConfig`）就把仓位口径一起带过来：不传的话这里默认
     `sizing="unit"`，也就是「名义敞口 = 本金」，而研究页和实盘都是「资金 ÷
@@ -155,8 +189,8 @@ def make_bt(market: str, allow_short: bool = False,
                     getattr(cfg, "cost_profile", "") or None, market="cn")
     if cfg is None:
         return bt
-    # 方向：`note == "short"` 是「允许做空」，`short_only` 是「禁止做多」。
-    # 后者只有在允许做空的前提下才有意义，所以两个都写进回测配置
+    # 方向：`resolve_allow_short()` 是唯一判据（市场默认 + 兼容老 note），
+    # `short_only` 是「禁止做多」。后者只有在允许做空的前提下才有意义
     bt.short_only = bool(getattr(cfg, "short_only", False)) and bt.long_only is False
     bt.sizing = getattr(cfg, "sizing", "") or "capital"
     bt.capital = float(getattr(cfg, "capital", 0) or 0)
@@ -386,7 +420,7 @@ def run(cfg, df: pd.DataFrame | None, market: str = "",
         return Replay(error=f"{cfg.key()} 在所选区间里没有足够的行情")
 
     period = getattr(cfg, "period", "") or "1d"
-    bt = make_bt(mk, getattr(cfg, "note", "") == "short", cfg)
+    bt = make_bt(mk, resolve_allow_short(cfg), cfg)
     # 年化口径跟着周期走：5 分钟一年一万多根，按 252 算夏普会虚高一个数量级
     bt.bars_per_year = bars_per_year(df.index)
     bpy = bt.bars_per_year
@@ -522,7 +556,7 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
             sym, ex = split_key(key, mk)
             one = cfg.clone(symbol=sym, exchange=ex, multi_symbols=[],
                             cross_symbols=[])
-            bt = make_bt(mk, getattr(cfg, "note", "") == "short", one)
+            bt = make_bt(mk, resolve_allow_short(one), one)
             bt.bars_per_year = bars_per_year(out.df.index)
             try:
                 results.append(run_backtest(out.df, bt, label=out.label))
@@ -603,7 +637,7 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "",
     panel = cross_engine.close_panel(frames)
     if panel.empty:
         return Replay(error="这批品种没有可用的收盘价")
-    bt = make_bt(mk, getattr(cfg, "note", "") == "short", cfg)
+    bt = make_bt(mk, resolve_allow_short(cfg), cfg)
     bt.bars_per_year = bars_per_year(panel.index)
 
     ccfg = cross_engine.CrossConfig(

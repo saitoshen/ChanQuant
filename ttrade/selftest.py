@@ -3873,7 +3873,10 @@ def _run() -> tuple[bool, list[str]]:
         for key, out in outs.items():
             one = cfg.clone(symbol=key.split("_")[0], exchange="SHFE",
                             multi_symbols=[], cross_symbols=[])
-            bt = RP.make_bt("cn", False, one)
+            # 手工口径的「允许做空」必须和 `run_multi` 走同一个判据 ——
+            # 这里以前硬编码 False，于是批量扫描的批次标签把策略裁成只做多时
+            # 两边还「对得上」，掩盖了 #145
+            bt = RP.make_bt("cn", RP.resolve_allow_short(one), one)
             bt.bars_per_year = RP.bars_per_year(out.df.index)
             manual.append(run_backtest(out.df, bt, label=out.label))
         res = combine(manual, label="多品种等权")
@@ -7525,6 +7528,52 @@ def _run() -> tuple[bool, list[str]]:
         return "5 种口径全部原样返回：" + " / ".join(S.SIZING_OK)
 
     check("仓位口径存→读往返（budget/unit 不能被改写成 capital）", _sizing_roundtrip)
+
+    def _allow_short_three_state():
+        """允许做空只有**一个**判据，且 `note` 的批次标签不能改变方向（#145）。
+
+        原状：回测读 `note == "short"`、界面读 `note == "short" or 市场默认`。
+        批量扫描把 `note` 写成批次标签（`sector-pack-v3` / `-q33` / `-m5b` …）
+        ⇒ 930 条策略在界面上「允许做空」是勾着的，回测里 `long_only=True`，
+        静默只剩多头。417 条抽样实测：86% 空头笔数=0、空头仅占 7%。
+        """
+        from ttrade import replay as _R
+        from ttrade.strategy_store import StrategyConfig as _S
+
+        fut = _S(symbol="MA", exchange="CZCE", period="1h", family="rule",
+                 rule_key="ma_cross")
+        stk = _S(symbol="600000", exchange="SSE", period="1d", family="rule",
+                 rule_key="ma_cross")
+        cases = [
+            ("期货 note=short", fut.clone(note="short"), True),
+            ("期货 note=long", fut.clone(note="long"), False),
+            ("期货 批次标签", fut.clone(note="sector-pack-v3"), True),
+            ("期货 note 空", fut.clone(note=""), True),
+            ("A股 批次标签", stk.clone(note="sector-pack-v3"), False),
+            ("A股 note=short", stk.clone(note="short"), True),
+            ("只做空 note=long", fut.clone(note="long", short_only=True), True),
+        ]
+        bad = []
+        for name, c, want in cases:
+            got = _R.resolve_allow_short(c)
+            if got != want:
+                bad.append(f"{name}：{got} != {want}")
+            # 判据必须真的落到回测配置上，否则「判对但没接线」。
+            # A 股/美股由市场自身的 `allow_short=False` 兜住，`long_only` 必为 True，
+            # 所以只在市场允许做空时才要求两者相反
+            bt = _R.make_bt(c.market, got, c)
+            market_ok = bool(_R.MARKET_COST.get(c.market, {}).get("allow_short"))
+            if market_ok and bt.long_only == got:
+                bad.append(f"{name}：make_bt 的 long_only 没跟着判据走")
+            if not market_ok and not bt.long_only:
+                bad.append(f"{name}：市场本不允许做空，long_only 却是 False")
+        if bad:
+            raise RuntimeError("允许做空判据不对：" + "；".join(bad))
+        if stk.market != "cn_stock":
+            raise RuntimeError(f"A 股市场判错了：{stk.market}")
+        return "三态 + 市场默认 7 组全对，批次标签不再裁成只做多"
+
+    check("允许做空判据（note 三态 / 批次标签不外溢）", _allow_short_three_state)
 
     def _sector_maps():
         """板块两层（L1 9 个 / L2 16 个）必须严格对齐。

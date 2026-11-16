@@ -1314,7 +1314,10 @@ class PortfolioRunner:
             self._log(f"{st.title()}：K 线内做多 {st.underlying} 触发价 {el:.3f}"
                       f"，现价 {price:.3f}，止损 {st.ib_stop:.3f}")
         elif (es == es and price <= es
-              and st.cfg.note == "short"):    # 不允许做空时忽略空头触发价
+              and replay.resolve_allow_short(st.cfg)):
+            # 不允许做空时忽略空头触发价。判据走 `replay.resolve_allow_short()`，
+            # 不要看 `note`：`note` 只是备注（曾被当批次标签写），照它判会让
+            # 回测能双向、实盘只做多（#145）
             st.target = -st.lots
             st.ib_fired = True
             st.ib_exit_pending = False

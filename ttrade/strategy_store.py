@@ -272,7 +272,10 @@ class StrategyConfig:
     # 第一个，留着给老代码和标题显示读）；`accounts` 为空 = 跟随默认账户。
     accounts: list = field(default_factory=list)
     enabled: bool = False
-    # `note == "short"` 就是「允许做空」。原来是自由文本，现在只剩这一个取值
+    # `note` 兼作「方向」标记，三态（判据见 `replay.resolve_allow_short()`）：
+    #   "short" = 显式允许做空；"long" = 显式只做多；其他 / 空 = 按市场默认。
+    # 早期它是自由文本，被批量脚本写过批次标签（`sector-pack-v3` 之类）——
+    # 那些标签**不再有方向语义**，否则整批策略会静默变成只做多（#145）。
     note: str = ""
     # 禁止做多（只做空）。和「允许做空」互斥：两个都开等于一笔都不做，
     # 界面上会拦住这种组合（勾了一个就把另一个弹掉或禁掉）

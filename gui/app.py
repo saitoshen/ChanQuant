@@ -5091,7 +5091,7 @@ class MainWindow(QMainWindow):
             stop_atr_n=int(self.sp_atr.value()),
             stop_mult=float(self.sp_stop.value()),
             volume=int(self.sp_vol.value()),
-            note="short" if self.chk_short.isChecked() else "",
+            note="short" if self.chk_short.isChecked() else "long",
             short_only=self._no_long_enabled(),
             range_years=float(self.cb_range.currentData() or 0),
             cost_profile=(self.cb_cost.currentData() or "") if self.market == "cn" else "",
@@ -5260,7 +5260,7 @@ class MainWindow(QMainWindow):
                     self.cb_tfactor.setCurrentIndex(i)
             self._sync_cross_controls()
 
-        self.chk_short.setChecked(cfg.note == "short")
+        self.chk_short.setChecked(replay.resolve_allow_short(cfg))
         if hasattr(self, "chk_no_long"):
             self.chk_no_long.blockSignals(True)
             self.chk_no_long.setChecked(bool(getattr(cfg, "short_only", False)))
