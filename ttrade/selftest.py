@@ -21,12 +21,23 @@ def _run() -> tuple[bool, list[str]]:
     lines: list[str] = []
     ok = True
     _cache: dict = {}
+    # 当前正在跑哪一项。崩溃（段错误）时进程直接死，`lines` 来不及落盘，
+    # faulthandler 也只能给出已经损坏的 C 层栈 —— 2026-11-16 的 macOS 构建
+    # 就只落了 "selftest.py line 7841 in run" 两帧，等于没说是哪一项死的。
+    # 这里每进一项就把名字刷到文件里（不缓冲），崩了至少知道死在谁身上。
+    _prog = None
 
     # 全程离屏，自检不应该在用户屏幕上闪一个窗口
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
     def check(name: str, fn) -> None:
         nonlocal ok
+        if _prog is not None:
+            try:
+                _prog.write(name + "\n")
+                _prog.flush()
+            except Exception:  # noqa: BLE001 - 写不进就少一层线索，不影响自检
+                pass
         try:
             detail = fn()
             lines.append(f"[ OK ] {name}" + (f"  {detail}" if detail else ""))
@@ -36,6 +47,12 @@ def _run() -> tuple[bool, list[str]]:
             lines.append(traceback.format_exc())
 
     from ttrade.paths import bundle_root, cache_dir, data_dir, is_frozen, log_dir, user_dir
+
+    try:
+        _prog = open(os.path.join(log_dir(), "selftest_progress.txt"), "w",
+                     encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        _prog = None
 
     lines.append(f"frozen={is_frozen()}  python={sys.version.split()[0]}  platform={sys.platform}")
     lines.append(f"bundle_root = {bundle_root()}")
@@ -7794,6 +7811,15 @@ def _run() -> tuple[bool, list[str]]:
     check("存入策略库的动作（strategy_save）", _strategy_save_action)
     check("K线与信号：持仓与交易记录同源（含手数）", _chart_from_trades)
     check("资金曲线纵轴（线性 / 对数 / 亏穿退回）", _perf_yscale)
+
+    # 跑完就把进度文件收掉：留着会让下一轮的诊断以为"上次崩过"。
+    # 崩溃时走不到这里，文件正好留下最后一项的名字。
+    if _prog is not None:
+        try:
+            _prog.close()
+            os.remove(os.path.join(log_dir(), "selftest_progress.txt"))
+        except Exception:  # noqa: BLE001
+            pass
 
     return ok, lines
 

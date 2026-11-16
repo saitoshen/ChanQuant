@@ -161,23 +161,26 @@ jobs:
               return 0
             fi
             echo "::error title=selftest::自检失败，退出码 $rc"
+            # 顺序很重要：每 step 只有 10 条 error annotation 配额，**先发最值钱的**。
+            # 崩溃栈和「死在哪一项」这两样一旦被日志尾部挤掉，这一轮又白跑了
+            # （v3.7.4~v3.7.6 三轮都是这么损失的）。
+            prog="$(dirname "$log")/selftest_progress.txt"
+            if [ -f "$prog" ] && [ -s "$prog" ]; then
+              echo "::error title=selftest-died-at::$(tail -n 1 "$prog")"
+            fi
+            if [ -f "$crash" ] && [ -s "$crash" ]; then
+              echo "----- 崩溃栈（selftest_crash.txt）-----"
+              cat "$crash"
+              emit_tail "$crash" 5 selftest-crash
+            fi
             if [ -f "$log" ] && grep -q "\[FAIL\]" "$log"; then
               cat "$log"
               emit_fail "$log"
             elif [ -f "$log" ]; then
-              echo "::error title=selftest::日志里没有 [FAIL] 行 —— 进程多半崩在中途或被信号打死，下面是日志尾部"
-              emit_tail "$log" 8
+              echo "::error title=selftest::日志里没有 [FAIL] 行 —— 进程崩在中途或被信号打死，下面是日志尾部"
+              emit_tail "$log" 3
             else
               echo "::error title=selftest::日志文件不存在（自检没跑完就没机会落盘）"
-            fi
-            # 段错误/栈溢出时日志一定是缺的，唯一线索是 faulthandler 落下的栈
-            if [ -f "$crash" ] && [ -s "$crash" ]; then
-              echo "----- 崩溃栈（selftest_crash.txt）-----"
-              cat "$crash"
-              emit_tail "$crash" 4 selftest-crash
-            else
-              echo "::error title=selftest::没有崩溃栈文件，进程可能连 Python 都没进（缺 DLL / Qt 插件加载失败）"
-              ls -l "$(dirname "$log")" 2>/dev/null || true
             fi
             return 1
           }
