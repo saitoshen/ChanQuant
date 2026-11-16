@@ -18,10 +18,11 @@
     dist/ChanQuant.app         macOS：拖进 /Applications
 """
 
+import importlib.util
 import os
 import sys
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 # SPECPATH 是 PyInstaller 注入的、本 spec 文件所在目录
 HERE = SPECPATH
@@ -32,7 +33,7 @@ APP_NAME = "ChanQuant"
 BUNDLE_ID = "com.chanquant.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "3.7.12"
+VERSION = "3.7.13"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
@@ -43,6 +44,7 @@ if not os.path.exists(ICON):
 # 展期因子和期权因子只依赖它；原始明细 data_contracts（130MB）与
 # data_options_raw（1GB+）不打包 —— 它们能用 download_aux.py 重新生成。
 DATAS = []
+BINARIES = []
 for sub in ("data", "data_futures", "data_futures_aux"):
     src = os.path.join(ROOT, sub)
     if os.path.isdir(src):
@@ -95,6 +97,43 @@ try:
                   "openctp_ctp.thosttraderapi"]
 except Exception:  # noqa: BLE001 - 没装 / DLL 加载失败都走这里
     HIDDEN_CTP = []
+
+# 融航资管中台（vnpy_rohon）同样是**可选**依赖：只有 Windows x86-64 的 wheel，
+# 而且只出 cp310 / cp313 两个 ABI（fq 环境是 3.13，base 是 3.14 ⇒ base 装不上）。
+#
+# 这里**不能**用 `import vnpy_rohon` 探活：它的包入口会
+# `from .gateway import RohonGateway` ⇒ `import vnpy`，而本程序故意不装 vnpy
+# （vnpy 4.5 把 pyside6 钉在 6.8.2.1，会把界面的 6.11 降级）。源码侧
+# `ttrade/rohon_client.py` 用 stub 包绕开了入口，打包这一层就用 find_spec
+# 只查「装没装」，一个字节的包代码都不执行。
+#
+# 采集拆成两步，少一步都是「源码运行正常、打包版一点融航就报错」：
+#   1. collect_dynamic_libs → api/ 下那 4 个 dll（RohonBaseV64 是融航自己的
+#      依赖库，三个 thost 是 CTP 的，全靠运行时 LoadLibrary 加载，静态分析
+#      看不见，不显式打进去就是「找不到指定模块」）。它只认 *.dll，
+#      不会和下面 hiddenimports 里的 .pyd 重复。
+#   2. hiddenimports 里的两个 .pyd 扩展模块（vnrohonmd / vnrohontd）由
+#      PyInstaller 按 import 解析，落到 _internal/vnpy_rohon/api/，和 dll 同目录。
+try:
+    HAS_ROHON = importlib.util.find_spec("vnpy_rohon") is not None
+except Exception:  # noqa: BLE001 - 包目录异常（权限/损坏）也当没装
+    HAS_ROHON = False
+
+if HAS_ROHON:
+    DATAS += collect_data_files("vnpy_rohon")
+    BINARIES += collect_dynamic_libs("vnpy_rohon")
+    HIDDEN_ROHON = [
+        # 包本身要进 PYZ：`rohon_client._import_api()` 用
+        # `find_spec("vnpy_rohon")` 判断装没装，冻结版里没有这个模块就
+        # 永远判「没装」，界面上会一直提示 pip install。
+        "vnpy_rohon",
+        "vnpy_rohon.api",
+        "vnpy_rohon.api.rohon_constant",
+        "vnpy_rohon.api.vnrohonmd",
+        "vnpy_rohon.api.vnrohontd",
+    ]
+else:
+    HIDDEN_ROHON = []
 
 # 动态导入的模块，静态分析扫不到，必须显式声明
 HIDDEN = [
@@ -213,11 +252,15 @@ HIDDEN = [
     # 交易页选到 CTP 账户时才会 import（`gui.live._hub_of` 里函数内导入），
     # 静态分析看不到，漏了就是「一切到 CTP 账户就崩」
     "ttrade.ctp_live",
+    # 融航账户同理：`ttrade.ctp_live.RohonHub` 的五个方法里才 import
+    # `ttrade.rohon_client`（延迟导入，为了没装 vnpy_rohon 时也能正常启动），
+    # 漏了这一项 ⇒ 打包版一勾融航账户就 ModuleNotFoundError
+    "ttrade.rohon_client",
     # A 股选股 / 股票库下载：都是按钮回调里才 import 的
     "gui.stock_picker",
     "ttrade.stockpick",
     "ttrade.stockdl",
-] + HIDDEN_CTP
+] + HIDDEN_CTP + HIDDEN_ROHON
 
 # 用不到的重量级依赖，剔掉能省 100MB 以上
 EXCLUDES = [
@@ -252,7 +295,7 @@ EXCLUDES = [
 a = Analysis(
     [os.path.join(ROOT, "launcher.py")],
     pathex=[ROOT],
-    binaries=[],
+    binaries=BINARIES,
     datas=DATAS,
     hiddenimports=HIDDEN,
     hookspath=[],

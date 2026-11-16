@@ -6948,12 +6948,14 @@ class MainWindow(QMainWindow):
             return None
         return sym, ex
 
-    def _on_trade_connect(self, specs) -> None:
-        """从「账户透视和交易」页点「连接」：这是**唯一**会去连天勤的入口。
+    def _on_trade_connect(self, payload) -> None:
+        """从「账户透视和交易」页点「连接」：这是**唯一**会去连柜台的入口。
+
+        `payload` 是 `(specs, feed)`：勾选的账户 + 行情源。账户可以跨柜台
+        （天勤 + CTP + 融航）混选 —— 每个柜台各自一条连接，同时登录；K 线只取
+        `feed` 指定的那一家，持仓 / 委托 / 成交全部合并。
 
         沿用当前选中的品种与周期，只为了有盘口 / 持仓 / 委托可看。
-        `specs` 是账户列表里勾选的那些 —— 一个也能连，多个走天勤的多账户模式
-        （一条连接、一次登录）。
 
         **不补本地历史**。这个动作的语义是「登录账户」，用户要看的是持仓/资金/
         委托，而 `hub.start()` 之后这些东西就有了。补历史一个品种十年 5m 要几十
@@ -6965,21 +6967,23 @@ class MainWindow(QMainWindow):
         的 K 线照样会跟着实时刷新 —— 走的是同一条 `_on_live_bars`，不用再单开
         一个连接。
         """
+        if isinstance(payload, tuple) and len(payload) == 2:
+            specs, feed = payload
+        else:                       # 兼容老调用（直接传 specs 列表）
+            specs, feed = payload, ""
         if self.market not in ("cn", "cn_stock"):
             self.trade_page.on_failed("交易只接了国内期货 / A 股")
             return
         if not specs:
             self.trade_page.on_failed("先在账户列表里勾选要连接的账户")
             return
-        # CTP 是**另一条连接**（直连柜台，不走天勤），不能和天勤账户混在一条
-        # 会话里 —— 混着勾会走天勤分支，然后在 `AccountSpec.build()` 上报
-        # 「缺少天勤账户」，看不出真正的原因
-        ctp = [s for s in specs if getattr(s, "is_ctp", False)]
-        if ctp and len(ctp) != len(specs):
-            self.trade_page.on_failed("CTP 账户和天勤账户不能同时连，分开连")
-            return
-        if ctp and self.market != "cn":
-            self.trade_page.on_failed("CTP 只交易国内期货，请把市场切到「国内期货」")
+        # 柜台（CTP / 融航）只做国内期货。**不再禁止和天勤混选** —— 混选时每个
+        # 柜台各开一条连接，这正是「同时登录」；但市场必须是国内期货
+        counters = [s for s in specs if getattr(s, "backend", "tq") != "tq"]
+        if counters and self.market != "cn":
+            names = "、".join(sorted({getattr(s, "backend", "") for s in counters}))
+            self.trade_page.on_failed(
+                f"{names} 账户只交易国内期货，请把市场切到「国内期货」")
             return
         pair = self._current_pair()
         period = "5m" if tqdata.is_daily(self._period()) else self._period()
@@ -6989,7 +6993,8 @@ class MainWindow(QMainWindow):
         # 两条会话画的是同一张图，同品种同周期会互相把 `_live_last` 顶掉。账户
         # 这条连上之后本来就会喂研究页的 K 线（见上面的说明），研究页那条先收掉
         self._stop_study_live()
-        self.live.start(specs, pair[0], pair[1], period, need_history=False)
+        self.live.start(specs, pair[0], pair[1], period, need_history=False,
+                        feed=feed or "")
         self.lbl_live_msg.setText("正在连接…")
 
     def _on_live_stop(self) -> None:

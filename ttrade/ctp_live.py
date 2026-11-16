@@ -258,7 +258,16 @@ class CtpHub:
 
     和 `LiveHub` 的差别只有「怎么连」和「数据从哪来」，对外的形状完全一致 ——
     `gui/live.py` 的 worker 循环拿到的就是这两样东西。
+
+    **融航走的是同一个类**（`RohonHub` 只覆盖下面四个工厂方法）。两家都是 CTP
+    协议的柜台：持仓怎么合并、上期所今昨仓怎么分、委托状态怎么翻成人话，这些
+    规则一模一样。为融航再写一份解析，等于把「平今和平昨是两个指令」这类坑再
+    踩一遍。
     """
+
+    # 界面上账户行显示的柜台名，也是报错时的主语
+    PLATFORM = "CTP"
+    KIND = "ctp"
 
     def __init__(self, specs) -> None:
         if specs is None:
@@ -279,28 +288,46 @@ class CtpHub:
         self._query_turn = 1          # 0 = 该发持仓了，1 = 该发资金了
         self._lock = threading.Lock()
 
+    # ---- 柜台适配（融航覆盖这四个） ----
+
+    def check_deps(self) -> None:
+        if not HAS_CTP:
+            raise CtpError("没装 openctp-ctp，用不了 CTP（pip install openctp-ctp）")
+
+    def make_config(self, spec):
+        return spec_to_config(spec)
+
+    def make_trader(self, cfg):
+        return TraderClient(cfg)
+
+    def make_md(self, cfg):
+        return MdClient(cfg)
+
+    def login_hint(self, cfg) -> str:
+        """登录超时时补一句「为什么」。CTP 的 SimNow 有个服务时段问题。"""
+        if "182.254.243.31" in str(getattr(cfg, "td_front", "")):
+            return ("（SimNow 只在服务时段内可连：第一套 30001 跟实盘交易时段一致，"
+                    "7x24 环境 40001 是 16:00 ~ 次日 09:00；周末和收盘后 TCP 会直接被拒）")
+        return ""
+
     # ---- 生命周期 ----
 
     def start(self) -> None:
-        if not HAS_CTP:
-            raise CtpError("没装 openctp-ctp，用不了 CTP（pip install openctp-ctp）")
+        self.check_deps()
         if not self.specs:
-            raise ValueError("CTP 会话至少要有一个账户")
-        cfg = spec_to_config(self.specs[0])
+            raise CtpError(f"{self.PLATFORM} 会话至少要有一个账户")
+        cfg = self.make_config(self.specs[0])
         if not cfg.user_id or not cfg.password:
             raise ValueError(f"账户「{cfg.name}」缺少投资者账号或密码")
         if not cfg.td_front:
-            raise ValueError("CTP 交易前置地址为空")
+            raise ValueError(f"{self.PLATFORM} 交易前置地址为空")
 
-        trader = TraderClient(cfg)
+        trader = self.make_trader(cfg)
         trader.start()
         if not trader.wait_ready(15.0):
             err = trader.last_error or "登录超时（15 秒）"
             trader.stop()
-            if "182.254.243.31" in cfg.td_front:
-                err += ("（SimNow 只在服务时段内可连：第一套 30001 跟实盘交易时段一致，"
-                        "7x24 环境 40001 是 16:00 ~ 次日 09:00；周末和收盘后 TCP 会直接被拒）")
-            raise CtpError(err)
+            raise CtpError(err + self.login_hint(cfg))
         trader.query_account()
         trader.query_positions()
         # 撤单要交易所代码，但**不查全量合约表**：SimNow 上是 1.6 万条、80 秒，
@@ -313,7 +340,7 @@ class CtpHub:
 
         # 行情是可选：只做交易不看盘也能用。连不上就只报一条日志，不影响下单
         if cfg.md_front:
-            md = MdClient(cfg)
+            md = self.make_md(cfg)
             try:
                 md.start()
                 if md.wait_ready(10.0):
@@ -350,7 +377,7 @@ class CtpHub:
             found = main_contract(symbol, exchange)
             if not found:
                 raise ValueError(
-                    f"CTP 没有主连，要用具体合约（如 rb2601）。"
+                    f"{self.PLATFORM} 没有主连，要用具体合约（如 rb2601）。"
                     f"查不到 {symbol} 的主力合约表，请在下单面板的「合约」里填具体合约"
                 )
             ins = found
@@ -415,7 +442,7 @@ class CtpHub:
         positions = self._positions(snap.get("positions") or {}, account)
         orders = self._orders(snap.get("orders") or {})
         trades = self._trades(snap.get("trades") or {})
-        name = self.spec.name if self.spec is not None else "CTP"
+        name = self.spec.name if self.spec is not None else self.PLATFORM
         row = self._account_row(name, account, positions, trades)
         st.account = account
         st.positions = positions
@@ -423,7 +450,7 @@ class CtpHub:
         st.trades = trades
         st.accounts = [row]
         st.by_account = {
-            name: {"spec": {"name": name, "kind": "ctp"},
+            name: {"spec": {"name": name, "kind": self.KIND},
                    "account": account, "positions": positions,
                    "orders": orders, "trades": trades}
         }
@@ -593,7 +620,7 @@ class CtpHub:
                      for t in trades)
         return {
             "name": name,
-            "platform": "CTP",
+            "platform": self.PLATFORM,
             "account_id": (self.spec.user if self.spec is not None else "") or "—",
             "balance": bal,
             "day_profit": bal - float(account.get("pre_balance") or bal),
@@ -617,7 +644,7 @@ class CtpHub:
         if not ins:
             raise CtpError("合约代码为空")
         if limit_price is None or float(limit_price) <= 0:
-            raise CtpError("CTP 只收限价单：请填价格，别用市价")
+            raise CtpError(f"{self.PLATFORM} 只收限价单：请填价格，别用市价")
         # 价格按最小变动价位对齐，否则柜台拒单理由是「价格不是最小变动价位整数倍」
         tick = 0.0
         info = self.trader.instruments.get(ins)
@@ -647,4 +674,55 @@ class CtpHub:
         )
 
     def set_target(self, symbol: str, volume: int, account: str = "") -> None:
-        raise CtpError("CTP 没有目标仓接口，请直接下单")
+        raise CtpError(f"{self.PLATFORM} 没有目标仓接口，请直接下单")
+
+
+# ------------------------------------------------------------------ 融航
+
+
+class RohonHub(CtpHub):
+    """融航资管中台。除了「怎么连」以外，全部复用 `CtpHub`。
+
+    融航（Rohon）对外是 CTP 协议的中台：同样的前置地址、同样的报单字段、同样的
+    委托状态字符。所以持仓合并、上期所今昨仓拆分、成交金额折算这些规则一条都
+    不用重写 —— 只换底下的三个客户端。
+
+    驱动层用 `vnpy_rohon.api`（两个 pybind 模块），**不用 vnpy 框架**：vnpy 4.5.0
+    把 `pyside6==6.8.2.1` 钉成硬依赖，装上就会把本程序的 Qt 降级。详见
+    `ttrade/rohon_client.py` 开头的说明。
+    """
+
+    PLATFORM = "融航"
+    KIND = "rohon"
+
+    def check_deps(self) -> None:
+        from .rohon_client import HAS_ROHON, ROHON_IMPORT_ERROR
+
+        if not HAS_ROHON:
+            raise CtpError(
+                f"没装 vnpy_rohon，用不了融航（{ROHON_IMPORT_ERROR}）"
+                "。装法：pip install vnpy_rohon==6.7.2.5 --no-deps"
+            )
+
+    def make_config(self, spec):
+        from .rohon_client import spec_to_config as _rohon_config
+
+        return _rohon_config(spec)
+
+    def make_trader(self, cfg):
+        from .rohon_client import RohonTraderClient
+
+        return RohonTraderClient(cfg)
+
+    def make_md(self, cfg):
+        from .rohon_client import RohonMdClient
+
+        return RohonMdClient(cfg)
+
+    def login_hint(self, cfg) -> str:
+        """融航没有 SimNow 那种「按时段开放」的问题，补的是缺字段的提示。"""
+        miss = [k for k in ("broker_id", "td_front")
+                if not getattr(cfg, k, "")]
+        if miss:
+            return f"（还缺：{'、'.join(miss)}。融航要填经纪商代码和交易服务器）"
+        return "（检查经纪商代码 / 交易服务器 / 产品名称 / 授权编码是否和资管后台一致）"

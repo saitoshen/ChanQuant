@@ -90,6 +90,18 @@ jobs:
         continue-on-error: true
         run: python -m pip install openctp-ctp
 
+      # 融航资管中台（vnpy_rohon）同样是可选依赖，同样只有 Windows wheel，
+      # 而且只出 cp310 / cp313（runner 是 3.13 ⇒ 正好有）。
+      # **必须 `--no-deps`**：它的依赖表里写着 vnpy>=4.0.0，而 vnpy 4.5 把
+      # pyside6==6.8.2.1 钉成硬依赖，一装就把 requirements 里的 6.11 降级，
+      # 打包出来的程序界面会当场变形（而且这种坏是「只在发布包里」的）。
+      # 我们只用它的 `vnpy_rohon.api` 驱动层（两个 .pyd + 四个 dll + 常量表），
+      # 那一层根本不 import vnpy。
+      - name: 安装融航客户端（可选）
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: python -m pip install vnpy_rohon==6.7.2.5 --no-deps
+
       # xgboost 的 macOS wheel 不打包 OpenMP 运行时，libxgboost.dylib 里写的是
       # @rpath/libomp.dylib + LC_RPATH=/usr/local/opt/libomp/lib（x64）或
       # /opt/homebrew/opt/libomp/lib（arm64）。macos-latest 镜像预装了 arm64 那份，

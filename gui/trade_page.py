@@ -45,7 +45,13 @@ from PySide6.QtWidgets import (
 
 from ttrade import tqlive
 from ttrade.ctp_client import PRESETS
-from ttrade.tqlive import ACCOUNT_KINDS, AccountSpec, LiveState
+from ttrade.tqlive import (
+    ACCOUNT_KINDS,
+    BACKEND_LABELS,
+    BACKENDS,
+    AccountSpec,
+    LiveState,
+)
 
 # 与 app.py 的配色保持一致。这里不 import app 的常量：app 会 import 本模块，
 # 顶层互相 import 会成环。
@@ -174,7 +180,10 @@ class AccountDialog(QDialog):
         form.addRow(self.lbl_user, self.ed_user)
         self.lbl_pwd = QLabel("天勤密码")
         form.addRow(self.lbl_pwd, self.ed_pwd)
-        form.addRow("期货公司代码", self.ed_broker)
+        # 标签要跟着柜台变：CTP 上它是经纪商代码（SimNow 是 9999），融航上它是
+        # 资管后台给的经纪商编号，写成「期货公司代码」用户会不确定该填哪个
+        self.lbl_broker = QLabel("期货公司代码")
+        form.addRow(self.lbl_broker, self.ed_broker)
         form.addRow("资金账号", self.ed_acct)
         form.addRow("资金密码", self.ed_acct_pwd)
         self.lbl_preset = QLabel("CTP 柜台")
@@ -194,6 +203,10 @@ class AccountDialog(QDialog):
             "（100 股起、必须整百），方向只有买入 / 卖出，T+1 当天买的当天不能卖。\n"
             "CTP 柜台**不走天勤**：填柜台预设 + 投资者账号密码即可，前置地址留空就"
             "按预设补（SimNow 7x24 可以随时连）。CTP 只收限价单，下单必须填价格。\n"
+            "融航资管中台**也不走天勤**：用户名 / 密码 / 经纪商代码 / 交易服务器 / "
+            "行情服务器 / 产品名称 / 授权编码这七项要填全，缺一项柜台就登不上。\n"
+            "**不同柜台的账户可以同时勾选、一起登录**，那时上面会出现「行情源」"
+            "下拉框，用来指定 K 线和盘口取哪一家（账户和持仓照旧全部合并显示）。\n"
             "密码明文存在本机用户目录，不会进仓库。"
         )
         self.hint.setObjectName("Hint")
@@ -227,21 +240,45 @@ class AccountDialog(QDialog):
     def _sync(self) -> None:
         kind = self.cb_kind.currentData()
         real = kind == "account"
+        ctp = kind == "ctp"
+        rohon = kind == "rohon"
+        counter = ctp or rohon          # 柜台：不走天勤，要前置地址那几项
         for w in (self.ed_broker, self.ed_acct, self.ed_acct_pwd):
             w.setEnabled(real)
-        ctp = kind == "ctp"
-        for w in (self.cb_preset, self.ed_md, self.ed_td, self.ed_appid, self.ed_auth):
-            w.setVisible(ctp)
-        for w in (self.lbl_preset, self.lbl_md, self.lbl_td,
-                  self.lbl_appid, self.lbl_auth):
-            w.setVisible(ctp)
-        # CTP 的「天勤账户」其实是投资者账号，标签得跟着变，否则用户会去填
+        # 预设只有 CTP 有（SimNow 那几套）。融航的前置地址由资管后台给，
+        # 拿 SimNow 的地址填进去只会连到一个不存在的服务器
+        self.cb_preset.setVisible(ctp)
+        self.lbl_preset.setVisible(ctp)
+        for w in (self.ed_md, self.ed_td, self.ed_appid, self.ed_auth):
+            w.setVisible(counter)
+        for w in (self.lbl_md, self.lbl_td, self.lbl_appid, self.lbl_auth):
+            w.setVisible(counter)
+        # 柜台模式下「天勤账户」其实是柜台账号，标签得跟着变，否则用户会去填
         # 一个天勤账号然后一直登不上
-        self.lbl_user.setText("投资者账号" if ctp else "天勤账户")
-        self.lbl_pwd.setText("投资者密码" if ctp else "天勤密码")
-        self.ed_user.setPlaceholderText("SimNow 账号" if ctp else "")
         if ctp:
+            self.lbl_user.setText("投资者账号")
+            self.lbl_pwd.setText("投资者密码")
+            self.lbl_broker.setText("经纪商代码")
+            self.lbl_appid.setText("AppID")
+            self.lbl_auth.setText("授权码")
+            self.ed_user.setPlaceholderText("SimNow 账号")
+        elif rohon:
+            self.lbl_user.setText("融航用户名")
+            self.lbl_pwd.setText("融航密码")
+            self.lbl_broker.setText("经纪商代码")
+            self.lbl_appid.setText("产品名称")
+            self.lbl_auth.setText("授权编码")
+            self.ed_user.setPlaceholderText("资管中台给的用户名")
+        else:
+            self.lbl_user.setText("天勤账户")
+            self.lbl_pwd.setText("天勤密码")
+            self.lbl_broker.setText("期货公司代码")
+            self.lbl_appid.setText("AppID")
+            self.lbl_auth.setText("授权码")
+            self.ed_user.setPlaceholderText("")
+        if counter:
             self.ed_broker.setEnabled(True)
+        if ctp:
             self._fill_preset()
 
     def spec(self) -> AccountSpec:
@@ -264,7 +301,9 @@ class AccountDialog(QDialog):
 class TradePage(QWidget):
     """账户透视 + 下单。"""
 
-    connect_requested = Signal(object)   # AccountSpec
+    # 参数是 `(specs, feed)`：勾选的账户 + 行情源（`tq` / `ctp` / `rohon`，
+    # 单柜台时是空串）。柜台可以混选 —— 天勤和 CTP 同时登录就是靠这个
+    connect_requested = Signal(object)
     disconnect_requested = Signal()
 
     def __init__(self, live, parent=None) -> None:
@@ -352,10 +391,54 @@ class TradePage(QWidget):
         lay.addWidget(self.lbl_conn)
 
         lay.addStretch(1)
+        # 行情源：多个柜台同时登录时，K 线和盘口只取一家。两个柜台的 tick 拼在
+        # 一条 K 线上会来回跳（时间戳、合约、口径都不是同一个），所以不给「混用」
+        # 这个选项。只有一个柜台时这个下拉框没有意义，直接藏起来。
+        self.lbl_feed = QLabel("行情源")
+        self.lbl_feed.setObjectName("Hint")
+        self.cb_feed = QComboBox()
+        self.cb_feed.setToolTip(
+            "多个柜台同时登录时，K 线和右侧盘口取哪一家。\n"
+            "持仓 / 委托 / 成交不受影响 —— 所有柜台的都合并显示。")
+        self.lbl_feed.setVisible(False)
+        self.cb_feed.setVisible(False)
+        lay.addWidget(self.lbl_feed)
+        lay.addWidget(self.cb_feed)
+
         self.lbl_quote = QLabel("")
         self.lbl_quote.setStyleSheet(f"color: {C_TEXT}; font-size: 13px; font-weight: 600;")
         lay.addWidget(self.lbl_quote)
         return card
+
+    def _sync_feed_box(self) -> None:
+        """按勾选刷新「行情源」下拉框。
+
+        选项来自**勾选账户所属的柜台**（不是全部账户）：勾了天勤 + CTP 就让用户
+        在这两家之间选，没勾的那个不该出现在选项里 —— 选了也连不上，只会白等
+        一轮超时。
+        """
+        backs = []
+        for s in self._checked_specs():
+            b = getattr(s, "backend", "tq")
+            if b not in backs:
+                backs.append(b)
+        backs = [b for b in BACKENDS if b in backs]
+        keep = self.cb_feed.currentData()
+        self.cb_feed.blockSignals(True)
+        self.cb_feed.clear()
+        for b in backs:
+            self.cb_feed.addItem(BACKEND_LABELS.get(b, b), b)
+        if keep in backs:
+            self.cb_feed.setCurrentIndex(backs.index(keep))
+        self.cb_feed.blockSignals(False)
+        multi = len(backs) > 1
+        self.lbl_feed.setVisible(multi)
+        self.cb_feed.setVisible(multi)
+        if multi:
+            self.cb_feed.setToolTip(
+                "多个柜台同时登录时，K 线和右侧盘口取哪一家。\n"
+                "持仓 / 委托 / 成交不受影响 —— 所有柜台的都合并显示。")
+            self.lbl_feed.setToolTip(self.cb_feed.toolTip())
 
     def _wrap(self, title: str, table: QTableWidget, with_btn: str | None,
               hint: str = "") -> QWidget:
@@ -548,6 +631,7 @@ class TradePage(QWidget):
         self._filling = False
         self._fit_columns(t, skip=0)
         self._sync_stock_mode()
+        self._sync_feed_box()
 
     def _sync_stock_mode(self) -> None:
         """按勾选的账户决定下单面板是「手」还是「股」。
@@ -558,16 +642,18 @@ class TradePage(QWidget):
         """
         sel = self._checked_specs() or self._accounts
         stock = bool(sel) and all(s.is_stock for s in sel)
-        ctp = bool(sel) and all(getattr(s, "is_ctp", False) for s in sel)
+        # 柜台口径（CTP / 融航）统一：都只收限价单。判据走 `backend`，
+        # 别再逐家写 == "ctp" —— 加了融航之后那样写会漏掉一家
+        ctp = bool(sel) and all(getattr(s, "backend", "tq") != "tq" for s in sel)
         self._stock_mode = stock
         self._ctp_mode = ctp
         if not hasattr(self, "lbl_vol"):
             return
-        # CTP 只收限价单：市价那个勾直接禁掉，别让人勾完再被柜台拒一次
+        # 柜台只收限价单：市价那个勾直接禁掉，别让人勾完再被柜台拒一次
         self.chk_market.setEnabled(not ctp)
         if ctp:
             self.chk_market.setChecked(False)
-            self.chk_market.setToolTip("CTP 只收限价单，必须填价格")
+            self.chk_market.setToolTip("柜台（CTP / 融航）只收限价单，必须填价格")
         else:
             self.chk_market.setToolTip("")
         self.lbl_vol.setText("股数" if stock else "手数")
@@ -609,9 +695,10 @@ class TradePage(QWidget):
             self._checked.add(name)
         else:
             self._checked.discard(name)
-        # 勾选可能把「期货 + 股票」的混合变成纯股票（或反过来），
-        # 下单面板的单位和开平要跟着变
+        # 勾选可能把「期货 + 股票」的混合变成纯股票（或反过来），也可能把
+        # 「天勤 + CTP」变成只有一家 —— 下单面板的单位和行情源选项都要跟着变
         self._sync_stock_mode()
+        self._sync_feed_box()
         self._refresh_view()
 
     def _on_acct_dbl(self, item: QTableWidgetItem) -> None:
@@ -625,6 +712,7 @@ class TradePage(QWidget):
                 it.setCheckState(Qt.Checked if i == item.row() else Qt.Unchecked)
         self._filling = False
         self._sync_stock_mode()
+        self._sync_feed_box()
         self._refresh_view()
 
     def _check_all(self, on: bool) -> None:
@@ -635,6 +723,8 @@ class TradePage(QWidget):
             if it is not None:
                 it.setCheckState(Qt.Checked if on else Qt.Unchecked)
         self._filling = False
+        self._sync_stock_mode()
+        self._sync_feed_box()
         self._refresh_view()
 
     def _refresh_view(self) -> None:
@@ -678,14 +768,28 @@ class TradePage(QWidget):
         if not specs:
             self.on_failed("先勾选至少一个账户；没有账户就点「＋」添加")
             return
-        self.connect_requested.emit(specs)
+        # 行情源只对「多柜台」有意义；单柜台时下拉框是藏着的，`currentData()`
+        # 可能就是 None，传空串让 worker 自己按顺序挑
+        feed = self.cb_feed.currentData() or ""
+        self.connect_requested.emit((specs, feed))
 
     def _on_started(self, key: str) -> None:
         self.btn_connect.setText("断开")
         self.lbl_dot.setStyleSheet(f"color: {C_OK}; font-size: 15px;")
         n = len(self._checked_specs())
-        self.lbl_conn.setText(f"已连接 · {n} 个账户" if n > 1 else
-                              f"已连接 · {self._current_spec().label() if self._current_spec() else ''}")
+        backs = []
+        for s in self._checked_specs():
+            b = getattr(s, "backend", "tq")
+            if b not in backs:
+                backs.append(b)
+        tail = ""
+        if len(backs) > 1:
+            # 多柜台时把行情源写在状态里：不然用户看到「K 线不动」会以为断线，
+            # 其实是另一家柜台今天没推
+            tail = f" · 行情 {BACKEND_LABELS.get(self.cb_feed.currentData(), '')}".rstrip()
+        self.lbl_conn.setText(
+            f"已连接 · {n} 个账户{tail}" if n > 1 else
+            f"已连接 · {self._current_spec().label() if self._current_spec() else ''}{tail}")
         self.lbl_conn.setStyleSheet(f"color: {C_OK}; font-size: 11px;")
 
     def _on_stopped(self) -> None:

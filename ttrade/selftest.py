@@ -5317,6 +5317,51 @@ def _run() -> tuple[bool, list[str]]:
 
     check("CTP 客户端（可选依赖）", _ctp)
 
+    def _rohon():
+        """融航资管中台：和 CTP 一样是可选依赖，没装必须优雅降级。
+
+        `vnpy_rohon` 只有 Windows 的 cp310 / cp313 wheel，macOS / Linux / 本机
+        的 3.14 base 全都没有 —— 所以这条自检**不能因为没装就红**。要验的是：
+        「没装时报的是人话、带装法」和「装了时方向/开平映射是对的」。
+        """
+        from ttrade.ctp_live import RohonHub
+        from ttrade import rohon_client as R
+
+        assert RohonHub.PLATFORM == "融航" and RohonHub.KIND == "rohon", \
+            "融航柜台的平台名/类型标识被改了（界面按这两个值分组）"
+
+        # 前置地址：用户通常只填 host:port，柜台只认 tcp://
+        assert R._addr("1.2.3.4:1000") == "tcp://1.2.3.4:1000"
+        assert R._addr("tcp://1.2.3.4:1000") == "tcp://1.2.3.4:1000"
+        assert R._addr("  ") == "", "空地址被补成了 tcp://"
+        # DBL_MAX 是「没有值」，不收敛就是界面上蹦出 1.79e+308
+        assert R._f(R._MAXF) == 0.0 and R._f(None) == 0.0 and R._f("2.5") == 2.5
+
+        hub = RohonHub([])
+        if not R.HAS_ROHON:
+            # 未装：check_deps 必须报出包名 + 装法，而不是 AttributeError
+            try:
+                hub.check_deps()
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                assert "vnpy_rohon" in msg and "pip install" in msg, \
+                    f"未装时 check_deps 的提示不可用（{msg}）"
+            else:
+                raise RuntimeError("没装 vnpy_rohon，check_deps 竟然通过了")
+            return f"vnpy_rohon 未安装（融航不可用，其余功能不受影响）：{R.ROHON_IMPORT_ERROR[:60]}"
+
+        # 装了：柜台的 DIR / OFFSET 编码是**字符串**，不是整数（'0'=买 '1'=卖）
+        assert R.DIR_VT2ROHON["BUY"] == "0" and R.DIR_VT2ROHON["SELL"] == "1", \
+            f"方向编码不是 CTP 字符串口径：{R.DIR_VT2ROHON}"
+        assert R.DIR_ROHON2VT["0"] == "BUY" and R.DIR_ROHON2VT["1"] == "SELL"
+        for vt in ("OPEN", "CLOSE", "CLOSETODAY"):
+            back = R.OFFSET_ROHON2VT.get(R.OFFSET_VT2ROHON[vt])
+            assert back == vt, f"开平往返不一致：{vt} → {R.OFFSET_VT2ROHON[vt]} → {back}"
+        hub.check_deps()
+        return "vnpy_rohon 已装，方向/开平编码正确"
+
+    check("融航客户端（可选依赖）", _rohon)
+
     def _ctp_live():
         """CTP 会话层：合约归一 / 主力解析 / tick 聚合 / 快照映射。
 
@@ -5771,6 +5816,64 @@ def _run() -> tuple[bool, list[str]]:
         )
         trade_info = (f"{tp.tbl_accts.columnCount()} 列账户表 / "
                       f"{len(tp._accounts)} 个账户" if tp is not None else "无交易页")
+
+        # 多柜台同时登录：分组 / 合并 / 行情源 / 融航口径。
+        # 「天勤和 CTP 一起登」是靠**按柜台分组建多条连接**实现的，不是把它们塞进
+        # 同一条会话；这条断言盯的就是那个分组函数和合并函数 —— 一旦有人把融航
+        # 或 CTP 又算成天勤，界面会静默退化成「只连上天勤那几个户」，账户表看着
+        # 有行、数字全是 —。
+        acct_ok = True
+        acct_info = ""
+        try:
+            from gui.live import group_specs
+            from ttrade.ctp_live import RohonHub
+            from ttrade.tqlive import (ACCOUNT_KINDS as _KINDS,
+                                       BACKENDS as _BACKENDS,
+                                       AccountSpec as _AS,
+                                       LiveState as _LS,
+                                       merge_states)
+
+            _tq = _AS(name="自检天勤", kind="kq", user="u", password="p")
+            _ctp = _AS(name="自检CTP", kind="ctp", user="u", password="p")
+            _roh = _AS(name="自检融航", kind="rohon", user="u", password="p")
+            _g = group_specs([_tq, _ctp, _roh])
+            acct_ok = (list(_g) == ["tq", "ctp", "rohon"]
+                       and [len(_g[k]) for k in _g] == [1, 1, 1])
+
+            def _fake(tag, bal):
+                acc = {"balance": bal, "available": bal, "margin": 0.0}
+                return _LS(connected=True, key=f"{tag}_K", period="5m",
+                           underlying=f"{tag}_rb2601",
+                           quote={"last": float(bal)},
+                           accounts=[{"name": tag, "account": acc}],
+                           by_account={tag: {"spec": {"name": tag},
+                                             "account": acc, "positions": [],
+                                             "orders": [], "trades": []}},
+                           account=acc)
+
+            _m = merge_states([("tq", _fake("天勤户", 100.0)),
+                               ("ctp", _fake("CTP户", 50.0))], "ctp")
+            acct_ok = (acct_ok
+                       and _m.quote.get("last") == 50.0
+                       and _m.underlying == "CTP户_rb2601"
+                       and set(_m.by_account) == {"天勤户", "CTP户"}
+                       and round(_m.account.get("balance") or 0, 2) == 150.0)
+            # 融航：账户类型要在表里、backend 要走 rohon、Hub 的柜台名要对；
+            # 没装 vnpy_rohon 时给的必须是**一句能看懂的话**，不是 ImportError 堆栈
+            acct_ok = (acct_ok and "rohon" in dict(_KINDS)
+                       and _roh.backend == "rohon"
+                       and RohonHub.PLATFORM == "融航"
+                       and tp is not None and hasattr(tp, "cb_feed"))
+            try:
+                RohonHub([]).check_deps()
+            except Exception as _exc:      # noqa: BLE001
+                acct_ok = acct_ok and "vnpy_rohon" in str(_exc)
+            acct_info = ("分组 " + "/".join(_g)
+                         + f"，合并 {len(_m.by_account)} 户 / 权益 "
+                         + f"{_m.account.get('balance'):,.0f}")
+        except Exception as _exc:          # noqa: BLE001
+            acct_ok = False
+            acct_info = f"{type(_exc).__name__}: {_exc}"
         # ChanAgent 页：删除按钮在没选中东西时必须是灰的，权限开关默认关。
         # 升级权限的文件模块是**函数里 import** 的，打包漏了只会在用户勾上开关
         # 之后才炸 —— 所以在这里 import 一次，把它变成打包期就能发现的问题。
@@ -6484,6 +6587,12 @@ def _run() -> tuple[bool, list[str]]:
         if not trade_ok:
             raise RuntimeError(
                 f"账户透视页异常（{trade_info}）：账户列表 / 资金账户列 / 时间列缺失"
+            )
+        if not acct_ok:
+            raise RuntimeError(
+                f"多柜台（天勤 / CTP / 融航）口径不对（{acct_info}）：勾选跨柜台时"
+                "要按柜台分成多条连接，账户合并、行情只取选定的那一路；融航账户"
+                "必须是 rohon 后端，不能落进天勤分支"
             )
         if not agent_ok:
             raise RuntimeError(
@@ -7434,7 +7543,7 @@ def _run() -> tuple[bool, list[str]]:
                 f"{factor_info}，滚轮缩放 {wheel_info}，策略验证 {verify_info}，"
                 f"波幅突破 {brk_info}，"
                 f"组合 {combo_info}，"
-                f"截面 {cross_info}，两步配置 {cross_dlg_info}，"
+                f"截面 {cross_info}，多柜台 {acct_info}，两步配置 {cross_dlg_info}，"
                 f"多品种往返 {multi_rt_info}，"
                 f"组合页回测 {view_info}，"
                 f"{side_info}，触发 {trig_info}，"

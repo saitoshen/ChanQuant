@@ -44,12 +44,22 @@ ACCOUNT_KINDS = [
     ("kq_stock", "快期股票模拟（需专业版）"),
     ("sim_stock", "本地股票模拟（TqSimStock）"),
     ("ctp", "CTP 柜台（SimNow / 期货公司）"),
+    ("rohon", "融航资管中台（vnpy_rohon）"),
 ]
 
 # 股票账户的两种。期货和股票在天勤里是**两套账户类**，不能混用一个连接：
 # 期货账户下单 `SHFE.rb2601`，股票账户下单 `SSE.600000`，撮合规则也不同
 # （T+1、涨跌停、100 股一手）。
 STOCK_KINDS = ("kq_stock", "sim_stock")
+
+# 柜台后端。**这是「走哪个连接」的唯一判据** —— 以前到处写 `is_ctp`，加了融航
+# 之后就变成「非 ctp 一律当天勤」，融航账户会被丢进 `LiveHub` 报「缺少天勤账户」。
+# 三个后端的连接对象、登录参数、回报口径都不一样，各自一条连接：
+#   tq    天勤 TqApi（多种账户共用一条连接，多账户走 TqMultiAccount）
+#   ctp   期货公司 CTP 柜台（openctp-ctp）
+#   rohon 融航资管中台（vnpy_rohon）
+BACKENDS = ("tq", "ctp", "rohon")
+BACKEND_LABELS = {"tq": "天勤", "ctp": "CTP", "rohon": "融航"}
 
 
 # ------------------------------------------------------------------ 账户配置
@@ -64,10 +74,15 @@ class AccountSpec:
     - `account`：实盘，需要期货公司的 broker_id + 资金账号 + 密码；
     - `kq_stock` / `sim_stock`：股票模拟，见 `STOCK_KINDS`；
     - `ctp`：期货公司 CTP 柜台，**不走天勤**。参数是前置地址 + BrokerID +
-      投资者账号，见 `md_front` / `td_front` / `app_id` / `auth_code`。
+      投资者账号，见 `md_front` / `td_front` / `app_id` / `auth_code`；
+    - `rohon`：融航资管中台，同样不走天勤。字段和 `ctp` **一一对应**（融航
+      本身就是 CTP 协议的中台）：`user`/`password` 是融航用户名密码，
+      `broker_id` 是经纪商代码，`td_front`/`md_front` 是交易/行情服务器，
+      `app_id` 是产品名称，`auth_code` 是授权编码。不另开一套字段：交易页只有
+      一张账户表，用户换个柜台不该去别的地方再填一遍。
 
-    `user` / `password` 是天勤账户（TqAuth），前五种模式都要；`ctp` 模式下
-    它们就是 CTP 的投资者账号与密码。
+    `user` / `password` 是天勤账户（TqAuth），前五种模式都要；`ctp` / `rohon`
+    模式下它们就是柜台账号与密码。
     """
 
     name: str = "默认"
@@ -77,7 +92,7 @@ class AccountSpec:
     broker_id: str = ""
     account_id: str = ""
     account_password: str = ""
-    # CTP 专用。留在同一个结构里而不是另开一张表：交易页只有一个账户列表，
+    # CTP / 融航专用。留在同一个结构里而不是另开一张表：交易页只有一个账户列表，
     # 用户不该为了换个柜台去另一个地方再配一遍
     ctp_preset: str = "simnow_7x24"
     md_front: str = ""
@@ -87,6 +102,14 @@ class AccountSpec:
 
     def build(self):
         """构造天勤的账户对象。实盘缺参数直接报错，不要静默退化成模拟。"""
+        if self.backend != "tq":
+            # 柜台账户没有天勤账户对象可构造。在这里挡掉而不是让它掉到下面
+            # `TqKq()` 的兜底分支 —— 那会静默连上一个快期模拟户，用户看着
+            # 「登录成功」，实际下的单全在模拟盘里
+            raise ValueError(
+                f"账户「{self.name}」是{BACKEND_LABELS[self.backend]}账户，"
+                "不走天勤，不能构造天勤账户对象"
+            )
         from tqsdk import TqAccount, TqKq, TqKqStock, TqSim, TqSimStock
 
         if self.kind == "account":
@@ -112,9 +135,23 @@ class AccountSpec:
         return self.kind in STOCK_KINDS
 
     @property
+    def backend(self) -> str:
+        """这条账户走哪个连接：`tq` / `ctp` / `rohon`。
+
+        全项目**只在这里判一次**。散在各处写 `kind == "ctp"` 的后果是：加了
+        融航之后，「不是 CTP 就当它走天勤」把融航账户塞进 `LiveHub`，报出来
+        的是「缺少天勤账户或密码」，看着像用户填错了账号。
+        """
+        return self.kind if self.kind in ("ctp", "rohon") else "tq"
+
+    @property
     def is_ctp(self) -> bool:
         """CTP 账户不走天勤，`LiveHub` 一构建就会报「缺天勤账户」。"""
-        return self.kind == "ctp"
+        return self.backend == "ctp"
+
+    @property
+    def is_rohon(self) -> bool:
+        return self.backend == "rohon"
 
     def label(self) -> str:
         kind = dict(ACCOUNT_KINDS).get(self.kind, self.kind)
@@ -344,6 +381,59 @@ class LiveState:
     by_account: dict = field(default_factory=dict)      # 账户名 → 该账户的明细
 
 
+def merge_states(parts, feed: str = "") -> LiveState:
+    """把几个柜台各自的快照合成一份，给「同时登录多个柜台」用。
+
+    `parts` 是 `[(后端, LiveState)]`，后端取 `BACKENDS` 里的值；顺序决定账户表
+    的排列（天勤 → CTP → 融航）。
+
+    **行情只取一路**：`feed` 指定的那个后端的 `quote` / `bar 周期` / 主力合约
+    作为整份快照的行情。两个柜台的 tick 拼在一条 K 线上会来回跳（时间戳、口径、
+    甚至合约都不是同一个），所以这里不做「取最新」这种聪明事，认准一个源。
+
+    **账户全合并**：`accounts` 拼起来，`by_account` 合并（同名时加后端后缀，
+    极少见 —— 账户表按名字去重，正常不会撞）。合计资金用 `_sum_accounts` 重算，
+    风险度是比值不能加。
+
+    `bar` 本身不在快照里（由 worker 直接发选定的那一路），这里只统一
+    `quote` / `underlying` / `period` / `key`，免得界面上「K 线是一个柜台的、
+    盘口是另一个柜台的」这种对不上的情况。
+    """
+    parts = [(name, st) for name, st in (parts or []) if st is not None]
+    if not parts:
+        return LiveState()
+    src = next((st for name, st in parts if name == feed), None)
+    if src is None:
+        # 选的那路没连上（或者调用方没指定）：退到第一个报得动行情的
+        src = next((st for name, st in parts if (st.quote or st.key)), parts[0][1])
+
+    st = LiveState(
+        connected=any(p.connected for _, p in parts),
+        error="；".join(f"[{BACKEND_LABELS.get(n, n)}] {p.error}"
+                       for n, p in parts if p.error),
+        key=src.key,
+        period=src.period,
+        underlying=src.underlying,
+        quote=dict(src.quote or {}),
+    )
+
+    acc_dicts: list[dict] = []
+    for name, p in parts:
+        st.accounts.extend(p.accounts or [])
+        st.positions.extend(p.positions or [])
+        st.orders.extend(p.orders or [])
+        st.trades.extend(p.trades or [])
+        for key, item in (p.by_account or {}).items():
+            k = key
+            if k in st.by_account:
+                # 两个柜台出现同名账户：加上后端后缀，否则后一个会把前一个顶掉
+                k = f"{key}（{BACKEND_LABELS.get(name, name)}）"
+            st.by_account[k] = item
+            acc_dicts.append((item or {}).get("account") or {})
+    st.account = _sum_accounts(acc_dicts) if acc_dicts else dict(src.account or {})
+    return st
+
+
 class LiveHub:
     """一个天勤连接：行情订阅 + 账户 + 下单。
 
@@ -398,6 +488,14 @@ class LiveHub:
                 raise ValueError("没有配置天勤账户，无法连接实时行情")
             self.api = TqApi(auth=TqAuth(user, pwd), web_gui=False)
             return
+        alien = [s.name for s in self.specs if s.backend != "tq"]
+        if alien:
+            # 柜台账户（CTP / 融航）在这里必须被挡住。掉到下面去的话，报的是
+            # 「缺少天勤账户或密码」，用户会以为自己账号密码填错了
+            raise ValueError(
+                f"账户「{'、'.join(alien)}」是柜台账户，不走天勤，"
+                "不能放进天勤连接（应各自单开一条柜台连接）"
+            )
         for s in self.specs:
             if not s.user or not s.password:
                 raise ValueError(f"账户「{s.name}」缺少天勤账户或密码")
