@@ -24,7 +24,25 @@ if not getattr(sys, "frozen", False):
 if "--selftest" in sys.argv:
     from ttrade.selftest import run as run_selftest
 
-    sys.exit(run_selftest())
+    _code = run_selftest()
+    # 自检跑完必须**硬退出**，不能让解释器慢慢 finalize 之后自然结束。
+    #
+    # 自检会把真实主窗口搭起来（QApplication + 几百个 QWidget），还要画图、开
+    # duckdb 连接。CPython 退出时按 gc 顺序逐个析构这些对象，而 PySide6 与原生库
+    # 的析构顺序不受我们控制 —— 实测**打包版**在这里 fail-fast：
+    # Windows 退出码 0xC0000409，而 `selftest.log` 里 81 项全绿、一行 [FAIL] 都没有。
+    # CI 只看退出码，于是这一轮被判定为「自检失败」，日志里却什么都看不到；
+    # v3.7.4 的构建就是这么白跑一轮的（Release 被整个跳过）。
+    #
+    # 日志在 `run()` 返回前就已经 `with` 落盘并关闭文件、退出码也拿到了，之后没有
+    # 任何非做不可的清理，OS 级退出最干净。
+    try:
+        for _stream in (sys.stdout, sys.stderr):
+            if _stream is not None:
+                _stream.flush()
+    except Exception:  # noqa: BLE001 - 窗口程序没有控制台，flush 失败无所谓
+        pass
+    os._exit(_code)
 
 from gui.app import _log_fatal, main
 

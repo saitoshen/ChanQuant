@@ -124,20 +124,59 @@ jobs:
         run: |
           # 失败时把 [FAIL] 那几行**发成 annotation**：job 日志要 API token 才能
           # 读，annotation 匿名就能读，排查打包环境独有的失败时这是唯一线索。
-          emit() {
-            grep -m5 "\[FAIL\]" "$1" | while IFS= read -r l; do
+          #
+          # 但只知道发 [FAIL] 是不够的。v3.7.4（2026-11-16）那次 Windows 与
+          # macOS arm64 双双失败，而 annotation 里一条 [FAIL] 都没有 —— 真实原因
+          # 是**自检跑完全绿、进程退出时 fail-fast**（0xC0000409），`||` 分支里
+          # `cat` 的日志当然没有失败项，于是只剩 GitHub 自动加的
+          # "Process completed with exit code 1"，谁也不知道该怎么办。
+          # 所以这里把「退出码 / 日志是否存在 / 没有 [FAIL] 时的日志尾部」都发出来。
+          emit_fail() {
+            grep -m5 "\[FAIL\]" "$1" 2>/dev/null | while IFS= read -r l; do
               echo "::error title=selftest::${l}"
             done
           }
+          emit_tail() {
+            tail -n 30 "$1" 2>/dev/null | while IFS= read -r l; do
+              echo "::error title=selftest-tail::${l}"
+            done
+          }
+          run_selftest() {
+            exe="$1"
+            log="$2"
+            # GitHub 的 bash 默认 `set -e`，直接调用失败会立刻退出脚本，
+            # 后面的诊断一行都跑不到 —— 用 if 包住，把退出码接过来
+            if "$exe" --selftest; then
+              rc=0
+            else
+              rc=$?
+            fi
+            echo "退出码=$(printf '0x%X' "$rc") ($rc)  日志=$log  存在=$([ -f "$log" ] && echo 是 || echo 否)"
+            if [ "$rc" -eq 0 ]; then
+              [ -f "$log" ] && cat "$log"
+              return 0
+            fi
+            echo "::error title=selftest::自检失败，退出码 $rc"
+            if [ -f "$log" ]; then
+              cat "$log"
+              if grep -q "\[FAIL\]" "$log"; then
+                emit_fail "$log"
+              else
+                echo "::error title=selftest::日志里没有 [FAIL] 行 —— 进程多半崩在启动或退出阶段，下面是日志尾部"
+                emit_tail "$log"
+              fi
+            else
+              echo "::error title=selftest::日志文件不存在，进程可能在启动阶段就崩了"
+              ls -l "$(dirname "$log")" 2>/dev/null || true
+            fi
+            return 1
+          }
           if [ "$RUNNER_OS" = "Windows" ]; then
-            log="$LOCALAPPDATA/ChanQuant/logs/selftest.log"
-            ./dist/ChanQuant/ChanQuant.exe --selftest || { cat "$log"; emit "$log"; exit 1; }
-            cat "$log"
+            run_selftest ./dist/ChanQuant/ChanQuant.exe \
+              "$LOCALAPPDATA/ChanQuant/logs/selftest.log"
           else
-            log="$HOME/Library/Application Support/ChanQuant/logs/selftest.log"
-            ./dist/ChanQuant.app/Contents/MacOS/ChanQuant --selftest || {
-              cat "$log"; emit "$log"; exit 1; }
-            cat "$log"
+            run_selftest ./dist/ChanQuant.app/Contents/MacOS/ChanQuant \
+              "$HOME/Library/Application Support/ChanQuant/logs/selftest.log"
           fi
 
       - name: 列出产物
