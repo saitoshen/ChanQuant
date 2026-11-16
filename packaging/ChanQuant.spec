@@ -107,12 +107,11 @@ except Exception:  # noqa: BLE001 - 没装 / DLL 加载失败都走这里
 # `ttrade/rohon_client.py` 用 stub 包绕开了入口，打包这一层就用 find_spec
 # 只查「装没装」，一个字节的包代码都不执行。
 #
-# 采集拆成两步，少一步都是「源码运行正常、打包版一点融航就报错」：
-#   1. collect_dynamic_libs → api/ 下那 4 个 dll（RohonBaseV64 是融航自己的
-#      依赖库，三个 thost 是 CTP 的，全靠运行时 LoadLibrary 加载，静态分析
-#      看不见，不显式打进去就是「找不到指定模块」）。它只认 *.dll，
-#      不会和下面 hiddenimports 里的 .pyd 重复。
-#   2. hiddenimports 里的两个 .pyd 扩展模块（vnrohonmd / vnrohontd）由
+# 要打进去的是**两类**文件，少一类都是「源码运行正常、打包版一点融航就报错」：
+#   1. api/ 下那 4 个 dll（RohonBaseV64 是融航自己的依赖库，三个 thost 是 CTP
+#      的）—— 全靠运行时 LoadLibrary 加载，静态分析看不见，不显式打进去就是
+#      「找不到指定模块」。走 collect_dynamic_libs，它只认 *.dll。
+#   2. hiddenimports 里那两个 .pyd 扩展模块（vnrohonmd / vnrohontd）——
 #      PyInstaller 按 import 解析，落到 _internal/vnpy_rohon/api/，和 dll 同目录。
 try:
     HAS_ROHON = importlib.util.find_spec("vnpy_rohon") is not None
@@ -120,7 +119,10 @@ except Exception:  # noqa: BLE001 - 包目录异常（权限/损坏）也当没�
     HAS_ROHON = False
 
 if HAS_ROHON:
-    DATAS += collect_data_files("vnpy_rohon")
+    # 只要 dll，**不要**再加 `collect_data_files("vnpy_rohon")`：实测它对这个包
+    # 只返回那 4 个 dll 加两个 `.lib`（链接期文件，运行时一点用没有），
+    # 和下面的 collect_dynamic_libs 完全重复，白占 2.5MB 还可能覆盖同一路径。
+    # `.py` 它一个都不给（默认 exclude_py_files），模块全靠 hiddenimports 进 PYZ。
     BINARIES += collect_dynamic_libs("vnpy_rohon")
     HIDDEN_ROHON = [
         # 包本身要进 PYZ：`rohon_client._import_api()` 用
