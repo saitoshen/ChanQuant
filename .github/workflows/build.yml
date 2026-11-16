@@ -137,13 +137,17 @@ jobs:
             done
           }
           emit_tail() {
-            tail -n 30 "$1" 2>/dev/null | while IFS= read -r l; do
-              echo "::error title=selftest-tail::${l}"
+            # 只发 8 行：GitHub 对每个 step 的 error annotation 有 **10 条**配额，
+            # 超出的直接丢弃。原先发 30 行，结果保留下来的恰好是日志尾部**最前面**
+            # 那 10 行 —— 真正想知道是「最后停在哪一项」，反而永远看不到。
+            tail -n "${2:-8}" "$1" 2>/dev/null | while IFS= read -r l; do
+              echo "::error title=${3:-selftest-tail}::${l}"
             done
           }
           run_selftest() {
             exe="$1"
             log="$2"
+            crash="$(dirname "$log")/selftest_crash.txt"
             # GitHub 的 bash 默认 `set -e`，直接调用失败会立刻退出脚本，
             # 后面的诊断一行都跑不到 —— 用 if 包住，把退出码接过来
             if "$exe" --selftest; then
@@ -157,16 +161,22 @@ jobs:
               return 0
             fi
             echo "::error title=selftest::自检失败，退出码 $rc"
-            if [ -f "$log" ]; then
+            if [ -f "$log" ] && grep -q "\[FAIL\]" "$log"; then
               cat "$log"
-              if grep -q "\[FAIL\]" "$log"; then
-                emit_fail "$log"
-              else
-                echo "::error title=selftest::日志里没有 [FAIL] 行 —— 进程多半崩在启动或退出阶段，下面是日志尾部"
-                emit_tail "$log"
-              fi
+              emit_fail "$log"
+            elif [ -f "$log" ]; then
+              echo "::error title=selftest::日志里没有 [FAIL] 行 —— 进程多半崩在中途或被信号打死，下面是日志尾部"
+              emit_tail "$log" 8
             else
-              echo "::error title=selftest::日志文件不存在，进程可能在启动阶段就崩了"
+              echo "::error title=selftest::日志文件不存在（自检没跑完就没机会落盘）"
+            fi
+            # 段错误/栈溢出时日志一定是缺的，唯一线索是 faulthandler 落下的栈
+            if [ -f "$crash" ] && [ -s "$crash" ]; then
+              echo "----- 崩溃栈（selftest_crash.txt）-----"
+              cat "$crash"
+              emit_tail "$crash" 4 selftest-crash
+            else
+              echo "::error title=selftest::没有崩溃栈文件，进程可能连 Python 都没进（缺 DLL / Qt 插件加载失败）"
               ls -l "$(dirname "$log")" 2>/dev/null || true
             fi
             return 1

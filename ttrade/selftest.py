@@ -7802,6 +7802,24 @@ def run() -> int:
     """执行自检并返回退出码。"""
     from ttrade.paths import log_dir
 
+    # 🔴 段错误 / 栈溢出时进程直接死，`_run()` 里的 `try/except Exception` 连异常
+    # 都抓不到，`lines` 根本没机会落盘 —— CI 上 v3.7.4 / v3.7.5 两轮就是这么失败
+    # 的：退出码 139（SIGSEGV），annotation 里只有「日志文件不存在，进程可能在
+    # 启动阶段就崩了」，连崩在哪一项都不知道。
+    #
+    # faulthandler 在崩溃瞬间把**每个线程的 Python 栈**直接写 fd，不经过解释器的
+    # 正常收尾，所以就算进程是被信号打断的，栈也留得下来。CI 的失败诊断会把
+    # 这个文件一起发出来。正常跑完则把空文件删掉，免得下次被误读成"崩过"。
+    crash_path = os.path.join(log_dir(), "selftest_crash.txt")
+    _crash_fh = None
+    try:
+        import faulthandler
+
+        _crash_fh = open(crash_path, "w", encoding="utf-8")
+        faulthandler.enable(file=_crash_fh, all_threads=True)
+    except Exception:  # noqa: BLE001 - 拿不到就不启用，不影响自检本身
+        _crash_fh = None
+
     # 🔴 自检会把**真实主窗口**搭起来，里面有切页签、加策略、改本金这些模拟
     # 动作。它们在生产里本来就该落盘，但跑自检时绝不能改用户的组合 —— 实测
     # 跑一轮就把 `portfolio.json` 里一条策略删没了、二十几条本金被重排。
@@ -7859,5 +7877,16 @@ def run() -> int:
                 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
             print(text)
         except Exception:
+            pass
+    # 没崩就把空的崩溃文件删掉：留着会让下一轮的诊断误以为"上次崩过"
+    if _crash_fh is not None:
+        try:
+            import faulthandler
+
+            faulthandler.disable()
+            _crash_fh.close()
+            if ok:
+                os.remove(crash_path)
+        except Exception:  # noqa: BLE001
             pass
     return 0 if ok else 1
