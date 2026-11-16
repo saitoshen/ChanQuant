@@ -5611,6 +5611,33 @@ def _run() -> tuple[bool, list[str]]:
             opt_range_ok = False
             opt_range_info = f"{type(_exc).__name__}: {_exc}"
 
+        # 定时日程必须还是四条，且「宏观 / 基本面」这两条**不是补 CSV** 的
+        # 要各自带着 `macro` / `edb` 标、`range` 置 None。
+        # 漏掉或并回市场队列的后果是静默的：界面上勾着「每天补基本面」，到点
+        # `_start_auto_next()` 却拿 `UpdateWorker` 去补期货 CSV，edb.duckdb
+        # 一行不涨、也不报错。这条断言就是防它被谁合并回去。
+        auto_jobs_info = ""
+        auto_jobs_ok = True
+        try:
+            _jobs = dp._auto_jobs() if dp is not None else []
+            _keys = [j["key"] for j in _jobs]
+            _want_flag = {"macro": "macro", "edb": "edb"}
+            _bad = []
+            for _j in _jobs:
+                _w = _want_flag.get(_j["key"])
+                if _w is None:
+                    if _j.get("macro") or _j.get("edb"):
+                        _bad.append(f"{_j['key']} 多带了标记")
+                elif not _j.get(_w):
+                    _bad.append(f"{_j['key']} 少了 {_w}")
+                elif _j.get("range") is not None:
+                    _bad.append(f"{_j['key']} 不该有区间")
+            auto_jobs_ok = _keys == ["aux", "daily", "macro", "edb"] and not _bad
+            auto_jobs_info = " / ".join(_keys) + ("；" + "、".join(_bad) if _bad else "")
+        except Exception as _exc:      # noqa: BLE001
+            auto_jobs_ok = False
+            auto_jobs_info = f"{type(_exc).__name__}: {_exc}"
+
         def _form_order_ok(d) -> bool:
             """「开始补充」必须紧跟在下载项之后，成本和定时不许混进来。
 
@@ -6447,6 +6474,12 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(
                 f"回溯区间没接到期权（{opt_range_info}）：选「近 1 天」期权也该只补"
                 "最近一天，选「近 20 年」该等于全量回填"
+            )
+        if not auto_jobs_ok:
+            raise RuntimeError(
+                f"每日定时日程不对（{auto_jobs_info}）：应该是 aux / daily / macro / "
+                "edb 四条，宏观与基本面各自带 macro / edb 标且没有区间 —— 少了标记"
+                "它们就会被当市场队列，到点补的是 CSV，基本面一行不涨还不报错"
             )
         if not trade_ok:
             raise RuntimeError(
@@ -7407,7 +7440,7 @@ def _run() -> tuple[bool, list[str]]:
                 f"{side_info}，触发 {trig_info}，"
                 f"回测区间 {range_info}，合成周期 {md_info}，实时开关已复位，"
                 f"{status_info}，"
-                f"数据管理页就绪（期权回溯区间 {opt_range_info}），手册 {manual_info}，输出 {out_info}，"
+                f"数据管理页就绪（期权回溯区间 {opt_range_info}；定时 {auto_jobs_info}），手册 {manual_info}，输出 {out_info}，"
                 f"对话渲染 {chat_info}，能力包 {skill_info}")
 
     check("长提示的压缩口径（状态栏 / 因子页脚注）", _status_brief)

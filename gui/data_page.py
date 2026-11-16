@@ -179,6 +179,67 @@ class MacroWorker(QObject):
         self.done.emit(st)
 
 
+class EdbWorker(QObject):
+    """后台线程里跑 `ttrade.edb.update()`：天勤 EDB 的 243 个基本面指标。
+
+    为什么单开一个 worker，而不是挂在别的更新上：
+
+    - **不能挂 `UpdateWorker`**（日线 / 衍生那条，走 Tushare）：EDB 是天勤独有的
+      「非价量数据」接口，必须有天勤会话，两个数据源、两个账号、失败原因也不一样。
+    - **不能挂 `TqWorker`**（天勤补齐）：那个 worker 会顺带把 K 线下一遍，
+      5m 真实合约能跑两小时。只想补基本面的定时任务不该被它拖着。
+
+    免费账户没有这个功能位，`update()` 会返回 `denied` 并立刻停手 —— 这时按
+    「跳过」处理，不当失败：行情照常，只是没有基本面，定时任务也不该天天报红。
+    """
+
+    progress = Signal(int, int, str)
+    done = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        from ttrade import edb as EDB
+        from ttrade import tqfetch as TQ
+
+        try:
+            self.progress.emit(0, 0, "连接天勤（基本面 EDB）…")
+            sess = TQ.Session()
+            try:
+                api = sess.get()
+                st = EDB.update(
+                    api,
+                    progress=lambda a, b, m: self.progress.emit(a, b, m),
+                    cancel=lambda: self._cancel,
+                )
+            finally:
+                sess.close()
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            return
+
+        if st.get("denied"):
+            self.done.emit(f"基本面（EDB）跳过：{st['denied']}")
+            return
+        ids = int(st.get("ids") or 0)
+        rows = int(st.get("rows") or 0)
+        head = "已取消" if self._cancel else "完成"
+        if not rows:
+            # 增量口径下日常大量时候就是这一句：库里已经是最新
+            self.done.emit(f"基本面（EDB）{head}：{ids} 个指标已是最新，没有新日期")
+            return
+        self.done.emit(
+            f"基本面（EDB）{head}：{ids} 个指标 / {int(st.get('batches') or 0)} 批，"
+            f"本次写入 {rows:,} 行（{st.get('start')} → {st.get('end')}）"
+        )
+
+
 class TqWorker(QObject):
     """在后台线程里跑天勤补行情。
 
@@ -625,10 +686,12 @@ class DataPage(QWidget):
         self._tq_thread: QThread | None = None
         self._macro_worker: MacroWorker | None = None
         self._macro_thread: QThread | None = None
+        self._edb_worker: EdbWorker | None = None
+        self._edb_thread: QThread | None = None
         self._auto_run = False          # 这一轮是不是定时任务起的（决定弹不弹窗）
         self._auto_last: dict[str, str] = {}   # 每条日程上次跑的日期（YYYY-MM-DD）
         self._auto_queue: list[str] = []       # 定时任务还要跑的市场
-        self._auto_key = ""             # 当前跑的是哪条日程（aux / daily）
+        self._auto_key = ""             # 当前跑的是哪条日程（aux / daily / macro / edb）
         self._auto_range = "1d"
         self._auto_aux = False
         self._build()
@@ -670,7 +733,7 @@ class DataPage(QWidget):
 
     def busy(self) -> bool:
         return (self._upd_thread is not None or self._tq_thread is not None
-                or self._macro_thread is not None)
+                or self._macro_thread is not None or self._edb_thread is not None)
 
     # ---- 构建 ----
 
@@ -932,6 +995,10 @@ class DataPage(QWidget):
         self.lbl_upd.setVisible(True)
         self.lbl_upd.setText("准备更新宏观因子…")
         self.btn_macro.setEnabled(False)
+        # 主按钮切成「取消」：`_cancel()` 现在也会置宏观的取消位，不把按钮
+        # 摆出来的话，用户看着「开始补充」其实是在取消，等于没有出口
+        self.btn_update.setText("取消")
+        self.btn_update.setEnabled(True)
         self._log("—— 更新宏观因子（23 条序列，Tushare + 东方财富）")
         self._macro_thread.start()
 
@@ -958,6 +1025,50 @@ class DataPage(QWidget):
         self.lbl_upd.setText(text)
         self._log(text)
         self._refresh_macro_stats()
+
+    def _start_edb(self, auto: bool = False) -> None:
+        """起基本面（EDB）更新。
+
+        与 `_start_macro` 同一套编排：`auto=True` 时置 `_auto_run` 让失败不弹模态框，
+        `_auto_queue` 留空以免 `_on_thread_done` 去起市场队列。
+
+        天勤会话是**独占**的：`busy()` 里已经算了 `_edb_thread`，所以到点时若
+        15:30 那条衍生还在跑，这里会直接返回（心跳下一轮再补），不会两个任务
+        同时连天勤把会话搅乱。
+        """
+        if self.busy():
+            self._log("还有任务在跑，先等它结束或点「取消」")
+            return
+        if auto:
+            self._auto_run = True
+            self._auto_key = "edb"
+            self._auto_queue = []
+        self._edb_worker = EdbWorker()
+        self._edb_thread = QThread(self)
+        self._edb_worker.moveToThread(self._edb_thread)
+        self._edb_thread.started.connect(self._edb_worker.run)
+        self._edb_worker.progress.connect(self._on_progress)
+        self._edb_worker.done.connect(self._on_edb_done)
+        self._edb_worker.failed.connect(self._on_update_failed)
+        self._edb_worker.done.connect(self._edb_thread.quit)
+        self._edb_worker.failed.connect(self._edb_thread.quit)
+        self._edb_thread.finished.connect(self._on_thread_done)
+
+        self.prog_update.setRange(0, 0)
+        self.prog_update.setVisible(True)
+        self.lbl_upd.setVisible(True)
+        self.lbl_upd.setText("准备更新基本面（EDB）…")
+        self._log("—— 更新基本面（EDB：243 个指标，天勤）")
+        # 和其它三条一样把主按钮切成「取消」：243 个指标分 3 批、每批一次 EDB
+        # 请求，慢的时候要几分钟，得留个出口
+        self.btn_update.setText("取消")
+        self.btn_update.setEnabled(True)
+        self._edb_thread.start()
+
+    def _on_edb_done(self, text: str) -> None:
+        self.lbl_upd.setVisible(True)
+        self.lbl_upd.setText(text)
+        self._log(text)
 
     def _build_form(self) -> QWidget:
         card = QFrame()
@@ -1264,6 +1375,35 @@ class DataPage(QWidget):
             self.cb_daily_range.addItem(label, key)
         row_daily.addWidget(self.cb_daily_range, 1)
         lay.addLayout(row_daily)
+
+        # 基本面（EDB）单独一条日程，不并进上面两条：
+        #   · 它是**天勤**接口，上面两条走 Tushare，账号和失败原因都不一样；
+        #   · 免费账户没有这个功能位（会 denied），要有独立开关让人能关掉；
+        #   · 现货价 / 仓单 / 库存 / 交割量这些指标在交易所盘后或次日才更新，
+        #     时刻可能得单独往后调，不该跟行情绑死。
+        self.chk_edb = QCheckBox("每天 15:45 补基本面（EDB：现货价 / 仓单 / 库存 / 交割量 / 利润）")
+        self.chk_edb.setToolTip(
+            "天勤 EDB 的 243 个基本面指标，写 data_tq/edb.duckdb（和行情库分开）。\n\n"
+            "这是**天勤独有**的「非价量数据」接口，必须有天勤账号（免费账户没有\n"
+            "这个功能位，会直接跳过，行情不受影响）。\n\n"
+            "为什么 15:45：紧跟在 15:30 的衍生数据之后。到点如果上一轮还在跑，\n"
+            "会等它结束、下一个 30 秒心跳再补，不会两个任务抢同一个天勤会话。\n\n"
+            "增量：只补库里最后一天之后的部分，并按批回看 30 天覆盖修订，日常几秒。"
+        )
+        lay.addWidget(self.chk_edb)
+
+        row_edb = QHBoxLayout()
+        row_edb.setSpacing(6)
+        self.time_edb = QTimeEdit()
+        self.time_edb.setDisplayFormat("HH:mm")
+        self.time_edb.setTime(QTime(15, 45))
+        self.time_edb.setToolTip(
+            "默认 15:45。仓单 / 库存 / 现货价这类指标在交易所盘后才落地，\n"
+            "定得比 15:30 的衍生数据稍晚一点，避免同一时刻抢天勤会话。"
+        )
+        row_edb.addWidget(self.time_edb)
+        row_edb.addStretch(1)
+        lay.addLayout(row_edb)
 
         self.lbl_auto_hint = QLabel(
             "只在本程序开着时生效；到点如果正在更新，就等这一轮跑完再补。"
@@ -1827,9 +1967,9 @@ class DataPage(QWidget):
 
         日期存盘而不是只放内存：半夜跑过一次之后用户重启程序，不该再补一遍。
 
-        三条日程（衍生 15:30 / 日线 17:00 / 宏观 08:00）共用这一个心跳，但各自
-        记各自的「今天跑过了」—— 15:30 的衍生数据补完不该让 17:00 的日线任务
-        也跟着认为今天跑完了。
+        四条日程（衍生 15:30 / 基本面 15:45 / 日线 17:00 / 宏观 08:00）共用这一个
+        心跳，但各自记各自的「今天跑过了」—— 15:30 的衍生数据补完不该让 17:00
+        的日线任务也跟着认为今天跑完了。
         """
         from datetime import date
 
@@ -1855,12 +1995,15 @@ class DataPage(QWidget):
                 # worker；不进 `_auto_queue`，否则 `_on_thread_done` 会去起下一个
                 # 市场，把 `_start_auto_next()` 里的 UpdateWorker 也拉起来。
                 self._start_macro(auto=True)
+            elif job.get("edb"):
+                # 基本面同理：它是天勤独有的接口，也不能排进市场队列
+                self._start_edb(auto=True)
             else:
                 self._start_auto(job["key"])
             return              # 一次只起一条，另一条等下一轮心跳
 
     def _auto_jobs(self) -> list[dict]:
-        """三条日程的控件与目标市场。
+        """四条日程的控件与目标市场。
 
         `markets` 是这条日程要跑的市场，按顺序跑 —— 日线那条要期货和美股都补，
         而衍生数据只有期货有。
@@ -1868,6 +2011,10 @@ class DataPage(QWidget):
         宏观那条是**另一种活**（不是按市场补 CSV，而是抓 23 条序列写 edb.duckdb），
         所以标 `macro: True`，并显式把 `range` 置 None：它没有「近 1 天/1 周」
         的概念，增量范围由 `macro.update()` 自己按库里最后一天算。
+
+        基本面（EDB）同理标 `edb: True`、`range` 置 None：它是天勤独有的非价量
+        接口，写的是另一张库（`data_tq/edb.duckdb` 的 edb_series），不能排进
+        市场队列 —— 排进去 `_start_auto_next()` 会拿 UpdateWorker 去补 CSV。
         """
         return [
             {"key": "aux", "label": "期货衍生数据",
@@ -1879,6 +2026,9 @@ class DataPage(QWidget):
             {"key": "macro", "label": "宏观因子",
              "chk": self.chk_macro_auto, "time": self.time_macro_auto,
              "range": None, "macro": True},
+            {"key": "edb", "label": "基本面（EDB）",
+             "chk": self.chk_edb, "time": self.time_edb,
+             "range": None, "edb": True},
         ]
 
     def _start_auto(self, key: str) -> None:
@@ -1946,6 +2096,13 @@ class DataPage(QWidget):
             self._upd_worker.cancel()
         if self._tq_worker is not None:
             self._tq_worker.cancel()
+        # 宏观 / 基本面也要收：它们没有独立的取消按钮，用户能按到的就是这一个。
+        # 原来这里只置前两个的取消位，08:00 的宏观或 15:45 的 EDB 一旦跑起来，
+        # 按钮变「取消中」却什么也没停，243 个指标要一直查到调度器走完。
+        if self._macro_worker is not None:
+            self._macro_worker.cancel()
+        if self._edb_worker is not None:
+            self._edb_worker.cancel()
         if hasattr(self, "btn_stock_run"):
             self.btn_stock_run.setEnabled(False)
         self.btn_update.setEnabled(False)
@@ -2084,12 +2241,12 @@ class DataPage(QWidget):
             QMessageBox.warning(self, "数据更新失败", message)
 
     def _on_thread_done(self) -> None:
-        for attr in ("_upd_thread", "_tq_thread", "_macro_thread"):
+        for attr in ("_upd_thread", "_tq_thread", "_macro_thread", "_edb_thread"):
             t = getattr(self, attr)
             if t is not None:
                 t.deleteLater()
                 setattr(self, attr, None)
-        for attr in ("_upd_worker", "_tq_worker", "_macro_worker"):
+        for attr in ("_upd_worker", "_tq_worker", "_macro_worker", "_edb_worker"):
             w = getattr(self, attr)
             if w is not None:
                 w.deleteLater()
@@ -2132,7 +2289,9 @@ class DataPage(QWidget):
         # `_macro_thread` 不一起收就会拖着进程不退出
         if self._macro_worker is not None:
             self._macro_worker.cancel()
-        for attr in ("_upd_thread", "_tq_thread", "_macro_thread"):
+        if self._edb_worker is not None:
+            self._edb_worker.cancel()
+        for attr in ("_upd_thread", "_tq_thread", "_macro_thread", "_edb_thread"):
             t = getattr(self, attr)
             if t is not None:
                 t.quit()
