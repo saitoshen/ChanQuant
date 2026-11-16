@@ -6179,7 +6179,8 @@ def _run() -> tuple[bool, list[str]]:
         try:
             keep = win.cb_strategy.currentIndex()
             counts = {}
-            for key in ("ria_break_day", "ria_break_night", "cta_break"):
+            for key in ("ria_break_day", "ria_break_night", "cta_break",
+                        "cta_break2"):
                 i = win.cb_strategy.findData(key)
                 if i < 0:
                     continue
@@ -6191,6 +6192,7 @@ def _run() -> tuple[bool, list[str]]:
             brk_ok = (counts.get("ria_break_day") == 6
                       and counts.get("ria_break_night") == 6
                       and counts.get("cta_break") == 6
+                      and counts.get("cta_break2") == 6
                       and win.sidebar.width() >= 340)
             brk_info = f"{counts} / 侧边栏 {win.sidebar.width()}px"
         except Exception as exc:  # noqa: BLE001
@@ -7574,6 +7576,112 @@ def _run() -> tuple[bool, list[str]]:
         return "三态 + 市场默认 7 组全对，批次标签不再裁成只做多"
 
     check("允许做空判据（note 三态 / 批次标签不外溢）", _allow_short_three_state)
+
+    def _break_caliber():
+        """波幅突破的两条口径：检查点时刻、因子基准价（#146）。
+
+        1. `cta_break2` 的检查点必须是 **10:05 那根**。交易日从夜盘 21:00 起算，
+           只写 `ms >= check_min` 的话 21:00 就满足了 —— 实测 RB 5m 上原本一半
+           的单在 21:00 进场，设 10:40 等于没设。
+        2. 用户因子 `open_range_break` 的基准是**当日开盘**、分母是**上一交易日**
+           波幅。原来写的是「当根 open / 上一根 high−low」，日线上碰巧对，5m 上
+           全错（同一根 bar 旧版 −0.83 / 新版 +0.63，连符号都反）。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factors as F
+        from ttrade import strategies as S
+
+        rows = []
+        days = ["2024-01-02", "2024-01-03", "2024-01-04"]
+        # 日盘 09:00~15:00 + 夜盘 21:00~23:00。夜盘归**下一个**交易日（交易所口径），
+        # 这正是「交易日从 21:00 起算」的来源 —— 不造夜盘就测不出检查点的时段限制
+        for k, d in enumerate(days):
+            t = pd.date_range(d + " 09:00", d + " 15:00", freq="5min")
+            drift = 0.0 if k == 0 else (0.006 if k == 1 else -0.006)
+            px = 100.0 * np.exp(drift * np.arange(len(t)))
+            for i, ts in enumerate(t):
+                rows.append((ts, px[i] * 0.999, px[i] * 1.002,
+                             px[i] * 0.998, px[i], 1000.0, pd.Timestamp(d)))
+            if k + 1 < len(days):
+                tn = pd.date_range(d + " 21:00", d + " 23:00", freq="5min")
+                pn = px[-1] * np.exp(drift * np.arange(len(tn)))
+                for i, ts in enumerate(tn):
+                    rows.append((ts, pn[i] * 0.999, pn[i] * 1.002,
+                                 pn[i] * 0.998, pn[i], 1000.0,
+                                 pd.Timestamp(days[k + 1])))
+        df = pd.DataFrame(rows, columns=["dt", "open", "high", "low", "close",
+                                         "volume", "trading_day"])
+        df = df.set_index("dt").sort_index()
+        # 再补一段**跳空夜盘**（01-04 夜 → 交易日 01-05）：夜盘档位要有大幅偏离
+        # 才可能触发。前一日波幅被顺势段放大到 35 点，所以跳空得开到 +20%（0.4×35
+        # ≈ 14 点）才够得着阈值
+        tn = pd.date_range("2024-01-04 21:00", "2024-01-04 23:00", freq="5min")
+        jump = np.r_[100.0, np.full(len(tn) - 1, 122.0)]
+        extra = pd.DataFrame({"dt": tn, "open": jump * 0.999,
+                              "high": jump * 1.002, "low": jump * 0.998,
+                              "close": jump, "volume": 1000.0,
+                              "trading_day": pd.Timestamp("2024-01-05")})
+        df = pd.concat([df, extra.set_index("dt")]).sort_index()
+
+        # 夜盘档位单独测：上面 `df` 里白天的仓会一直持到夜盘（次日 09:05 才平），
+        # 把 21:30 那个检查点挡住 —— 那是另一件事，不该混进这条断言。这里造一份
+        # 「前一日横盘 + 夜盘跳空」，保证进夜盘时是空仓
+        n_rows = [(ts, 99.9, 100.2, 99.8, 100.0, 1000.0,
+                   pd.Timestamp("2024-01-08"))
+                  for ts in pd.date_range("2024-01-08 09:00",
+                                          "2024-01-08 15:00", freq="5min")]
+        for i, ts in enumerate(pd.date_range("2024-01-08 21:00",
+                                             "2024-01-08 23:00", freq="5min")):
+            px = 100.0 if i == 0 else 122.0
+            n_rows.append((ts, px * 0.999, px * 1.002, px * 0.998, px,
+                           1000.0, pd.Timestamp("2024-01-09")))
+        df_n = pd.DataFrame(n_rows, columns=["dt", "open", "high", "low", "close",
+                                             "volume", "trading_day"])
+        df_n = df_n.set_index("dt").sort_index()
+
+        ms = (df.index.hour * 60 + df.index.minute).to_numpy()
+        sp = S.STRATEGIES["cta_break2"]
+        out = sp.func(df, **sp.params)
+        sig = out["signal"].to_numpy()
+        prev = np.r_[0, sig[:-1]]
+        ent = (sig != 0) & (sig != prev)
+        if not ent.any():
+            raise RuntimeError("合成行情没有触发任何开仓")
+        bad = sorted(set(ms[ent]) - {605})
+        if bad:
+            raise RuntimeError(f"cta_break2 不在 10:05 进场，多出时刻 {bad[:4]}")
+
+        # 夜盘档位仍然可用：21:30 开仓（用干净行情，避免被白天的持仓挡住）
+        p = dict(sp.params)
+        p.update(check_min=1290, exit_min=545)
+        o2 = sp.func(df_n, **p)
+        s2 = o2["signal"].to_numpy()
+        e2 = (s2 != 0) & (s2 != np.r_[0, s2[:-1]])
+        ms_n = (df_n.index.hour * 60 + df_n.index.minute).to_numpy()
+        if not e2.any() or set(ms_n[e2]) != {1290}:
+            raise RuntimeError(
+                "夜盘检查点（21:30）被日盘时段限制误伤："
+                f"{sorted(set(ms_n[e2])) if e2.any() else '一笔没开'}")
+
+        # 因子：当日开盘 + 昨日波幅 + 1.0 = 40%
+        g = df.groupby("trading_day")
+        o0 = g["open"].transform("first")
+        rng = (g["high"].max() - g["low"].min()).shift(1)
+        want = (df["close"] - o0) / df["trading_day"].map(rng) / 0.4
+        got = F.FACTORS["open_range_break"].func(df)
+        dev = float(np.nanmax(np.abs(got.to_numpy() - want.to_numpy())))
+        if dev > 1e-9:
+            raise RuntimeError(f"波幅突破因子没按当日开盘算：偏差 {dev:.2e}")
+        # 反证：拿「当根 open」当基准必须对不上，否则这条检查是摆设
+        wrong = (df["close"] - df["open"]) / df["trading_day"].map(rng) / 0.4
+        if float(np.nanmax(np.abs(wrong.to_numpy() - got.to_numpy()))) < 1e-6:
+            raise RuntimeError("合成行情造得太规整，证明不了当日开盘口径")
+        return (f"检查点只落在 10:05（{int(ent.sum())} 笔）/ 夜盘 21:30 可用；"
+                f"因子按当日开盘，偏差 {dev:.0e}")
+
+    check("波幅突破：检查点时刻 + 当日开盘口径", _break_caliber)
 
     def _sector_maps():
         """板块两层（L1 9 个 / L2 16 个）必须严格对齐。

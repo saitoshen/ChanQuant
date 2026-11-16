@@ -937,6 +937,15 @@ def strat_cta_break(
     - 出场：`stop_mult` × ATR 止损 + 次日 `exit_min`（默认 09:35）定时平
       + 最长持有 `hold_bars` 根
 
+    🔴 检查点必须在**自己那一段时段**里成立。交易日从夜盘 21:00 起算，
+    只写 `ms >= ck` 的话，10:40 的检查点在 21:00 那根就满足了 —— 实测 RB 5m
+    改之前 1260 分（21:00）69 笔、640 分 68 笔，一半的单压根没等检查点。
+    现在日盘检查点（ck < 12:00）限制在 09:00~16:00 内，夜盘检查点（如 21:30）
+    仍用「>=」。
+    🔴 定时平仓判据是「**进场之后**第一个 `exit_min`」，不是「换日之后」。
+    原来的 `cur_day > entry_day` 会让夜盘 21:30 进的仓多拿一整天（09:05 就在
+    同一个交易日内，永远等不到「换日」）。
+
     夜盘版不用另写一条策略：把 `check_min` 设成 21:30（1290）、`exit_min` 设成
     09:05（545）就是夜盘口径 —— 两者除了时刻没有任何差别。
 
@@ -964,6 +973,13 @@ def strat_cta_break(
     stop_mult = float(stop_mult)
     ratio = float(ratio)
     hold_bars = max(int(hold_bars), 1)
+    # 🔴 检查点只在自己那一段时段里成立。交易日是从**夜盘 21:00** 起算的
+    # （`_trading_days` + `_day_blocks`），所以 `ms[i] >= ck` 这条判据在夜盘开盘
+    # 就满足了 —— 设 10:40 的检查点，实际一半的单在 21:00 就进去了（实测 RB 5m：
+    # 1260 分 69 笔 / 640 分 68 笔）。10:05、10:40 这类日盘时刻必须限制在日盘段内，
+    # 21:30 这类夜盘时刻才用「>=」。
+    day_ck = ck < 1200            # 12:00 之前算日盘检查点（日盘 09:00~15:15）
+    day_end = 960                 # 16:00，留足国债 15:15 收盘
 
     sig = np.zeros(n, dtype=int)
     pos = 0
@@ -982,14 +998,15 @@ def strat_cta_break(
                     hit = True
                 elif pos < 0 and c[i] >= entry_px + stop_mult * entry_atr:
                     hit = True
-            timed = ms[i] == ex and cur_day > entry_day
+            timed = ms[i] == ex and i > entry_i
             if hit or timed or (i - entry_i) >= hold_bars:
                 pos = 0
                 entry_px = entry_atr = np.nan
                 entry_day = -1
                 entry_i = -1
-        # 检查点：当天的第一根 `ms >= check_min` 的 K 线，一天只看这一次
-        if pos == 0 and cur_day != checked and ms[i] >= ck:
+        # 检查点：当天第一根满足「在自己那一段时段里、且到了检查点之后」的 K 线
+        if pos == 0 and cur_day != checked and ms[i] >= ck and \
+                (not day_ck or ms[i] <= day_end):
             checked = cur_day
             pr = prev_range[i]
             base = daily_open[i]
@@ -1803,6 +1820,30 @@ STRATEGIES: dict[str, StrategySpec] = {
         desc="future_quant cta_short 的规则时序：一天只看一个检查点（默认 10:40），"
              "偏离超过 0.4×前一日振幅就顺向开仓；5×ATR 止损 + 次日 09:35 定时平。"
              "把确认时刻改成 21:30、平仓改成 09:05 就是夜盘版。",
+    ),
+    # 同一条判据、同一份代码，只把「确认时刻」提前到 10:05。
+    # 为什么值得单独存一条：`check_min` 是策略参数，注册进策略库才带得动；而
+    # 10:40 是原项目（future_quant cta_short）扫出来的平衡点，10:05 是另一头的
+    # 候选 —— 越早越接近开盘噪音、假突破多，但吃得到当天的主升段。两条并排跑
+    # 才看得出「早看」和「晚看」的差别，改参数来回切是比不出来的（会盖掉另一条）。
+    "cta_break2": StrategySpec(
+        key="cta_break2",
+        label="CTA 波幅突破·检查点2",
+        func=strat_cta_break,
+        params={"ratio": 0.40, "check_min": 605, "atr_n": 20,
+                "stop_mult": 5.0, "exit_min": 575, "hold_bars": 96},
+        param_meta={
+            "ratio": (0.1, 1.5, 0.05),
+            "check_min": (540, 1380, 5),
+            "atr_n": (5, 60, 1),
+            "stop_mult": (2.0, 12.0, 0.5),
+            "exit_min": (540, 600, 5),
+            "hold_bars": (24, 480, 12),
+        },
+        desc="和 `cta_break` 同一条判据、同一份代码，只把检查点从 10:40（640）"
+             "提前到 10:05（605）：偏离超过 0.4×前一日振幅就顺向开仓；"
+             "5×ATR 止损 + 次日 09:35 定时平 + 最长持有 96 根。"
+             "早看 35 分钟，吃得到当天主升段，代价是假突破更多。",
     ),
     # ---- A 股选股型（只做多、只吃日线）----
     "a_vol_breakout": StrategySpec(
