@@ -411,7 +411,11 @@ SIZE_MODES = [
 
 # 因子策略的参数：名字 -> (标签, 最小, 最大, 步长, 默认值)
 FACTOR_PARAMS = {
-    "window": ("标准化窗口（根）", 120, 500, 20, 252),
+    # 上限 3000：`window` 是 **bar 根数**，扫描/注册端按「252 个交易日 × 每日根数」
+    # 折算，30m 上就是 2822（AU 30m 每天 19 根 → 4788）。原来卡在 500，载入库里
+    # 这些策略时滑块会把值静默钳到 500，再保存就把策略改掉了 —— 见 `_apply_factor_cfg`
+    # 里那道「超量程先撑量程」的补丁。
+    "window": ("标准化窗口（根）", 120, 3000, 20, 252),
     "horizon": ("预测期数", 1, 20, 1, 5),
     # 下限 0.1：分数在 ±4 之间，0.1 大约是十分位，想「几乎一直有仓」时能设到。
     # 离场阈值会跟着压到它下面（见 _tie_exit_to_entry）
@@ -2418,7 +2422,10 @@ class MainWindow(QMainWindow):
         lbl.setObjectName("Hint")
         irl.addWidget(lbl, 1)
         self.sp_ic_rebal = QSpinBox()
-        self.sp_ic_rebal.setRange(10, 500)
+        # 上限 2000：与 `window` 同理，IC 重算间隔也跟着「天数 × 每日根数」走
+        # （30m 上 60 天 × 19 根 = 1140）。原来卡 500，库里 119/737 条超限，
+        # 载入再保存就会被静默改小。
+        self.sp_ic_rebal.setRange(10, 2000)
         self.sp_ic_rebal.setSingleStep(10)
         self.sp_ic_rebal.setValue(60)
         self.sp_ic_rebal.setSuffix(" 根")
@@ -5366,9 +5373,16 @@ class MainWindow(QMainWindow):
             if name not in cfg:
                 continue
             try:
-                wdg.setValue(int(round(float(cfg[name]) * self.fparam_scales.get(name, 1))))
+                v = int(round(float(cfg[name]) * self.fparam_scales.get(name, 1)))
             except (TypeError, ValueError):
                 continue
+            # 🔴 滑块会把超量程的值**静默钳到上限**：库里 window=4788 的策略载入后
+            # 变成 500，用户什么都没动、一保存就把这条策略改掉了，而且界面上看不出
+            # 任何异常（数字就那么显示着，像个合法值）。载入时遇到超量程就把量程
+            # 撑到那个值 —— 宁可不整齐，也不能替用户改数据。
+            if v > wdg.maximum():
+                wdg.setMaximum(v)
+            wdg.setValue(v)
         for key, cb in (("model", self.cb_fmodel), ("orient", self.cb_forient),
                         ("method", getattr(self, "cb_fmethod", None)),
                         # 过滤时机（否决 / 延后 / 离场）。`_factor_cfg()` 一直在
@@ -5427,7 +5441,11 @@ class MainWindow(QMainWindow):
                 self.cb_fweight.setCurrentIndex(i)
                 self.cb_fweight.blockSignals(False)
             if hasattr(self, "sp_ic_rebal") and cfg.get("ic_rebal"):
-                self.sp_ic_rebal.setValue(int(cfg["ic_rebal"]))
+                _v = int(cfg["ic_rebal"])
+                # 同 `_apply_factor_cfg`：超量程先撑量程，别让 QSpinBox 悄悄改数
+                if _v > self.sp_ic_rebal.maximum():
+                    self.sp_ic_rebal.setMaximum(_v)
+                self.sp_ic_rebal.setValue(_v)
             # 权重列：只把配置里有的键写回去，其余保持表格里的现值。
             # 整表重灌会把用户在界面上刚改过的权重冲掉
             wts = cfg.get("weights") or {}
