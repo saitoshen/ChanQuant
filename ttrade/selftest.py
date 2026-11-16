@@ -7421,6 +7421,22 @@ def _run() -> tuple[bool, list[str]]:
         multi = [c for c in S.load_library() if c.name == pm["name"]][0]
         if multi.multi_symbols != ["MA_CZCE", "TA_CZCE"]:
             raise RuntimeError(f"多品种回读不对：{multi.multi_symbols}")
+        # 🔴 2026-11-16：板块级策略只有 `multi_symbols`、没有 symbol/exchange，
+        # 空着会让 `market_of()` 判成 us（美股）、`key()` 返回空串 ⇒ 界面加载时
+        # 先切到美股市场、再按空 key 定位品种，两步全落空，多品种勾选被清空
+        # （用户报的「注册时没存多品种信息」）。340 条板块级条目全中过。
+        # 这里钉死三件事：存盘时补代表品种、市场判据退到品种池、key 不为空
+        if (multi.symbol, multi.exchange) != ("MA", "CZCE"):
+            raise RuntimeError(
+                f"多品种代表品种没补上：{multi.symbol!r}/{multi.exchange!r}")
+        if multi.market != "cn":
+            raise RuntimeError(f"多品种市场判错了：{multi.market}（应为 cn）")
+        if multi.key() != "MA_CZCE":
+            raise RuntimeError(f"多品种 key() 不对：{multi.key()!r}")
+        bare = multi.clone(symbol="", exchange="")
+        if bare.market != "cn" or bare.key() != "MA_CZCE":
+            raise RuntimeError(
+                f"空 symbol 时兜底失效：market={bare.market} key={bare.key()!r}")
 
         bad = []
         for args, want in (

@@ -47,6 +47,31 @@ MARKET_COST = {
 STOCK_EXCHANGES = ("SSE", "SZSE", "BSE")
 
 
+def _ex_of_key(key: str) -> str:
+    """从品种键反解交易所。
+
+    `DataStore` 的键有两种写法，两种都要认：
+    - 期货：`RB_SHFE`（下划线后缀）
+    - A 股：`SSE.600000`（**点前缀**，代码本身就带交易所）
+    - 美股：`AAPL`（没有交易所，返回空）
+    """
+    k = str(key or "").strip()
+    if not k:
+        return ""
+    if "." in k:
+        return k.split(".", 1)[0].upper()
+    if "_" in k:
+        return k.rsplit("_", 1)[-1].upper()
+    return ""
+
+
+def _market_of_ex(ex: str) -> str:
+    ex = str(ex or "").upper()
+    if ex in STOCK_EXCHANGES:
+        return "cn_stock"
+    return "cn" if ex else "us"
+
+
 def market_of(cfg) -> str:
     """配置属于哪个市场。
 
@@ -54,11 +79,22 @@ def market_of(cfg) -> str:
     （SHFE / DCE / CZCE / INE / CFFEX / GFEX）是期货；交易所为空是美股。
     这个判据和「策略研究」页的 `self.market` 保持一致 —— 两边不一致的话，
     组合页会用期货的手续费去回放一条 A 股策略。
+
+    🔴 多品种策略（板块级）没有 `symbol` / `exchange`，只有 `multi_symbols`。
+    2026-11-16 之前这里只看 `exchange`，于是 **340 条板块级策略全被判成 `us`**：
+    `key()` 也返回空串，界面按市场重建品种列表后一个都匹配不上，多品种勾选被
+    清空 —— 用户看到的就是「注册时没存多品种信息，加载回来没了」。
+    数据明明在 `multi_symbols` 里，错的是判据。所以交易所为空时**退到品种池
+    第一个成员的交易所**，只有连品种池都没有才算美股。
     """
     ex = str(getattr(cfg, "exchange", "") or "").upper()
-    if ex in STOCK_EXCHANGES:
-        return "cn_stock"
-    return "cn" if ex else "us"
+    if ex:
+        return _market_of_ex(ex)
+    for k in (getattr(cfg, "multi_symbols", None) or []):
+        ex = _ex_of_key(k)
+        if ex:
+            return _market_of_ex(ex)
+    return "us"
 
 
 def default_allow_short(cfg) -> bool:
@@ -430,7 +466,8 @@ def run(cfg, df: pd.DataFrame | None, market: str = "",
 
 
 def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
-              extras: dict[str, dict] | None = None) -> Replay:
+              extras: dict[str, dict] | None = None,
+              allow_partial: bool = False) -> Replay:
     """多品种等权回放的离线版本。组合页双击一条多品种策略走这里。
 
     和研究页的「多品种回测」是同一个口径：**每个品种各跑一遍**（各自的成本、
@@ -508,6 +545,18 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
             named.append((key, rp.res))
     if not results:
         return Replay(error="多品种一个都没跑出来：" + "；".join(failed[:4]))
+    # 🔴 掉了腿就必须报错，不能「有几个算几个」（2026-11-16 补）。
+    # 以前只有「一条都没跑出来」才报错，跑出 1~N-1 条就**静默返回残缺组合** ——
+    # 而多品种等权的分母是腿数，少一条腿就是另一条净值曲线：实测 9 品种 5m 那条
+    # 在内存吃紧时只剩 1 条腿，笔数 3649 → 151、卡玛 0.56 → 0.29，界面上看不出
+    # 任何异常，只会觉得「这策略最近变差了」。这类失败多数是 OOM（5m 单帧 60~81MB，
+    # 9 个品种连 replay 的工作副本一起要 1GB 以上）。
+    # 真的要「有就画」，显式传 `allow_partial=True`，别让默认路径出错答案。
+    if failed and not allow_partial:
+        return Replay(
+            error="多品种掉了 %d/%d 条腿（结果不可比，已拒绝返回）：%s"
+                  % (len(failed), len(keys), "；".join(failed[:4]))
+                  + "　—— 常见原因是内存不足或该品种行情太短")
     # 🔴 组合的「本金」是**一个账户**的钱，不是各品种之和。多品种等权是「同一个
     # 策略在 N 个品种上各跑一遍、净值取均值」，每个品种那份回测都拿满了同一笔
     # 本金（`run()` 里 `initial_cash = principal`），把它们加起来是 N 倍本金 ——

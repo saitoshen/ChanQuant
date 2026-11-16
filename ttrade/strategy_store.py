@@ -312,12 +312,24 @@ class StrategyConfig:
         - 期货：`RB_SHFE`
         - A 股：`SSE.600000` —— **代码里本来就带交易所前缀**，再拼一次就成
           `SSE.600000_SSE`，`cb_symbol.findData()` 找不到，恢复配置会静默失败
+
+        🔴 多品种策略（板块级）**没有单品种**：`symbol` / `exchange` 都是空，
+        只有 `multi_symbols`。以前这里直接返回空串，于是 `cb_symbol.findData("")`
+        永远找不到、按 `key()` 筛品种池的地方也全是空。现在退到品种池第一个成员 ——
+        它只是给「下拉框定位 / 日志里指代」用的**代表品种**，真正要跑哪些品种
+        一律走 `symbols` 属性（那个才是 `multi_symbols` 优先的真源）。
         """
         ex = str(self.exchange or "").upper()
         if ex in _STOCK_EXCHANGES:
             sym = str(self.symbol or "")
             return sym if "." in sym else f"{ex}.{sym}"
-        return f"{self.symbol}_{self.exchange}" if self.exchange else self.symbol
+        if self.exchange:
+            return f"{self.symbol}_{self.exchange}"
+        if not self.symbol:
+            for k in (self.multi_symbols or []):
+                if str(k or "").strip():
+                    return str(k).strip()
+        return self.symbol
 
     @property
     def market(self) -> str:
@@ -786,6 +798,39 @@ def _ensure_sid(cfg: StrategyConfig) -> None:
         cfg.sid = uuid.uuid4().hex[:12]
 
 
+def _ensure_symbol(cfg: StrategyConfig) -> None:
+    """落盘前给多品种策略补一个**代表品种**（`symbol` / `exchange`）。
+
+    板块级策略只有 `multi_symbols`，`symbol` / `exchange` 是空的。空着会连带
+    三件事全废：`market_of()` 判成 `us`（美股）、`key()` 返回空串、界面按
+    `key()` 定位品种下拉框找不到 —— 用户看到的就是「注册时没存多品种信息，
+    加载回来没了」（2026-11-16 之前 340 条板块级条目全中）。
+
+    `market_of()` / `key()` 已经会退到 `multi_symbols` 兜住，这里再做一层是
+    为了**写出界面自己保存时的形状**（GUI 的 `_current_config` 一定会带一个
+    真实 symbol），这样打包版 / 旧版本打开也不坏。代表品种只用于定位与显示，
+    真正跑哪些品种一律走 `symbols` 属性。
+    """
+    if cfg.symbol or cfg.exchange:
+        return
+    keys = [str(k).strip() for k in (cfg.multi_symbols or []) if str(k).strip()]
+    if len(keys) < 2:
+        return
+    k = keys[0]
+    if "." in k:                              # A 股：`SSE.600000`
+        head, tail = k.split(".", 1)
+        if head.upper() in _STOCK_EXCHANGES:
+            cfg.symbol, cfg.exchange = tail, head.upper()
+            return
+        cfg.symbol, cfg.exchange = head, tail
+        return
+    if "_" in k:                              # 期货：`RB_SHFE`
+        sym, ex = k.rsplit("_", 1)
+        cfg.symbol, cfg.exchange = sym, ex
+        return
+    cfg.symbol = k                            # 美股：没有交易所
+
+
 def _load_list(name: str) -> list[StrategyConfig]:
     raw = _load(name)
     if not isinstance(raw, list):
@@ -833,6 +878,7 @@ def library_view() -> list[StrategyConfig]:
 def save_library(items: list[StrategyConfig]) -> None:
     for c in items:
         _ensure_sid(c)
+        _ensure_symbol(c)
     _save(LIB_FILE, [c.to_dict() for c in items])
 
 
@@ -1020,6 +1066,7 @@ def load_portfolio() -> list[StrategyConfig]:
 def save_portfolio(items: list[StrategyConfig]) -> None:
     for c in items:
         _ensure_sid(c)
+        _ensure_symbol(c)
     _save(PORT_FILE, [c.to_dict() for c in items])
 
 
