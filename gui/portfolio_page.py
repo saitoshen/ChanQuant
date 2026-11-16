@@ -305,7 +305,7 @@ class MeasureWorker(QObject):
                     if frame is None and kind == "single":
                         frame = payload[0] if isinstance(payload, tuple) else payload
                     mk = replay.market_of(cfg)
-                    bt = replay.make_bt(mk, replay.default_allow_short(cfg), cfg)
+                    bt = replay.make_bt(mk, replay.resolve_allow_short(cfg), cfg)
                     out.append(PL.measure(cfg, frame, rp.res,
                                           bt.multiplier, bt.margin_rate))
                 except Exception as exc:           # noqa: BLE001

@@ -1718,11 +1718,18 @@ class MainWindow(QMainWindow):
         收益对不上策略说明，而且**不报错**。
 
         现在：Agent 明确说 short 就照办，没说就按市场默认（期货勾上、A 股 / 美股
-        不勾），判据统一走 `replay.default_allow_short()`。
+        不勾），判据统一走 `replay.resolve_allow_short()` —— 别再用
+        `default_allow_short()`，那会把用户显式取消勾选（`note="long"`）也一起
+        翻回允许做空。
+
+        ⚠️ 这里 `cfg.note` 还没赋值（本函数的返回值就是要赋给它的），所以显式意图
+        得先自己接住，再落到「市场默认」那一档。
         """
-        if note == "short" or replay.default_allow_short(cfg):
+        if note == "short":
             return "short"
-        return ""
+        if note == "long":
+            return ""
+        return "short" if replay.resolve_allow_short(cfg) else ""
 
     def _on_agent_trade(self, action) -> None:
         """Agent 给了交易动作。动作**已经在界面上确认过**才走到这里。"""

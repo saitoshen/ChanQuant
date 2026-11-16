@@ -604,7 +604,11 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
     # 原本的 label 是策略名（「唐奇安」），切过去图例上写着策略名会认不出是谁
     res.legs = {str(k): replace(r, label=str(k)) for k, r in named}
     bpy = bars_per_year(res.equity.index)
-    _bt = make_bt(mk, getattr(cfg, "note", "") == "short", cfg)
+    # 方向标记同样走 `resolve_allow_short()` —— 这里是 #145 的漏网之鱼：上面每条
+    # 腿都是逐品种 `run()`（判据已是三态），回填 Replay 的标记却还写着
+    # `note == "short"`。后果是**执行双向、界面显示只做多**：批次标签
+    # （`sector-pack-*`）在界面上被当成「只做多」，同一份配置两个答案。
+    _bt = make_bt(mk, resolve_allow_short(cfg), cfg)
     return Replay(res=res, bh=None, label=res.label,
                   family=getattr(cfg, "family", "rule"),
                   period=period,
