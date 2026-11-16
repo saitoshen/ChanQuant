@@ -6523,6 +6523,27 @@ def _run() -> tuple[bool, list[str]]:
                            and title_txt.startswith(f"{len(before)} 个品种"))
             multi_rt_info = (f"存 {len(before)} 个 / 清空 {len(cleared)} 个 / "
                              f"恢复 {len(after_sel)} 个 / 标题 {title_txt[:16]}")
+
+            # ---- 板块级（多品种）配置：`symbol` / `exchange` 是空的 ----
+            #
+            # 上面那条往返走的是 `_current_config()`，它一定会带一个真实 symbol，
+            # 所以从没覆盖到「板块级」这种形态 —— 用户报的「产业板块的多品种策略
+            # 注册完再加载，品种勾选没了」就是这么溜过去的。原形是两条判据只看单
+            # 品种字段：`market_of()` 见 exchange 空就判 us（美股，整个品种池被换
+            # 掉）、`key()` 返回空串（下拉框定位落空）。这里把代表品种抹掉再灌一
+            # 次，勾选必须原样回来。
+            bare_rt = cfg_rt.clone(symbol="", exchange="")
+            win.sym_pick.clear()
+            app.processEvents()
+            win.apply_config(bare_rt)
+            app.processEvents()
+            bare_sel = list(win.sym_pick.selected())
+            if bare_sel != before:
+                raise RuntimeError(
+                    f"板块级（无 symbol/exchange）配置灌回界面丢了品种："
+                    f"{len(bare_sel)} 个 vs {len(before)} 个"
+                    f"（market={bare_rt.market}、key={bare_rt.key()!r}）")
+            multi_rt_info += f" / 板块级 {len(bare_sel)} 个也回来"
             win.sym_pick.clear()
             app.processEvents()
         except Exception as exc:  # noqa: BLE001
