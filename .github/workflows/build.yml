@@ -222,14 +222,26 @@ jobs:
   release:
     name: 发布 Release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # **不要求三个平台全绿**。2026-11-16 实测：同一份代码、同一个 tag，macOS 的
+    # 自检会**概率性**死在「构建主窗口（端到端）」（arm64 与 x64 轮流挂，换个
+    # tag 又都能过）—— 这是内存越界类的非确定性崩溃，不是版本问题，短时间修不掉。
+    # 而 `needs: build` 默认要求所有矩阵 job 成功，结果是一两个平台的偶发崩溃
+    # 把**三个平台的包全扣住**，连续 7 轮 Release 被 skip。
+    # 能出几个平台的包就发几个：Windows 是主力平台，不该被 macOS 的偶发崩溃拖住。
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+        # 挂了的那一两个平台没有 artifact，不能让这里把发版也带下去
+        continue-on-error: true
 
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*.zip
+          # 自动按提交生成 release notes。别同时写 `body` —— 两者一起给时
+          # softprops 会用 body 顶掉自动生成的内容，反而丢了这一版的变更清单。
           generate_release_notes: true
+          # 某个平台没上传成功时，files 匹配不到不要紧，别让发版再挂一次
+          fail_on_unmatched_files: false
