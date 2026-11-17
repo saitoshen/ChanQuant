@@ -4721,15 +4721,14 @@ def _run() -> tuple[bool, list[str]]:
         if r.book:
             raise RuntimeError(f"账户漂移触发了交易：{r.book}")
 
-        # ④ 信号真的变了才发：-5 → +3 就是买 8 手（其中 5 手平空、3 手开多）。
-        #    `closeable=5` 是关键：账户上可能还有别的策略的空单，能平的只有自己
-        #    发过的这 5 手
+        # ④ 信号真的变了才发：-5 → +3 就是买 8 手。**不传 `closeable`**：
+        #    账户里有没有空单可平是 `_legs` 的事，策略只认自己该发几手
         st.pending.clear()
         st.target = 3
         r._pos = {"SHFE.rb2701": _P(0, 5)}
         r._rebalance(st)
-        if r.book != [("SHFE.rb2701", 8, 5)]:
-            raise RuntimeError(f"信号驱动该发 +8 手（可平 5）：{r.book}")
+        if r.book != [("SHFE.rb2701", 8, None)]:
+            raise RuntimeError(f"信号驱动该发 +8 手：{r.book}")
         if st.sent.get("SHFE.rb2701") != 3:
             raise RuntimeError(f"发完之后 sent 要跟目标一致：{st.sent}")
 
@@ -4748,7 +4747,7 @@ def _run() -> tuple[bool, list[str]]:
         st.pending.clear()
         r.book.clear()
         r._rebalance(st)
-        if r.book != [("SHFE.rb2702", 3, 0)]:
+        if r.book != [("SHFE.rb2702", 3, None)]:
             raise RuntimeError(f"换月后新合约要按目标建仓：{r.book}")
 
         # ⑥ 换月后立刻重启：`sent` 是空的，不知道老合约有几手 ⇒ 不发单，
@@ -4778,35 +4777,30 @@ def _run() -> tuple[bool, list[str]]:
         if b.sent:
             raise RuntimeError("`sent` 被不同槽位共享了")
 
-        # ⑨ 平仓**不许**变成反手开仓：目标 0、自己记着 -5，但账户里一手空都没有
-        #    （被手工平了）。硬发一笔「买 5 手」就凭空开了 5 手多
+        # ⑨ 🔴 账户里没有可平的仓，**照样按信号发**：策略手里记着 -5（空），
+        #    目标回到 0 ⇒ 买 5 手平。账户里没有空单，可能是别的策略的多单对冲
+        #    掉了；这一买落成「开多」是对的 —— 策略只负责下单，账户长什么样由
+        #    外部（一键对齐）负责。任何「看账户裁剪订单」都会把策略重新绑回账户
         r3 = _runner()
         st3 = _slot(r3, sid="c", target=0)
         st3.based = True
         st3.sent = {"SHFE.rb2701": -5}
         r3._pos = {}
         r3._rebalance(st3)
-        if r3.book:
-            raise RuntimeError(f"账户没仓还去平，等于反手开仓：{r3.book}")
+        if r3.book != [("SHFE.rb2701", 5, None)]:
+            raise RuntimeError(f"信号要平仓就照发，不许看账户砍单：{r3.book}")
 
-        # 反证：账户里真有那 5 手空时，同样一笔必须发出去（买 5 手平）
-        st3.pending.clear()
-        r3.book.clear()
-        r3._pos = {"SHFE.rb2701": _P(0, 5)}
-        r3._rebalance(st3)
-        if r3.book != [("SHFE.rb2701", 5, 5)]:
-            raise RuntimeError(f"该买 5 手平空：{r3.book}")
-        # ⑩ 同一个合约上还站着**别的策略**的仓：只能平自己发过的那部分
-        #    A 发过 +5（多），信号翻空到 -3 ⇒ 该卖 8 手；账户里多 10 手是 A+B 的。
-        #    能平的上限必须是 5，否则会把 B 的仓平掉，B 下一根又开回来，来回拆台
+        # ⑩ 同一个合约上还站着**别的策略**的仓（账户多 10 手 = A 的 5 + B 的 5）：
+        #    A 从 +5 翻到 -3，就该卖 8 手。能平多少由 `_legs` 按账户算，
+        #    策略不去替它做主
         r4 = _runner()
         st4 = _slot(r4, sid="d", target=-3)
         st4.based = True
         st4.sent = {"SHFE.rb2701": 5}
         r4._pos = {"SHFE.rb2701": _P(10, 0)}
         r4._rebalance(st4)
-        if r4.book != [("SHFE.rb2701", -8, 5)]:
-            raise RuntimeError(f"卖 8 手、其中只有 5 手可平：{r4.book}")
+        if r4.book != [("SHFE.rb2701", -8, None)]:
+            raise RuntimeError(f"该卖 8 手（不看别人仓）：{r4.book}")
         return "重启只建基准、目标不变不发单、账户漂移不管，换月仍自动平老开新"
 
     check("取消台账：策略只在信号驱动下交易", _no_ledger)
