@@ -18,7 +18,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from datetime import datetime
+import json
+import os
+
+from PySide6.QtCore import Qt, QTime, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -39,6 +43,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -114,6 +119,109 @@ def _color(v) -> str:
     if f < 0:
         return C_DOWN
     return C_TEXT
+
+
+# ---------------------------------------------------------------- 账户定时
+#
+# 「到点自动登录 / 登出」。两行、四个时刻，都是用户 2026-11-17 定的：
+#
+#     夜盘  登录 20:55   登出 02:35
+#     日盘  登录 08:55   登出 15:20
+#
+# 登录时刻都留了 5 分钟余量（20:55 / 08:55）——柜台开盘前要握手、订阅、拉持仓，
+# 卡在整点登录经常出现「第一根 bar 没收到」；登出时刻留 5 分钟（02:35 / 15:20）
+# 让收盘那几笔成交和结算回推完再断。
+#
+# **夜盘登出跨零点**（02:35 在「第二天」）。判据不能写成「今天 02:35 之前」，
+# 只能按「当前时刻往回推 grace 秒内有没有一个到点」，见 `acc_due()`。
+
+ACC_TIMER_FILE = "account_timer.json"
+# 到点之后多久之内还算「该动作」。程序 21:03 才打开，20:55 的登录仍然要补上；
+# 但中午 12:00 打开不该把 08:55 那次再补一遍（那时补登录没意义）。
+ACC_GRACE = 600
+
+ACC_DEFAULTS = {
+    "enabled": False,
+    "night": ["20:55", "02:35"],     # [登录, 登出]
+    "day": ["08:55", "15:20"],
+}
+
+
+def acc_timer_path() -> str:
+    from ttrade.paths import user_dir
+
+    return os.path.join(user_dir(), ACC_TIMER_FILE)
+
+
+def load_acc_timer() -> dict:
+    """读账户定时配置；坏的/缺的字段按默认值补齐。"""
+    cfg = {k: (list(v) if isinstance(v, list) else v)
+           for k, v in ACC_DEFAULTS.items()}
+    try:
+        with open(acc_timer_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            cfg["enabled"] = bool(d.get("enabled", cfg["enabled"]))
+            for k in ("night", "day"):
+                v = d.get(k)
+                if isinstance(v, (list, tuple)) and len(v) == 2:
+                    cfg[k] = [str(v[0]), str(v[1])]
+    except Exception:  # noqa: BLE001
+        pass
+    return cfg
+
+
+def save_acc_timer(cfg: dict) -> None:
+    try:
+        path = acc_timer_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def acc_transitions(cfg: dict) -> list[tuple[str, str, str]]:
+    """(kind, "HH:MM", 场次名) 四个时刻。`kind` 是 `login` / `logout`。"""
+    out: list[tuple[str, str, str]] = []
+    for key, label in (("day", "日盘"), ("night", "夜盘")):
+        pair = cfg.get(key) or []
+        if len(pair) != 2:
+            continue
+        out.append(("login", str(pair[0]), label))
+        out.append(("logout", str(pair[1]), label))
+    return out
+
+
+def acc_due(cfg: dict, now: datetime, last_token: str = "",
+            grace: int = ACC_GRACE):
+    """当前时刻该不该动作。返回 `(kind, 标签, token)`，没有就 None。
+
+    「到点」的判据是**往回看 grace 秒**：`now - 时刻` 落在 `[0, grace]` 内。
+    这样夜盘 02:35 的登出（跨零点）和 20:55 的登录是同一套逻辑，不用分今天明天。
+
+    `last_token` 是上次已经执行过的那个时刻（`YYYY-MM-DD HH:MM`），同一时刻不会
+    执行第二遍 —— 心跳 20 秒一次，否则会连着发十几个登录请求。
+    """
+    if not cfg.get("enabled"):
+        return None
+    best = None
+    for kind, hhmm, label in acc_transitions(cfg):
+        try:
+            hh, mm = [int(x) for x in hhmm.split(":")[:2]]
+        except (ValueError, AttributeError):
+            continue
+        ts = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        delta = (now - ts).total_seconds()
+        if delta < 0 or delta > grace:
+            continue
+        if best is None or ts > best[0]:
+            best = (ts, kind, label, f"{ts:%Y-%m-%d %H:%M}")
+    if best is None or best[3] == last_token:
+        return None
+    return best[1], best[2], best[3]
 
 
 class _Stat(QFrame):
@@ -298,6 +406,86 @@ class AccountDialog(QDialog):
         )
 
 
+class AccountTimerDialog(QDialog):
+    """账户定时：到点自动登录 / 登出。
+
+    两行四个时刻，第一行夜盘、第二行日盘，每行「登录 … 登出 …」。
+    夜盘的登出会跨零点（20:55 登 → 次日 02:35 出），所以这里只收时刻，
+    不让人填日期 —— 场次是按时刻判的，见 `acc_due()`。
+    """
+
+    def __init__(self, cfg: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("账户定时登录 / 登出")
+        self.setMinimumWidth(460)
+        form = QFormLayout(self)
+
+        self.chk = QCheckBox("启用（到点自动登录 / 登出，程序开着才生效）")
+        self.chk.setChecked(bool(cfg.get("enabled")))
+        self.chk.setToolTip(
+            "登录用的是**账户列表里勾选的那几个账户**，和点「连接」完全一样；\n"
+            "登出就是点「断开」。\n\n"
+            "到点时如果已经连着（或已经断开），什么也不做，不会重复发请求。\n"
+            "程序在那个时刻没开着，这一场就跳过 —— 不会攒着补一次。"
+        )
+        form.addRow(self.chk)
+
+        self.ed: dict[str, tuple[QTimeEdit, QTimeEdit]] = {}
+        for key, label in (("night", "夜盘"), ("day", "日盘")):
+            pair = cfg.get(key) or ACC_DEFAULTS[key]
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            row.addWidget(QLabel("登录"))
+            a = QTimeEdit()
+            a.setDisplayFormat("HH:mm")
+            a.setTime(QTime.fromString(str(pair[0]), "HH:mm"))
+            row.addWidget(a)
+            row.addWidget(QLabel("登出"))
+            b = QTimeEdit()
+            b.setDisplayFormat("HH:mm")
+            b.setTime(QTime.fromString(str(pair[1]), "HH:mm"))
+            row.addWidget(b)
+            row.addStretch(1)
+            box = QWidget()
+            box.setLayout(row)
+            form.addRow(f"{label}（登录 / 登出）", box)
+            self.ed[key] = (a, b)
+
+        hint = QLabel(
+            "默认：夜盘 20:55 登 → 02:35 出，日盘 08:55 登 → 15:20 出。\n"
+            "登录留 5 分钟余量是给柜台握手、订阅行情、拉持仓；登出留 5 分钟是等\n"
+            "收盘那几笔成交和结算回推完。\n\n"
+            "**只管登录 / 登出，不管下单**：策略是不是自动交易，仍由策略页的开关决定。\n"
+            "夜盘登出跨零点（02:35），按时刻判，不用管它是哪天。"
+        )
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        form.addRow(hint)
+
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        box.accepted.connect(self._on_ok)
+        box.rejected.connect(self.reject)
+        form.addRow(box)
+
+    def _on_ok(self) -> None:
+        for key, label in (("night", "夜盘"), ("day", "日盘")):
+            a, b = self.ed[key]
+            if a.time() == b.time():
+                QMessageBox.warning(
+                    self, "时刻重复",
+                    f"{label}的登录和登出是同一个时刻（{a.time().toString('HH:mm')}），"
+                    "这样只会立刻断开。改一下再确定。")
+                return
+        self.accept()
+
+    def result_cfg(self) -> dict:
+        cfg = {"enabled": self.chk.isChecked()}
+        for key in ("night", "day"):
+            a, b = self.ed[key]
+            cfg[key] = [a.time().toString("HH:mm"), b.time().toString("HH:mm")]
+        return cfg
+
+
 class TradePage(QWidget):
     """账户透视 + 下单。"""
 
@@ -317,6 +505,11 @@ class TradePage(QWidget):
         # 一单同时下到期货和股票账户本来就不成立
         self._stock_mode = False
         self._ctp_mode = False
+        # 账户定时（到点自动登录 / 登出）。配置存磁盘，`_acc_last` 只放内存：
+        # 同一个时刻跑过就不再跑，重启程序后重跑一次也没关系（已经连着/断着
+        # 就什么都不做）。
+        self._acc_cfg = load_acc_timer()
+        self._acc_last = ""
         self._build()
         # 默认全勾：以前是「下拉框选中谁就连谁」，现在多个账户并存，全勾等于
         # 保持原来的行为；用户想只连一个，取消其余勾选即可
@@ -328,6 +521,13 @@ class TradePage(QWidget):
         live.started.connect(self._on_started)
         live.stopped.connect(self._on_stopped)
         live.order_sent.connect(self._on_order_sent)
+        # 20 秒看一眼。定时精度到分钟，没必要每秒唤醒；`acc_due()` 还有
+        # 10 分钟宽限窗口，所以 20 秒的粒度不会漏掉任何一场。
+        self._acc_timer = QTimer(self)
+        self._acc_timer.setInterval(20000)
+        self._acc_timer.timeout.connect(self._acc_tick)
+        self._acc_timer.start()
+        self._sync_acc_btn()
 
     # ---------------------------------------------------------- 构建
     def _build(self) -> None:
@@ -382,6 +582,12 @@ class TradePage(QWidget):
         self.btn_connect = QPushButton("连接")
         self.btn_connect.clicked.connect(self._toggle_connect)
         lay.addWidget(self.btn_connect)
+
+        # 账户定时：到点自动登录 / 登出。和「连接」并排 —— 用户想找的就是
+        # 「怎么让它自己连」，放在同一行不用翻设置。
+        self.btn_acc_timer = QPushButton("账户定时…")
+        self.btn_acc_timer.clicked.connect(self._open_acc_timer)
+        lay.addWidget(self.btn_acc_timer)
 
         self.lbl_dot = QLabel("●")
         self.lbl_dot.setStyleSheet(f"color: {C_IDLE}; font-size: 15px;")
@@ -772,6 +978,56 @@ class TradePage(QWidget):
         # 可能就是 None，传空串让 worker 自己按顺序挑
         feed = self.cb_feed.currentData() or ""
         self.connect_requested.emit((specs, feed))
+
+    # ---- 账户定时 ----
+
+    def _open_acc_timer(self) -> None:
+        dlg = AccountTimerDialog(self._acc_cfg, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._acc_cfg = dlg.result_cfg()
+        save_acc_timer(self._acc_cfg)
+        self._sync_acc_btn()
+        self.on_log(
+            "账户定时：" + ("已开启" if self._acc_cfg["enabled"] else "已关闭")
+            + "　夜盘 {} 登 / {} 出，日盘 {} 登 / {} 出".format(
+                *self._acc_cfg["night"], *self._acc_cfg["day"]))
+
+    def _sync_acc_btn(self) -> None:
+        """按钮上直接标出开没开，不用点开才知道。"""
+        cfg = self._acc_cfg
+        on = bool(cfg.get("enabled"))
+        self.btn_acc_timer.setText("账户定时（已开）" if on else "账户定时…")
+        self.btn_acc_timer.setToolTip(
+            "到点自动登录 / 登出（程序开着才生效）。\n"
+            f"夜盘：{cfg['night'][0]} 登录 → {cfg['night'][1]} 登出\n"
+            f"日盘：{cfg['day'][0]} 登录 → {cfg['day'][1]} 登出\n"
+            "登录用的是账户列表里勾选的账户；登出就是断开。\n"
+            "已连着 / 已断着时不重复动作。"
+            + ("" if on else "\n\n当前：**未启用**（点开勾上「启用」）"))
+
+    def _acc_tick(self) -> None:
+        due = acc_due(self._acc_cfg, datetime.now(), self._acc_last)
+        if due is None:
+            return
+        kind, label, token = due
+        self._acc_last = token
+        hhmm = token[-5:]
+        if kind == "login":
+            if self.live.running:
+                self.on_log(f"账户定时：{label} {hhmm} 到点，已经连着，不重复登录")
+                return
+            specs = self._checked_specs()
+            if not specs:
+                self.on_log(f"账户定时：{label} {hhmm} 到点，但没有勾选账户，跳过")
+                return
+            self.connect_requested.emit((specs, self.cb_feed.currentData() or ""))
+            self.on_log(f"账户定时：{label} {hhmm} 自动登录（{len(specs)} 个账户）")
+        else:
+            if not self.live.running:
+                return
+            self.disconnect_requested.emit()
+            self.on_log(f"账户定时：{label} {hhmm} 自动断开")
 
     def _on_started(self, key: str) -> None:
         self.btn_connect.setText("断开")

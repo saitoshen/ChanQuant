@@ -6076,18 +6076,32 @@ def _run() -> tuple[bool, list[str]]:
         try:
             _jobs = dp._auto_jobs() if dp is not None else []
             _keys = [j["key"] for j in _jobs]
-            _want_flag = {"macro": "macro", "edb": "edb", "tq": "tq"}
             _bad = []
             for _j in _jobs:
-                _w = _want_flag.get(_j["key"])
-                if _w is None:
-                    if _j.get("macro") or _j.get("edb") or _j.get("tq"):
+                _flags = [f for f in ("macro", "edb", "tq") if _j.get(f)]
+                if _j["key"] == "macro":
+                    # 宏观 + 基本面**一条日程**（用户 11-17 17:01 要求合并），
+                    # 两个时刻都要在，串行链也要在 —— 少了 `chain` 就只跑宏观，
+                    # EDB 静默不更新，日志里看不出来
+                    if sorted(_flags) != ["edb", "macro"]:
+                        _bad.append(f"macro 标记是 {_flags}")
+                    if len(_j.get("times") or []) != 2:
+                        _bad.append("宏观日程不是两个时刻")
+                    if "edb" not in (_j.get("chain") or []):
+                        _bad.append("宏观日程没有 edb 串行链")
+                elif _j["key"] == "tq":
+                    if _flags != ["tq"]:
+                        _bad.append(f"tq 标记是 {_flags}")
+                    if len(_j.get("times") or []) != 1:
+                        _bad.append("天勤日程时刻数不对")
+                else:
+                    if _flags:
                         _bad.append(f"{_j['key']} 多带了标记")
-                elif not _j.get(_w):
-                    _bad.append(f"{_j['key']} 少了 {_w}")
-                elif _j.get("range") is not None:
+                    if len(_j.get("times") or []) != 1:
+                        _bad.append(f"{_j['key']} 时刻数不对")
+                if _j["key"] in ("macro", "tq") and _j.get("range") is not None:
                     _bad.append(f"{_j['key']} 不该有区间")
-            auto_jobs_ok = _keys == ["aux", "daily", "macro", "edb", "tq"] and not _bad
+            auto_jobs_ok = _keys == ["aux", "daily", "macro", "tq"] and not _bad
             auto_jobs_info = " / ".join(_keys) + ("；" + "、".join(_bad) if _bad else "")
         except Exception as _exc:      # noqa: BLE001
             auto_jobs_ok = False
@@ -6207,17 +6221,22 @@ def _run() -> tuple[bool, list[str]]:
                 saved = {}
             if "aux" not in saved and ("enabled" in saved or "time" in saved):
                 saved = {"aux": saved}        # 老版本只有一条，存的是扁平结构
-            for key, chk, tm, rng in (
-                ("aux", d.chk_auto, d.time_auto, d.cb_auto_range),
-                ("daily", d.chk_daily, d.time_daily, d.cb_daily_range),
+            for key, chk, tms, rng in (
+                ("aux", d.chk_auto, [d.time_auto], d.cb_auto_range),
+                ("daily", d.chk_daily, [d.time_daily], d.cb_daily_range),
+                # 宏观 + 基本面合成了一条，**两个时刻**（08:45 / 20:45），存盘里
+                # 是 `time` 和 `time2` 两个键
+                ("macro", d.chk_macro_auto,
+                 [d.time_macro_auto, d.time_macro_auto2], None),
                 # 天勤那条没有区间下拉（`range` 存的是 null），只比勾选和时刻
-                ("tq", d.chk_tq_auto, d.time_tq_auto, None),
+                ("tq", d.chk_tq_auto, [d.time_tq_auto], None),
             ):
                 one = saved.get(key) or {}
                 if bool(one.get("enabled", False)) != chk.isChecked():
                     return False
-                if one.get("time") and tm.time().toString("HH:mm") != str(one["time"]):
-                    return False
+                for edit, field in zip(tms, ("time", "time2")):
+                    if one.get(field) and edit.time().toString("HH:mm") != str(one[field]):
+                        return False
                 if one.get("range") and (rng is None
                                          or rng.currentData() != one["range"]):
                     return False
@@ -8689,7 +8708,108 @@ def _run() -> tuple[bool, list[str]]:
         return ("逐因子口径生效：mom_20 走分位、vol_20 跟全局 z，两列各自逐位相等且"
                 "与另一口径不等；带周期 id 退回纯键；全局 rank + 逐因子 z 可覆盖")
 
+    def _account_timer():
+        """账户定时登录 / 登出：四个时刻、跨零点、去重、配置往返。
+
+        判据是「往回看 10 分钟」而不是「今天几点过了没」——夜盘的登出是**次日**
+        02:35，按日期判会永远不触发（或者一开机就触发）。这条把四个边角都钉住：
+        到点前不动、到点动、过了宽限不动、同一时刻只动一次。
+        """
+        import inspect
+
+        from datetime import datetime as _dt
+
+        from gui.trade_page import (
+            ACC_DEFAULTS,
+            TradePage,
+            acc_due,
+            acc_transitions,
+            load_acc_timer,
+        )
+
+        if (ACC_DEFAULTS["night"] != ["20:55", "02:35"]
+                or ACC_DEFAULTS["day"] != ["08:55", "15:20"]):
+            raise RuntimeError(
+                f"默认时刻不对：夜盘 {ACC_DEFAULTS['night']}、日盘 {ACC_DEFAULTS['day']}"
+                "（用户定的是 20:55/02:35 与 08:55/15:20）")
+        cfg = dict(ACC_DEFAULTS)
+        cfg["enabled"] = True
+        order = [(k, h) for k, h, _lab in acc_transitions(cfg)]
+        if order != [("login", "08:55"), ("logout", "15:20"),
+                     ("login", "20:55"), ("logout", "02:35")]:
+            raise RuntimeError(f"四个时刻的顺序/取值不对：{order}")
+
+        for s, want in (
+            ("2026-11-17 20:54", None),
+            ("2026-11-17 20:55", ("login", "夜盘")),
+            ("2026-11-17 20:58", ("login", "夜盘")),
+            ("2026-11-17 21:10", None),          # 超过 10 分钟宽限
+            ("2026-11-18 02:35", ("logout", "夜盘")),   # 跨零点
+            ("2026-11-18 02:30", None),
+            ("2026-11-18 08:55", ("login", "日盘")),
+            ("2026-11-18 15:20", ("logout", "日盘")),
+            ("2026-11-18 15:31", None),
+        ):
+            got = acc_due(cfg, _dt.strptime(s, "%Y-%m-%d %H:%M"))
+            got = None if got is None else (got[0], got[1])
+            if got != want:
+                raise RuntimeError(f"{s} 应判 {want}，实际 {got}")
+        # 同一时刻只执行一次：心跳 20 秒一轮，不去重会连着发十几个登录
+        d = _dt(2026, 11, 18, 2, 35)
+        first = acc_due(cfg, d)
+        if first is None or acc_due(cfg, d, first[2]) is not None:
+            raise RuntimeError("同一时刻没有去重，会重复登录 / 登出")
+        if acc_due(dict(ACC_DEFAULTS), _dt(2026, 11, 17, 21, 0)) is not None:
+            raise RuntimeError("没启用时仍然触发了动作")
+        if not isinstance(load_acc_timer().get("night"), list):
+            raise RuntimeError("账户定时配置读回来不是预期结构")
+
+        src = inspect.getsource(TradePage._acc_tick)
+        for must in ("connect_requested.emit", "disconnect_requested.emit",
+                     "self.live.running"):
+            if must not in src:
+                raise RuntimeError(f"`_acc_tick` 少了 {must}（不会真连/真断）")
+        if "QTimer" not in inspect.getsource(TradePage.__init__):
+            raise RuntimeError("TradePage 没起定时器")
+        return ("四个时刻判对（含夜盘 02:35 跨零点与 10 分钟宽限），同一时刻只动一次，"
+                "未启用不动作，登录走 connect_requested、登出走 disconnect_requested")
+
+    def _auto_two_slots():
+        """「一条日程两个时刻」的判据（宏观 08:45 / 20:45，以及 EDB 串行链）。
+
+        这条判据错了不会有任何报错：少跑一场只是数据旧半天。所以逐条钉住：
+        未到点不动、到点跑、同一天第二场照跑、晚开机只补一场、老格式不重复补。
+        """
+        from gui.data_page import due_slot
+
+        T = ["08:45", "20:45"]
+        for now, last, want in (
+            ("08:44", "", None),
+            ("08:45", "", "2026-11-17@08:45"),
+            ("12:00", "2026-11-17@08:45", None),
+            ("20:45", "2026-11-17@08:45", "2026-11-17@20:45"),
+            ("23:30", "2026-11-17@08:45", "2026-11-17@20:45"),
+            ("23:30", "2026-11-17@20:45", None),
+            # 晚开机：两场都过了，只补最晚那一场，不连跑两遍
+            ("23:30", "", "2026-11-17@20:45"),
+            # 老格式（只有日期）：升级当天当整天都跑过，别重复补
+            ("23:30", "2026-11-17", None),
+            # 单时刻的日程（aux / daily / tq）行为不变
+            ("14:00", "", None),
+            ("15:30", "", "2026-11-17@15:30"),
+        ):
+            times = T if now not in ("14:00", "15:30") else ["15:30"]
+            got = due_slot(times, now, last, "2026-11-17")
+            if got != want:
+                raise RuntimeError(f"{times} {now} last={last!r}：应判 {want}，实际 {got}")
+        return ("未到点不动 / 到点跑 / 同一天第二场照跑 / 晚开机只补最晚一场 / "
+                "老日期格式不重复补；单时刻日程行为不变")
+
     check("逐因子标准化口径（method_of：仓单分位 / 动量 z 可混用）", _factor_method_of)
+
+    check("每日定时：一条日程两个时刻（08:45 / 20:45）", _auto_two_slots)
+
+    check("账户定时登录 / 登出（夜盘 20:55→02:35、日盘 08:55→15:20）", _account_timer)
 
     check("存入策略库的动作（strategy_save）", _strategy_save_action)
     check("K线与信号：持仓与交易记录同源（含手数）", _chart_from_trades)

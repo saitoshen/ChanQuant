@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QSizePolicy,
     QTimeEdit,
     QVBoxLayout,
     QWidget,
@@ -71,6 +72,42 @@ TQ_PERIODS = [("1d", "日线"), ("1h", "1 小时"), ("5m", "5 分钟")]
 # 顺序固定 1d 打头：它先把日历刷新掉，后面补分钟线时对账才是按新日历算的。
 TQ_SOURCE_PERIODS = ["1d", "1h", "5m"]
 TQ_OPT_PERIODS = ["1d"]
+
+
+def due_slot(times: list[str], now: str, last: str, today: str) -> str | None:
+    """这条日程此刻该跑哪个时刻 —— 返回 token（`YYYY-MM-DD@HH:mm`），不用跑就 None。
+
+    `times` 是时刻清单（`"HH:mm"`），一条日程可以有多个（宏观 + 基本面那条是
+    08:45 与 20:45）。挑**已经到点的最晚那个**：程序 21:00 才打开时两个都过了，
+    只该跑一轮、记在 20:45 名下，不该连跑两遍。
+
+    `last` 是上次跑过的 token。`last == today` 是**老格式**（只有日期，分不出
+    哪一场），当作今天所有时刻都跑过 —— 升级当天不重复补。
+
+    抽成纯函数是因为这条判据错了很难看出来：少跑一场只是数据旧半天，没有任何
+    报错。自检里逐条钉住（见 `_auto_two_slots`）。
+    """
+    def _m(v: str) -> int:
+        h, mm = [int(x) for x in str(v).split(":")[:2]]
+        return h * 60 + mm
+
+    try:
+        cur = _m(now)
+    except (ValueError, AttributeError):
+        return None
+    slot = None
+    for t in times:
+        try:
+            if cur >= _m(t):
+                slot = str(t)
+        except (ValueError, AttributeError):
+            continue
+    if slot is None:
+        return None
+    token = f"{today}@{slot}"
+    if last in (token, today):
+        return None
+    return token
 
 # 天勤的回溯区间。用**天数**而不是年数：用户要的是「近 1 天 / 近 1 周」，年表达
 # 不了。20 年那档等于「全部」—— 天勤日线能给到二十几年，5m 只有十年出头，
@@ -780,9 +817,13 @@ class DataPage(QWidget):
         self._edb_worker: EdbWorker | None = None
         self._edb_thread: QThread | None = None
         self._auto_run = False          # 这一轮是不是定时任务起的（决定弹不弹窗）
-        self._auto_last: dict[str, str] = {}   # 每条日程上次跑的日期（YYYY-MM-DD）
+        # 每条日程上次跑的是**哪个时段**（`YYYY-MM-DD@HH:mm`）。只记日期的话，
+        # 「一天两个时刻」那条第二次到点就会被当成「今天已经跑过」而跳过。
+        self._auto_last: dict[str, str] = {}
         self._auto_queue: list[str] = []       # 定时任务还要跑的市场
-        self._auto_key = ""             # 当前跑的是哪条日程（aux / daily / macro / edb）
+        # 同一条日程里还要接着跑的步骤（宏观 → 基本面）。`_on_thread_done` 里取。
+        self._auto_chain: list[str] = []
+        self._auto_key = ""             # 当前跑的是哪条日程（aux / daily / macro / tq）
         self._auto_range = "1d"
         self._auto_aux = False
         self._build()
@@ -1004,31 +1045,55 @@ class DataPage(QWidget):
         lay.addWidget(self.btn_macro)
         outer.addLayout(lay)
 
-        # 第二行：定时开关。宏观序列是**页级**数据（跟市场、跟天勤账户都无关），
-        # 所以不塞进右下角那张「每日自动补充」卡 —— 那张卡的每条日程都要配一个
-        # 「近 1 天 / 近 1 周」的区间下拉，而宏观走的是自己的增量逻辑（库里最后
-        # 一天往后 + 回看 400 天覆盖修订），根本没有区间可选。放这一行还有个好处：
-        # 用户在「上次更新」的同一眼就能顺手把自动更新打开，不用去别处找。
+        # 第二行：定时开关。宏观序列和基本面（EDB）**共用一条日程**（用户 11-17
+        # 17:01 要求合在一起）—— 两者都是「抓一批序列写 edb.duckdb」，一个十几秒、
+        # 一个几秒，各占一条日程、各配一个时刻只是让界面更乱；而且它们的数据都是
+        # 盘后/盘前各需要一次。
+        #
+        # 两个时刻 = 「盘前 + 盘后」：
+        #   · 08:45 赶在 09:00 开盘前，把隔夜落地的日频宏观补齐；
+        #   · 20:45 紧跟夜盘开盘，EDB 的当日值也落地了。
+        # 放这一行还有个好处：用户在「上次更新」的同一眼就能顺手把自动更新打开。
         row_macro = QHBoxLayout()
         row_macro.setSpacing(8)
-        self.chk_macro_auto = QCheckBox("每天自动更新")
+        self.chk_macro_auto = QCheckBox("每天自动更新宏观 + 基本面")
         self.chk_macro_auto.setToolTip(
-            "到点自动跑一遍宏观增量更新（Tushare + 东方财富，十几秒）。\n\n"
-            "为什么放上午：日频宏观（SHIBOR / 美债 / 外汇 / 全球指数）的当日值\n"
-            "要等前一个交易日晚间才落地，08:00 时昨天那根已经齐了；而且这个点\n"
-            "跟 15:30（衍生）/ 17:00（日线）两条日程不撞车。\n\n"
+            "到点自动跑两件事，**一条日程两个时刻**：宏观增量（Tushare + 东方财富，\n"
+            "十几秒）→ 基本面 EDB（243 个指标，天勤，几秒到几分钟）。\n\n"
+            "08:45 盘前：日频宏观（SHIBOR / 美债 / 外汇 / 全球指数）的当日值要等前一个\n"
+            "交易日晚间才落地，这时昨天那根已经齐了，也不跟开盘抢时间。\n"
+            "20:45 盘后：夜盘已开、EDB 的当日值（现货价 / 仓单 / 库存）也落地了。\n\n"
+            "EDB 需要天勤账号；没有账号时这一步会报一句「没有账号」然后跳过，\n"
+            "不影响宏观那一半。\n\n"
             "只在本程序开着时生效；到点如果正在更新别的数据，就等这一轮跑完再补。"
         )
         row_macro.addWidget(self.chk_macro_auto)
+        _tip = (
+            "一天跑两次：「盘前 + 盘后」。两个时刻都跑一整轮（宏观 → 基本面），\n"
+            "不是「早上只跑宏观、晚上只跑基本面」—— 两边的数据落地时间都不固定，\n"
+            "分开判断只会让某一半永远慢半天。\n\n"
+            "到点时如果程序没开，这一轮就跳过（不会攒着一次补好几轮）。"
+        )
         self.time_macro_auto = QTimeEdit()
         self.time_macro_auto.setDisplayFormat("HH:mm")
-        self.time_macro_auto.setTime(QTime(8, 0))
-        self.time_macro_auto.setToolTip(
-            "默认 08:00。宏观是日频，一天补一次就够。\n"
-            "太早拿不到昨天的最终值（数据源当天最后一根常是临时值，隔天会被修订），\n"
-            "太晚又赶不上盘前看数据。"
-        )
+        self.time_macro_auto.setTime(QTime(8, 45))
+        self.time_macro_auto.setToolTip(_tip)
         row_macro.addWidget(self.time_macro_auto)
+        sep = QLabel("和")          # 「起止」会被读成区间，写个「和」表明是两个时刻
+        sep.setObjectName("Hint")
+        row_macro.addWidget(sep)
+        self.time_macro_auto2 = QTimeEdit()
+        self.time_macro_auto2.setDisplayFormat("HH:mm")
+        self.time_macro_auto2.setTime(QTime(20, 45))
+        self.time_macro_auto2.setToolTip(_tip)
+        row_macro.addWidget(self.time_macro_auto2)
+        # 三个控件都钉成固定宽度。默认 `Policy.Minimum` 允许「比 sizeHint 更宽」，
+        # 而这一行在 1280 宽的页面上，Qt 会把多出来的空间**按比例摊给每个能长的
+        # 控件** —— 结果是勾选框和两个时刻被拉得隔了半个屏幕，看着像三件不相干
+        # 的东西。剩下的空间全交给末尾那个 stretch。
+        for _w in (self.chk_macro_auto, self.time_macro_auto,
+                   self.time_macro_auto2, sep):
+            _w.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         row_macro.addStretch(1)
         outer.addLayout(row_macro)
 
@@ -1117,11 +1182,15 @@ class DataPage(QWidget):
         self._log(text)
         self._refresh_macro_stats()
 
-    def _start_edb(self, auto: bool = False) -> None:
+    def _start_edb(self, auto: bool = False, keep_key: bool = False) -> None:
         """起基本面（EDB）更新。
 
         与 `_start_macro` 同一套编排：`auto=True` 时置 `_auto_run` 让失败不弹模态框，
         `_auto_queue` 留空以免 `_on_thread_done` 去起市场队列。
+
+        `keep_key=True` 是「宏观 → 基本面」这条链的第二步：`_auto_key` 要留着
+        合并后的日程键（`macro`），否则收尾时会去日程表里找一个已经不存在的
+        `edb` 键，日志里只能打出内部键名。
 
         天勤会话是**独占**的：`busy()` 里已经算了 `_edb_thread`，所以到点时若
         15:30 那条衍生还在跑，这里会直接返回（心跳下一轮再补），不会两个任务
@@ -1132,7 +1201,8 @@ class DataPage(QWidget):
             return
         if auto:
             self._auto_run = True
-            self._auto_key = "edb"
+            if not keep_key:
+                self._auto_key = "macro"
             self._auto_queue = []
         self._edb_worker = EdbWorker()
         self._edb_thread = QThread(self)
@@ -1472,34 +1542,21 @@ class DataPage(QWidget):
         row_daily.addWidget(self.cb_daily_range, 1)
         lay.addLayout(row_daily)
 
-        # 基本面（EDB）单独一条日程，不并进上面两条：
-        #   · 它是**天勤**接口，上面两条走 Tushare，账号和失败原因都不一样；
-        #   · 免费账户没有这个功能位（会 denied），要有独立开关让人能关掉；
-        #   · 现货价 / 仓单 / 库存 / 交割量这些指标在交易所盘后或次日才更新，
-        #     时刻可能得单独往后调，不该跟行情绑死。
-        self.chk_edb = QCheckBox("每天 15:45 补基本面（EDB：现货价 / 仓单 / 库存 / 交割量 / 利润）")
-        self.chk_edb.setToolTip(
-            "天勤 EDB 的 243 个基本面指标，写 data_tq/edb.duckdb（和行情库分开）。\n\n"
-            "这是**天勤独有**的「非价量数据」接口，必须有天勤账号（免费账户没有\n"
-            "这个功能位，会直接跳过，行情不受影响）。\n\n"
-            "为什么 15:45：紧跟在 15:30 的衍生数据之后。到点如果上一轮还在跑，\n"
-            "会等它结束、下一个 30 秒心跳再补，不会两个任务抢同一个天勤会话。\n\n"
-            "增量：只补库里最后一天之后的部分，并按批回看 30 天覆盖修订，日常几秒。"
+        # 基本面（EDB）**不在这里**：它已经和宏观合成一条日程（用户 11-17 17:01
+        # 要求），控件在顶部那张宏观卡的「每天自动更新宏观 + 基本面」那一行。
+        # 两边各留一个开关就是两套判据 —— 同一个任务能不能跑，只许有一个地方说。
+        self.lbl_edb_hint = QLabel(
+            "基本面（EDB）已并入上方「每天自动更新宏观 + 基本面」，"
+            "每天两个时刻各跑一遍。"
         )
-        lay.addWidget(self.chk_edb)
-
-        row_edb = QHBoxLayout()
-        row_edb.setSpacing(6)
-        self.time_edb = QTimeEdit()
-        self.time_edb.setDisplayFormat("HH:mm")
-        self.time_edb.setTime(QTime(15, 45))
-        self.time_edb.setToolTip(
-            "默认 15:45。仓单 / 库存 / 现货价这类指标在交易所盘后才落地，\n"
-            "定得比 15:30 的衍生数据稍晚一点，避免同一时刻抢天勤会话。"
+        self.lbl_edb_hint.setObjectName("Hint")
+        self.lbl_edb_hint.setWordWrap(True)
+        self.lbl_edb_hint.setToolTip(
+            "天勤 EDB 的 243 个基本面指标，写 data_tq/edb.duckdb（和行情库分开）。\n"
+            "免费账户没有这个功能位，会直接跳过，行情不受影响。\n"
+            "手动补：勾上天勤那张卡的「一并更新基本面（EDB…）」，再点「开始补充」。"
         )
-        row_edb.addWidget(self.time_edb)
-        row_edb.addStretch(1)
-        lay.addLayout(row_edb)
+        lay.addWidget(self.lbl_edb_hint)
 
         # 天勤那条日程。和上面三条都不同源：它补的是 data_tq（天勤口径的主连、
         # 主力切换表、复权因子），Tushare 那两条补的是 data_futures 的 CSV。
@@ -2049,14 +2106,31 @@ class DataPage(QWidget):
             pass
         if "aux" not in cfg and ("enabled" in cfg or "time" in cfg):
             cfg = {"aux": cfg}
+        # 合并前的两条日程（`macro` 08:00 / `edb` 15:45）→ 现在是一条。任一开着
+        # 就继续开着，别让用户升级完发现「本来每天补基本面，现在悄悄不补了」。
+        legacy_edb = cfg.get("edb") or {}
         self._auto_last = {}
         for job in self._auto_jobs():
-            one = cfg.get(job["key"]) or {}
+            one = dict(cfg.get(job["key"]) or {})
+            if job["key"] == "macro":
+                if legacy_edb.get("enabled"):
+                    one["enabled"] = True
+                # `v` 是「这条日程已经是合并后的结构」的标记。没有它的（老配置：
+                # 宏观 08:00 + EDB 15:45 两条）一律套新默认 **08:45 / 20:45** ——
+                # 用户 11-17 定的就是这两点，继承老值等于没改。
+                if int(one.get("v") or 1) < 2:
+                    one.pop("time", None)
+                    one.pop("time2", None)
+                    # 老的 `last` 只有日期（分不出是哪一场跑的），清掉：升级后的
+                    # 第一场照常跑一次。两个任务都是增量的，重复跑没有副作用，
+                    # 而漏掉一整天要等明天。
+                    one["last"] = ""
             self._auto_last[job["key"]] = str(one.get("last") or "")
             job["chk"].setChecked(bool(one.get("enabled", False)))
-            t = QTime.fromString(str(one.get("time") or ""), "HH:mm")
-            if t.isValid():
-                job["time"].setTime(t)
+            for edit, raw in zip(job["times"], (one.get("time"), one.get("time2"))):
+                t = QTime.fromString(str(raw or ""), "HH:mm")
+                if t.isValid():
+                    edit.setTime(t)
             # 宏观那条没有区间下拉（`range` 是 None），别对它调 findData
             if job.get("range") is not None:
                 i = job["range"].findData(one.get("range") or "1d")
@@ -2067,21 +2141,32 @@ class DataPage(QWidget):
         # 程序」就把它们的勾选状态按默认值写回磁盘 —— 下次启动定时任务就丢了。
         for job in self._auto_jobs():
             job["chk"].toggled.connect(self._save_auto_cfg)
-            job["time"].timeChanged.connect(self._save_auto_cfg)
+            for edit in job["times"]:
+                edit.timeChanged.connect(self._save_auto_cfg)
             if job.get("range") is not None:
                 job["range"].currentIndexChanged.connect(self._save_auto_cfg)
+        # 结构迁移（macro + edb 合成一条、多个时刻）之后立刻落盘：不然磁盘上还是
+        # 老结构，界面显示的和文件里存的对不上 —— 自检那条「界面 = 存盘」直接红，
+        # 而且下次启动又会按老值覆盖回来。
+        self._save_auto_cfg()
 
     def _save_auto_cfg(self, *_args) -> None:
-        cfg = {
-            job["key"]: {
+        cfg = {}
+        for job in self._auto_jobs():
+            times = [e.time().toString("HH:mm") for e in job["times"]]
+            one = {
                 "enabled": job["chk"].isChecked(),
-                "time": job["time"].time().toString("HH:mm"),
+                # 第一个时刻沿用老键 `time`（老版本读得回来），第二个新加 `time2`
+                "time": times[0],
                 "range": (job["range"].currentData() or "1d")
                           if job.get("range") is not None else None,
                 "last": self._auto_last.get(job["key"], ""),
             }
-            for job in self._auto_jobs()
-        }
+            if len(times) > 1:
+                one["time2"] = times[1]
+            if job["key"] == "macro":
+                one["v"] = 2        # 已经是合并后的双时刻结构，迁移别再套默认
+            cfg[job["key"]] = one
         try:
             path = self._auto_path()
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2093,13 +2178,18 @@ class DataPage(QWidget):
             pass
 
     def _check_auto(self) -> None:
-        """每 30 秒看一眼：到点、今天还没跑过、手上没活儿，就补一次。
+        """每 30 秒看一眼：到点、这个时段还没跑过、手上没活儿，就补一次。
 
         日期存盘而不是只放内存：半夜跑过一次之后用户重启程序，不该再补一遍。
 
-        五条日程（衍生 15:30 / 基本面 15:45 / 天勤 15:50 / 日线 17:00 / 宏观 08:00）
-        共用这一个心跳，但各自记各自的「今天跑过了」—— 15:30 的衍生数据补完不该
-        让 17:00 的日线任务也跟着认为今天跑完了。
+        **一条日程可以有两个时刻**（宏观 + 基本面那条：08:45 与 20:45）。判据因此
+        不是「今天跑过了」，而是「**今天这个时刻**跑过了」—— 存的 token 是
+        `2026-11-17@20:45`。老配置里只有日期（`2026-11-17`）的，当作今天所有时刻
+        都跑过，升级当天不重复补。
+
+        四条日程（衍生 15:30 / 日线 17:00 / 宏观+基本面 08:45·20:45 / 天勤 15:50）
+        共用这一个心跳，但各自记各自的 token —— 15:30 的衍生数据补完不该让 17:00
+        的日线任务也跟着认为今天跑完了。
         """
         from datetime import date
 
@@ -2108,26 +2198,28 @@ class DataPage(QWidget):
         for job in self._auto_jobs():
             if not job["chk"].isChecked():
                 continue
-            if self._auto_last.get(job["key"]) == today:
-                continue
-            if now < job["time"].time():
+            token = due_slot([e.time().toString("HH:mm") for e in job["times"]],
+                             now.toString("HH:mm"),
+                             self._auto_last.get(job["key"], ""), today)
+            if token is None:
                 continue
             if self.busy():
-                return          # 正在更新，下一个 30 秒再看（两条都不抢）
-            self._auto_last[job["key"]] = today
+                return          # 正在更新，下一个 30 秒再看（几条都不抢）
+            self._auto_last[job["key"]] = token
             self._save_auto_cfg()
             self._log(
                 f"—— 定时补充开始：{job['label']}"
-                f"（{job['time'].time().toString('HH:mm')}）"
+                f"（{token.split('@')[-1]}）"
             )
             if job.get("macro"):
                 # 宏观不是「补某个市场的 CSV」，是抓序列写 edb.duckdb，走自己的
                 # worker；不进 `_auto_queue`，否则 `_on_thread_done` 会去起下一个
                 # 市场，把 `_start_auto_next()` 里的 UpdateWorker 也拉起来。
+                #
+                # 合并进来的基本面（EDB）排在宏观之后串行跑（见 `chain`）：两者
+                # 都要连天勤/网络，并发只会互相抢，而 EDB 只要几秒。
+                self._auto_chain = list(job.get("chain") or [])
                 self._start_macro(auto=True)
-            elif job.get("edb"):
-                # 基本面同理：它是天勤独有的接口，也不能排进市场队列
-                self._start_edb(auto=True)
             elif job.get("tq"):
                 # 天勤这条也不是补 CSV：它走 TqWorker（切换表 → 主连 → 复权），
                 # 排进市场队列的话会被 `_start_auto_next()` 当成 Tushare 市场
@@ -2137,18 +2229,21 @@ class DataPage(QWidget):
             return              # 一次只起一条，另一条等下一轮心跳
 
     def _auto_jobs(self) -> list[dict]:
-        """五条日程的控件与目标市场。
+        """四条日程的控件与目标市场。
 
         `markets` 是这条日程要跑的市场，按顺序跑 —— 日线那条要期货和美股都补，
         而衍生数据只有期货有。
 
-        宏观那条是**另一种活**（不是按市场补 CSV，而是抓 23 条序列写 edb.duckdb），
-        所以标 `macro: True`，并显式把 `range` 置 None：它没有「近 1 天/1 周」
-        的概念，增量范围由 `macro.update()` 自己按库里最后一天算。
+        `times` 是**一条日程可以有的多个时刻**。只有宏观 + 基本面那条是两个
+        （08:45 / 20:45），其余一个。两个时刻各跑一整轮，不是「早上跑一个、
+        晚上跑另一个」。
 
-        基本面（EDB）同理标 `edb: True`、`range` 置 None：它是天勤独有的非价量
-        接口，写的是另一张库（`data_tq/edb.duckdb` 的 edb_series），不能排进
-        市场队列 —— 排进去 `_start_auto_next()` 会拿 UpdateWorker 去补 CSV。
+        宏观 + 基本面那条是**两种活**合在一条日程里（用户 11-17 17:01 要求）：
+        数据都是抓一批序列写 `edb.duckdb`，一个十几秒、一个几秒，各占一条日程
+        只是让界面更乱。标 `macro: True` + `edb: True`，`chain: ["edb"]` 表示
+        宏观跑完接着跑 EDB（串行，别两条线程同时抢天勤会话）。
+        `range` 显式置 None：它们没有「近 1 天/1 周」的概念，增量范围由各自的
+        `update()` 按库里最后一天算。
 
         天勤那条标 `tq: True`、`range` 也置 None：它走 `TqWorker`（切换表 →
         主连 → 复权），补的是 data_tq 里的主连，区间固定「近 1 天」，
@@ -2156,19 +2251,17 @@ class DataPage(QWidget):
         """
         return [
             {"key": "aux", "label": "期货衍生数据",
-             "chk": self.chk_auto, "time": self.time_auto, "range": self.cb_auto_range,
-             "markets": ["cn"], "aux": True},
+             "chk": self.chk_auto, "times": [self.time_auto],
+             "range": self.cb_auto_range, "markets": ["cn"], "aux": True},
             {"key": "daily", "label": "日线（期货 + 美股）",
-             "chk": self.chk_daily, "time": self.time_daily, "range": self.cb_daily_range,
-             "markets": ["cn", "us"], "aux": False},
-            {"key": "macro", "label": "宏观因子",
-             "chk": self.chk_macro_auto, "time": self.time_macro_auto,
-             "range": None, "macro": True},
-            {"key": "edb", "label": "基本面（EDB）",
-             "chk": self.chk_edb, "time": self.time_edb,
-             "range": None, "edb": True},
+             "chk": self.chk_daily, "times": [self.time_daily],
+             "range": self.cb_daily_range, "markets": ["cn", "us"], "aux": False},
+            {"key": "macro", "label": "宏观因子 + 基本面（EDB）",
+             "chk": self.chk_macro_auto,
+             "times": [self.time_macro_auto, self.time_macro_auto2],
+             "range": None, "macro": True, "edb": True, "chain": ["edb"]},
             {"key": "tq", "label": "天勤（切换表 + 主连 + 复权）",
-             "chk": self.chk_tq_auto, "time": self.time_tq_auto,
+             "chk": self.chk_tq_auto, "times": [self.time_tq_auto],
              "range": None, "tq": True},
         ]
 
@@ -2244,6 +2337,9 @@ class DataPage(QWidget):
             self._macro_worker.cancel()
         if self._edb_worker is not None:
             self._edb_worker.cancel()
+        # 取消也要掐断「同一日程里的下一步」：宏观被取消时，别接着起 EDB ——
+        # 用户按的是「停」，不是「换下一件事做」。
+        self._auto_chain = []
         if hasattr(self, "btn_stock_run"):
             self.btn_stock_run.setEnabled(False)
         self.btn_update.setEnabled(False)
@@ -2445,6 +2541,13 @@ class DataPage(QWidget):
             if w is not None:
                 w.deleteLater()
                 setattr(self, attr, None)
+        # 定时任务还有下一步：**同日程里串行的下一件事**（宏观 → 基本面）。
+        # 放在市场队列之前判断 —— 两者不会同时存在，但先判链能少一次分支。
+        if self._auto_run and self._auto_chain:
+            step = self._auto_chain.pop(0)
+            if step == "edb":
+                self._start_edb(auto=True, keep_key=True)
+                return
         # 定时任务还有下一个市场（日线那条是期货 → 美股）：接着起，
         # 按钮和进度条保持「忙」的样子，别让用户以为跑完了又点一次
         if self._auto_run and self._auto_queue:
@@ -2470,6 +2573,7 @@ class DataPage(QWidget):
             self._log(f"—— 定时补充结束：{label}")
         self._auto_run = False
         self._auto_queue = []
+        self._auto_chain = []
 
     def shutdown(self) -> None:
         """关窗口时收尾：让后台线程别拖着进程。"""
