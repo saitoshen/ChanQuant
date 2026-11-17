@@ -1295,9 +1295,10 @@ class PortfolioRunner:
             return
         st.target = st.signal * st.lots
         if not open_now:
-            # 让状态栏说清楚「不是没算，是收盘了不下单」
-            st.last_action = (f"非交易时段：暂停下单，理论 {st.target:+d} 手"
-                              if st.target else CLOSED_NOTE)
+            # 让状态栏说清楚「不是没算，是收盘了不下单」。**0 也要写出来** ——
+            # 空着或者只写「暂停下单」时，用户分不清「算了但是空仓」和
+            # 「压根没算」（2026-11-17 就为这个反复排查了三轮）。
+            st.last_action = f"非交易时段：暂停下单，理论 {st.target:+d} 手"
 
     def _pick_ml_signal(self, st: SlotState) -> bool:
         """从后台缓存取一次机器学习信号；取到就落信号 / 手数，返回 True。
