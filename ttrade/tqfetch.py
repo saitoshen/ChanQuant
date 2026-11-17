@@ -1021,6 +1021,16 @@ def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
             break
         run(tail[i : i + chunk], f"MAIN_{period}", report=True)
 
+    # 写完日线就把日历缓存作废。日历（`S.calendar()`）是从 1d 表推的、按天缓存，
+    # 而 GUI 一开一整天不重启：缓存里没有今天 ⇒ 接着补 1h/5m 时
+    # `miss_days()` 认不出「今天这一天该有数据却没补上」，洞检测静默失效，
+    # 策略端那条缺口闸也一起失灵。定时任务把 1d 排在第一个，就是让这里先刷新。
+    if period == "1d":
+        try:
+            S.calendar(refresh=True)
+        except Exception:  # noqa: BLE001
+            pass
+
     # ---- 补完对账：**「+N 行」不等于「补全了」** ----
     # 2026-11-17 的现场：IF 的 5m 停在 11-10，每日任务只往后接，中间那几天
     # 永远补不上，日志却天天显示「+14 行」。修了增量口径之后新洞不会再产生，

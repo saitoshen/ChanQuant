@@ -61,6 +61,17 @@ SRC_TQ = "tq"
 
 TQ_PERIODS = [("1d", "日线"), ("1h", "1 小时"), ("5m", "5 分钟")]
 
+# 天勤**要补哪几个周期**（用户 2026-11-17 定死的口径）：
+#   · 期权只要日线 —— IV 是日频估值，分钟 IV 既稀疏又没有预测力，而且 5m 的
+#     期权只有中金所 IO/MO/HO，跟着界面选 5m 跑一轮，别的品种一条都补不到；
+#   · **其余全部三个周期**：主连、真实合约都按 1d + 1h + 5m 补。
+#     少 1d ⇒ 交易日历（`tqstore.calendar()` 从 1d 表推）跟着停，洞检测和策略端
+#     的缺口闸一起失灵；少 5m/1h ⇒ 策略跑的周期没人续，库安静地停在某一天，
+#     展期族（分钟级唯一不衰减的因子家族）整列「无数据」。
+# 顺序固定 1d 打头：它先把日历刷新掉，后面补分钟线时对账才是按新日历算的。
+TQ_SOURCE_PERIODS = ["1d", "1h", "5m"]
+TQ_OPT_PERIODS = ["1d"]
+
 # 天勤的回溯区间。用**天数**而不是年数：用户要的是「近 1 天 / 近 1 周」，年表达
 # 不了。20 年那档等于「全部」—— 天勤日线能给到二十几年，5m 只有十年出头，
 # 取不到的更早部分不报错，只是历史更短。
@@ -265,11 +276,15 @@ class TqWorker(QObject):
                  force_switch: bool = False,
                  periods: list[str] | None = None) -> None:
         super().__init__()
+        # 老的「单周期」参数，只为不破坏既有调用（自检里 `TqWorker("1d", 1)`）。
+        # 真正决定补什么的是下面的 `periods`，别再拿它当「这一轮的周期」用 ——
+        # 期权固定日线，主连和真实合约固定三个周期。
         self.period = period
-        # **主连要补哪些周期**。默认就一个（=界面选的）；定时那条给「5m + 1h」，
-        # 因为策略跑的周期未必是界面上选着的那个 —— 只续 1h 的话 5m 库会安静地
-        # 停在某一天，而每天日志都在报「+N 行」（11-17 的 IF 就是这样）。15m/30m
-        # 由 5m 合并、2h/4h 由 1h 合并，所以补这两个源周期就覆盖了全部分钟周期。
+        # **主连/真实合约要补哪些周期**。默认就一个（=参数给的），界面那条现在
+        # 一律传 `TQ_SOURCE_PERIODS`（1d + 1h + 5m）：策略跑的周期未必是界面上
+        # 选着的那个 —— 只续 1h 的话 5m 库会安静地停在某一天，而每天日志都在报
+        # 「+N 行」（11-17 的 IF 就是这样）。15m/30m 由 5m 合并、2h/4h 由 1h 合并；
+        # 日线除了自己有用，还是**交易日历**的来源（`tqstore.calendar()`）。
         self.periods = [p for p in (periods or [period]) if p] or [period]
         self.days = int(days or 7300)
         self.pairs = pairs
@@ -372,13 +387,13 @@ class TqWorker(QObject):
                         # 起点跟**界面上的回溯区间**走（不再是写死的「全部历史」）：
                         # 选「近 1 天」就只补最近一天，整条链在窗口之前的老链
                         # （库里七成）会被直接筛掉，不再白跑两千多条
+                        #
+                        # 🔴 周期**固定日线**，不跟界面那个下拉（用户 11-17 定的
+                        # 口径：期权只补日线，其余都是 1d + 1h + 5m）。IV 是日频
+                        # 估值，分钟 IV 既稀疏又没用；而 5m 只有中金所 IO/MO/HO，
+                        # 跟着界面选 5m 跑一轮，别的品种一条都补不到还看不出来。
                         if free_mode:
-                            # 三个周期的量级差太多，笼统写「约 27 小时」会吓跑
-                            # 只想补 5m 股指期权的人
-                            hint = {"1d": "全量约 27 小时",
-                                    "1h": "全量约 19 小时",
-                                    "5m": "5m 只有中金所 IO/MO/HO，约十几分钟"
-                                    }.get(self.period, "全量要几小时")
+                            hint = "全量约 27 小时"
                             if self.days <= 92:
                                 hint = "只补窗口内的链，通常几分钟"
                             self.progress.emit(
@@ -386,11 +401,11 @@ class TqWorker(QObject):
                                 f"期权：免费账户 → 逐合约 get_kline_serial，"
                                 f"{hint}；可随时取消，再点一次续传")
                         o = OPT.update(
-                            sess, periods=(self.period,),
+                            sess, periods=tuple(TQ_OPT_PERIODS),
                             start=self.range_start(),
                             progress=lambda a, b, m: self.progress.emit(a, b, m),
                             cancel=lambda: self._cancel,
-                        ).get(self.period, {})
+                        ).get("1d", {})
                         n_opt = int(o.get("rows") or 0)
                         if free_mode:
                             opt_note = ("　【期权】免费账户：逐合约取最近 %d 根"
@@ -474,50 +489,63 @@ class TqWorker(QObject):
                 # ---- 真实合约 + 期限结构
                 n_contracts = 0
                 bad: list[str] = []
-                dead = 0
                 if self.contracts and not self._cancel:
-                    for i, (sym, ex) in enumerate(pairs, 1):
+                    # 真实合约也是**三个周期全补**（用户 11-17 定的口径：期权只要
+                    # 日线，其余都是 1d + 1h + 5m）。只下日线的话 `contract_bars`
+                    # 里只剩 1d，而展期族是分钟级唯一不衰减的因子家族 ——
+                    # 5m/1h 的 `roll_*` 会整列「无数据」，且不报任何错。
+                    for per in self.periods:
                         if self._cancel:
                             break
-                        self.progress.emit(i, len(pairs),
-                                           f"真实合约 {i}/{len(pairs)}　{sym}_{ex}…")
-                        try:
-                            r = TQ.write_contracts(api, sym, ex, self.period, 0,
-                                                   days=self.days,
-                                                   cancel=lambda: self._cancel)
-                        except Exception as exc:  # noqa: BLE001
-                            # 一个品种的合约失败不该把整轮打断 —— 主连已经落库了
-                            bad.append(f"{sym}_{ex}：{type(exc).__name__}")
-                            self.progress.emit(i, len(pairs),
-                                               f"真实合约 {sym}_{ex} 失败：{str(exc)[:60]}")
-                            continue
-                        if r.get("cancelled"):
-                            break     # 用户点了取消，后面的品种一个都别再起
-                        # **不抛异常不等于全下到了**：卡死保护会把没下完的合约记成
-                        # 「等待超时」放进 failed，然后正常返回；「查合约失败」更是
-                        # 直接 early return。这里必须看返回值，否则用户看到「真实
-                        # 合约 78 个品种」以为齐了，展期因子却是断的（CLI 那边一直
-                        # 是看 failed 的）。
-                        if r.get("status") in ("ok", "无数据"):
-                            n_contracts += 1
-                        else:
-                            note = str(r.get("status") or "")[:40]
-                            bad.append(f"{sym}_{ex}：{note}")
-                            self.progress.emit(i, len(pairs),
-                                               f"真实合约 {sym}_{ex} 未下全：{note}")
-                        # 连着几个品种一行都没下到，多半是连接已经死了：重建会话再
-                        # 继续。不重建的话剩下每个品种都要白等一轮看门狗（3 分钟）。
-                        # 免费账户例外：本来就常常「无新数据」，重建会话只会白花
-                        # 十几秒的握手，78 个品种能白重建二十多次。
-                        if r.get("rows") or free_mode:
-                            dead = 0
-                        else:
-                            dead += 1
-                            if dead >= 3:
-                                self.progress.emit(i, len(pairs), "连接似乎已断，重建会话…")
-                                sess.reset()
-                                api = sess.get()
+                        lab = dict(TQ_PERIODS).get(per, per)
+                        dead = 0        # 「连着几个品种没下到」按周期重新数
+                        for i, (sym, ex) in enumerate(pairs, 1):
+                            if self._cancel:
+                                break
+                            self.progress.emit(
+                                i, len(pairs),
+                                f"真实合约 {lab} {i}/{len(pairs)}　{sym}_{ex}…")
+                            try:
+                                r = TQ.write_contracts(api, sym, ex, per, 0,
+                                                       days=self.days,
+                                                       cancel=lambda: self._cancel)
+                            except Exception as exc:  # noqa: BLE001
+                                # 一个品种的合约失败不该把整轮打断 —— 主连已经落库了
+                                bad.append(f"{sym}_{ex}@{per}：{type(exc).__name__}")
+                                self.progress.emit(
+                                    i, len(pairs),
+                                    f"真实合约 {lab} {sym}_{ex} 失败：{str(exc)[:60]}")
+                                continue
+                            if r.get("cancelled"):
+                                break     # 用户点了取消，后面的品种一个都别再起
+                            # **不抛异常不等于全下到了**：卡死保护会把没下完的合约记成
+                            # 「等待超时」放进 failed，然后正常返回；「查合约失败」更是
+                            # 直接 early return。这里必须看返回值，否则用户看到「真实
+                            # 合约 78 个品种」以为齐了，展期因子却是断的（CLI 那边一直
+                            # 是看 failed 的）。
+                            if r.get("status") in ("ok", "无数据"):
+                                n_contracts += 1
+                            else:
+                                note = str(r.get("status") or "")[:40]
+                                bad.append(f"{sym}_{ex}@{per}：{note}")
+                                self.progress.emit(
+                                    i, len(pairs),
+                                    f"真实合约 {lab} {sym}_{ex} 未下全：{note}")
+                            # 连着几个品种一行都没下到，多半是连接已经死了：重建会话再
+                            # 继续。不重建的话剩下每个品种都要白等一轮看门狗（3 分钟）。
+                            # 免费账户例外：本来就常常「无新数据」，重建会话只会白花
+                            # 十几秒的握手，78 个品种能白重建二十多次。
+                            if r.get("rows") or free_mode:
                                 dead = 0
+                            else:
+                                dead += 1
+                                if dead >= 3:
+                                    self.progress.emit(
+                                        i, len(pairs),
+                                        f"真实合约 {lab}：连接似乎已断，重建会话…")
+                                    sess.reset()
+                                    api = sess.get()
+                                    dead = 0
             finally:
                 sess.close()
 
@@ -526,24 +554,27 @@ class TqWorker(QObject):
             n_curve = 0
             if self.contracts:
                 self.progress.emit(0, 0, "构建期限结构（展期因子）…")
-                built = tqcurve.build_all(pairs, period=self.period)
+                # 期限结构一个品种只有一个文件（日频），`build_all` 自己会优先
+                # 挑 1d，别再按周期循环把它覆盖成低精度的版本
+                built = tqcurve.build_all(pairs, period="1d")
                 n_curve = sum(1 for v in built.values() if v)
 
             rows = sum(int(v or 0) for v in got.values())
             head = "已取消" if self._cancel else "完成"
             extra = ""
             if self.contracts:
-                extra = (f"；真实合约 {n_contracts} 个品种，"
+                # 计数是「品种 × 周期」：三个周期各算一次，写「个品种」会让人
+                # 以为是 3 倍的品种数
+                extra = (f"；真实合约 {n_contracts} 个品种周期，"
                          f"期限结构 {n_curve} 个品种")
                 if bad:
                     shown = "、".join(bad[:4]) + ("…" if len(bad) > 4 else "")
-                    extra += f"；{len(bad)} 个品种有合约没下全（{shown}），再点一次会续传"
+                    extra += f"；{len(bad)} 处有合约没下全（{shown}），再点一次会续传"
             note = ""
             if free_mode:
-                note = (f"　【免费账户】单次只能取 {TQ.RECENT_BARS} 根 K 线：主连和"
-                        "真实合约的日线都是完整的，1h 约 6 年、5m 只拿得到每个合约"
-                        "最后约 7 个月。")
-                if self.period in ("5m", "15m", "30m"):
+                note = (f"　【免费账户】单次只能取 {TQ.RECENT_BARS} 根 K 线：日线是完整的，"
+                        "1h 约 6 年、5m 只拿得到每个合约最后约 7 个月。")
+                if any(p in ("5m", "15m", "30m") for p in self.periods):
                     note += " 展期因子在早期合约上会退回日线口径。"
             if self.edb and n_edb:
                 note += f"　【基本面】本次写入 {n_edb:,} 行（data_tq/edb.duckdb）"
@@ -552,8 +583,13 @@ class TqWorker(QObject):
             elif self.options:
                 note += "　【期权】本次没有新数据（已下完的合约会跳过）"
             note += opt_note
+            # `period_label` 这个变量**从来没被定义过**（`self.period` 现在固定
+            # "1d"，也不再是「这一轮的唯一周期」）。以前每次补完天勤都会在这里
+            # 抛 NameError，被外层 except 接住 ⇒ 明明补成功了，界面弹的却是
+            # 「NameError: name 'period_label' is not defined」。
+            span_lab = " + ".join(dict(TQ_PERIODS).get(p, p) for p in self.periods)
             self.done.emit(
-                f"天勤 {period_label} {head}：{len(pairs)} 个品种，本次写入 {rows:,} 行{extra}"
+                f"天勤 {span_lab} {head}：{len(pairs)} 个品种，本次写入 {rows:,} 行{extra}"
                 f"{switch_note}；校正换月日 {moved} 处，刷新复权 {touched} 个品种周期"
                 + note
             )
@@ -1150,11 +1186,16 @@ class DataPage(QWidget):
         self.lbl_sec_period = self._section("周期")
         lay.addWidget(self.lbl_sec_period)
         self.cb_period = QComboBox()
-        for key, label in TQ_PERIODS:
-            self.cb_period.addItem(label, key)
+        # **不再是「选一个周期来补」**。周期已经定死（`TQ_SOURCE_PERIODS`），
+        # 留着可选只会骗人：以前界面停在 1h 时，点「开始补充」就只续 1h，5m 那
+        # 半边库一直是旧的，而日志只报这一轮写了多少行，看不出另一半没碰。
+        # 现在它就是一个清单 —— 用户一眼看到「三个一起补」，不用猜。
+        self.cb_period.addItem("日线 + 1 小时 + 5 分钟（一起补）", "1d")
         self.cb_period.setToolTip(
             "天勤原生只有日线 / 1 小时 / 5 分钟三种 bar，15m/30m/2h/4h 是本地合并的，\n"
-            "不用单独下。日线能追到二十几年，5 分钟最早约 2016 年。"
+            "不用单独下。三个源周期每轮一起补：日线还兼作交易日历的来源，\n"
+            "少补它，缺天检测和策略端的缺口闸都会失灵。\n"
+            "期权例外，只补日线。"
         )
         lay.addWidget(self.cb_period)
         self.cb_period.currentIndexChanged.connect(self._sync_opt_label)
@@ -1462,15 +1503,19 @@ class DataPage(QWidget):
         # 切换表排在最前，是因为主连写库时就要用它算复权因子。
         self.chk_tq_auto = QCheckBox("每天 15:50 从天勤补（切换表 → 主连 → 复权）")
         self.chk_tq_auto.setToolTip(
-            "先从**天勤**重新下载主力切换表，再按天勤那张卡上选的周期补最近一天的\n"
-            "主连，最后按新表把复权因子刷到全部历史上，写 data_tq/tq.duckdb。\n\n"
+            "先从**天勤**重新下载主力切换表，再把主连的**日线 / 1 小时 / 5 分钟**\n"
+            "三个周期一起补到此刻（库里缺交易日的地方从最早那个洞补起），最后按新表\n"
+            "把复权因子刷到全部历史上，写 data_tq/tq.duckdb。\n\n"
             "为什么必须有这一条：切换表不刷新，换月那天就没有 ratio，前复权序列\n"
             "会在换月处留一根假跳空（JD 2026-11-17 从 jd2612 换到 jd2701，\n"
             "近月差价约 −10%，图上就是当天 09:00 一根大阴线）。\n\n"
+            "为什么是三个周期：日线不补，从它推出来的交易日历就跟着停，缺天检测和\n"
+            "策略端的缺口闸一起失灵；5m/1h 不补，策略跑的周期没人续，库安静地停在\n"
+            "某一天而日志照样报「+N 行」。\n\n"
             "为什么 15:50：日盘 15:00 收盘，15:50 时当日 bar 已经齐了；排在 15:45 的\n"
             "基本面之后、16:00 起的其它日程之前，既不抢天勤会话，也不会被跑几小时的\n"
             "日线任务堵在后面。当晚 21:00 起的夜盘归属下一个交易日，由次日这一轮补上。\n\n"
-            "只补主连最近一天，不碰真实合约和期权（那些体积大、要手动挑区间）。\n"
+            "只补主连，不碰真实合约和期权（那些体积大、要手动挑区间；期权也只补日线）。\n"
             "增量：切换表只给**表里没有的**换月取价，日常几秒。"
         )
         lay.addWidget(self.chk_tq_auto)
@@ -1827,18 +1872,15 @@ class DataPage(QWidget):
         self._log("下一轮下载会用新账号；已经在跑的不会换。")
 
     def _sync_opt_label(self) -> None:
-        """5m 的期权只有中金所三个股指期权，标签上直接写明。
+        """期权那一行的文案。
 
-        不写的话用户会以为「勾了就等于全品种 5m 期权」，跑完发现只有 IO/MO/HO
-        会以为程序漏下了。
+        期权**只有日线**（`TQ_OPT_PERIODS`），不再跟着周期下拉变 —— 以前选 5m
+        时这里会写「5m 只有中金所 IO / MO / HO」，然后真去补 5m 期权，别的品种
+        一条都补不到。文案直接写死，省得再被周期牵着走。
         """
         if not hasattr(self, "chk_tq_options"):
             return
-        p = self.cb_period.currentData() if hasattr(self, "cb_period") else "1d"
-        if p == "5m":
-            self.chk_tq_options.setText("一并更新期权（隐含波动率）—— 5m 只有中金所 IO / MO / HO")
-        else:
-            self.chk_tq_options.setText("一并更新期权（隐含波动率）")
+        self.chk_tq_options.setText("一并更新期权（隐含波动率，只补日线）")
 
     def _sync_controls(self, *_args) -> None:
         """按数据源 + 市场切换可见性。"""
@@ -2105,7 +2147,7 @@ class DataPage(QWidget):
 
         天勤那条标 `tq: True`、`range` 也置 None：它走 `TqWorker`（切换表 →
         主连 → 复权），补的是 data_tq 里的主连，区间固定「近 1 天」，
-        周期跟着界面上选的那个。
+        周期固定「1d + 1h + 5m」三个源周期（不跟界面上选的那个）。
         """
         return [
             {"key": "aux", "label": "期货衍生数据",
@@ -2248,17 +2290,30 @@ class DataPage(QWidget):
         从最早那个洞补起），切换表 → 主连 → 复权因子。真实合约、期权、基本面
         各自有更合适的时机（体积大 / 15:45 已单独排了 EDB），不该压进一条
         每天 15:50 跑的日程里。
+
+        **周期口径（手动、定时同一条）**：主连和真实合约都补 1d + 1h + 5m，
+        期权只补 1d —— 见 `TQ_SOURCE_PERIODS` / `TQ_OPT_PERIODS`。不再跟界面上
+        那个下拉，所以它只当「本轮要补什么」的展示用。
         """
         if auto:
             self._auto_run = True
             self._auto_key = "tq"
             self._auto_queue = []
-            period = self.cb_period.currentData() or "1h"
             # 🔴 主连要补的周期**不能只跟界面选的那个**：策略跑 5m、界面停在 1h，
             # 那 5m 就永远没人补 —— 库会安静地停在某一天，而日志每天照样报
-            # 「+14 行」（11-17 的 IF 就是这样）。补这两个源周期就够：15m/30m 由
-            # 5m 合并，2h/4h 由 1h 合并。日线归 17:00 那条日程。
-            periods = ["5m", "1h"]
+            # 「+14 行」（11-17 的 IF 就是这样）。
+            #
+            # **三个周期全补，日线排第一**（用户 11-17 16:15 明确要求）：
+            #   · 1d 不补的话，库里那张「交易日历」会跟着停 —— 日历是从 1d 表
+            #     推的（`tqstore.calendar()`），洞检测和策略端的缺口闸全靠它，
+            #     日历停在昨天就等于「今天该不该有数据」永远判不出来；
+            #   · 排在第一个是为了让它先把日历刷新掉，再拿新日历去对账 1h/5m；
+            #   · 15m/30m 由 5m 合并、2h/4h 由 1h 合并，补这三个源周期就覆盖了
+            #     界面上的全部周期。
+            # 17:00 那条「日线（期货 + 美股）」**不写这个库** —— 它走 Tushare
+            # 落 `data_futures/*.csv`，是回测/因子用的另一份数据，别指望它。
+            period = "1d"
+            periods = list(TQ_SOURCE_PERIODS)
             days = 1
             contracts = False
             edb = False
@@ -2266,8 +2321,11 @@ class DataPage(QWidget):
         else:
             self._auto_run = False
             self._auto_queue = []       # 手动跑一趟就别再接着排定时的那几个市场
-            period = self.cb_period.currentData() or "1h"
-            periods = None              # 手动的按界面选的周期来，用户说什么就补什么
+            period = "1d"
+            # 手动也补三个周期（用户 11-17 16:17 要求）：以前「界面选什么就补
+            # 什么」，选着 1h 点「开始补充」，5m 那半边库就一直是旧的，而日志
+            # 只报这一轮写了多少行 —— 看不出另一半根本没碰。
+            periods = list(TQ_SOURCE_PERIODS)
             days = int(self.cb_tq_range.currentData() or 7300)
             contracts = self.chk_tq_contracts.isChecked()
             edb = self.chk_tq_edb.isChecked()
@@ -2285,20 +2343,19 @@ class DataPage(QWidget):
         self._tq_worker.failed.connect(self._tq_thread.quit)
         self._tq_thread.finished.connect(self._on_thread_done)
 
-        label = dict(TQ_PERIODS).get(period, period)
+        span_lab = " + ".join(dict(TQ_PERIODS).get(p, p) for p in self._tq_worker.periods)
         self.prog_update.setRange(0, 0)
         self.prog_update.setVisible(True)
         self.lbl_upd.setVisible(True)
-        self.lbl_upd.setText(f"准备从天勤补 {label}…")
+        self.lbl_upd.setText(f"准备从天勤补 {span_lab}…")
         if auto:
-            span_lab = " + ".join(dict(TQ_PERIODS).get(p, p) for p in self._tq_worker.periods)
             self._log(f"—— 天勤 {span_lab}：切换表 → 主连（库尾 → 现在）→ 复权因子")
         else:
             span = self.cb_tq_range.currentText()
             self._log(
-                f"—— 天勤补齐 {label}（{span}）"
+                f"—— 天勤补齐 {span_lab}（{span}）"
                 + ("，含真实合约与展期因子" if contracts else "，只补主连")
-                + ("，期权按同一区间" if options else "")
+                + ("，期权按同一区间（只要日线）" if options else "")
             )
         self.btn_update.setText("取消")
         self.btn_update.setEnabled(True)

@@ -6123,6 +6123,42 @@ def _run() -> tuple[bool, list[str]]:
             switch_src_ok = False
             switch_src_info = f"{type(_exc).__name__}: {_exc}"
 
+        # 定时补天勤必须**三个源周期全补、日线排第一**；期权**只补日线**
+        # （用户 11-17 16:15 / 16:17 定的口径）。少一条的后果全是静默的：
+        #   · 少 1d → 1d 表停更，而交易日历是从 1d 推的 ⇒ 洞检测和策略端缺口闸
+        #     一起失灵，界面天天报「补完了」；
+        #   · 少 5m/1h → 策略跑的周期没人续，库停在某一天（11-17 的 IF）；
+        #   · 期权跟着界面选到 5m → 只有中金所 IO/MO/HO 有数据，别的品种一条都
+        #     补不到，还看不出是漏了。
+        tq_periods_info = ""
+        tq_periods_ok = True
+        try:
+            from gui import data_page as _dp2
+            from ttrade import tqfetch as _TQ2
+
+            _bad = []
+            if list(_dp2.TQ_SOURCE_PERIODS) != ["1d", "1h", "5m"]:
+                _bad.append(f"源周期是 {_dp2.TQ_SOURCE_PERIODS}")
+            elif "1d" != _dp2.TQ_SOURCE_PERIODS[0]:
+                _bad.append("日线没排第一（日历要先刷新）")
+            if list(_dp2.TQ_OPT_PERIODS) != ["1d"]:
+                _bad.append(f"期权周期是 {_dp2.TQ_OPT_PERIODS}")
+            _st = _inspect.getsource(_dp2.DataPage._start_tq)
+            if _st.count("TQ_SOURCE_PERIODS") < 2:
+                _bad.append("定时/手动没有都按三周期走")
+            _run2 = _inspect.getsource(_dp2.TqWorker.run)
+            if "TQ_OPT_PERIODS" not in _run2:
+                _bad.append("期权没固定用 TQ_OPT_PERIODS")
+            if "periods=(self.period," in _run2:
+                _bad.append("期权还在跟界面周期")
+            if "calendar(refresh=True)" not in _inspect.getsource(_TQ2.write_main_many):
+                _bad.append("补完 1d 没作废日历缓存")
+            tq_periods_ok = not _bad
+            tq_periods_info = "、".join(_bad) or " / ".join(_dp2.TQ_SOURCE_PERIODS)
+        except Exception as _exc:      # noqa: BLE001
+            tq_periods_ok = False
+            tq_periods_info = f"{type(_exc).__name__}: {_exc}"
+
         def _form_order_ok(d) -> bool:
             """「开始补充」必须紧跟在下载项之后，成本和定时不许混进来。
 
@@ -7118,6 +7154,12 @@ def _run() -> tuple[bool, list[str]]:
                 "update_switch()，只补空表的 ensure_switch() 会让换月后新增的换月"
                 "记录永远进不来，前复权序列在换月处留假跳空"
             )
+        if not tq_periods_ok:
+            raise RuntimeError(
+                f"天勤补数的周期口径不对（{tq_periods_info}）：主连和真实合约都要 "
+                "1d + 1h + 5m（日线打头，它兼作交易日历来源），期权只补日线 —— "
+                "少一条都是静默的：库停在某一天、洞检测失灵、展期族整列无数据"
+            )
         if not trade_ok:
             raise RuntimeError(
                 f"账户透视页异常（{trade_info}）：账户列表 / 资金账户列 / 时间列缺失"
@@ -8085,7 +8127,9 @@ def _run() -> tuple[bool, list[str]]:
                 f"{side_info}，触发 {trig_info}，"
                 f"回测区间 {range_info}，合成周期 {md_info}，实时开关已复位，"
                 f"{status_info}，"
-                f"数据管理页就绪（期权回溯区间 {opt_range_info}；定时 {auto_jobs_info}；切换表{'真下载' if switch_src_ok else switch_src_info}），手册 {manual_info}，输出 {out_info}，"
+                f"数据管理页就绪（期权回溯区间 {opt_range_info}；定时 {auto_jobs_info}；"
+                f"天勤周期 {tq_periods_info}；"
+                f"切换表{'真下载' if switch_src_ok else switch_src_info}），手册 {manual_info}，输出 {out_info}，"
                 f"对话渲染 {chat_info}，能力包 {skill_info}")
 
     check("长提示的压缩口径（状态栏 / 因子页脚注）", _status_brief)
