@@ -4794,16 +4794,16 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"信号要平仓就照发，不许看账户砍单：{r3.book}")
 
         # ⑩ 同一个合约上还站着**别的策略**的仓（账户多 10 手 = A 的 5 + B 的 5）：
-        #    A 从 +5 翻到 -3，就该卖 8 手。能平多少由 `_legs` 按账户算，
-        #    策略不去替它做主
+        #    A 从 +5 翻到 -3，就该卖 8 手；其中只有 5 手是本进程记的、能平，
+        #    剩下 3 手是开空 —— `_clamp_close` 只减不增，算的就是这个可平量
         r4 = _runner()
         st4 = _slot(r4, sid="d", target=-3)
         st4.based = True
         st4.sent = {"SHFE.rb2701": 5}
         r4._pos = {"SHFE.rb2701": _P(10, 0)}
         r4._rebalance(st4)
-        if r4.book != [("SHFE.rb2701", -8, None)]:
-            raise RuntimeError(f"该卖 8 手（不看别人仓）：{r4.book}")
+        if r4.book != [("SHFE.rb2701", -8, 5)]:
+            raise RuntimeError(f"卖 8 手、其中只有 5 手可平：{r4.book}")
         # ⑪ 多品种那条**汇总行也要有理论仓**。用户 11-17 的原话：
         #    「台账系统没有了，但是策略的目前持仓的理论仓位依然还是要有的，
         #     目前有几个策略有的持仓都没有显示出来。」「现在理论都显示 0」

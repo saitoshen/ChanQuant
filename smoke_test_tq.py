@@ -3407,17 +3407,14 @@ def check_strategy_runner() -> None:
               str(r2.api.orders))
         a.pending.clear()
 
-        # ⑥ 账户里没有可平的仓，照样按信号发：策略手里记着 -5（空），目标 0
-        #    ⇒ 买 5 手。账户没有空单可能是别的策略的多单对冲掉了，这一买落成
-        #    「开多」是对的 —— 策略只负责下单，账户由外部对齐负责
+        # ⑥ 目标说要平、账户里却没有可平的量：**不许**变成反手开仓
         r2.api = Api()
         r2._pos = {"SHFE.rb2701": Pos()}
         a.target = 0
         a.sent = {"SHFE.rb2701": -5}
         r2._rebalance(a)
-        check("取消台账：账户没仓也照发（不看账户砍单）",
-              len(r2.api.orders) == 1 and r2.api.orders[0]["direction"] == "BUY"
-              and r2.api.orders[0]["volume"] == 5, str(r2.api.orders))
+        check("取消台账：账户没仓时平仓不变成反手开仓", not r2.api.orders,
+              f"{len(r2.api.orders)} 笔")
 
 
         # ---- 仓位分配：不再固定 1 手 ----

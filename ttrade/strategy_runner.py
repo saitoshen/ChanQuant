@@ -2033,6 +2033,46 @@ class PortfolioRunner:
             return 0
         return int(st.sent.get(st.underlying, 0))
 
+    @staticmethod
+    def _closeable_of(own: int, delta: int) -> int:
+        """这次调仓里，本策略手上能拿去平的**最多**几手。
+
+        卖（delta<0）能平的是自己多的那部分，买（delta>0）能平的是自己空的那
+        部分。方向相同就是纯加仓，没有可平的量。
+
+        🔴 必须传给 `_send`：`_legs` 只看得到账户持仓，同一个合约上可能还站着
+        别的策略的仓。不卡这个上限，一条策略的反手会把别人的仓一起平掉，那条
+        策略下次信号再把它开回来 —— 两条策略互相拆台，账户来回震。
+        """
+        own, delta = int(own or 0), int(delta or 0)
+        if not own or not delta or delta * own > 0:
+            return 0
+        return min(abs(delta), abs(own))
+
+    def _clamp_close(self, sym: str, delta: int, own: int) -> int:
+        """把「平自己仓」那部分裁到账户里真能平的量，裁掉的**不转成开仓**。
+
+        取消台账之后策略不跟账户对账，但有一件事必须防：目标说要平掉 5 手，而
+        账户里其实一手都没有（被手工平了、被快期客户端平了、被别的平台平了），
+        这笔卖单下去就成了**反手开 5 手空** —— `_legs` 只看得到账户持仓，它会
+        老老实实把差额算成 OPEN。多开一笔反向仓比少平一笔严重得多。
+
+        所以这个函数只做减法：|delta| 只减不增，永远不会凭空造出一笔委托。
+        它**不是**在跟账户对齐（对齐要平多少、加多少由用户点「一键对齐」决定），
+        只是在「平不掉」的时候别把事情弄得更糟。
+        """
+        own = int(own or 0)
+        delta = int(delta or 0)
+        if not own or not delta or delta * own > 0:
+            return delta        # 空仓 / 同向加仓，跟平仓无关
+        want = min(abs(delta), abs(own))        # 这一笔里有几手是「平自己」
+        side = "long" if own > 0 else "short"
+        avail = self._side_pos(sym, side) if self._pos is not None else 0
+        if avail >= want:
+            return delta
+        cut = want - max(0, int(avail))
+        return delta - (cut if delta > 0 else -cut)
+
     def _rebalance(self, st: SlotState) -> None:
         """目标仓变了就发单 —— **只跟自己的目标比，不跟账户比**。
 
@@ -2042,12 +2082,6 @@ class PortfolioRunner:
           （`_adopt_if_needed` / `_trim`）。那是在做「对齐」，不是在执行信号。
         - 现在：`delta = st.target - 本进程发过的手数`。目标没变 ⇒ 一手都不发；
           账户实际持仓是多少**一概不看**。理论与实际不一致，统一交给「一键对齐」。
-
-        🔴 **策略不碰账户，连「能平多少」都不看**（用户 2026-11-17 明确纠正过）。
-        账户里没有多单，可能是**别的策略的空单对冲掉了**；这时候本该平多的这笔
-        卖单落成「开空」是对的 —— 策略只负责按自己的信号把单子发出去，账户最后
-        长什么样由外部（一键对齐）负责。任何「看账户来裁剪订单」的写法都会把
-        策略和账户重新绑在一起，那正是被砍掉的那套台账干的事。
 
         **唯一保留的自动动作是换月**：老合约上的单是本进程自己发的，自己收尾
         （用户 2026-11-17 明确要求保留）。平仓量按 `sent[老合约]` 算，不看账户。
@@ -2084,10 +2118,16 @@ class PortfolioRunner:
                 return
             if st.rejects and time.time() - st.reject_ts < REJECT_COOL:
                 return
-            # 老合约平多少，只由「我在这个合约上发过多少手」决定。账户里是什么
-            # 样一概不管 —— `_legs` 会按账户实际情况把这一笔拆成 CLOSE / OPEN，
-            # 那只是交易所的报单口径，不影响「策略发了多少」这件事
-            if self._send(st, sym, -have, closeable=abs(have)):
+            delta = self._clamp_close(sym, -have, have)
+            if not delta:
+                # 账户里一手可平的都没有：老合约已经是干净的了，记完收工。
+                # 这里不能硬发 —— 发出去就是在新（老）合约上反手开一笔
+                st.sent.pop(sym, None)
+                st.retired.remove(sym)
+                st.last_action = f"换月：老合约 {sym} 账户里已无持仓"
+                self._log(f"{st.title()}：{st.last_action}")
+                continue
+            if self._send(st, sym, delta, closeable=abs(have)):
                 st.sent.pop(sym, None)
                 st.retired.remove(sym)
                 st.last_action = f"换月平老合约 {sym} {have:+d} 手"
@@ -2107,9 +2147,11 @@ class PortfolioRunner:
             self._log(f"{st.title()}：{st.last_action}")
             return
 
-        delta = int(st.target) - self._sent_of(st)
+        own = self._sent_of(st)
+        delta = int(st.target) - own
+        delta = self._clamp_close(st.underlying, delta, own)
         if delta == 0:
-            # 目标没变。之前的拒单记录可以清了
+            # 目标没变（或要平的量账户里根本没有）。之前的拒单记录可以清了
             st.rejects = 0
             st.reject_msg = ""
             return
@@ -2123,7 +2165,7 @@ class PortfolioRunner:
             # 的单只会被打回，攒够 3 次策略就停机了。等下一根 bar 再说。
             st.last_action = "行情已停（收盘或断流），等下一根 bar 再调仓"
             return
-        if self._send(st, st.underlying, delta):
+        if self._send(st, st.underlying, delta, closeable=self._closeable_of(own, delta)):
             # 发出去就当它成交 —— **不跟踪成交回报来修正这个数**。部分成交、
             # 被拒、被人手工平掉，都会让账户和它慢慢偏离，那正是「一键对齐」
             # 存在的意义。这里再自作聪明去对，就又变成账号本了。
