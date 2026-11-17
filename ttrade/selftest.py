@@ -8015,13 +8015,20 @@ def _run() -> tuple[bool, list[str]]:
     def _break_caliber():
         """波幅突破的两条口径：检查点时刻、因子基准价（#146）。
 
-        1. `cta_break2` 的检查点必须是 **10:05 那根**。交易日从夜盘 21:00 起算，
-           只写 `ms >= check_min` 的话 21:00 就满足了 —— 实测 RB 5m 上原本一半
-           的单在 21:00 进场，设 10:40 等于没设。
+        1. 检查点有**三档口径**（`caliber`），2026-11-17 并入一个参数：
+           `orig` / `window` / `strict`。这里同时钉住三件事 ——
+           a) **默认必须是 `orig`**（用户决定：先让策略库存量曲线可复现）；
+           b) `window` / `strict` 下 `cta_break2` 的检查点只落在 **10:05 那根**
+              —— 交易日从夜盘 21:00 起算，21:00 那根不能把当天的 `checked` 用掉；
+           c) 夜盘腿是**独立注册**的 `cta_break_night`，进场时刻只能是 21:30。
+           🔴 只测 `window` 是不够的：默认值一改，这条测试就该红，否则「默认口径
+           被谁悄悄改了」永远发现不了。
         2. 用户因子 `open_range_break` 的基准是**当日开盘**、分母是**上一交易日**
            波幅。原来写的是「当根 open / 上一根 high−low」，日线上碰巧对，5m 上
            全错（同一根 bar 旧版 −0.83 / 新版 +0.63，连符号都反）。
         """
+        import inspect
+
         import numpy as np
         import pandas as pd
 
@@ -8078,26 +8085,54 @@ def _run() -> tuple[bool, list[str]]:
 
         ms = (df.index.hour * 60 + df.index.minute).to_numpy()
         sp = S.STRATEGIES["cta_break2"]
-        out = sp.func(df, **sp.params)
-        sig = out["signal"].to_numpy()
-        prev = np.r_[0, sig[:-1]]
-        ent = (sig != 0) & (sig != prev)
+
+        def _sig(data, spec, **over):
+            p = dict(spec.params)
+            p.update(over)
+            return spec.func(data, **p)["signal"].to_numpy()
+
+        def _entries(sig):
+            return (sig != 0) & (sig != np.r_[0, sig[:-1]])
+
+        # ① 默认口径必须是 orig —— 签在函数签名上，不靠记忆
+        dflt = inspect.signature(S.strat_cta_break).parameters["caliber"].default
+        if dflt != "orig":
+            raise RuntimeError(
+                "strat_cta_break 的默认 caliber 应为 orig（存量曲线口径，"
+                f"用户 2026-11-17 决定），实际 {dflt!r}")
+
+        # ② window / strict：日盘检查点只落在 10:05 —— 21:00 那根不能把当天的
+        #    `checked` 用掉，这正是 #146 修的那个 bug
+        win = _sig(df, sp, caliber="window")
+        ent = _entries(win)
         if not ent.any():
-            raise RuntimeError("合成行情没有触发任何开仓")
+            raise RuntimeError("合成行情在 caliber=window 下一笔都没开")
         bad = sorted(set(ms[ent]) - {605})
         if bad:
-            raise RuntimeError(f"cta_break2 不在 10:05 进场，多出时刻 {bad[:4]}")
+            raise RuntimeError(
+                f"cta_break2（caliber=window）不在 10:05 进场，多出时刻 {bad[:4]}")
+        strict = _sig(df, sp, caliber="strict")
+        if not np.array_equal(win, strict):
+            raise RuntimeError("5m 上 window 与 strict 应该逐根等价，实际不同")
 
-        # 夜盘档位仍然可用：21:30 开仓（用干净行情，避免被白天的持仓挡住）
-        p = dict(sp.params)
-        p.update(check_min=1290, exit_min=545)
-        o2 = sp.func(df_n, **p)
-        s2 = o2["signal"].to_numpy()
-        e2 = (s2 != 0) & (s2 != np.r_[0, s2[:-1]])
+        # ③ orig 在同样的行情上结果必须不同（21:00 那根先把 checked 用掉了）；
+        #    相同就说明默认值没真的生效
+        if np.array_equal(_sig(df, sp, caliber="orig"), win):
+            raise RuntimeError("caliber=orig 与 window 结果相同 —— 默认口径没生效")
+
+        # ④ 夜盘腿：独立注册的 cta_break_night 只能 21:30 进场（固定 window 口径）。
+        #    用干净行情，避免被白天的持仓挡住
+        sn = S.STRATEGIES["cta_break_night"]
+        if (sn.params.get("check_min"), sn.params.get("exit_min")) != (1290, 545):
+            raise RuntimeError(
+                f"cta_break_night 的默认时刻应是 21:30 进 / 09:05 平，"
+                f"实际 {sn.params.get('check_min')} / {sn.params.get('exit_min')}")
+        s2 = _sig(df_n, sn)
+        e2 = _entries(s2)
         ms_n = (df_n.index.hour * 60 + df_n.index.minute).to_numpy()
         if not e2.any() or set(ms_n[e2]) != {1290}:
             raise RuntimeError(
-                "夜盘检查点（21:30）被日盘时段限制误伤："
+                "cta_break_night 不在 21:30 进场："
                 f"{sorted(set(ms_n[e2])) if e2.any() else '一笔没开'}")
 
         # 因子：当日开盘 + 昨日波幅 + 1.0 = 40%
@@ -8124,8 +8159,10 @@ def _run() -> tuple[bool, list[str]]:
             if _mod != "ttrade.factors_intraday":
                 raise RuntimeError(f"{_k} 不是内置因子（func 来自 {_mod!r}）")
 
-        return (f"检查点只落在 10:05（{int(ent.sum())} 笔）/ 夜盘 21:30 可用；"
-                f"因子按当日开盘，偏差 {dev:.0e}；两个因子都是内置 Python 实现")
+        return (f"默认 orig（与 window 结果不同）；window/strict 只落在 10:05"
+                f"（{int(ent.sum())} 笔）且 5m 上逐根等价；夜盘腿 21:30 进场"
+                f"（{int(e2.sum())} 笔）；因子按当日开盘，偏差 {dev:.0e}；"
+                f"两个因子都是内置 Python 实现")
 
     check("波幅突破：检查点时刻 + 当日开盘口径", _break_caliber)
 
