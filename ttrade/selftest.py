@@ -4599,6 +4599,7 @@ def _run() -> tuple[bool, list[str]]:
         r._slots = {}
         st = SlotState(cfg=SStore.StrategyConfig(sid="t", name="jd", period="1h"))
         st.running, st.underlying, st.target = True, "DCE.jd2612", -24
+        st.target_ok = True
         r._slots["t"] = st
         r._align_slot = SlotState(cfg=SStore.StrategyConfig(
             sid="__align__", name="一键对齐", period="1d"))
@@ -4663,6 +4664,7 @@ def _run() -> tuple[bool, list[str]]:
         def _runner():
             r = PortfolioRunner.__new__(PortfolioRunner)
             r._slots = {}
+            r._groups, r._parents = {}, {}
             r._mm_cache, r._mm_ts = [], 0.0
             r._align_ts = 0.0
             r._pos = None
@@ -4684,6 +4686,7 @@ def _run() -> tuple[bool, list[str]]:
             st = SlotState(cfg=SStore.StrategyConfig(
                 sid=sid, name=sid, symbol="RB", exchange="SHFE", period="1d"))
             st.running, st.underlying, st.target = True, under, int(target)
+            st.target_ok = True          # 用例显式给了目标 ⇒ 就是「已算出来」
             r._slots[sid] = st
             return st
 
@@ -4801,7 +4804,54 @@ def _run() -> tuple[bool, list[str]]:
         r4._rebalance(st4)
         if r4.book != [("SHFE.rb2701", -8, None)]:
             raise RuntimeError(f"该卖 8 手（不看别人仓）：{r4.book}")
-        return "重启只建基准、目标不变不发单、账户漂移不管，换月仍自动平老开新"
+        # ⑪ 多品种那条**汇总行也要有理论仓**。用户 11-17 的原话：
+        #    「台账系统没有了，但是策略的目前持仓的理论仓位依然还是要有的，
+        #     目前有几个策略有的持仓都没有显示出来。」「现在理论都显示 0」
+        #    两个毛病：汇总行 `target=None` ⇒ 一律「—」；目标还没算出来时
+        #    `target` 是初值 0 ⇒ 界面把「未知」显示成「0 手」。
+        r5 = _runner()
+        r5._groups = {"p": ["p#a", "p#b", "p#c"]}
+        r5._parents = {"p": SStore.StrategyConfig(
+            sid="p", name="多品种汇总", period="1d",
+            multi_symbols=["RB_SHFE", "AG_SHFE", "CU_SHFE"])}
+        for sid, und, tg in (("p#a", "SHFE.rb2701", 3),
+                             ("p#b", "SHFE.ag2612", -1),
+                             ("p#c", "SHFE.cu2701", 0)):
+            s = SlotState(cfg=SStore.StrategyConfig(sid=sid, period="1d"))
+            s.running, s.underlying, s.target = True, und, tg
+            s.target_ok = True
+            r5._slots[sid] = s
+        g = r5._group_slots()
+        if len(g) != 1:
+            raise RuntimeError(f"汇总行没生成：{g}")
+        g = g[0]
+        if (g["tgt_long"], g["tgt_short"], g["multi"]) != (3, 1, 3):
+            raise RuntimeError(
+                "汇总行没有合计理论仓：多 %s / 空 %s（multi=%s）"
+                % (g.get("tgt_long"), g.get("tgt_short"), g.get("multi")))
+        if [v for _, v in g["tgt_detail"]] != [3, -1]:
+            raise RuntimeError(f"逐品种目标漏了：{g['tgt_detail']}")
+        if g["target"] is not None or not g["target_ok"]:
+            raise RuntimeError("汇总行不该有「一个」目标仓，但必须标 target_ok")
+
+        # ⑫ 「还没算出目标」≠「目标 0 手」：前者一手都不许发（0 手是「该平仓」），
+        #    对账时也不许算成 0（否则一键对齐会拿它把账户的实仓平掉）
+        r6 = _runner()
+        s6 = _slot(r6, sid="e", target=0)
+        s6.target_ok = False       # 显式回到「目标还没算出来」
+        s6.based = True            # 跳过「建基准」，直接比差额
+        s6.sent = {"SHFE.rb2701": 4}
+        r6._rebalance(s6)          # target_ok 还是 False
+        if r6.book:
+            raise RuntimeError(f"目标还没算出来就发单了：{r6.book}")
+        if r6.theoretical().get("SHFE.rb2701"):
+            raise RuntimeError("目标未知的槽位被算进理论仓（一键对齐会平掉实仓）")
+        s6.target_ok = True
+        r6._rebalance(s6)
+        if r6.book != [("SHFE.rb2701", -4, None)]:
+            raise RuntimeError(f"目标算出来是 0 就该平掉 4 手：{r6.book}")
+        return ("重启只建基准、目标不变不发单、账户漂移不管，换月仍自动平老开新；"
+                "多品种汇总行给出「多 X 空 Y」+ 逐品种明细；目标未知≠0 手")
 
     check("取消台账：策略只在信号驱动下交易", _no_ledger)
 
