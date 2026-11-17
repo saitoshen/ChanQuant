@@ -4599,6 +4599,7 @@ def _run() -> tuple[bool, list[str]]:
         r._slots = {}
         st = SlotState(cfg=SStore.StrategyConfig(sid="t", name="jd", period="1h"))
         st.running, st.underlying, st.target = True, "DCE.jd2612", -24
+        st.target_ok = True          # 目标已算出，才进 theoretical
         r._slots["t"] = st
         r._align_slot = SlotState(cfg=SStore.StrategyConfig(
             sid="__align__", name="一键对齐", period="1d"))
@@ -4768,6 +4769,145 @@ def _run() -> tuple[bool, list[str]]:
                 "换月不受限；目标未知不进理论仓；多品种汇总给「多 X 空 Y」")
 
     check("加载策略时不按台账自动交易", _load_no_trade)
+
+    def _data_gap_gate():
+        """K 线缺交易日 / 补库静默成功 —— 2026-11-17 的现场。
+
+        用户报三件事：IF 的 5m 历史还停在 11-10；同一个策略在两个账户上一个
+        1 手、一个 0 手；回测里却还持仓。
+
+        根因不在策略：本地库缺了 11-11~11-17，`merge_live` 把实时段直接贴在
+        11-10 后面 —— 索引看着连续，中间五个交易日凭空消失。指标（60 根动量、
+        上一交易日波幅、ATR）跨着断口算，信号就和回测对不上。柜台账户更容易撞：
+        它没有回填历史的能力，序列全靠本地库里种进去的 300 根。
+        """
+        import inspect
+
+        import pandas as pd
+
+        from ttrade import strategy_runner as R
+        from ttrade import topup, tqstore
+
+        cal = sorted(tqstore.calendar())
+        if len(cal) < 10:
+            raise RuntimeError("库里没有日线日历，这条自检跑不了")
+
+        def mk(i):
+            return pd.DataFrame({"close": [1.0] * len(i)}, index=i)
+
+        def at(days):
+            return pd.DatetimeIndex([pd.Timestamp(d) + pd.Timedelta(hours=10)
+                                     for d in days])
+
+        # ① 完整的一段不能报缺口；抽掉一天必须报出来
+        tail = cal[-6:]
+        if R.hole_days(mk(at(tail))):
+            raise RuntimeError(f"完整的 K 线被判成缺口：{R.hole_days(mk(at(tail)))}")
+        miss = R.hole_days(mk(at(tail[:2] + tail[3:])))
+        if miss != [tail[2]]:
+            raise RuntimeError(f"缺一天没判出来：{miss} vs {[tail[2]]}")
+
+        # ② 空表 / 只有索引的帧：空表返回空（没得判），只有索引也要照判
+        if R.hole_days(pd.DataFrame()):
+            raise RuntimeError("空表被判成缺口")
+        if not R.hole_days(pd.DataFrame(index=at(tail[:2] + tail[3:]))):
+            raise RuntimeError("只有索引的帧漏判了（`DataFrame.empty` 对 0 列也是 True）")
+
+        # ③ 🔴 长假不能误判：日历里间隔最大的那两天之间没有任何交易日
+        #    （春节 / 国庆），拿自然日判会把它们当成缺口，一年两次把策略停掉
+        best = max(range(len(cal) - 1), key=lambda i: (cal[i + 1] - cal[i]).days)
+        d0, d1 = cal[best], cal[best + 1]
+        if (d1 - d0).days < 3:
+            raise RuntimeError("日历里没有长假段，这条反证没意义")
+        if R.hole_days(mk(at([d0, d1]))):
+            raise RuntimeError(f"长假被当成缺口（{d0} → {d1} 共 {(d1 - d0).days} 天）")
+
+        # ④ 补库：整段落在交易时段外（午休 / 收盘快照）时**不能当成功**。
+        #    当成功就把这个品种永久钉在旧数据上，一句话都不说
+        serial = pd.DataFrame({
+            # 天勤给的是 UTC 纳秒，北京 11:45（CFFEX 午休）＝ UTC 03:45
+            "datetime": [pd.Timestamp("2026-11-17 03:45").value],
+            "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+            "volume": [1.0], "open_oi": [1.0], "close_oi": [1.0],
+        })
+        r = topup.save(serial, "IF", "CFFEX", "5m")
+        if r["ok"] or not r["error"]:
+            raise RuntimeError(f"全是时段外的 bar 竟被当成补库成功：{r}")
+
+        # ⑤ 停机槽位也要继续补库（源码判据：这里没有真连接，只能看结构）
+        src = inspect.getsource(R.PortfolioRunner.tick)
+        i = src.find("if not st.running:")
+        if i < 0 or "_top_up" not in src[i:i + 500]:
+            raise RuntimeError("停机后不再补库：库会一直停在旧数据上（IF 就是这样停在 11-10）")
+
+        # ⑥ bar 数不足要写出来，不许静默 return（否则界面上只剩「理论 0 手」）
+        src2 = inspect.getsource(R.PortfolioRunner._refresh_signal)
+        j = src2.find("MIN_BARS")
+        if j < 0 or "last_action" not in src2[j:j + 500]:
+            raise RuntimeError("bar 数不足时又静默 return 了，界面上看不出原因")
+
+        # ⑦ 🔴 增量窗口的起点就一条：**现有数据到哪一刻，就从那儿补到此刻**。
+        #    老写法 `max(hard_start, last-3d)` 会被「回溯区间」夹住 —— 定时任务
+        #    固定 days=1（hard_start = 昨天），库尾停在 11-10 时算出来是「从
+        #    11-16 开始补」，中间那截永远补不上，而日志照样报「+14 行」。
+        #    这里把下载函数换掉，只看它算出来的窗口。
+        from datetime import date, timedelta
+
+        from ttrade import tqfetch as TQ
+
+        seen: list = []
+        keep = (TQ.download_many, TQ.can_download, tqstore.last_dt,
+                tqstore.first_dt, tqstore.load_switch, tqstore.miss_days)
+        d_last = cal[-4]
+
+        def fake_dl(api, reqs, period, root, label, max_parallel=8):
+            seen.extend(reqs)
+            return {}
+
+        try:
+            TQ.download_many = fake_dl
+            TQ.can_download = lambda api: True
+            tqstore.last_dt = lambda s, e, p: pd.Timestamp(d_last) + pd.Timedelta(hours=15)
+            tqstore.first_dt = lambda s, e, p: pd.Timestamp(cal[0])
+            tqstore.load_switch = lambda s, e: pd.DataFrame()
+            tqstore.miss_days = lambda s, e, p, c=None: []
+            TQ.write_main_many(None, [("IF", "CFFEX")], "5m", 0, days=1)
+        finally:
+            (TQ.download_many, TQ.can_download, tqstore.last_dt,
+             tqstore.first_dt, tqstore.load_switch, tqstore.miss_days) = keep
+        if not seen:
+            raise RuntimeError("增量窗口一个都没算出来")
+        got = seen[0][1]
+        want = d_last - timedelta(days=3)
+        if got != want:
+            raise RuntimeError(
+                f"增量起点被回溯区间夹住了：算成 {got}，应当是库尾往前 3 天的 {want}"
+                f"（今天 {date.today()}，days=1 ⇒ 老写法会算成 {date.today() - timedelta(days=1)}）")
+
+        # ⑧ 库尾之前中间缺的那几天：从**最早缺的那天**补起，一次覆盖洞和尾巴
+        seen.clear()
+        d_hole = cal[-12]
+        try:
+            TQ.download_many = fake_dl
+            TQ.can_download = lambda api: True
+            tqstore.last_dt = lambda s, e, p: pd.Timestamp(d_last) + pd.Timedelta(hours=15)
+            tqstore.first_dt = lambda s, e, p: pd.Timestamp(cal[0])
+            tqstore.load_switch = lambda s, e: pd.DataFrame()
+            tqstore.miss_days = lambda s, e, p, c=None: [d_hole]
+            TQ.write_main_many(None, [("IF", "CFFEX")], "5m", 0, days=1)
+        finally:
+            (TQ.download_many, TQ.can_download, tqstore.last_dt,
+             tqstore.first_dt, tqstore.load_switch, tqstore.miss_days) = keep
+        if not seen or seen[0][1] != d_hole:
+            raise RuntimeError(
+                f"中间有洞时没从洞的起点补起：算出 {seen[0][1] if seen else None}，"
+                f"应当是 {d_hole}")
+
+        return ("缺口按交易日历判（长假不误报、0 列的帧也照判）；"
+                "补库不再静默成功；停机仍补库；bar 不足会写明原因；"
+                "增量起点 = 库尾/最早的洞 → 此刻，不受回溯区间夹取")
+
+    check("K 线缺交易日 / 补库静默成功", _data_gap_gate)
 
     def _add_or_update():
         """新加进组合的策略要能被「启动 / 停止」接上。
@@ -8389,11 +8529,25 @@ def _run() -> tuple[bool, list[str]]:
             if got != want:
                 raise RuntimeError(
                     f"_open_now 与 in_session 不一致（{sym}）：{want} vs {got}")
-        if not SR.PortfolioRunner._open_now(
-                None, _Cfg("", "SHFE", ["IM_CFFEX", "RB_SHFE"])):
-            raise RuntimeError("板块级策略没有按「任一成员开市」判定")
-        if not SI.in_session("600519", "SSE"):
-            raise RuntimeError("A 股被期货交易时段表误伤了")
+        # 🔴 「任一成员开市」不能拿**当前时刻**去验：15:00 一过 IM 和 RB 都
+        # 收盘，这条断言就必红（2026-11-17 15:03 实测红过）。判据换成确定的
+        # 假函数，自检才能全天候跑。
+        _is = SI.in_session
+        try:
+            SI.in_session = lambda s, e, t=None: str(s).startswith("RB")
+            if not SR.PortfolioRunner._open_now(
+                    None, _Cfg("", "SHFE", ["IM_CFFEX", "RB_SHFE"])):
+                raise RuntimeError("板块级策略没有按「任一成员开市」判定")
+            SI.in_session = lambda s, e, t=None: False
+            if SR.PortfolioRunner._open_now(
+                    None, _Cfg("", "SHFE", ["IM_CFFEX", "RB_SHFE"])):
+                raise RuntimeError("板块级策略在全部成员闭市时仍然开跑")
+        finally:
+            SI.in_session = _is
+        # A 股在品种信息表里没有时段 ⇒ 一律判「开着」，三个时刻都试一遍
+        for _tick in ("2026-11-17 03:00", "2026-11-17 10:00", "2026-11-17 15:30"):
+            if not SI.in_session("600519", "SSE", _t(_tick)):
+                raise RuntimeError("A 股被期货交易时段表误伤了（%s）" % _tick)
 
         return (f"{len(cases)} 个时刻判对（含夜盘跨零点 / 周五夜盘跑到周六凌晨 / "
                 f"午休 / 股指无夜盘）；CTP 挡掉时段外 tick（留 {','.join(kept)}）；"
