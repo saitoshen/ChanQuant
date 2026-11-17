@@ -263,6 +263,39 @@ class SlotState:
 # ------------------------------------------------------------------ 引擎
 
 
+def hole_days(df: pd.DataFrame) -> list:
+    """这段 K 线里**缺掉的交易日**（拿全库日历比）。
+
+    为什么必须有这条：本地库落后几天时，`merge_live` 会把实时段直接贴在旧的
+    最后一根后面 —— 中间那几天凭空消失，索引看着还是连的。指标跨着这个断口算
+    （60 根动量、上一交易日波幅、ATR），出来的信号和回测**不一样**，而且完全
+    没有痕迹。2026-11-17 的现场就是它：IF 的 5m 库停在 11-10，柜台账户的历史
+    也只有从库里种进去的 300 根（同样停在 11-10），实时从当天接上；同一个策略
+    在两个账户上一个多 1 手、一个 0 手，而回测按完整数据算出来是持仓的。
+
+    不能按自然日判：春节、国庆一周不开市，按自然日会把长假当成缺口天天误报。
+    日历取 `tqstore.calendar()`（全库日线出现过的交易日）。
+
+    返回缺掉的交易日（空表 = 这段是完整的）。日历读不到时也返回空表 ——
+    「不知道」不能当成「缺了」，那会把所有策略一起停掉。
+    🔴 判空只能用 `len(df)`：`DataFrame.empty` 在**没有列**时也是 True（pandas 的
+    规定是「任一轴长度为 0」），拿它判空会把只有索引的帧当成没数据，缺口静默漏掉。
+    """
+    if df is None or len(df) == 0:
+        return []
+    from ttrade import tqstore
+
+    cal = tqstore.calendar()
+    if not cal:
+        return []
+    have = {pd.Timestamp(x).date() for x in tqdata.trading_days(df.index)}
+    if not have:
+        return []
+    # 上限卡到日历最后一根：当天的日线还没落库，别把「今天」当成缺口
+    hi = min(max(have), max(cal))
+    return sorted(d for d in cal if min(have) <= d <= hi and d not in have)
+
+
 class LiveLog:
     """实盘诊断日志，落盘到 `logs/live.log`。
 
@@ -529,6 +562,8 @@ class PortfolioRunner:
         # 算信号用的前复权基准，(品种_交易所@周期) -> qfq 历史。实盘必须和回测
         # 同一份复权口径（见 `_signal_frame`）。主连换月时失效重载。
         self._qfq_base: dict[str, pd.DataFrame] = {}
+        # K 线缺交易日的提示（键同 `_qfq_base`），同样的原因只记一次
+        self._gap_note: dict[str, str] = {}
         self._aux_warned: set[str] = set()
         # 因子被剔除只提示一次（按 sid 去重），理由见 `_note_dropped`
         self._factor_warned: set[str] = set()
@@ -967,6 +1002,15 @@ class PortfolioRunner:
             return
         for st in list(self._slots.values()):
             if not st.running:
+                # 停机**不等于**不补数据。补库只依赖那条订阅，和策略在不在跑无关；
+                # 而库里停在几天前，回测、详情页、下次启动读到的全是旧数据。
+                # 2026-11-17 的现场就是这样：IF 在 11:45 被拒单停机，之后补库
+                # 也一起停了，5m 库一直卡在 11-10。
+                try:
+                    if self._skey(st.cfg) in self._klines:
+                        self._top_up(st)
+                except Exception:  # noqa: BLE001
+                    pass
                 continue
             try:
                 # 订阅**不受**时段限制（在 `_refresh_signal` 里先订再判）：
@@ -1122,6 +1166,14 @@ class PortfolioRunner:
         if serial is None or not len(serial):
             return
         r = topup.save(serial, st.cfg.symbol, st.cfg.exchange, src)
+        if r.get("gap"):
+            # 接缝有洞：库缺了几天，而手上这份序列也没有那几天（柜台账户的序列
+            # 只有 300 根，就是从库里种进去的）。追加帮不上忙，得靠全量下载补。
+            msg = (f"本地历史与实时段之间缺一截（{r['gap']}），"
+                   "补库补不上，请在「数据管理」补该品种历史")
+            if self._top_err.get(slot) != msg:
+                self._top_err[slot] = msg
+                self._log(f"{st.title()}：{msg}")
         if not r["ok"]:
             # 序列还没填充，或者库被别的连接锁着（下载器在跑、主线程正在读）。
             # 两种都值得过 2 秒再试 —— 一次写库失败就把这个品种永久放弃，
@@ -1190,6 +1242,14 @@ class PortfolioRunner:
         if len(df) > 1:
             df = df.iloc[:-1]
         if len(df) < MIN_BARS:
+            # 静默 return 是最糟的一种：界面上只看到「理论 0 手」，谁也想不到
+            # 是因为手上只有几根 bar。柜台账户尤其容易撞上 —— 它没有回填历史的
+            # 能力，序列全靠本地库种进去的 300 根。
+            if len(df):
+                note = f"K 线只有 {len(df)} 根（要 {MIN_BARS} 根），先不算信号"
+                if st.last_action != note:
+                    st.last_action = note
+                    self._log(f"{st.title()}：{note}")
             return
         if self._is_ml(st.cfg):
             # 机器学习：整段历史重走一遍要几十秒，交给后台线程，这一 tick 只读缓存
@@ -1421,6 +1481,10 @@ class PortfolioRunner:
             self._log(f"{st.title()}：K 线内做空 {st.underlying} 触发价 {es:.3f}"
                       f"，现价 {price:.3f}，止损 {st.ib_stop:.3f}")
 
+    def _hole_days(self, df: pd.DataFrame) -> list:
+        """这段 K 线里缺掉的交易日。判据见模块级 `hole_days()`。"""
+        return hole_days(df)
+
     def _signal_frame(self, st: SlotState, kl) -> pd.DataFrame:
         """算信号用的行情：**本地前复权历史 + 实时 bar**。
 
@@ -1464,6 +1528,18 @@ class PortfolioRunner:
         # `WARMUP_BARS` 根预热），这里切同一刀。详情页画多少根、从哪根开始算，
         # 实盘就用同样那些根 —— 所见即所得，不再截 KLINE_LEN。
         merged = merge_live(base, live)
+        miss = self._hole_days(merged)
+        if miss:
+            # 🔴 缺交易日就**不算信号**：跨着断口算出来的指标是错的，拿它下单就是
+            # 「回测持仓、实盘空仓」这种对不上账。保持原仓，把原因写出来。
+            note = (f"K 线缺 {len(miss)} 个交易日（{miss[0]:%m-%d}~{miss[-1]:%m-%d}），"
+                    "实时段直接接在旧数据后面 —— 先补历史再算信号")
+            if self._gap_note.get(key) != note:
+                self._gap_note[key] = note
+                st.last_action = note
+                self._log(f"{st.title()}：{note}")
+            return pd.DataFrame()
+        self._gap_note.pop(key, None)
         merged = replay.window(merged, getattr(st.cfg, "range_years", 0) or 0)
         if merged is None or len(merged) < 2:
             return live

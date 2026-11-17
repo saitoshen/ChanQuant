@@ -842,7 +842,10 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int,
         if last is None and ts_code in empty and _expired(ts_code, end):
             blank += 1                    # 摘牌时就没数据，不会再有
             continue
-        cstart = start if last is None else max(start, (last - timedelta(days=3)).date())
+        # 同理**不能**用 `max(start, ...)` 夹：定时任务 days=1 时 start 是昨天，
+        # 合约要是停在更早（主连在补、真实合约没跟上），夹完就从昨天开始，
+        # 中间那截永远缺，展期因子照样算得出来，只是算错。
+        cstart = start if last is None else (last - timedelta(days=3)).date()
         todo.append((c, ts_code, cstart))
 
     added = n_con = 0
@@ -916,7 +919,7 @@ def _tq_product_of(sym: str, ex: str) -> str:
 
 def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
                     on_row=None, max_parallel: int = 8,
-                    cancel=None, days: int = 0) -> dict[str, int]:
+                    cancel=None, days: int = 0, on_note=None) -> dict[str, int]:
     """批量下载主连并写库（原始价 + adj_factor，复权在读取时做）。
 
     一个品种十年 5m 串行要几分钟，78 个品种两个周期就是几小时。这里走 8 路并发，
@@ -924,6 +927,8 @@ def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
     增量跳过不会重下。
 
     `on_row(key, rows, first_dt)` 是进度回调：命令行用它打日志，界面用它刷状态。
+    `on_note(text)` 是**对账**回调：补完之后拿日线日历比一遍，把「仍缺 N 个交易日」
+    的品种单独报出来 —— 行数只说明写了多少，说明不了全了没有。传 None 就不对账。
     返回 `{品种_交易所: 本次写入行数}`。
 
     **`period` 会先归一成源周期**（`tqdata.source_period`）：天勤只下 5m 和 1h，
@@ -935,6 +940,8 @@ def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
     hard_start = window_start(years, days)
     # 免费账户只能取最近一段，补历史缺口那段会拿到同一批数据、白跑一倍请求
     free_mode = not can_download(api)
+    # 日线日历（进程缓存，0.2 秒）：判「库里中间缺没缺交易日」用
+    cal = S.calendar()
 
     tail: list[tuple[str, date, date, str, str]] = []
     head: list[tuple[str, date, date, str, str]] = []
@@ -948,12 +955,19 @@ def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
         if last is None:
             tail.append((tq, hard_start, end, sym, ex))
             continue
-        # 尾段：往前推 3 天重叠，覆盖「上次下到一半」和节假日边界；主键冲突会覆盖
-        tail_start = max(hard_start, (last - timedelta(days=3)).date())
-        if free_mode:
-            # 免费路径一次就能拿 8000 根，多取不花钱：从库里最后一根接着补。
-            # 不然「近 1 天」只会写最近两天，中间断了几个月的那段空洞永远补不上。
-            tail_start = (last - timedelta(days=3)).date()
+        # 起点 = 「现有数据到哪儿了」→ 从那儿补到现在。一句话就够：
+        # 🔴 起点**不能**拿回溯区间去夹（老写法 `max(hard_start, last-3d)`）。
+        # 定时任务固定 `days=1`，`hard_start` 就是昨天；库尾要落后了（IF 的 5m
+        # 停在 11-10），夹出来就是「从 11-16 开始补」，中间 11-11~11-13 那一截
+        # **永远补不上**，而日志每天照样报「+14 行」，看着像正常增量
+        # （2026-11-17 的现场）。
+        tail_start = (last - timedelta(days=3)).date()
+        # 库尾之前**中间**缺的那几天同理：从最早缺的那天补到现在，一次就够，
+        # 顺带把尾巴也接上。不这么做的话（实测 11-02 全库 31 个品种都缺那一天），
+        # 策略端会一直判「K 线缺交易日」而不交易，比补一遍严重得多。
+        miss = S.miss_days(sym, ex, period, cal)
+        if miss:
+            tail_start = min(tail_start, miss[0])
         tail.append((tq, tail_start, end, sym, ex))
         # 头段：库里最早那根比回溯区间晚，说明前面那段从来没下过。早期版本用两年
         # 窗口跑过一轮，之后增量只看 last_dt，于是那几年永远补不上 —— RB 的 1h
@@ -1006,6 +1020,35 @@ def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
         if cancel is not None and cancel():
             break
         run(tail[i : i + chunk], f"MAIN_{period}", report=True)
+
+    # ---- 补完对账：**「+N 行」不等于「补全了」** ----
+    # 2026-11-17 的现场：IF 的 5m 停在 11-10，每日任务只往后接，中间那几天
+    # 永远补不上，日志却天天显示「+14 行」。修了增量口径之后新洞不会再产生，
+    # 但**已经存在的洞**必须报出来 —— 否则用户看到「补完了」继续让策略跑，
+    # 指标跨断口算，信号和回测对不上，还完全无痕。
+    if on_note is not None:
+        try:
+            cal = S.calendar()
+            cov = S.coverage(period)
+            holes: list[tuple[str, str, int]] = []
+            for sym, ex in pairs:
+                lo, hi, n = cov.get((sym, ex), (None, None, 0))
+                if lo is None or not cal:
+                    continue
+                want = [d for d in cal if lo <= d <= min(hi, max(cal))]
+                if len(want) > n:
+                    holes.append((sym, ex, len(want) - n))
+            if holes:
+                holes.sort(key=lambda x: -x[2])
+                shown = "、".join(f"{s}_{e}(缺{k}天)" for s, e, k in holes[:6])
+                more = f"……共 {len(holes)} 个品种" if len(holes) > 6 else ""
+                on_note(
+                    f"{period} 仍缺交易日：{shown}{more}。"
+                    "增量补不上这些洞（只往库尾接），请在界面选「近 1 年」重跑一次该周期"
+                )
+        except Exception:  # noqa: BLE001
+            # 对账失败不该让「已经补进去的数据」跟着报错
+            pass
     return out
 
 

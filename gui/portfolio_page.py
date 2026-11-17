@@ -167,7 +167,7 @@ from ttrade import workspace_store as WS
 from ttrade.tqlive import merge_live
 from ttrade.backtest import combine, combine_trades
 from ttrade.strategies import STRATEGIES, param_label
-from ttrade.strategy_runner import PortfolioRunner
+from ttrade.strategy_runner import PortfolioRunner, hole_days
 from ttrade.universe import cn_name
 
 # 与 trade_page.py / app.py 同一套配色。不 import 那两处：app 会 import 本模块。
@@ -1165,6 +1165,8 @@ class PortfolioPage(QWidget):
         self._live_sid = ""
         self._live_busy = False
         self._live_req = 0.0
+        # 图上缺交易日时的提示键（(首日, 末日)），同一条只提示一次
+        self._live_seam = None
         self._live_timer = QTimer(self)
         self._live_timer.setInterval(5000)
         self._live_timer.timeout.connect(self._poll_live)
@@ -2588,6 +2590,19 @@ class PortfolioPage(QWidget):
             df = merge_live(self._live_base, live)
             if df is None or df.empty:
                 return
+            # 🔴 图上不能把「中间缺了几天」画成连续走势：本地历史停在 11-10、
+            # 实时段从当天接上，看着是连贯的，其实中间五个交易日凭空消失了。
+            # 策略那边按同一条判据**拒绝算信号**（`hole_days`），这里把原因
+            # 说在日志里，否则用户只会看到「回测还持仓、实盘空仓」。
+            miss = hole_days(df)
+            key = (miss[0], miss[-1]) if miss else None
+            if key != self._live_seam:
+                self._live_seam = key
+                if miss:
+                    self._on_log(
+                        f"K 线缺 {len(miss)} 个交易日（{miss[0]:%m-%d}~{miss[-1]:%m-%d}）："
+                        "本地历史没补齐，实时段直接贴在旧数据后面。"
+                        "策略此时不会交易，请先在「数据管理」补该品种历史")
             rp = replay.run(cfg, df, extra=self._extra_periods(cfg))
         except Exception as exc:  # noqa: BLE001
             self._on_failed(f"实时 K 线刷新失败：{type(exc).__name__}: {exc}")

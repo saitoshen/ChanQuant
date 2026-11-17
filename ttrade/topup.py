@@ -58,7 +58,7 @@ def save(serial, symbol: str, exchange: str, period: str) -> dict:
     策略打死。
     """
     src = source_of(period)
-    out = {"added": 0, "src": src, "last": None, "error": "", "ok": False}
+    out = {"added": 0, "src": src, "last": None, "error": "", "gap": "", "ok": False}
     if src not in SOURCE_PERIODS:
         out["error"] = f"{period} 不是可落库的源周期"
         out["ok"] = True          # 不重试：这是配置问题，不是「还没数据」
@@ -79,14 +79,24 @@ def save(serial, symbol: str, exchange: str, period: str) -> dict:
     # 不在这儿另写一套时间判断。
     ok_open = [symbols_info.in_session(symbol, exchange, t) for t in df.index]
     if not all(ok_open):
-        df = df[ok_open]
-        if df.empty:
-            out["ok"] = True      # 全是时段外的：不是「没数据」，别重试
+        kept = df[ok_open]
+        if kept.empty:
+            # 一根合规的都没有 = 这份序列本身可疑（时区错位、时段表配错、或者
+            # 里面全是收盘后的快照）。**不能当成功** —— 当成功就会把这个品种
+            # 永久钉在旧数据上，而且一句话都不说。报错让调用方过几秒重试。
+            out["error"] = f"{len(df)} 根全落在交易时段外，序列可疑（时区或时段表？）"
             return out
+        df = kept
     try:
         last = tqstore.last_dt(symbol, exchange, src)
     except Exception:  # noqa: BLE001
         last = None
+    if last is not None and df.index[0] > last:
+        # 序列的**第一根**就比库里的最后一根晚 —— 中间那几天谁也不在：库里没有，
+        # 这份序列也没有。追加下去就是把一段空洞贴成连续（`_signal_frame` 会
+        # 据此判定缺交易日、不下单）。这里只负责把话说清楚。
+        out["gap"] = (f"库停在 {last:%Y-%m-%d %H:%M}，"
+                      f"序列从 {df.index[0]:%Y-%m-%d %H:%M} 才开始")
     if last is not None:
         # 只写严格晚于库里的。重叠那段库里那份 `adj_factor` 是对的，用 1.0
         # 盖过去会让复权价在接缝处跳一下

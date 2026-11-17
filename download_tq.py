@@ -242,7 +242,8 @@ def main() -> int:
                             print(f"  [{period} {done}/{total}] {key}: 无新数据", flush=True)
 
                     write_main_many(api, pairs, period, years, on_row=on_row,
-                                    days=args.days)
+                                    days=args.days,
+                                    on_note=lambda t: print(f"  [!] {t}", flush=True))
 
                 with_retry(f"主连 {period}", job)
 

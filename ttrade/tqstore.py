@@ -344,6 +344,107 @@ def bar_count(symbol: str, exchange: str, period: str) -> int:
     return int(r[0]) if r else 0
 
 
+# 交易日历（进程级缓存）。日历来自**日线表**：全库 1d 只有十几万行，扫一遍
+# 几十毫秒，比给 5m 的九百万行建索引便宜得多。日线一个交易日一根，任一品种
+# 都在，所以并起来就是整张交易所日历 —— 节假日自然不在里面。
+_CAL_CACHE: dict = {"days": None, "last": None}
+
+
+def calendar(refresh: bool = False) -> set:
+    """全库出现过的**交易日**集合（`datetime.date`）。
+
+    用来判断「某段 K 线是不是缺了几天」。不能拿自然日算：春节、国庆一周不开市，
+    按自然日会把正常的长假当成数据缺口，然后天天报错。
+
+    `1d` 表为空时退回空集合 —— 调用方要按「不知道日历」处理，别把整段判成缺。
+    """
+    today = pd.Timestamp.now().normalize().date()
+    if (not refresh and _CAL_CACHE["days"] is not None
+            and _CAL_CACHE["last"] == today):
+        return _CAL_CACHE["days"]
+    days: set = set()
+    if exists():
+        try:
+            with connect(read_only=True) as con:
+                r = con.execute(
+                    "SELECT DISTINCT trading_day FROM bars "
+                    "WHERE period='1d' AND trading_day IS NOT NULL"
+                ).df()
+            if not r.empty:
+                days = {pd.Timestamp(x).date() for x in r["trading_day"]}
+        except Exception:  # noqa: BLE001
+            days = set()
+    if days:
+        _CAL_CACHE["days"], _CAL_CACHE["last"] = days, today
+    return days
+
+
+def coverage(period: str) -> dict:
+    """每个「品种_交易所」在该周期的覆盖情况：`(首日, 末日, 有数据的交易日数)`。
+
+    一次扫表分组，**别逐品种查** —— 5m 表九百万行，78 个品种各查一次要几十秒；
+    这条按 `period` 过滤后一次聚合，实测 0.5 秒。
+
+    存在的理由：**「补了多少行」不能证明「补全了」**。增量只要按库尾往后接，
+    中间断的那几天就永远不会被碰，而日志每天照样显示「+14 行」。
+    """
+    if not exists():
+        return {}
+    out: dict = {}
+    try:
+        with connect(read_only=True) as con:
+            r = con.execute(
+                "SELECT symbol, exchange, min(trading_day) AS lo, "
+                "       max(trading_day) AS hi, "
+                "       COUNT(DISTINCT trading_day) AS n "
+                "FROM bars WHERE period=? AND trading_day IS NOT NULL "
+                "GROUP BY 1, 2",
+                [period],
+            ).df()
+    except Exception:  # noqa: BLE001
+        return {}
+    for _, row in r.iterrows():
+        if row["lo"] is None or row["hi"] is None:
+            continue
+        out[(row["symbol"], row["exchange"])] = (
+            pd.Timestamp(row["lo"]).date(),
+            pd.Timestamp(row["hi"]).date(),
+            int(row["n"]),
+        )
+    return out
+
+
+def miss_days(symbol: str, exchange: str, period: str, cal: set | None = None) -> list:
+    """这个品种该周期的 K 线里**缺掉的交易日**（首尾之间，拿日线日历比）。
+
+    2026-11-17 的现场：IF 的 5m 停在 11-10，每日定时任务按「近 1 天」增量，
+    中间 11-11~11-13 再也不碰 —— 策略把实时段直接贴在 11-10 后面算指标，
+    信号与回测对不上，账户里有仓的被平掉，而回测里还「持着」。
+
+    只抓**整天缺失**：一天的 bar 只少几根是半天市或停牌，不是数据缺口。
+    """
+    if not exists():
+        return []
+    try:
+        with connect(read_only=True) as con:
+            r = con.execute(
+                "SELECT DISTINCT trading_day FROM bars "
+                "WHERE symbol=? AND exchange=? AND period=? AND trading_day IS NOT NULL",
+                [symbol, exchange, period],
+            ).df()
+    except Exception:  # noqa: BLE001
+        return []
+    if r.empty:
+        return []
+    have = {pd.Timestamp(x).date() for x in r["trading_day"]}
+    cal = calendar() if cal is None else cal
+    if not cal:
+        return []
+    lo, hi = min(have), max(have)
+    hi = min(hi, max(cal))
+    return sorted(d for d in cal if lo <= d <= hi and d not in have)
+
+
 def set_adj_factor(con, symbol: str, exchange: str, period: str,
                    trading_day, factor) -> int:
     """按**交易日**整段重写 `adj_factor`，返回该品种该周期覆盖的 bar 数。

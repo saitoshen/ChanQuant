@@ -445,6 +445,10 @@ class TqWorker(QObject):
                 got = TQ.write_main_many(
                     api, pairs, self.period, 0,
                     on_row=on_row, cancel=lambda: self._cancel, days=self.days,
+                    # 对账：补完拿日线日历比一遍。行数只说明「写了多少」，
+                    # 说明不了「全了没有」—— 11-17 那次 IF 的 5m 停在 11-10，
+                    # 每天日志都显示「+14 行」，看着像正常增量
+                    on_note=lambda text: self.progress.emit(0, 0, text),
                 )
 
                 # ---- 真实合约 + 期限结构
@@ -2220,9 +2224,10 @@ class DataPage(QWidget):
     def _start_tq(self, auto: bool = False) -> None:
         """起天勤补行情。`auto=True` 是「每日定时补充」那条日程在用。
 
-        定时那条**只补最近一天的主连**：切换表 → 主连 → 复权因子。真实合约、
-        期权、基本面各自有更合适的时机（体积大 / 15:45 已单独排了 EDB），
-        不该压进一条每天 16:00 跑的日程里。
+        定时那条**只补主连**：从「库里最后一根」一路补到此刻（缺交易日的地方
+        从最早那个洞补起），切换表 → 主连 → 复权因子。真实合约、期权、基本面
+        各自有更合适的时机（体积大 / 15:45 已单独排了 EDB），不该压进一条
+        每天 15:50 跑的日程里。
         """
         if auto:
             self._auto_run = True
@@ -2261,7 +2266,7 @@ class DataPage(QWidget):
         self.lbl_upd.setVisible(True)
         self.lbl_upd.setText(f"准备从天勤补 {label}…")
         if auto:
-            self._log(f"—— 天勤 {label}：切换表 → 主连（近 1 天）→ 复权因子")
+            self._log(f"—— 天勤 {label}：切换表 → 主连（库尾 → 现在）→ 复权因子")
         else:
             span = self.cb_tq_range.currentText()
             self._log(
