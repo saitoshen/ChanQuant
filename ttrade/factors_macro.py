@@ -105,7 +105,21 @@ def clear_cache() -> None:
 
 
 def _pct_series(code: str) -> pd.Series:
-    """宏观序列 → 扩张分位（PIT），缓存在序列自己的日频索引上。"""
+    """宏观序列 → 扩张分位（PIT），缓存在序列自己的日频索引上。
+
+    🔴 **只有「读成功」才写缓存。** `edb.duckdb` 是 DuckDB 单文件库，文件锁
+    是排他的 —— 宏观定时任务在写库的那几十秒里，只读连接会抛异常
+    （`edb.connect` 只重试 3 次共 1.2 秒，挡不住一次完整的宏观下载）。以前这里
+    `except: pass` 之后**连空 Series 一起缓存了**，于是一次撞锁就让整个进程的
+    宏观因子永久变 NaN：因子被 `factor_matrix` 静默剔除、参与打分的票数比回测
+    少几票，实盘与回测的信号就翻到两边去（2026-11-17 两条 IM 策略就是这个
+    现象：一条实盘多 1 手、回测空仓，另一条反过来）。
+
+    两种「空」必须分开：
+      - **读失败**（异常）→ 不缓存，返回空，下一次调用自己重试；
+      - **真没数据**（LPR 这种抓不到的 code）→ `M.series()` 返回空 Series、
+        不抛异常，照常缓存 —— 否则每分钟都去查一次库。
+    """
     if code in _cache:
         return _cache[code]
     s = pd.Series(dtype=float)
@@ -118,7 +132,7 @@ def _pct_series(code: str) -> pd.Series:
             s = s[~s.index.duplicated(keep="last")]
             s = s.expanding(min_periods=MIN_OBS).rank(pct=True)
     except Exception:  # noqa: BLE001
-        pass
+        return s                      # 读失败：不写缓存，留给下次重试
     _cache[code] = s
     return s
 
