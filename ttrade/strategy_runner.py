@@ -58,7 +58,8 @@ from ttrade import specs, symbols_info
 from ttrade.backtest import lots_round
 from ttrade.strategies import STRATEGIES, next_levels, run_strategy
 from ttrade.tqfetch import PERIOD_SEC
-from ttrade.tqlive import AccountSpec, bars_from_serial, merge_live
+from ttrade.tqlive import (BACKEND_LABELS, AccountSpec, bars_from_serial,
+                           merge_live)
 from ttrade.tqsdk_symbols import is_stock, trade_symbol
 
 KLINE_LEN = 3000          # 每个策略回看多少根。日线 3000 根够跑 MA200，5m 够跑一周多
@@ -70,6 +71,33 @@ FACTOR_MIN_BARS = 300
 # 界面上仍然是一条策略一行 —— 用户管的是「这条策略」，不是 19 个各自为政的
 # 槽位；拆开只是为了每个品种有自己的订阅、自己的仓位账本、自己的手数。
 GROUP_SEP = "#"
+
+
+def require_tq_account(spec: AccountSpec) -> None:
+    """「策略交易和组合」只能跑天勤账户；CTP / 融航 在这里就挡掉。
+
+    挡在**最前面**（补数据、import tqsdk 之前）不是洁癖：`AccountSpec.build()`
+    也会拒绝非天勤账户，但那是在 `start()` 的最后一步 —— 前面 `_ensure_aux()`
+    会先补期货日线和展期/期权快照（几分钟），用户等完才看到一句
+    「不走天勤，不能构造天勤账户对象」，既不知道错在哪，也不知道该改什么。
+
+    这一页的下单/持仓/追单全是按天勤的口径写的（主连 `KQ.m@` 直接下单、`is_changing`
+    推 update、平今平昨由天勤自己拆），柜台账户换一个「账户对象」是通不了的：
+    CTP / 融航 必须写一条自己的执行层（具体月份合约、限价单、平今平昨、主连换月、
+    历史回放到 live bar）。所以这里的选择只有「说清楚 + 给出路」，不是「试试看」。
+    """
+    be = getattr(spec, "backend", "tq")
+    if be == "tq":
+        return
+    who = str(getattr(spec, "name", "") or "")
+    label = BACKEND_LABELS.get(be, str(be))
+    raise ValueError(
+        f"账户「{who}」是{label}账户。「策略交易和组合」这一页只能跑天勤账户"
+        f"（快期模拟 / 天勤实盘 / 本地模拟）—— {label}账户目前只在"
+        f"「账户透视和交易」页支持手工下单，还不支持自动交易。\n"
+        f"要么把这条策略的交易账户改成天勤账户，要么换一条天勤账户来跑。"
+    )
+
 
 # 「没有训练产物」这件事多久之内不再重试 / 不再刷日志。产物是用户手动训的，
 # 训完之后要么重启、要么下一次重试就会加载上 —— 每次 tick 都去试一遍 + 刷一行
@@ -584,6 +612,9 @@ class PortfolioRunner:
             self._log(f"衍生数据补充失败（{type(exc).__name__}: {exc}），先用本地快照")
 
     def start(self) -> None:
+        # 先判柜台：非天勤账户到下面 `TqApi(spec.build())` 才会炸，而那时候
+        # `_ensure_aux()` 已经补了几分钟数据。理由见 `require_tq_account()`
+        require_tq_account(self.spec)
         from tqsdk import TqApi, TqAuth
 
         if not self.spec.user or not self.spec.password:

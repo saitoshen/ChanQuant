@@ -162,6 +162,28 @@ def _int(v) -> int:
         return 0
 
 
+#: 「策略交易和组合」这一页只跑天勤账户（见 `strategy_runner.require_tq_account`）。
+#: 其余柜台能在「账户透视和交易」页手工下单，但接不了这一页的自动交易。
+NO_AUTO_HINT = "本页不支持自动交易，只能手工下单"
+
+
+def auto_ok(spec) -> bool:
+    """这个账户能不能挂到「策略交易和组合」里跑自动交易。"""
+    return getattr(spec, "backend", "tq") == "tq"
+
+
+def account_label(spec) -> str:
+    """账户在**这一页**下拉/清单里的名字。
+
+    `spec.label()` 只写到柜台类型（「091438 · CTP 柜台（SimNow / 期货公司）」），
+    看着像是可以选的 —— 真选了，点「全部启动」才红一行
+    「ValueError: …不走天勤，不能构造天勤账户对象」，用户不知道该改哪儿。
+    所以这里当场把「这一页用不了」标在名字上。
+    """
+    base = spec.label() if hasattr(spec, "label") else str(spec)
+    return base if auto_ok(spec) else f"{base} —— {NO_AUTO_HINT}"
+
+
 def _pos_text(actual, r: dict) -> str:
     """账户持仓写成一行。锁仓要带两条腿，不然 `0` 看不出有仓。"""
     if r.get("locked"):
@@ -881,14 +903,31 @@ class EditDialog(QDialog):
             "每个账户各算各的手数（各自的本金、各自的保证金），策略参数只有一份 ——\n"
             "所以不用为每个账户复制一遍策略。")
         chosen = list(cfg.accounts or ([cfg.account] if cfg.account else []))
+        # 账户名 → 柜台。CTP / 融航 能选但不支持自动交易，**当场标在名字上**
+        # 而不是等点了「全部启动」再红一行 —— 那时候用户已经以为配好了。
+        try:
+            _specs = {s.name: s for s in tqlive.load_accounts()}
+        except Exception:                                # noqa: BLE001
+            _specs = {}
+        bad_acct: list[str] = []
         for a in accounts:
-            it = QListWidgetItem(a)
+            sp = _specs.get(a)
+            unsupported = sp is not None and not auto_ok(sp)
+            it = QListWidgetItem(f"{a} —— {NO_AUTO_HINT}" if unsupported else a)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(Qt.Checked if a in chosen else Qt.Unchecked)
+            it.setData(Qt.UserRole, a)      # 显示名带后缀，存盘只能用原始名
+            if unsupported:
+                it.setForeground(QColor(C_MUTED))
+                bad_acct.append(a)
             self.lst_acct.addItem(it)
         form.addRow("交易账户", self.lst_acct)
         if not accounts:
             form.addRow("", _hint("还没有交易账户，先到「账户透视和交易」页添加"))
+        elif bad_acct:
+            form.addRow("", _hint(
+                f"{len(bad_acct)} 个账户是 CTP / 融航柜台，这一页跑不了自动交易"
+                "（只支持手工下单）。自动交易请勾天勤账户：快期模拟 / 天勤实盘 / 本地模拟。"))
 
         # ---- 策略参数 ----
         # 小数参数（vol_ratio 0.4、stop_mult 2.5）必须用 QDoubleSpinBox：
@@ -1004,7 +1043,10 @@ class EditDialog(QDialog):
         cfg.volume = self.sp_vol.value()
         cfg.note = "short" if self.chk_short.isChecked() else "long"
         cfg.short_only = bool(self.chk_no_long.isChecked() and self.chk_short.isChecked())
-        picked = [self.lst_acct.item(i).text()
+        # 显示名可能带「本页不支持自动交易」后缀，存盘只认 `UserRole` 里的原始
+        # 账户名 —— 拿 text 存会把后缀写进 `cfg.accounts`，下次就找不到这个账户
+        picked = [self.lst_acct.item(i).data(Qt.UserRole)
+                  or self.lst_acct.item(i).text()
                   for i in range(self.lst_acct.count())
                   if self.lst_acct.item(i).checkState() == Qt.Checked]
         cfg.accounts = picked
@@ -1869,7 +1911,9 @@ class PortfolioPage(QWidget):
         self.cb_acct.blockSignals(True)
         self.cb_acct.clear()
         for s in self._accounts:
-            self.cb_acct.addItem(s.label(), s.name)
+            # 非天勤账户在名字后面直接标「本页不支持自动交易」——
+            # 这一页是老「短线策略工作区」，只跑天勤账户（见 module 头注释）
+            self.cb_acct.addItem(account_label(s), s.name)
         if cur:
             idx = self.cb_acct.findData(cur)
             if idx >= 0:
@@ -2859,6 +2903,19 @@ class PortfolioPage(QWidget):
                         continue
                     seen[k] = p
                     plan.setdefault(acct, []).append(c)
+        # 非天勤账户（CTP / 融航）在这一页跑不了自动交易：不是「连不上」，是这一页
+        # 的下单 / 持仓 / 追单整套都按天勤口径写的（主连直接下单、平今平昨由天勤
+        # 自己拆）。留在计划里只会等到启动那一刻抛一句「不能构造天勤账户对象」，
+        # 用户看不懂，而且同批的其他账户也跟着白启一轮。
+        for acct in list(plan):
+            sp = self._spec(acct)
+            if sp is not None and not auto_ok(sp):
+                be = tqlive.BACKEND_LABELS.get(getattr(sp, "backend", ""), "")
+                warn.append(
+                    f"账户「{acct}」是{be}柜台，这一页只能跑天勤账户，"
+                    f"已跳过它上面的 {len(plan[acct])} 条策略（{be}账户的"
+                    "手工下单在「账户透视和交易」页）")
+                plan.pop(acct)
         return plan, warn
 
     def _start_all(self) -> None:
@@ -2873,7 +2930,12 @@ class PortfolioPage(QWidget):
         for msg in warn:
             self._on_log(f"注意：{msg}")
         if not groups:
-            self._on_failed("所有工作区里都没有启用的策略")
+            # 分两种「空」：真的没有启用策略，和「启用着的都在 CTP / 融航 上」——
+            # 后者是配置选错了账户，说成「没有启用的策略」会让人去翻策略列表
+            self._on_failed(
+                "没有可以启动的账户：启用的策略都挂在 CTP / 融航账户上，"
+                "这一页只能跑天勤账户，请把策略的交易账户改成天勤账户"
+                if warn else "所有工作区里都没有启用的策略")
             return
         for name in list(groups):
             if not name:
@@ -2954,6 +3016,23 @@ class PortfolioPage(QWidget):
         if not accts:
             self._on_failed("这条策略没有可用账户（既没绑账户，也没有默认账户）")
             return
+        # 非天勤账户（CTP / 融航）这一页跑不了：引擎里的下单 / 持仓 / 追单全按
+        # 天勤口径写，柜台账户要在 `PortfolioRunner.start()` 里被挡下来。这里先
+        # 摘掉并说清原因，别让它把同一条策略上天勤账户那份也拖死
+        bad = [a for a in accts
+               if (self._spec(a) is not None and not auto_ok(self._spec(a)))]
+        if bad:
+            for a in bad:
+                be = tqlive.BACKEND_LABELS.get(
+                    getattr(self._spec(a), "backend", ""), "")
+                self._on_log(f"注意：账户「{a}」是{be}柜台，这一页只能跑天勤账户，"
+                             f"已跳过（{be}账户的手工下单在「账户透视和交易」页）")
+            accts = [a for a in accts if a not in bad]
+            if not accts:
+                self._on_failed(
+                    "这条策略只绑了 CTP / 融航账户，这一页跑不了自动交易；"
+                    "把交易账户改成天勤账户（快期模拟 / 天勤实盘 / 本地模拟）")
+                return
         slots = self._slots_of(cfg)
         # 🔴 判据是「引擎里真实在不在跑」，不是存盘的 `enabled` 开关。
         # 多账户时只要有一个账户在跑，这一下就是「停」——全部停下来才叫停

@@ -5762,13 +5762,16 @@ def _run() -> tuple[bool, list[str]]:
             for key, chk, tm, rng in (
                 ("aux", d.chk_auto, d.time_auto, d.cb_auto_range),
                 ("daily", d.chk_daily, d.time_daily, d.cb_daily_range),
+                # 天勤那条没有区间下拉（`range` 存的是 null），只比勾选和时刻
+                ("tq", d.chk_tq_auto, d.time_tq_auto, None),
             ):
                 one = saved.get(key) or {}
                 if bool(one.get("enabled", False)) != chk.isChecked():
                     return False
                 if one.get("time") and tm.time().toString("HH:mm") != str(one["time"]):
                     return False
-                if one.get("range") and rng.currentData() != one["range"]:
+                if one.get("range") and (rng is None
+                                         or rng.currentData() != one["range"]):
                     return False
             return True
 
@@ -5809,10 +5812,12 @@ def _run() -> tuple[bool, list[str]]:
             and hasattr(dp, "chk_daily")
             and hasattr(dp, "time_daily")
             and hasattr(dp, "cb_daily_range")
-            # 天勤那条（切换表 → 主连 → 复权）也要有开关和时刻
+            # 天勤那条（切换表 → 主连 → 复权）也要有开关和时刻。
+            # **不许断言它「默认没勾」**：用户打开定时之后自检就必红 —— 那是
+            # 设置，不是代码坏了。真正的判据是「界面上和存盘的一致」，在
+            # `_sched_ok()` 里比。
             and hasattr(dp, "chk_tq_auto")
             and hasattr(dp, "time_tq_auto")
-            and not dp.chk_tq_auto.isChecked()
             and dp.cb_auto_range.count() == 2
             and dp.cb_daily_range.count() == 2
             and _sched_ok(dp)
@@ -5902,9 +5907,46 @@ def _run() -> tuple[bool, list[str]]:
                 RohonHub([]).check_deps()
             except Exception as _exc:      # noqa: BLE001
                 acct_ok = acct_ok and "vnpy_rohon" in str(_exc)
+
+            # ---- 「策略交易和组合」只跑天勤账户
+            # CTP / 融航 账户配到组合里时，以前要等到 `PortfolioRunner.start()`
+            # 最后一步才炸（前面还先补了几分钟数据），界面上只剩一行
+            # 「ValueError: 不走天勤，不能构造天勤账户对象」。这条断言盯三件事：
+            #   1. 挡在补数据和 tqsdk 之前（看源码里判据的先后顺序）；
+            #   2. 报错说清「改成天勤账户」这条路，不是只丢一个异常名；
+            #   3. 界面上账户名字就标出「本页不支持」，别让人配完才发现。
+            from gui.portfolio_page import account_label, auto_ok
+            from ttrade.strategy_runner import PortfolioRunner, require_tq_account
+
+            import inspect as _inspect
+
+            try:
+                require_tq_account(_ctp)
+                _guard_msg = ""          # 没抛 = 没挡住，下面会判失败
+            except ValueError as _exc:
+                _guard_msg = str(_exc)
+            _src = _inspect.getsource(PortfolioRunner.start)
+            _i_guard = _src.find("require_tq_account(self.spec)")
+            # 找**真实调用**而不是任意一处 `TqApi(`：函数开头的说明性注释里也写着
+            # `TqApi(spec.build())`，按那几个字找会命中注释、把顺序判成反的
+            _i_api = _src.find("self.api = TqApi(")
+            _i_aux = _src.find("self._ensure_aux()")
+            _order = (_i_guard >= 0 and _i_aux > 0 and _i_api > 0
+                      and _i_guard < _i_aux and _i_guard < _i_api)
+            acct_ok = (acct_ok
+                       and bool(_guard_msg)
+                       and "天勤" in _guard_msg
+                       and "自检CTP" in _guard_msg
+                       and _order
+                       and require_tq_account(_tq) is None
+                       and auto_ok(_tq) and not auto_ok(_ctp)
+                       and "不支持" in account_label(_ctp)
+                       and "不支持" not in account_label(_tq))
             acct_info = ("分组 " + "/".join(_g)
                          + f"，合并 {len(_m.by_account)} 户 / 权益 "
-                         + f"{_m.account.get('balance'):,.0f}")
+                         + f"{_m.account.get('balance'):,.0f}"
+                         + f"，策略页柜台门禁 {'OK' if _order else '位置不对'}"
+                         + ("" if _guard_msg else "（没报错）"))
         except Exception as _exc:          # noqa: BLE001
             acct_ok = False
             acct_info = f"{type(_exc).__name__}: {_exc}"
@@ -6633,7 +6675,9 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(
                 f"多柜台（天勤 / CTP / 融航）口径不对（{acct_info}）：勾选跨柜台时"
                 "要按柜台分成多条连接，账户合并、行情只取选定的那一路；融航账户"
-                "必须是 rohon 后端，不能落进天勤分支"
+                "必须是 rohon 后端，不能落进天勤分支；另外「策略交易和组合」只跑"
+                "天勤账户，CTP / 融航 必须在补数据与连 tqsdk 之前就被挡下来，"
+                "并在账户名字上标出「本页不支持」"
             )
         if not agent_ok:
             raise RuntimeError(
