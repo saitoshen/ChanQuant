@@ -4632,6 +4632,185 @@ def _run() -> tuple[bool, list[str]]:
 
     check("一键对齐看得见锁仓（多空双开）", _align_lock)
 
+    def _no_ledger():
+        """取消台账（2026-11-17）：策略只在**信号**驱动下交易。
+
+        用户原话：
+        - 「取消策略自身的台账记录……不对齐的时候也不需要触发交易，策略触发交易
+          只有在交易信号产生的时候」；
+        - 「台账的机制会在策略加载完成自动交易合约，有时候策略加载完发现仓位异常，
+          但是单子马上就发出去了」；
+        - 「换月要自动处理的」。
+
+        这一项把四件事钉死：重启只建基准、目标不变不发单、账户漂移不管、
+        换月仍然自动平老开新。
+        """
+        import inspect
+
+        from ttrade import strategy_store as SStore
+        from ttrade import strategy_runner as R
+        from ttrade.strategy_runner import PortfolioRunner, SlotState
+
+        # 引擎源码里不许再出现持仓台账：那句「读落盘账本」就是加载即发单的根因。
+        # 带括号扫调用/赋值，别把 docstring 里讲历史的措辞也算上
+        src = inspect.getsource(R.PortfolioRunner)
+        for bad in ("positionbook", "sent_qty", "_save_book(", "_adopt_if_needed("):
+            if bad in src:
+                raise RuntimeError(f"`PortfolioRunner` 里还有台账残留：{bad}")
+        if "held" in SlotState.__dataclass_fields__:
+            raise RuntimeError("`SlotState` 还留着持仓账本 `held`")
+
+        def _runner():
+            r = PortfolioRunner.__new__(PortfolioRunner)
+            r._slots = {}
+            r._mm_cache, r._mm_ts = [], 0.0
+            r._align_ts = 0.0
+            r._pos = None
+            r.api = object()
+            r._log = lambda *_a, **_k: None
+            r._align_slot = SlotState(cfg=SStore.StrategyConfig(
+                sid="__align__", name="一键对齐", period="1d"))
+            r.book = []
+
+            def _send(st, sym, delta, closeable=None):
+                r.book.append((sym, int(delta), closeable))
+                st.pending.append("x")     # 在途，模拟真实发单后的状态
+                return 1
+
+            r._send = _send
+            return r
+
+        def _slot(r, sid="a", under="SHFE.rb2701", target=-5):
+            st = SlotState(cfg=SStore.StrategyConfig(
+                sid=sid, name=sid, symbol="RB", exchange="SHFE", period="1d"))
+            st.running, st.underlying, st.target = True, under, int(target)
+            r._slots[sid] = st
+            return st
+
+        class _P:
+            """账户持仓（只要够 `_side_pos` / `_split_pos` 读就行）。"""
+
+            def __init__(self, lo=0, sh=0):
+                self.pos_long, self.pos_short = lo, sh
+                for s, v in (("long", lo), ("short", sh)):
+                    setattr(self, f"pos_{s}_his", v)
+                    setattr(self, f"pos_{s}_today", 0)
+                    setattr(self, f"volume_{s}_his", v)
+                    setattr(self, f"volume_{s}_today", 0)
+
+        # ① 重启后第一根 bar：只建基准，一手都不发。
+        #    `sent` 是内存的，重启必然是空的；从 0 算差额就会把目标再开一遍
+        r = _runner()
+        st = _slot(r)
+        r._rebalance(st)
+        if r.book:
+            raise RuntimeError(f"重启第一根就发单了：{r.book}")
+        if not st.based or st.sent.get("SHFE.rb2701") != -5:
+            raise RuntimeError(f"基准没建对：based={st.based} sent={st.sent}")
+
+        # ② 目标不变：一手都不发（哪怕账户里空空如也 —— 策略不看账户）
+        st.pending.clear()
+        r._rebalance(st)
+        if r.book:
+            raise RuntimeError(f"目标没变还是发单了：{r.book}")
+
+        # ③ 账户被手工平掉：策略**不补**、也不收窄，等一键对齐
+        r._pos = {}
+        st.pending.clear()
+        r._rebalance(st)
+        if r.book:
+            raise RuntimeError(f"账户漂移触发了交易：{r.book}")
+
+        # ④ 信号真的变了才发：-5 → +3 就是买 8 手（其中 5 手平空、3 手开多）。
+        #    `closeable=5` 是关键：账户上可能还有别的策略的空单，能平的只有自己
+        #    发过的这 5 手
+        st.pending.clear()
+        st.target = 3
+        r._pos = {"SHFE.rb2701": _P(0, 5)}
+        r._rebalance(st)
+        if r.book != [("SHFE.rb2701", 8, 5)]:
+            raise RuntimeError(f"信号驱动该发 +8 手（可平 5）：{r.book}")
+        if st.sent.get("SHFE.rb2701") != 3:
+            raise RuntimeError(f"发完之后 sent 要跟目标一致：{st.sent}")
+
+        # ⑤ 换月：老合约按自己发过的量平掉，然后新合约按目标建仓
+        st.pending.clear()
+        r.book.clear()
+        st.retired = ["SHFE.rb2701"]
+        st.underlying = "SHFE.rb2702"
+        st.sent = {"SHFE.rb2701": 3}
+        r._pos = {"SHFE.rb2701": _P(3, 0)}
+        r._rebalance(st)
+        if r.book != [("SHFE.rb2701", -3, 3)]:
+            raise RuntimeError(f"换月该平老合约 3 手：{r.book}")
+        if st.retired or st.sent:
+            raise RuntimeError(f"老合约平完要清干净：{st.retired} {st.sent}")
+        st.pending.clear()
+        r.book.clear()
+        r._rebalance(st)
+        if r.book != [("SHFE.rb2702", 3, 0)]:
+            raise RuntimeError(f"换月后新合约要按目标建仓：{r.book}")
+
+        # ⑥ 换月后立刻重启：`sent` 是空的，不知道老合约有几手 ⇒ 不发单，
+        #    留给一键对齐（宁可少做一笔，不能多发一笔）。这时 `based` 也是 False，
+        #    所以新合约同样只建基准 —— 否则就等于重开一遍仓
+        r2 = _runner()
+        st2 = _slot(r2, sid="b", under="SHFE.rb2702", target=3)
+        st2.retired = ["SHFE.rb2701"]
+        r2._rebalance(st2)
+        if r2.book:
+            raise RuntimeError(f"重启后老合约没有下单记录还发单：{r2.book}")
+        if st2.retired:
+            raise RuntimeError("没有记录的老合约要从 retired 里摘掉，否则每轮都重算")
+        if not st2.based or st2.sent.get("SHFE.rb2702") != 3:
+            raise RuntimeError(f"重启该只建基准：{st2.based} {st2.sent}")
+
+        # ⑦ 一键对齐之后：`sent` 摆成 target（否则下一次信号会多算一段差额）
+        st2.sent = {}
+        r2._sync_after_align("SHFE.rb2702")
+        if st2.sent.get("SHFE.rb2702") != 3:
+            raise RuntimeError(f"对齐之后没摆成 target：{st2.sent}")
+
+        # ⑧ 每条策略各记各的（`sent` 不能是类属性共享的同一只字典）
+        a = SlotState(cfg=SStore.StrategyConfig(sid="x", period="1d"))
+        b = SlotState(cfg=SStore.StrategyConfig(sid="y", period="1d"))
+        a.sent["SHFE.rb2701"] = 1
+        if b.sent:
+            raise RuntimeError("`sent` 被不同槽位共享了")
+
+        # ⑨ 平仓**不许**变成反手开仓：目标 0、自己记着 -5，但账户里一手空都没有
+        #    （被手工平了）。硬发一笔「买 5 手」就凭空开了 5 手多
+        r3 = _runner()
+        st3 = _slot(r3, sid="c", target=0)
+        st3.based = True
+        st3.sent = {"SHFE.rb2701": -5}
+        r3._pos = {}
+        r3._rebalance(st3)
+        if r3.book:
+            raise RuntimeError(f"账户没仓还去平，等于反手开仓：{r3.book}")
+
+        # 反证：账户里真有那 5 手空时，同样一笔必须发出去（买 5 手平）
+        st3.pending.clear()
+        r3.book.clear()
+        r3._pos = {"SHFE.rb2701": _P(0, 5)}
+        r3._rebalance(st3)
+        if r3.book != [("SHFE.rb2701", 5, 5)]:
+            raise RuntimeError(f"该买 5 手平空：{r3.book}")
+        # ⑩ 同一个合约上还站着**别的策略**的仓：只能平自己发过的那部分
+        #    A 发过 +5（多），信号翻空到 -3 ⇒ 该卖 8 手；账户里多 10 手是 A+B 的。
+        #    能平的上限必须是 5，否则会把 B 的仓平掉，B 下一根又开回来，来回拆台
+        r4 = _runner()
+        st4 = _slot(r4, sid="d", target=-3)
+        st4.based = True
+        st4.sent = {"SHFE.rb2701": 5}
+        r4._pos = {"SHFE.rb2701": _P(10, 0)}
+        r4._rebalance(st4)
+        if r4.book != [("SHFE.rb2701", -8, 5)]:
+            raise RuntimeError(f"卖 8 手、其中只有 5 手可平：{r4.book}")
+        return "重启只建基准、目标不变不发单、账户漂移不管，换月仍自动平老开新"
+
+    check("取消台账：策略只在信号驱动下交易", _no_ledger)
+
     def _add_or_update():
         """新加进组合的策略要能被「启动 / 停止」接上。
 
