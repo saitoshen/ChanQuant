@@ -124,7 +124,9 @@ REJECT_COOL = 5.0
 MAX_REJECTS = 3
 
 # 非交易时段挂起时写在策略行上的那句话。判据见 `_open_now()`。
-CLOSED_NOTE = "非交易时段，暂停信号与下单"
+# 非交易时段的那句话。**只暂停下单，信号与理论仓位照算** —— 用户 2026-11-17：
+# 「不能不显示，只是停止信号与下单，不是停止显示信号和理论持仓数量」
+CLOSED_NOTE = "非交易时段：暂停下单（理论仓位照算）"
 
 # 刚记完账（本策略成交）之后，账户持仓明细要过几百毫秒才跟上。这段时间里
 # 账本比账户多是一时的，不能当成「被手工平了」去收窄 —— 见 `_trim`。
@@ -1029,10 +1031,11 @@ class PortfolioRunner:
                 # 否则开盘时手上没有底料
                 self._refresh_signal(st)
                 if not self._open_now(st.cfg):
-                    # 非交易时段：K 线内不触发、不调仓、不追单。追单一起停 ——
-                    # 收盘后重报只会被柜台打回，攒够 MAX_REJECTS 策略就自己停机，
-                    # 那是最难查的一种「早上发现昨天停了」
-                    if st.last_action != CLOSED_NOTE:
+                    # 非交易时段：**只跳过下单链路**（K 线内不触发、不调仓、
+                    # 不追单 —— 收盘后重报只会被柜台打回，攒够 MAX_REJECTS
+                    # 策略就自己停机）。信号与理论仓位已经在 `_refresh_signal`
+                    # 里算好了，所以这里**不许盖掉它写的那句话**。
+                    if not st.last_action:
                         st.last_action = CLOSED_NOTE
                     continue
                 if not st.ml_ready:
@@ -1202,13 +1205,12 @@ class PortfolioRunner:
 
     def _refresh_signal(self, st: SlotState) -> None:
         self._subscribe(st)
-        # 🔴 非交易时段**不算信号**。这里挡在「先订阅、后计算」之间：订阅必须
-        # 照常做（否则收盘后启动的策略永远拿不到 K 线），但信号不能算 ——
-        # 天勤模拟账户收盘后还在长 bar，算了就会得出一个假的 `st.target`。
-        if not self._open_now(st.cfg):
-            if st.last_action != CLOSED_NOTE:
-                st.last_action = CLOSED_NOTE
-            return
+        # 🔴 非交易时段**照常算信号，只是不下单**。老写法在这里直接 return，
+        # 结果面板上的理论仓位一直是 0，用户以为「策略没仓 / 台账没了」
+        # （2026-11-17 两次误判都是它）。收盘后模拟账户还在长的那根 bar 会被
+        # 下面 `iloc[:-1]` 切掉，算的是最后一根真 bar；下单链路在 `tick()` 里
+        # 整段跳过，`_send` 还有最后一道闸 —— 一笔也发不出去。
+        open_now = self._open_now(st.cfg)
         key = self._skey(st.cfg)
         kl = self._klines.get(key)
         if kl is None or not len(kl):
@@ -1285,9 +1287,17 @@ class PortfolioRunner:
             # 决定（见 `_intrabar_tick`）。这根 bar 在这里只做两件事：
             # ① 重算本根的触发价；② 执行上一根收盘留下的「反向突破离场」
             st.signal = 0
+            if not open_now:
+                # K 线内那一族的触发价要盘中价格才算得出来，收盘后重算只会
+                # 把最后一根的价位当成「现在」。保留上一轮的目标就行。
+                return
             self._ib_arm(st, full)
             return
         st.target = st.signal * st.lots
+        if not open_now:
+            # 让状态栏说清楚「不是没算，是收盘了不下单」
+            st.last_action = (f"非交易时段：暂停下单，理论 {st.target:+d} 手"
+                              if st.target else CLOSED_NOTE)
 
     def _pick_ml_signal(self, st: SlotState) -> bool:
         """从后台缓存取一次机器学习信号；取到就落信号 / 手数，返回 True。

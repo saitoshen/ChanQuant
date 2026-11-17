@@ -8443,6 +8443,7 @@ def _run() -> tuple[bool, list[str]]:
            板块级按「任一成员开市」，非期货（A 股）不受这张表管。
         """
         from datetime import datetime as _dt
+        import inspect
 
         from ttrade import ctp_live as CL
         from ttrade import strategy_runner as SR
@@ -8528,6 +8529,19 @@ def _run() -> tuple[bool, list[str]]:
             if not SI.in_session("600519", "SSE", _t(_tick)):
                 raise RuntimeError("A 股被期货交易时段表误伤了（%s）" % _tick)
 
+        # 🔴 非交易时段**照常算信号，只暂停下单**。老写法在 `_refresh_signal`
+        # 开头就 return，结果面板上的「理论」一直是 0，用户两次误判成
+        # 「台账没了所以理论也没了」（2026-11-17 15:55）。
+        src_r = inspect.getsource(SR.PortfolioRunner._refresh_signal)
+        j = src_r.find("open_now = self._open_now")
+        k = src_r.find("key = self._skey(st.cfg)")
+        if j < 0 or k < 0 or k < j:
+            raise RuntimeError("非交易时段在算信号之前就 return 了，理论仓位会一直是 0")
+        if "return" in src_r[j:k]:
+            raise RuntimeError("算信号之前还有一条 return：理论仓位会一直是 0")
+        src_t = inspect.getsource(SR.PortfolioRunner.tick)
+        if "if not st.last_action:" not in src_t:
+            raise RuntimeError("tick 的非交易时段分支会盖掉信号那边写的提示")
         return (f"{len(cases)} 个时刻判对（含夜盘跨零点 / 周五夜盘跑到周六凌晨 / "
                 f"午休 / 股指无夜盘）；CTP 挡掉时段外 tick（留 {','.join(kept)}）；"
                 f"策略门禁与 in_session 逐品种一致，板块级任一开市即跑，A 股不受管")
