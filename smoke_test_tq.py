@@ -3068,11 +3068,19 @@ def check_strategy_runner() -> None:
         def cancel_order(self, order):
             self.cancelled.append(order)
 
-    # 2026-11-17 取消台账之后引擎不再落盘任何持仓文件（`SlotState.sent` 只在
-    # 内存里），所以这一段不用再切 user_dir。`try` 留着是为了把异常变成一条
-    # 失败用例而不是整段冒烟中断。
+    # 持仓账本会落盘。整段切到临时目录 —— 不切的话跑一次冒烟就在真实用户目录
+    # 留下一份 live_positions.json，真程序下次启动会以为「账本早就有了」而跳过
+    # 首次认领，升级上来的仓位就会被再开一遍。
+    from ttrade import positionbook as _PB
+
+    _pb_old = _PB.user_dir
+    _PB.user_dir = lambda: tempfile.mkdtemp(prefix="tdpos_")
+
     try:
         r = PortfolioRunner(AccountSpec(name="t", kind="sim"), St.ChaseConfig())
+        # 下面这些用例都是「账户口径」的（`_legs` / 对齐 / 拒单），别让「首次
+        # 启用账本时认领账户仓位」插进来改变 delta —— 那一条单独测
+        r._fresh_book = False
 
         # 平仓必须按实际今昨仓拆开。整笔当 CLOSE 发出去，超过昨仓的部分会被
         # 交易所整单打回（截图上「平昨手数超过持仓仓量」刷屏就是这个）
@@ -3172,8 +3180,7 @@ def check_strategy_runner() -> None:
         # 在途期间策略也不许动手，否则「策略平、对齐开」互相打架
         r.api = Api()
         st.target = 5
-        st.based = True
-        st.sent = {}
+        st.held = {}
         r._rebalance(st)
         check("对齐：在途时策略不调仓", not r.api.orders, f"{len(r.api.orders)} 笔")
 
@@ -3325,97 +3332,162 @@ def check_strategy_runner() -> None:
         st.retired = []
         check("理论持仓：只算运行中的策略", r.theoretical() == {}, str(r.theoretical()))
 
-        # ---- 策略只跟「本进程发过多少手」比，完全不看账户 ----
+        # ---- 单策略只跟自己的账本比，不盯账户净仓 ----
         # 账户是**一个**、策略是**一群**：同一个品种被两条策略同时交易时，账户
         # 净仓是它们的和，单看账户分不出哪几手是谁的。早先按账户调仓，两条策略
-        # 会互相把对方的仓当成自己的偏差，来回对打。
-        #
-        # 2026-11-17 用户要求把**落盘台账整个砍掉**：老版本启动时读回账本、立刻
-        # 跟目标比、对不上就补/收窄 —— 表现出来就是「策略加载完成就自动交易合约，
-        # 发现仓位异常时单子已经发出去」。现在 `SlotState.sent` 只在内存里记
-        # 「本进程发过什么单」，不落盘、不认领、不跟账户收窄；理论与实际不一致
-        # 只由「一键对齐」处理。换月是唯一保留的自动动作。
-        r2 = PortfolioRunner(AccountSpec(name="取消台账测试", kind="sim"),
-                             St.ChaseConfig())
+        # 会互相把对方的仓当成自己的偏差，来回对打；手工开的仓也会被策略当成
+        # 「少开了」补回去。现在每条策略按**自己委托的成交**记账（positionbook）。
+        from ttrade import positionbook as PB
 
-        def _slot(sid: str, vol: int = 5):
-            s = r2.add(St.StrategyConfig(
-                sid=sid, symbol="RB", exchange="SHFE", period="1d",
-                rule_key="ma_cross", sizing="fixed", volume=vol))
-            s.running = True
-            s.underlying = "SHFE.rb2701"
-            return s
+        pb_tmp = tempfile.mkdtemp(prefix="tdpos")
+        pb_old = PB.user_dir
+        PB.user_dir = lambda: pb_tmp
+        try:
+            r2 = PortfolioRunner(AccountSpec(name="仓位账本测试", kind="sim"),
+                                 St.ChaseConfig())
+            acct = r2.spec.label()
 
-        a = _slot("a")
-        b = _slot("b")
-        a.signal = b.signal = -1
-        a.target = b.target = -5
-        r2.api = Api()
-        r2._pos = {"SHFE.rb2701": Pos(short=5)}
+            def _slot(sid: str, vol: int = 5):
+                s = r2.add(St.StrategyConfig(
+                    sid=sid, symbol="RB", exchange="SHFE", period="1d",
+                    rule_key="ma_cross", sizing="fixed", volume=vol))
+                s.running = True
+                s.underlying = "SHFE.rb2701"
+                return s
 
-        # ① 重启第一轮：账户里已经有 5 手空，谁都不许发单（老版本会认领/补齐）
-        r2._rebalance(a)
-        r2._rebalance(b)
-        check("取消台账：重启第一轮只建基准，不发单", not r2.api.orders,
-              f"{len(r2.api.orders)} 笔")
-        check("取消台账：基准记的是目标仓",
-              a.sent.get("SHFE.rb2701") == -5 and a.based, f"{a.sent} based={a.based}")
+            a = _slot("a")
+            b = _slot("b")
+            a.signal = b.signal = -1
+            a.target = b.target = -5
+            a.held = {"SHFE.rb2701": -5}     # a 的 5 手空已经在账户里了
+            b.held = {}
+            r2.api = Api()
+            r2._pos = {"SHFE.rb2701": Pos(short=5)}
+            r2._rebalance(a)
+            check("账本：自己已经到位就不再发单", not r2.api.orders,
+                  f"{len(r2.api.orders)} 笔")
+            r2._rebalance(b)
+            check("账本：另一条策略照自己的账本开 5 手",
+                  len(r2.api.orders) == 1 and r2.api.orders[0]["volume"] == 5,
+                  str(r2.api.orders))
 
-        # ② 目标没变：继续一手不发
-        r2._rebalance(a)
-        r2._rebalance(b)
-        check("取消台账：目标没变就不发单", not r2.api.orders,
-              f"{len(r2.api.orders)} 笔")
+            # 账户里还有 7 手多 —— 手工开的。两条策略目标都是 0，谁都不许动它
+            a.pending.clear()
+            b.pending.clear()
+            r2.api = Api()
+            r2._pos = {"SHFE.rb2701": Pos(long=7)}
+            a.target = b.target = 0
+            a.held = {}
+            b.held = {}
+            r2._rebalance(a)
+            r2._rebalance(b)
+            check("账本：账户里的手工仓不被策略平掉", not r2.api.orders,
+                  f"{len(r2.api.orders)} 笔")
 
-        # ③ 账户漂移（手工平掉 / 手工加仓）一概不看
-        r2.api = Api()
-        r2._pos = {"SHFE.rb2701": Pos(long=7)}
-        r2._rebalance(a)
-        check("取消台账：账户漂移不触发交易", not r2.api.orders,
-              f"{len(r2.api.orders)} 笔")
+            # 成交要记进自己的账本，并且落盘 —— 重启不读回来的话，目标 -3 会
+            # 从头再开一遍，账户直接变 -6
+            c = _slot("c", 3)
+            c.target = -3
+            c.held = {}
+            r2.api = Api()
+            r2._pos = {"SHFE.rb2701": Pos()}
+            r2._rebalance(c)
+            oid = c.pending[0].order_id if c.pending else ""
+            r2._orders = {oid: type("O", (), {
+                "status": "FINISHED", "volume_left": 0, "last_msg": "",
+            })()}
+            r2._chase(c)
+            check("账本：成交记进自己的持仓", c.held.get("SHFE.rb2701") == -3, str(c.held))
+            check("账本：落盘后重启能读回来",
+                  PB.load(acct).get("c", {}).get("SHFE.rb2701") == -3,
+                  str(PB.load(acct)))
+            c.pending.clear()
 
-        # ④ 信号真的翻了才发：a 从 -5 到 +5，买 10 手（5 平空 + 5 开多）
-        r2.api = Api()
-        r2._pos = {"SHFE.rb2701": Pos(short=5)}
-        a.target = 5
-        r2._rebalance(a)
-        check("取消台账：信号变了才交易（-5 → +5 买 5 平空 + 5 开多）",
-              len(r2.api.orders) == 2
-              and all(o["direction"] == "BUY" for o in r2.api.orders)
-              and [o["offset"] for o in r2.api.orders] == ["CLOSE", "OPEN"]
-              and sum(o["volume"] for o in r2.api.orders) == 10,
-              str(r2.api.orders))
-        a.pending.clear()
+            # 部分成交后被撤：重报只能补剩下的。不减 `volume` 的话重报会把成交
+            # 过的部分再发一遍，5 手变 8 手
+            d = _slot("d", 5)
+            d.target = -5
+            d.held = {}
+            r2.api = Api()
+            r2._pos = {"SHFE.rb2701": Pos()}
+            r2._rebalance(d)
+            part = d.pending[0]
+            r2._orders = {part.order_id: type("O", (), {
+                "status": "DEAD", "volume_left": 2, "last_msg": "",
+            })()}
+            part.phase = "cancelling"
+            part.retries = 0
+            r2.chase = St.ChaseConfig(enabled=True, wait_sec=1, retries=3, ticks=1)
+            r2._chase(d)
+            check("账本：部分成交只补剩下的（5 手成交 3 手，重报 2 手）",
+                  d.held.get("SHFE.rb2701") == -3
+                  and bool(r2.api.orders) and r2.api.orders[-1]["volume"] == 2,
+                  f"held={d.held} 重报={[o['volume'] for o in r2.api.orders]}")
+            d.pending.clear()
 
-        # ⑤ 换月：老合约按自己发过的量自动平掉，新合约自动建起来
-        r2.api = Api()
-        r2._pos = {"SHFE.rb2611": Pos(long=3)}
-        a.retired = ["SHFE.rb2611"]
-        a.sent = {"SHFE.rb2611": 3}
-        a.underlying = "SHFE.rb2701"
-        a.target = 3
-        r2._rebalance(a)
-        old = r2.api.orders[0] if r2.api.orders else {}
-        check("换月：老合约自动卖平 3 手（只看自己发过的量）",
-              old.get("direction") == "SELL" and old.get("volume") == 3
-              and old.get("offset") == "CLOSE", str(old))
-        a.pending.clear()
-        r2.api = Api()
-        r2._rebalance(a)
-        check("换月：新合约按当前目标自动建仓 3 手",
-              bool(r2.api.orders) and r2.api.orders[0]["volume"] == 3,
-              str(r2.api.orders))
-        a.pending.clear()
+            # 账户被手工平掉之后：账本 -5、账户 0，目标回到 0 时想「买 5 手平仓」。
+            # 不能真的去买 —— 那是反手开 5 手多。只能把账本按账户收窄
+            a.underlying = "SHFE.rb2701"
+            a.target = 0
+            a.held = {"SHFE.rb2701": -5}
+            a.book_ts = 0.0
+            r2.api = Api()
+            r2._pos = {"SHFE.rb2701": Pos()}
+            r2._rebalance(a)
+            check("账本：账户里没这些仓了就不反手开多",
+                  not r2.api.orders and not a.held,
+                  f"{len(r2.api.orders)} 笔 / held={a.held}")
 
-        # ⑥ 目标说要平、账户里却没有可平的量：**不许**变成反手开仓
-        r2.api = Api()
-        r2._pos = {"SHFE.rb2701": Pos()}
-        a.target = 0
-        a.sent = {"SHFE.rb2701": -5}
-        r2._rebalance(a)
-        check("取消台账：账户没仓时平仓不变成反手开仓", not r2.api.orders,
-              f"{len(r2.api.orders)} 笔")
+            # 换月的老合约也按自己的账本平，不看账户（账户里可能有别人的仓）
+            a.retired = ["SHFE.rb2611"]
+            a.held = {"SHFE.rb2611": 3}
+            a.book_ts = 0.0
+            r2.api = Api()
+            r2._pos = {"SHFE.rb2611": Pos(long=10, long_his=10)}   # 其中 7 手是别人的
+            r2._rebalance(a)
+            old = r2.api.orders[0] if r2.api.orders else {}
+            check("账本：换月老合约只平自己那 3 手",
+                  old.get("direction") == "SELL" and old.get("volume") == 3
+                  and old.get("offset") == "CLOSE", str(old))
 
+            # 一键对齐之后账本要跟着摆：对齐的目标就是 sum(target)，发完之后
+            # 每条运行中的策略账本正好是自己的 target
+            a.retired = []
+            a.held = {"SHFE.rb2701": -9}
+            a.target = -5
+            a.book_ts = 0.0
+            b.held = {"SHFE.rb2701": 4}
+            b.target = 0
+            b.book_ts = 0.0
+            r2.api = Api()
+            r2._pos = {"SHFE.rb2701": Pos()}
+            r2._align_ts = 0.0
+            r2._align_slot.pending.clear()
+            r2.align(close_orphans=False)
+            check("账本：一键对齐后按 target 重新记账",
+                  a.held.get("SHFE.rb2701") == -5 and not b.held,
+                  f"a={a.held} b={b.held}")
+            r2._align_slot.pending.clear()
+
+            # 升级上来的第一次启动：账本文件还不存在，账户里已经有 -5 手。
+            # 不认领的话目标 -5 会再开 5 手，账户直接变 -10
+            r3 = PortfolioRunner(AccountSpec(name="认领测试", kind="sim"),
+                                 St.ChaseConfig())
+            r3._fresh_book = True
+            r3.api = Api()
+            e = r3.add(St.StrategyConfig(sid="e", symbol="RB", exchange="SHFE",
+                                         period="1d", rule_key="ma_cross",
+                                         sizing="fixed", volume=5))
+            e.running = True
+            e.underlying = "SHFE.rb2701"
+            e.target = -5
+            r3._pos = {"SHFE.rb2701": Pos(short=5)}
+            r3._rebalance(e)
+            check("账本：首次启用时认领账户里已有的仓位，不重复开",
+                  e.held.get("SHFE.rb2701") == -5 and not r3.api.orders,
+                  f"held={e.held} 下单={len(r3.api.orders)} 笔")
+        finally:
+            PB.user_dir = pb_old
 
         # ---- 仓位分配：不再固定 1 手 ----
         r.api = Api()
@@ -3500,10 +3572,6 @@ def check_strategy_runner() -> None:
         st_rej.underlying = "SHFE.rb2701"
         st_rej.running = True
         st_rej.target = 1
-        # 已经建过基准（本进程发过 0 手）。不设的话 `_rebalance` 第一轮只记基准，
-        # 下面两条「冷却期内 / 冷却结束后」就测不到重报这条路径
-        st_rej.based = True
-        st_rej.sent = {}
         r._pos = {}
         r.chase = St.ChaseConfig(enabled=True, wait_sec=1, retries=2, ticks=1)
 
@@ -3787,6 +3855,8 @@ def check_strategy_runner() -> None:
 
     except Exception as exc:  # noqa: BLE001
         check("多策略引擎", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        _PB.user_dir = _pb_old
 
 
 def check_sizing() -> None:

@@ -4599,7 +4599,6 @@ def _run() -> tuple[bool, list[str]]:
         r._slots = {}
         st = SlotState(cfg=SStore.StrategyConfig(sid="t", name="jd", period="1h"))
         st.running, st.underlying, st.target = True, "DCE.jd2612", -24
-        st.target_ok = True
         r._slots["t"] = st
         r._align_slot = SlotState(cfg=SStore.StrategyConfig(
             sid="__align__", name="一键对齐", period="1d"))
@@ -4633,42 +4632,49 @@ def _run() -> tuple[bool, list[str]]:
 
     check("一键对齐看得见锁仓（多空双开）", _align_lock)
 
-    def _no_ledger():
-        """取消台账（2026-11-17）：策略只在**信号**驱动下交易。
+    def _load_no_trade():
+        """加载策略时**不许**按台账自动交易（2026-11-17 用户要求）。
 
-        用户原话：
-        - 「取消策略自身的台账记录……不对齐的时候也不需要触发交易，策略触发交易
-          只有在交易信号产生的时候」；
-        - 「台账的机制会在策略加载完成自动交易合约，有时候策略加载完发现仓位异常，
-          但是单子马上就发出去了」；
-        - 「换月要自动处理的」。
+        用户原话：「还是先回滚恢复到原来的台账的机制吧，只是加一个策略加载的时候
+        不要自动去根据台账去做交易。」
 
-        这一项把四件事钉死：重启只建基准、目标不变不发单、账户漂移不管、
-        换月仍然自动平老开新。
+        老痛点：`_add_one` 读回账本 → `_rebalance` 拿它跟 `target` 比 → 差额当场
+        变委托。用户刚在界面上看到「仓位异常」，单子已经发出去了。
+
+        现在的判据：**加载后目标没变过，就一手都不发**（账本/账户差多少都不管，
+        交给一键对齐）；只有信号真的把 `target` 改了，才按台账调仓。
+        换月不走这条 —— 老合约该平还得平。
+
+        另外两条一起钉住：`target_ok`（「还没算出来」≠「0 手」）和多品种汇总行
+        （不能只给一个「—」）。
         """
-        import inspect
-
         from ttrade import strategy_store as SStore
-        from ttrade import strategy_runner as R
         from ttrade.strategy_runner import PortfolioRunner, SlotState
 
-        # 引擎源码里不许再出现持仓台账：那句「读落盘账本」就是加载即发单的根因。
-        # 带括号扫调用/赋值，别把 docstring 里讲历史的措辞也算上
-        src = inspect.getsource(R.PortfolioRunner)
-        for bad in ("positionbook", "sent_qty", "_save_book(", "_adopt_if_needed("):
-            if bad in src:
-                raise RuntimeError(f"`PortfolioRunner` 里还有台账残留：{bad}")
-        if "held" in SlotState.__dataclass_fields__:
-            raise RuntimeError("`SlotState` 还留着持仓账本 `held`")
+        class _Spec:
+            def label(self):
+                return "__selftest__"
+
+        class _P:
+            def __init__(self, lo=0, sh=0):
+                self.pos_long, self.pos_short = lo, sh
+                for side, v in (("long", lo), ("short", sh)):
+                    setattr(self, "pos_%s_his" % side, v)
+                    setattr(self, "pos_%s_today" % side, 0)
+                    setattr(self, "volume_%s_his" % side, v)
+                    setattr(self, "volume_%s_today" % side, 0)
 
         def _runner():
             r = PortfolioRunner.__new__(PortfolioRunner)
-            r._slots = {}
-            r._groups, r._parents = {}, {}
+            r._slots, r._groups, r._parents = {}, {}, {}
             r._mm_cache, r._mm_ts = [], 0.0
             r._align_ts = 0.0
-            r._pos = None
+            r._pos = {}
             r.api = object()
+            r.spec = _Spec()
+            r._fresh_book = False       # 不认领账户里已有的仓
+            r._adopted = set()
+            r._gap_note = {}
             r._log = lambda *_a, **_k: None
             r._align_slot = SlotState(cfg=SStore.StrategyConfig(
                 sid="__align__", name="一键对齐", period="1d"))
@@ -4676,323 +4682,92 @@ def _run() -> tuple[bool, list[str]]:
 
             def _send(st, sym, delta, closeable=None):
                 r.book.append((sym, int(delta), closeable))
-                st.pending.append("x")     # 在途，模拟真实发单后的状态
+                st.pending.append("x")
                 return 1
 
             r._send = _send
             return r
 
-        def _slot(r, sid="a", under="SHFE.rb2701", target=-5):
+        def _slot(r, sid="a", under="SHFE.rb2701", target=5):
             st = SlotState(cfg=SStore.StrategyConfig(
                 sid=sid, name=sid, symbol="RB", exchange="SHFE", period="1d"))
             st.running, st.underlying, st.target = True, under, int(target)
-            st.target_ok = True          # 用例显式给了目标 ⇒ 就是「已算出来」
+            st.target_ok = True
             r._slots[sid] = st
             return st
 
-        class _P:
-            """账户持仓（只要够 `_side_pos` / `_split_pos` 读就行）。"""
-
-            def __init__(self, lo=0, sh=0):
-                self.pos_long, self.pos_short = lo, sh
-                for s, v in (("long", lo), ("short", sh)):
-                    setattr(self, f"pos_{s}_his", v)
-                    setattr(self, f"pos_{s}_today", 0)
-                    setattr(self, f"volume_{s}_his", v)
-                    setattr(self, f"volume_{s}_today", 0)
-
-        # ① 重启后第一根 bar：只建基准，一手都不发。
-        #    `sent` 是内存的，重启必然是空的；从 0 算差额就会把目标再开一遍
+        # ① 加载首轮：目标 +5、账本空、账户上站着 10 手（多半是别人的）
+        #    ⇒ 一手都不许发，只把「这时的目标」记成基准
         r = _runner()
-        st = _slot(r)
+        st = _slot(r, target=5)
+        st.held = {}
+        r._pos = {"SHFE.rb2701": _P(10, 0)}
         r._rebalance(st)
         if r.book:
-            raise RuntimeError(f"重启第一根就发单了：{r.book}")
-        if not st.based or st.sent.get("SHFE.rb2701") != -5:
-            raise RuntimeError(f"基准没建对：based={st.based} sent={st.sent}")
+            raise RuntimeError(f"加载首轮就按台账发单了：{r.book}")
+        if not st.based or st.based_target != 5:
+            raise RuntimeError(f"加载基准没记上：based={st.based} "
+                               f"based_target={st.based_target}")
 
-        # ② 目标不变：一手都不发（哪怕账户里空空如也 —— 策略不看账户）
-        st.pending.clear()
-        r._rebalance(st)
-        if r.book:
-            raise RuntimeError(f"目标没变还是发单了：{r.book}")
-
-        # ③ 账户被手工平掉：策略**不补**、也不收窄，等一键对齐
-        r._pos = {}
-        st.pending.clear()
-        r._rebalance(st)
-        if r.book:
-            raise RuntimeError(f"账户漂移触发了交易：{r.book}")
-
-        # ④ 信号真的变了才发：-5 → +3 就是买 8 手。**不传 `closeable`**：
-        #    账户里有没有空单可平是 `_legs` 的事，策略只认自己该发几手
-        st.pending.clear()
-        st.target = 3
-        r._pos = {"SHFE.rb2701": _P(0, 5)}
-        r._rebalance(st)
-        if r.book != [("SHFE.rb2701", 8, None)]:
-            raise RuntimeError(f"信号驱动该发 +8 手：{r.book}")
-        if st.sent.get("SHFE.rb2701") != 3:
-            raise RuntimeError(f"发完之后 sent 要跟目标一致：{st.sent}")
-
-        # ⑤ 换月：老合约按自己发过的量平掉，然后新合约按目标建仓
-        st.pending.clear()
-        r.book.clear()
-        st.retired = ["SHFE.rb2701"]
-        st.underlying = "SHFE.rb2702"
-        st.sent = {"SHFE.rb2701": 3}
-        r._pos = {"SHFE.rb2701": _P(3, 0)}
-        r._rebalance(st)
-        if r.book != [("SHFE.rb2701", -3, 3)]:
-            raise RuntimeError(f"换月该平老合约 3 手：{r.book}")
-        if st.retired or st.sent:
-            raise RuntimeError(f"老合约平完要清干净：{st.retired} {st.sent}")
+        # ② 目标没变：第二轮、第三轮仍然一手不发（这正是老行为发单的地方）
         st.pending.clear()
         r.book.clear()
         r._rebalance(st)
-        if r.book != [("SHFE.rb2702", 3, None)]:
-            raise RuntimeError(f"换月后新合约要按目标建仓：{r.book}")
+        r._rebalance(st)
+        if r.book:
+            raise RuntimeError(f"目标没变还在发单：{r.book}")
 
-        # ⑥ 换月后立刻重启：`sent` 是空的，不知道老合约有几手 ⇒ 不发单，
-        #    留给一键对齐（宁可少做一笔，不能多发一笔）。这时 `based` 也是 False，
-        #    所以新合约同样只建基准 —— 否则就等于重开一遍仓
+        # ③ 信号把目标改成 -3：这时才按台账调仓（账本 0 ⇒ 卖 3 手）
+        st.target = -3
+        r._rebalance(st)
+        if not r.book or r.book[0][1] != -3:
+            raise RuntimeError(f"目标变了该按台账卖 3 手：{r.book}")
+
+        # ④ 换月**不受这条限制**：加载首轮也要把老合约平掉
         r2 = _runner()
-        st2 = _slot(r2, sid="b", under="SHFE.rb2702", target=3)
+        st2 = _slot(r2, target=2)
+        st2.held = {"SHFE.rb2701": 3}
         st2.retired = ["SHFE.rb2701"]
+        st2.underlying = "SHFE.rb2705"
+        r2._pos = {"SHFE.rb2701": _P(3, 0)}
         r2._rebalance(st2)
-        if r2.book:
-            raise RuntimeError(f"重启后老合约没有下单记录还发单：{r2.book}")
-        if st2.retired:
-            raise RuntimeError("没有记录的老合约要从 retired 里摘掉，否则每轮都重算")
-        if not st2.based or st2.sent.get("SHFE.rb2702") != 3:
-            raise RuntimeError(f"重启该只建基准：{st2.based} {st2.sent}")
+        if not r2.book or r2.book[0][0] != "SHFE.rb2701" or r2.book[0][1] != -3:
+            raise RuntimeError(f"换月平老合约被加载门挡住了：{r2.book}")
 
-        # ⑦ 一键对齐之后：`sent` 摆成 target（否则下一次信号会多算一段差额）
-        st2.sent = {}
-        r2._sync_after_align("SHFE.rb2702")
-        if st2.sent.get("SHFE.rb2702") != 3:
-            raise RuntimeError(f"对齐之后没摆成 target：{st2.sent}")
-
-        # ⑧ 每条策略各记各的（`sent` 不能是类属性共享的同一只字典）
-        a = SlotState(cfg=SStore.StrategyConfig(sid="x", period="1d"))
-        b = SlotState(cfg=SStore.StrategyConfig(sid="y", period="1d"))
-        a.sent["SHFE.rb2701"] = 1
-        if b.sent:
-            raise RuntimeError("`sent` 被不同槽位共享了")
-
-        # ⑨ 🔴 账户里没有可平的仓，**照样按信号发**：策略手里记着 -5（空），
-        #    目标回到 0 ⇒ 买 5 手平。账户里没有空单，可能是别的策略的多单对冲
-        #    掉了；这一买落成「开多」是对的 —— 策略只负责下单，账户长什么样由
-        #    外部（一键对齐）负责。任何「看账户裁剪订单」都会把策略重新绑回账户
+        # ⑤ 「还没算出目标」≠「0 手」：不发单，也不许进理论仓
+        #    （进了 `theoretical()` 就等于告一键对齐「这个合约该平到 0」）
         r3 = _runner()
-        st3 = _slot(r3, sid="c", target=0)
+        st3 = _slot(r3, target=0)
+        st3.target_ok = False
         st3.based = True
-        st3.sent = {"SHFE.rb2701": -5}
-        r3._pos = {}
+        st3.held = {"SHFE.rb2701": 4}
+        r3._pos = {"SHFE.rb2701": _P(4, 0)}
         r3._rebalance(st3)
-        if r3.book != [("SHFE.rb2701", 5, None)]:
-            raise RuntimeError(f"信号要平仓就照发，不许看账户砍单：{r3.book}")
+        if r3.book:
+            raise RuntimeError(f"目标还没算出来就发单：{r3.book}")
+        if r3.theoretical().get("SHFE.rb2701"):
+            raise RuntimeError("目标未知的槽位进了理论仓（对齐会平掉实仓）")
 
-        # ⑩ 同一个合约上还站着**别的策略**的仓（账户多 10 手 = A 的 5 + B 的 5）：
-        #    A 从 +5 翻到 -3，就该卖 8 手；其中只有 5 手是本进程记的、能平，
-        #    剩下 3 手是开空 —— `_clamp_close` 只减不增，算的就是这个可平量
+        # ⑥ 多品种汇总行：给「多 X 空 Y」，不能只有一个「—」
         r4 = _runner()
-        st4 = _slot(r4, sid="d", target=-3)
-        st4.based = True
-        st4.sent = {"SHFE.rb2701": 5}
-        r4._pos = {"SHFE.rb2701": _P(10, 0)}
-        r4._rebalance(st4)
-        if r4.book != [("SHFE.rb2701", -8, 5)]:
-            raise RuntimeError(f"卖 8 手、其中只有 5 手可平：{r4.book}")
-        # ⑪ 多品种那条**汇总行也要有理论仓**。用户 11-17 的原话：
-        #    「台账系统没有了，但是策略的目前持仓的理论仓位依然还是要有的，
-        #     目前有几个策略有的持仓都没有显示出来。」「现在理论都显示 0」
-        #    两个毛病：汇总行 `target=None` ⇒ 一律「—」；目标还没算出来时
-        #    `target` 是初值 0 ⇒ 界面把「未知」显示成「0 手」。
-        r5 = _runner()
-        r5._groups = {"p": ["p#a", "p#b", "p#c"]}
-        r5._parents = {"p": SStore.StrategyConfig(
-            sid="p", name="多品种汇总", period="1d",
+        r4._groups = {"p": ["p#a", "p#b", "p#c"]}
+        r4._parents = {"p": SStore.StrategyConfig(
+            sid="p", name="多品种", period="1d",
             multi_symbols=["RB_SHFE", "AG_SHFE", "CU_SHFE"])}
         for sid, und, tg in (("p#a", "SHFE.rb2701", 3),
                              ("p#b", "SHFE.ag2612", -1),
                              ("p#c", "SHFE.cu2701", 0)):
-            s = SlotState(cfg=SStore.StrategyConfig(sid=sid, period="1d"))
-            s.running, s.underlying, s.target = True, und, tg
-            s.target_ok = True
-            r5._slots[sid] = s
-        g = r5._group_slots()
-        if len(g) != 1:
-            raise RuntimeError(f"汇总行没生成：{g}")
-        g = g[0]
-        if (g["tgt_long"], g["tgt_short"], g["multi"]) != (3, 1, 3):
-            raise RuntimeError(
-                "汇总行没有合计理论仓：多 %s / 空 %s（multi=%s）"
-                % (g.get("tgt_long"), g.get("tgt_short"), g.get("multi")))
-        if [v for _, v in g["tgt_detail"]] != [3, -1]:
-            raise RuntimeError(f"逐品种目标漏了：{g['tgt_detail']}")
-        if g["target"] is not None or not g["target_ok"]:
-            raise RuntimeError("汇总行不该有「一个」目标仓，但必须标 target_ok")
+            s2 = SlotState(cfg=SStore.StrategyConfig(sid=sid, period="1d"))
+            s2.running, s2.underlying, s2.target = True, und, tg
+            s2.target_ok = True
+            r4._slots[sid] = s2
+        g = r4._group_slots()
+        if not g or (g[0]["tgt_long"], g[0]["tgt_short"]) != (3, 1):
+            raise RuntimeError(f"多品种汇总没有合计理论仓：{g}")
+        return ("加载首轮不发单、目标不变一直不发、目标改了才按台账调；"
+                "换月不受限；目标未知不进理论仓；多品种汇总给「多 X 空 Y」")
 
-        # ⑫ 「还没算出目标」≠「目标 0 手」：前者一手都不许发（0 手是「该平仓」），
-        #    对账时也不许算成 0（否则一键对齐会拿它把账户的实仓平掉）
-        r6 = _runner()
-        s6 = _slot(r6, sid="e", target=0)
-        s6.target_ok = False       # 显式回到「目标还没算出来」
-        s6.based = True            # 跳过「建基准」，直接比差额
-        s6.sent = {"SHFE.rb2701": 4}
-        r6._rebalance(s6)          # target_ok 还是 False
-        if r6.book:
-            raise RuntimeError(f"目标还没算出来就发单了：{r6.book}")
-        if r6.theoretical().get("SHFE.rb2701"):
-            raise RuntimeError("目标未知的槽位被算进理论仓（一键对齐会平掉实仓）")
-        s6.target_ok = True
-        r6._rebalance(s6)
-        if r6.book != [("SHFE.rb2701", -4, None)]:
-            raise RuntimeError(f"目标算出来是 0 就该平掉 4 手：{r6.book}")
-        return ("重启只建基准、目标不变不发单、账户漂移不管，换月仍自动平老开新；"
-                "多品种汇总行给出「多 X 空 Y」+ 逐品种明细；目标未知≠0 手")
-
-    check("取消台账：策略只在信号驱动下交易", _no_ledger)
-
-    def _data_gap_gate():
-        """K 线缺交易日 / 补库静默成功 —— 2026-11-17 的现场。
-
-        用户报三件事：IF 的 5m 历史还停在 11-10；同一个策略在两个账户上一个
-        1 手、一个 0 手；回测里却还持仓。
-
-        根因不在策略：本地库缺了 11-11~11-17，`merge_live` 把实时段直接贴在
-        11-10 后面 —— 索引看着连续，中间五个交易日凭空消失。指标（60 根动量、
-        上一交易日波幅、ATR）跨着断口算，信号就和回测对不上。柜台账户更容易撞：
-        它没有回填历史的能力，序列全靠本地库里种进去的 300 根。
-        """
-        import inspect
-
-        import pandas as pd
-
-        from ttrade import strategy_runner as R
-        from ttrade import topup, tqstore
-
-        cal = sorted(tqstore.calendar())
-        if len(cal) < 10:
-            raise RuntimeError("库里没有日线日历，这条自检跑不了")
-
-        def mk(i):
-            return pd.DataFrame({"close": [1.0] * len(i)}, index=i)
-
-        def at(days):
-            return pd.DatetimeIndex([pd.Timestamp(d) + pd.Timedelta(hours=10)
-                                     for d in days])
-
-        # ① 完整的一段不能报缺口；抽掉一天必须报出来
-        tail = cal[-6:]
-        if R.hole_days(mk(at(tail))):
-            raise RuntimeError(f"完整的 K 线被判成缺口：{R.hole_days(mk(at(tail)))}")
-        miss = R.hole_days(mk(at(tail[:2] + tail[3:])))
-        if miss != [tail[2]]:
-            raise RuntimeError(f"缺一天没判出来：{miss} vs {[tail[2]]}")
-
-        # ② 空表 / 只有索引的帧：空表返回空（没得判），只有索引也要照判
-        if R.hole_days(pd.DataFrame()):
-            raise RuntimeError("空表被判成缺口")
-        if not R.hole_days(pd.DataFrame(index=at(tail[:2] + tail[3:]))):
-            raise RuntimeError("只有索引的帧漏判了（`DataFrame.empty` 对 0 列也是 True）")
-
-        # ③ 🔴 长假不能误判：日历里间隔最大的那两天之间没有任何交易日
-        #    （春节 / 国庆），拿自然日判会把它们当成缺口，一年两次把策略停掉
-        best = max(range(len(cal) - 1), key=lambda i: (cal[i + 1] - cal[i]).days)
-        d0, d1 = cal[best], cal[best + 1]
-        if (d1 - d0).days < 3:
-            raise RuntimeError("日历里没有长假段，这条反证没意义")
-        if R.hole_days(mk(at([d0, d1]))):
-            raise RuntimeError(f"长假被当成缺口（{d0} → {d1} 共 {(d1 - d0).days} 天）")
-
-        # ④ 补库：整段落在交易时段外（午休 / 收盘快照）时**不能当成功**。
-        #    当成功就把这个品种永久钉在旧数据上，一句话都不说
-        serial = pd.DataFrame({
-            # 天勤给的是 UTC 纳秒，北京 11:45（CFFEX 午休）＝ UTC 03:45
-            "datetime": [pd.Timestamp("2026-11-17 03:45").value],
-            "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
-            "volume": [1.0], "open_oi": [1.0], "close_oi": [1.0],
-        })
-        r = topup.save(serial, "IF", "CFFEX", "5m")
-        if r["ok"] or not r["error"]:
-            raise RuntimeError(f"全是时段外的 bar 竟被当成补库成功：{r}")
-
-        # ⑤ 停机槽位也要继续补库（源码判据：这里没有真连接，只能看结构）
-        src = inspect.getsource(R.PortfolioRunner.tick)
-        i = src.find("if not st.running:")
-        if i < 0 or "_top_up" not in src[i:i + 500]:
-            raise RuntimeError("停机后不再补库：库会一直停在旧数据上（IF 就是这样停在 11-10）")
-
-        # ⑥ bar 数不足要写出来，不许静默 return（否则界面上只剩「理论 0 手」）
-        src2 = inspect.getsource(R.PortfolioRunner._refresh_signal)
-        j = src2.find("MIN_BARS")
-        if j < 0 or "last_action" not in src2[j:j + 500]:
-            raise RuntimeError("bar 数不足时又静默 return 了，界面上看不出原因")
-
-        # ⑦ 🔴 增量窗口的起点就一条：**现有数据到哪一刻，就从那儿补到此刻**。
-        #    老写法 `max(hard_start, last-3d)` 会被「回溯区间」夹住 —— 定时任务
-        #    固定 days=1（hard_start = 昨天），库尾停在 11-10 时算出来是「从
-        #    11-16 开始补」，中间那截永远补不上，而日志照样报「+14 行」。
-        #    这里把下载函数换掉，只看它算出来的窗口。
-        from datetime import date, timedelta
-
-        from ttrade import tqfetch as TQ
-
-        seen: list = []
-        keep = (TQ.download_many, TQ.can_download, tqstore.last_dt,
-                tqstore.first_dt, tqstore.load_switch, tqstore.miss_days)
-        d_last = cal[-4]
-
-        def fake_dl(api, reqs, period, root, label, max_parallel=8):
-            seen.extend(reqs)
-            return {}
-
-        try:
-            TQ.download_many = fake_dl
-            TQ.can_download = lambda api: True
-            tqstore.last_dt = lambda s, e, p: pd.Timestamp(d_last) + pd.Timedelta(hours=15)
-            tqstore.first_dt = lambda s, e, p: pd.Timestamp(cal[0])
-            tqstore.load_switch = lambda s, e: pd.DataFrame()
-            tqstore.miss_days = lambda s, e, p, c=None: []
-            TQ.write_main_many(None, [("IF", "CFFEX")], "5m", 0, days=1)
-        finally:
-            (TQ.download_many, TQ.can_download, tqstore.last_dt,
-             tqstore.first_dt, tqstore.load_switch, tqstore.miss_days) = keep
-        if not seen:
-            raise RuntimeError("增量窗口一个都没算出来")
-        got = seen[0][1]
-        want = d_last - timedelta(days=3)
-        if got != want:
-            raise RuntimeError(
-                f"增量起点被回溯区间夹住了：算成 {got}，应当是库尾往前 3 天的 {want}"
-                f"（今天 {date.today()}，days=1 ⇒ 老写法会算成 {date.today() - timedelta(days=1)}）")
-
-        # ⑧ 库尾之前中间缺的那几天：从**最早缺的那天**补起，一次覆盖洞和尾巴
-        seen.clear()
-        d_hole = cal[-12]
-        try:
-            TQ.download_many = fake_dl
-            TQ.can_download = lambda api: True
-            tqstore.last_dt = lambda s, e, p: pd.Timestamp(d_last) + pd.Timedelta(hours=15)
-            tqstore.first_dt = lambda s, e, p: pd.Timestamp(cal[0])
-            tqstore.load_switch = lambda s, e: pd.DataFrame()
-            tqstore.miss_days = lambda s, e, p, c=None: [d_hole]
-            TQ.write_main_many(None, [("IF", "CFFEX")], "5m", 0, days=1)
-        finally:
-            (TQ.download_many, TQ.can_download, tqstore.last_dt,
-             tqstore.first_dt, tqstore.load_switch, tqstore.miss_days) = keep
-        if not seen or seen[0][1] != d_hole:
-            raise RuntimeError(
-                f"中间有洞时没从洞的起点补起：算出 {seen[0][1] if seen else None}，"
-                f"应当是 {d_hole}")
-
-        return ("缺口按交易日历判（长假不误报、0 列的帧也照判）；"
-                "补库不再静默成功；停机仍补库；bar 不足会写明原因；"
-                "增量起点 = 库尾/最早的洞 → 此刻，不受回溯区间夹取")
-
-    check("K 线缺交易日 / 补库静默成功", _data_gap_gate)
+    check("加载策略时不按台账自动交易", _load_no_trade)
 
     def _add_or_update():
         """新加进组合的策略要能被「启动 / 停止」接上。
@@ -8614,26 +8389,11 @@ def _run() -> tuple[bool, list[str]]:
             if got != want:
                 raise RuntimeError(
                     f"_open_now 与 in_session 不一致（{sym}）：{want} vs {got}")
-        # 🔴 「任一成员开市」**不能拿当前时刻去验证**：15:00 一过 IM 和 RB 都收盘，
-        # 这条断言就必红（2026-11-17 15:03 实测红了一次）。判据换成确定的假函数，
-        # 才能全天候跑 —— 自检本身不许有时间敏感性。
-        _is = SI.in_session
-        try:
-            SI.in_session = lambda s, e, t=None: str(s).startswith("RB")
-            if not SR.PortfolioRunner._open_now(
-                    None, _Cfg("", "SHFE", ["IM_CFFEX", "RB_SHFE"])):
-                raise RuntimeError("板块级策略没有按「任一成员开市」判定")
-            SI.in_session = lambda s, e, t=None: False
-            if SR.PortfolioRunner._open_now(
-                    None, _Cfg("", "SHFE", ["IM_CFFEX", "RB_SHFE"])):
-                raise RuntimeError("板块级策略在全部成员闭市时仍然开跑")
-        finally:
-            SI.in_session = _is
-        # A 股在品种信息表里没有时段 ⇒ `segs` 为空 ⇒ 一律判「开着」（不限制）。
-        # 三个时刻都试一遍：凌晨、早盘、收盘后，任何一个被判关都是期货表越界了。
-        for _tick in ("2026-11-17 03:00", "2026-11-17 10:00", "2026-11-17 15:30"):
-            if not SI.in_session("600519", "SSE", _t(_tick)):
-                raise RuntimeError(f"A 股被期货交易时段表误伤了（{_tick}）")
+        if not SR.PortfolioRunner._open_now(
+                None, _Cfg("", "SHFE", ["IM_CFFEX", "RB_SHFE"])):
+            raise RuntimeError("板块级策略没有按「任一成员开市」判定")
+        if not SI.in_session("600519", "SSE"):
+            raise RuntimeError("A 股被期货交易时段表误伤了")
 
         return (f"{len(cases)} 个时刻判对（含夜盘跨零点 / 周五夜盘跑到周六凌晨 / "
                 f"午休 / 股指无夜盘）；CTP 挡掉时段外 tick（留 {','.join(kept)}）；"
