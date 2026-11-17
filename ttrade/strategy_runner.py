@@ -73,30 +73,34 @@ FACTOR_MIN_BARS = 300
 GROUP_SEP = "#"
 
 
-def require_tq_account(spec: AccountSpec) -> None:
-    """「策略交易和组合」只能跑天勤账户；CTP / 融航 在这里就挡掉。
+def require_live_account(spec: AccountSpec) -> None:
+    """启动前的账户体检：**在最前面**（补数据、连柜台之前）把配错的挡掉。
 
-    挡在**最前面**（补数据、import tqsdk 之前）不是洁癖：`AccountSpec.build()`
-    也会拒绝非天勤账户，但那是在 `start()` 的最后一步 —— 前面 `_ensure_aux()`
-    会先补期货日线和展期/期权快照（几分钟），用户等完才看到一句
-    「不走天勤，不能构造天勤账户对象」，既不知道错在哪，也不知道该改什么。
+    `_ensure_aux()` 会先补期货日线和展期/期权快照（几分钟），用户等完才看到一句
+    「缺少天勤账户或密码」，既不知道错在哪，也不知道该改什么。所以缺参数、柜台
+    不支持这类**一眼就能判的**问题都挪到这里。
 
-    这一页的下单/持仓/追单全是按天勤的口径写的（主连 `KQ.m@` 直接下单、`is_changing`
-    推 update、平今平昨由天勤自己拆），柜台账户换一个「账户对象」是通不了的：
-    CTP / 融航 必须写一条自己的执行层（具体月份合约、限价单、平今平昨、主连换月、
-    历史回放到 live bar）。所以这里的选择只有「说清楚 + 给出路」，不是「试试看」。
+    三种后端都能跑：
+
+    - `tq`：天勤 TqApi，历史 + 实时 + 下单全走天勤；
+    - `ctp` / `rohon`：历史走本地天勤数据（柜台没有历史行情），实时行情和下单
+      走柜台（见 `ttrade/broker_api.py`）。
+
+    唯一跑不了的是「柜台 + A 股」：CTP / 融航 只做期货，没有股票代码可报。
     """
     be = getattr(spec, "backend", "tq")
+    who = str(getattr(spec, "name", "") or "")
+    if not str(getattr(spec, "user", "") or "") or not str(getattr(spec, "password", "") or ""):
+        label = "天勤账户" if be == "tq" else "柜台账号"
+        raise ValueError(f"账户「{who}」缺少{label}或密码")
     if be == "tq":
         return
-    who = str(getattr(spec, "name", "") or "")
-    label = BACKEND_LABELS.get(be, str(be))
-    raise ValueError(
-        f"账户「{who}」是{label}账户。「策略交易和组合」这一页只能跑天勤账户"
-        f"（快期模拟 / 天勤实盘 / 本地模拟）—— {label}账户目前只在"
-        f"「账户透视和交易」页支持手工下单，还不支持自动交易。\n"
-        f"要么把这条策略的交易账户改成天勤账户，要么换一条天勤账户来跑。"
-    )
+    if getattr(spec, "is_stock", False):
+        label = BACKEND_LABELS.get(be, str(be))
+        raise ValueError(
+            f"账户「{who}」是{label}账户。{label}只做期货，没有 A 股可报 —— "
+            "股票策略请用天勤账户跑。"
+        )
 
 
 # 「没有训练产物」这件事多久之内不再重试 / 不再刷日志。产物是用户手动训的，
@@ -612,24 +616,44 @@ class PortfolioRunner:
             self._log(f"衍生数据补充失败（{type(exc).__name__}: {exc}），先用本地快照")
 
     def start(self) -> None:
-        # 先判柜台：非天勤账户到下面 `TqApi(spec.build())` 才会炸，而那时候
-        # `_ensure_aux()` 已经补了几分钟数据。理由见 `require_tq_account()`
-        require_tq_account(self.spec)
-        from tqsdk import TqApi, TqAuth
+        # 先体检账户：配错的（缺账号密码、柜台+A股）到下面连的时候才炸，而那时候
+        # `_ensure_aux()` 已经补了几分钟数据。理由见 `require_live_account()`
+        require_live_account(self.spec)
+        backend = getattr(self.spec, "backend", "tq")
 
-        if not self.spec.user or not self.spec.password:
-            raise ValueError("缺少天勤账户或密码")
-        # 补数据放在连接之前：连上就要开始算信号了，那时候快照还是旧的
+        # 补数据放在连接之前：连上就要开始算信号了，那时候快照还是旧的。
+        # 柜台账户也要补 —— 展期/期权因子是策略自己的输入，跟用哪个柜台下单无关；
+        # 而且柜台没有历史行情，「当前主力是哪个合约」也读的是本地衍生数据
         self._ensure_aux()
-        self.api = TqApi(
-            self.spec.build(),
-            auth=TqAuth(self.spec.user, self.spec.password),
-            web_gui=False,
-        )
+
+        if backend == "tq":
+            from tqsdk import TqApi, TqAuth
+
+            self.api = TqApi(
+                self.spec.build(),
+                auth=TqAuth(self.spec.user, self.spec.password),
+                web_gui=False,
+            )
+        else:
+            self.api = self._broker_api(backend)
         self._pos = self.api.get_position()
         self._orders = self.api.get_order()
-        self._log(f"账户已连接：{self.spec.label()}")
+        if backend == "tq":
+            self._log(f"账户已连接：{self.spec.label()}")
+        else:
+            self._log(
+                f"账户已连接：{self.spec.label()}"
+                f"（行情源 {BACKEND_LABELS.get(backend, backend)}；"
+                "历史行情读本地天勤数据）")
         self._sweep_orders()
+
+    def _broker_api(self, backend: str):
+        """柜台账户的执行层：实时行情 + 下单走柜台，历史走本地天勤数据。"""
+        from ttrade.broker_api import BrokerApi
+
+        api = BrokerApi(self.spec, feed=backend, log=self._log)
+        api.start()
+        return api
 
     def _sweep_orders(self) -> None:
         """撤掉上一次运行留下、还挂着的委托。
@@ -644,6 +668,14 @@ class PortfolioRunner:
         ids = orderbook.load(self.spec.label())
         if not ids:
             return
+        if getattr(self.spec, "backend", "tq") != "tq":
+            # 柜台没有「查历史委托」的接口（`TraderClient` 没实现 ReqQryOrder），
+            # 新会话里看不到上一个进程留下的挂单 —— 上面的循环会一笔都撤不到。
+            # 这件事必须说出来：不说的话用户以为已经撤干净了，那几笔单还在交易所
+            # 挂着，成交了就是「没点按钮它自己建了仓」。
+            self._log(
+                "柜台查不到历史委托：上一次运行遗留的挂单请在"
+                "「账户透视和交易」页对着委托列表撤掉")
         n = 0
         for oid in ids:
             o = self._orders.get(oid) if self._orders is not None else None

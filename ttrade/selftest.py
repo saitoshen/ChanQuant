@@ -5496,6 +5496,156 @@ def _run() -> tuple[bool, list[str]]:
 
     check("CTP 会话层（交易页后端）", _ctp_live)
 
+    def _broker_api() -> str:
+        """柜台执行层：把 CTP / 融航 装成 `TqApi` 的形状（`ttrade/broker_api.py`）。
+
+        这一层的三个 bug 都是「静默的」，所以必须离线跑一遍真流程：
+
+        1. **时间戳单位**：pandas 2.x 起 `DatetimeIndex` 的单位可能是微秒，
+           `asi8` 给的是本单位整数。当纳秒用，整条序列会落到 1970 年，
+           `bars_from_serial` 只是把它整段剔掉 —— 表现为「300 行序列、0 根 bar」；
+        2. **正在走的那根 bar 要就地更新**：只接「新增」的话，一根 bar 在它诞生
+           那一刻就定格了，K 线内触发（拿最新价跟触发价比）当根永远不触发；
+        3. **没有柜台回报的委托要判死**：一直 ALIVE 会让引擎永远等它、永远不重发
+           —— 看着像策略死了。
+        """
+        import pandas as pd
+
+        from ttrade.broker_api import OPTIMISTIC_TTL, BrokerApi
+        from ttrade.tqlive import AccountSpec, bars_from_serial
+
+        class _Md:
+            def __init__(self):
+                self.ticks = {}
+                self.subs = []
+
+            def subscribe(self, items):
+                self.subs.extend(items)
+
+            def last(self, ins):
+                return dict(self.ticks.get(ins) or {})
+
+            def push(self, ins, stamp, price, vol):
+                self.ticks[ins] = {"instrument": ins, "datetime": stamp,
+                                   "last": price, "bid": price - 1, "ask": price + 1,
+                                   "volume": vol, "oi": 1000}
+
+        class _Td:
+            def __init__(self):
+                self.instruments = {"rb2701": {"tick": 1.0, "exchange": "SHFE"}}
+                self.positions, self.orders, self.trades = {}, {}, {}
+                self.account, self.placed = {}, []
+
+            def query_account(self):
+                pass
+
+            def query_positions(self):
+                pass
+
+            def query_instruments(self, ins=""):
+                self.instruments.setdefault(ins, {"tick": 1.0, "exchange": "SHFE"})
+
+            def snapshot(self):
+                return {"account": self.account, "positions": self.positions,
+                        "orders": self.orders, "trades": self.trades}
+
+            def place(self, ins, direction, offset, price, volume):
+                ref = str(9000 + len(self.placed))
+                self.placed.append((ins, direction, offset, price, volume, ref))
+                return ref
+
+        class _Hub:
+            def __init__(self):
+                self.md, self.trader, self.last_error = _Md(), _Td(), ""
+                self.cancelled = []
+
+            def start(self):
+                pass
+
+            def close(self):
+                pass
+
+            def place(self, symbol, direction, offset, volume, limit_price=None):
+                return self.trader.place(symbol, direction, offset,
+                                         float(limit_price), int(volume))
+
+            def cancel(self, order_id, account=""):
+                self.cancelled.append(str(order_id))
+
+        def _hist(code, ex, period):
+            end = pd.Timestamp.now().normalize() + pd.Timedelta(hours=9)
+            idx = pd.DatetimeIndex([end - pd.Timedelta(minutes=5 * (300 - i))
+                                    for i in range(300)])
+            n = len(idx)
+            return pd.DataFrame({
+                "open": [100.0] * n, "high": [101.0] * n, "low": [99.0] * n,
+                "close": [100.5] * n, "volume": [10.0] * n,
+                "open_oi": [1000.0] * n, "close_oi": [1000.0] * n}, index=idx)
+
+        spec = AccountSpec(name="自检CTP", kind="ctp", user="u", password="p")
+        hub = _Hub()
+        api = BrokerApi(spec, log=lambda _m: None, hub=hub, history=_hist)
+        api._main_of = lambda code, ex: "rb2701"
+        api._ensure_sub = lambda ins: None
+        api.start()
+
+        kl = api.get_kline_serial("KQ.m@SHFE.rb", 300, 300)
+        live = bars_from_serial(kl, "5m")
+        assert len(live) == 300, f"历史灌进去要能转成行情表，实际 {len(live)} 根"
+
+        q = api.get_quote("KQ.m@SHFE.rb")
+        assert q.underlying_symbol == "SHFE.rb2701", q.underlying_symbol
+
+        base = pd.Timestamp.now().normalize() + pd.Timedelta(hours=9)
+        for mins, px, vol in ((1, 3551.0, 110), (2, 3552.0, 120), (6, 3553.0, 140)):
+            ts = base + pd.Timedelta(minutes=mins)
+            hub.md.push("rb2701", f"{ts:%Y%m%d %H:%M:%S}", px, vol)
+            api.wait_update(deadline=time.time() + 0.02)
+        live = bars_from_serial(api.get_kline_serial("KQ.m@SHFE.rb", 300, 300), "5m")
+        assert len(live) == 302, f"tick 要拼成新 bar，实际 {len(live)} 根"
+        assert abs(live["close"].iloc[-2] - 3552.0) < 1e-9, (
+            f"同一根 bar 里来了新 tick 要就地更新，实际 {live['close'].iloc[-2]}")
+        assert abs(live["volume"].iloc[-1] - 20.0) < 1e-9, live["volume"].iloc[-1]
+
+        order = api.insert_order(symbol="SHFE.rb2701", direction="BUY",
+                                 offset="OPEN", volume=2, limit_price=3550.0)
+        assert api.get_order()[order.order_id].status == "ALIVE"
+        hub.trader.orders["1000"] = {"order_ref": "1000", "instrument": "rb2701",
+                                     "direction": "0", "offset": "0", "price": 3550.0,
+                                     "volume": 2, "traded": 2, "status": "全部成交"}
+        hub.trader.orders["1001"] = {"order_ref": "1001", "instrument": "rb2701",
+                                     "direction": "0", "offset": "0", "price": 3550.0,
+                                     "volume": 2, "traded": 0, "status": "被拒",
+                                     "msg": "价格不对"}
+        hub.trader.positions["rb2701"] = {"long": 5, "short": 1, "long_yd": 2,
+                                          "short_yd": 0, "price": 3500.0}
+        api._refresh(force=True)
+        assert api.get_order()["1000"].status == "FINISHED"
+        assert api.get_order()["1001"].status == "DEAD"
+        assert api.get_order()["1001"].last_msg == "价格不对"
+        pos = api.get_position()["SHFE.rb2701"]
+        assert (pos.pos_long, pos.pos_short, pos.pos_long_his,
+                pos.pos_long_today) == (5, 1, 2, 3), pos
+
+        # 柜台一直不回报：超时判死，否则引擎永远等它
+        api._ord[order.order_id].ts -= OPTIMISTIC_TTL * 2
+        api._refresh(force=True)
+        assert api.get_order()[order.order_id].status == "DEAD", "没回报的委托要判死"
+
+        # 市价（NaN）在柜台上不存在，要报一句人话而不是静默下 0 价单
+        try:
+            api.insert_order(symbol="SHFE.rb2701", direction="BUY", offset="OPEN",
+                             volume=1, limit_price=float("nan"))
+        except ValueError as exc:
+            assert "限价" in str(exc), str(exc)
+        else:
+            raise RuntimeError("NaN 价格竟然能下单")
+
+        api.close()
+        return "序列 300 根 + 拼 bar + 委托三态 + 今昨仓 + 无回报判死 全对"
+
+    check("柜台执行层（策略页跑 CTP / 融航）", _broker_api)
+
     def _many_failed(n: int = 40) -> list[str]:
         """造一批「同一原因、不同品种」的失败清单。
 
@@ -5908,45 +6058,86 @@ def _run() -> tuple[bool, list[str]]:
             except Exception as _exc:      # noqa: BLE001
                 acct_ok = acct_ok and "vnpy_rohon" in str(_exc)
 
-            # ---- 「策略交易和组合」只跑天勤账户
-            # CTP / 融航 账户配到组合里时，以前要等到 `PortfolioRunner.start()`
-            # 最后一步才炸（前面还先补了几分钟数据），界面上只剩一行
-            # 「ValueError: 不走天勤，不能构造天勤账户对象」。这条断言盯三件事：
-            #   1. 挡在补数据和 tqsdk 之前（看源码里判据的先后顺序）；
-            #   2. 报错说清「改成天勤账户」这条路，不是只丢一个异常名；
-            #   3. 界面上账户名字就标出「本页不支持」，别让人配完才发现。
-            from gui.portfolio_page import account_label, auto_ok
-            from ttrade.strategy_runner import PortfolioRunner, require_tq_account
+            # ---- 「策略交易和组合」跑柜台账户（CTP / 融航）
+            # 以前这一页只认天勤账户，CTP / 融航 配进来要等到 `start()` 最后一步
+            # 才炸（前面还先补了几分钟数据）。现在柜台账户能跑：历史行情读本地
+            # 天勤数据、实时行情和下单走柜台（`ttrade/broker_api.py`）。这条断言
+            # 盯四件事：
+            #   1. 体检挪到补数据和连柜台**之前**（看源码里的先后顺序）；
+            #   2. 真正跑不了的只有「柜台 + 股票」，而且报错说清为什么；
+            #   3. `start()` 真的按 `backend` 分叉到 BrokerApi；
+            #   4. 界面上账户名字标出「历史行情读本地天勤」，别让人以为柜台给历史。
+            from gui.portfolio_page import BROKER_HINT, account_label, auto_ok
+            from ttrade.strategy_runner import PortfolioRunner, require_live_account
 
             import inspect as _inspect
 
+            _msg_stock = ""
             try:
-                require_tq_account(_ctp)
-                _guard_msg = ""          # 没抛 = 没挡住，下面会判失败
+                require_live_account(_AS(name="自检CTP", kind="ctp",
+                                         user="u", password="p",
+                                         account_id="1"))
+                # 柜台 + 股票：`kind` 换成股票模拟再套 ctp 后端走不通，只能直接
+                # 造一个「backend=ctp 且 is_stock」的组合，走同一条判据
+                class _BrokerStock(_AS):
+                    kind = "ctp"
+
+                    @property
+                    def is_stock(self):        # noqa: D102 - 自检桩
+                        return True
+                require_live_account(_BrokerStock(name="自检股票CTP", kind="ctp",
+                                                 user="u", password="p"))
             except ValueError as _exc:
-                _guard_msg = str(_exc)
+                _msg_stock = str(_exc)
+            _msg_pwd = ""
+            try:
+                require_live_account(_AS(name="自检空密码", kind="ctp", user="u"))
+            except ValueError as _exc:
+                _msg_pwd = str(_exc)
             _src = _inspect.getsource(PortfolioRunner.start)
-            _i_guard = _src.find("require_tq_account(self.spec)")
-            # 找**真实调用**而不是任意一处 `TqApi(`：函数开头的说明性注释里也写着
-            # `TqApi(spec.build())`，按那几个字找会命中注释、把顺序判成反的
-            _i_api = _src.find("self.api = TqApi(")
+            _i_guard = _src.find("require_live_account(self.spec)")
             _i_aux = _src.find("self._ensure_aux()")
+            _i_api = _src.find("self.api = TqApi(")
+            _i_broker = _src.find("self._broker_api(backend)")
             _order = (_i_guard >= 0 and _i_aux > 0 and _i_api > 0
                       and _i_guard < _i_aux and _i_guard < _i_api)
             acct_ok = (acct_ok
-                       and bool(_guard_msg)
-                       and "天勤" in _guard_msg
-                       and "自检CTP" in _guard_msg
-                       and _order
-                       and require_tq_account(_tq) is None
-                       and auto_ok(_tq) and not auto_ok(_ctp)
-                       and "不支持" in account_label(_ctp)
-                       and "不支持" not in account_label(_tq))
+                       and require_live_account(_tq) is None
+                       and require_live_account(_ctp) is None
+                       and require_live_account(_roh) is None
+                       and bool(_msg_stock) and "期货" in _msg_stock
+                       and "自检股票CTP" in _msg_stock
+                       and bool(_msg_pwd) and "缺少" in _msg_pwd
+                       and _order and _i_broker > _i_api
+                       and auto_ok(_tq) and auto_ok(_ctp)
+                       and BROKER_HINT in account_label(_ctp)
+                       and BROKER_HINT not in account_label(_tq))
+
+            # 执行层本身：接口形状 + 时间戳单位 + 委托三态。
+            # `_ns` 那条是**实测踩出来的**：pandas 2.x 起 `DatetimeIndex` 的单位
+            # 可能是微秒，`asi8` 给的是本单位的整数，当纳秒用整条序列会落到
+            # 1970-01-22，而且 `bars_from_serial` 只是把它整段剔掉 —— 表现是
+            # 「序列有 300 行、一根 bar 都转不出来」，没有任何报错。
+            from ttrade import broker_api as _BA
+
+            import pandas as _pd
+
+            _api_keys = ("get_kline_serial", "get_quote", "get_position", "get_order",
+                         "insert_order", "cancel_order", "wait_update", "close",
+                         "start")
+            _ns_v = _BA._ns(_pd.DatetimeIndex(["2026-11-16 09:00:00"]))[0]
+            _expect = int(_pd.Timestamp("2026-11-16 01:00:00Z").value)
+            acct_ok = (acct_ok
+                       and all(hasattr(_BA.BrokerApi, k) for k in _api_keys)
+                       and int(_ns_v) == _expect
+                       and _BA._STATUS_MAP.get("全部成交") == "FINISHED"
+                       and _BA._STATUS_MAP.get("已撤单") == "DEAD"
+                       and "部分成交" not in _BA._STATUS_MAP)
             acct_info = ("分组 " + "/".join(_g)
                          + f"，合并 {len(_m.by_account)} 户 / 权益 "
                          + f"{_m.account.get('balance'):,.0f}"
-                         + f"，策略页柜台门禁 {'OK' if _order else '位置不对'}"
-                         + ("" if _guard_msg else "（没报错）"))
+                         + f"，策略页柜台执行层 {'OK' if _order else '位置不对'}"
+                         + ("" if _i_broker > _i_api else "（没接 broker_api）"))
         except Exception as _exc:          # noqa: BLE001
             acct_ok = False
             acct_info = f"{type(_exc).__name__}: {_exc}"
