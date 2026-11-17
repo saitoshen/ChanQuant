@@ -262,9 +262,15 @@ class TqWorker(QObject):
                  contracts: bool = True,
                  edb: bool = False,
                  options: bool = False,
-                 force_switch: bool = False) -> None:
+                 force_switch: bool = False,
+                 periods: list[str] | None = None) -> None:
         super().__init__()
         self.period = period
+        # **主连要补哪些周期**。默认就一个（=界面选的）；定时那条给「5m + 1h」，
+        # 因为策略跑的周期未必是界面上选着的那个 —— 只续 1h 的话 5m 库会安静地
+        # 停在某一天，而每天日志都在报「+N 行」（11-17 的 IF 就是这样）。15m/30m
+        # 由 5m 合并、2h/4h 由 1h 合并，所以补这两个源周期就覆盖了全部分钟周期。
+        self.periods = [p for p in (periods or [period]) if p] or [period]
         self.days = int(days or 7300)
         self.pairs = pairs
         self.contracts = contracts
@@ -433,23 +439,37 @@ class TqWorker(QObject):
                     return
 
                 done = 0
-                total = len(pairs)
-                period_label = dict(TQ_PERIODS).get(self.period, self.period)
+                total = len(pairs) * len(self.periods)
+                got: dict[str, int] = {}
 
-                def on_row(key: str, rows: int, first) -> None:
+                def on_row(key: str, rows: int, first, label: str = "") -> None:
                     nonlocal done
                     done += 1
                     tail = f"+{rows} 行（{first:%Y-%m-%d} 起）" if rows else "无新数据"
-                    self.progress.emit(done, total, f"{period_label} {done}/{total}　{key}　{tail}")
+                    self.progress.emit(done, total, f"{label} {done}/{total}　{key}　{tail}")
 
-                got = TQ.write_main_many(
-                    api, pairs, self.period, 0,
-                    on_row=on_row, cancel=lambda: self._cancel, days=self.days,
-                    # 对账：补完拿日线日历比一遍。行数只说明「写了多少」，
-                    # 说明不了「全了没有」—— 11-17 那次 IF 的 5m 停在 11-10，
-                    # 每天日志都显示「+14 行」，看着像正常增量
-                    on_note=lambda text: self.progress.emit(0, 0, text),
-                )
+                # 主连按 `periods` 逐个补。**不止界面选的那个周期**：定时任务要是
+                # 只续「界面上选着的 1h」，策略跑的 5m 就永远没人补 —— 库会安静地
+                # 停在某一天，而每天日志都在报「+N 行」
+                for per in self.periods:
+                    if self._cancel:
+                        break
+                    lab = dict(TQ_PERIODS).get(per, per)
+
+                    def on_note(text: str, lab: str = lab) -> None:
+                        self.progress.emit(0, 0, f"{lab}：{text}")
+
+                    g = TQ.write_main_many(
+                        api, pairs, per, 0,
+                        on_row=lambda k, r, f, lab=lab: on_row(k, r, f, lab),
+                        cancel=lambda: self._cancel, days=self.days,
+                        # 对账：补完拿日线日历比一遍。行数只说明「写了多少」，
+                        # 说明不了「全了没有」—— 11-17 那次 IF 的 5m 停在 11-10，
+                        # 每天日志都显示「+14 行」，看着像正常增量
+                        on_note=on_note,
+                    )
+                    for k, v in (g or {}).items():
+                        got[f"{per}:{k}"] = int(v or 0)
 
                 # ---- 真实合约 + 期限结构
                 n_contracts = 0
@@ -2233,8 +2253,12 @@ class DataPage(QWidget):
             self._auto_run = True
             self._auto_key = "tq"
             self._auto_queue = []
-            # 周期跟着天勤那张卡上选的那个 —— 用户看的是哪个周期，日常就该续哪个
             period = self.cb_period.currentData() or "1h"
+            # 🔴 主连要补的周期**不能只跟界面选的那个**：策略跑 5m、界面停在 1h，
+            # 那 5m 就永远没人补 —— 库会安静地停在某一天，而日志每天照样报
+            # 「+14 行」（11-17 的 IF 就是这样）。补这两个源周期就够：15m/30m 由
+            # 5m 合并，2h/4h 由 1h 合并。日线归 17:00 那条日程。
+            periods = ["5m", "1h"]
             days = 1
             contracts = False
             edb = False
@@ -2243,13 +2267,14 @@ class DataPage(QWidget):
             self._auto_run = False
             self._auto_queue = []       # 手动跑一趟就别再接着排定时的那几个市场
             period = self.cb_period.currentData() or "1h"
+            periods = None              # 手动的按界面选的周期来，用户说什么就补什么
             days = int(self.cb_tq_range.currentData() or 7300)
             contracts = self.chk_tq_contracts.isChecked()
             edb = self.chk_tq_edb.isChecked()
             options = self.chk_tq_options.isChecked()
         self._tq_worker = TqWorker(period, days, contracts=contracts,
                                    edb=edb, options=options,
-                                   force_switch=not auto)
+                                   force_switch=not auto, periods=periods)
         self._tq_thread = QThread(self)
         self._tq_worker.moveToThread(self._tq_thread)
         self._tq_thread.started.connect(self._tq_worker.run)
@@ -2266,7 +2291,8 @@ class DataPage(QWidget):
         self.lbl_upd.setVisible(True)
         self.lbl_upd.setText(f"准备从天勤补 {label}…")
         if auto:
-            self._log(f"—— 天勤 {label}：切换表 → 主连（库尾 → 现在）→ 复权因子")
+            span_lab = " + ".join(dict(TQ_PERIODS).get(p, p) for p in self._tq_worker.periods)
+            self._log(f"—— 天勤 {span_lab}：切换表 → 主连（库尾 → 现在）→ 复权因子")
         else:
             span = self.cb_tq_range.currentText()
             self._log(

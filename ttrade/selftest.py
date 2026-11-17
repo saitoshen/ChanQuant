@@ -8564,11 +8564,26 @@ def _run() -> tuple[bool, list[str]]:
             if got != want:
                 raise RuntimeError(
                     f"_open_now 与 in_session 不一致（{sym}）：{want} vs {got}")
-        if not SR.PortfolioRunner._open_now(
-                None, _Cfg("", "SHFE", ["IM_CFFEX", "RB_SHFE"])):
-            raise RuntimeError("板块级策略没有按「任一成员开市」判定")
-        if not SI.in_session("600519", "SSE"):
-            raise RuntimeError("A 股被期货交易时段表误伤了")
+        # 🔴 「任一成员开市」**不能拿当前时刻去验证**：15:00 一过 IM 和 RB 都收盘，
+        # 这条断言就必红（2026-11-17 15:03 实测红了一次）。判据换成确定的假函数，
+        # 才能全天候跑 —— 自检本身不许有时间敏感性。
+        _is = SI.in_session
+        try:
+            SI.in_session = lambda s, e, t=None: str(s).startswith("RB")
+            if not SR.PortfolioRunner._open_now(
+                    None, _Cfg("", "SHFE", ["IM_CFFEX", "RB_SHFE"])):
+                raise RuntimeError("板块级策略没有按「任一成员开市」判定")
+            SI.in_session = lambda s, e, t=None: False
+            if SR.PortfolioRunner._open_now(
+                    None, _Cfg("", "SHFE", ["IM_CFFEX", "RB_SHFE"])):
+                raise RuntimeError("板块级策略在全部成员闭市时仍然开跑")
+        finally:
+            SI.in_session = _is
+        # A 股在品种信息表里没有时段 ⇒ `segs` 为空 ⇒ 一律判「开着」（不限制）。
+        # 三个时刻都试一遍：凌晨、早盘、收盘后，任何一个被判关都是期货表越界了。
+        for _tick in ("2026-11-17 03:00", "2026-11-17 10:00", "2026-11-17 15:30"):
+            if not SI.in_session("600519", "SSE", _t(_tick)):
+                raise RuntimeError(f"A 股被期货交易时段表误伤了（{_tick}）")
 
         return (f"{len(cases)} 个时刻判对（含夜盘跨零点 / 周五夜盘跑到周六凌晨 / "
                 f"午休 / 股指无夜盘）；CTP 挡掉时段外 tick（留 {','.join(kept)}）；"
