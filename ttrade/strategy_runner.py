@@ -122,6 +122,9 @@ SPLIT_OFFSET_EX = ("SHFE", "INE")
 REJECT_COOL = 5.0
 MAX_REJECTS = 3
 
+# 非交易时段挂起时写在策略行上的那句话。判据见 `_open_now()`。
+CLOSED_NOTE = "非交易时段，暂停信号与下单"
+
 # 刚记完账（本策略成交）之后，账户持仓明细要过几百毫秒才跟上。这段时间里
 # 账本比账户多是一时的，不能当成「被手工平了」去收窄 —— 见 `_trim`。
 BOOK_GRACE = 3.0
@@ -962,7 +965,17 @@ class PortfolioRunner:
             if not st.running:
                 continue
             try:
+                # 订阅**不受**时段限制（在 `_refresh_signal` 里先订再判）：
+                # 策略可能是在午休、收盘之后启动的，那一刻也得把 K 线订上，
+                # 否则开盘时手上没有底料
                 self._refresh_signal(st)
+                if not self._open_now(st.cfg):
+                    # 非交易时段：K 线内不触发、不调仓、不追单。追单一起停 ——
+                    # 收盘后重报只会被柜台打回，攒够 MAX_REJECTS 策略就自己停机，
+                    # 那是最难查的一种「早上发现昨天停了」
+                    if st.last_action != CLOSED_NOTE:
+                        st.last_action = CLOSED_NOTE
+                    continue
                 if not st.ml_ready:
                     # 机器学习还在算第一批信号：仓位保持原样，只把在途单追完
                     self._chase(st)
@@ -1122,6 +1135,13 @@ class PortfolioRunner:
 
     def _refresh_signal(self, st: SlotState) -> None:
         self._subscribe(st)
+        # 🔴 非交易时段**不算信号**。这里挡在「先订阅、后计算」之间：订阅必须
+        # 照常做（否则收盘后启动的策略永远拿不到 K 线），但信号不能算 ——
+        # 天勤模拟账户收盘后还在长 bar，算了就会得出一个假的 `st.target`。
+        if not self._open_now(st.cfg):
+            if st.last_action != CLOSED_NOTE:
+                st.last_action = CLOSED_NOTE
+            return
         key = self._skey(st.cfg)
         kl = self._klines.get(key)
         if kl is None or not len(kl):
@@ -1828,6 +1848,39 @@ class PortfolioRunner:
         age = time.time() - bar_s
         return age < self._bar_seconds(st.cfg.period) * 1.1
 
+    def _open_now(self, cfg) -> bool:
+        """这条策略此刻有没有品种在**交易时段**内 —— 信号与下单的唯一门禁。
+
+        判据是品种信息表里的「交易时段」（`symbols_info.in_session`），
+        **不是** `_market_alive()`。两者解决的是不同问题，别合并：
+
+        - `_market_alive()`：**断流**检测（最近一根 bar 是不是刚来的）——
+          ML 信号在后台线程算，算完那一刻行情可能已经断了；
+        - `_open_now()`：**交易时段**（这个品种现在根本不该有行情）。
+
+        🔴 为什么非加不可：天勤模拟账户在收盘之后照样推 bar、推最新价，
+        CTP 也会把最后一次快照一直往外吐 —— `_market_alive()` 会一路判 True，
+        策略就跟着在非交易时段触发、开仓、下单。这个门禁是「按交易所日历」
+        的，不看行情本身活不活。
+
+        板块级策略（没有 `symbol`、只有 `multi_symbols`）按「**任一**成员开市」
+        算：各腿的交易时段本来就不同，只要有一腿在交易，这一轮就该跑。
+        连品种都没有（配置还没填完）时返回 True —— 宁可让它按老样子跑，
+        也不要因为查不到时段把一条正在跑的实盘策略静默停掉。
+        """
+        sym = str(getattr(cfg, "symbol", "") or "")
+        ex = str(getattr(cfg, "exchange", "") or "")
+        if sym:
+            return symbols_info.in_session(sym, ex)
+        keys = list(getattr(cfg, "multi_symbols", None) or [])
+        if not keys:
+            return True
+        for k in keys:
+            s, _, e = str(k).partition("_")
+            if s and symbols_info.in_session(s, e or ex):
+                return True
+        return False
+
     def _net_pos(self, symbol: str) -> int:
         if self._pos is None:
             return 0
@@ -2161,6 +2214,11 @@ class PortfolioRunner:
     def _send(self, st: SlotState, symbol: str, delta: int,
               closeable: int | None = None) -> int:
         """按差额下发委托，返回实际发出去的笔数。"""
+        # 最后一道闸。`tick()` 已经按交易时段整槽跳过了，这里再挡一次是因为
+        # `_send` 是唯一的发单出口 —— 以后谁加了别的调用方，也不会绕过门禁。
+        if not self._open_now(st.cfg):
+            st.last_action = CLOSED_NOTE
+            return 0
         legs = self._legs(symbol, delta, closeable)
         if legs is None:
             st.last_action = "持仓今昨明细未就绪，等下一轮"

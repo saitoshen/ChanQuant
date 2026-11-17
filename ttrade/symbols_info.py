@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+from datetime import datetime
 from decimal import Decimal
 
 from . import specs
@@ -76,10 +78,16 @@ S_BOND = "09:30-11:30,13:00-15:15"
 
 # 贵金属夜盘到 02:30；有色到 01:00；黑色 / 农产品 23:00 收。
 _NIGHT0230 = {"AU", "AG", "SC"}
-_NIGHT01 = {"CU", "AL", "ZN", "PB", "NI", "SN", "SS", "BC", "NR", "LU", "BR"}
+# 🔴 AO（氧化铝）/ AD（铸造铝合金）也是有色，夜盘 21:00-01:00 —— 2026-11-17
+# 用近 100 天真实 5m 逐根验时段表时才发现它们被漏在这儿之外（末根 00:55）。
+_NIGHT01 = {"CU", "AL", "ZN", "PB", "NI", "SN", "SS", "BC", "NR", "LU", "BR",
+            "AO", "AD"}
+# 🔴 SA/PF/PR/PX/SH（郑商所纯碱、短纤、瓶片、对二甲苯、烧碱）**有**夜盘
+# 21:00-23:00，以前被错列在这张「无夜盘」表里 —— 后果是收盘后照样认为在交易，
+# 而且白天开盘前也把 21:00 后的 bar 当成非法。同样是逐根验表查出来的。
 _NO_NIGHT = {
     "JD", "JR", "LR", "PM", "RI", "RS", "WH", "SF", "SM", "AP", "CJ",
-    "PK", "UR", "SA", "PF", "SH", "PX", "PR", "IF", "IH", "IC", "IM",
+    "PK", "UR", "IF", "IH", "IC", "IM",
     "T", "TF", "TS", "TL",
 }
 
@@ -166,6 +174,10 @@ def _path() -> str:
 
 
 _OVERRIDES: dict | None = None
+# 覆盖表的版本号。任何写盘都 +1，`session_ranges` 用它判定缓存是否还新鲜。
+# 为什么不用 `_OVERRIDES` 的 id / 内容比较：行情链路每秒问好几次，比较整张表
+# 比直接解析还贵；整数比对是常数时间。
+_VER: int = 0
 
 
 def load_overrides() -> dict:
@@ -183,7 +195,7 @@ def load_overrides() -> dict:
 
 
 def save_overrides(d: dict) -> None:
-    global _OVERRIDES
+    global _OVERRIDES, _VER
     path = _path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -193,6 +205,9 @@ def save_overrides(d: dict) -> None:
         os.fsync(fh.fileno())
     os.replace(tmp, path)
     _OVERRIDES = d
+    # 用户改过「交易时段」⇒ 下面那些解析缓存必须整片作废。用版本号而不是
+    # `clear()`：`session_ranges` 拿版本号比对，命中就是一次整数比较。
+    _VER += 1
 
 
 def info(symbol: str, exchange: str) -> dict:
@@ -280,3 +295,121 @@ def _gcd(a: Decimal, b: Decimal) -> Decimal:
     while b:
         a, b = b, a % b
     return a
+
+
+# ---------------------------------------------------------------- 交易时段门禁
+#
+# 「这个品种现在开不开市」是**一条判据**：实盘行情（天勤 / CTP / 融航）和策略
+# 引擎都问它，不许各处自己写一遍 `9 <= hour <= 15`（#5 同一语义只许一个判据）。
+# 收盘之后还在更新行情、还在下单，就是这条判据缺失的直接后果。
+
+_SESSION_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$")
+_PARSE_CACHE: dict = {}       # 时段字符串 → ((起, 止), …)，键就是字符串本身
+_RANGE_CACHE: dict = {}       # (品种, 交易所) → (版本号, ((起, 止), …))
+# 这张时段表只对**期货**有意义（默认值是按六个期货交易所给的）
+_FUTURES_EX = {"SHFE", "DCE", "CZCE", "CFFEX", "INE", "GFEX"}
+
+
+def parse_session(raw: str) -> tuple:
+    """`"21:00-23:00,09:00-10:15"` → `((1260, 1380), (540, 615))`（0 点起分钟数）。
+
+    **止 < 起 = 跨零点**（21:00-01:00 / 21:00-02:30）。
+
+    解析不出来就跳过那一段，**不抛异常**：这是用户可编辑的文本框，写错了也只该
+    退化成「少挡一段」，不该让行情线程崩掉。
+    """
+    raw = str(raw or "")
+    hit = _PARSE_CACHE.get(raw)
+    if hit is not None:
+        return hit
+    out = []
+    for part in raw.split(","):
+        m = _SESSION_RE.match(part)
+        if not m:
+            continue
+        h1, m1, h2, m2 = (int(g) for g in m.groups())
+        a, b = h1 * 60 + m1, h2 * 60 + m2
+        if not (0 <= a < 1440 and 0 <= b <= 1440) or a == b:
+            continue
+        out.append((a, b))
+    _PARSE_CACHE[raw] = tuple(out)
+    return _PARSE_CACHE[raw]
+
+
+def session_ranges(symbol: str, exchange: str) -> tuple:
+    """品种 → 解析好的时段表。取**用户改过的**那张（`info()["session"]`）。
+
+    只有**期货**走这张表：A 股 / 美股 / 交易所为空的一律返回空元组 =
+    「不限制」。理由很直接 —— `session_of()` 那套默认表是按期货交易所给的，
+    拿它去管 600519 会得出「21:00 有夜盘」这种结论，比不限制更糟。
+
+    按版本号缓存：行情链路每秒问好几次，而 `info()` 里要算乘数和保证金率，
+    不缓存撑不住。
+    """
+    key = ((symbol or "").upper(), (exchange or "").upper())
+    if key[1] not in _FUTURES_EX:
+        return ()
+    # 具体合约（rb2601 / IM2612）退到品种：交易时段是按**品种**配的
+    if any(ch.isdigit() for ch in key[0]):
+        key = ("".join(ch for ch in key[0] if ch.isalpha()) or key[0], key[1])
+    hit = _RANGE_CACHE.get(key)
+    if hit is not None and hit[0] == _VER:
+        return hit[1]
+    segs = parse_session(info(key[0], key[1]).get("session"))
+    if not segs:
+        segs = parse_session(session_of(key[0], key[1]))
+    _RANGE_CACHE[key] = (_VER, segs)
+    return segs
+
+
+def in_session(symbol: str, exchange: str, ts=None) -> bool:
+    """此刻（或 `ts` 那一刻）这个品种是否在交易时段内。
+
+    `ts` 缺省 = 现在；可以是 `datetime` / `pd.Timestamp`（datetime 子类）/
+    `"2026-11-17 14:35[:00]"`。
+
+    ## 星期规则（夜盘按**起算那天**归）
+
+    - **日盘段**只在周一~周五成立；
+    - **夜盘段 21:00 之后那截**在周日~周五成立 —— 周五夜盘真实存在（一直跑到
+      周六凌晨），周日夜盘属于下周一，**周六 21:00 没有盘**；
+    - **跨零点之后那截**（00:00-02:30）跟着「前一天」走：周六凌晨有（周五夜盘
+      的延续），周日凌晨没有。
+
+    🔴 **不判法定节假日**：这张表只有时段、没有日历。节假日里的工作日会被判成
+    「开着」—— 但那时交易所本来就不推行情，挡不挡结果一样；真按日历挡得接一份
+    交易日历，是另一件事。这一版只保证**收盘之后一定判成关**，那是这次要修的。
+
+    🔴 判据用 **`a <= m < b`**（bar 的时刻是**起点**）：11:25 那根 5m 覆盖
+    11:25~11:30，判开；11:30 没有那根 bar，收盘时刻本身判关。
+    """
+    segs = session_ranges(symbol, exchange)
+    if not segs:
+        return True                  # 解析不出时段 ⇒ 不限制（宁可漏挡，别误挡）
+    if ts is None:
+        ts = datetime.now()
+    elif isinstance(ts, str):
+        # 认几种常见写法就算（日志、自检、状态栏都会传字符串）
+        raw = ts.strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y%m%d %H:%M:%S",
+                    "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+            try:
+                ts = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            ts = datetime.now()      # 认不出就当现在，别让门禁把行情整条挡掉
+    m = ts.hour * 60 + ts.minute
+    wd = ts.weekday()                # 周一=0 … 周日=6
+    for a, b in segs:
+        night = a >= 1200            # 20:00 起算夜盘段（这套表里夜盘都是 21:00 起）
+        if a < b:                    # 不跨零点
+            if a <= m < b and ((wd != 5) if night else (wd <= 4)):
+                return True
+        else:                        # 跨零点：前半截看今天，后半截看昨天
+            if m >= a and wd != 5:
+                return True
+            if m < b and (wd - 1) % 7 != 5:
+                return True
+    return False

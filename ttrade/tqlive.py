@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, field
 
 import pandas as pd
 
-from . import daylimit
+from . import daylimit, symbols_info
 from .paths import user_dir
 from .tqdata import PERIODS, resample, trading_days
 from .tqfetch import PERIOD_SEC, local_time
@@ -462,6 +462,9 @@ class LiveHub:
         self._n = 1              # 目标周期相对源周期的合并根数
         self.tq_symbol = ""      # KQ.m@SHFE.rb
         self.underlying = ""     # 当前真实主力合约
+        self._sym = ""           # 订阅时传进来的品种 / 交易所（交易时段门禁用）
+        self._ex = ""
+        self._quote_cache: dict = {}   # 最后一笔「交易时段内」的行情快照
         self._klines = None
         self._quote = None
         self._accs: list[tuple[AccountSpec, object]] = []   # (配置, 天勤账户对象)
@@ -560,6 +563,8 @@ class LiveHub:
         )
         self._n = n
         self.key, self.period, self.tq_symbol = key, period, tq_sym
+        self._sym, self._ex = symbol, exchange
+        self._quote_cache = {}
         # 股票没有「主连 → 真实合约」这一步，订的就是能下单的那个代码
         self.underlying = tq_sym if is_stock(symbol, exchange) else ""
 
@@ -583,7 +588,21 @@ class LiveHub:
     # ---- 读 ----
 
     def bars(self) -> pd.DataFrame:
-        return resample(bars_from_serial(self._klines, self.period), self._n)
+        """实时 K 线。
+
+        🔴 **收盘之后的 bar 不采信**：天勤的模拟账户（快期模拟 / TqSim）在非交易
+        时段照样会在序列里继续长 bar，界面上看着像还在交易。这里从尾部往前砍掉
+        落在时段外的那些 —— 只砍尾，因为 bar 是按时间排的，中间不会冒出一根
+        「时段外」的（真冒出来说明这张表本身配错了，那是另一件事）。
+        只砍尾还有个好：通常是 0 根，`while` 一次就退出，不拖慢刷新。
+        """
+        df = resample(bars_from_serial(self._klines, self.period), self._n)
+        if df.empty or symbols_info.in_session(self._sym, self._ex):
+            return df
+        j = len(df) - 1
+        while j >= 0 and not symbols_info.in_session(self._sym, self._ex, df.index[j]):
+            j -= 1
+        return df.iloc[: j + 1]
 
     def state(self) -> LiveState:
         """拷一份普通数据出来。界面线程只碰这个，不碰天勤对象。"""
@@ -704,7 +723,13 @@ class LiveHub:
         und = getattr(q, "underlying_symbol", "") or ""
         if und and und != self.underlying:
             self.underlying = und
-        return {
+        # 🔴 交易时段门禁：和 `ctp_live` 同一条判据。开市时刷新缓存，收市时把
+        # 最后一笔时段内快照原样还回去 —— 否则收盘后「最新价」还在跳，
+        # 用户没法判断这台机器现在到底还在不在交易。
+        open_now = symbols_info.in_session(self._sym, self._ex)
+        if not open_now and self._quote_cache:
+            return dict(self._quote_cache)
+        snap = {
             "symbol": getattr(q, "instrument_id", ""),
             "underlying": und,
             "name": getattr(q, "instrument_name", ""),
@@ -724,6 +749,9 @@ class LiveHub:
             "multiple": self._num(q, "volume_multiple"),
             "expired": bool(getattr(q, "expired", False)),
         }
+        if open_now:
+            self._quote_cache = snap
+        return dict(snap)
 
     def _account_snapshot(self, obj=None) -> dict:
         """单个账户的资金。`obj` 是天勤账户对象（TqKq / TqAccount / TqSim）。

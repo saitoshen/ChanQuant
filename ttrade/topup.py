@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from ttrade import tqstore
+from ttrade import symbols_info, tqstore
 from ttrade.tqdata import source_period, trading_days
 from ttrade.tqlive import bars_from_serial
 
@@ -73,6 +73,16 @@ def save(serial, symbol: str, exchange: str, period: str) -> dict:
     df = drop_live_tail(df)
     if df.empty:
         return out
+    # 🔴 交易时段门禁：天勤的模拟账户在非交易时段照样往序列里长 bar，直接落库
+    # 就等于把「不存在的 bar」写进历史，回测以后都按它算 —— 这是那种要过很久
+    # 才会被发现的污染。判据和实盘门禁是同一条（`symbols_info.in_session`），
+    # 不在这儿另写一套时间判断。
+    ok_open = [symbols_info.in_session(symbol, exchange, t) for t in df.index]
+    if not all(ok_open):
+        df = df[ok_open]
+        if df.empty:
+            out["ok"] = True      # 全是时段外的：不是「没数据」，别重试
+            return out
     try:
         last = tqstore.last_dt(symbol, exchange, src)
     except Exception:  # noqa: BLE001

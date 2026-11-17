@@ -4248,6 +4248,10 @@ def _run() -> tuple[bool, list[str]]:
 
             def _subscribe(self, st): pass
             def _skey(self, cfg): return cfg.key()
+            # 这一项测的是「同一根 bar 里读后台信号」，不是交易时段门禁 ——
+            # 把时段闸门关掉，否则它会随「自检跑在几点」而红（`_session_gate`
+            # 那一项才是测门禁本身，用的是固定时间戳）
+            def _open_now(self, cfg): return True
             def _signal_frame(self, st, kl): return self.frame
             def _predictor_for(self, st):
                 return object() if self.fast else None
@@ -8165,6 +8169,100 @@ def _run() -> tuple[bool, list[str]]:
                 f"两个因子都是内置 Python 实现")
 
     check("波幅突破：检查点时刻 + 当日开盘口径", _break_caliber)
+
+    def _session_gate():
+        """交易时段门禁：行情（天勤 / CTP / 融航）与策略引擎共用**一条**判据。
+
+        为什么要有这一条：收盘之后 CTP 还会把最后一次快照一直往外吐、天勤的
+        模拟账户还会继续往序列里长 bar —— 行情看着在动，策略就跟着触发、下单，
+        实盘和「真的能成交」完全脱节。修法不是各处补一句 `9 <= hour <= 15`
+        （那正是 #5 那类 bug 的温床），而是所有地方都问
+        `symbols_info.in_session()`。
+
+        这里钉住三件事：
+        1. 时段判据本身 —— 夜盘跨零点、**周五夜盘跑到周六凌晨**、周日夜盘算
+           下周一、午休空档、股指没夜盘、国债到 15:15；
+        2. CTP 攒 bar 时会**丢掉**时段外的 tick（含收盘后快照、周末）；
+        3. 策略引擎的 `_open_now()` 与 `in_session()` 逐品种一致（单一判据），
+           板块级按「任一成员开市」，非期货（A 股）不受这张表管。
+        """
+        from datetime import datetime as _dt
+
+        from ttrade import ctp_live as CL
+        from ttrade import strategy_runner as SR
+        from ttrade import symbols_info as SI
+
+        def _t(s):
+            d, _, hm = s.partition(" ")
+            y, mo, dd = (int(x) for x in d.split("-"))
+            h, mi = (int(x) for x in hm.split(":"))
+            return _dt(y, mo, dd, h, mi)
+
+        cases = (
+            ("SC", "INE", "2026-11-17 14:35", True, "周二日盘"),
+            ("SC", "INE", "2026-11-17 15:00", False, "收盘时刻本身判关"),
+            ("SC", "INE", "2026-11-17 13:00", False, "午休空档"),
+            ("SC", "INE", "2026-11-17 21:30", True, "夜盘"),
+            ("SC", "INE", "2026-11-18 01:30", True, "夜盘跨零点（到 02:30）"),
+            ("SC", "INE", "2026-11-18 03:00", False, "夜盘已收"),
+            ("SC", "INE", "2026-11-21 01:00", True, "周六凌晨 = 周五夜盘延续"),
+            ("SC", "INE", "2026-11-21 21:30", False, "周六晚上没有盘"),
+            ("SC", "INE", "2026-11-22 01:00", False, "周日凌晨没有盘"),
+            ("SC", "INE", "2026-11-22 21:30", True, "周日夜盘算下周一"),
+            ("RB", "SHFE", "2026-11-17 23:00", False, "黑色 23:00 收"),
+            ("IM", "CFFEX", "2026-11-17 09:05", False, "股指 09:30 开"),
+            ("IM", "CFFEX", "2026-11-17 21:30", False, "股指没有夜盘"),
+            ("T", "CFFEX", "2026-11-17 15:10", True, "国债交易到 15:15"),
+            ("T", "CFFEX", "2026-11-17 15:15", False, "国债 15:15 收"),
+            ("T", "CFFEX", "2026-11-17 09:20", False, "国债 09:30 开（2020-07 起）"),
+            # 下面这几个是 2026-11-17 用近 100 天真实 5m 逐根验表才查出来的配错：
+            # 郑商所 SA/PF/PR/PX/SH **有** 21:00-23:00 夜盘，被错列进「无夜盘」；
+            # 上期所 AO/AD 夜盘到 01:00，被当成 23:00。写进自检，防止再抄错一遍。
+            ("SA", "CZCE", "2026-11-17 21:30", True, "纯碱有夜盘"),
+            ("PX", "CZCE", "2026-11-17 21:30", True, "对二甲苯有夜盘"),
+            ("SH", "CZCE", "2026-11-17 21:30", True, "烧碱有夜盘"),
+            ("AO", "SHFE", "2026-11-18 00:30", True, "氧化铝夜盘到 01:00"),
+            ("AD", "SHFE", "2026-11-18 00:30", True, "铸造铝合金夜盘到 01:00"),
+            ("UR", "CZCE", "2026-11-17 21:30", False, "尿素真的没有夜盘"),
+            ("AP", "CZCE", "2026-11-17 21:30", False, "苹果没有夜盘"),
+        )
+        bad = [f"{s} {t}（{why}）期望 {w} 实得 {SI.in_session(s, e, _t(t))}"
+               for s, e, t, w, why in cases
+               if SI.in_session(s, e, _t(t)) != w]
+        if bad:
+            raise RuntimeError("交易时段判据错了：" + "；".join(bad[:3]))
+
+        # CTP：时段外的 tick 不能攒成 bar（收盘后快照 / 周末都要挡）
+        b = CL._BarBuilder(period="1m", symbol="SC", exchange="INE")
+        for t, vol in (("20261117 14:35:00", 10), ("20261117 15:05:00", 11),
+                       ("20261117 21:05:00", 12), ("20261121 10:00:00", 13)):
+            b.push({"datetime": t, "last": 500.0, "volume": vol})
+        kept = [f"{ts:%H:%M}" for ts in b.frame().index]
+        if kept != ["14:35", "21:05"]:
+            raise RuntimeError(f"CTP 没挡住时段外的 tick：留下 {kept}")
+
+        class _Cfg:
+            def __init__(self, sym, ex, ms=None):
+                self.symbol, self.exchange = sym, ex
+                self.multi_symbols = list(ms or [])
+
+        for sym, ex in (("IM", "CFFEX"), ("SC", "INE"), ("RB", "SHFE")):
+            want = SI.in_session(sym, ex)
+            got = SR.PortfolioRunner._open_now(None, _Cfg(sym, ex))
+            if got != want:
+                raise RuntimeError(
+                    f"_open_now 与 in_session 不一致（{sym}）：{want} vs {got}")
+        if not SR.PortfolioRunner._open_now(
+                None, _Cfg("", "SHFE", ["IM_CFFEX", "RB_SHFE"])):
+            raise RuntimeError("板块级策略没有按「任一成员开市」判定")
+        if not SI.in_session("600519", "SSE"):
+            raise RuntimeError("A 股被期货交易时段表误伤了")
+
+        return (f"{len(cases)} 个时刻判对（含夜盘跨零点 / 周五夜盘跑到周六凌晨 / "
+                f"午休 / 股指无夜盘）；CTP 挡掉时段外 tick（留 {','.join(kept)}）；"
+                f"策略门禁与 in_session 逐品种一致，板块级任一开市即跑，A 股不受管")
+
+    check("交易时段门禁（行情与策略共用一条判据）", _session_gate)
 
     def _sector_maps():
         """板块两层（L1 9 个 / L2 16 个）必须严格对齐。

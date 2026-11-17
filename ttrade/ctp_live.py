@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from ttrade import symbols_info
 from ttrade.ctp_client import (
     ALIVE_STATUS,
     HAS_CTP,
@@ -176,6 +177,9 @@ class _BarBuilder:
     """
 
     period: str = "1m"
+    # 「交易时段」门禁要的品种 / 交易所。空 = 不限制（见 `push`）。
+    symbol: str = ""
+    exchange: str = ""
     _bars: dict = field(default_factory=dict)
     _last_vol: float = -1.0
 
@@ -212,6 +216,13 @@ class _BarBuilder:
     def push(self, tick: dict) -> None:
         ts = self._bucket(tick.get("datetime", ""))
         if ts is None:
+            return
+        # 🔴 交易时段门禁：收盘之后柜台还会继续推最后一次快照（模拟环境尤其
+        # 明显：`last` 停在那、`volume` 却还变），不挡的话 bar 会一直往前长，
+        # 策略就跟着在非交易时段算出新信号、发新单。判据只有一条 ——
+        # 品种信息表里的「交易时段」（`symbols_info.in_session`）。
+        if not symbols_info.in_session(self.symbol, self.exchange,
+                                       ts.to_pydatetime()):
             return
         price = float(tick.get("last") or 0.0)
         if price <= 0:
@@ -283,6 +294,9 @@ class CtpHub:
         self.period = ""
         self.instrument = ""            # CTP 合约，如 rb2601
         self.underlying = ""
+        self._sym = ""                  # 订阅时传进来的品种（交易时段门禁用）
+        self._ex = ""
+        self._quote_cache: dict = {}    # 最后一个「交易时段内」的行情快照
         self._builder = _BarBuilder()
         self._last_query = 0.0
         self._query_turn = 1          # 0 = 该发持仓了，1 = 该发资金了
@@ -368,7 +382,10 @@ class CtpHub:
     def subscribe(self, symbol: str, exchange: str, period: str) -> None:
         """订阅一个合约的 tick。`symbol` 可以是品种（自动查主力）或具体合约。"""
         self.period = str(period or "1m")
-        self._builder = _BarBuilder(period=self.period)
+        self._sym, self._ex = symbol, exchange
+        self._builder = _BarBuilder(period=self.period, symbol=symbol,
+                                   exchange=exchange)
+        self._quote_cache = {}
         ins = ctp_instrument(symbol, exchange)
         if not ins:
             raise ValueError("合约代码为空")
@@ -476,11 +493,17 @@ class CtpHub:
     def _quote(self) -> dict:
         if self.md is None or not self.instrument:
             return {}
+        # 🔴 交易时段门禁：收盘之后 CTP 还会推最后一次快照，`last` 不跳了但
+        # `volume` / `oi` 还在动 —— 直接透传的话界面上的「实时行情」看着还在
+        # 更新，用户以为还在交易。这里**冻结在最后一笔时段内快照**：
+        # 开市时更新缓存，收市时把缓存原样还回去。
+        if not symbols_info.in_session(self._sym, self._ex) and self._quote_cache:
+            return dict(self._quote_cache)
         t = self.md.last(self.instrument) or {}
         info = {}
         if self.trader is not None:
             info = self.trader.instruments.get(self.instrument) or {}
-        return {
+        q = {
             "symbol": self.instrument,
             "underlying": self.instrument,
             "name": self.instrument,
@@ -500,6 +523,10 @@ class CtpHub:
             "multiple": float(info.get("multiple") or 0.0),
             "expired": False,
         }
+        # 只在开市时刷新。上面那条「收市直接还缓存」靠的就是它 —— 收盘那一刻
+        # 手上这份就是最后一笔真行情，之后柜台再推什么都不再采信。
+        self._quote_cache = q
+        return dict(q)
 
     def _account(self, acc: dict) -> dict:
         """CTP 资金 → 平台口径。
