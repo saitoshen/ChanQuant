@@ -6146,6 +6146,8 @@ def _run() -> tuple[bool, list[str]]:
             _st = _inspect.getsource(_dp2.DataPage._start_tq)
             if _st.count("TQ_SOURCE_PERIODS") < 2:
                 _bad.append("定时/手动没有都按三周期走")
+            if "force_switch=True" not in _st:
+                _bad.append("切换表没做到每轮真刷（同一天手动补过就跳过）")
             _run2 = _inspect.getsource(_dp2.TqWorker.run)
             if "TQ_OPT_PERIODS" not in _run2:
                 _bad.append("期权没固定用 TQ_OPT_PERIODS")

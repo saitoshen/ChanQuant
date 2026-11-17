@@ -291,8 +291,11 @@ class TqWorker(QObject):
         self.contracts = contracts
         self.edb = edb
         self.options = options
-        # 手动点「开始补充」时 True：用户按下去就是要最新的，不认「今天算过了」。
-        # 定时那条给 False —— 同一天里手动补过一次就不必再问一遍天勤。
+        # 切换表**每轮都真刷**（`force_switch=True`，手动和定时同一套）。留着「今天
+        # 算过就跳过」是按品种记日期的：上午手动补过一次，下午那条定时就整轮不问，
+        # 而换月可能发生在盘中（JD 11-17 就是 09:00 之后才暴露）—— 那一根 −10%
+        # 的假跳空要等到第二天才修。代价很小：`update_switch` 只给表里没有的换月
+        # 取价，日常几秒。
         self.force_switch = force_switch
         self._cancel = False
 
@@ -1501,7 +1504,7 @@ class DataPage(QWidget):
         # 天勤那条日程。和上面三条都不同源：它补的是 data_tq（天勤口径的主连、
         # 主力切换表、复权因子），Tushare 那两条补的是 data_futures 的 CSV。
         # 切换表排在最前，是因为主连写库时就要用它算复权因子。
-        self.chk_tq_auto = QCheckBox("每天 15:50 从天勤补（切换表 → 主连 → 复权）")
+        self.chk_tq_auto = QCheckBox("每天 15:50 从天勤补：切换表 → 主连（日线/1h/5m）→ 复权")
         self.chk_tq_auto.setToolTip(
             "先从**天勤**重新下载主力切换表，再把主连的**日线 / 1 小时 / 5 分钟**\n"
             "三个周期一起补到此刻（库里缺交易日的地方从最早那个洞补起），最后按新表\n"
@@ -1516,7 +1519,9 @@ class DataPage(QWidget):
             "基本面之后、16:00 起的其它日程之前，既不抢天勤会话，也不会被跑几小时的\n"
             "日线任务堵在后面。当晚 21:00 起的夜盘归属下一个交易日，由次日这一轮补上。\n\n"
             "只补主连，不碰真实合约和期权（那些体积大、要手动挑区间；期权也只补日线）。\n"
-            "增量：切换表只给**表里没有的**换月取价，日常几秒。"
+            "增量：切换表只给**表里没有的**换月取价，日常几秒。\n\n"
+            "**切换表就在这一条里，界面上没有第二个天勤定时**：每轮都真刷一遍\n"
+            "（不认「今天算过」），换月发生在盘中也能当天修掉。"
         )
         lay.addWidget(self.chk_tq_auto)
 
@@ -2332,7 +2337,14 @@ class DataPage(QWidget):
             options = self.chk_tq_options.isChecked()
         self._tq_worker = TqWorker(period, days, contracts=contracts,
                                    edb=edb, options=options,
-                                   force_switch=not auto, periods=periods)
+                                   # **切换表每轮都真刷**（手动、定时一样），不再按
+                                   # 「今天算过就跳过」：跳过是按品种记日期的，
+                                   # 上午手动补过一次，下午这条定时就整轮不问了 ——
+                                   # 而换月完全可能发生在盘中（JD 11-17 就是当天
+                                   # 09:00 之后才暴露），那一根 −10% 的假跳空就
+                                   # 得等到第二天才修。`update_switch` 只给**表里
+                                   # 没有的**换月取价，日常几秒，扛得住每天刷。
+                                   force_switch=True, periods=periods)
         self._tq_thread = QThread(self)
         self._tq_worker.moveToThread(self._tq_thread)
         self._tq_thread.started.connect(self._tq_worker.run)
