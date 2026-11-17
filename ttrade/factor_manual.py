@@ -229,7 +229,7 @@ DATA_GUIDE = """## 一、行情数据是怎么来的
 | 期货日线本地读取 | `ttrade/futures.py` | `load_local()`（读 CSV、乘复权因子） |
 | 期货分钟线抓取 | `ttrade/tqfetch.py` | `write_main_many()`（主连）、`write_contracts()`（真实合约） |
 | 期货分钟线本地读取 | `ttrade/tqdata.py` | `load_main()`（DuckDB + 复权 + 合并） |
-| 主力切换表 / 复权因子 | `ttrade/tqfetch.py` | `ensure_switch()`、`refresh_all()` |
+| 主力切换表 / 复权因子 | `ttrade/tqfetch.py` | `update_switch()`（从天勤下载并刷新）、`refresh_all()` |
 | 衍生列并进 DataFrame | `ttrade/auxdata.py` | `attach()`（日线）/ `attach_intraday()`（分钟） |
 | 期权 IV 取哪一档（日频 / 1h / 5m） | `ttrade/auxdata.py` | `_use_iv_period()`、`_iv_period_for()` |
 | 期货品种 ↔ 期权品种映射 | `ttrade/optstore.py` | `opt_variety()`、`iv_candidates()` |

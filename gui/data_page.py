@@ -247,8 +247,10 @@ class TqWorker(QObject):
     十几分钟。断线不在这里重试 —— 增量是按库里的最后时间算的，用户再点一次
     就是断点续传，比在这里猜重试策略可靠。
 
-    三件事按顺序做：主连 → 真实合约 → 期限结构（展期因子要用的那份）。后两步
-    可以关掉：真实合约十年 5m 是 8.4 GB，只想跑主连的人没必要下。
+    四件事按顺序做：**主力切换表 → 主连 → 真实合约 → 期限结构**（展期因子要用的
+    那份）。切换表排第一，因为主连写库时就要拿它算复权因子 —— 表要是停在旧口径，
+    写进去的 `adj_factor` 就是错的，得再刷一遍历史才修得回来。后两步可以关掉：
+    真实合约十年 5m 是 8.4 GB，只想跑主连的人没必要下。
     """
 
     progress = Signal(int, int, str)
@@ -259,7 +261,8 @@ class TqWorker(QObject):
                  pairs: list[tuple[str, str]] | None = None,
                  contracts: bool = True,
                  edb: bool = False,
-                 options: bool = False) -> None:
+                 options: bool = False,
+                 force_switch: bool = False) -> None:
         super().__init__()
         self.period = period
         self.days = int(days or 7300)
@@ -267,6 +270,9 @@ class TqWorker(QObject):
         self.contracts = contracts
         self.edb = edb
         self.options = options
+        # 手动点「开始补充」时 True：用户按下去就是要最新的，不认「今天算过了」。
+        # 定时那条给 False —— 同一天里手动补过一次就不必再问一遍天勤。
+        self.force_switch = force_switch
         self._cancel = False
 
     def cancel(self) -> None:
@@ -391,15 +397,37 @@ class TqWorker(QObject):
                         self.progress.emit(0, 0,
                                            f"期权更新失败：{str(exc)[:60]}，继续补行情")
 
-                self.progress.emit(0, 0, "检查主力切换表…")
-                # 补切换表要给每个品种请求几十次合约日线，78 个品种能跑半小时。
-                # 不回调的话进度条会一直停在「检查主力切换表…」，看着像卡死了
-                n_switch = TQ.ensure_switch(
-                    api, pairs,
-                    on_row=lambda key, n: self.progress.emit(
-                        0, 0, f"切换表 {key}（{n} 次换月）"
-                    ),
-                )
+                self.progress.emit(0, 0, "从天勤更新主力切换表…")
+                # **每次都真的去天勤取一遍**（`update_switch`），不是「表空的才补」
+                # —— JD 2026-11-17 从 jd2612 换到 jd2701 就是这么漏掉的：表里停在
+                # 10-12，`adj_factor` 不认这次换月，前复权图上当天 09:00 一根 −10%。
+                #
+                # 贵的只有取换月价那一步，而它只算**表里没有的**记录，日常几秒；
+                # 所以手动这条不用给开关，全量刷一遍也不心疼。
+                n_switch = 0
+                switch_note = ""
+                try:
+                    st_sw = TQ.update_switch(
+                        api, pairs, force=self.force_switch,
+                        on_row=lambda key, n: self.progress.emit(
+                            0, 0, f"切换表 {key}：新增 {n} 次换月"),
+                    )
+                    n_switch = int(st_sw["added"])
+                    switch_note = (
+                        f"，切换表新增 {n_switch} 次换月（{st_sw['touched']} 个品种）"
+                        if n_switch else "，切换表无新换月"
+                    )
+                    if st_sw["empty"]:
+                        switch_note += f"，{len(st_sw['empty'])} 个品种天勤无主力映射"
+                    if st_sw["failed"]:
+                        switch_note += (f"，{len(st_sw['failed'])} 个品种取不到换月价"
+                                        "（复权会在那里断一截）")
+                except Exception as exc:      # noqa: BLE001
+                    # 切换表拿不到不该拦住补行情：库里那张（哪怕是旧的）照样能算
+                    # 复权因子，补完这一轮再点一次就自愈
+                    switch_note = (f"，切换表更新失败（{type(exc).__name__}: "
+                                   f"{str(exc)[:40]}），本轮按旧表算复权")
+                    self.progress.emit(0, 0, "切换表更新失败，继续补行情")
                 if self._cancel:
                     self.done.emit("已取消（切换表已更新，行情未补）")
                     return
@@ -501,8 +529,8 @@ class TqWorker(QObject):
                 note += "　【期权】本次没有新数据（已下完的合约会跳过）"
             note += opt_note
             self.done.emit(
-                f"天勤 {period_label} {head}：{len(pairs)} 个品种，本次写入 {rows:,} 行{extra}；"
-                f"新补切换表 {n_switch} 个，校正换月日 {moved} 处，刷新复权 {touched} 个品种周期"
+                f"天勤 {period_label} {head}：{len(pairs)} 个品种，本次写入 {rows:,} 行{extra}"
+                f"{switch_note}；校正换月日 {moved} 处，刷新复权 {touched} 个品种周期"
                 + note
             )
         except Exception as exc:  # noqa: BLE001
@@ -1405,6 +1433,37 @@ class DataPage(QWidget):
         row_edb.addStretch(1)
         lay.addLayout(row_edb)
 
+        # 天勤那条日程。和上面三条都不同源：它补的是 data_tq（天勤口径的主连、
+        # 主力切换表、复权因子），Tushare 那两条补的是 data_futures 的 CSV。
+        # 切换表排在最前，是因为主连写库时就要用它算复权因子。
+        self.chk_tq_auto = QCheckBox("每天 15:50 从天勤补（切换表 → 主连 → 复权）")
+        self.chk_tq_auto.setToolTip(
+            "先从**天勤**重新下载主力切换表，再按天勤那张卡上选的周期补最近一天的\n"
+            "主连，最后按新表把复权因子刷到全部历史上，写 data_tq/tq.duckdb。\n\n"
+            "为什么必须有这一条：切换表不刷新，换月那天就没有 ratio，前复权序列\n"
+            "会在换月处留一根假跳空（JD 2026-11-17 从 jd2612 换到 jd2701，\n"
+            "近月差价约 −10%，图上就是当天 09:00 一根大阴线）。\n\n"
+            "为什么 15:50：日盘 15:00 收盘，15:50 时当日 bar 已经齐了；排在 15:45 的\n"
+            "基本面之后、16:00 起的其它日程之前，既不抢天勤会话，也不会被跑几小时的\n"
+            "日线任务堵在后面。当晚 21:00 起的夜盘归属下一个交易日，由次日这一轮补上。\n\n"
+            "只补主连最近一天，不碰真实合约和期权（那些体积大、要手动挑区间）。\n"
+            "增量：切换表只给**表里没有的**换月取价，日常几秒。"
+        )
+        lay.addWidget(self.chk_tq_auto)
+
+        row_tq = QHBoxLayout()
+        row_tq.setSpacing(6)
+        self.time_tq_auto = QTimeEdit()
+        self.time_tq_auto.setDisplayFormat("HH:mm")
+        self.time_tq_auto.setTime(QTime(15, 50))
+        self.time_tq_auto.setToolTip(
+            "默认 15:50。定得比 15:30/15:45 那两条晚，是为了不抢同一个天勤会话；\n"
+            "定得比后面那些日程早，是为了不被一条跑几小时的任务堵住。"
+        )
+        row_tq.addWidget(self.time_tq_auto)
+        row_tq.addStretch(1)
+        lay.addLayout(row_tq)
+
         self.lbl_auto_hint = QLabel(
             "只在本程序开着时生效；到点如果正在更新，就等这一轮跑完再补。"
         )
@@ -1967,9 +2026,9 @@ class DataPage(QWidget):
 
         日期存盘而不是只放内存：半夜跑过一次之后用户重启程序，不该再补一遍。
 
-        四条日程（衍生 15:30 / 基本面 15:45 / 日线 17:00 / 宏观 08:00）共用这一个
-        心跳，但各自记各自的「今天跑过了」—— 15:30 的衍生数据补完不该让 17:00
-        的日线任务也跟着认为今天跑完了。
+        五条日程（衍生 15:30 / 基本面 15:45 / 天勤 15:50 / 日线 17:00 / 宏观 08:00）
+        共用这一个心跳，但各自记各自的「今天跑过了」—— 15:30 的衍生数据补完不该
+        让 17:00 的日线任务也跟着认为今天跑完了。
         """
         from datetime import date
 
@@ -1998,12 +2057,16 @@ class DataPage(QWidget):
             elif job.get("edb"):
                 # 基本面同理：它是天勤独有的接口，也不能排进市场队列
                 self._start_edb(auto=True)
+            elif job.get("tq"):
+                # 天勤这条也不是补 CSV：它走 TqWorker（切换表 → 主连 → 复权），
+                # 排进市场队列的话会被 `_start_auto_next()` 当成 Tushare 市场
+                self._start_tq(auto=True)
             else:
                 self._start_auto(job["key"])
             return              # 一次只起一条，另一条等下一轮心跳
 
     def _auto_jobs(self) -> list[dict]:
-        """四条日程的控件与目标市场。
+        """五条日程的控件与目标市场。
 
         `markets` 是这条日程要跑的市场，按顺序跑 —— 日线那条要期货和美股都补，
         而衍生数据只有期货有。
@@ -2015,6 +2078,10 @@ class DataPage(QWidget):
         基本面（EDB）同理标 `edb: True`、`range` 置 None：它是天勤独有的非价量
         接口，写的是另一张库（`data_tq/edb.duckdb` 的 edb_series），不能排进
         市场队列 —— 排进去 `_start_auto_next()` 会拿 UpdateWorker 去补 CSV。
+
+        天勤那条标 `tq: True`、`range` 也置 None：它走 `TqWorker`（切换表 →
+        主连 → 复权），补的是 data_tq 里的主连，区间固定「近 1 天」，
+        周期跟着界面上选的那个。
         """
         return [
             {"key": "aux", "label": "期货衍生数据",
@@ -2029,6 +2096,9 @@ class DataPage(QWidget):
             {"key": "edb", "label": "基本面（EDB）",
              "chk": self.chk_edb, "time": self.time_edb,
              "range": None, "edb": True},
+            {"key": "tq", "label": "天勤（切换表 + 主连 + 复权）",
+             "chk": self.chk_tq_auto, "time": self.time_tq_auto,
+             "range": None, "tq": True},
         ]
 
     def _start_auto(self, key: str) -> None:
@@ -2147,16 +2217,34 @@ class DataPage(QWidget):
         self.btn_update.setEnabled(True)
         self._upd_thread.start()
 
-    def _start_tq(self) -> None:
-        self._auto_run = False
-        self._auto_queue = []
-        period = self.cb_period.currentData() or "1h"
-        days = int(self.cb_tq_range.currentData() or 7300)
-        contracts = self.chk_tq_contracts.isChecked()
-        edb = self.chk_tq_edb.isChecked()
-        options = self.chk_tq_options.isChecked()
+    def _start_tq(self, auto: bool = False) -> None:
+        """起天勤补行情。`auto=True` 是「每日定时补充」那条日程在用。
+
+        定时那条**只补最近一天的主连**：切换表 → 主连 → 复权因子。真实合约、
+        期权、基本面各自有更合适的时机（体积大 / 15:45 已单独排了 EDB），
+        不该压进一条每天 16:00 跑的日程里。
+        """
+        if auto:
+            self._auto_run = True
+            self._auto_key = "tq"
+            self._auto_queue = []
+            # 周期跟着天勤那张卡上选的那个 —— 用户看的是哪个周期，日常就该续哪个
+            period = self.cb_period.currentData() or "1h"
+            days = 1
+            contracts = False
+            edb = False
+            options = False
+        else:
+            self._auto_run = False
+            self._auto_queue = []       # 手动跑一趟就别再接着排定时的那几个市场
+            period = self.cb_period.currentData() or "1h"
+            days = int(self.cb_tq_range.currentData() or 7300)
+            contracts = self.chk_tq_contracts.isChecked()
+            edb = self.chk_tq_edb.isChecked()
+            options = self.chk_tq_options.isChecked()
         self._tq_worker = TqWorker(period, days, contracts=contracts,
-                                   edb=edb, options=options)
+                                   edb=edb, options=options,
+                                   force_switch=not auto)
         self._tq_thread = QThread(self)
         self._tq_worker.moveToThread(self._tq_thread)
         self._tq_thread.started.connect(self._tq_worker.run)
@@ -2168,16 +2256,19 @@ class DataPage(QWidget):
         self._tq_thread.finished.connect(self._on_thread_done)
 
         label = dict(TQ_PERIODS).get(period, period)
-        span = self.cb_tq_range.currentText()
         self.prog_update.setRange(0, 0)
         self.prog_update.setVisible(True)
         self.lbl_upd.setVisible(True)
         self.lbl_upd.setText(f"准备从天勤补 {label}…")
-        self._log(
-            f"—— 天勤补齐 {label}（{span}）"
-            + ("，含真实合约与展期因子" if contracts else "，只补主连")
-            + ("，期权按同一区间" if options else "")
-        )
+        if auto:
+            self._log(f"—— 天勤 {label}：切换表 → 主连（近 1 天）→ 复权因子")
+        else:
+            span = self.cb_tq_range.currentText()
+            self._log(
+                f"—— 天勤补齐 {label}（{span}）"
+                + ("，含真实合约与展期因子" if contracts else "，只补主连")
+                + ("，期权按同一区间" if options else "")
+            )
         self.btn_update.setText("取消")
         self.btn_update.setEnabled(True)
         self._tq_thread.start()
@@ -2225,7 +2316,10 @@ class DataPage(QWidget):
         self.lbl_upd.setVisible(True)
         self.lbl_upd.setText(text)
         self._log(text)
-        self.data_changed.emit(self.market)
+        # 天勤这条路只写国内期货。定时那条可能在用户停在美股页的时候跑起来，
+        # 这时候 `self.market` 是 "us"，拿它去刷新只会白读一遍美股的标的池，
+        # 而真正变了的 cn 反而没人管。
+        self.data_changed.emit("cn")
         # 有品种没下全就弹一下：跑几小时的下载用户未必盯着 label 看，而缺的那几个
         # 合约正是展期因子断掉的地方
         if "没下全" in text:

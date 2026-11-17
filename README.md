@@ -5230,8 +5230,10 @@ python download_tq.py --period 5m --years 10     # 5 分钟线十年
 python download_tq.py --period 1h --switch       # 1 小时 + 补主力切换表
 ```
 
-界面里跑的就是这条路径：`ensure_switch()` 补缺失的切换表 → `write_main_many()`
-增量写 DuckDB → `refresh_all()` 对齐换月点并重刷复权因子。
+界面里跑的就是这条路径：`update_switch()` 从天勤**下载并刷新**主力切换表（已有的表
+也更新，只给新出现的换月取价）→ `write_main_many()` 增量写 DuckDB → `refresh_all()`
+对齐换月点并重刷复权因子。这一步同时挂在「每日自动补充」里（默认 15:50），不刷新
+切换表的话，换月那天就没有复权比率，前复权序列会在换月处留一根假跳空。
 
 ### 数据源与口径（重要）
 

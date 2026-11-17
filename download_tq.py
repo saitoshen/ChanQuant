@@ -39,8 +39,6 @@ import sys
 import time
 from datetime import date
 
-import pandas as pd
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from ttrade import tqstore as S  # noqa: E402
@@ -52,12 +50,13 @@ from ttrade.tqfetch import (  # noqa: E402
     PERIOD_SEC,
     RECENT_BARS,
     Session,
-    adj_factor_series,
+    apply_switch,
     fetch_switch,
-    fill_ratio,
     can_download,
     refresh_all,
+    switch_fresh,
     switch_records,
+    switch_stamp,
     tq_root,
     write_contracts,
     write_main_many,
@@ -82,32 +81,14 @@ def pick_pairs(symbols: str | None, all_: bool) -> list[tuple[str, str]]:
     return pairs
 
 
-def _switch_stamp(sym: str, ex: str) -> str:
-    return f"switch_at::{sym}_{ex}"
-
-
 def _fresh_switch(sym: str, ex: str, days: int = 1) -> bool:
-    """切换表是不是最近算过。
+    """切换表是不是最近算过（判据与界面共用 `tqfetch.switch_fresh()`）。
 
-    重算一个品种要请求几十次合约日线（约 20 秒），78 个品种就是半小时，所以
-    断线重跑时必须能跳过。这里用「上次计算时间」而不是「最后一次换月日期」：
-    低流动性品种可能两个月才换一次月，按后者判断会把它们每次重跑都重算一遍
-    —— 实测 78 个品种里有 28 个会中招。
-
-    默认窗口 1 天：同一天内重跑一律跳过，跨天重算一次。想立刻刷新用
-    `--force-switch`。
+    早先这里有一份自己的实现，界面那边又是另一套（只判「表是不是空的」）——
+    两套判据的结果就是：命令行天天更新、界面永远不更新，最后一次算完之后新增的
+    换月只有敲命令才进得来。现在只剩 `tqfetch` 那一份。
     """
-    ts = S.meta_get(_switch_stamp(sym, ex))
-    if ts:
-        try:
-            return (pd.Timestamp.today().normalize() - pd.Timestamp(str(ts))).days < days
-        except (ValueError, TypeError):
-            pass
-    if len(S.load_switch(sym, ex)) == 0:
-        return False
-    # 老数据没有时间戳（加这一列之前算的），补一个今天的，之后就走上面的日期判断
-    S.meta_set(_switch_stamp(sym, ex), str(date.today()))
-    return True
+    return switch_fresh(sym, ex, days)
 
 
 def main() -> int:
@@ -174,8 +155,6 @@ def main() -> int:
     pairs = pick_pairs(args.symbols, args.all)
     print(f"品种 {len(pairs)} 个，仓库 {S.db_path(read_only=False)}")
 
-    ratio_cache: dict = {}
-
     def with_retry(label: str, fn):
         """跑一个品种，断线就重建会话再试一次。失败两次就记下来跳过，不中断全局。"""
         for attempt in (1, 2):
@@ -218,24 +197,26 @@ def main() -> int:
 
                 def job(api, sym=sym, ex=ex, df=df, key=key, i=i):
                     rec = switch_records(df, sym, ex)
-                    rec = fill_ratio(api, rec, ratio_cache,
-                                     "5m" if args.precise_ratio else "1d")
-                    with S.connect() as con:
-                        S.upsert_switch(con, sym, ex, rec)
-                    S.meta_set(_switch_stamp(sym, ex), str(date.today()))
-                    src = "5m 同刻价" if args.precise_ratio else "日线收盘"
-                    n_bar = int((rec.get("price_src") == "bar").sum()) if len(rec) else 0
+                    # 只给**表里没有的**换月算 ratio：`--main` 每次都会顺手更新
+                    # 切换表，全量重算的话 78 个品种要半小时，白等
+                    n_new, n_lost = apply_switch(api, sym, ex, rec,
+                                                 args.precise_ratio)
+                    S.meta_set(switch_stamp(sym, ex), str(date.today()))
+                    tail = f"新增 {n_new}" if n_new else "无新增"
+                    if n_lost:
+                        tail += f"，{n_lost} 条取不到换月价"
                     print(f"  [{i}/{len(todo)}] {key}: {len(rec)} 次换月"
-                          f"（{n_bar} 条取到{src}，{len(rec) - n_bar} 条回退）"
+                          f"（{tail}）"
                           f"，{rec['switch_date'].min().date() if len(rec) else '-'} 起",
                           flush=True)
-                    return rec
+                    return n_new
 
                 with_retry(key, job)
 
             if todo:
-                # 切换表刚变过：新 ratio 要乘到全部历史上，已落库的 adj_factor 过期了
-                print("  切换表有变化，重算历史复权因子", flush=True)
+                # 切换表可能刚变过：新 ratio 要乘到全部历史上，已落库的 adj_factor
+                # 是上次写库时的快照，不刷就停在旧口径（纯本地计算，秒级）
+                print("  重算历史复权因子", flush=True)
                 moved, touched = refresh_all(pairs, on_msg=lambda m: print(f"  {m}", flush=True))
                 print(f"  换月日校正 {moved} 处，复权因子刷新 {touched} 个品种周期", flush=True)
 

@@ -1014,31 +1014,131 @@ def switch_stamp(sym: str, ex: str) -> str:
     return f"switch_at::{sym}_{ex}"
 
 
-def ensure_switch(api, pairs: list[tuple[str, str]], on_row=None) -> int:
-    """给**还没有切换表**的品种补一张。返回补了几个。
+def switch_fresh(sym: str, ex: str, days: int = 1) -> bool:
+    """切换表「最近算过」吗 —— 默认同一品种一天之内不重算。
 
-    界面第一次补分钟线时必须先走这一步：`write_main_many` 用切换表算复权因子，
-    表是空的，`adj_factor` 就会全是 1.0，价格看起来正常、复权全错。
-    已有的不重算 —— 重算一个品种要请求几十次合约日线，78 个品种半小时。
+    判据是**上次计算时间**，不是「最后一次换月日期」：低流动性品种可能两个月才
+    换一次月，按后者判断会让它们每次重跑都白跑一遍（78 个品种里 28 个中招）。
+
+    老数据没有时间戳（加这一列之前算的），补一个今天的，之后就走日期判断。
     """
-    todo = [(s_, e_) for s_, e_ in pairs if len(S.load_switch(s_, e_)) == 0]
+    ts = S.meta_get(switch_stamp(sym, ex))
+    if ts:
+        try:
+            return (pd.Timestamp.today().normalize() - pd.Timestamp(str(ts))).days < days
+        except (ValueError, TypeError):
+            pass
+    if len(S.load_switch(sym, ex)) == 0:
+        return False
+    S.meta_set(switch_stamp(sym, ex), str(date.today()))
+    return True
+
+
+def apply_switch(api, sym: str, ex: str, rec: pd.DataFrame,
+                 precise: bool = False) -> tuple[int, int]:
+    """把从天勤推导出的切换记录并进已有表，**只给新出现的换月算 ratio**。
+
+    「新」按 `(旧合约, 新合约)` 认，**不按日期认**：`realign_switch()` 会把切换日
+    挪一天去对齐真实的跳空位置，按日期比就会把同一次换月再当成新的插一条 ——
+    两条都留在表里，复权因子就把它连乘两遍，价格在换月处凭空跳 3%。
+
+    只补新的，是因为这一步唯一贵的活儿在 `fill_ratio()`：每条记录要取新旧两个
+    合约的 K 线（一个品种几十次请求）。全量重算 78 个品种要半小时，只算新换月
+    通常几秒 —— 定时任务每天能不能跑得起，全看这一点。
+
+    返回 (新增到表里的条数, 取不到价格而丢掉的条数)。后者不是 0 说明那几次换月
+    的价格在本地取不到（合约刚上市 / 已摘牌太早），复权会在那里断一截。
+    """
+    if rec is None or rec.empty:
+        return 0, 0
+    known = S.load_switch(sym, ex)
+    have: set[tuple[str, str]] = set()
+    if len(known):
+        have = {(str(a), str(b)) for a, b in zip(known["old_tq"], known["new_tq"])}
+    mask = [(str(a), str(b)) not in have for a, b in zip(rec["old_tq"], rec["new_tq"])]
+    fresh = rec[mask].reset_index(drop=True)
+    if fresh.empty:
+        return 0, 0
+    # 缓存只在**一个品种内**复用：合约名自带品种前缀，跨品种根本命中不了，
+    # 留着只会白占内存（78 个品种各几十个合约，5m 口径下能吃掉几百 MB）
+    filled = fill_ratio(api, fresh, {}, "5m" if precise else "1d")
+    if len(filled):
+        with S.connect() as con:
+            S.upsert_switch(con, sym, ex, filled)
+    return len(filled), len(fresh) - len(filled)
+
+
+def update_switch(api, pairs: list[tuple[str, str]], days: int = 1,
+                  force: bool = False, precise: bool = False,
+                  only_empty: bool = False, on_row=None,
+                  cancel=None) -> dict:
+    """从天勤**下载并刷新**主力切换表 —— 已有的表也会更新。
+
+    跟 `ensure_switch()` 的区别就在这一句：那个只给**空表**补一张，已经算过的表
+    永不刷新。于是最后一次算完之后新发生的换月再也进不来，`adj_factor` 停在旧
+    口径上，主连序列在换月处留一根假跳空（JD 2026-11-17 从 jd2612 换到 jd2701，
+    表里还停在 10-12，前复权图上就是当天 09:00 一根 −10%）。
+
+    `days`：同一品种多久之内不重算，默认 1 天。`fetch_switch()` 是批量接口
+    （30 个品种一个请求，78 个品种 3 个请求），本身很便宜；限流是为了不重复
+    做同一件事，不是怕慢。`force=True` 无视它（手动点「开始补充」用，用户按下去
+    就是想要最新的）。
+
+    `only_empty=True` 退回「只补空表」的老语义，给 `ensure_switch()` 用。
+
+    返回统计：`checked` 实际处理品种数、`added` 新增换月条数、`touched` 有新换月
+    的品种数、`skipped` 因较新跳过、`empty` 天勤没给映射、`failed` 取不到换月价。
+    调用方拿 `added` 决定要不要接着 `refresh_all()` 把因子刷到历史上。
+    """
+    st: dict = {"checked": 0, "added": 0, "touched": 0, "skipped": 0,
+                "empty": [], "failed": []}
+    todo: list[tuple[str, str]] = []
+    for sym, ex in pairs:
+        if only_empty:
+            if len(S.load_switch(sym, ex)):
+                st["skipped"] += 1
+                continue
+        elif not force and switch_fresh(sym, ex, days):
+            st["skipped"] += 1
+            continue
+        todo.append((sym, ex))
     if not todo:
-        return 0
+        return st
+
     maps = fetch_switch(api, todo)
-    n = 0
     for sym, ex in todo:
+        if cancel is not None and cancel():
+            break
         key = f"{sym}_{ex}"
         df = maps.get(key)
         if df is None or len(df) < 2:
+            # 天勤没有这个品种的历史主力映射（本地池子里有几个对不上的假合约）。
+            # 时间戳照样写，否则每天都要把同一批再问一遍。
+            st["empty"].append(key)
+            S.meta_set(switch_stamp(sym, ex), str(date.today()))
             continue
-        rec = fill_ratio(api, switch_records(df, sym, ex), {}, "1d")
-        with S.connect() as con:
-            S.upsert_switch(con, sym, ex, rec)
+        n_new, n_lost = apply_switch(api, sym, ex,
+                                     switch_records(df, sym, ex), precise)
         S.meta_set(switch_stamp(sym, ex), str(date.today()))
-        n += 1
+        st["checked"] += 1
+        st["added"] += n_new
+        if n_new:
+            st["touched"] += 1
+        if n_lost:
+            st["failed"].append(key)
         if on_row is not None:
-            on_row(key, len(rec))
-    return n
+            on_row(key, n_new)
+    return st
+
+
+def ensure_switch(api, pairs: list[tuple[str, str]], on_row=None) -> int:
+    """只给**还没有切换表**的品种补一张，返回补了几个。
+
+    留着是给老调用点用的：新代码一律走 `update_switch()`，它连已有的表一起刷新。
+    界面第一次补分钟线时曾经必须先走这一步 —— `write_main_many` 用切换表算复权
+    因子，表空了 `adj_factor` 全是 1.0，价格看着正常、复权全错。
+    """
+    return update_switch(api, pairs, only_empty=True, on_row=on_row)["checked"]
 
 
 def refresh_all(pairs: list[tuple[str, str]], on_msg=None) -> tuple[int, int]:

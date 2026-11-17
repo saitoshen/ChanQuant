@@ -5656,8 +5656,8 @@ def _run() -> tuple[bool, list[str]]:
             opt_range_ok = False
             opt_range_info = f"{type(_exc).__name__}: {_exc}"
 
-        # 定时日程必须还是四条，且「宏观 / 基本面」这两条**不是补 CSV** 的
-        # 要各自带着 `macro` / `edb` 标、`range` 置 None。
+        # 定时日程必须还是五条，且「宏观 / 基本面 / 天勤」这三条**不是补 CSV** 的
+        # 要各自带着 `macro` / `edb` / `tq` 标、`range` 置 None。
         # 漏掉或并回市场队列的后果是静默的：界面上勾着「每天补基本面」，到点
         # `_start_auto_next()` 却拿 `UpdateWorker` 去补期货 CSV，edb.duckdb
         # 一行不涨、也不报错。这条断言就是防它被谁合并回去。
@@ -5666,22 +5666,52 @@ def _run() -> tuple[bool, list[str]]:
         try:
             _jobs = dp._auto_jobs() if dp is not None else []
             _keys = [j["key"] for j in _jobs]
-            _want_flag = {"macro": "macro", "edb": "edb"}
+            _want_flag = {"macro": "macro", "edb": "edb", "tq": "tq"}
             _bad = []
             for _j in _jobs:
                 _w = _want_flag.get(_j["key"])
                 if _w is None:
-                    if _j.get("macro") or _j.get("edb"):
+                    if _j.get("macro") or _j.get("edb") or _j.get("tq"):
                         _bad.append(f"{_j['key']} 多带了标记")
                 elif not _j.get(_w):
                     _bad.append(f"{_j['key']} 少了 {_w}")
                 elif _j.get("range") is not None:
                     _bad.append(f"{_j['key']} 不该有区间")
-            auto_jobs_ok = _keys == ["aux", "daily", "macro", "edb"] and not _bad
+            auto_jobs_ok = _keys == ["aux", "daily", "macro", "edb", "tq"] and not _bad
             auto_jobs_info = " / ".join(_keys) + ("；" + "、".join(_bad) if _bad else "")
         except Exception as _exc:      # noqa: BLE001
             auto_jobs_ok = False
             auto_jobs_info = f"{type(_exc).__name__}: {_exc}"
+
+        # 切换表必须是**从天勤下载刷新**的，不能退回「表空的才补」。
+        # 这条防的是一个特别隐蔽的退化：`ensure_switch()` 只给空表补一张，
+        # 已经有表的品种永远不再更新 —— 于是每次换月都没 ratio，前复权序列在
+        # 换月处留一根假跳空（JD 2026-11-17 从 jd2612 换 jd2701 差 −10%），
+        # 而界面上一切正常、不报任何错。
+        switch_src_info = ""
+        switch_src_ok = True
+        try:
+            import inspect as _inspect
+
+            from gui import data_page as _dp
+            from ttrade import tqfetch as _TQ
+
+            _run = _inspect.getsource(_dp.TqWorker.run)
+            _bad = []
+            if "update_switch" not in _run:
+                _bad.append("补充流程没调 update_switch")
+            if "ensure_switch" in _run:
+                _bad.append("还在用 ensure_switch（只补空表）")
+            for _fn in ("update_switch", "apply_switch", "switch_fresh"):
+                if not callable(getattr(_TQ, _fn, None)):
+                    _bad.append(f"tqfetch 少了 {_fn}()")
+            if "force_switch" not in _inspect.getsource(_dp.TqWorker.__init__):
+                _bad.append("TqWorker 没有 force_switch 开关")
+            switch_src_ok = not _bad
+            switch_src_info = "、".join(_bad)
+        except Exception as _exc:      # noqa: BLE001
+            switch_src_ok = False
+            switch_src_info = f"{type(_exc).__name__}: {_exc}"
 
         def _form_order_ok(d) -> bool:
             """「开始补充」必须紧跟在下载项之后，成本和定时不许混进来。
@@ -5770,15 +5800,19 @@ def _run() -> tuple[bool, list[str]]:
             and dp.chk_upd_options.isHidden() == (is_us or src_tq)
             and not dp.chk_upd_contracts.isChecked()
             and not dp.chk_upd_options.isChecked()
-            # 每日定时补充：两条日程（15:30 衍生 / 17:00 日线）的控件都在、
-            # 默认不勾（不能让用户装完就被自动跑一次几十分钟的下载），
-            # 区间都是「近 1 天 / 近 1 周」两档
+            # 每日定时补充：几条日程（衍生 / 日线 / 宏观 / 基本面 / 天勤）的控件
+            # 都在、默认不勾（不能让用户装完就被自动跑一次几十分钟的下载），
+            # 市场那两条的区间都是「近 1 天 / 近 1 周」两档
             and hasattr(dp, "chk_auto")
             and hasattr(dp, "time_auto")
             and hasattr(dp, "cb_auto_range")
             and hasattr(dp, "chk_daily")
             and hasattr(dp, "time_daily")
             and hasattr(dp, "cb_daily_range")
+            # 天勤那条（切换表 → 主连 → 复权）也要有开关和时刻
+            and hasattr(dp, "chk_tq_auto")
+            and hasattr(dp, "time_tq_auto")
+            and not dp.chk_tq_auto.isChecked()
             and dp.cb_auto_range.count() == 2
             and dp.cb_daily_range.count() == 2
             and _sched_ok(dp)
@@ -6581,8 +6615,15 @@ def _run() -> tuple[bool, list[str]]:
         if not auto_jobs_ok:
             raise RuntimeError(
                 f"每日定时日程不对（{auto_jobs_info}）：应该是 aux / daily / macro / "
-                "edb 四条，宏观与基本面各自带 macro / edb 标且没有区间 —— 少了标记"
-                "它们就会被当市场队列，到点补的是 CSV，基本面一行不涨还不报错"
+                "edb / tq 五条，宏观、基本面、天勤各自带 macro / edb / tq 标且没有"
+                "区间 —— 少了标记它们就会被当市场队列，到点补的是 CSV，"
+                "基本面一行不涨还不报错"
+            )
+        if not switch_src_ok:
+            raise RuntimeError(
+                f"主力切换表没有真正从天勤更新（{switch_src_info}）：必须走 "
+                "update_switch()，只补空表的 ensure_switch() 会让换月后新增的换月"
+                "记录永远进不来，前复权序列在换月处留假跳空"
             )
         if not trade_ok:
             raise RuntimeError(
@@ -7549,7 +7590,7 @@ def _run() -> tuple[bool, list[str]]:
                 f"{side_info}，触发 {trig_info}，"
                 f"回测区间 {range_info}，合成周期 {md_info}，实时开关已复位，"
                 f"{status_info}，"
-                f"数据管理页就绪（期权回溯区间 {opt_range_info}；定时 {auto_jobs_info}），手册 {manual_info}，输出 {out_info}，"
+                f"数据管理页就绪（期权回溯区间 {opt_range_info}；定时 {auto_jobs_info}；切换表{'真下载' if switch_src_ok else switch_src_info}），手册 {manual_info}，输出 {out_info}，"
                 f"对话渲染 {chat_info}，能力包 {skill_info}")
 
     check("长提示的压缩口径（状态栏 / 因子页脚注）", _status_brief)
