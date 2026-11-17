@@ -2716,47 +2716,13 @@ class PortfolioPage(QWidget):
                         + "\n　".join(bits)
                         + "\n逐合约的持仓在右下监控器里")
             elif slot.get("running") and multi:
-                # 多品种没有「一个」目标仓，但**不能只给一个「—」**：一条正在持仓
-                # 的多品种策略和空仓的那条，看起来会一模一样（2026-11-17 用户就被
-                # 这个绊住）。汇总成「多 X 空 Y」，只选了一个品种时直接给那个数，
-                # 逐品种明细在 tooltip 里。一个子槽都没算出目标时显示「—」。
-                lg = _int(slot.get("tgt_long"))
-                sh = _int(slot.get("tgt_short"))
-                if not slot.get("target_ok"):
-                    txt, col = "—", C_MUTED
-                elif multi == 1:
-                    txt, col = str(lg - sh), C_TEXT
-                elif lg and sh:
-                    txt, col = f"多{lg} 空{sh}", C_TEXT
-                elif lg or sh:
-                    txt, col = (f"+{lg}" if lg else f"-{sh}"), C_TEXT
-                else:
-                    txt, col = "0", C_TEXT
-                self._set_cell(t, i, 5, txt, col)
-                it5 = t.item(i, 5)
-                if it5 is not None:
-                    det = slot.get("tgt_detail") or []
-                    lines = [f"{k}：{v:+d} 手" for k, v in det[:20]]
-                    it5.setToolTip(
-                        (f"{multi} 个品种各自的目标仓（合计 {txt}）：\n　"
-                         + ("\n　".join(lines) if lines else "（全部 0 手）")
-                         + ("\n　……" if len(det) > 20 else "")
-                         + "\n逐合约的持仓与差额在右下监控器里")
-                        if slot.get("target_ok") else
-                        (f"{multi} 个品种都还没算出目标仓，所以这里是「—」而不是 0。\n"
-                         "原因看「状态」列（常见：K 线不够 60 根、缺交易日未补、"
-                         "刚启动还在算第一根）")
-                    )
-            elif slot.get("running") and slot.get("target") is None:
-                # 目标仓**还没算出来**。这里必须和「0 手（该空仓）」分开显示 ——
-                # 全表都是 0 的时候，用户在图上看到的就是「策略明明有仓，理论却是 0」
+                # 多品种没有「一个」目标仓：19 个品种各有一个，加起来是 19 个
+                # 不同合约的手数之和，没有任何意义。逐合约的去监控器看
                 self._set_cell(t, i, 5, "—", C_MUTED)
                 it5 = t.item(i, 5)
                 if it5 is not None:
                     it5.setToolTip(
-                        "还没算出目标仓，所以这里是「—」而不是 0。\n"
-                        "原因看「状态」列（常见：K 线不够 60 根、缺交易日未补、"
-                        "刚启动还在算第一根）"
+                        f"{multi} 个品种各自的目标仓在右下监控器里逐合约列出"
                     )
             elif slot.get("running"):
                 self._set_cell(t, i, 5, str(theo), C_TEXT)

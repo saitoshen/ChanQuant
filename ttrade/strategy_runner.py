@@ -201,10 +201,6 @@ class SlotState:
     signal: int = 0
     lots: int = 1              # 一次满仓对应几手（按资金 / 止损金额算出来）
     target: int = 0            # 策略理论净仓（手）
-    # `target` 是不是**已经算出来过**。`False` 时 `target` 那个 0 只表示「还没算」，
-    # 不表示「该空仓」：拿它去调仓会把上一根留下的仓平掉（重启 / K 线不够 /
-    # 缺交易日都会走到这里）。界面同样要分开显示。
-    target_ok: bool = False
     # **这条策略自己**在各合约上的净仓（手），按自己委托的成交累计，落盘在
     # `positionbook`。不是账户净仓 —— 账户是所有策略 + 手工单 + 别的平台的和，
     # 拿它当自己的仓，同品种两条策略就会互相把对方的仓当成自己的。
@@ -1292,7 +1288,6 @@ class PortfolioRunner:
             self._ib_arm(st, full)
             return
         st.target = st.signal * st.lots
-        st.target_ok = True
 
     def _pick_ml_signal(self, st: SlotState) -> bool:
         """从后台缓存取一次机器学习信号；取到就落信号 / 手数，返回 True。
@@ -1330,7 +1325,6 @@ class PortfolioRunner:
         if st.cfg.note != "short":
             st.signal = max(0, st.signal)
         st.target = st.signal * st.lots
-        st.target_ok = True
         return True
 
     # ---- K 线内进出场（`StrategySpec.intrabar`） ----
@@ -1373,7 +1367,6 @@ class PortfolioRunner:
             # 一次缺数就把用户的仓平掉，比不交易糟糕得多
             st.ib_armed = False
             st.target = int(st.held.get(st.underlying, 0)) if st.underlying else 0
-            st.target_ok = True      # 「保持原仓」也是**已知**的目标，不是未知
             return
 
         st.ib_entry_long = lv["entry_long"]
@@ -1399,7 +1392,6 @@ class PortfolioRunner:
         # ① 反向突破离场：上一根**收盘**决定，这一根**开盘**执行
         if held and ((held > 0 and lv["exit_long"]) or (held < 0 and lv["exit_short"])):
             st.target = 0
-            st.target_ok = True
             st.ib_armed = False          # 这根不再看入场，等下一根重来
             st.ib_exit_pending = True
             st.ib_stop = float("nan")
@@ -1415,11 +1407,9 @@ class PortfolioRunner:
                 # 不会被撤，但下一轮又按「持有」算 —— 只要中间哪次重算把
                 # target 改回去，这笔平仓就丢了。索性一直按平仓走到底
                 st.target = 0
-                st.target_ok = True
                 st.ib_armed = False
                 return
             st.target = held
-            st.target_ok = True
             if not (st.ib_stop == st.ib_stop and st.ib_stop > 0):
                 # 没有止损价 = 程序重启过（`ib_stop` 只存在内存里）。按当前
                 # 标记价补挂一条，宁可比原来宽松，也不能裸奔到下一根
@@ -1434,7 +1424,6 @@ class PortfolioRunner:
 
         # ③ 空仓：目标就是空，等盘中触发价
         st.target = 0
-        st.target_ok = True
 
     def _intrabar_tick(self, st: SlotState) -> None:
         """每个 tick 拿最新价比一次触发价 / 止损价，越价就把目标仓改掉。
@@ -1458,7 +1447,6 @@ class PortfolioRunner:
                 hit = price <= sp if held > 0 else price >= sp
                 if hit:
                     st.target = 0
-                    st.target_ok = True
                     st.ib_armed = False      # 这根 bar 不再入场
                     st.ib_exit_pending = True
                     st.ib_stop = float("nan")
@@ -1475,7 +1463,6 @@ class PortfolioRunner:
         if el == el and price >= el and not getattr(st.cfg, "short_only", False):
             # 禁止做多时多头触发价作废：价格冲上去了也不开多
             st.target = st.lots
-            st.target_ok = True
             st.ib_fired = True
             st.ib_exit_pending = False     # 重新持仓了，上一笔的平仓账已清
             # 止损绑**触发价**（那一刻的下单价），不是此刻的最新价 ——
@@ -1490,7 +1477,6 @@ class PortfolioRunner:
             # 不要看 `note`：`note` 只是备注（曾被当批次标签写），照它判会让
             # 回测能双向、实盘只做多（#145）
             st.target = -st.lots
-            st.target_ok = True
             st.ib_fired = True
             st.ib_exit_pending = False
             st.ib_stop = es + d if (d == d and d > 0) else float("nan")
@@ -2028,11 +2014,6 @@ class PortfolioRunner:
     def _rebalance(self, st: SlotState) -> None:
         if not st.underlying:
             return
-        if not st.target_ok:
-            # 目标仓**还没算出来**（刚启动 / K 线不够 / 缺交易日）。这时候
-            # `st.target` 那个 0 只是初值，不是「该空仓」—— 拿它比差额就会把
-            # 上一根留下的仓平掉。一手都不发，等信号算出来再说。
-            return
         if self._align_slot.pending:
             # 一键对齐的委托还在路上。它要达成的目标仓位和策略此刻算出来的
             # 未必一样（信号刚翻、手数刚变），两边一起动手就会「平了又开」。
@@ -2546,12 +2527,7 @@ class PortfolioRunner:
     # ---- 监控器 ----
 
     def theoretical(self) -> dict[str, int]:
-        """按合约汇总策略的理论净仓。同一个品种被多个策略持有时取和。
-
-        🔴 只累计 `target_ok` 的槽位：目标仓**还没算出来**时 `target` 那个 0
-        不是「该空仓」，算进来就等于告诉「一键对齐」这个合约该平到 0 ——
-        一次缺数据就能把用户的仓全平掉（2026-11-17 补库前就是这样）。
-        """
+        """按合约汇总策略的理论净仓。同一个品种被多个策略持有时取和。"""
         out: dict[str, int] = {}
         for st in self._slots.values():
             if not st.running:
@@ -2560,7 +2536,7 @@ class PortfolioRunner:
             # `managed`，否则一键对齐会绕开它，仓位就永远挂在那儿。
             for sym in st.retired:
                 out.setdefault(sym, 0)
-            if st.underlying and st.target_ok:
+            if st.underlying:
                 out[st.underlying] = out.get(st.underlying, 0) + st.target
         return out
 
@@ -2767,9 +2743,6 @@ class PortfolioRunner:
             action = f"{len(rows)} 个品种：{n_pos} 个有仓"
             if n_err:
                 action += f"，{n_err} 个出错"
-            tgts = [(r.underlying, int(r.target or 0)) for r in rows if r.target]
-            # 一个子槽都没算出目标时，汇总行同样只能显示「—」，不能显示 0
-            ready = any(r.target_ok for r in rows)
             out.append({
                 "sid": pid,
                 "title": cfg.title(),
@@ -2783,11 +2756,6 @@ class PortfolioRunner:
                 "running": running,
                 "signal": 0,
                 "target": None,          # 没有「一个」目标仓
-                # 汇总：多/空各多少手（给「理论」列用），逐品种目标（给 tooltip 用）
-                "tgt_long": sum(v for _, v in tgts if v > 0),
-                "tgt_short": sum(-v for _, v in tgts if v < 0),
-                "tgt_detail": tgts,
-                "target_ok": ready,
                 "underlying": "",
                 # 一个都没跑起来才把错误顶到这一行；部分失败写进 action，
                 # 免得 18/19 个品种正常、界面上却是红字「错误」
@@ -2840,11 +2808,7 @@ class PortfolioRunner:
                 "lots": st.lots,
                 "running": st.running,
                 "signal": st.signal,
-                # `target_ok=False`（还没算出来）时给 None，**不能给 0**：
-                # 界面拿 `_int(None)` 会显示成「0 手」，一条正在持仓的策略
-                # 看起来和空仓一样（2026-11-17 用户就是这个观感）
-                "target": (int(st.target) if st.target_ok else None),
-                "target_ok": bool(st.target_ok),
+                "target": st.target,
                 "underlying": st.underlying,
                 "error": st.error,
                 "action": st.last_action,

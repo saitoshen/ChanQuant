@@ -4599,7 +4599,6 @@ def _run() -> tuple[bool, list[str]]:
         r._slots = {}
         st = SlotState(cfg=SStore.StrategyConfig(sid="t", name="jd", period="1h"))
         st.running, st.underlying, st.target = True, "DCE.jd2612", -24
-        st.target_ok = True          # 目标已算出，才进 theoretical
         r._slots["t"] = st
         r._align_slot = SlotState(cfg=SStore.StrategyConfig(
             sid="__align__", name="一键对齐", period="1d"))
@@ -4646,8 +4645,7 @@ def _run() -> tuple[bool, list[str]]:
         交给一键对齐）；只有信号真的把 `target` 改了，才按台账调仓。
         换月不走这条 —— 老合约该平还得平。
 
-        另外两条一起钉住：`target_ok`（「还没算出来」≠「0 手」）和多品种汇总行
-        （不能只给一个「—」）。
+        顺带钉住台账的另一半：账本比账户多时要按账户收窄（只减不增）。
         """
         from ttrade import strategy_store as SStore
         from ttrade.strategy_runner import PortfolioRunner, SlotState
@@ -4693,7 +4691,6 @@ def _run() -> tuple[bool, list[str]]:
             st = SlotState(cfg=SStore.StrategyConfig(
                 sid=sid, name=sid, symbol="RB", exchange="SHFE", period="1d"))
             st.running, st.underlying, st.target = True, under, int(target)
-            st.target_ok = True
             r._slots[sid] = st
             return st
 
@@ -4735,38 +4732,20 @@ def _run() -> tuple[bool, list[str]]:
         if not r2.book or r2.book[0][0] != "SHFE.rb2701" or r2.book[0][1] != -3:
             raise RuntimeError(f"换月平老合约被加载门挡住了：{r2.book}")
 
-        # ⑤ 「还没算出目标」≠「0 手」：不发单，也不许进理论仓
-        #    （进了 `theoretical()` 就等于告一键对齐「这个合约该平到 0」）
+        # ⑤ 台账的「只减不增」：账本 4 手、账户里只剩 2 手（被别人平掉了）
+        #    ⇒ 只能按 2 手发单。照着账本平 4 手会被交易所打回，`_legs` 还会
+        #    把平不掉的量当成开仓，反手开出一笔没道理的反向仓
         r3 = _runner()
         st3 = _slot(r3, target=0)
-        st3.target_ok = False
         st3.based = True
+        st3.based_target = 5
         st3.held = {"SHFE.rb2701": 4}
-        r3._pos = {"SHFE.rb2701": _P(4, 0)}
+        r3._pos = {"SHFE.rb2701": _P(2, 0)}
         r3._rebalance(st3)
-        if r3.book:
-            raise RuntimeError(f"目标还没算出来就发单：{r3.book}")
-        if r3.theoretical().get("SHFE.rb2701"):
-            raise RuntimeError("目标未知的槽位进了理论仓（对齐会平掉实仓）")
-
-        # ⑥ 多品种汇总行：给「多 X 空 Y」，不能只有一个「—」
-        r4 = _runner()
-        r4._groups = {"p": ["p#a", "p#b", "p#c"]}
-        r4._parents = {"p": SStore.StrategyConfig(
-            sid="p", name="多品种", period="1d",
-            multi_symbols=["RB_SHFE", "AG_SHFE", "CU_SHFE"])}
-        for sid, und, tg in (("p#a", "SHFE.rb2701", 3),
-                             ("p#b", "SHFE.ag2612", -1),
-                             ("p#c", "SHFE.cu2701", 0)):
-            s2 = SlotState(cfg=SStore.StrategyConfig(sid=sid, period="1d"))
-            s2.running, s2.underlying, s2.target = True, und, tg
-            s2.target_ok = True
-            r4._slots[sid] = s2
-        g = r4._group_slots()
-        if not g or (g[0]["tgt_long"], g[0]["tgt_short"]) != (3, 1):
-            raise RuntimeError(f"多品种汇总没有合计理论仓：{g}")
+        if not r3.book or r3.book[0][1] != -2:
+            raise RuntimeError(f"账本比账户多时要收窄到可平量：{r3.book}")
         return ("加载首轮不发单、目标不变一直不发、目标改了才按台账调；"
-                "换月不受限；目标未知不进理论仓；多品种汇总给「多 X 空 Y」")
+                "换月不受限；账本比账户多时按可平量收窄")
 
     check("加载策略时不按台账自动交易", _load_no_trade)
 
