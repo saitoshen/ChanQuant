@@ -208,6 +208,50 @@ def month_digits(tq_code: str) -> int:
     return (2000 + int(d[:2])) * 12 + int(d[2:])
 
 
+def contract_from_input(text: str, exchange: str = "") -> tuple[str, str]:
+    """用户手输的合约 → `(天勤写法, 交易所)`，解析不了返回 `("", "")`。
+
+    下单面板的合约框**只收真实合约代码**（`rb2601`），不带交易所前缀 ——
+    这是用户定的口径。所以四种写法都得认：
+
+    - `rb2601` / `RB2601`：光秃秃的，靠 `exchange` 补交易所（本地合约表里有）
+    - `RB2601.SHF`：Tushare 写法，后缀自己带交易所
+    - `SHFE.rb2601` / `shfe.SR601`：天勤写法，前缀自己带交易所
+
+    返回的天勤写法同时能满足两个下游：天勤 `insert_order(symbol=...)` 直接用，
+    CTP 的 `ctp_instrument()` 会把前缀剥掉。**所以下单只需要传这一个字符串。**
+
+    不做「猜交易所」：猜错不会报错，只会把单子下到一个不存在的合约上（拒单）
+    或者更糟 —— 下到一个同名的、别的交易所的合约上。查不到就返回空，让界面说
+    「查不到这个合约」。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return "", ""
+    ex = str(exchange or "").strip().upper()
+    if "." in s:
+        head, tail = s.rsplit(".", 1)
+        if tail.upper() in _TS_SUFFIX_REV:          # Tushare：RB2601.SHF
+            ex = ex or _TS_SUFFIX_REV[tail.upper()]
+            s = head
+        elif head.upper() in TQ_EXCHANGE:           # 天勤：SHFE.rb2601
+            ex = ex or head.upper()
+            s = tail
+        else:
+            return "", ""
+    m = _CODE_RE.match(s.strip())
+    if not m or not ex:
+        return "", ""
+    variety, digits = m.group(1), m.group(2)
+    if ex in SHORT_MONTH_EXCHANGES:
+        # 郑商所：4 位（Tushare）收成 3 位（天勤 / CTP 柜台都认 3 位）
+        digits = digits[-3:]
+    elif len(digits) != 4:
+        return "", ""
+    code = f"{tq_product(variety, ex)}{digits}"
+    return f"{TQ_EXCHANGE.get(ex, ex)}.{code}", ex
+
+
 def read_account(prefix: str = "") -> tuple[str, str]:
     """读天勤账户，返回 (用户名, 密码)。
 

@@ -6312,13 +6312,18 @@ def _run() -> tuple[bool, list[str]]:
         trade_ok = (
             tp is not None
             and _heads(tp.tbl_accts) == [
-                "账户", "账户平台", "资金账户", "最新权益", "当日盈亏", "净杠杆",
-                "总杠杆", "可用资金", "成交金额", "持仓保证金", "手续费"]
+                "账户", "连接", "账户平台", "资金账户", "最新权益", "当日盈亏",
+                "净杠杆", "总杠杆", "可用资金", "成交金额", "持仓保证金", "手续费"]
             and _heads(tp.tbl_pos)[:2] == ["资金账户", "合约"]
             and _heads(tp.tbl_orders)[:2] == ["资金账户", "时间"]
             and _heads(tp.tbl_trades)[:2] == ["资金账户", "时间"]
             # 默认全勾：以前是「下拉框选中谁就连谁」，现在多个账户并存
             and tp._checked == {s.name for s in tp._accounts}
+            # 「连接」列每行一个按钮：逐账户登录 / 登出的入口，少一个就只能整批
+            and tp.tbl_accts.rowCount() == len(tp._accounts)
+            and len(tp._acct_btns) == len(tp._accounts)
+            and all(tp.tbl_accts.cellWidget(i, 1) is not None
+                    for i in range(tp.tbl_accts.rowCount()))
         )
         trade_info = (f"{tp.tbl_accts.columnCount()} 列账户表 / "
                       f"{len(tp._accounts)} 个账户" if tp is not None else "无交易页")
@@ -8774,6 +8779,153 @@ def _run() -> tuple[bool, list[str]]:
         return ("四个时刻判对（含夜盘 02:35 跨零点与 10 分钟宽限），同一时刻只动一次，"
                 "未启用不动作，登录走 connect_requested、登出走 disconnect_requested")
 
+    def _per_account_sessions():
+        """逐账户登录 / 登出：一个账户一条会话。
+
+        这条判据错了**不会报错**：点了某个账户的登录，另一个户被悄悄掐掉，界面
+        上只是那个户的持仓和资金突然不动了。所以逐条钉住：已连着的账户重复
+        `start` 不许重开、`stop_one` 不许连带别人、纯行情会话不算账户、合并快照
+        得把几条会话的账户都带上。
+        """
+        import inspect
+
+        from gui.live import MARKET_KEY, LiveController, _session_key
+        from gui.trade_page import TradePage
+        from ttrade.tqlive import AccountSpec, LiveState
+
+        ctl = LiveController()
+        starts: list[str] = []
+
+        class _S:
+            def __init__(self, name, spec, sym, per):
+                self.name = name
+                self.spec = spec
+                self.backend = getattr(spec, "backend", "tq")
+                self.symbol, self.period = sym, per
+                self.state = None
+                self.worker = None
+                self.thread = None
+
+        def _fake_start(spec, name, sym, ex, per, hist):
+            starts.append(name)
+            ctl._sessions[name] = _S(name, spec, sym, per)
+
+        ctl._start_one = _fake_start
+        A = AccountSpec(name="自检A", kind="kq", user="u", password="p")
+        B = AccountSpec(name="自检B", kind="ctp", user="u", password="p")
+        ctl.start([A, B], "rb", "SHFE", "5m", need_history=False, feed="tq")
+        if starts != ["自检A", "自检B"] or ctl.running_names != {"自检A", "自检B"}:
+            raise RuntimeError(f"一次登录两个账户没建两条会话：{starts}")
+        # 再点一次「连接」（只勾了 A）：A 不能被掐掉重开
+        starts.clear()
+        ctl.start([A], "rb", "SHFE", "5m", need_history=False)
+        if starts:
+            raise RuntimeError(f"已经连着的账户被重开了：{starts}")
+        # 换了合约要重订
+        ctl.start([A], "m", "DCE", "5m", need_history=False)
+        if starts != ["自检A"]:
+            raise RuntimeError(f"换了合约却没重订：{starts}")
+        # 单点登出：别人还在
+        ctl._sessions.pop("自检A")
+        if ctl.running_names != {"自检B"}:
+            raise RuntimeError(f"登出一个账户把别的也带走了：{ctl.running_names}")
+        if ctl.stop_one("根本没这个户"):
+            raise RuntimeError("stop_one 对不存在的账户返回了 True")
+        # 纯行情会话不算账户
+        if _session_key(None) != MARKET_KEY or MARKET_KEY in ctl.running_names:
+            raise RuntimeError("纯行情会话被算成了账户")
+
+        # 合并快照：两个会话的账户都要在，权益相加
+        def _st(tag, bal):
+            return LiveState(
+                connected=True, quote={"last": bal},
+                accounts=[{"name": tag, "account": {"balance": bal}}],
+                by_account={tag: {"spec": {"name": tag},
+                                  "account": {"balance": bal},
+                                  "positions": [], "orders": [], "trades": []}},
+                account={"balance": bal})
+
+        ctl._sessions.clear()
+        for tag, bal in (("自检A", 100.0), ("自检B", 50.0)):
+            sp = A if tag == "自检A" else B
+            s = _S(tag, sp, "rb", "5m")
+            s.state = _st(tag, bal)
+            ctl._sessions[tag] = s
+        m = ctl._merged()
+        if set(m.by_account) != {"自检A", "自检B"}:
+            raise RuntimeError(f"合并快照里少了账户：{sorted(m.by_account)}")
+        if abs(float(m.account.get("balance") or 0) - 150.0) > 1e-6:
+            raise RuntimeError(f"合并权益不对：{m.account.get('balance')}")
+
+        # 界面侧：每行一个按钮、点它只连这一个户；顶部按钮按勾选的连没连判方向
+        src_tp = inspect.getsource(TradePage)
+        for must in ("setCellWidget(i, 1, btn)", "disconnect_one.emit",
+                     "def _edit_account", "def _toggle_account",
+                     "def _sync_conn_buttons"):
+            if must not in src_tp:
+                raise RuntimeError(f"交易页少了 {must}")
+        if "✎" not in inspect.getsource(TradePage._wrap):
+            raise RuntimeError("账户表的「编辑」按钮不见了")
+        if "[spec]" not in inspect.getsource(TradePage._toggle_account):
+            raise RuntimeError("单点登录没有只发一个 spec（会连带别的户一起登）")
+        if "is_running" not in inspect.getsource(TradePage._toggle_connect):
+            raise RuntimeError("顶部按钮还在用「有没有一条会话」判方向，"
+                               "单独登一个户就会显示成「断开」")
+        from gui.app import MainWindow
+
+        if "stop_one" not in inspect.getsource(MainWindow._on_live_stop_one):
+            raise RuntimeError("主窗口没有把单户登出接到 stop_one")
+        return ("已连着的账户重复 start 不重开（换合约才重订）、单户登出不带走别人、"
+                "纯行情会话不算账户、合并快照两户权益 100+50=150；"
+                "账户表每行一个按钮、单点只连这一个户、顶部按勾选判方向")
+
+    def _contract_input():
+        """手输合约 → 天勤写法。下单面板只收裸合约代码（`rb2601`）。
+
+        这条错了的后果是**下到一个不存在的合约**（柜台拒单，还能看出来）或者
+        更糟：下到一个同名的、另一个交易所的合约上。所以两种写法都得认，猜不到
+        交易所时必须返回空串而不是硬猜一个。
+        """
+        import inspect
+
+        from gui.trade_page import TradePage
+        from ttrade.ctp_live import ctp_instrument
+        from ttrade.tqsdk_symbols import contract_from_input, to_ts
+
+        for args, want in (
+            (("rb2601", "SHFE"), ("SHFE.rb2601", "SHFE")),
+            (("SHFE.rb2601", ""), ("SHFE.rb2601", "SHFE")),
+            (("shfe.rb2601", ""), ("SHFE.rb2601", "SHFE")),
+            (("RB2601.SHF", ""), ("SHFE.rb2601", "SHFE")),
+            (("CU2612.SHF", ""), ("SHFE.cu2612", "SHFE")),
+            (("TA2706.ZCE", ""), ("CZCE.TA706", "CZCE")),
+            # 光秃秃的合约 + 没有交易所：不猜，返回空让界面报「认不出」
+            (("rb2601", ""), ("", "")),
+            (("TA2706", ""), ("", "")),
+            (("", ""), ("", "")),
+            (("垃圾", "SHFE"), ("", "")),
+        ):
+            got = contract_from_input(*args)
+            if got != want:
+                raise RuntimeError(f"contract_from_input{args}：应 {want}，实际 {got}")
+        # 天勤写法要能直接喂给 CTP（柜台那边自己剥前缀），否则「同一条下单链路
+        # 服务两种柜台」就不成立
+        if ctp_instrument("SHFE.rb2601") != "rb2601":
+            raise RuntimeError("天勤写法喂给 CTP 没有收敛成 InstrumentID")
+        if to_ts("SHFE.rb2601", "2026-11-17") != "RB2601.SHF":
+            raise RuntimeError("天勤写法转不回 Tushare 合约（本地取价要用它）")
+        # 界面侧：合约框要走解析，不能把裸代码原样扔给柜台
+        src = inspect.getsource(TradePage._place)
+        if "_resolve_contract" not in src:
+            raise RuntimeError("下单没有解析合约，裸代码会原样发到柜台")
+        if "quote_of" not in inspect.getsource(TradePage._fill_price):
+            raise RuntimeError("选中合约后没有去取最新价")
+        if "setValue" not in inspect.getsource(TradePage._on_quote):
+            raise RuntimeError("取价回执没有填进价格框")
+        return ("四种写法都归一：rb2601+SHFE / SHFE.rb2601 / shfe.rb2601 / "
+                "RB2601.SHF；郑商所 4 位收成 3 位（TA2706→TA706）；"
+                "没交易所时不猜（返回空）；归一后天勤能下单、CTP 也能用")
+
     def _auto_two_slots():
         """「一条日程两个时刻」的判据（宏观 08:45 / 20:45，以及 EDB 串行链）。
 
@@ -8810,6 +8962,10 @@ def _run() -> tuple[bool, list[str]]:
     check("每日定时：一条日程两个时刻（08:45 / 20:45）", _auto_two_slots)
 
     check("账户定时登录 / 登出（夜盘 20:55→02:35、日盘 08:55→15:20）", _account_timer)
+
+    check("逐账户登录 / 登出（一条会话一个账户）", _per_account_sessions)
+
+    check("合约手输 → 天勤写法（不带交易所前缀）", _contract_input)
 
     check("存入策略库的动作（strategy_save）", _strategy_save_action)
     check("K线与信号：持仓与交易记录同源（含手数）", _chart_from_trades)

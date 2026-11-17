@@ -50,6 +50,10 @@ BAR_COLS = [
     "volume", "open_oi", "close_oi", "adj_factor",
 ]
 
+# `all_contracts()` 的进程内缓存：周期 → (键, DataFrame)。键里带库文件 mtime，
+# 补完库自动失效，不需要谁记着来清。
+_CON_CACHE: dict = {}
+
 DDL = [
     """
     CREATE TABLE IF NOT EXISTS bars (
@@ -645,6 +649,73 @@ def list_contracts(symbol: str, exchange: str, period: str) -> pd.DataFrame:
         df["first"] = pd.to_datetime(df["first"])
         df["last"] = pd.to_datetime(df["last"])
     return df
+
+
+def all_contracts(period: str = "1d") -> pd.DataFrame:
+    """库里**全部品种**的真实合约：contract / symbol / exchange / last。
+
+    下单面板的合约补全读这个。和 `list_contracts()` 的区别是那个按品种查（图上的
+    「具体合约」下拉），这个跨品种一次拿全 —— 下单时要输的合约跟当前图上的品种
+    没有关系（图上看着 rb、手上要下 m2601 是常事）。
+
+    结果按 `_CON_CACHE` 缓存：合约表一天只变一次（挂牌/摘牌），而这里要扫
+    一百万行 `contract_bars`，每次下拉都查一遍是几百毫秒。缓存键带上库文件的
+    mtime，补完库自动失效。
+    """
+    empty = pd.DataFrame(columns=["contract", "symbol", "exchange", "last"])
+    if not exists():
+        return empty
+    try:
+        stamp = os.path.getmtime(db_path())
+    except OSError:
+        stamp = 0.0
+    key = f"{period}|{stamp}"
+    hit = _CON_CACHE.get(period)
+    if hit is not None and hit[0] == key:
+        return hit[1].copy()
+    try:
+        with connect(read_only=True) as con:
+            if not _has_table(con, "contract_bars"):
+                return empty
+            df = con.execute(
+                "SELECT contract, any_value(symbol) AS symbol,"
+                " any_value(exchange) AS exchange, max(dt) AS last"
+                " FROM contract_bars WHERE period=?"
+                " GROUP BY contract ORDER BY contract",
+                [period],
+            ).df()
+    except Exception:      # noqa: BLE001
+        return empty
+    if not df.empty:
+        df["last"] = pd.to_datetime(df["last"])
+    _CON_CACHE[period] = (key, df)
+    return df.copy()
+
+
+def contract_last_bar(contract: str, period: str = "1d") -> dict | None:
+    """某个真实合约的最后一根 bar：`{dt, close, ...}`，查不到返回 None。
+
+    下单面板在**没连柜台**的时候拿它填「最新价」—— 所以只查一行，不走
+    `load_contracts()`（那个会把整个合约十年的行都读出来）。调用方必须把
+    「这是本地收盘价、不是现价」写在界面上，不然盘中会当成现价用。
+    """
+    c = str(contract or "").strip()
+    if not c or not exists():
+        return None
+    try:
+        with connect(read_only=True) as con:
+            if not _has_table(con, "contract_bars"):
+                return None
+            row = con.execute(
+                "SELECT dt, close FROM contract_bars"
+                " WHERE contract=? AND period=? ORDER BY dt DESC LIMIT 1",
+                [c, period],
+            ).fetchone()
+    except Exception:      # noqa: BLE001
+        return None
+    if not row or row[1] is None:
+        return None
+    return {"dt": pd.Timestamp(row[0]), "close": float(row[1])}
 
 
 def meta_get(k: str, default=None):

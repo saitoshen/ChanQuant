@@ -2,11 +2,16 @@
 
 分工：
 
-- `LiveWorker` 跑在**独立线程**里，独占一条或多条连接：天勤 `LiveHub`（一条
-  TqApi）、CTP `CtpHub`、融航 `RohonHub`。**同时登录多个柜台**时，每个柜台
-  各一条连接，进程里同时存在 —— 这是「天勤和 CTP 一起登」的前提。
+- `LiveWorker` 跑在**独立线程**里，独占一条连接：天勤 `LiveHub`（一条 TqApi）、
+  CTP `CtpHub`、融航 `RohonHub`。
 - `LiveController` 活在主线程，负责起停线程、把界面操作**排队**丢给 worker，
   再把 worker 的信号转出来。
+
+**一条会话一个账户**（2026-11-17 改）。早先是「一条会话装所有勾选的账户」：
+天勤走 `TqMultiAccount` 一次登录，多个账户共用一条 TqApi。那样省连接，但账户
+列表里**没法单独登录 / 登出某一个账户** —— 而用户要的就是每行一个按钮。所以
+改成按账户分会话：一个账户一个线程、一条连接。代价是 N 个天勤账户就是 N 条
+TqApi（N 次登录、各订一份行情）；账户是「两三个」这个量级时无所谓。
 
 为什么下单要排队而不是直接调：天勤的 `insert_order()` 只是入队，真正的报文在
 下一次 `wait_update()` 发出；而 `wait_update()` 正在 worker 线程里阻塞着。跨线程
@@ -160,6 +165,11 @@ class HubSet:
     def set_target(self, symbol: str, volume: int, account: str = "") -> None:
         self._owner(account).set_target(symbol, volume, account=account)
 
+    def quote_of(self, symbol: str, account: str = "",
+                 timeout: float = 3.0) -> dict:
+        """按账户路由到它那条连接去取最新盘口（下单面板「填最新价」）。"""
+        return self._owner(account).quote_of(symbol, timeout=timeout)
+
 
 class LiveWorker(QObject):
     """跑在实时线程里：（可选）补历史 → 连接各柜台 → 订阅 → 循环推进。
@@ -312,8 +322,54 @@ class LiveWorker(QObject):
             hs.close()
 
 
+class _Session:
+    """一条会话：一个账户 + 一个线程 + 一个 worker + 它最近一次的账户快照。
+
+    `state` 存最近一份快照：合并多会话时要用，而且某个账户断开之后，别的账户
+    的快照还在（不能因为这一条没了就把整页清空）。
+    """
+
+    __slots__ = ("name", "spec", "backend", "worker", "thread",
+                 "symbol", "period", "state")
+
+    def __init__(self, name: str, spec, backend: str) -> None:
+        self.name = name
+        self.spec = spec
+        self.backend = backend
+        self.worker: LiveWorker | None = None
+        self.thread: QThread | None = None
+        self.symbol = ""
+        self.period = ""
+        self.state = None
+
+
+# 纯行情会话（`spec=None`，研究页的「启动实时」）在注册表里用的键。用 `\x00`
+# 打头是为了不可能撞上任何一个真账户名。
+MARKET_KEY = "\x00market"
+
+
+def _session_key(spec) -> str:
+    """账户名就是会话键。`spec=None` 是纯行情会话。"""
+    if spec is None:
+        return MARKET_KEY
+    return str(getattr(spec, "name", "") or MARKET_KEY)
+
+
+def _as_list(spec) -> list:
+    if spec is None:
+        return [None]
+    if isinstance(spec, (list, tuple)):
+        return list(spec) or [None]
+    return [spec]
+
+
 class LiveController(QObject):
-    """主线程这一侧：起停线程、转发信号、排队界面操作。"""
+    """主线程这一侧：起停线程、转发信号、排队界面操作。
+
+    内部是一张**会话注册表** `{账户名: _Session}`。`start()` 可以一次登录一批
+    （「连接」按钮），也可以只登录一个（账户表每行的「登录」按钮），已经连着的
+    账户一律不动 —— 这正是「逐账户独立登录 / 登出」的实现方式。
+    """
 
     bars = Signal(object)
     state = Signal(object)
@@ -322,42 +378,107 @@ class LiveController(QObject):
     started = Signal(str)
     stopped = Signal()
     order_sent = Signal(str)
+    quote_got = Signal(object)      # 下单面板「填最新价」的回执（异步）
+    sessions = Signal(object)       # 当前连着哪些账户（set[str]）
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._thread: QThread | None = None
-        self._worker: LiveWorker | None = None
+        self._sessions: dict[str, _Session] = {}
         self.spec = None
         self.key = ""
         self.feed = ""
         # 这条会话实际用的周期。`_on_live_started` 里不能拿研究页当前选的周期
         # 去猜 —— 交易页连的时候可能按 5m 连，而研究页正停在日线上。
         self.period = ""
+        # `started` 只在「第一个就绪的会话」上发一次：三条会话同一个品种，发三次
+        # 会让上层把 K 线状态重置三遍（每遍都要重读一次本地历史）
+        self._emitted_key = ""
+        self._stop_notified = False
+
+    # ---- 注册表 ----
 
     @property
     def running(self) -> bool:
-        return self._worker is not None
+        """有没有任何一条会话在跑。上层只关心「连没连上」时用这个。"""
+        return bool(self._sessions)
+
+    @property
+    def running_names(self) -> set:
+        """连着哪些**账户**（纯行情会话不算账户）。"""
+        return {n for n in self._sessions if n != MARKET_KEY}
+
+    def is_running(self, name: str) -> bool:
+        return str(name or "") in self._sessions
+
+    def _primary(self) -> _Session | None:
+        """K 线与盘口的来源。多柜台时认 `feed` 指定的那家，否则取第一条。"""
+        if self.feed:
+            for s in self._sessions.values():
+                if s.backend == self.feed:
+                    return s
+        return next(iter(self._sessions.values()), None)
+
+    def _session_for(self, account: str = "") -> _Session | None:
+        """账户名 → 它那条会话。没指定（自动交易链路不传）就退回主会话。"""
+        name = str(account or "")
+        if name and name in self._sessions:
+            return self._sessions[name]
+        if name:
+            for s in self._sessions.values():
+                if getattr(s.spec, "name", "") == name:
+                    return s
+        return self._primary()
+
+    def _merged(self):
+        parts = [(s.backend, s.state) for s in self._sessions.values()
+                 if s.state is not None]
+        return merge_states(parts, self.feed)
+
+    def _emit_state(self) -> None:
+        self.state.emit(self._merged())
+
+    def _emit_sessions(self) -> None:
+        self.sessions.emit(self.running_names)
+
+    # ---- 起停 ----
 
     def start(self, spec, symbol: str, exchange: str, period: str,
               need_history: bool = True, feed: str = "") -> None:
-        """启动实时会话。已经在跑会先停掉 —— 同一时刻只留一条会话。
+        """登录账户。`spec` 可以是一个、也可以是一批；**已经在跑的账户不动**。
 
         `feed` 是行情源（`tq` / `ctp` / `rohon`），多柜台同时登录时才需要传；
-        空表示按固定顺序挑第一个连上的。
+        空表示按固定顺序挑第一个连上的。**只传一次就记住** —— 单点某个账户登录
+        时界面不会传 feed，不能把它清掉。
         """
-        self.stop(wait=True)
+        if feed:
+            self.feed = feed
         self.spec = spec
         self.period = period
-        self.feed = feed
-        worker = LiveWorker(spec, symbol, exchange, period, need_history, feed)
+        for s in _as_list(spec):
+            name = _session_key(s)
+            old = self._sessions.get(name)
+            if old is not None:
+                # 已经连着了：品种 / 周期没变就原样留着。重复 start 等于把用户
+                # 刚点的那条会话掐掉再重开，盘口会闪一下、委托列表也会空一拍
+                if old.symbol == symbol and old.period == period:
+                    continue
+                self.stop_one(name, wait=True)
+            self._start_one(s, name, symbol, exchange, period, need_history)
+
+    def _start_one(self, spec, name: str, symbol: str, exchange: str,
+                   period: str, need_history: bool) -> None:
+        sess = _Session(name, spec, (getattr(spec, "backend", "tq") or "tq"))
+        sess.symbol, sess.period = symbol, period
+        worker = LiveWorker(spec, symbol, exchange, period, need_history,
+                            self.feed)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.ready.connect(self.started)
-        worker.bars.connect(self.bars)
-        worker.state.connect(self.state)
+        worker.ready.connect(lambda key, n=name: self._on_ready(n, key))
+        worker.bars.connect(lambda df, n=name: self._on_bars(n, df))
+        worker.state.connect(lambda st, n=name: self._on_state(n, st))
         worker.log.connect(self.log)
-        worker.failed.connect(self.failed)
+        worker.failed.connect(lambda msg, n=name: self._on_failed(n, msg))
         worker.order_sent.connect(self.order_sent)
         # `run()` 有两种提前返回：连接失败、行情中断。两种都不会回到 while 循环，
         # 而线程的事件循环还开着 —— 不显式 quit 的话 `finished` 永不发，
@@ -366,31 +487,86 @@ class LiveController(QObject):
         # worker 循环结束就退线程，再让 Qt 回收
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_thread_finished)
-        self._worker, self._thread = worker, thread
+        thread.finished.connect(lambda n=name: self._on_thread_finished(n))
+        sess.worker, sess.thread = worker, thread
+        self._sessions[name] = sess
+        self._stop_notified = False
         thread.start()
+        self._emit_sessions()
 
     def stop(self, wait: bool = False) -> None:
-        worker, thread = self._worker, self._thread
-        if worker is None or thread is None:
-            return
-        self._worker, self._thread = None, None
-        worker.stop()
+        """断开**全部**账户。"""
+        for name in list(self._sessions):
+            self.stop_one(name, wait=wait)
+
+    def stop_one(self, name: str, wait: bool = False) -> bool:
+        """只断开这一个账户，其余会话照跑。返回是否真停了一条。"""
+        sess = self._sessions.pop(str(name or ""), None)
+        if sess is None or sess.worker is None:
+            return False
+        sess.worker.stop()
         if wait:
             # 最多等 5 秒：worker 里可能正卡在 wait_update(0.8) 或一次下载里
-            thread.quit()
-            thread.wait(5000)
+            sess.thread.quit()
+            sess.thread.wait(5000)
         else:
-            thread.quit()
+            sess.thread.quit()
+        # 这一路的账户快照要立刻扔掉，不然界面上它还挂在那儿（数字不再更新，
+        # 看着像「连着的账户不动了」）
+        self._emit_state()
+        self._emit_sessions()
+        return True
 
-    def _on_thread_finished(self) -> None:
+    # ---- worker 回传 ----
+
+    def _on_ready(self, name: str, key: str) -> None:
+        if name not in self._sessions:
+            return
+        self.key = key
+        if key and key != self._emitted_key:
+            self._emitted_key = key
+            self.started.emit(key)
+        self._emit_sessions()
+
+    def _on_bars(self, name: str, df) -> None:
+        """只转发**行情源**那一路的 K 线。
+
+        两条会话各推一份同一品种的 bar，都往上画就是「一根 bar 反复重算」。
+        """
+        sess = self._primary()
+        if sess is None or sess.name != name:
+            return
+        self.bars.emit(df)
+
+    def _on_state(self, name: str, st) -> None:
+        sess = self._sessions.get(name)
+        if sess is None:
+            return
+        sess.state = st
+        self._emit_state()
+
+    def _on_failed(self, name: str, msg: str) -> None:
+        # 只有一个账户时别加前缀（「天勤：还没连上柜台」读着别扭），多账户才加
+        if len(self._sessions) > 1:
+            msg = f"{name}：{msg}"
+        self.failed.emit(msg)
+
+    def _on_thread_finished(self, name: str) -> None:
+        self._sessions.pop(name, None)
+        self._emit_state()
+        self._emit_sessions()
+        if self._sessions or self._stop_notified:
+            return
+        self._stop_notified = True
+        self._emitted_key = ""
         self.stopped.emit()
 
     # ---- 界面操作：全部排队给 worker ----
 
     def place(self, symbol: str, direction: str, offset: str, volume: int,
               limit_price: float | None, account: str = "") -> bool:
-        if self._worker is None:
+        sess = self._session_for(account)
+        if sess is None or sess.worker is None:
             self.failed.emit("还没连上柜台，无法下单")
             return False
 
@@ -399,27 +575,52 @@ class LiveController(QObject):
                             account=account)
             self.order_sent.emit(oid)
 
-        self._worker.submit(job)
+        sess.worker.submit(job)
         return True
 
     def cancel(self, order_id: str, account: str = "") -> bool:
-        if self._worker is None:
+        sess = self._session_for(account)
+        if sess is None or sess.worker is None:
             self.failed.emit("还没连上柜台，无法撤单")
             return False
 
         def job(hub):
             hub.cancel(order_id, account=account)
 
-        self._worker.submit(job)
+        sess.worker.submit(job)
         return True
 
     def set_target(self, symbol: str, volume: int, account: str = "") -> bool:
         """把某个合约的目标净仓交给 TargetPosTask（自动交易用）。"""
-        if self._worker is None:
+        sess = self._session_for(account)
+        if sess is None or sess.worker is None:
             return False
 
         def job(hub):
             hub.set_target(symbol, volume, account=account)
 
-        self._worker.submit(job)
+        sess.worker.submit(job)
+        return True
+
+    def quote_of(self, symbol: str, account: str = "",
+                 timeout: float = 3.0) -> bool:
+        """取某个合约的最新价。**异步**：结果从 `quote_got` 回来。
+
+        取价要等行情推一帧（天勤新订阅第一次是 NaN、CTP 要等柜台推 tick），
+        放在主线程会把界面卡住 2~3 秒，所以排进 worker 队列。
+        """
+        sess = self._session_for(account)
+        if sess is None or sess.worker is None:
+            self.failed.emit("还没连上柜台，取不到最新价")
+            return False
+
+        def job(hub):
+            try:
+                info = hub.quote_of(symbol, account=account, timeout=timeout)
+            except Exception as exc:  # noqa: BLE001 - 取价失败不该炸掉整条会话
+                self.failed.emit(f"取最新价失败：{type(exc).__name__}: {exc}")
+                return
+            self.quote_got.emit(dict(info or {}, symbol=symbol))
+
+        sess.worker.submit(job)
         return True

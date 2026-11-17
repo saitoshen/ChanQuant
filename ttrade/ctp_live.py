@@ -446,6 +446,45 @@ class CtpHub:
     def bars(self) -> pd.DataFrame:
         return self._builder.frame()
 
+    def quote_of(self, symbol: str, timeout: float = 2.0) -> dict:
+        """取任意一个合约的最新 tick，给下单面板「填最新价」用。
+
+        和天勤那边同一个用途。CTP 没有「查一下报价」的接口，只能订阅然后等柜台
+        推 —— 订阅是幂等的，已经订过的合约再订一次没有副作用。
+
+        拿不到就返回空 dict（不在交易时段、合约代码不对、柜台没开行情都是这个
+        结果）。**不返回 0**：0 价的限价单会被柜台按「价格不合法」拒掉，而界面上
+        看着像是填好了。
+
+        必须在 worker 线程里调（要 `sleep` 等推送）。
+        """
+        if self.md is None:
+            raise CtpError(f"{self.PLATFORM} 这条会话没有行情连接，取不到最新价")
+        ins = ctp_instrument(symbol)
+        if not ins:
+            raise CtpError("合约代码为空")
+        self.md.subscribe([ins])
+        end = time.time() + max(0.5, float(timeout))
+        tick: dict = {}
+        while time.time() < end:
+            tick = self.md.last(ins) or {}
+            if float(tick.get("last") or 0) > 0:
+                break
+            time.sleep(0.2)
+        last = float(tick.get("last") or 0)
+        if last <= 0:
+            return {}
+        return {
+            "symbol": ins,
+            "instrument": ins,
+            "last": last,
+            "bid": float(tick.get("bid") or 0),
+            "ask": float(tick.get("ask") or 0),
+            "tick": 0.0,
+            "datetime": str(tick.get("datetime") or ""),
+            "source": "live",
+        }
+
     # ---- 读 ----
 
     def state(self) -> LiveState:

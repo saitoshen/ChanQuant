@@ -587,6 +587,57 @@ class LiveHub:
 
     # ---- 读 ----
 
+    def quote_of(self, symbol: str, timeout: float = 3.0) -> dict:
+        """取**任意一个**合约的最新盘口，给下单面板「填最新价」用。
+
+        和 `state()["quote"]` 的区别：那个是当前订阅的主连，只会有一个；这里按
+        合约现取。下单面板的合约和图上看的品种经常不是一个（图上 rb、手上要下
+        m2601），所以必须有这条路径。
+
+        **必须在 worker 线程里调**（内部会 `wait_update`）。新订阅第一次通常拿不到
+        数据，`last_price` 是 NaN —— 要等一两轮推送。所以这里带墙钟上限轮询，
+        拿不到就返回空 dict，让界面说「还没拿到这个合约的行情」，而不是把 NaN
+        当成 0 填进价格框（0 价的限价单会被柜台按「价格不合法」拒掉）。
+
+        `symbol` 必须是天勤写法 `SHFE.rb2601`；主连 `KQ.m@` 也能取，但下单要用
+        真实合约，所以界面上不该出现它。
+        """
+        if self.api is None:
+            raise RuntimeError("还没连接")
+        sym = str(symbol or "").strip()
+        if not sym or "." not in sym:
+            raise ValueError(f"要天勤写法的合约（如 SHFE.rb2601），收到 {symbol!r}")
+        q = self.api.get_quote(sym)
+
+        def num(name: str) -> float:
+            """NaN 也是「没数据」。`self._num` 会把 NaN 原样返回（float('nan')
+            不抛异常），而 NaN 是 truthy —— 直接拿它做判断会一路走到把 NaN 填进
+            价格框。这里统一归到 0。"""
+            v = self._num(q, name, 0.0)
+            return 0.0 if v != v else v
+
+        end = time.time() + max(0.5, float(timeout))
+        while time.time() < end:
+            if num("last_price"):
+                break
+            try:
+                self.api.wait_update(deadline=time.time() + 0.5)
+            except Exception:  # noqa: BLE001 - 抢不到推送就再转一圈，超时由墙钟兜
+                break
+        last = num("last_price")
+        if not last:
+            return {}
+        return {
+            "symbol": getattr(q, "symbol", "") or sym,
+            "instrument": getattr(q, "instrument_id", "") or "",
+            "last": float(last),
+            "bid": num("bid_price1"),
+            "ask": num("ask_price1"),
+            "tick": num("price_tick"),
+            "datetime": str(getattr(q, "datetime", "") or ""),
+            "source": "live",
+        }
+
     def bars(self) -> pd.DataFrame:
         """实时 K 线。
 

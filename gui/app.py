@@ -1522,6 +1522,8 @@ class MainWindow(QMainWindow):
 
         self.trade_page.connect_requested.connect(self._on_trade_connect)
         self.trade_page.disconnect_requested.connect(self._on_live_stop)
+        # 账户表每行的「登出」：只断开这一个账户，别的会话照跑
+        self.trade_page.disconnect_one.connect(self._on_live_stop_one)
         self._wire_live()
         self._wire_study_live()
 
@@ -7000,6 +7002,17 @@ class MainWindow(QMainWindow):
     def _on_live_stop(self) -> None:
         self.live.stop(wait=False)
         self.lbl_live_msg.setText("实时已停止")
+
+    def _on_live_stop_one(self, name: str) -> None:
+        """只断开一个账户（账户表每行的「登出」）。
+
+        不断研究页那条行情会话：它和账户是两条独立的连接，账户全断完了 K 线
+        也不必跟着停（用户可能正拿它看图）。
+        """
+        if self.live.stop_one(name):
+            self.trade_page.on_log(f"已断开「{name}」")
+        else:
+            self.trade_page.on_log(f"「{name}」本来就没连着")
 
     # ---- 研究页的实时（手动） ----
 
