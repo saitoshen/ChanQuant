@@ -98,6 +98,12 @@ def _pnl(v) -> str:
     return "—" if f is None else f"{f:+,.2f}"
 
 
+def _px(v) -> str:
+    """盘口价：0 / NaN 都是「没有这一档」，画「—」而不是 0.00。"""
+    f = _num(v)
+    return "—" if not f else f"{f:,.2f}"
+
+
 def _avg_price(r: dict) -> str:
     """开仓均价。锁仓时两边都有，按净头寸取；只有一边就取那一边。"""
     pl = _num(r.get("open_price_long"))
@@ -561,10 +567,20 @@ class TradePage(QWidget):
         # 账户列表摆在资金卡和持仓之间：上面是「一共多少钱」，中间是「钱分在
         # 哪几个户里」，下面是「这些户里有什么仓」。反过来先看持仓再找归属，
         # 多账户时每次都要在心里做一次分组。
-        root.addWidget(self._wrap("账户", self._build_accounts(), with_btn="账户", hint=(
+        #
+        # 「报价」框和账户框并排：左边是「钱分在哪几个户里」，右边是「这些户里
+        # 的合约现在什么价」。双击报价行 → 合约 + 最新价直接带到最下面的手动
+        # 下单行，省掉「翻代码、抄价格」这两步最容易抄错的动作。
+        top = QSplitter(Qt.Horizontal)
+        top.setChildrenCollapsible(False)
+        top.addWidget(self._wrap("账户", self._build_accounts(), with_btn="账户", hint=(
             "勾选决定连接哪些账户、上面资金卡和下面三张表统计哪些账户。"
             "双击某一行 = 只看这一个。"
-        )), 0)
+        )))
+        top.addWidget(self._wrap("报价", self._build_quotes(), with_btn="报价",
+                                 hint="双击一行 → 合约和价格带到下面下单行"))
+        top.setSizes([720, 400])
+        root.addWidget(top, 0)
 
         split = QSplitter(Qt.Horizontal)
         split.addWidget(self._wrap("持仓", self._build_positions(), with_btn=None))
@@ -688,11 +704,23 @@ class TradePage(QWidget):
                     b.setFixedWidth(32)
                 b.clicked.connect(slot)
                 head.addWidget(b)
+        elif with_btn == "报价":
+            for text, tip, slot in (
+                ("＋", "把下单框里的合约加进报价框", self._watch_add),
+                ("－", "从报价框删掉选中行（持仓里的合约会自己回来）", self._watch_del),
+            ):
+                b = QPushButton(text)
+                b.setObjectName("Ghost")
+                b.setToolTip(tip)
+                b.setFixedWidth(32)
+                b.clicked.connect(slot)
+                head.addWidget(b)
         lay.addLayout(head)
         lay.addWidget(table, 1)
         return card
 
-    def _table(self, headers: list[str], check: bool = False) -> QTableWidget:
+    def _table(self, headers: list[str], check: bool = False,
+               stretch: int | None = 0) -> QTableWidget:
         t = QTableWidget(0, len(headers))
         t.setHorizontalHeaderLabels(headers)
         t.verticalHeader().setVisible(False)
@@ -702,27 +730,45 @@ class TradePage(QWidget):
         t.setShowGrid(False)
         t.setAlternatingRowColors(False)
         h = t.horizontalHeader()
-        h.setSectionResizeMode(0, QHeaderView.Stretch if not check else QHeaderView.Interactive)
         # **不要用 `ResizeToContents`**。它对每一次 `setItem` 都重算全部行的高度
         # 与宽度，而我们是整表重建（一天几百条委托）：同样的 200 行，第一次填
         # 28ms，第二次 12 秒 —— 挂上一笔新委托正好触发第二次，界面直接冻住。
         # 改成固定模式 + 填完调一次 `_fit_columns()`，同一场景 30ms。
-        for i in range(1, len(headers)):
+        #
+        # `stretch` 是「吃剩余宽度的那一列」。**不能默认第 0 列**：三张表第 0 列
+        # 都是「资金账户」（就那么几个字），让它吃剩余的话整列被拉得极宽，真正
+        # 该宽的「合约 / 说明」反而只有 90px。
+        for i in range(len(headers)):
             h.setSectionResizeMode(i, QHeaderView.Interactive)
             t.setColumnWidth(i, 90)
+        if stretch is not None and 0 <= stretch < len(headers):
+            h.setSectionResizeMode(stretch, QHeaderView.Stretch)
         if check:
             t.setColumnWidth(0, 150)
         return t
 
-    def _fit_columns(self, t: QTableWidget, skip: int = 1) -> None:
+    def _fit_columns(self, t: QTableWidget, skip: int = 0,
+                     stretch: int | None = None) -> None:
         """填完之后按内容定一次列宽。
 
-        第 0 列是 Stretch（合约名占满剩余），不参与；其余列各算一次，
-        200 行 8 列实测 30ms 上下。带勾选框的账户表第 0 列也不是 Stretch，
-        用 `skip=0` 让它一起算。
+        `stretch` 那一列由 QHeaderView 自己吃剩余宽度，不能参与
+        `resizeColumnToContents`（会把它的 Stretch 模式顶掉、钉成定宽）。
+        200 行 8 列实测 30ms 上下。
         """
         for j in range(skip, t.columnCount()):
+            if stretch is not None and j == stretch:
+                continue
             t.resizeColumnToContents(j)
+
+    def _clamp_col(self, t: QTableWidget, col: int, max_w: int) -> None:
+        """按内容定宽，但封顶。
+
+        「资金账户」列原先由 Stretch 吃掉全部剩余宽度，一列比整个表还宽；
+        纯按内容算又可能被一个超长账户名顶开。所以先按内容、再封顶。
+        """
+        t.resizeColumnToContents(col)
+        if t.columnWidth(col) > max_w:
+            t.setColumnWidth(col, max_w)
 
     def _build_accounts(self) -> QTableWidget:
         # 第 1 列是**每行一个登录 / 登出按钮**。放在「账户」右边而不是最右边：
@@ -750,24 +796,67 @@ class TradePage(QWidget):
         return self.tbl_accts
 
     def _build_positions(self) -> QTableWidget:
+        # 「合约」列吃剩余宽度（`stretch=1`）：它是这一列里唯一长度不定的
         self.tbl_pos = self._table(
             ["资金账户", "合约", "净", "多", "空", "今多", "今空",
-             "开仓均价", "浮动盈亏", "保证金"]
+             "开仓均价", "浮动盈亏", "当日盈亏", "保证金"],
+            stretch=1,
+        )
+        self.tbl_pos.setToolTip(
+            "浮动盈亏 = 相对**开仓均价**的盈亏（开仓到现在）。\n"
+            "当日盈亏 = 相对**昨结算**的持仓盈亏，柜台直接给的口径。\n"
+            "两者在「今天开的仓」上数值相同，隔夜仓才会分开。"
         )
         return self.tbl_pos
 
     def _build_orders(self) -> QTableWidget:
+        # 「说明」列吃剩余宽度：拒单理由是这里唯一说不准长度的一列
         self.tbl_orders = self._table(
             ["资金账户", "时间", "合约", "方向", "开平", "委托", "剩余", "价格",
-             "状态", "说明"]
+             "状态", "说明"],
+            stretch=9,
         )
         return self.tbl_orders
 
     def _build_trades(self) -> QTableWidget:
         self.tbl_trades = self._table(
-            ["资金账户", "时间", "合约", "方向", "开平", "价格", "手数"]
+            ["资金账户", "时间", "合约", "方向", "开平", "价格", "手数", "平仓盈亏"],
+            stretch=2,
+        )
+        self.tbl_trades.setToolTip(
+            "平仓盈亏是**估算值**：两个柜台的成交回报里都没有盈亏字段，只能按\n"
+            "「成交价 − 该方向开仓均价」× 手数 × 乘数倒推。\n"
+            "开仓单记 0；开仓均价取不到时显示「—」（不是 0）。"
         )
         return self.tbl_trades
+
+    def _build_quotes(self) -> QTableWidget:
+        """「报价」框：盯着的合约各一行。
+
+        盯哪些合约 = 持仓里的 + 下单框里填的 + 手动「＋」加的。持仓合约自动
+        进来，不用一个个手打 —— 这是这个框最有用的地方。
+        """
+        # 「合约」列吃剩余宽度，其余固定
+        self.tbl_quotes = self._table(
+            ["合约", "最新", "涨跌", "买价", "卖价", "时间"], stretch=0)
+        self.tbl_quotes.setMaximumHeight(150)
+        self.tbl_quotes.setToolTip(
+            "自动盯：持仓里的合约、下单框里填的合约。\n"
+            "「＋」把下单框当前的合约加进来，「－」删掉选中行。\n"
+            "**双击一行** = 合约和最新价直接填到底下的手动下单行。"
+        )
+        self.tbl_quotes.itemDoubleClicked.connect(self._on_quote_dbl)
+        # 数字列钉定宽，**不按内容自适应**：这张卡片只有 300~450 像素，按内容算
+        # （表头两个字 + 一列 2 位小数）会要 600 多，直接顶出一条横向滚动条，
+        # 「合约」那列还被挤到只剩一半。这里给够显示 `-120.50` 的宽度就够了。
+        for j, w in enumerate((70, 70, 62, 62, 70), start=1):
+            self.tbl_quotes.setColumnWidth(j, w)
+        # 手动加进来的合约（`SHFE.rb2601` 天勤写法）。持仓那部分是每轮从快照
+        # 推的，不存在这里 —— 否则平了仓还得手动删，越积越多
+        self._watch_extra: list[str] = []
+        # 上一次真的发给柜台的那批合约。每轮比对，变了才重新订阅
+        self._watch_sent: tuple = ()
+        return self.tbl_quotes
 
     def _build_order_panel(self) -> QWidget:
         card = QWidget()
@@ -1481,7 +1570,9 @@ class TradePage(QWidget):
             "pos", pos, self._fill_positions,
             tuple((r.get("account"), r.get("symbol"), r.get("pos"),
                    r.get("pos_long_today"), r.get("pos_short_today"),
-                   round(r.get("float_profit") or 0, 2), round(r.get("margin") or 0, 2))
+                   round(r.get("float_profit") or 0, 2),
+                   round(r.get("position_profit") or 0, 2),
+                   round(r.get("margin") or 0, 2))
                   for r in pos),
             force,
         )
@@ -1493,7 +1584,21 @@ class TradePage(QWidget):
         )
         self._fill_if_changed(
             "trd", trds, self._fill_trades,
-            tuple((r.get("account"), r.get("trade_id")) for r in trds),
+            tuple((r.get("account"), r.get("trade_id"),
+                   round(r.get("close_profit") or 0, 2)) for r in trds),
+            force,
+        )
+
+        # 报价框：数据来自 worker 盯的那批合约，盯哪些由「持仓 + 下单框 +
+        # 手动加的」决定。先同步订阅，再画表 —— 反过来的话刚加的合约要等
+        # 下一轮（0.4 秒后）才出现，看着像没加上
+        self._sync_watch(pos)
+        quotes = st.quotes or []
+        self._fill_if_changed(
+            "quo", quotes, self._fill_quotes,
+            tuple((r.get("symbol"), round(r.get("last") or 0, 3),
+                   round(r.get("bid") or 0, 3), round(r.get("ask") or 0, 3),
+                   r.get("datetime")) for r in quotes),
             force,
         )
 
@@ -1558,22 +1663,28 @@ class TradePage(QWidget):
         t = self.tbl_pos
         t.setRowCount(len(rows))
         for i, r in enumerate(rows):
+            day = r.get("position_profit")
             vals = [
                 r.get("account", ""), r["symbol"], str(r["pos"]),
                 str(r["pos_long"]), str(r["pos_short"]),
                 str(r["pos_long_today"]), str(r["pos_short_today"]),
                 _avg_price(r),
-                _pnl(r["float_profit"]),
+                _pnl(r.get("float_profit")),
+                _pnl(day),
                 _money(r["margin"]),
             ]
             for j, v in enumerate(vals):
                 item = QTableWidgetItem(v)
+                # 8 = 浮动盈亏、9 = 当日盈亏，各自按自己的数着色（两者可能一红一绿）
                 if j == 8:
-                    item.setForeground(QColor(C_UP if r["float_profit"] > 0 else C_DOWN))
+                    item.setForeground(QColor(_color(r.get("float_profit"))))
+                elif j == 9:
+                    item.setForeground(QColor(_color(day)))
                 if j > 1:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 t.setItem(i, j, item)
-        self._fit_columns(t, skip=2)
+        self._fit_columns(t, stretch=1)
+        self._clamp_col(t, 0, 110)
 
     def _fill_orders(self, rows: list[dict]) -> None:
         t = self.tbl_orders
@@ -1594,23 +1705,172 @@ class TradePage(QWidget):
                 if j in (5, 6, 7):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 t.setItem(i, j, item)
-        self._fit_columns(t, skip=2)
+        self._fit_columns(t, stretch=9)
+        self._clamp_col(t, 0, 110)
 
     def _fill_trades(self, rows: list[dict]) -> None:
         t = self.tbl_trades
         t.setRowCount(len(rows))
         for i, r in enumerate(rows):
+            pnl = r.get("close_profit")
             vals = [
                 r.get("account", ""), r.get("time", ""),
                 r["symbol"], r["direction"], r["offset"],
                 f"{r['price']:.2f}", str(r["volume"]),
+                _pnl(pnl),
             ]
             for j, v in enumerate(vals):
                 item = QTableWidgetItem(v)
-                if j in (5, 6):
+                if j == 7:
+                    item.setForeground(QColor(_color(pnl)))
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                elif j in (5, 6):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 t.setItem(i, j, item)
-        self._fit_columns(t, skip=2)
+        self._fit_columns(t, stretch=2)
+        self._clamp_col(t, 0, 110)
+
+    # ---------------------------------------------------------- 报价框
+
+    def _watch_add(self) -> None:
+        """「＋」：把下单框里的合约加进报价框。"""
+        sym, _ex = self._resolve_contract(self.cb_contract.currentText())
+        if not sym:
+            self.lbl_order_msg.setText(
+                "合约框里没有能认的合约代码，先填 rb2601 这种再点「＋」")
+            return
+        if sym not in self._watch_extra:
+            self._watch_extra.append(sym)
+        # 清掉「上次发过的」，下一轮 on_state 会比出差异重新订阅
+        self._watch_sent = ()
+        self.lbl_order_msg.setText(f"报价框已加入 {sym}")
+
+    def _watch_del(self) -> None:
+        """「－」：从报价框删掉选中行。
+
+        持仓里的合约删不掉（删了下一轮又会被持仓推回来），这种情况直接说明
+        原因 —— 否则用户会以为按钮坏了。
+        """
+        row = self.tbl_quotes.currentRow()
+        if row < 0:
+            self.lbl_order_msg.setText("先在报价框里选中一行")
+            return
+        item = self.tbl_quotes.item(row, 0)
+        sym = str(item.data(Qt.UserRole) or "") if item is not None else ""
+        if not sym:
+            return
+        if sym in self._watch_extra:
+            self._watch_extra.remove(sym)
+            self._watch_sent = ()
+            self.lbl_order_msg.setText(f"已从报价框删掉 {sym}")
+        else:
+            self.lbl_order_msg.setText(
+                f"{sym} 是持仓 / 下单框里的合约，平仓或改掉合约后会自动消失")
+
+    def _on_quote_dbl(self, item) -> None:
+        """双击报价行 → 合约和最新价填进最底下的手动下单行。
+
+        填的是**裸合约代码**（`rb2601`），和下单面板的口径一致（交易所在
+        `_resolve_contract` 里反查）。勾了「市价」就不动价格框 —— 市价单
+        填数字没有意义，改了反而让人以为那个价会生效。
+        """
+        row = item.row() if item is not None else -1
+        if row < 0:
+            return
+        cell = self.tbl_quotes.item(row, 0)
+        if cell is None:
+            return
+        code = cell.text().strip()
+        sym = str(cell.data(Qt.UserRole) or "") or code
+        if not code:
+            return
+        self.cb_contract.setCurrentText(code)
+        self._order_symbol = sym
+        self._auto_contract = ""      # 别让行情推送把合约改回主力
+        last = _num(cell.data(Qt.UserRole + 1), 0.0) or 0.0
+        if last > 0:
+            if not self.chk_market.isChecked():
+                self.sp_price.setValue(last)
+            self._priced_for = sym
+            self.lbl_order_msg.setText(
+                f"已带入 {code} @ {last:g}，确认手数和方向后点「下单」")
+            return
+        self.lbl_order_msg.setText(f"已带入 {code}，还没拿到最新价，正在取…")
+        self._fill_price()
+
+    def _watch_targets(self, pos_rows: list[dict]) -> list[str]:
+        """报价框该盯哪些合约：持仓 → 下单框 → 手动加的，统一成天勤写法。
+
+        CTP 的持仓给的是裸代码 `rb2601`，`get_quote` 认不出交易所，所以这里
+        过一遍 `_resolve_contract` 补成 `SHFE.rb2601`；补不出来的直接不要
+        （猜交易所会把报价订到一个不存在的合约上，那一行永远是「—」）。
+        """
+        want: list[str] = []
+
+        def push(raw) -> None:
+            s = str(raw or "").strip()
+            if not s:
+                return
+            s, _ex = self._resolve_contract(s)
+            if s and s not in want:
+                want.append(s)
+
+        for r in pos_rows or ():
+            push(r.get("symbol"))
+        push(self.cb_contract.currentText())
+        for sym in self._watch_extra:
+            push(sym)
+        return want
+
+    def _sync_watch(self, pos_rows: list[dict]) -> None:
+        """合约集合变了才重订行情。
+
+        每轮 `on_state` 都算一遍，但只有真的变了才排队给 worker —— 0.4 秒
+        重订一次会把柜台日志刷满，行情也跟着抖。
+        """
+        if not self.live.running:
+            return
+        want = self._watch_targets(pos_rows)
+        key = tuple(want)
+        if key == self._watch_sent:
+            return
+        self._watch_sent = key
+        if not key:
+            return
+        self.live.watch(list(key))
+
+    def _fill_quotes(self, rows: list[dict]) -> None:
+        t = self.tbl_quotes
+        t.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            sym = str(r.get("symbol") or "")
+            code = str(r.get("instrument") or "") or sym.rsplit(".", 1)[-1]
+            last = _num(r.get("last"), 0.0) or 0.0
+            pre = _num(r.get("pre_close"), 0.0) or 0.0
+            # 涨跌用昨结算比。拿不到昨结算就画「—」，别拿 0 当昨结
+            chg = (last - pre) if (last > 0 and pre > 0) else None
+            vals = [
+                code,
+                f"{last:.2f}" if last else "—",
+                _pnl(chg) if chg is not None else "—",
+                _px(r.get("bid")),
+                _px(r.get("ask")),
+                str(r.get("datetime") or "")[-8:],
+            ]
+            for j, v in enumerate(vals):
+                item = QTableWidgetItem(v)
+                item.setData(Qt.UserRole, sym)
+                if j in (1, 2):
+                    item.setForeground(QColor(_color(chg)))
+                if j >= 1:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                t.setItem(i, j, item)
+            # 双击要带走的「最新价」打在合约格上，省得再去读另一格的文字
+            cell = t.item(i, 0)
+            if cell is not None:
+                cell.setData(Qt.UserRole + 1, last)
+        # 这里**不做 `_fit_columns`**：列宽在 `_build_quotes` 里已经钉死，按内容
+        # 自适应会把这几个数字列顶宽到出滚动条（见那里的注释）
 
     # ---------------------------------------------------------- 操作
     def _cancel_selected(self) -> None:

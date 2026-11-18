@@ -43,7 +43,7 @@ from ttrade.ctp_client import (
     MdClient,
     TraderClient,
 )
-from ttrade.tqlive import LiveState, _mult_of
+from ttrade.tqlive import LiveState, _mult_of, est_close_pnl, update_open_avg
 
 # 大写合约代码的交易所。CZCE 的合约是 `TA601` 这种，郑商所历史上一直用大写；
 # 中金所 `IF2601` 也是大写。其余（上期/大商/能源/广期）全小写。
@@ -57,6 +57,27 @@ PERIOD_SEC = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "1d": 86
 
 
 _EX_MAP: dict[str, str] | None = None
+
+
+def _ctp_stamp(day: str, hms: str) -> str:
+    """CTP 的 `TradingDay` + `InsertTime` → `MM-DD HH:MM:SS`。
+
+    `InsertTime` 只有 `HH:MM:SS`，跨夜盘就得靠 `TradingDay`（`YYYYMMDD`）补
+    日期；只有一个时给哪个算哪个，都没有返回空串。
+    **绝不退化成返回委托说明** —— 那种「时间列里写着拒单理由」的样子，正是
+    这一列原先的 bug。
+    """
+    d = "".join(ch for ch in str(day or "") if ch.isdigit())
+    t = str(hms or "").strip()
+    if len(d) >= 8 and t:
+        return f"{d[4:6]}-{d[6:8]} {t}"
+    return t
+
+
+def _ctp_ts(day: str, hms: str) -> str:
+    """排序用的时间键：`YYYYMMDDHH:MM:SS`，比字符串大小就等于比时间先后。"""
+    d = "".join(ch for ch in str(day or "") if ch.isdigit())
+    return f"{d}{str(hms or '').strip()}"
 
 
 def variety_exchange(variety: str) -> str:
@@ -301,6 +322,10 @@ class CtpHub:
         self._last_query = 0.0
         self._query_turn = 1          # 0 = 该发持仓了，1 = 该发资金了
         self._lock = threading.Lock()
+        # 开仓均价缓存：成交的「平仓盈亏」靠它倒推（见 `tqlive.est_close_pnl`）
+        self._open_cache: dict = {}
+        # 「报价」框盯的合约。只存代码，行情对象按需订阅
+        self._watch_syms: list[str] = []
 
     # ---- 柜台适配（融航覆盖这四个） ----
 
@@ -487,6 +512,54 @@ class CtpHub:
 
     # ---- 读 ----
 
+    def watch(self, symbols) -> None:
+        """盯一列合约的 tick，给交易页的「报价」框用。
+
+        和 `quote_of()` 的区别：那个是「取一次价、等有值再返回」，这个是「订上
+        就一直读」。CTP 的 `SubscribeMarketData` 幂等，重复订没有副作用。
+
+        **必须在 worker 线程里调**（会动行情连接的订阅表）。
+        """
+        if self.md is None:
+            return
+        want: list[str] = []
+        for raw in symbols or ():
+            ins = ctp_instrument(raw)
+            if ins and ins not in want:
+                want.append(ins)
+        self._watch_syms = want
+        if not want:
+            return
+        try:
+            self.md.subscribe(want)
+        except Exception:  # noqa: BLE001 - 订不上就让那几行留着空值，别炸整条会话
+            pass
+
+    def _watch_rows(self) -> list[dict]:
+        """「报价」框的数据：盯着的每个合约一行。没 tick 的给 last=0。"""
+        out = []
+        for ins in self._watch_syms:
+            t = (self.md.last(ins) if self.md is not None else None) or {}
+            info = (self.trader.instruments.get(ins) if self.trader is not None else None) or {}
+            out.append({
+                "symbol": ins,
+                "instrument": ins,
+                "last": float(t.get("last") or 0.0),
+                "bid": float(t.get("bid") or 0.0),
+                "ask": float(t.get("ask") or 0.0),
+                "bid_vol": float(t.get("bid_vol") or 0.0),
+                "ask_vol": float(t.get("ask_vol") or 0.0),
+                "open": float(t.get("open") or 0.0),
+                "high": float(t.get("high") or 0.0),
+                "low": float(t.get("low") or 0.0),
+                "pre_close": float(t.get("pre_close") or 0.0),
+                "volume": float(t.get("volume") or 0.0),
+                "tick": float(info.get("tick") or 0.0),
+                "datetime": str(t.get("datetime") or ""),
+                "source": "live",
+            })
+        return out
+
     def state(self) -> LiveState:
         st = LiveState(connected=bool(self.trader and self.trader.logged_in.is_set()),
                        error=self.last_error, key=self.key, period=self.period,
@@ -498,6 +571,10 @@ class CtpHub:
         positions = self._positions(snap.get("positions") or {}, account)
         orders = self._orders(snap.get("orders") or {})
         trades = self._trades(snap.get("trades") or {})
+        # 顺序不能反：刚平光的仓这一轮已经不在持仓里，靠的正是缓存里上一轮
+        # 的均价；所以先刷新缓存，再倒推成交的平仓盈亏
+        update_open_avg(self._open_cache, positions)
+        est_close_pnl(trades, self._open_cache, self._mult)
         name = self.spec.name if self.spec is not None else self.PLATFORM
         row = self._account_row(name, account, positions, trades)
         st.account = account
@@ -511,6 +588,7 @@ class CtpHub:
                    "orders": orders, "trades": trades}
         }
         st.quote = self._quote()
+        st.quotes = self._watch_rows()
         return st
 
     def _mult(self, instrument: str) -> float:
@@ -603,6 +681,12 @@ class CtpHub:
             cost = float(p.get("price") or 0.0)          # CTP 的 OpenCost 是总成本
             total = long_q + short_q
             avg = (cost / (total * mult)) if total and cost else 0.0
+            # 多空分开的均价：两边都有仓时混用一个均值，算「成交平仓盈亏」必错
+            # （`cost_long/cost_short` 是 `ctp_client` 按 PosiDirection 分开记的）
+            cl = float(p.get("cost_long") or 0.0)
+            cs = float(p.get("cost_short") or 0.0)
+            avg_l = (cl / (long_q * mult)) if (long_q and cl > 0) else (avg if long_q else 0.0)
+            avg_s = (cs / (short_q * mult)) if (short_q and cs > 0) else (avg if short_q else 0.0)
             out.append({
                 "symbol": ins,
                 "pos": long_q - short_q,
@@ -610,10 +694,10 @@ class CtpHub:
                 "pos_short": short_q,
                 "pos_long_today": long_td,
                 "pos_short_today": short_td,
-                "open_price_long": avg if long_q else 0.0,
-                "open_price_short": avg if short_q else 0.0,
-                "open_cost_long": cost if long_q else 0.0,
-                "open_cost_short": cost if short_q else 0.0,
+                "open_price_long": avg_l,
+                "open_price_short": avg_s,
+                "open_cost_long": (cl or cost) if long_q else 0.0,
+                "open_cost_short": (cs or cost) if short_q else 0.0,
                 "float_profit": float(p.get("profit") or 0.0),
                 "float_profit_long": float(p.get("profit") or 0.0) if long_q else 0.0,
                 "float_profit_short": float(p.get("profit") or 0.0) if short_q else 0.0,
@@ -625,7 +709,7 @@ class CtpHub:
         return out
 
     def _orders(self, src: dict) -> list[dict]:
-        out, seen = [], set()
+        pairs, seen = [], set()
         for oid, o in src.items():
             # CTP 的委托在 orders 里同时以 OrderRef 和 OrderSysID 各存一份
             key = (o.get("order_sys_id") or o.get("order_ref") or oid,
@@ -636,7 +720,9 @@ class CtpHub:
             status = str(o.get("status") or "")
             vol = int(o.get("volume") or 0)
             traded = int(o.get("traded") or 0)
-            out.append({
+            day = str(o.get("trading_day") or "")
+            hms = str(o.get("insert_time") or "")
+            pairs.append((_ctp_ts(day, hms), {
                 "order_id": o.get("order_sys_id") or o.get("order_ref") or oid,
                 "symbol": str(o.get("instrument") or ""),
                 "direction": {"0": "BUY", "1": "SELL"}.get(str(o.get("direction")), str(o.get("direction") or "")),
@@ -649,12 +735,18 @@ class CtpHub:
                 # 拒单理由全在 StatusMsg 里（「50:已撤单报单被拒绝SHFE:价格跌破跌停板」），
                 # 只给「已撤单」等于什么都没说 —— 用户没法判断是价格错了还是权限不够
                 "last_msg": str(o.get("msg") or status),
+                # 「时间」列。**这一列曾经错成显示 `msg`**（委托说明），因为
+                # `ctp_client` 那时根本没读 InsertTime。现在两个字段都落下来了：
+                # InsertTime 只有 HH:MM:SS，要配 TradingDay 才拼得出跨夜的
+                # 「MM-DD HH:MM:SS」
                 "insert_date_time": 0.0,
-                "time": str(o.get("msg") or ""),
-            })
-        # 未成交的排前面：撤单要点的就是它们
-        out.sort(key=lambda r: (r["status"] != "ALIVE", r["symbol"]))
-        return out[:200]
+                "time": _ctp_stamp(day, hms),
+            }))
+        # 未成交的排前面：撤单要点的就是它们；同类里时间新的在上。
+        # 稳定排序 ⇒ 先按时间倒一遍，再按「是否活单」正一遍
+        pairs.sort(key=lambda kv: kv[0], reverse=True)
+        pairs.sort(key=lambda kv: kv[1]["status"] != "ALIVE")
+        return [kv[1] for kv in pairs][:200]
 
     def _trades(self, src: dict) -> list[dict]:
         out = []

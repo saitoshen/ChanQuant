@@ -646,6 +646,10 @@ class TraderClient:
                         "traded": 0,
                         "status": "被拒" if err else "已提交",
                         "msg": err,
+                        # 柜台回报里没有时间字段，只能记本地墙钟。界面「时间」列
+                        # 靠这两个键，缺了会退化成显示委托说明（见 _orders）
+                        "insert_time": time.strftime("%H:%M:%S"),
+                        "trading_day": time.strftime("%Y%m%d"),
                     }
                 if err:
                     outer.last_error = f"下单被拒：{err}"
@@ -665,6 +669,10 @@ class TraderClient:
                     "traded": int(getattr(pOrder, "VolumeTraded", 0) or 0),
                     "status": _STATUS.get(_s(getattr(pOrder, "OrderStatus", "")), "未知"),
                     "msg": _s(getattr(pOrder, "StatusMsg", "")),
+                    # 报单时间：InsertTime 只有 HH:MM:SS，配 TradingDay(YYYYMMDD)
+                    # 才能拼出跨日的 MM-DD HH:MM:SS；缺一个就只能显示半截
+                    "insert_time": _s(getattr(pOrder, "InsertTime", "")),
+                    "trading_day": _s(getattr(pOrder, "TradingDay", "")),
                 }
                 with outer._lock:
                     outer.orders[key] = row
@@ -738,7 +746,10 @@ class TraderClient:
                         ins, {"instrument": ins, "long": 0, "short": 0,
                               "long_yd": 0, "short_yd": 0,
                               "long_today": 0, "short_today": 0,
-                              "price": 0.0, "profit": 0.0, "margin": 0.0})
+                              "price": 0.0, "profit": 0.0, "margin": 0.0,
+                              # 多空分开记总成本：算「成交平仓盈亏」要知道**这一侧**
+                              # 的开仓均价，混在一个 price 里多空都有仓时必错
+                              "cost_long": 0.0, "cost_short": 0.0})
                     n = int(getattr(pInvestorPosition, "Position", 0) or 0)
                     yd = int(getattr(pInvestorPosition, "YdPosition", 0) or 0)
                     # 今仓单独记：上期所平今和平昨是两个指令，界面要能分开看
@@ -752,7 +763,12 @@ class TraderClient:
                         row["short_yd"] = yd
                         row["short_today"] = td
                     # OpenCost 是**总成本**（含乘数），不是单价
-                    row["price"] = _f(getattr(pInvestorPosition, "OpenCost", 0)) or row["price"]
+                    oc = _f(getattr(pInvestorPosition, "OpenCost", 0))
+                    row["price"] = oc or row["price"]
+                    if side == "long":
+                        row["cost_long"] = oc
+                    elif side == "short":
+                        row["cost_short"] = oc
                     row["profit"] += _f(getattr(pInvestorPosition, "PositionProfit", 0))
                     row["margin"] += _f(getattr(pInvestorPosition, "UseMargin", 0))
 

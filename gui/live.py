@@ -170,6 +170,19 @@ class HubSet:
         """按账户路由到它那条连接去取最新盘口（下单面板「填最新价」）。"""
         return self._owner(account).quote_of(symbol, timeout=timeout)
 
+    def watch(self, symbols) -> None:
+        """每个柜台各订一遍「报价」框要盯的合约。
+
+        **全订而不是只订行情源**：报价框显示的是行情源的价格，但行情源掉线时
+        会在剩下的柜台里换一路，事先只订一家的话换过去就全是「—」。订阅本身
+        幂等，多订十几行合约的代价可以忽略。
+        """
+        for hub in self.hubs.values():
+            try:
+                hub.watch(symbols)
+            except Exception:  # noqa: BLE001 - 一个柜台订不上不该拖死整条会话
+                pass
+
 
 class LiveWorker(QObject):
     """跑在实时线程里：（可选）补历史 → 连接各柜台 → 订阅 → 循环推进。
@@ -624,3 +637,31 @@ class LiveController(QObject):
 
         sess.worker.submit(job)
         return True
+
+    def watch(self, symbols) -> bool:
+        """让「报价」框盯一批合约（`SHFE.rb2601` 这种天勤写法）。
+
+        **所有会话都订**，不按账户路由：报价框显示的是行情源那一路的价格，而
+        行情源掉线时会在剩下的柜台里换一家 —— 只订当前选中账户那一路的话，换
+        过去就全是「—」。`merge_states` 已经保证只把行情源那份画出来。
+
+        **异步**：订上之后下一次 `state()` 才有数据（天勤要等第一帧 tick）。
+        调用方负责去重 —— 本函数每次都真的排队，0.4 秒一次会刷满柜台日志。
+        """
+        syms = [str(s) for s in (symbols or ()) if str(s or "").strip()]
+        if not syms:
+            return False
+
+        def job(hub):
+            try:
+                hub.watch(syms)
+            except Exception as exc:  # noqa: BLE001 - 订不上只是那几行空着
+                self.failed.emit(f"报价订阅失败：{type(exc).__name__}: {exc}")
+
+        sent = 0
+        for sess in list(self._sessions.values()):
+            if sess.worker is None:
+                continue
+            sess.worker.submit(job)
+            sent += 1
+        return sent > 0

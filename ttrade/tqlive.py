@@ -31,7 +31,7 @@ from . import daylimit, symbols_info
 from .paths import user_dir
 from .tqdata import PERIODS, resample, trading_days
 from .tqfetch import PERIOD_SEC, local_time
-from .tqsdk_symbols import contract_key, is_stock, trade_symbol
+from .tqsdk_symbols import contract_from_input, contract_key, is_stock, trade_symbol
 
 # 实时 K 线向天勤要多少根。10000 是单次上限；5m 的 10000 根约 208 个交易日，
 # 足够覆盖「界面开着放了一周」这种场景，再长的缺口应该走 update_main 补。
@@ -338,6 +338,42 @@ def _mult_of(contract: str) -> float:
     return val
 
 
+def _qnum(q, name: str, default: float = 0.0) -> float:
+    """行情对象上的数值字段，**NaN 一律当 0**。
+
+    天勤新订阅的第一帧、停牌、收盘后都是 `NaN`；`float('nan')` 不抛异常而且是
+    truthy —— 不归零就会一路漏到价格框里，0 价的限价单会被柜台按「价格不合法」
+    拒掉。所有读行情数值的地方都走这一处，别各写一遍。
+    """
+    try:
+        v = float(getattr(q, name, default))
+    except (TypeError, ValueError):
+        return default
+    return default if v != v else v
+
+
+def _quote_row(q, fallback_symbol: str = "") -> dict:
+    """把一个行情对象摊成一行普通 dict（「报价」框一行 / 盘口一条）。"""
+    return {
+        "symbol": str(getattr(q, "symbol", "") or fallback_symbol),
+        "instrument": str(getattr(q, "instrument_id", "") or ""),
+        "last": _qnum(q, "last_price"),
+        "bid": _qnum(q, "bid_price1"),
+        "ask": _qnum(q, "ask_price1"),
+        "bid_vol": _qnum(q, "bid_volume1"),
+        "ask_vol": _qnum(q, "ask_volume1"),
+        # 涨跌幅要拿昨结算比；pre_close 在天勤里就是昨结算，两个都取一下兜底
+        "pre_close": _qnum(q, "pre_close") or _qnum(q, "pre_settlement"),
+        "open": _qnum(q, "open"),
+        "high": _qnum(q, "highest"),
+        "low": _qnum(q, "lowest"),
+        "volume": _qnum(q, "volume"),
+        "tick": _qnum(q, "price_tick"),
+        "datetime": str(getattr(q, "datetime", "") or ""),
+        "source": "live",
+    }
+
+
 def _sum_accounts(rows: list[dict]) -> dict:
     """把多账户的资金合成一份，给「全选」时的顶部资金卡用。
 
@@ -351,6 +387,106 @@ def _sum_accounts(rows: list[dict]) -> dict:
     out["risk_ratio"] = (out["margin"] / bal) if bal > 0 else 0.0
     out["accounts"] = len(rows)
     return out
+
+
+# --------------------------------------------------- 成交的「平仓盈亏」估算
+#
+# 天勤的 `Trade` 和 CTP 的成交回报上**都没有任何盈亏字段**（只有价、量、
+# 方向、开平），所以「平仓盈亏」这一列只能自己倒推。口径是
+# `(成交价 − 该方向开仓均价) × 手数 × 乘数 × 方向`。两个柜台共用这一份实现，
+# 不允许各写一遍（同一个语义在两处各写一遍是这个项目的第一类 bug）。
+
+# 开仓均价的保鲜期。持仓被平光后 `Position` 整个消失、均价就没了，所以缓存
+# 上一轮；但隔夜后价格量级全变，拿昨天的均价算今天的平仓会凭空造出盈亏。
+_OPEN_AVG_TTL = 6 * 3600.0
+
+
+def _is_close_offset(offset) -> bool:
+    """这一笔是不是平仓单。
+
+    offset 空着当开仓：柜台漏推 offset 时，宁可算作开仓，也不要给一笔来路
+    不明的「平仓盈亏」——那个数会被当成真钱。
+    """
+    s = str(offset or "").upper()
+    return ("CLOSE" in s) or s in ("1", "3")
+
+
+def update_open_avg(cache: dict, positions, now: float = 0.0) -> dict:
+    """把一轮持仓快照里「有仓那一侧」的开仓均价记进缓存。
+
+    `cache` 形状 `{合约: [多头均价, 空头均价, 时间戳]}`。均价 <= 0 的那一侧
+    **不覆盖**旧值 —— 算不出来时留着上一轮的，别把能用的抹成 0。
+    """
+    ts = now or time.time()
+    for p in positions or ():
+        sym = str(p.get("symbol") or "")
+        if not sym:
+            continue
+        cur = cache.get(sym) or [0.0, 0.0, 0.0]
+        lg = float(p.get("open_price_long") or 0.0)
+        sh = float(p.get("open_price_short") or 0.0)
+        if lg > 0:
+            cur[0] = lg
+        if sh > 0:
+            cur[1] = sh
+        cur[2] = ts
+        cache[sym] = cur
+    # 过期的留着只会误导，顺手清掉（一天的合约数不过百，清起来不贵）
+    for sym in [k for k, v in cache.items() if ts - float(v[2] or 0.0) > _OPEN_AVG_TTL * 2]:
+        cache.pop(sym, None)
+    return cache
+
+
+def open_avg_of(cache: dict, symbol: str, now: float = 0.0,
+                ttl: float = _OPEN_AVG_TTL) -> tuple[float, float]:
+    """取某合约的 (多头均价, 空头均价)，过期的当没有。"""
+    row = cache.get(symbol) if cache else None
+    if not row:
+        return (0.0, 0.0)
+    ts = now or time.time()
+    if ts - float(row[2] or 0.0) > ttl:
+        return (0.0, 0.0)
+    return (float(row[0] or 0.0), float(row[1] or 0.0))
+
+
+def est_close_pnl(trades, cache: dict, mult_of=None, now: float = 0.0,
+                  ttl: float = _OPEN_AVG_TTL) -> list[dict]:
+    """就地给成交行补 `close_profit`（平仓盈亏，估算值）。
+
+    * 卖出平多：`+（成交价 − 多头均价）× 手数 × 乘数`
+    * 买入平空：`+（空头均价 − 成交价）× 手数 × 乘数`
+    * 开仓单：`0.0`
+    * 该方向均价拿不到 / 方向缺失：**`None`**
+
+    最后那条是重点：`None` 界面画「—」，`0.0` 画「0.00」。实盘上「平了但
+    不知道赚多少」和「这一笔刚好打平」是两回事，混成一个数会被当成真盈亏。
+    """
+    fn = mult_of or _mult_of
+    ts = now or time.time()
+    for t in trades or ():
+        t["close_profit"] = 0.0
+        if not _is_close_offset(t.get("offset")):
+            continue
+        sym = str(t.get("symbol") or "")
+        vol = int(t.get("volume") or 0)
+        price = float(t.get("price") or 0.0)
+        if not sym or vol <= 0 or price <= 0:
+            t["close_profit"] = None
+            continue
+        lg, sh = open_avg_of(cache, sym, ts, ttl)
+        d = str(t.get("direction") or "").upper()
+        if d.startswith("SELL"):
+            avg, sign = lg, 1.0            # 卖出平多：价越高越赚
+        elif d.startswith("BUY"):
+            avg, sign = sh, -1.0           # 买入平空：价越低越赚
+        else:
+            t["close_profit"] = None
+            continue
+        if avg <= 0:
+            t["close_profit"] = None
+            continue
+        t["close_profit"] = sign * (price - avg) * vol * float(fn(sym) or 1.0)
+    return trades
 
 
 @dataclass
@@ -373,6 +509,8 @@ class LiveState:
     period: str = ""
     underlying: str = ""
     quote: dict = field(default_factory=dict)
+    # 「报价」框：盯着的每个合约一行（持仓合约 + 下单框里的 + 手动加的）
+    quotes: list = field(default_factory=list)
     account: dict = field(default_factory=dict)
     positions: list = field(default_factory=list)
     orders: list = field(default_factory=list)
@@ -415,6 +553,7 @@ def merge_states(parts, feed: str = "") -> LiveState:
         period=src.period,
         underlying=src.underlying,
         quote=dict(src.quote or {}),
+        quotes=list(src.quotes or []),
     )
 
     acc_dicts: list[dict] = []
@@ -470,6 +609,13 @@ class LiveHub:
         self._accs: list[tuple[AccountSpec, object]] = []   # (配置, 天勤账户对象)
         self._order_book: dict = {}
         self._targets: dict = {}
+        # 开仓均价缓存：平仓盈亏靠它倒推（见 `update_open_avg`）。持仓一平光
+        # `Position` 就消失，不留一份上一轮的均价，那一列永远是「—」
+        self._open_cache: dict = {}
+        # 「报价」框盯的合约（`watch()` 设）。这里只存代码，真正的 quote 对象
+        # 在 `_watch` 里，`state()` 时逐个取最新价
+        self._watch_syms: list[str] = []
+        self._watch: dict = {}
         # 交易所对日内报单 / 撤单次数有硬上限。组合页的引擎和这里共用同一份
         # 落盘计数（同一个账户、同一个进程只能有一份）。多账户各自计数。
         self.limit = daylimit.DayLimit(self.spec.label() if self.spec else "账户")
@@ -568,6 +714,36 @@ class LiveHub:
         # 股票没有「主连 → 真实合约」这一步，订的就是能下单的那个代码
         self.underlying = tq_sym if is_stock(symbol, exchange) else ""
 
+    def watch(self, symbols) -> None:
+        """盯一列合约的盘口，给交易页的「报价」框用。
+
+        和 `subscribe()` 的分工：`subscribe` 是「画 K 线的那一个品种」，一条会话
+        只有一个；`watch` 是「随时要看最新价的十几个合约」，用 `get_quote()`
+        就够（不建 kline serial，不多占带宽）。幂等：重复传同一批只是命中缓存。
+
+        **必须在 worker 线程里调** —— `get_quote` 会动订阅状态。
+        """
+        if self.api is None:
+            return
+        want: list[str] = []
+        for raw in symbols or ():
+            sym = str(raw or "").strip()
+            if not sym:
+                continue
+            if "." not in sym:
+                sym, _ex = contract_from_input(sym)
+            if sym and sym not in want:
+                want.append(sym)
+        self._watch_syms = want
+        for sym in want:
+            if sym in self._watch:
+                continue
+            try:
+                self._watch[sym] = self.api.get_quote(sym)
+            except Exception:  # noqa: BLE001 - 单个合约拼错不该废掉整列
+                continue
+        for sym in [s for s in self._watch if s not in want]:
+            self._watch.pop(sym, None)
 
     # ---- 推进 ----
 
@@ -609,34 +785,18 @@ class LiveHub:
             raise ValueError(f"要天勤写法的合约（如 SHFE.rb2601），收到 {symbol!r}")
         q = self.api.get_quote(sym)
 
-        def num(name: str) -> float:
-            """NaN 也是「没数据」。`self._num` 会把 NaN 原样返回（float('nan')
-            不抛异常），而 NaN 是 truthy —— 直接拿它做判断会一路走到把 NaN 填进
-            价格框。这里统一归到 0。"""
-            v = self._num(q, name, 0.0)
-            return 0.0 if v != v else v
-
         end = time.time() + max(0.5, float(timeout))
         while time.time() < end:
-            if num("last_price"):
+            if _qnum(q, "last_price"):
                 break
             try:
                 self.api.wait_update(deadline=time.time() + 0.5)
             except Exception:  # noqa: BLE001 - 抢不到推送就再转一圈，超时由墙钟兜
                 break
-        last = num("last_price")
+        last = _qnum(q, "last_price")
         if not last:
             return {}
-        return {
-            "symbol": getattr(q, "symbol", "") or sym,
-            "instrument": getattr(q, "instrument_id", "") or "",
-            "last": float(last),
-            "bid": num("bid_price1"),
-            "ask": num("ask_price1"),
-            "tick": num("price_tick"),
-            "datetime": str(getattr(q, "datetime", "") or ""),
-            "source": "live",
-        }
+        return _quote_row(q, sym)
 
     def bars(self) -> pd.DataFrame:
         """实时 K 线。
@@ -669,8 +829,24 @@ class LiveHub:
             underlying=self.underlying,
         )
         st.quote = quote
+        st.quotes = self._watch_rows()
         self._fill_accounts(st)
         return st
+
+    def _watch_rows(self) -> list[dict]:
+        """「报价」框的数据：盯着的每个合约一行。
+
+        还没拿到第一帧的合约给 `last=0`（界面画「—」），不能漏掉这一行 ——
+        漏了的话用户加进去的合约会在表里「消失」，看着像没加成功。
+        """
+        out = []
+        for sym in self._watch_syms:
+            q = self._watch.get(sym)
+            if q is None:
+                out.append({"symbol": sym, "instrument": "", "last": 0.0})
+                continue
+            out.append(_quote_row(q, sym))
+        return out
 
     def _fill_accounts(self, st: LiveState) -> None:
         """按账户拷一份明细，再合并出总量。
@@ -685,6 +861,10 @@ class LiveHub:
                 ords = self._orders_snapshot(obj)
                 trds = self._trades_snapshot(obj)
                 acc = self._account_snapshot(obj)
+                # 平仓盈亏只能倒推：先用这一轮持仓刷新开仓均价，再拿它估成交。
+                # 顺序不能反 —— 刚平光的仓这一轮已经不在持仓里了，靠的正是缓存
+                update_open_avg(self._open_cache, pos)
+                est_close_pnl(trds, self._open_cache)
             except Exception as exc:  # noqa: BLE001
                 # 单个账户查不出来不该拖垮整页：其余账户照样能看能下单
                 self.last_error = f"{spec.name}：{type(exc).__name__}: {exc}"

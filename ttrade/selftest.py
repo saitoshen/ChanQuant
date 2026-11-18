@@ -9035,7 +9035,185 @@ def _run() -> tuple[bool, list[str]]:
     check("K线与信号：持仓与交易记录同源（含手数）", _chart_from_trades)
     check("资金曲线纵轴（线性 / 对数 / 亏穿退回）", _perf_yscale)
 
+    def _trade_pnl_quote():
+        """交易页四处：持仓「当日盈亏」、成交「平仓盈亏」、CTP 委托时间、「报价」框。
+
+        这四条**都不会报错，只会显示一个看着没问题的错东西** —— 所以逐条钉住：
+
+        * CTP 的委托「时间」列整列显示的是拒单理由（`_orders` 里把 `msg` 当
+          时间用，而 `ctp_client` 当年根本没读 `InsertTime`）；
+        * 平仓盈亏如果拿不到开仓均价就写 0，会被读成「这一笔刚好打平」；
+        * 「资金账户」列吃 Stretch 会把整列拉到比表还宽，该宽的合约/说明只剩 90px；
+        * 报价框双击要真把合约和价格写进下单行，否则「双击没反应」只能靠人眼发现。
+        """
+        import inspect
+
+        from PySide6.QtWidgets import QApplication, QHeaderView
+
+        from gui.live import LiveController
+        from gui.trade_page import TradePage
+        from ttrade import ctp_client
+        from ttrade.ctp_live import CtpHub, _ctp_stamp, _ctp_ts
+        from ttrade.tqlive import (LiveState, est_close_pnl, merge_states,
+                                   open_avg_of, update_open_avg)
+
+        # ---- 1. 成交的平仓盈亏：多空各用自己那侧的均价，开仓单 0，拿不到均价 None
+        cache: dict = {}
+        update_open_avg(cache, [{"symbol": "SHFE.rb2601",
+                                 "open_price_long": 3500.0,
+                                 "open_price_short": 3600.0}], now=1000.0)
+        if open_avg_of(cache, "SHFE.rb2601", now=1000.0) != (3500.0, 3600.0):
+            raise RuntimeError("开仓均价没按多空分开记")
+        trades = [
+            {"symbol": "SHFE.rb2601", "direction": "SELL", "offset": "CLOSE",
+             "price": 3550.0, "volume": 2},
+            {"symbol": "SHFE.rb2601", "direction": "BUY", "offset": "CLOSETODAY",
+             "price": 3500.0, "volume": 1},
+            {"symbol": "SHFE.rb2601", "direction": "BUY", "offset": "OPEN",
+             "price": 3500.0, "volume": 1},
+            {"symbol": "SHFE.rb9999", "direction": "SELL", "offset": "CLOSE",
+             "price": 3550.0, "volume": 1},
+        ]
+        est_close_pnl(trades, cache, lambda _s: 10.0, now=1000.0)
+        want = [1000.0, 1000.0, 0.0, None]
+        got = [t["close_profit"] for t in trades]
+        if got != want:
+            raise RuntimeError(f"平仓盈亏估错：应 {want}，实际 {got}"
+                               "（卖出平多/买入平空各用自己那侧均价；开仓 0；"
+                               "没均价必须是 None 不是 0）")
+        if any(open_avg_of(cache, "SHFE.rb2601", now=1000.0 + 7 * 3600)):
+            raise RuntimeError("开仓均价过了保鲜期还在用（隔夜会凭空造盈亏）")
+
+        # ---- 2. CTP 委托时间：MM-DD HH:MM:SS，**不许是委托说明**
+        if _ctp_stamp("20261118", "14:35:02") != "11-18 14:35:02":
+            raise RuntimeError(f"CTP 委托时间拼错：{_ctp_stamp('20261118', '14:35:02')!r}")
+        if _ctp_stamp("", "14:35:02") != "14:35:02":
+            raise RuntimeError("只有 InsertTime 时不该丢掉时间")
+        if _ctp_ts("20261118", "14:35:02") <= _ctp_ts("20261118", "09:01:00"):
+            raise RuntimeError("排序键没按时间递增")
+        hub = CtpHub([])
+        rows = hub._orders({
+            "ref1": {"order_sys_id": "sys1", "order_ref": "ref1",
+                     "instrument": "rb2601", "direction": "0", "offset": "0",
+                     "price": 3500.0, "volume": 2, "traded": 0,
+                     "status": "未成交", "msg": "已提交",
+                     "insert_time": "14:35:02", "trading_day": "20261118"},
+            "ref2": {"order_sys_id": "sys2", "order_ref": "ref2",
+                     "instrument": "rb2601", "direction": "1", "offset": "1",
+                     "price": 3400.0, "volume": 1, "traded": 1,
+                     "status": "已撤单",
+                     "msg": "50:已撤单报单被拒绝SHFE:价格跌破跌停板",
+                     "insert_time": "09:01:00", "trading_day": "20261118"},
+        })
+        if not rows or rows[0]["status"] != "ALIVE":
+            raise RuntimeError("未成交的委托没有排在最前面（撤单要点它们）")
+        if rows[0]["time"] != "11-18 14:35:02":
+            raise RuntimeError(f"未成交单的时间列是 {rows[0]['time']!r}，不是时间")
+        if "拒绝" in "".join(r["time"] for r in rows):
+            raise RuntimeError("委托「时间」列又显示成委托说明了")
+        if rows[0]["last_msg"] != "已提交":
+            raise RuntimeError("委托说明被挪没了（拒单理由要靠它看）")
+        spi_src = inspect.getsource(ctp_client)
+        if "InsertTime" not in spi_src or "TradingDay" not in spi_src:
+            raise RuntimeError("ctp_client 没把 InsertTime / TradingDay 落下来")
+
+        # ---- 3. 报价：只取行情源那一路
+        st = merge_states(
+            [("tq", LiveState(quotes=[{"symbol": "SHFE.rb2601", "last": 1.0}])),
+             ("ctp", LiveState(quotes=[{"symbol": "DCE.m2601", "last": 2.0}]))],
+            "ctp")
+        if [q["symbol"] for q in st.quotes] != ["DCE.m2601"]:
+            raise RuntimeError("报价没按行情源取一路（两个柜台的价会来回跳）")
+
+        # ---- 4. 界面：列、颜色、列宽、双击
+        app = QApplication.instance() or QApplication([])  # noqa: F841
+        page = TradePage(LiveController())
+        try:
+            pos_hdr = [page.tbl_pos.horizontalHeaderItem(i).text()
+                       for i in range(page.tbl_pos.columnCount())]
+            if "当日盈亏" not in pos_hdr:
+                raise RuntimeError(f"持仓表没有「当日盈亏」列：{pos_hdr}")
+            page._fill_positions([{
+                "account": "甲", "symbol": "SHFE.rb2601", "pos": 2,
+                "pos_long": 2, "pos_short": 0,
+                "pos_long_today": 2, "pos_short_today": 0,
+                "open_price_long": 3500.0, "open_price_short": 0.0,
+                "float_profit": 120.0, "position_profit": -80.0,
+                "margin": 7000.0,
+            }])
+            j = pos_hdr.index("当日盈亏")
+            if page.tbl_pos.item(0, j).text() != "-80.00":
+                raise RuntimeError(
+                    f"当日盈亏填成了 {page.tbl_pos.item(0, j).text()!r}"
+                    "（要柜台给的 position_profit，不是浮盈）")
+
+            trd_hdr = [page.tbl_trades.horizontalHeaderItem(i).text()
+                       for i in range(page.tbl_trades.columnCount())]
+            if "平仓盈亏" not in trd_hdr:
+                raise RuntimeError(f"成交表没有「平仓盈亏」列：{trd_hdr}")
+            page._fill_trades([
+                {"account": "甲", "time": "11-18 14:00:00",
+                 "symbol": "SHFE.rb2601", "direction": "SELL", "offset": "CLOSE",
+                 "price": 3550.0, "volume": 2, "close_profit": 250.0},
+                {"account": "甲", "time": "11-18 14:01:00",
+                 "symbol": "SHFE.rb2601", "direction": "BUY", "offset": "CLOSE",
+                 "price": 3550.0, "volume": 1, "close_profit": None},
+            ])
+            k = trd_hdr.index("平仓盈亏")
+            if page.tbl_trades.item(0, k).text() != "+250.00":
+                raise RuntimeError(f"平仓盈亏显示成 {page.tbl_trades.item(0, k).text()!r}")
+            if page.tbl_trades.item(1, k).text() != "—":
+                raise RuntimeError("拿不到均价的平仓盈亏要显示「—」，不是 0")
+
+            # 「资金账户」列不许吃 Stretch；该宽的那列才 Stretch
+            for tbl, wide in ((page.tbl_pos, 1), (page.tbl_orders, 9),
+                              (page.tbl_trades, 2)):
+                h = tbl.horizontalHeader()
+                if h.sectionResizeMode(0) == QHeaderView.Stretch:
+                    raise RuntimeError("「资金账户」列又在吃剩余宽度（整列会被拉爆）")
+                if h.sectionResizeMode(wide) != QHeaderView.Stretch:
+                    raise RuntimeError(f"第 {wide} 列应该是吃剩余宽度的那一列")
+
+            # 报价框：列、涨跌、双击带入下单行
+            q_hdr = [page.tbl_quotes.horizontalHeaderItem(i).text()
+                     for i in range(page.tbl_quotes.columnCount())]
+            if "最新" not in q_hdr or "买价" not in q_hdr:
+                raise RuntimeError(f"报价框列不对：{q_hdr}")
+            page._fill_quotes([{
+                "symbol": "SHFE.rb2601", "instrument": "rb2601",
+                "last": 3550.0, "bid": 3549.0, "ask": 3551.0,
+                "pre_close": 3500.0, "datetime": "2026-11-18 14:35:02",
+            }])
+            if page.tbl_quotes.item(0, 0).text() != "rb2601":
+                raise RuntimeError("报价框合约显示的不是裸代码")
+            if page.tbl_quotes.item(0, 1).text() != "3550.00":
+                raise RuntimeError("报价框最新价没填对")
+            if page.tbl_quotes.item(0, 2).text() != "+50.00":
+                raise RuntimeError(
+                    f"涨跌算错：{page.tbl_quotes.item(0, 2).text()!r}（要 3550−3500）")
+            page._on_quote_dbl(page.tbl_quotes.item(0, 0))
+            if page.cb_contract.currentText() != "rb2601":
+                raise RuntimeError("双击报价行没把合约带进下单行")
+            if abs(page.sp_price.value() - 3550.0) > 1e-6:
+                raise RuntimeError(
+                    f"双击报价行没把价格带进下单行：{page.sp_price.value()}")
+
+            # 盯哪些合约：持仓 + 下单框 + 手动加的，去重并归一成天勤写法
+            page.cb_contract.setCurrentText("rb2601")
+            page._watch_extra = ["SHFE.rb2601"]
+            got = page._watch_targets([{"symbol": "SHFE.rb2601"}])
+            if got != ["SHFE.rb2601"]:
+                raise RuntimeError(f"报价框合约没去重 / 没归一：{got}")
+        finally:
+            page.deleteLater()
+        return ("持仓当日盈亏走 position_profit（-80.00）、成交平仓盈亏按多空各侧均价"
+                "（+250.00 / 拿不到均价画「—」）、CTP 委托时间=11-18 14:35:02 而不是"
+                "委托说明、三表资金账户列不再吃 Stretch、报价框双击带入 "
+                "rb2601@3550 且合约去重归一")
+
     check("组合页工作区工具条：工作区一行、资金分配一行", _ws_bar_two_rows)
+
+    check("交易页：持仓当日盈亏 / 成交平仓盈亏 / CTP 委托时间 / 报价框", _trade_pnl_quote)
 
     # 跑完就把进度文件收掉：留着会让下一轮的诊断以为"上次崩过"。
     # 崩溃时走不到这里，文件正好留下最后一项的名字。
