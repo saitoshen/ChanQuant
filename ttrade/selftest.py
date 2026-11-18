@@ -3187,10 +3187,13 @@ def _run() -> tuple[bool, list[str]]:
         前视不会报错、不会让回测崩，只会把结果抬得好看，且**只在分钟周期
         上出现**（日线上看不出来）。所以必须有一个人守着的断言。
 
-        验证分两半：
+        验证分三半：
           ① `_asof(lag_days=1)` 把 D 的值推到 D+1 才可见
           ② 反证：同一份数据用 `lag_days=0` 时 D 当天就能看到 —— 说明这个
              断言真的能抓到前视，而不是恒真
+          ③ 扩张分位（`_pct_series`）只用「≤t」的值：把序列砍到第 200 天，
+             前 200 天的分位必须一模一样；反证「全样本分位」在这种砍法下一定
+             不等 —— 否则这条也是恒真的空断言
         """
         import numpy as np
         import pandas as pd
@@ -3225,8 +3228,43 @@ def _run() -> tuple[bool, list[str]]:
         n_codes = len(FM._LABEL)
         if n_codes < 20:
             raise RuntimeError(f"注册的宏观因子只有 {n_codes} 个，序列表被改小了")
+
+        # ③ 扩张分位不能吃未来：砍掉后面 100 天，前 200 天的分位必须一模一样。
+        #    这是宏观这条链路上**唯一**一处会碰到完整序列的地方 —— `_asof` 只管
+        #    「哪天的值可见」，管不了「分位是怎么算的」。要是哪天有人把
+        #    `expanding().rank()` 改成 `rank(pct=True)`（全样本分位），`_asof`
+        #    那两条照样全绿，而因子已经把未来三年的分布信息灌进今天了。
+        from ttrade import macro as M
+
+        n = 300
+        dd = pd.bdate_range("2024-01-01", periods=n)
+        vals = pd.Series(np.linspace(10.0, 40.0, n)
+                         + np.sin(np.arange(n) / 7.0), index=dd)
+        orig = M.series
+        try:
+            M.series = lambda code: vals                         # noqa: ARG005
+            FM.clear_cache()
+            f_full = FM._pct_series("usdcnh")
+            M.series = lambda code: vals[vals.index <= dd[199]]   # noqa: ARG005
+            FM.clear_cache()
+            f_half = FM._pct_series("usdcnh")
+        finally:
+            M.series = orig
+            FM.clear_cache()
+        a = f_full.reindex(dd[:200]).to_numpy(dtype=float)
+        b = f_half.reindex(dd[:200]).to_numpy(dtype=float)
+        if not np.allclose(a, b, equal_nan=True):
+            raise RuntimeError(
+                "砍掉第 200 天之后的宏观序列，前 200 天的分位就变了 —— "
+                "扩张分位用到了未来数据")
+        # 反证：全样本分位在同样的砍法下一定不等，否则上面那条是空断言
+        fs = vals.rank(pct=True).reindex(dd[:200]).to_numpy(dtype=float)
+        if np.allclose(a, fs, equal_nan=True):
+            raise RuntimeError("扩张分位等于全样本分位 —— 这条断言抓不到东西")
+
         return (f"{n_codes} 个宏观因子；发布日当天零可见、D+1 可见；"
-                f"反证 lag=0 立刻可见（断言有效）")
+                f"反证 lag=0 立刻可见；扩张分位砍掉后 100 天后前 200 天不变"
+                f"（且 ≠ 全样本分位）")
 
     check("宏观因子的发布日对齐（5m/1h 不前视）", _macro_pit)
 
