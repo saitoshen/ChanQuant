@@ -80,12 +80,29 @@ def _day(df: pd.DataFrame) -> pd.Series:
     return pd.Series(idx.normalize(), index=df.index)
 
 
+def _adate(df: pd.DataFrame) -> pd.Series:
+    """每根 bar 的**自然日**（日历日期）。
+
+    🔴🔴 日频外部序列（仓单 / 库存 / 利润 / 现货 / 交割量）的压缩与滞后**必须**
+    用这个键，不能用上面的 `_day`（交易日）。理由是 `_asof` 本身就是按**自然日**
+    as-of 的：EDB 的读数是「某一天收盘后才有」，所以它统一往后推一个**日历日**
+    （`lag_days=1`）。「哪根 bar 能看到哪一天的读数」这条边界画在自然日上。
+
+    混用 `trading_day` 会在夜盘那一段出问题：21:00 的 bar 交易日是**次日**，
+    按交易日分组会把它和「次日日盘」并成一格，`.last()` 取到的是**次日日盘**
+    的读数再映射回夜盘 —— 等于 21:00 就用上了「当日（次日）的日频数据」，
+    而那会儿盘面还拿不到。白天看不出来，只在夜盘段错。
+    """
+    idx = pd.DatetimeIndex(df.index)
+    return pd.Series(idx.normalize(), index=df.index)
+
+
 def _day_diff(df: pd.DataFrame, s: pd.Series, n: int) -> pd.Series:
-    """按**交易日**取 n 天变化（分钟线上不能直接 diff(n)）。"""
+    """按**自然日**取 n 天变化（分钟线上不能直接 diff(n)）。"""
     idx = s.index
     if not isinstance(idx, pd.DatetimeIndex) or len(idx) < 2:
         return s.diff(n)
-    day = _day(df)
+    day = _adate(df)
     if len(day) == len(day.unique()):
         return s.diff(n)
     daily = s.groupby(day).last()
@@ -93,18 +110,21 @@ def _day_diff(df: pd.DataFrame, s: pd.Series, n: int) -> pd.Series:
 
 
 def _day_shift(df: pd.DataFrame, s: pd.Series, n: int) -> pd.Series:
-    """按**交易日**取 n 天前的值（分钟线上不能直接 shift(n)）。
+    """按**自然日**取 n 天前的值（分钟线上不能直接 shift(n)）。
 
-    日频外部值（仓单 / 库存 / 利润）被 `_asof` 铺到分钟线之后，一整个交易日里
-    都是同一个数。这时候 `s.shift(5)` 量到的是「25 分钟前」、`s.pct_change(5)`
+    日频外部值（仓单 / 库存 / 利润）被 `_asof` 铺到分钟线之后，同一个**自然日**
+    里都是同一个数。这时候 `s.shift(5)` 量到的是「25 分钟前」、`s.pct_change(5)`
     也是 —— 同一天内全是 0，只有每天第一根是真值。因子看着有值，实际上一整天
     都退化成「昨天 vs 前 n 天」的一个常数，等于把日频因子废掉。
     必须先压成日频、算完再映射回 bar —— 和 `_day_diff` 同一套办法。
+
+    分组键用 `_adate`（自然日），理由见那里。价格类序列（`f_spot_basis_chg_5`
+    的分子）也走这里：它会在每根 bar 上变，但「多少天前」仍然按自然日数。
     """
     idx = s.index
     if not isinstance(idx, pd.DatetimeIndex) or len(idx) < 2:
         return s.shift(n)
-    day = _day(df)
+    day = _adate(df)
     if len(day) == len(day.unique()):
         return s.shift(n)
     daily = s.groupby(day).last().shift(n)
@@ -112,7 +132,7 @@ def _day_shift(df: pd.DataFrame, s: pd.Series, n: int) -> pd.Series:
 
 
 def _day_pct(df: pd.DataFrame, s: pd.Series, n: int) -> pd.Series:
-    """按**交易日**取 n 天变化率（分钟线上不能直接 `pct_change(n)`）。"""
+    """按**自然日**取 n 天变化率（分钟线上不能直接 `pct_change(n)`）。"""
     return _safe_div(s, _day_shift(df, s, n)) - 1.0
 
 
@@ -461,15 +481,25 @@ def _pct_rank(df: pd.DataFrame, s: pd.Series, n: int = 750,
     窗口 750 个交易日约三年：太短会被一个交割季带偏（仓单本身有强季节性），
     太长则新品种（碳酸锂、氧化铝上市不满三年）整列 NaN。
 
-    **窗口必须按交易日算，不能按 bar 算**：5 分钟线上一根日线快照被铺到几十
-    根 bar 上，直接 `s.rolling(750)` 量到的是「最近 15 个交易日」，出来的是
-    两周内的排名，不是三年分位 —— 而且它不会报错，只是悄悄变成另一个因子。
+    **窗口必须按天算，不能按 bar 算**：5 分钟线上一根日线快照被铺到几十根 bar
+    上，直接 `s.rolling(750)` 量到的是「最近 15 个交易日」，出来的是两周内的
+    排名，不是三年分位 —— 而且它不会报错，只是悄悄变成另一个因子。
     做法和 `_day_diff` 一样：压成日频算完再映射回去。
+
+    🔴 分组键是 `_adate`（**自然日**），不是 `_day`（交易日）。窗口 `[X-n+1, X]`
+    的最后一格是「自然日 X 能看到的最后一个读数」（= 序列里 <= X-1 那天），
+    正好是 `_asof(lag_days=1)` 给的边界。用交易日分组会把次日日盘的读数搬回
+    夜盘 —— 21:00 就用上「当日的日频数据」，而 `_asof` 自己是不允许的。
 
     只用向后看的 rolling rank，不用全样本 —— 全样本分位会把未来的分布
     泄露到今天的因子值里，是最隐蔽的一类未来函数。
+
+    🔴 **只能喂「同一个自然日内是常数」的日频外部序列**（`_fund()` 那几列：
+    仓单 / 库存 / 利润 / 现货 / 交割量）。窗口**包含 X 自己**那一格，外部值在
+    那格是 T-1 的读数没问题；但要是喂一条价格序列，那格就成了「当天的收盘价」
+    —— 上午 09:35 的 bar 拿它算分位，等于把收盘价提前用了。
     """
-    day = _day(df)
+    day = _adate(df)
     if len(day) == len(day.unique()):        # 日线：一天一根，直接滚
         return s.rolling(n, min_periods=minp).rank(pct=True)
     daily = s.groupby(day).last()

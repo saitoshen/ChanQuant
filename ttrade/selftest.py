@@ -3855,38 +3855,47 @@ def _run() -> tuple[bool, list[str]]:
 
 
     def _factor_daily_lag():
-        """日频外部因子铺到分钟线上：必须按**交易日**差分，且只吃 T-1 的值。
+        """日频外部因子铺到分钟线上：按**自然日**差分，且只吃 T-1 的读数。
 
-        EDB 的仓单 / 库存 / 利润 / 交割量、宏观的美元兑人民币，一天只有一个
-        数。`_asof(lag_days=1)` 把它铺到分钟线上 —— 一整个交易日里所有 bar 都
-        是同一个常数。这时候因子里的 `s.shift(5)` / `s.pct_change(5)` 量到的
-        是「5 根 bar 前」（5m 上就是 25 分钟），同一天里恒为 0，只有每天头
-        n 根才是真值。
+        EDB 的仓单 / 库存 / 利润 / 交割量一天只有一个数，`_asof(lag_days=1)`
+        把它铺到分钟线上 —— 同一个**自然日**里所有 bar 都是同一个常数。这时候
+        因子里的 `s.shift(5)` / `s.pct_change(5)` 量到的是「5 根 bar 前」（5m
+        上就是 25 分钟），同一天里恒为 0，只有每天头 n 根才是真值。方向和前视
+        相反，但一样隐蔽：因子有数、不报错、IC 还挺像样，实际是另一个东西。
 
-        方向和前视相反，但一样隐蔽：因子有数、不报错、IC 还挺像样，实际上是
-        另一个东西（「昨天的值 / 前 n 根 bar 那天的值」）。2026-11 用户问
-        「5m 用日频因子有没有偷未来」时顺着查出来的。
+        🔴🔴 **分组键必须是自然日，不能是交易日。** `_asof` 是按自然日 as-of
+        的（EDB 的读数是「某一天收盘后才有」，统一推后一个日历日），所以「哪根
+        bar 能看到哪一天的读数」这条边界画在自然日上。用 `trading_day` 分组会
+        把夜盘和次日日盘并成一格：21:00 那段的交易日是**次日**，`.last()` 取到
+        次日日盘的读数再搬回夜盘 —— 等于 21:00 就用上「当日的日频数据」。
+        这个构造特意带了**夜盘**（挂在上一交易日的日历日、交易日归次日），
+        不带夜盘的话两种分组键一模一样，测了也白测。
 
-        验四件事：
-          1. 同一交易日内的因子值是**常数**（说明按天算了，不是按 bar）
-          2. 值等于「T-1 的序列值 / T-1-n 的序列值」，不是「n 根 bar 前」
-          3. 改未来日期的数据，过去那些天的因子一动不动
-          4. 日线帧上 `_day_shift` / `_day_diff` 退化成普通 `shift` / `diff`
-             （不能为了分钟线把日线搞坏）
+        验五件事：
+          1. 同一个**自然日**内恒定（按交易日看会出现两个值，那正是错的）
+          2. 值 = 「自然日 X 能看到的读数 / 5 个交易日前的读数」，不是「n 根 bar 前」
+          3. 分位窗口的最后一格是「X 能看到的读数」，不是「X 当天或次日」的
+          4. 改未来日期的数据，过去那些天一动不动
+          5. 日线帧上 `_day_shift` / `_day_diff` 退化成普通 `shift` / `diff`
         """
         import numpy as np
         import pandas as pd
 
         from ttrade import factors_ext as FE
 
-        # --- 人造 5m 骨架：40 个交易日 × 每天 8 根（8 > 5，老实现会在
-        #     每天后 3 根退化成 0，这样才抓得住）
-        days = pd.bdate_range("2024-01-02", periods=40)
+        # --- 人造 5m 骨架：45 个交易日，每天「日盘 10 根 + 夜盘 6 根」。
+        #     夜盘挂在**上一交易日**的日历日 21:00–22:25，交易日归次日 ——
+        #     和真实夜盘一致。日盘根数 10 > 5，老实现会在日盘后 5 根退化成 0。
+        days = pd.bdate_range("2024-01-02", periods=45)
         stamps, tdays = [], []
-        for d in days:
-            for k in range(8):
+        for i, d in enumerate(days):
+            for k in range(10):                     # 日盘 09:00–09:45
                 stamps.append(d + pd.Timedelta(minutes=5 * k))
                 tdays.append(d)
+            if i + 1 < len(days):                   # 夜盘 21:00–22:25，归次日
+                for k in range(6):
+                    stamps.append(d + pd.Timedelta(hours=21, minutes=5 * k))
+                    tdays.append(days[i + 1])
         idx = pd.DatetimeIndex(stamps)
         n_bar = len(idx)
         # 收盘价逐 bar 递增一点点：`spot_basis_chg_5` 的分子要随 bar 变
@@ -3935,17 +3944,26 @@ def _run() -> tuple[bool, list[str]]:
             del_chg30 = FE.f_deliv_chg_30(df)
             bas_chg5 = FE.f_spot_basis_chg_5(df)
 
-            # 1. 同一交易日内恒定
-            day_key = pd.Series([d for d in tdays], index=idx)
+            # 1. 同一个**自然日**内恒定
+            adate = pd.Series(idx.normalize(), index=idx)
             for nm, s in (("war_val", war_val), ("war_chg_5", war_chg5),
                           ("inv_chg_5", inv_chg5), ("pro_chg_5", pro_chg5),
                           ("deliv_chg_30", del_chg30)):
-                nc = s.groupby(day_key).nunique(dropna=True)
+                nc = s.groupby(adate).nunique(dropna=True)
                 if (nc > 1).any():
                     bad = nc[nc > 1].index[0]
                     raise AssertionError(
-                        f"{nm} 在 {pd.Timestamp(bad).date()} 一天内有 "
-                        f"{int(nc.loc[bad])} 个不同值 —— 说明还在按 bar 差分")
+                        f"{nm} 在 {pd.Timestamp(bad).date()} 一个自然日内有 "
+                        f"{int(nc.loc[bad])} 个不同值 —— 要么还在按 bar 差分，"
+                        f"要么分组键用了交易日（夜盘段会拿到次日读数）")
+            # 反证：这个骨架必须真的把「夜盘段」和「日盘段」分成两个交易日
+            # 口径的值，否则按交易日分组的错法在这里测不出来（测试就变空了）
+            tkey = pd.Series([d for d in tdays], index=idx)
+            nc_t = war_chg5.groupby(tkey).nunique(dropna=True)
+            if not (nc_t > 1).any():
+                raise AssertionError(
+                    "骨架没造出「夜盘归次日」的效果 —— 按交易日分组也不会错，"
+                    "这条自检等于没测到东西")
 
             # 2. 值 = 两个交易日的序列值之比
             for i, d in enumerate(days):
@@ -3968,9 +3986,24 @@ def _run() -> tuple[bool, list[str]]:
                             f"war_chg_5 在 {d.date()} 是 {got5:.6f}，"
                             f"按交易日应是 {exp5:.6f}（老实现会算成 25 分钟）")
 
-            # 老实现会在每天后 3 根上退化成 0；按交易日算则一个 0 都不该有
+            # 老实现会在日盘后 5 根上退化成 0；按天算则一个 0 都不该有
             if (np.abs(war_chg5.dropna()) < 1e-12).any():
                 raise AssertionError("war_chg_5 出现了 0 值 —— 仍是按 bar 差分的")
+
+            # 2b. 分位窗口的最后一格必须是「这个自然日能看到的读数」。
+            #     用交易日分组会让夜盘段拿到次日日盘的读数 —— 那正是
+            #     「21:00 就用上当日的日频数据」。
+            fund = FE._fund(df, "warehouse")
+            rk = FE._pct_rank(df, fund, n=10, minp=3)
+            exp_avail = pd.Series([manual_asof(d) for d in days], index=days)
+            exp_rk = exp_avail.rolling(10, min_periods=3).rank(pct=True)
+            got_rk = rk.groupby(pd.DatetimeIndex(rk.index).normalize()).first()
+            for d in days[2:]:
+                a, b = float(got_rk.loc[d]), float(exp_rk.loc[d])
+                if abs(a - b) > 1e-12:
+                    raise AssertionError(
+                        f"war_pct 的分位窗口在 {d.date()} 是 {a:.6f}，"
+                        f"按「只看得到 <= 前一天」应是 {b:.6f}")
 
             # 3. 未来扰动不影响过去
             bumped = raw.copy()
@@ -4022,11 +4055,12 @@ def _run() -> tuple[bool, list[str]]:
             FE._edb_pick = orig_pick
             FE.clear_cache()
 
-        return ("仓单/库存/利润/交割量/现货在 5m 上按交易日差分（每天常数、"
-                "等于 T-1 对 T-1-n，不是 25 分钟前）；改未来数据不影响过去；"
+        return ("仓单/库存/利润/交割量/现货在 5m 上按**自然日**差分（同日内常数、"
+                "等于「X 能看到的读数」对 5 个交易日前，不是 25 分钟前）；"
+                "夜盘段不会被搬用次日日盘的读数；改未来数据不影响过去；"
                 "日线帧上退化成普通 shift/diff")
 
-    check("日频因子在分钟线上按交易日算 + 只吃 T-1", _factor_daily_lag)
+    check("日频因子在分钟线上按自然日算 + 只吃 T-1（含夜盘段）", _factor_daily_lag)
 
 
     def _factor_multi_period():
