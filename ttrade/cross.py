@@ -237,6 +237,12 @@ def align_to_clock(panel: pd.DataFrame, index) -> pd.DataFrame:
     源周期比目标周期细的时候这条规则同样成立：1 小时 bar 标 10:00、11:00 才收完，
     10:35 那根 5 分钟 bar 只能看到 09:00 那根的结果。代价是窗口最前面一段没有
     分数（源周期第一根之前），那几根不参与排名，属于正常损耗。
+
+    **和 `factor_strategy.align_to_base` 的关系**：日线级的结论完全一致（都是
+    「当天收盘后才可用」）。分钟级源这边 `shift(1)` 会**多滞后一根** —— 5m 源
+    下 10:05 拿到 09:55 那根（其实 10:00 那根本身已经收完），而 `align_to_base`
+    准时换。多滞后属于保守方向（不会引入未来数据），所以这里不动：改它会让板块
+    级 / 截面的既有回测数字整体变动，而收益只是一根 bar 的时效。
     """
     if panel is None or panel.empty:
         return pd.DataFrame(index=pd.Index(index))

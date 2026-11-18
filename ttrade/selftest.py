@@ -3640,7 +3640,8 @@ def _run() -> tuple[bool, list[str]]:
 
         # 2. 逐根核对：对齐值 = 决策时刻不晚于基准的**最后一根**周线
         dt_src = FS._decision_time(z.index, "1w")
-        dt_base = FS._decision_time(base.index, "5m")
+        # 基准是分钟级：它的决策时刻就是 bar 自己的时间戳（`source=False`）
+        dt_base = FS._decision_time(base.index, "5m", source=False)
         vals = z.to_numpy(dtype=float)
         # 最后一根周线可能还没走完，按实现约定丢掉
         keep = len(vals) - 1
@@ -3699,6 +3700,333 @@ def _run() -> tuple[bool, list[str]]:
                 f"{len(s)} 根覆盖里周内不换值；周线+日线因子接上；缺周期报错")
 
     check("跨周期因子（截断 / 对齐）", _factor_cross_period)
+
+    def _cross_period_minute():
+        """分钟级跨周期：1h 的因子在 5m 策略上必须晚一根。
+
+        这是补一次真实事故：5m 策略挂 1h 的 `mom_20`，卡玛翻了几倍。原因不是
+        因子算错，而是**分钟级 bar 的时间戳是开始时刻**（天勤约定，本地 1h 库也
+        是天勤下来的）——标 10:00 的那根覆盖 10:00–11:00，11:00 才收完，而
+        `_decision_time` 当时对分钟级原样返回，等于 10:05 就用上了 10:00–11:00
+        的收盘价。
+
+        上一项（周线）测不出这个：周线走的是日线级那条分支（`normalize + 15:00`），
+        本来就是对的；而且它拿 `_decision_time` 自己算期望值，实现错了也自洽。
+        所以这里**用固定数值硬编码期望**，不准再调被测函数。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factor_strategy as FS
+
+        # 1. 时间戳 → 收完时刻的偏移量。**等于源周期时长**，不是目标周期：
+        #    合成周期的索引取「组内最后一根源 bar 的开始时刻」
+        #    （15m 首根 09:10 = 5m 的第 3 根，收完在 09:15）
+        for p, want in (("5m", 300), ("15m", 300), ("30m", 300), ("1h", 3600),
+                        ("2h", 3600), ("4h", 3600), ("1d_tq", 0), ("1w", 0)):
+            got = FS._close_lag(p)
+            if got != want:
+                raise RuntimeError(f"_close_lag({p!r})：应 {want}，实际 {got}")
+
+        # 2. 人造 1h 源：09:00/10:00/11:00/13:00/14:00 五根，值 1..5
+        src_idx = pd.to_datetime(["2026-11-18 09:00", "2026-11-18 10:00",
+                                  "2026-11-18 11:00", "2026-11-18 13:00",
+                                  "2026-11-18 14:00"])
+        src = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0], index=src_idx)
+        base = pd.date_range("2026-11-18 09:00", "2026-11-18 14:55", freq="5min")
+        got = FS.align_to_base(src, base, "5m", "1h")
+
+        def at(ts: str) -> float:
+            return float(got.loc[pd.Timestamp("2026-11-18 " + ts)])
+
+        # 09:00 那根 1h 也要 10:00 才收完 ⇒ 上午 10 点之前一根都用不上
+        if np.isfinite(at("09:05")) or np.isfinite(at("09:55")):
+            raise RuntimeError("09:00 那根 1h 在 10:00 之前就被用了（未来数据）")
+        # 10:00 那根覆盖 10:00–11:00 ⇒ 11:00 之前只能用 09:00 那根（值 1）
+        for ts in ("10:00", "10:05", "10:30", "10:55"):
+            if at(ts) != 1.0:
+                raise RuntimeError(
+                    f"{ts} 拿到的 1h 因子是 {at(ts)}，应该是 09:00 那根（1.0）"
+                    "—— 用上了还没收完的 10:00 那根就是未来数据")
+        # 11:00 收完 ⇒ 11:00 起换 10:00 那根（值 2）；13:00 那根到 14:00 才可用
+        for ts, want in (("11:00", 2.0), ("11:55", 2.0), ("13:05", 3.0),
+                         ("14:05", 4.0), ("14:55", 4.0)):
+            if at(ts) != want:
+                raise RuntimeError(f"{ts} 应拿到 {want}，实际 {at(ts)}")
+
+        # 3. 未来扰动：改「10:00 那根」的值，10:55 之前一根都不许动
+        src2 = src.copy()
+        src2.loc[pd.Timestamp("2026-11-18 10:00")] = 99.0
+        got2 = FS.align_to_base(src2, base, "5m", "1h")
+        mask = base <= pd.Timestamp("2026-11-18 10:55")
+        a = got[mask].fillna(-9.0).to_numpy()
+        b = got2[mask].fillna(-9.0).to_numpy()
+        if not np.allclose(a, b):
+            raise RuntimeError("改动 10:00 那根之后 10:55 之前的值变了 —— 有未来数据")
+        # 但它必须在 11:00 之后**真的**被用上（否则上面那条靠「整列没用」也能过）
+        if float(got2.loc[pd.Timestamp("2026-11-18 11:00")]) != 99.0:
+            raise RuntimeError("10:00 那根在 11:00 之后也没被用上（对齐断了）")
+
+        # 4. 日线级口径不许被这次改动带偏：15:00 才是当天的可用时刻
+        day_idx = pd.to_datetime(["2026-11-17", "2026-11-18"])
+        day = pd.Series([7.0, 8.0], index=day_idx)
+        dbase = pd.date_range("2026-11-18 09:00", "2026-11-19 14:55", freq="5min")
+        dgot = FS.align_to_base(day, dbase, "5m", "1d_tq")
+        if float(dgot.loc[pd.Timestamp("2026-11-18 09:05")]) != 7.0:
+            raise RuntimeError("日线在当天开盘就用上了（应只有 15:00 之后才可用）")
+        if float(dgot.loc[pd.Timestamp("2026-11-18 14:55")]) != 7.0:
+            raise RuntimeError(
+                "15:00 之前就用上了当天日线（14:55 那根收盘价在 15:00，日线同刻才收完）")
+        if float(dgot.loc[pd.Timestamp("2026-11-19 09:05")]) != 8.0:
+            raise RuntimeError("前一天的日线到第二天开盘还没生效")
+        # 2 日 / 周线照旧丢最后一根（会变形的 bar）
+        if len(FS._decision_time(pd.DatetimeIndex(day_idx), "1w")) != 2:
+            raise RuntimeError("周线的决策时刻算坏了")
+
+        # 5. **全组合矩阵**：基准 × 源 逐对做未来扰动。
+        #    只钉 1h→5m 不够 —— 用户踩到的就是这个坑，其它组合同样可能漏。
+        #    `LAG` 是测试自己认的物理事实（源 bar 从时间戳到收完的秒数），
+        #    故意不复用 `_close_lag`，否则实现错了这里也自洽。
+        FREQ = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h",
+                "2h": "2h", "4h": "4h", "1d_tq": "D", "2d": "2D", "1w": "7D"}
+        LAG = {"5m": 300, "15m": 300, "30m": 300, "1h": 3600, "2h": 3600,
+               "4h": 3600, "1d_tq": None, "2d": None, "1w": None}  # None = 15:00 收
+        SPAN = pd.Timedelta(days=28)
+        t0 = pd.Timestamp("2026-11-02 09:00")
+        bases = ["5m", "15m", "30m", "1h", "1d_tq"]
+        sources = ["5m", "15m", "30m", "1h", "2h", "4h", "1d_tq", "2d", "1w"]
+
+        def done_at(st: pd.Timestamp, p: str) -> pd.Timestamp:
+            lag = LAG[p]
+            return st + pd.Timedelta(seconds=lag) if lag else st.normalize() + FS.DAY_CLOSE
+
+        checked = 0
+        for b in bases:
+            b_idx = pd.date_range(t0, t0 + SPAN, freq=FREQ[b])
+            # 基准的**决策时刻**：分钟级就是它的时间戳，日线级是当天 15:00
+            dt_base = (b_idx if LAG[b] is not None
+                       else b_idx.normalize() + FS.DAY_CLOSE)
+            for s in sources:
+                if s == b:
+                    continue
+                s_idx = pd.date_range(t0, t0 + SPAN, freq=FREQ[s])
+                if len(s_idx) < 5 or len(b_idx) < 5:
+                    continue
+                src = pd.Series(np.arange(len(s_idx), dtype=float), index=s_idx)
+                got = FS.align_to_base(src, b_idx, b, s)
+                # 两个截断点都要测，缺一个就漏一半：
+                #   · 开始时刻：这根 bar 还没走完，基准此刻不能用它（抓「提前用半根」，
+                #     1h/15m 这类就是这么漏的）；
+                #   · 收完时刻：它之后的 bar 更不许用（抓「跨 bar 泄漏」）。
+                k = len(s_idx) // 2
+                for T in (s_idx[k], done_at(s_idx[k], s)):
+                    m = np.asarray(dt_base <= T)
+                    if not m.any():
+                        continue
+                    src2 = src.copy()
+                    bad = [i for i, t in enumerate(s_idx) if done_at(t, s) > T]
+                    if not bad:
+                        continue
+                    src2.iloc[bad] = 999.0
+                    got2 = FS.align_to_base(src2, b_idx, b, s)
+                    a = got[m].fillna(-9.0).to_numpy()
+                    c = got2[m].fillna(-9.0).to_numpy()
+                    if not np.allclose(a, c):
+                        n_bad = int((a != c).sum())
+                        raise RuntimeError(
+                            f"{b} 基准 / {s} 源：把 T={T} 时还没收完的 {len(bad)} 根源"
+                            f"bar 改成 999 之后，决策时刻不晚于 T 的 {n_bad} 个对齐值"
+                            "变了 —— 有未来数据")
+                    # 扰动必须真的生效，否则上面那条靠「整列没用」也能过
+                    later = got2[~m]
+                    if not (later.fillna(-9.0) == 999.0).any():
+                        raise RuntimeError(
+                            f"{b}/{s}：T 之后的扰动值没有被用上（对齐断了）")
+                    checked += 1
+        if checked < 60:
+            raise RuntimeError(f"组合矩阵只跑了 {checked} 对，覆盖不够")
+
+        return ("1h 的 10:00 那根到 11:00 才可用（10:00/10:55 仍是 09:00 那根 1.0，"
+                "11:00 起 2.0、13:05 是 3.0）；改 10:00 那根不影响 10:55 之前、"
+                f"却在 11:00 生效；日线仍 15:00 可用；{checked} 个「基准×源」组合"
+                "在各自截断点上未来扰动全部无影响（含 15m/30m/2h/4h 合成周期与 1d/2d/1w）")
+
+    check("跨周期因子：分钟级（1h 因子在 5m 上必须晚一根）", _cross_period_minute)
+
+
+    def _factor_daily_lag():
+        """日频外部因子铺到分钟线上：必须按**交易日**差分，且只吃 T-1 的值。
+
+        EDB 的仓单 / 库存 / 利润 / 交割量、宏观的美元兑人民币，一天只有一个
+        数。`_asof(lag_days=1)` 把它铺到分钟线上 —— 一整个交易日里所有 bar 都
+        是同一个常数。这时候因子里的 `s.shift(5)` / `s.pct_change(5)` 量到的
+        是「5 根 bar 前」（5m 上就是 25 分钟），同一天里恒为 0，只有每天头
+        n 根才是真值。
+
+        方向和前视相反，但一样隐蔽：因子有数、不报错、IC 还挺像样，实际上是
+        另一个东西（「昨天的值 / 前 n 根 bar 那天的值」）。2026-11 用户问
+        「5m 用日频因子有没有偷未来」时顺着查出来的。
+
+        验四件事：
+          1. 同一交易日内的因子值是**常数**（说明按天算了，不是按 bar）
+          2. 值等于「T-1 的序列值 / T-1-n 的序列值」，不是「n 根 bar 前」
+          3. 改未来日期的数据，过去那些天的因子一动不动
+          4. 日线帧上 `_day_shift` / `_day_diff` 退化成普通 `shift` / `diff`
+             （不能为了分钟线把日线搞坏）
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factors_ext as FE
+
+        # --- 人造 5m 骨架：40 个交易日 × 每天 8 根（8 > 5，老实现会在
+        #     每天后 3 根退化成 0，这样才抓得住）
+        days = pd.bdate_range("2024-01-02", periods=40)
+        stamps, tdays = [], []
+        for d in days:
+            for k in range(8):
+                stamps.append(d + pd.Timedelta(minutes=5 * k))
+                tdays.append(d)
+        idx = pd.DatetimeIndex(stamps)
+        n_bar = len(idx)
+        # 收盘价逐 bar 递增一点点：`spot_basis_chg_5` 的分子要随 bar 变
+        close = 100.0 + 0.01 * np.arange(n_bar, dtype=float)
+
+        def _make():
+            df = pd.DataFrame({
+                "open": close, "high": close + 1.0, "low": close - 1.0,
+                "close": close, "volume": 10.0, "open_interest": 1000.0,
+                "trading_day": pd.to_datetime(tdays),
+            }, index=idx)
+            df.attrs["symbol"] = "RB"
+            return df
+
+        # --- 人造 EDB：从 2023-12-25 起每个工作日一个值，值 = 1,2,3,...
+        #     （顺手留出前置区间，免得 2024-01-02 那天 as-of 落空）
+        raw = pd.Series(np.arange(1, 61, dtype=float),
+                        index=pd.bdate_range("2023-12-25", periods=60))
+        raw_dates = list(raw.index)
+        raw_vals = [float(v) for v in raw.to_numpy()]
+
+        def manual_asof(ts, series_dates=raw_dates, series_vals=raw_vals,
+                        lag_days=1):
+            """手写一遍 as-of 取数，不复用 `_asof` —— 否则就是自洽测试。"""
+            t = pd.Timestamp(ts).normalize() - pd.Timedelta(days=int(lag_days))
+            pick = np.nan
+            for d, v in zip(series_dates, series_vals):
+                if d <= t:
+                    pick = v
+                else:
+                    break
+            return pick
+
+        orig_pick = FE._edb_pick
+        try:
+            FE._edb_pick = lambda sym: {
+                "warehouse": raw, "inventory": raw, "profit": raw,
+                "delivery": raw, "spot_price": raw,
+            }
+            df = _make()
+            war_val = FE.f_war_val(df)
+            war_chg1 = FE.f_war_chg_1(df)
+            war_chg5 = FE.f_war_chg_5(df)
+            inv_chg5 = FE.f_inv_chg_5(df)
+            pro_chg5 = FE.f_profit_chg_5(df)
+            del_chg30 = FE.f_deliv_chg_30(df)
+            bas_chg5 = FE.f_spot_basis_chg_5(df)
+
+            # 1. 同一交易日内恒定
+            day_key = pd.Series([d for d in tdays], index=idx)
+            for nm, s in (("war_val", war_val), ("war_chg_5", war_chg5),
+                          ("inv_chg_5", inv_chg5), ("pro_chg_5", pro_chg5),
+                          ("deliv_chg_30", del_chg30)):
+                nc = s.groupby(day_key).nunique(dropna=True)
+                if (nc > 1).any():
+                    bad = nc[nc > 1].index[0]
+                    raise AssertionError(
+                        f"{nm} 在 {pd.Timestamp(bad).date()} 一天内有 "
+                        f"{int(nc.loc[bad])} 个不同值 —— 说明还在按 bar 差分")
+
+            # 2. 值 = 两个交易日的序列值之比
+            for i, d in enumerate(days):
+                here = manual_asof(d)
+                if abs(war_val.loc[war_val.index.normalize() == d].iloc[0] - here) > 1e-9:
+                    raise AssertionError(f"war_val 在 {d.date()} 不等于 T-1 的序列值")
+                if i >= 1:
+                    # war_chg_1：今天那根用的值 比 上一个交易日那根用的值
+                    exp1 = here / manual_asof(days[i - 1]) - 1.0
+                    got1 = war_chg1.loc[(war_chg1.index.normalize() == d)].iloc[0]
+                    if np.isfinite(exp1) and abs(got1 - exp1) > 1e-9:
+                        raise AssertionError(
+                            f"war_chg_1 在 {d.date()} 是 {got1:.6f}，"
+                            f"按交易日应是 {exp1:.6f}")
+                if i >= 5:
+                    exp5 = here / manual_asof(days[i - 5]) - 1.0
+                    got5 = war_chg5.loc[war_chg5.index.normalize() == d].iloc[0]
+                    if np.isfinite(exp5) and abs(got5 - exp5) > 1e-9:
+                        raise AssertionError(
+                            f"war_chg_5 在 {d.date()} 是 {got5:.6f}，"
+                            f"按交易日应是 {exp5:.6f}（老实现会算成 25 分钟）")
+
+            # 老实现会在每天后 3 根上退化成 0；按交易日算则一个 0 都不该有
+            if (np.abs(war_chg5.dropna()) < 1e-12).any():
+                raise AssertionError("war_chg_5 出现了 0 值 —— 仍是按 bar 差分的")
+
+            # 3. 未来扰动不影响过去
+            bumped = raw.copy()
+            bumped.loc[bumped.index >= days[-2]] *= 100.0
+            if not (bumped.to_numpy() != raw.to_numpy()).any():
+                raise AssertionError("扰动日的构造错了：一个值都没改到")
+            FE._edb_pick = lambda sym: {"warehouse": bumped}
+            war_chg5b = FE.f_war_chg_5(_make())
+            cut = war_chg5.index.normalize() <= days[-3]
+            a = war_chg5[cut].to_numpy(dtype=float)
+            b = war_chg5b[cut].to_numpy(dtype=float)
+            if not np.allclose(a, b, equal_nan=True):
+                raise AssertionError(
+                    f"改了 {days[-2].date()} 之后的数据，{days[-3].date()} 及之前的 "
+                    "war_chg_5 变了 —— 有前视")
+
+            # 4. 日线帧上退化成普通 shift / diff
+            dclose = pd.Series(100.0 + np.arange(60, dtype=float),
+                               index=pd.bdate_range("2024-01-02", periods=60))
+            ddf = pd.DataFrame({"close": dclose, "trading_day": dclose.index},
+                               index=dclose.index)
+            ddf.attrs["symbol"] = "RB"
+            if not np.allclose(FE._day_shift(ddf, dclose, 5).to_numpy(),
+                               dclose.shift(5).to_numpy(), equal_nan=True):
+                raise AssertionError("日线帧上 `_day_shift` 没退化成 shift(5)")
+            if not np.allclose(FE._day_diff(ddf, dclose, 5).to_numpy(),
+                               dclose.diff(5).to_numpy(), equal_nan=True):
+                raise AssertionError("日线帧上 `_day_diff` 没退化成 diff(5)")
+
+            # 5. 基差变化率的**分子**仍跟当根 bar（不是常数），减数走交易日
+            bidx = bas_chg5.index
+            ulast = {d: bidx[bidx.normalize() == d][-1] for d in days}
+            for i in (25, 30, 35):
+                d, d5 = days[i], days[i - 5]
+                spot = float(manual_asof(d))
+                spot5 = float(manual_asof(d5))
+                t5 = ulast[d5]
+                bas_old = (spot5 - df.at[t5, "close"]) / df.at[t5, "close"]
+                for pos in (0, 3, 7):
+                    t = bidx[bidx.normalize() == d][pos]
+                    bas_now = (spot - df.at[t, "close"]) / df.at[t, "close"]
+                    exp = bas_now - bas_old
+                    got = float(bas_chg5.loc[t])
+                    if abs(got - exp) > 1e-9:
+                        raise AssertionError(
+                            f"spot_basis_chg_5 在 {t} 是 {got:.8f}，应是 {exp:.8f}")
+
+        finally:
+            FE._edb_pick = orig_pick
+            FE.clear_cache()
+
+        return ("仓单/库存/利润/交割量/现货在 5m 上按交易日差分（每天常数、"
+                "等于 T-1 对 T-1-n，不是 25 分钟前）；改未来数据不影响过去；"
+                "日线帧上退化成普通 shift/diff")
+
+    check("日频因子在分钟线上按交易日算 + 只吃 T-1", _factor_daily_lag)
 
 
     def _factor_multi_period():

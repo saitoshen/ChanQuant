@@ -92,6 +92,30 @@ def _day_diff(df: pd.DataFrame, s: pd.Series, n: int) -> pd.Series:
     return pd.Series(np.asarray(day.map(daily.diff(n)), dtype=float), index=idx)
 
 
+def _day_shift(df: pd.DataFrame, s: pd.Series, n: int) -> pd.Series:
+    """按**交易日**取 n 天前的值（分钟线上不能直接 shift(n)）。
+
+    日频外部值（仓单 / 库存 / 利润）被 `_asof` 铺到分钟线之后，一整个交易日里
+    都是同一个数。这时候 `s.shift(5)` 量到的是「25 分钟前」、`s.pct_change(5)`
+    也是 —— 同一天内全是 0，只有每天第一根是真值。因子看着有值，实际上一整天
+    都退化成「昨天 vs 前 n 天」的一个常数，等于把日频因子废掉。
+    必须先压成日频、算完再映射回 bar —— 和 `_day_diff` 同一套办法。
+    """
+    idx = s.index
+    if not isinstance(idx, pd.DatetimeIndex) or len(idx) < 2:
+        return s.shift(n)
+    day = _day(df)
+    if len(day) == len(day.unique()):
+        return s.shift(n)
+    daily = s.groupby(day).last().shift(n)
+    return pd.Series(np.asarray(day.map(daily), dtype=float), index=idx)
+
+
+def _day_pct(df: pd.DataFrame, s: pd.Series, n: int) -> pd.Series:
+    """按**交易日**取 n 天变化率（分钟线上不能直接 `pct_change(n)`）。"""
+    return _safe_div(s, _day_shift(df, s, n)) - 1.0
+
+
 def _asof(series: pd.Series, index, lag_days: int = 0) -> pd.Series:
     """把「一天一个值」的外部序列 as-of 铺到 bar 上。
 
@@ -455,14 +479,12 @@ def _pct_rank(df: pd.DataFrame, s: pd.Series, n: int = 750,
 
 def f_war_chg_1(df):
     """仓单数量 1 日变化率。仓单增加 = 现货往交易所流 = 供应宽松。"""
-    s = _fund(df, "warehouse")
-    return s.pct_change(1)
+    return _day_pct(df, _fund(df, "warehouse"), 1)
 
 
 def f_war_chg_5(df):
     """仓单数量 5 日变化率。一周的注册/注销节奏。"""
-    s = _fund(df, "warehouse")
-    return s.pct_change(5)
+    return _day_pct(df, _fund(df, "warehouse"), 5)
 
 
 def f_war_oi(df):
@@ -470,6 +492,10 @@ def f_war_oi(df):
 
     比值高说明「可交割的货相对持仓很多」，近月逼仓的难度大；
     比值低说明盘面持仓远大于库存，交割月容易出挤仓行情。
+
+    分子是 T-1 的仓单（`_fund` 默认 `lag_days=1`），分母是当根 bar 的持仓量，
+    两条腿都不含未来信息。它是个**水平比值**，不做跨期差分，所以不存在
+    「日频值铺到分钟线上被当成 n 根 bar 前」的问题。
     """
     s = _fund(df, "warehouse")
     oi = _oi(df)
@@ -513,10 +539,15 @@ def f_spot_basis(df):
 
 
 def f_spot_basis_chg_5(df):
-    """基差率的 5 日变化。现货相对盘面在走强还是走弱。"""
+    """基差率的 5 日变化。现货相对盘面在走强还是走弱。
+
+    分子保留当根 bar 的收盘（`spot_basis` 本来就是随时在动的一条腿），
+    减数走**交易日**口径（5 个交易日前当日最后一根的基差）。直接
+    `basis.shift(5)` 在分钟线上量到的是「25 分钟前」——同一天内几乎恒为 0。
+    """
     s = _fund(df, "spot_price")
     basis = _safe_div(s - df["close"], df["close"])
-    return basis - basis.shift(5)
+    return basis - _day_shift(df, basis, 5)
 
 
 def f_profit_val(df):
@@ -531,13 +562,13 @@ def f_profit_val(df):
 def f_profit_chg_5(df):
     """加工利润的 5 日变化率。用绝对值做分母，利润为负时符号才不会翻。"""
     s = _fund(df, "profit")
-    return _safe_div(s - s.shift(5), s.shift(5).abs())
+    prev = _day_shift(df, s, 5)
+    return _safe_div(s - prev, prev.abs())
 
 
 def f_inv_chg_5(df):
     """期货库存 5 日变化率。和仓单类似但口径更宽（含非注册仓单）。"""
-    s = _fund(df, "inventory")
-    return s.pct_change(5)
+    return _day_pct(df, _fund(df, "inventory"), 5)
 
 
 def f_inv_val(df):
@@ -560,9 +591,13 @@ def f_deliv_chg_30(df):
 
     交割量突然放大往往意味着「有货要交」或者「逼仓成功」，对近月合约的
     影响远大于远月，所以这条因子只对近月有解释力。
+
+    月频序列铺到分钟线上是一整个交易日一个常数，`s.shift(30)` 量到的是
+    「30 根 bar 前」而不是 30 个交易日前，必须走 `_day_shift`。
     """
     s = _fund(df, "delivery")
-    return _safe_div(s - s.shift(30), s.shift(30).abs())
+    prev = _day_shift(df, s, 30)
+    return _safe_div(s - prev, prev.abs())
 
 
 # ---------------------------------------------------------------- 板块 / 行业指数

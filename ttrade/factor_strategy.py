@@ -1099,11 +1099,63 @@ DAY_CLOSE = pd.Timedelta(hours=15)
 _DAY_PERIODS = {"1d", "1d_tq", "2d", "1w"}
 
 
-def _decision_time(index, period: str) -> pd.DatetimeIndex:
-    """把某个周期的 bar 时间戳换成「这根 bar 的数据已经全部可用的时刻」。"""
+def _close_lag(period: str) -> int:
+    """从 bar 的**时间戳**到它真正收完，还要多少秒。日线级 / 认不出来返回 0。
+
+    这个数等于**源周期**的秒数，不是目标周期 —— 因为本地合成周期
+    （`tqdata.merge_bars`）的索引取的是「组内最后一根源 bar 的开始时刻」，
+    不是组内第一根：
+
+        15m（5m×3）第一根：09:00/09:05/09:10 三根 ⇒ 索引 `09:10`，收完 `09:15`
+        2h （1h×2）第一根：09:00/10:00 两根     ⇒ 索引 `10:00`，收完 `11:00`
+
+    实测确认过：`15m[09:10].close == 5m[09:10].close`（第 3 根），
+    `30m[09:25].close == 5m[09:25].close`（第 6 根）。所以偏移量一律是源周期
+    时长；按「目标周期时长」算会把 2h 往后推 2 小时、4h 推 4 小时（虽然不前视，
+    但白丢时效，看起来像「大周期因子没反应」）。
+
+    日线级**必须**返回 0：它们的可用时刻另有口径（收盘 15:00），不是
+    「日戳 + 86400 秒」。
+    """
+    p = str(period or "")
+    if p in _DAY_PERIODS:
+        return 0
+    from .tqdata import PERIODS
+    from .tqfetch import PERIOD_SEC
+
+    src, _n = PERIODS.get(p, ("", 1))
+    return int(PERIOD_SEC.get(src, 0) or 0)
+
+
+def _decision_time(index, period: str, source: bool = True) -> pd.DatetimeIndex:
+    """bar 时间戳 → 「这根 bar 的数据已经全部可用的时刻」。
+
+    `source=True` 是**源周期**（被搬过来的那个大周期），`source=False` 是
+    **基准周期**（策略自己跑的周期）。两者语义不同，别混：
+
+    * 源周期：时间戳后面还有一段没走完（见 `_close_lag`），收盘价要到 bar 真正
+      走完才知道。🔴🔴 天勤原生分钟 bar 的 `datetime` 是这根 K 线的**开始时刻**
+      （实测 RB 的 1h：`09:00` 那根 close = `10:00` 那根的 open，`21:00` 那根
+      close = `22:00` 那根的 open，链式衔接），本地 1h 库是从天勤下来的，同一条
+      口径。所以标 `10:00` 的 1h bar 覆盖 10:00–11:00，**11:00 才收完**；不加这
+      段就等于把「本小时的收盘价」当成「本小时开盘时就知道」，5 分钟策略在
+      10:05 用上 10:00 那根 1h 因子，整整提前 55 分钟。症状是回测业绩好得不
+      真实（5m 挂 1h 的 `mom_20` 实测年化 +50.9%→+3.7%、夏普 4.06→0.29），
+      IC / 胜率 / 回撤会一致地「变漂亮」，且不报错。
+    * 基准周期：策略在第 t 根 bar 上按下标 t 的信号决策（当根收盘价算因子、
+      当根收盘 / 下一根开盘成交），所以**它的时间戳本身就是决策时刻**，分钟级
+      不加偏移。日线级才换成 15:00 收盘（日戳只到日精度）。
+    """
     idx = pd.DatetimeIndex(index)
-    if str(period or "") in _DAY_PERIODS:
+    p = str(period or "")
+    if p in _DAY_PERIODS:
         return idx.normalize() + DAY_CLOSE
+    if source:
+        lag = _close_lag(p)
+        if lag:
+            return idx + pd.Timedelta(seconds=lag)
+    # 周期认不出来：只能按原样比。调用方必须把周期传进来（`period_of` 会给），
+    # 传空串等于放弃这层保护 —— 所以这里不做「猜一个偏移」的聪明事
     return idx
 
 
@@ -1119,6 +1171,10 @@ def align_to_base(
     源周期里时间戳晚于当前 bar 的那些值，一根都不许进来。用 `searchsorted` 而
     不是 `reindex(method="ffill")`：后者要求两边都单调且源索引唯一，源周期是
     合成周期时（周线 / 2 日）偶尔会出现重复时间戳，一重复就抛异常。
+
+    **两边的时间语义不同，这一点最容易错**（详见 `_decision_time`）：
+      - 源周期 `source=True`：1h 的 10:00 那根到 11:00 才可用；
+      - 基准周期 `source=False`：决策时刻就是 bar 自己的时间戳。
     """
     base_index = pd.DatetimeIndex(base_index)
     if series is None or not len(series):
@@ -1136,7 +1192,8 @@ def align_to_base(
     # 日线级里只有这两档会这样，1d / 1d_tq 每天收盘就是完整的一天。
     if str(src_period or "") in ("2d", "1w") and len(vals) > 1:
         vals = vals.iloc[:-1]
-    tgt = _decision_time(base_index, base_period)
+    # 基准用**它自己的时间戳**（分钟级不偏移；日线级换成当天 15:00）
+    tgt = _decision_time(base_index, base_period, source=False)
 
     pos = vals.index.values.searchsorted(tgt.values, side="right") - 1
     out = np.full(len(base_index), np.nan, dtype=float)
@@ -1274,7 +1331,7 @@ def cross_period_note(
         parts.append(f"{_name(p)} {n} 个")
     base = _name(base_period) if base_period else "策略周期"
     return (f"跨周期因子：{'、'.join(parts)}（基准 {base}）——"
-            "只用已收完的 bar，对齐时不会拿到未来数据")
+            "只用已收完的 bar（大周期晚一根才生效），对齐时不会拿到未来数据")
 
 
 # ---------------------------------------------------------------- 分数构建
