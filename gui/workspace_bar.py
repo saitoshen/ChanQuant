@@ -6,10 +6,21 @@
 
 ## 工具条长什么样
 
+**两行**（2026-11-18 改：原来挤一行）：
+
 ```
- 默认组合 │ 新组合 │ ＋    [改名] [删除]
- 总资金 [100.0 万]  分配方式 [资金等权 ▾]  校准 [按分配额 ▾]   [量一下占用] [分配预览]
+ 默认组合 │ 短线策略 │ [新建] [改名] [删除工作区]        27 条 · 本金合计 143.4 万
+ 总资金 [100.0 万]  分配方式 [资金等权 ▾]  校准 [按分配额 ▾]
+ 调整 [本金归位… ▾]  [量一下占用] [分配预览]
 ```
+
+分两行不是审美问题：一行放这么多控件，总宽会超出卡片可用宽度，Qt 就把**每个
+控件都按比例压窄** —— 实测页签从 237px 压到 123px（直接冒出左右滚动箭头，
+第二个工作区看不见），「＋」从 42px 压到 30px（文字被内边距吃光，渲染成一个
+**空框**）。分两行之后每行都有富余，页签和按钮都按自己的尺寸显示。
+
+第一行是「哪个工作区」（分页 + 新建 / 改名 / 删除），第二行是「这个工作区的
+钱怎么分」。两件事本来就不该混在一起看。
 
 分页只是**视图**：切分页不改变任何正在跑的东西，运行按账户合并（见
 `workspace_store` 的模块注释）。所以切页签之后不需要重启连接。
@@ -17,7 +28,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -43,6 +55,68 @@ C_WARN = "#b45309"
 C_BAD = "#dc2626"
 
 
+class _HintLabel(QLabel):
+    """一行提示，放不下就用省略号截断，完整内容进 tooltip。
+
+    这一行里它排在页签和按钮后面，窗口一窄就最先被压。直接用 `QLabel` 的话，
+    `minimumSizeHint` 等于整段文字的宽度，压不下去 —— 结果是在右边缘**硬切**，
+    半个字没了，也看不出后面还有内容（实测「校准会退回按分配额」被切成
+    「…退回按分配额」的残句）。
+
+    所以：最小宽度放开，`sizeHint` 也**只报最小宽**（不按全文算），宽度靠布局
+    里那个 stretch=1 把剩余空间全给它，画的时候按实际宽度 `elidedText`。
+    反过来「sizeHint 按全文宽」是错的 —— 那样长文案会把第一行想要的宽度顶到
+    1000px 以上，Qt 就按比例压窄每个控件，页签立刻冒滚动箭头（实测 tab 从
+    237px 压到 123px，第二个工作区被吃掉）。
+    """
+
+    def __init__(self, text: str = "", parent=None, color: str = C_MUTED) -> None:
+        super().__init__("", parent)
+        self._full = ""
+        # 颜色自己存一份：paintEvent 是绕过 QLabel 的绘制自己画的，样式表里的
+        # `color:` 根本不进 palette() —— 实测那样画出来是默认的 #2a2a2a，
+        # 和旁边的正文一样黑，看不出这是「次要提示」
+        self._color = QColor(color)
+        self.setMinimumWidth(60)
+        self.setText(text)
+
+    def set_color(self, color: str) -> None:
+        self._color = QColor(color)
+        self.update()
+
+    def setText(self, text: str) -> None:      # noqa: N802 - Qt 命名
+        self._full = str(text or "")
+        self.setToolTip(self._full)
+        # 只重画，不动几何 —— 在 resizeEvent 里 setText 会把进程顶崩，见 paintEvent
+        self.update()
+
+    def text(self) -> str:
+        return self._full
+
+    def minimumSizeHint(self):                 # noqa: N802 - Qt 命名
+        return QSize(60, super().minimumSizeHint().height())
+
+    def sizeHint(self):                        # noqa: N802 - Qt 命名
+        return self.minimumSizeHint()
+
+    def paintEvent(self, ev) -> None:          # noqa: N802 - Qt 命名
+        """按当前宽度截断后自己画。
+
+        🔴 绝不能在 `resizeEvent` 里 `setText(截断后的文字)`：`setText` 会让
+        QLabel 重算 `sizeHint` 并请求父布局重排，重排又触发 `resizeEvent` ——
+        在主窗口里这一环没稳定下来，实测直接把进程顶成段错误（`--selftest`
+        基线 exit 0，加了这一版 exit 139，栈落在 `gui/app.py` 的
+        `_add_param_slider` 里，跟本文件毫无关系，就是被布局递归带崩的）。
+        `paintEvent` 里截断只影响这一次绘制，不改任何几何，不进布局循环。
+        """
+        p = QPainter(self)
+        p.setPen(self._color if self._color.isValid() else self.palette().color(self.foregroundRole()))
+        fm = p.fontMetrics()
+        shown = fm.elidedText(self._full, Qt.ElideRight, max(0, self.width())) if self._full else ""
+        if shown:
+            p.drawText(self.rect(), int(self.alignment()), shown)
+
+
 class WorkspaceBar(QWidget):
     """工作区分页 + 资金分配方式的那一条。
 
@@ -63,9 +137,16 @@ class WorkspaceBar(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        lay = QHBoxLayout(self)
+        # 两行：第一行「哪个工作区」，第二行「这个工作区的钱怎么分」。
+        # 挤一行的话总宽会超，Qt 会把每个控件按比例压窄 —— 页签冒滚动箭头、
+        # 「＋」被内边距吃成空框（见模块注释）。
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(6)
+        lay = QHBoxLayout()
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
+        lay.setSpacing(4)
+        root.addLayout(lay)
 
         self.tabs = QTabBar()
         self.tabs.setExpanding(False)
@@ -77,9 +158,10 @@ class WorkspaceBar(QWidget):
         self.tabs.currentChanged.connect(self.switched.emit)
         lay.addWidget(self.tabs)
 
-        btn_add = QPushButton("＋")
+        # 文字写全而不是一个「＋」：圆角小方格里只放一个全角加号，被全局
+        # 按钮内边距一压就看不见了（实测渲染成一个空框）
+        btn_add = QPushButton("新建")
         btn_add.setObjectName("Ghost")
-        btn_add.setFixedWidth(30)
         btn_add.setToolTip("新建一个工作区（空的分页，从「从策略库添加」加成员）")
         btn_add.clicked.connect(self.create.emit)
         lay.addWidget(btn_add)
@@ -95,22 +177,44 @@ class WorkspaceBar(QWidget):
         btn_del.clicked.connect(self.remove.emit)
         lay.addWidget(btn_del)
 
-        lay.addSpacing(10)
-        lay.addWidget(QLabel("总资金"))
+        # 第一行剩下的空间全给提示标签（stretch=1），不再额外 addStretch：
+        # 提示**不主张**自己的宽度（sizeHint 只有最小宽），否则长文案会把
+        # 第一行「想要的宽度」顶到 1000px 以上，Qt 又按比例压窄每个控件 ——
+        # 页签冒出滚动箭头、第二个工作区看不见，跟拆行之前一模一样。
+        # 提示（「27 条 · 本金合计 143.4 万 · = 总资金的 1.04 倍」）放第一行右端：
+        # 它是**这个工作区**的摘要，不是某个资金控件的说明；放第二行末尾的话，
+        # 那一行本来就满，最长的一段会被右边缘裁掉（实测末尾的「按分配额」被切）
+        self.lbl_hint = _HintLabel("")
+        # 只留字号：颜色由 _HintLabel 自己画（样式表的 color 进不了 palette）
+        self.lbl_hint.setStyleSheet("font-size: 11px;")
+        self.lbl_hint.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        lay.addWidget(self.lbl_hint, 1)
+
+        # ---- 第二行：资金分配 ----
+        lay2 = QHBoxLayout()
+        lay2.setContentsMargins(0, 0, 0, 0)
+        # 4 而不是 6：第二行有 10 个控件，6px 间距在 1280 窗口下正好差 6px 撞边，
+        # 「分配预览」会被右边缘切掉一条
+        lay2.setSpacing(4)
+        root.addLayout(lay2)
+
+        lay2.addWidget(QLabel("总资金"))
         self.sp_total = QDoubleSpinBox()
         self.sp_total.setDecimals(1)
         self.sp_total.setRange(0.0, 1e7)          # 单位：万
         self.sp_total.setSingleStep(10.0)
         self.sp_total.setSuffix(" 万")
-        self.sp_total.setMinimumWidth(110)
+        # 100 而不是 110：这一行 10 个控件，1280 窗口下正好差几像素撞边，
+        # 收窄总资金那个框是最不疼的一处（「137.4 万」在 100px 里放得下）
+        self.sp_total.setMinimumWidth(100)
         self.sp_total.setToolTip(
             "这个工作区的总资金。0 = 用成员本金之和（老组合迁移过来就是这个状态）。\n"
             "分配方式按它把钱包分下去。")
         self.sp_total.valueChanged.connect(
             lambda v: self.total_changed.emit(float(v) * 10000.0))
-        lay.addWidget(self.sp_total)
+        lay2.addWidget(self.sp_total)
 
-        lay.addWidget(QLabel("分配方式"))
+        lay2.addWidget(QLabel("分配方式"))
         self.cb_mode = QComboBox()
         for k, v in PL.MODES.items():
             self.cb_mode.addItem(v, k)
@@ -129,9 +233,9 @@ class WorkspaceBar(QWidget):
             "手动设置：按你填的金额比例分。")
         self.cb_mode.currentIndexChanged.connect(
             lambda _i: self.mode_changed.emit(str(self.cb_mode.currentData() or "equal")))
-        lay.addWidget(self.cb_mode)
+        lay2.addWidget(self.cb_mode)
 
-        lay.addWidget(QLabel("校准"))
+        lay2.addWidget(QLabel("校准"))
         self.cb_basis = QComboBox()
         for k, v in PL.BASES.items():
             self.cb_basis.addItem(v, k)
@@ -145,11 +249,11 @@ class WorkspaceBar(QWidget):
             "先「量一下占用」再点，预览里会写出倍数。")
         self.cb_basis.currentIndexChanged.connect(
             lambda _i: self.basis_changed.emit(str(self.cb_basis.currentData() or "principal")))
-        lay.addWidget(self.cb_basis)
+        lay2.addWidget(self.cb_basis)
 
         # 校准倍数记在哪个参数上。和「校准」一格一体两面：
         #   「校准」决定**调到多少**，「调整方式」决定**记在哪个旋钮上**。
-        lay.addWidget(QLabel("调整"))
+        lay2.addWidget(QLabel("调整"))
         self.cb_knob = QComboBox()
         for k, v in PL.KNOBS.items():
             self.cb_knob.addItem(v, k)
@@ -165,7 +269,7 @@ class WorkspaceBar(QWidget):
             "固定手数（用 volume）、按本金全额 这几种会自动退回「只调本金」。")
         self.cb_knob.currentIndexChanged.connect(
             lambda _i: self.knob_changed.emit(str(self.cb_knob.currentData() or "split")))
-        lay.addWidget(self.cb_knob)
+        lay2.addWidget(self.cb_knob)
 
         self.btn_measure = QPushButton("量一下占用")
         self.btn_measure.setObjectName("Ghost")
@@ -175,17 +279,14 @@ class WorkspaceBar(QWidget):
             "不是逐根 bar 的均值：那个会把空仓时间算进分母，日内策略摊出来只有\n"
             "本金的 1~2%，量的是「摊到每根 bar 用多少」而不是「出手一次用多少」。")
         self.btn_measure.clicked.connect(self.measure.emit)
-        lay.addWidget(self.btn_measure)
+        lay2.addWidget(self.btn_measure)
 
         self.btn_preview = QPushButton("分配预览")
         self.btn_preview.setToolTip("按当前分配方式算出每条策略该拿多少钱，看一眼再决定要不要应用")
         self.btn_preview.clicked.connect(self.preview.emit)
-        lay.addWidget(self.btn_preview)
+        lay2.addWidget(self.btn_preview)
 
-        lay.addStretch(1)
-        self.lbl_hint = QLabel("")
-        self.lbl_hint.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
-        lay.addWidget(self.lbl_hint)
+        lay2.addStretch(1)
 
     # ---- 读写 ----
     def set_workspaces(self, names: list[str], index: int) -> None:
@@ -217,8 +318,7 @@ class WorkspaceBar(QWidget):
 
     def hint(self, text: str, bad: bool = False) -> None:
         self.lbl_hint.setText(text)
-        self.lbl_hint.setStyleSheet(
-            f"color: {C_BAD if bad else C_MUTED}; font-size: 11px;")
+        self.lbl_hint.set_color(C_BAD if bad else C_MUTED)
 
 
 class AllocDialog(QDialog):

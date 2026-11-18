@@ -1050,6 +1050,70 @@ def _run() -> tuple[bool, list[str]]:
                 f"开仓 {len(ent)} 个、平仓 {len(ext)} 个、"
                 f"手数 3/5 手带到图上、区间前开仓延续、连线到右边缘")
 
+    def _ws_bar_two_rows():
+        """组合页的工作区工具条必须是**两行**：工作区一行、资金分配一行。
+
+        挤一行不会报错，只会悄悄缩水：实测总宽 1714px 撞上 1058px 的卡片，
+        Qt 就按比例压每一个控件 —— 页签从 237px 压到 123px（冒出左右滚动箭头，
+        第二个工作区看不见），「＋」从 42px 压到 30px（文字被内边距吃光，
+        渲染成一个空框）。所以用**结构**钉住，而不是凭眼睛看截图。
+        """
+        from PySide6.QtWidgets import QHBoxLayout
+
+        from gui.workspace_bar import WorkspaceBar
+
+        bar = WorkspaceBar()
+        bar.set_workspaces(["默认组合", "短线策略"], 0)
+        root = bar.layout()
+        if root is None or root.count() != 2:
+            raise RuntimeError(f"工具条不是两行：layout 有 {root.count() if root else 0} 项")
+        rows = []
+        for i in range(2):
+            it = root.itemAt(i)
+            lay = it.layout() if it is not None else None
+            if not isinstance(lay, QHBoxLayout):
+                raise RuntimeError(f"第 {i + 1} 行不是横排布局")
+            rows.append(lay)
+        if rows[0].indexOf(bar.tabs) < 0:
+            raise RuntimeError("工作区页签不在第一行")
+        for w, name in ((bar.sp_total, "总资金"), (bar.cb_mode, "分配方式"),
+                        (bar.cb_basis, "校准"), (bar.cb_knob, "调整"),
+                        (bar.btn_measure, "量一下占用"), (bar.btn_preview, "分配预览")):
+            if rows[1].indexOf(w) < 0:
+                raise RuntimeError(f"「{name}」没有落在第二行")
+            if rows[0].indexOf(w) >= 0:
+                raise RuntimeError(f"「{name}」还挤在工作区那一行")
+        # 页签宽度要够：被压窄时 QTabBar 会冒滚动箭头，这一条是那个症状的判据
+        hint = bar.tabs.sizeHint().width()
+        if hint < 150:
+            raise RuntimeError(f"页签 sizeHint 只有 {hint}px，工作区名一长就看不见")
+        # 「新建」不能让固定宽度把文字吃掉（原来 `setFixedWidth(30)`，sizeHint 却是
+        # 42 —— 全局按钮内边距 2×14px，内容只剩 2px，渲染出来是个空框）
+        from PySide6.QtWidgets import QPushButton
+
+        add = next((b for b in bar.findChildren(QPushButton)
+                    if b.text() == "新建"), None)
+        if add is None:
+            raise RuntimeError("找不到「新建」按钮")
+        if add.maximumWidth() < add.sizeHint().width():
+            raise RuntimeError(
+                f"「新建」被固定成 {add.maximumWidth()}px，比文字宽度 "
+                f"{add.sizeHint().width()}px 还窄（会渲染成空框）")
+        # 🔴 长提示不许把这一行「想要的宽度」顶大：提示标签自己按 stretch 吃剩余
+        # 空间、用 elidedText 截断；一旦它的 sizeHint 按全文算，第一行需求就会
+        # 超过卡片宽，Qt 又按比例压窄所有控件，页签立刻冒滚动箭头（实测 237→123）。
+        tab_before = bar.tabs.sizeHint().width()
+        bar.hint("7 条 · 本金合计 143.4 万 · = 总资金的 1.04 倍 · ⚠ 没量占用，"
+                 "校准会退回按分配额")
+        if bar.lbl_hint.sizeHint().width() > 80:
+            raise RuntimeError(
+                f"提示标签的 sizeHint 是 {bar.lbl_hint.sizeHint().width()}px，"
+                "按全文算宽了 —— 会把第一行的页签压窄")
+        if bar.tabs.sizeHint().width() != tab_before:
+            raise RuntimeError("加了长提示之后页签宽度变了，说明提示在抢这一行的宽度")
+        return (f"两行：工作区（页签 sizeHint {hint}px + 新建/改名/删除工作区）｜"
+                "资金分配（总资金/分配方式/校准/调整/量一下占用/分配预览）")
+
     def _perf_yscale():
         """资金曲线纵轴的「线性 / 对数」开关（绩效页页首那个下拉框）。
 
@@ -8970,6 +9034,8 @@ def _run() -> tuple[bool, list[str]]:
     check("存入策略库的动作（strategy_save）", _strategy_save_action)
     check("K线与信号：持仓与交易记录同源（含手数）", _chart_from_trades)
     check("资金曲线纵轴（线性 / 对数 / 亏穿退回）", _perf_yscale)
+
+    check("组合页工作区工具条：工作区一行、资金分配一行", _ws_bar_two_rows)
 
     # 跑完就把进度文件收掉：留着会让下一轮的诊断以为"上次崩过"。
     # 崩溃时走不到这里，文件正好留下最后一项的名字。
