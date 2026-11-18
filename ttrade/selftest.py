@@ -9191,6 +9191,21 @@ def _run() -> tuple[bool, list[str]]:
             if page.tbl_quotes.item(0, 2).text() != "+50.00":
                 raise RuntimeError(
                     f"涨跌算错：{page.tbl_quotes.item(0, 2).text()!r}（要 3550−3500）")
+            # 天勤的 datetime 带微秒，`[-8:]` 会截出 `2.000000`
+            page._fill_quotes([{
+                "symbol": "SHFE.rb2601", "instrument": "rb2601", "last": 3550.0,
+                "bid": 3549.0, "ask": 3551.0, "pre_close": 3500.0,
+                "datetime": "2026-11-18 14:35:02.000000",
+            }])
+            if page.tbl_quotes.item(0, 5).text() != "14:35:02":
+                raise RuntimeError(
+                    f"行情时间截错：{page.tbl_quotes.item(0, 5).text()!r}"
+                    "（天勤带微秒，不能直接 [-8:]）")
+            page._fill_quotes([{
+                "symbol": "SHFE.rb2601", "instrument": "rb2601",
+                "last": 3550.0, "bid": 3549.0, "ask": 3551.0,
+                "pre_close": 3500.0, "datetime": "2026-11-18 14:35:02",
+            }])
             page._on_quote_dbl(page.tbl_quotes.item(0, 0))
             if page.cb_contract.currentText() != "rb2601":
                 raise RuntimeError("双击报价行没把合约带进下单行")

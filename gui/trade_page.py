@@ -104,6 +104,19 @@ def _px(v) -> str:
     return "—" if not f else f"{f:,.2f}"
 
 
+def _hms(v) -> str:
+    """行情时间 → `HH:MM:SS`。
+
+    两个柜台的格式不一样：天勤给 `2026-11-18 14:35:02.000000`（带微秒），
+    CTP 给 `14:35:02`。直接 `[-8:]` 在天勤那串上会截出 `2.000000` —— 所以先取
+    空格后面那一段，再取前 8 个字符。
+    """
+    t = str(v or "").strip()
+    if not t:
+        return ""
+    return t.rsplit(" ", 1)[-1][:8]
+
+
 def _avg_price(r: dict) -> str:
     """开仓均价。锁仓时两边都有，按净头寸取；只有一边就取那一边。"""
     pl = _num(r.get("open_price_long"))
@@ -1100,7 +1113,7 @@ class TradePage(QWidget):
         if not self.chk_market.isChecked():
             self.sp_price.setValue(last)
         self._priced_for = sym
-        stamp = str(info.get("datetime") or "")[-8:]
+        stamp = _hms(info.get("datetime"))
         self.lbl_order_msg.setText(
             f"{sym} 最新价 {last:g}" + (f"（{stamp}）" if stamp else ""))
 
@@ -1855,7 +1868,7 @@ class TradePage(QWidget):
                 _pnl(chg) if chg is not None else "—",
                 _px(r.get("bid")),
                 _px(r.get("ask")),
-                str(r.get("datetime") or "")[-8:],
+                _hms(r.get("datetime")),
             ]
             for j, v in enumerate(vals):
                 item = QTableWidgetItem(v)
