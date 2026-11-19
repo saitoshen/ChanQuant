@@ -44,7 +44,7 @@ ACCOUNT_KINDS = [
     ("kq_stock", "快期股票模拟（需专业版）"),
     ("sim_stock", "本地股票模拟（TqSimStock）"),
     ("ctp", "CTP 柜台（SimNow / 期货公司）"),
-    ("rohon", "融航资管中台（vnpy_rohon）"),
+    ("rohon", "融航资管中台（CTP 兼容接口）"),
 ]
 
 # 股票账户的两种。期货和股票在天勤里是**两套账户类**，不能混用一个连接：
@@ -57,7 +57,7 @@ STOCK_KINDS = ("kq_stock", "sim_stock")
 # 三个后端的连接对象、登录参数、回报口径都不一样，各自一条连接：
 #   tq    天勤 TqApi（多种账户共用一条连接，多账户走 TqMultiAccount）
 #   ctp   期货公司 CTP 柜台（openctp-ctp）
-#   rohon 融航资管中台（vnpy_rohon）
+#   rohon 融航资管中台（CTP 兼容 dll，独立于系统那份 openctp-ctp）
 BACKENDS = ("tq", "ctp", "rohon")
 BACKEND_LABELS = {"tq": "天勤", "ctp": "CTP", "rohon": "融航"}
 

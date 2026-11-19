@@ -35,16 +35,47 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 
-try:  # 可选依赖：装不上就降级，别让整个程序 import 失败
-    from openctp_ctp import thostmduserapi as mdapi
-    from openctp_ctp import thosttraderapi as tdapi
+from ttrade import ctp_channel
+from ttrade.ctp_channel import ChannelError
 
+# 注意：模块级**不再**直接 import openctp-ctp。为什么见 `ttrade/ctp_channel.py`：
+# 融航那套（6.7.2.8 + 融航 dll）和标准那套（6.7.11）不能同进程共存，
+# 一旦在 import 时就钉死成标准通道，融航账户就没法用了。改成用到时才绑定。
+
+mdapi = None          # 绑定后才有的模块；`_make_spi()` 里按名字取结构体
+tdapi = None
+HAS_CTP = False       # 绑定成功后才为真
+CTP_IMPORT_ERROR = "尚未绑定 CTP 通道"
+BOUND_CHANNEL = ""    # "" / "ctp" / "rohon"
+
+
+def bind_channel(kind: str = "ctp") -> bool:
+    """把本模块的 `mdapi` / `tdapi` 绑到某个通道。重复绑定同一通道是安全的。
+
+    返回是否可用（不可用时 `CTP_IMPORT_ERROR` 里有人话）。换通道会抛
+    `ctp_channel.ChannelError` —— 那是进程级限制，不是能用 try/except 绕过的。
+    """
+    global mdapi, tdapi, HAS_CTP, CTP_IMPORT_ERROR, BOUND_CHANNEL
+
+    kind = (kind or "ctp").strip().lower()
+    if BOUND_CHANNEL == kind and HAS_CTP:
+        return True
+    try:
+        md, td = ctp_channel.load(kind)
+    except Exception as exc:  # noqa: BLE001 - ImportError / DLL 加载失败 / 通道冲突
+        # 通道冲突（已经绑了另一个）必须往上抛：那是调用方用错了，不能静默降级
+        if isinstance(exc, ChannelError):
+            raise CtpError(str(exc)) from exc
+        mdapi = tdapi = None
+        HAS_CTP = False
+        CTP_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+        BOUND_CHANNEL = kind
+        return False
+    mdapi, tdapi = md, td
     HAS_CTP = True
     CTP_IMPORT_ERROR = ""
-except Exception as exc:  # noqa: BLE001 - ImportError 之外还可能是 DLL 加载失败
-    mdapi = tdapi = None
-    HAS_CTP = False
-    CTP_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+    BOUND_CHANNEL = kind
+    return True
 
 
 # ------------------------------------------------------------------ 配置
@@ -102,6 +133,9 @@ class CtpConfig:
     password: str = ""
     app_id: str = "simnow_client_test"
     auth_code: str = "0000000000000000"
+    #: 走哪套 CTP 运行时：`ctp` = 系统装的 openctp-ctp；`rohon` = 融航那套
+    #: （vendored 6.7.2.8 + 融航 dll）。一个进程只能用一个，见 ctp_channel
+    channel: str = "ctp"
 
     def fill_preset(self) -> "CtpConfig":
         """没填前置地址时按预设补齐。手填过的字段不覆盖。"""
@@ -206,8 +240,8 @@ class MdClient:
     # ---- 生命周期 ----
 
     def start(self, instruments=()) -> None:
-        if not HAS_CTP:
-            raise CtpError(f"没装 openctp-ctp，用不了 CTP（{CTP_IMPORT_ERROR}）")
+        if not bind_channel(getattr(self.cfg, "channel", "ctp") or "ctp"):
+            raise CtpError(f"用不了 CTP 行情（{CTP_IMPORT_ERROR}）")
         spi = self._make_spi()
         self._spi = spi
         flow = os.path.join(_flow_dir(), f"md_{int(time.time())}")
@@ -386,8 +420,8 @@ class TraderClient:
     # ---- 生命周期 ----
 
     def start(self) -> None:
-        if not HAS_CTP:
-            raise CtpError(f"没装 openctp-ctp，用不了 CTP（{CTP_IMPORT_ERROR}）")
+        if not bind_channel(getattr(self.cfg, "channel", "ctp") or "ctp"):
+            raise CtpError(f"用不了 CTP 交易（{CTP_IMPORT_ERROR}）")
         spi = self._make_spi()
         self._spi = spi
         flow = os.path.join(_flow_dir(), f"td_{int(time.time())}")
@@ -895,7 +929,7 @@ class CtpSession:
 
     def status(self) -> str:
         if not HAS_CTP:
-            return f"没装 openctp-ctp（{CTP_IMPORT_ERROR}）"
+            return f"CTP 通道不可用（{CTP_IMPORT_ERROR}）"
         if self.trader.last_error:
             return self.trader.last_error
         if self.md.last_error:

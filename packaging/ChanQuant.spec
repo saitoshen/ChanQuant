@@ -33,7 +33,7 @@ APP_NAME = "ChanQuant"
 BUNDLE_ID = "com.chanquant.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "3.7.16"
+VERSION = "3.8.0"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
@@ -98,44 +98,39 @@ try:
 except Exception:  # noqa: BLE001 - 没装 / DLL 加载失败都走这里
     HIDDEN_CTP = []
 
-# 融航资管中台（vnpy_rohon）同样是**可选**依赖：只有 Windows x86-64 的 wheel，
-# 而且只出 cp310 / cp313 两个 ABI（fq 环境是 3.13，base 是 3.14 ⇒ base 装不上）。
+# 融航资管中台：**走 CTP 兼容 dll**，不再依赖 `vnpy_rohon`。
 #
-# 这里**不能**用 `import vnpy_rohon` 探活：它的包入口会
-# `from .gateway import RohonGateway` ⇒ `import vnpy`，而本程序故意不装 vnpy
-# （vnpy 4.5 把 pyside6 钉在 6.8.2.1，会把界面的 6.11 降级）。源码侧
-# `ttrade/rohon_client.py` 用 stub 包绕开了入口，打包这一层就用 find_spec
-# 只查「装没装」，一个字节的包代码都不执行。
+# 融航官方给了一套替换用的 `thosttraderapi_se.dll`，配 openctp-ctp 6.7.2.8 就能
+# 用标准 CTP 接口登录（2026-11-19 实测）。运行时放在 `vendor/rohon_ctp/`，
+# 由 `ttrade/ctp_channel.py` 用 importlib 按独立顶层名加载，和系统那份
+# openctp-ctp 互不覆盖。
 #
-# 要打进去的是**两类**文件，少一类都是「源码运行正常、打包版一点融航就报错」：
-#   1. api/ 下那 4 个 dll（RohonBaseV64 是融航自己的依赖库，三个 thost 是 CTP
-#      的）—— 全靠运行时 LoadLibrary 加载，静态分析看不见，不显式打进去就是
-#      「找不到指定模块」。走 collect_dynamic_libs，它只认 *.dll。
-#   2. hiddenimports 里那两个 .pyd 扩展模块（vnrohonmd / vnrohontd）——
-#      PyInstaller 按 import 解析，落到 _internal/vnpy_rohon/api/，和 dll 同目录。
-try:
-    HAS_ROHON = importlib.util.find_spec("vnpy_rohon") is not None
-except Exception:  # noqa: BLE001 - 包目录异常（权限/损坏）也当没装
-    HAS_ROHON = False
-
-if HAS_ROHON:
-    # 只要 dll，**不要**再加 `collect_data_files("vnpy_rohon")`：实测它对这个包
-    # 只返回那 4 个 dll 加两个 `.lib`（链接期文件，运行时一点用没有），
-    # 和下面的 collect_dynamic_libs 完全重复，白占 2.5MB 还可能覆盖同一路径。
-    # `.py` 它一个都不给（默认 exclude_py_files），模块全靠 hiddenimports 进 PYZ。
-    BINARIES += collect_dynamic_libs("vnpy_rohon")
-    HIDDEN_ROHON = [
-        # 包本身要进 PYZ：`rohon_client._import_api()` 用
-        # `find_spec("vnpy_rohon")` 判断装没装，冻结版里没有这个模块就
-        # 永远判「没装」，界面上会一直提示 pip install。
-        "vnpy_rohon",
-        "vnpy_rohon.api",
-        "vnpy_rohon.api.rohon_constant",
-        "vnpy_rohon.api.vnrohonmd",
-        "vnpy_rohon.api.vnrohontd",
-    ]
+# **坑在 ABI**：那个 .pyd 是按构建 Python 的大版本编的（cp314 依赖
+# python314.dll，cp313 依赖 python313.dll），跨版本加载一律
+# `DLL load failed`。CI 与开发机现在都是 3.14（2026-11-19 从 3.13 对齐上来的），
+# 但带哪一份仍按当前解释器判断 —— `vendor/rohon_ctp/_abi.txt` 记着它是给谁编的。
+#
+# 对不上就**不带**：宁可发布包里的融航通道显示「不可用」，也不能塞一个
+# 注定加载失败的 pyd —— 那种包的症状是「点连接直接闪退」，比少个功能糟得多。
+ROHON_VENDOR = os.path.join(ROOT, "vendor", "rohon_ctp")
+BUILD_ABI = f"cp{sys.version_info.major}{sys.version_info.minor}"
+if os.path.isdir(ROHON_VENDOR):
+    try:
+        with open(os.path.join(ROHON_VENDOR, "_abi.txt"), encoding="utf-8") as fh:
+            VENDORED_ABI = fh.read().strip()
+    except OSError:
+        VENDORED_ABI = ""
+    if VENDORED_ABI == BUILD_ABI:
+        DATAS.append((ROHON_VENDOR, "vendor/rohon_ctp"))
+        print(f"[spec] 融航运行时 {VENDORED_ABI} 已打入")
+    else:
+        print(f"[spec] 跳过融航运行时：vendor 是 {VENDORED_ABI or '未知'}，"
+              f"本次构建是 {BUILD_ABI}（发布包里融航通道会显示不可用）")
 else:
-    HIDDEN_ROHON = []
+    print("[spec] 没有 vendor/rohon_ctp，融航通道不可用")
+
+
+HIDDEN_ROHON = []
 
 # 动态导入的模块，静态分析扫不到，必须显式声明
 HIDDEN = [

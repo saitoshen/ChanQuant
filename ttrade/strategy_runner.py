@@ -192,6 +192,9 @@ class PendingOrder:
     ts: float
     retries: int = 0
     phase: str = "live"        # live / cancelling
+    # 平今平昨被柜台打回后，是否已经换过一次（CLOSE ↔ CLOSETODAY）。
+    # 只翻一次：两个都说没仓，就是真的没仓，交给计数 + 停机，别来回弹。
+    flipped: bool = False
 
 
 @dataclass
@@ -219,6 +222,11 @@ class SlotState:
     based_target: int = 0
     underlying: str = ""       # 当前真实主力合约
     last_bar: object = None
+    # 这一轮算信号用的是哪份行情：「本地 N 根 + 实时 M 根」/「退回实时原始价」/
+    # 「K 线缺 N 个交易日」。目标仓一变就带着它落进 live.log —— 用户问
+    # 「实盘开了仓、回测却是空仓，是不是信号在闪」时，光有 target 一条数字
+    # 什么都证明不了，必须知道**当时喂进去的是什么**（2026-11-19）。
+    frame_note: str = ""
     error: str = ""
     last_action: str = ""
     pending: list = field(default_factory=list)
@@ -1294,7 +1302,15 @@ class PortfolioRunner:
                 return
             self._ib_arm(st, full)
             return
+        prev = int(st.target)
         st.target = st.signal * st.lots
+        if int(st.target) != prev:
+            # 目标一变就**落一次盘**（不只是写进界面那份内存日志）。
+            # 用户问「实盘开了仓、回测却空仓，是不是信号在闪」时，磁盘上必须
+            # 能回答：哪一根 bar、signal 几、手数几、当时喂进去的是哪份行情。
+            # 这三样缺一样，就只能靠猜（2026-11-19 就卡在这儿）。
+            bar = df.index[-1] if len(df) else ""
+            self._note_target(st, prev, bar)
         if not open_now:
             # 让状态栏说清楚「不是没算，是收盘了不下单」。**0 也要写出来** ——
             # 空着或者只写「暂停下单」时，用户分不清「算了但是空仓」和
@@ -1336,7 +1352,12 @@ class PortfolioRunner:
         st.signal = int(sig)
         if st.cfg.note != "short":
             st.signal = max(0, st.signal)
+        prev = int(st.target)
         st.target = st.signal * st.lots
+        if int(st.target) != prev:
+            # 机器学习信号是后台算的，这里手上没有 df —— 末根留空，
+            # 但要留下 ml_age，能反推「这份信号是多久以前出的」
+            self._note_target(st, prev, f"ML {st.ml_age:.0f}s 前算出")
         return True
 
     # ---- K 线内进出场（`StrategySpec.intrabar`） ----
@@ -1530,14 +1551,19 @@ class PortfolioRunner:
                     f"{st.title()}：读前复权历史失败，暂用实时原始价"
                     f"（{type(exc).__name__}: {exc}）"
                 )
+                st.frame_note = f"前复权历史读不到，用实时原始价 {len(live)} 根"
                 base = pd.DataFrame()
             self._qfq_base[key] = base
         if base is None or base.empty:
+            st.frame_note = f"没有本地历史，用实时原始价 {len(live)} 根"
             return live
         if live.index[0] > base.index[-1]:
             # 本地历史太旧，和实时段接不上（中间断了一截）。硬拼会在断口造一次
             # 假跳空，比用原始价更糟 —— 退回实时原始价，并记一条日志
             self._log(f"{st.title()}：本地历史与实时段接不上，暂用实时原始价")
+            st.frame_note = (f"本地历史与实时段接不上（本地止于 "
+                             f"{base.index[-1]:%m-%d %H:%M}），用实时原始价 "
+                             f"{len(live)} 根")
             return live
         # **和回测同源同长**：`replay.run` 先按 `range_years` 切一刀（还多留
         # `WARMUP_BARS` 根预热），这里切同一刀。详情页画多少根、从哪根开始算，
@@ -1567,12 +1593,29 @@ class PortfolioRunner:
                 self._gap_note[key] = note
                 st.last_action = note
                 self._log(f"{st.title()}：{note}")
+            st.frame_note = note
             return pd.DataFrame()
         self._gap_note.pop(key, None)
         merged = replay.window(merged, getattr(st.cfg, "range_years", 0) or 0)
         if merged is None or len(merged) < 2:
+            st.frame_note = f"本地历史切片后不足 2 根，用实时原始价 {len(live)} 根"
             return live
+        st.frame_note = (f"前复权本地 {len(base)} 根 + 实时 {len(live)} 根"
+                         f"（合并后 {len(merged)} 根）")
         return merged
+
+    def _note_target(self, st: SlotState, prev: int, bar) -> None:
+        """目标仓一变就写一行 `[TGT]` 到 `live.log`。
+
+        只进界面日志是不够的：那份在内存里，关窗就没了。而「实盘这根 bar 为什么
+        开仓」恰恰是事后才问的 —— 到时候账户、持仓、委托全变了，只剩日志能说明
+        当时 signal / lots / 行情来源各是什么。
+        """
+        msg = (f"{st.title()}：目标 {prev:+d} → {int(st.target):+d} 手"
+               f"（signal={st.signal:+d} lots={st.lots} 末根={bar}"
+               + (f"；{st.frame_note}" if st.frame_note else "") + "）")
+        if self._diag is not None:
+            self._diag.write("TGT", msg)
 
     @staticmethod
     def _is_ml(cfg) -> bool:
@@ -2303,8 +2346,18 @@ class PortfolioRunner:
 
         his = max(_i(f"pos_{side}_his"), _i(f"volume_{side}_his"))
         today = max(_i(f"pos_{side}_today"), _i(f"volume_{side}_today"))
-        if his + today < self._side_pos(symbol, side):
+        total = self._side_pos(symbol, side)
+        if his + today < total:
             return None
+        # 总仓是硬约束。两套字段（天勤 pos_* / 柜台 volume_*）混着取 max，
+        # 或者柜台把今昨分两条推、累加后各自都等于总仓，都会让 his+today > total。
+        # 这时**以今仓为准**（TodayPosition 是柜台对「今天开的」直接计数，
+        # YdPosition 在分条推送下并不可靠），剩下的才算昨仓。
+        # 反过来做（信 YdPosition、把余量算今仓）正是 2026-11-19 那次
+        # 「一键对齐平 sn 今仓却发 CLOSE，被 [51] 平昨仓位不足 打回」的成因。
+        if today > total:
+            today = total
+        his = max(0, total - today)
         return his, today
 
     def _legs(self, symbol: str, delta: int,
@@ -2523,6 +2576,13 @@ class PortfolioRunner:
                     # 跟着行情推送一秒能跑十几次，一个注定失败的单会把日志刷爆、
                     # 把主线程拖死。所以计数 + 冷却，连续几次直接停机。
                     why = getattr(order, "last_msg", "") or "未知原因"
+                    # 平今平昨判错是**可以自己纠正**的：手数、方向、价格都没问题，
+                    # 只是告诉交易所「平哪一边」错了。这里换一边重报一次，
+                    # 不占「连续被拒」的次数 —— 否则一次判错就直接停机
+                    # （2026-11-19 一键对齐平 sn 今仓，发成 CLOSE 被打回）。
+                    if self._flip_offset(st, o, why):
+                        keep.append(o)
+                        continue
                     st.rejects += 1
                     st.reject_ts = now
                     st.reject_msg = why
@@ -2588,6 +2648,56 @@ class PortfolioRunner:
             o.phase = "cancelling"
             keep.append(o)
         st.pending = keep
+
+    def _flip_offset(self, st: SlotState, o: PendingOrder, why: str) -> bool:
+        """「平昨仓位不足」这类拒单：把 CLOSE / CLOSETODAY 换一边重报一次。
+
+        上期所（SHFE）和能源中心（INE）把平今、平昨当成**两个指令**分别校验：
+        报 CLOSE 而昨仓是 0，整单被 `[51] 平昨仓位不足` 打回；报 CLOSETODAY
+        而今天没开过仓，同样打回。手数、方向、价格都是对的，错的只是
+        「平哪一边」这一位 —— 换一边重报，成交了平掉的还是同一笔仓。
+
+        只在拒单文案确实指向仓位不足时动手（资金不足、涨跌停之类换了没用），
+        且 `o.flipped` 保证只翻一次：两边都说没仓就是真没仓，交给计数 + 停机。
+
+        这是**兜底**，不是正路。正路是 `_split_pos` 拿到对的今昨明细，
+        一开始就发对指令（2026-11-19 的根因在 `broker_api._fill_positions`
+        把 YdPosition 当昨仓，与持仓表口径不一致）。
+        """
+        if o.flipped:
+            return False
+        if o.offset not in ("CLOSE", "CLOSETODAY"):
+            return False
+        ex = str(o.symbol or "").split(".")[0].upper()
+        if ex not in SPLIT_OFFSET_EX:
+            return False
+        text = str(why or "")
+        if not any(k in text for k in ("仓位不足", "持仓不足", "可平", "平昨", "平今")):
+            return False
+        price = self._price_at(o.symbol, o.direction)
+        if not price or price != price:      # NaN：盘口还没来，等下一轮
+            return False
+        want = "CLOSETODAY" if o.offset == "CLOSE" else "CLOSE"
+        try:
+            again = self._order(
+                symbol=o.symbol, direction=o.direction, offset=want,
+                volume=o.volume, limit_price=price,
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.last_action = f"换平今平昨重报失败：{exc}"
+            return False
+        if again is None:
+            return False                     # 额度用完，交给上层按「报单到顶」处理
+        o.offset = want
+        o.flipped = True
+        o.order_id = self._order_id(again)
+        o.price = price
+        o.phase = "live"
+        o.ts = time.time()
+        st.last_action = (
+            f"平今平昨对不上（{text}），改 {want} 重报 {o.volume} 手 @ {price:.2f}")
+        self._log(f"{st.title()}：{st.last_action}")
+        return True
 
     # ---- 监控器 ----
 

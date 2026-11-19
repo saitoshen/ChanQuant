@@ -51,7 +51,13 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          # 3.14 而不是 3.13：融航那套 CTP 运行时（见 vendor/rohon_ctp）
+          # 里的 pyd 是 **cp314** 的，`packaging/ChanQuant.spec` 会拿它跟构建解释器
+          # 的 ABI 比对，对不上就把 vendor 整份剔掉 —— 打出来的包在融航账户上只会
+          # 显示「通道不可用」。本机 base 也是 3.14，CI 对齐后 vendor 才能进 Windows 包。
+          # 三平台 cp314 轮子已逐个确认（numpy / pandas / scipy / scikit-learn /
+          # duckdb / PySide6 / Pillow / matplotlib / lightgbm / xgboost 全都有）。
+          python-version: "3.14"
           cache: pip
 
       # 发版最容易忘的就是同步版本号：v1.0.1 那次打出来的包里还写着 1.0.0，
@@ -90,17 +96,10 @@ jobs:
         continue-on-error: true
         run: python -m pip install openctp-ctp
 
-      # 融航资管中台（vnpy_rohon）同样是可选依赖，同样只有 Windows wheel，
-      # 而且只出 cp310 / cp313（runner 是 3.13 ⇒ 正好有）。
-      # **必须 `--no-deps`**：它的依赖表里写着 vnpy>=4.0.0，而 vnpy 4.5 把
-      # pyside6==6.8.2.1 钉成硬依赖，一装就把 requirements 里的 6.11 降级，
-      # 打包出来的程序界面会当场变形（而且这种坏是「只在发布包里」的）。
-      # 我们只用它的 `vnpy_rohon.api` 驱动层（两个 .pyd + 四个 dll + 常量表），
-      # 那一层根本不 import vnpy。
-      - name: 安装融航客户端（可选）
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        run: python -m pip install vnpy_rohon==6.7.2.5 --no-deps
+      # 融航**不需要**再 pip 装东西了。旧路线 `vnpy_rohon` 只有 cp310 / cp313
+      # 的轮子（3.14 装不上），而且它声明依赖 vnpy，一装就把 PySide6 钉回
+      # 6.8.2.1，界面当场变形。现在走融航官方给的「CTP 兼容 dll」：运行时随仓库
+      # 放在 `vendor/rohon_ctp/`（cp314），由 spec 按构建解释器的 ABI 决定带不带。
 
       # xgboost 的 macOS wheel 不打包 OpenMP 运行时，libxgboost.dylib 里写的是
       # @rpath/libomp.dylib + LC_RPATH=/usr/local/opt/libomp/lib（x64）或
@@ -206,13 +205,26 @@ jobs:
             fi
             return 1
           }
+          # 首轮没过就**重试一次**再判死。macOS 的自检偶尔会死在「构建主窗口（端到端）」
+          # （exit 139，内存越界类，非确定性：同一份代码换个 tag 又全过，arm64 与 x64
+          # 轮流中招）。真正的结构性问题——日志里有 [FAIL]——重试照样失败，所以重试
+          # 不掩盖问题；它只把「随机蹦一次」救回来，免得整个平台的白干。
           if [ "$RUNNER_OS" = "Windows" ]; then
-            run_selftest ./dist/ChanQuant/ChanQuant.exe \
-              "$LOCALAPPDATA/ChanQuant/logs/selftest.log"
+            exe=./dist/ChanQuant/ChanQuant.exe
+            log="$LOCALAPPDATA/ChanQuant/logs/selftest.log"
           else
-            run_selftest ./dist/ChanQuant.app/Contents/MacOS/ChanQuant \
-              "$HOME/Library/Application Support/ChanQuant/logs/selftest.log"
+            exe=./dist/ChanQuant.app/Contents/MacOS/ChanQuant
+            log="$HOME/Library/Application Support/ChanQuant/logs/selftest.log"
           fi
+          if run_selftest "$exe" "$log"; then
+            exit 0
+          fi
+          # 重试前清掉上一轮的状态文件：不清的话 progress 停在上次的死点，
+          # 第二次真死了反而看不出来
+          rm -f "$log" "$(dirname "$log")/selftest_crash.txt" \
+                "$(dirname "$log")/selftest_progress.txt"
+          echo "::warning title=selftest::首轮未通过，清理状态后重试一次"
+          run_selftest "$exe" "$log"
 
       - name: 列出产物
         shell: bash

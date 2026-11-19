@@ -4816,6 +4816,9 @@ def _run() -> tuple[bool, list[str]]:
                 self._qfq_base, self.api, self.fast = {}, None, True
                 self._ml = _Ml()
                 self.frame = frame
+                # ML 快/慢路径会往诊断日志里写 `[TGT]`。真构造函数里 `_diag`
+                # 一定有（`LiveLog()`），这里绕过了 `super().__init__()`，得自己补
+                self._diag = None
 
             def _subscribe(self, st): pass
             def _skey(self, cfg): return cfg.key()
@@ -4927,6 +4930,7 @@ def _run() -> tuple[bool, list[str]]:
                 self._aux_warned = set()
                 self._qfq_base = {}
                 self._log_fn = None
+                self._diag = None        # 同上：绕过了真构造函数
 
             def _with_aux(self, st, d):
                 return d
@@ -6197,6 +6201,12 @@ def _run() -> tuple[bool, list[str]]:
         else:
             raise RuntimeError("没登录时 place() 竟然没报错")
 
+        # `HAS_CTP` 现在是惰性的（通道用到时才绑定），这里先绑一次再判断，
+        # 否则会误判成「没装」而跳过后面所有实质检查
+        try:
+            C.bind_channel("ctp")
+        except Exception:  # noqa: BLE001 - 自测里不该因通道冲突中断
+            pass
         if not C.HAS_CTP:
             return f"openctp-ctp 未安装（CTP 不可用，其余功能不受影响）：{C.CTP_IMPORT_ERROR[:60]}"
         return f"openctp-ctp 已装，{len(cases)} 个合约的交易所解析正确"
@@ -6210,41 +6220,56 @@ def _run() -> tuple[bool, list[str]]:
         的 3.14 base 全都没有 —— 所以这条自检**不能因为没装就红**。要验的是：
         「没装时报的是人话、带装法」和「装了时方向/开平映射是对的」。
         """
-        from ttrade.ctp_live import RohonHub
-        from ttrade import rohon_client as R
+        import types
+
+        from ttrade import ctp_channel
+        from ttrade.ctp_live import RohonHub, _tcp_addr
 
         assert RohonHub.PLATFORM == "融航" and RohonHub.KIND == "rohon", \
             "融航柜台的平台名/类型标识被改了（界面按这两个值分组）"
+        # 融航的行情前置就是标准 CTP md 服务（实测能登录能订阅），所以有行情；
+        # 但「有没有行情」最终由账户里填没填 `md_front` 决定
+        assert RohonHub.SUPPORTS_MD is True, \
+            "融航的行情前置是标准 CTP md 服务，SUPPORTS_MD 应为 True"
 
-        # 前置地址：用户通常只填 host:port，柜台只认 tcp://
-        assert R._addr("1.2.3.4:1000") == "tcp://1.2.3.4:1000"
-        assert R._addr("tcp://1.2.3.4:1000") == "tcp://1.2.3.4:1000"
-        assert R._addr("  ") == "", "空地址被补成了 tcp://"
-        # DBL_MAX 是「没有值」，不收敛就是界面上蹦出 1.79e+308
-        assert R._f(R._MAXF) == 0.0 and R._f(None) == 0.0 and R._f("2.5") == 2.5
+        # 前置地址：账户表里填的是裸 host:port，RegisterFront 只认带协议的，
+        # 而且填错**不报错**、只是静默超时
+        assert _tcp_addr("1.2.3.4:1000") == "tcp://1.2.3.4:1000"
+        assert _tcp_addr("tcp://1.2.3.4:1000") == "tcp://1.2.3.4:1000"
+        assert _tcp_addr("  ") == "", "空地址被补成了 tcp://"
 
+        ok, why = ctp_channel.available("rohon")
+        if not ok:
+            raise RuntimeError(f"融航运行时缺失：{why}")
+
+        # 配置构造：**不能走 fill_preset**。走了的话，交易前置漏填会被
+        # SimNow 预设悄悄补成 182.254.243.31，融航 dll 一 connect 就段错误
         hub = RohonHub([])
-        if not R.HAS_ROHON:
-            # 未装：check_deps 必须报出包名 + 装法，而不是 AttributeError
-            try:
-                hub.check_deps()
-            except Exception as exc:  # noqa: BLE001
-                msg = str(exc)
-                assert "vnpy_rohon" in msg and "pip install" in msg, \
-                    f"未装时 check_deps 的提示不可用（{msg}）"
-            else:
-                raise RuntimeError("没装 vnpy_rohon，check_deps 竟然通过了")
-            return f"vnpy_rohon 未安装（融航不可用，其余功能不受影响）：{R.ROHON_IMPORT_ERROR[:60]}"
+        cfg = hub.make_config(types.SimpleNamespace(
+            name="t", td_front="1.2.3.4:1000", broker_id="B", user="u",
+            password="p", app_id="a", auth_code="c"))
+        assert cfg.channel == "rohon", f"通道没标成 rohon（会是 {cfg.channel}）"
+        assert cfg.td_front == "tcp://1.2.3.4:1000", f"交易前置没归一：{cfg.td_front}"
+        assert cfg.md_front == "", "账户没填 md_front，就不该有行情地址"
 
-        # 装了：柜台的 DIR / OFFSET 编码是**字符串**，不是整数（'0'=买 '1'=卖）
-        assert R.DIR_VT2ROHON["BUY"] == "0" and R.DIR_VT2ROHON["SELL"] == "1", \
-            f"方向编码不是 CTP 字符串口径：{R.DIR_VT2ROHON}"
-        assert R.DIR_ROHON2VT["0"] == "BUY" and R.DIR_ROHON2VT["1"] == "SELL"
-        for vt in ("OPEN", "CLOSE", "CLOSETODAY"):
-            back = R.OFFSET_ROHON2VT.get(R.OFFSET_VT2ROHON[vt])
-            assert back == vt, f"开平往返不一致：{vt} → {R.OFFSET_VT2ROHON[vt]} → {back}"
-        hub.check_deps()
-        return "vnpy_rohon 已装，方向/开平编码正确"
+        # 账户填了行情前置 -> 归一成 tcp://，交给 MdClient
+        cfg3 = hub.make_config(types.SimpleNamespace(
+            name="t3", td_front="1.2.3.4:1000", md_front="5.6.7.8:2000",
+            broker_id="B", user="u", password="p", app_id="a", auth_code="c"))
+        assert cfg3.md_front == "tcp://5.6.7.8:2000", \
+            f"行情前置没归一：{cfg3.md_front}"
+
+        cfg2 = hub.make_config(types.SimpleNamespace(
+            name="t2", td_front="", broker_id="B", user="u",
+            password="p", app_id="a", auth_code="c"))
+        assert cfg2.td_front == "", \
+            "空交易前置被预设补上了 —— 那会连到 SimNow，融航 dll 直接崩"
+
+        # 通道互斥的错误文案必须把人话讲清楚（这里只验措辞，不真的绑第二个通道：
+        # 一旦在本进程加载融航 dll，后面的 CTP 用例就没法跑了）
+        assert "段错误" in ctp_channel.ChannelError(
+            "两套 CTP 库在同一进程里会段错误崩溃").args[0]
+        return "融航走 CTP 兼容 dll（6.7.2.8），行情/交易地址归一正确"
 
     check("融航客户端（可选依赖）", _rohon)
 
@@ -6360,7 +6385,14 @@ def _run() -> tuple[bool, list[str]]:
         # 查合约：传合约号要带上 InstrumentID（单条秒回），不传才是全量。
         # 这段要构造 CTP 的请求对象，所以只能在装了 openctp-ctp 的平台上跑 ——
         # macOS 没有这个包（只有 Win/Linux wheel），跳过而不是判失败
-        from ttrade.ctp_client import HAS_CTP, TraderClient
+        from ttrade import ctp_client as _cc
+        from ttrade.ctp_client import TraderClient
+
+        try:
+            _cc.bind_channel("ctp")     # 惰性绑定：不先绑，`HAS_CTP` 一律是 False
+        except Exception:  # noqa: BLE001
+            pass
+        HAS_CTP = _cc.HAS_CTP
 
         if HAS_CTP:
             got_req = []
@@ -6531,6 +6563,99 @@ def _run() -> tuple[bool, list[str]]:
         return "序列 300 根 + 拼 bar + 委托三态 + 今昨仓 + 无回报判死 全对"
 
     check("柜台执行层（策略页跑 CTP / 融航）", _broker_api)
+
+    def _today_split():
+        """上期所平今 / 平昨：今仓从 `TodayPosition` 认，别把 YdPosition 当昨仓。
+
+        2026-11-19 用户报「一键对齐：委托被拒（第 1 次）[51] CTP:平昨仓位不足」，
+        而账户里 sn2612 明明是今仓 1 手（持仓表也写着「今多 1」）。根因是引擎
+        拿 YdPosition 当昨仓 → 发 `CLOSE` 去平一手今天才开的仓，上期所整单打回。
+        同一份快照两处两种说法，是因为持仓表（`ctp_live`）和引擎
+        （`broker_api._fill_positions`）各取了一套字段。
+
+        这一项钉三处：快照口径 / 拆单指令 / 被拒后自动换一边重报。
+        """
+        import types
+
+        from ttrade import strategy_runner as R
+        from ttrade.ctp_live import split_today_his
+        from ttrade.tqlive import AccountSpec
+
+        # ① 快照口径。分条推送累加后 his+today 会大于总仓，必须收敛回总仓，
+        #    且以今仓为准（今仓不可能超过总仓，昨仓才是「剩下的」）。
+        cases = [
+            ("今仓 1、YdPosition 报 0", {"long": 1, "long_yd": 0, "long_today": 1}, 1, (0, 1)),
+            ("今昨都报 1、总仓 1（累加后不自洽）",
+             {"long": 1, "long_yd": 1, "long_today": 1}, 1, (0, 1)),
+            ("纯昨仓 2", {"long": 2, "long_yd": 2, "long_today": 0}, 2, (2, 0)),
+            ("柜台没给 TodayPosition，退回「总 − 昨」",
+             {"long": 3, "long_yd": 1}, 3, (1, 2)),
+            ("空仓", {"long": 0}, 0, (0, 0)),
+        ]
+        for note, row, total, want in cases:
+            got = split_today_his(row, "long", total)
+            assert got == want, f"{note}：要 {want}，得到 {got}"
+
+        # ② 拆单指令：今仓必须发 CLOSETODAY
+        spec = AccountSpec(name="__selftest__", kind="sim")
+        run = R.PortfolioRunner(spec)
+        run._pos = {"SHFE.sn2612": types.SimpleNamespace(
+            pos_long=1, pos_short=0, volume_long=1, volume_short=0,
+            pos_long_his=0, pos_long_today=1, pos_short_his=0, pos_short_today=0,
+            volume_long_his=0, volume_long_today=1,
+            volume_short_his=0, volume_short_today=0)}
+        legs = run._legs("SHFE.sn2612", -1)
+        assert legs == [("CLOSETODAY", 1)], f"今仓要发平今，得到 {legs}"
+        # 昨仓反过来必须是 CLOSE —— 给上期所发 CLOSETODAY 会被打回「平今仓位不足」
+        run._pos["SHFE.sn2612"].pos_long_today = 0
+        run._pos["SHFE.sn2612"].volume_long_today = 0
+        run._pos["SHFE.sn2612"].pos_long_his = 1
+        run._pos["SHFE.sn2612"].volume_long_his = 1
+        assert run._legs("SHFE.sn2612", -1) == [("CLOSE", 1)], "昨仓要发平昨"
+        # 非上期所 / 能源中心不分今昨：一律 CLOSE（发 CLOSETODAY 会被整单打回）
+        run._pos["DCE.i2701"] = types.SimpleNamespace(
+            pos_long=1, pos_short=0, volume_long=1, volume_short=0,
+            pos_long_his=1, pos_long_today=0,
+            pos_short_his=0, pos_short_today=0,
+            volume_long_his=1, volume_long_today=0,
+            volume_short_his=0, volume_short_today=0)
+        assert run._legs("DCE.i2701", -1) == [("CLOSE", 1)], "大商所不能用 CLOSETODAY"
+
+        # ③ 被拒后自动换一边重报，且只翻一次
+        class _Api:
+            def __init__(self):
+                self.calls: list[dict] = []
+
+            def get_quote(self, sym):
+                return types.SimpleNamespace(
+                    price_tick=10.0, ask_price1=325810.0, bid_price1=325800.0,
+                    last_price=325800.0)
+
+            def insert_order(self, **kw):
+                self.calls.append(kw)
+                return {"order_id": f"o{len(self.calls)}"}
+
+        run.api = _Api()
+        st = run._align_slot
+        o = R.PendingOrder(order_id="x", symbol="SHFE.sn2612", direction="SELL",
+                           offset="CLOSE", volume=1, price=325800.0, ts=0.0)
+        ok = run._flip_offset(st, o, "[51] CTP:平昨仓位不足")
+        assert ok, "平昨仓位不足没触发换边重报"
+        assert o.offset == "CLOSETODAY", f"该换成平今，得到 {o.offset}"
+        assert run.api.calls and run.api.calls[-1]["offset"] == "CLOSETODAY", run.api.calls
+        assert run.api.calls[-1]["volume"] == 1, "手数不能变"
+        assert not run._flip_offset(st, o, "[51] CTP:平今仓位不足"), "只该翻一次"
+        # 与仓位无关的拒单（资金不足）不换边 —— 换了也还是失败，只会白耗额度
+        o2 = R.PendingOrder(order_id="y", symbol="SHFE.sn2612", direction="SELL",
+                            offset="CLOSE", volume=1, price=325800.0, ts=0.0)
+        assert not run._flip_offset(st, o2, "[31] CTP:资金不足"), "资金不足不该换边"
+        # 大商所不换边
+        o3 = R.PendingOrder(order_id="z", symbol="DCE.i2701", direction="SELL",
+                            offset="CLOSE", volume=1, price=800.0, ts=0.0)
+        assert not run._flip_offset(st, o3, "平昨仓位不足"), "大商所不分今昨"
+        return "今仓优先取 TodayPosition、上期所拆平今、被拒自动换边一次 全对"
+
+    check("平今平昨：今仓优先 + 被拒自动换边", _today_split)
 
     def _many_failed(n: int = 40) -> list[str]:
         """造一批「同一原因、不同品种」的失败清单。
@@ -6995,8 +7120,9 @@ def _run() -> tuple[bool, list[str]]:
                        and _m.underlying == "CTP户_rb2601"
                        and set(_m.by_account) == {"天勤户", "CTP户"}
                        and round(_m.account.get("balance") or 0, 2) == 150.0)
-            # 融航：账户类型要在表里、backend 要走 rohon、Hub 的柜台名要对；
-            # 没装 vnpy_rohon 时给的必须是**一句能看懂的话**，不是 ImportError 堆栈
+            # 融航：账户类型要在表里、backend 要走 rohon、Hub 的柜台名要对。
+            # 现在融航走 CTP 兼容 dll（vendor/rohon_ctp），**不再依赖 vnpy_rohon**，
+            # 所以这里不再要求报错里出现包名；缺运行时的话，文案要能指到 vendor
             acct_ok = (acct_ok and "rohon" in dict(_KINDS)
                        and _roh.backend == "rohon"
                        and RohonHub.PLATFORM == "融航"
@@ -7004,7 +7130,8 @@ def _run() -> tuple[bool, list[str]]:
             try:
                 RohonHub([]).check_deps()
             except Exception as _exc:      # noqa: BLE001
-                acct_ok = acct_ok and "vnpy_rohon" in str(_exc)
+                _msg = str(_exc)
+                acct_ok = acct_ok and "融航" in _msg and "vendor" in _msg
 
             # ---- 「策略交易和组合」跑柜台账户（CTP / 融航）
             # 以前这一页只认天勤账户，CTP / 融航 配进来要等到 `start()` 最后一步

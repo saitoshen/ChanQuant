@@ -2,6 +2,9 @@
 .venv/
 __pycache__/
 *.py[cod]
+# 上面的 *.py[cod] 会连 `.pyd` 一起吃掉 —— 但融航那套运行时里，两个 .pyd 是
+# 真正的驱动（融航的 dll 靠它加载），漏掉它们的包一点「连接」就报加载失败。
+!vendor/rohon_ctp/openctp_ctp/*.pyd
 .mplcache/
 .pytest_cache/
 

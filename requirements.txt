@@ -76,22 +76,15 @@ threadpoolctl==3.7.0
 # `--selftest` 会照实报「openctp-ctp 未安装」。CI 里也是一步独立的、
 # `continue-on-error` 的 Windows 专属安装。
 #
-# 融航资管中台（vnpy_rohon）：只有 Windows x86-64 的 wheel，且只有
-# cp310 / cp313 两个 ABI（本机 base 是 3.14 ⇒ 装不上，`envs/fq` 是 3.13 ⇒ 能用）。
-# 三个硬约束，少一个就会踩坑：
+# 融航资管中台（旧路线 vnpy_rohon）：**已废弃，不要再装**。
 #
-#   1. **必须 `--no-deps`**。它的依赖表里写着 `vnpy>=4.0.0`，而 vnpy 4.5 把
-#      `pyside6==6.8.2.1` 钉成硬依赖 —— 一装就把本程序的 pyside6 6.11
-#      降级，界面当场变形/起不来。我们只借它的 `vnpy_rohon.api` 驱动层
-#      （两个 .pyd + 四个 dll + 常量表），那一层根本不 import vnpy。
-#   2. 装完**不要**再 `pip install vnpy`，也不要让它被别的包顺带拉进来
-#      （`pip check` 会因此报一条 vnpy 未满足，属预期，忽略）。
-#   3. 版本钉死 6.7.2.5：它是按当前融航客户端 6.4.x 的 API 编的，换版本
-#      要重测（`RohonHub.check_deps()` 里写的也是这个号）。
+# 它只有 cp310 / cp313 的 Windows 轮子（本项目现在是 3.14，装不上），而且依赖
+# 表里写着 vnpy>=4.0.0 —— 一装就把 PySide6 钉回 6.8.2.1，界面当场变形/起不来。
 #
-#     pip install vnpy_rohon==6.7.2.5 --no-deps      # Windows + cp313
+# 现在走融航官方给的「CTP 兼容 dll」：运行时在 `vendor/rohon_ctp/`（cp314），
+# 由 `ttrade/ctp_channel.py` 按独立顶层名加载，`packaging/ChanQuant.spec` 按
+# 构建解释器的 ABI 决定带不带。**不需要 pip 装任何东西**。
 #
-# 没装时 `ttrade/rohon_client.py` 的 `HAS_ROHON` 为 False，界面里融航账户
-# 一勾就提示装包，其余功能（含 CTP / 天勤）完全不受影响；`--selftest`
-# 里有一项专门检查这种「未装时也照实报错、不炸」的行为。
+# `ttrade/rohon_client.py` 作为旧实现留着备用，`HAS_ROHON` 为 False 不影响
+# 其他任何功能（CTP / 天勤 / 回测都照常）。
 

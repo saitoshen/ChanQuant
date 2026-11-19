@@ -44,7 +44,8 @@ import numpy as np
 import pandas as pd
 
 from ttrade.ctp_live import (_EX_SHORT, _BarBuilder, ctp_instrument, exchange_of_contract,
-                             looks_contract, main_contract, variety_exchange)
+                             looks_contract, main_contract, split_today_his,
+                             variety_exchange)
 from ttrade.tqlive import BACKEND_LABELS
 
 #: `get_kline_serial` 的第二个参数是秒，反过来要认出周期名
@@ -659,21 +660,26 @@ class BrokerApi:
             short_q = int(p.get("short") or 0)
             if not long_q and not short_q:
                 continue
-            long_yd = max(0, int(p.get("long_yd") or 0))
-            short_yd = max(0, int(p.get("short_yd") or 0))
+            # 今仓**优先用柜台给的 `TodayPosition`**，昨仓由「总 − 今」反推，
+            # 和 `ctp_live._positions()` 走同一个函数（口径只要分家就会出人命：
+            # 持仓表显示「今多 1」、引擎却认为「昨多 1」，一键对齐发 CLOSE 去平
+            # 今天才开的仓，被上期所整单打回 `[51] 平昨仓位不足`）。
+            # 为什么以今仓为准、为什么 YdPosition 不可靠，见 `split_today_his()`。
+            long_yd, long_td = split_today_his(p, "long", long_q)
+            short_yd, short_td = split_today_his(p, "short", short_q)
             ex = self._exchange_of(ins)
             key = _canon(ex, ins)
             out[key] = _Obj(
                 symbol=key, exchange=ex,
                 pos_long=long_q, pos_short=short_q,
                 volume_long=long_q, volume_short=short_q,
-                pos_long_his=min(long_yd, long_q), pos_short_his=min(short_yd, short_q),
-                pos_long_today=max(0, long_q - long_yd),
-                pos_short_today=max(0, short_q - short_yd),
-                volume_long_his=min(long_yd, long_q),
-                volume_short_his=min(short_yd, short_q),
-                volume_long_today=max(0, long_q - long_yd),
-                volume_short_today=max(0, short_q - short_yd),
+                pos_long_his=long_yd, pos_short_his=short_yd,
+                pos_long_today=long_td,
+                pos_short_today=short_td,
+                volume_long_his=long_yd,
+                volume_short_his=short_yd,
+                volume_long_today=long_td,
+                volume_short_today=short_td,
                 open_price_long=float(p.get("price") or 0.0),
                 open_price_short=float(p.get("price") or 0.0),
                 float_profit=float(p.get("profit") or 0.0),

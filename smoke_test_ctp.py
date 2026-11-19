@@ -27,9 +27,16 @@ import os
 import sys
 import time
 
-from ttrade.ctp_client import HAS_CTP
+from ttrade import ctp_client as _cc
 from ttrade.ctp_live import CtpHub
 from ttrade.tqlive import AccountSpec
+
+# 通道是惰性绑定的（见 ttrade/ctp_channel.py），这里显式绑一次再判断
+try:
+    _cc.bind_channel("ctp")
+except Exception:  # noqa: BLE001 - 通道被占用时下面会照实报
+    pass
+HAS_CTP = _cc.HAS_CTP
 
 RESULTS: list[tuple[str, bool, str]] = []
 

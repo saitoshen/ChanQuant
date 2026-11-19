@@ -1,5 +1,13 @@
 """融航资管中台（vnpy_rohon）：行情 + 交易。
 
+**已停用（2026-11-19）** —— 现在走融航官方的「CTP 兼容 dll」路线，见
+`ttrade/ctp_channel.py` 和 `ttrade/ctp_live.RohonHub`：把融航给的
+`thosttraderapi_se.dll` 配 openctp-ctp 6.7.2.8，用标准 CTP 接口直接登录，
+不再依赖 `vnpy_rohon`（那包只出 cp310/cp313 轮子，本机 base 是 3.14 装不上）。
+
+这个文件保留，是因为它是 vnpy_rohon 路线的完整实现（行情 + 交易 + 字段映射），
+哪天拿到 cp314 的轮子可以直接接回来。**它不再被任何代码引入**。
+
 **为什么不装 vnpy**：`vnpy_rohon` 的包入口（`vnpy_rohon/__init__.py`）会
 `from .gateway import RohonGateway`，而那个 gateway 要 `import vnpy`；vnpy 4.5.0
 把 `pyside6==6.8.2.1` 钉成**硬依赖**，本程序锁的是 6.11.3（见 requirements.txt

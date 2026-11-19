@@ -34,10 +34,10 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from ttrade import symbols_info
+from ttrade import ctp_channel, symbols_info
+from ttrade import ctp_client as ctp_client_mod
 from ttrade.ctp_client import (
     ALIVE_STATUS,
-    HAS_CTP,
     CtpConfig,
     CtpError,
     MdClient,
@@ -230,6 +230,41 @@ def main_contract(symbol: str, exchange: str = "") -> str:
 # ------------------------------------------------------------------ 配置装配
 
 
+def split_today_his(p: dict, side: str, total: int) -> tuple[int, int]:
+    """柜台持仓行 → `(昨仓, 今仓)`，**今仓优先**。`side` 是 `long` / `short`。
+
+    `ctp_client` 的快照里同时有 `{side}_yd`（YdPosition 累加）和
+    `{side}_today`（TodayPosition 累加）。以前两张表各取一套：
+
+    - 持仓表（交易页）优先 `long_today` → 显示「今多 1」；
+    - 引擎（`broker_api._fill_positions`）直接拿 `long_yd` 当昨仓
+      → 认为「昨多 1、今多 0」，一键对齐于是发 CLOSE 去平一手今天才开的仓，
+      被上期所整单打回 `[51] CTP:平昨仓位不足`（2026-11-19 用户报的 sn2612）。
+
+    为什么必须以今仓为准：CTP 对上期所的持仓按「今/昨 + 开仓日」**分条推送**，
+    每条 `Position` 只算自己那一段，`YdPosition` 在分条累加后不一定等于昨仓
+    （两条都带 Position=1、YdPosition 各填自己那份时，his+today 会大于总仓）。
+    `TodayPosition` 是柜台对「今天开的」直接计数，反而是稳的。
+
+    所以：今仓取 `TodayPosition`，昨仓 = 总 − 今。总仓是硬约束。
+    """
+    total = max(0, int(total or 0))
+    if not total:
+        return 0, 0
+
+    def _i(name: str) -> int:
+        try:
+            return int(p.get(name) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    today = _i(f"{side}_today")
+    if today <= 0:                      # 柜台没给今仓，退回「总 − 昨」
+        today = max(0, total - _i(f"{side}_yd"))
+    today = min(max(0, today), total)
+    return total - today, today
+
+
 def spec_to_config(spec) -> CtpConfig:
     """`AccountSpec`（kind=ctp）→ `CtpConfig`。
 
@@ -367,6 +402,9 @@ class CtpHub:
     # 界面上账户行显示的柜台名，也是报错时的主语
     PLATFORM = "CTP"
     KIND = "ctp"
+    #: 这条通道有没有行情。融航也支持 —— 它的行情前置就是标准 CTP md 服务，
+    #: 账户里填了 `md_front` 就会连；留空则整段行情逻辑跳过
+    SUPPORTS_MD = True
 
     def __init__(self, specs) -> None:
         if specs is None:
@@ -400,8 +438,12 @@ class CtpHub:
     # ---- 柜台适配（融航覆盖这四个） ----
 
     def check_deps(self) -> None:
-        if not HAS_CTP:
-            raise CtpError("没装 openctp-ctp，用不了 CTP（pip install openctp-ctp）")
+        # 绑一次比「查 import 成功没有」更实在：DLL 加载失败、通道被占用
+        # 都会在这里就报出来，而不是等 start() 里半路炸
+        if not ctp_client_mod.bind_channel("ctp"):
+            raise CtpError(
+                f"用不了 CTP（{ctp_client_mod.CTP_IMPORT_ERROR}）"
+                "。装法：pip install openctp-ctp")
 
     def make_config(self, spec):
         return spec_to_config(spec)
@@ -448,7 +490,8 @@ class CtpHub:
         self.trader = trader
 
         # 行情是可选：只做交易不看盘也能用。连不上就只报一条日志，不影响下单
-        if cfg.md_front:
+        # （账户没填 `md_front`、或通道 `SUPPORTS_MD` 为假时整段跳过）
+        if cfg.md_front and self.SUPPORTS_MD:
             md = self.make_md(cfg)
             try:
                 md.start()
@@ -781,12 +824,11 @@ class CtpHub:
             if not long_q and not short_q:
                 continue
             # 今仓优先用柜台给的 `TodayPosition`（多条记录累加后的值），
-            # 拿不到才用「总 − 昨」推。两者在正常行情下相等，但今昨分两条
-            # 推送时，「总 − 昨」会把昨仓那条的 0 也算进来，累加后偏大。
-            long_td = int(p.get("long_today")
-                          or max(0, long_q - int(p.get("long_yd") or 0)))
-            short_td = int(p.get("short_today")
-                           or max(0, short_q - int(p.get("short_yd") or 0)))
+            # 拿不到才用「总 − 昨」推。口径统一在 `split_today_his()` 里 ——
+            # 引擎那边的 `broker_api._fill_positions` 用的是同一个函数，
+            # 两张表必须一眼对得上，否则「平今平昨」两边各说各话。
+            _hl, long_td = split_today_his(p, "long", long_q)
+            _hs, short_td = split_today_his(p, "short", short_q)
             mult = self._mult(ins)
             cost = float(p.get("price") or 0.0)          # CTP 的 OpenCost 是总成本
             total = long_q + short_q
@@ -948,44 +990,91 @@ class CtpHub:
 # ------------------------------------------------------------------ 融航
 
 
+def _tcp_addr(text: str) -> str:
+    """`210.22.96.58:28111` → `tcp://210.22.96.58:28111`。
+
+    CTP 的 `RegisterFront` 只认带协议的地址，裸 `ip:port` 会一直连不上，
+    而且**不报错**——`Init()` 之后就是静默超时，界面只会说「登录超时」。
+    账户表里融航填的是裸地址，所以这里补一次。
+    """
+    v = str(text or "").strip()
+    if not v:
+        return ""
+    if v.lower().startswith(("tcp://", "ssl://", "udp://")):
+        return v
+    return "tcp://" + v
+
+
 class RohonHub(CtpHub):
     """融航资管中台。除了「怎么连」以外，全部复用 `CtpHub`。
 
     融航（Rohon）对外是 CTP 协议的中台：同样的前置地址、同样的报单字段、同样的
     委托状态字符。所以持仓合并、上期所今昨仓拆分、成交金额折算这些规则一条都
-    不用重写 —— 只换底下的三个客户端。
+    不用重写 —— 只换底下的客户端。
 
-    驱动层用 `vnpy_rohon.api`（两个 pybind 模块），**不用 vnpy 框架**：vnpy 4.5.0
-    把 `pyside6==6.8.2.1` 钉成硬依赖，装上就会把本程序的 Qt 降级。详见
-    `ttrade/rohon_client.py` 开头的说明。
+    驱动层是融航官方给的 **CTP 兼容 dll**（替换 `thosttraderapi_se.dll`），
+    配 openctp-ctp 6.7.2.8 用标准 CTP 接口登录。以前那条 `vnpy_rohon` 的路
+    走不通：那个包只有 cp310/cp313 的轮子，本机 base 是 3.14 装不上。
+    `ttrade/rohon_client.py` 还留着（旧路线的完整实现，备用），但**没人调它**。
     """
 
     PLATFORM = "融航"
     KIND = "rohon"
+    #: 融航的替换包里只给了 `thosttraderapi_se.dll`，但它的**行情前置是标准
+    #: CTP md 服务**：vendor 里那份 6.7.2 的 `thostmduserapi_se` 连
+    #: `124.160.66.120:41253` 能连上、能登录（交易日 20261119）、能订阅，
+    #: 不需要融航另给 md dll（2026-11-19 实测）。
+    #:
+    #: 早先记的「标准 md 连融航行情口 0xC0000005 崩溃」是**探测脚本的问题**：
+    #: `api.RegisterSpi(Spi(api))` 传的是临时对象，CPython 当场回收，CTP 侧
+    #: 拿到悬空指针就崩。SPI 必须被变量持有（正式代码里是 `self._spi`）。
+    #:
+    #: 账户里填了 `md_front` 才连行情，留空就退回「只交易、行情靠天勤」。
+    SUPPORTS_MD = True
 
     def check_deps(self) -> None:
-        from .rohon_client import HAS_ROHON, ROHON_IMPORT_ERROR
+        """融航走 CTP 兼容 dll，**不再依赖 vnpy_rohon**。
 
-        if not HAS_ROHON:
+        `vnpy_rohon` 只有 cp310/cp313 的轮子，本机 base 是 3.14 装不上；
+        而融航的 dll 导出的就是标准 CTP 的 C 接口（`CreateFtdcTraderApi` 等），
+        配 openctp-ctp 6.7.2.8 能直接登录（2026-11-19 实测）。
+        """
+        ok, why = ctp_channel.available("rohon")
+        if not ok:
             raise CtpError(
-                f"没装 vnpy_rohon，用不了融航（{ROHON_IMPORT_ERROR}）"
-                "。装法：pip install vnpy_rohon==6.7.2.5 --no-deps"
-            )
+                f"融航通道用不了：{why}。\n"
+                "融航运行时在 vendor/rohon_ctp/（openctp-ctp 6.7.2.8 + 融航替换 dll），"
+                "从仓库拉全就能用，不需要 pip install vnpy_rohon")
 
     def make_config(self, spec):
-        from .rohon_client import spec_to_config as _rohon_config
+        """融航账户 → `CtpConfig(channel="rohon")`。
 
-        return _rohon_config(spec)
+        **不调 `fill_preset()`**：那个会按 SimNow 的预设补齐空地址，一旦
+        融航的交易前置漏填，就会被悄悄填成 `182.254.243.31:30001`，
+        然后融航的 dll 连标准 CTP 前置直接段错误 —— 界面上只会看到
+        「程序没了」，查不出原因。
+        """
+        return CtpConfig(
+            name=getattr(spec, "name", "") or "融航",
+            preset="",
+            md_front=_tcp_addr(getattr(spec, "md_front", "")),   # 填了就自己收行情
+            td_front=_tcp_addr(getattr(spec, "td_front", "")),
+            broker_id=getattr(spec, "broker_id", "") or "",
+            user_id=getattr(spec, "user", "") or "",
+            password=getattr(spec, "password", "") or "",
+            app_id=getattr(spec, "app_id", "") or "",
+            auth_code=getattr(spec, "auth_code", "") or "",
+            channel="rohon",
+        )
 
     def make_trader(self, cfg):
-        from .rohon_client import RohonTraderClient
-
-        return RohonTraderClient(cfg)
+        # 同一个 `TraderClient`：融航的 dll 就是 CTP 接口，解析规则一模一样
+        return TraderClient(cfg)
 
     def make_md(self, cfg):
-        from .rohon_client import RohonMdClient
-
-        return RohonMdClient(cfg)
+        # 融航的 md 前置是标准 CTP 行情服务，直接复用 `MdClient`。
+        # 收不到行情时 `start()` 只记一条 `last_error`，不影响下单。
+        return MdClient(cfg)
 
     def login_hint(self, cfg) -> str:
         """融航没有 SimNow 那种「按时段开放」的问题，补的是缺字段的提示。"""
