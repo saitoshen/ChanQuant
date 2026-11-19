@@ -3268,6 +3268,97 @@ def _run() -> tuple[bool, list[str]]:
 
     check("宏观因子的发布日对齐（5m/1h 不前视）", _macro_pit)
 
+    def _macro_avail_8():
+        """日更宏观在凌晨只能看到 D-2：汇率两项 + 美债实际利率。
+
+        用户 2026-11-19 钉死：Tushare 的日频汇率 **D+1 08:00 之后才更新**。
+        商品夜盘是 21:00 ~ 次日 02:30，00:00 之后那一段如果还按「自然日 − 1」
+        取数，拿到的是**当时还没发布**的那一行 —— 真正的未来函数，而且只在凌晨
+        两三个小时里发作，日盘看不出来、日线上更看不出来。
+
+        同日追加：`us_real10` 也要套。它的时区链比汇率更长 —— 纽约是
+        **UTC−5（EST）/ UTC−4（EDT）**，财政部按美国交易日 D 在美东
+        15:30~18:00 收完盘才发布 ⇒ 北京时间 **D+1 04:30~07:00**。
+        所以 bar 次日 02:00 用它就是偷未来。
+
+        验三件：
+          ① 边界精确：D 07:59 仍是 D-2，到 D 08:00 才切到 D-1；
+          ② 夜盘各时点：D 02:00 取 D-2、D 21:00 取 D-1，日盘取 D-1；
+          ③ `_make()` 真的把参数接上了（三个 code 逐个验，不是只有 `_asof`
+             支持、调用方却没传）。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factors_macro as FM
+        from ttrade import macro as M
+
+        if set(FM.AVAIL_08) != {"dxy", "usdcnh", "us_real10"}:
+            raise RuntimeError(f"AVAIL_08 应正好是 dxy/usdcnh/us_real10，实际 {FM.AVAIL_08}")
+
+        d0, d1, d2 = (pd.Timestamp("2026-10-19"), pd.Timestamp("2026-10-20"),
+                      pd.Timestamp("2026-10-21"))
+        s = pd.Series([1.0, 2.0, 3.0], index=pd.DatetimeIndex([d0, d1, d2]))
+
+        def at(ts, avail):
+            i = pd.DatetimeIndex([ts])
+            return float(FM._asof(s, i, lag_days=1, avail_hour=avail).iloc[0])
+
+        for ts, want, why in (
+            (d2 + pd.Timedelta(hours=2), 1.0, "凌晨 02:00 必须取 D-2"),
+            (d2 + pd.Timedelta(hours=7, minutes=59), 1.0, "07:59 仍是 D-2"),
+            (d2 + pd.Timedelta(hours=8), 2.0, "08:00 必须切到 D-1"),
+            (d2 + pd.Timedelta(hours=9, minutes=30), 2.0, "日盘取 D-1"),
+            (d2 + pd.Timedelta(hours=21), 2.0, "夜盘 21:00 取 D-1"),
+        ):
+            got = at(ts, 8)
+            if got != want:
+                raise RuntimeError(f"{ts} 取到 {got}，应为 {want}（{why}）")
+
+        # 反证：不传 8 这条，凌晨就会取到 D-1 —— 说明上面那几条不是恒真
+        if at(d2 + pd.Timedelta(hours=2), 0) != 2.0:
+            raise RuntimeError("avail_hour=0 时凌晨也取 D-2 —— 这条断言抓不到东西")
+
+        # ③ `_make` 必须把这个参数传下去（参数加了、调用方不传，等于没改）
+        #    三个 code 都要验：us_real10 是 2026-11-19 追加的（美债按美东交易日发布，
+        #    UTC−5/−4 ⇒ 北京 D+1 04:30~07:00 才有，凌晨绝拿不到当天那行）。
+        n = 300
+        dd = pd.date_range("2025-01-01", periods=n, freq="D")
+        vals = pd.Series(np.sin(np.arange(n) / 9.0) * 10 + 20, index=dd)
+        orig = M.series
+        got_by_code = {}
+        try:
+            M.series = lambda code: vals                          # noqa: ARG005
+            FM.clear_cache()
+            pct = FM._pct_series("usdcnh")
+            probe = pd.DatetimeIndex([dd[250] + pd.Timedelta(hours=2),
+                                      dd[250] + pd.Timedelta(hours=10)])
+            for code in ("usdcnh", "dxy", "us_real10"):
+                got_by_code[code] = FM._make(code)(
+                    pd.DataFrame(index=probe)).to_numpy(float)
+            w8 = FM._asof(pct, probe, avail_hour=8).to_numpy(float)
+            w0 = FM._asof(pct, probe, avail_hour=0).to_numpy(float)
+        finally:
+            M.series = orig
+            FM.clear_cache()
+        got = got_by_code["usdcnh"]
+        if np.isnan(got).any():
+            raise RuntimeError("探针落在分位的最小观测窗口里，这条断言测了个空")
+        if not np.allclose(got, w8, equal_nan=True):
+            raise RuntimeError("_make('usdcnh') 没把 avail_hour=8 传下去")
+        if np.allclose(got, w0, equal_nan=True):
+            raise RuntimeError("_make('usdcnh') 的结果与 avail_hour=0 相同 —— 参数没生效")
+        for code in ("dxy", "us_real10"):
+            g = got_by_code[code]
+            if not np.allclose(g, w8, equal_nan=True):
+                raise RuntimeError(f"_make('{code}') 没把 avail_hour=8 传下去")
+
+        return ("07:59→D-2 / 08:00→D-1 边界精确；凌晨 02:00 取 D-2、日盘与夜盘 "
+                "21:00 取 D-1；反证 avail=0 会取到 D-1；_make 对 "
+                "usdcnh/dxy/us_real10 三条都接通")
+
+    check("汇率因子 08:00 前用自然日-2（夜盘凌晨不前视）", _macro_avail_8)
+
     def _contract_terms():
         """「从天勤刷新品种参数」这条通路：取到的真值要能写进表、回测要读到。
 
@@ -4332,6 +4423,18 @@ def _run() -> tuple[bool, list[str]]:
         if not hits:
             raise RuntimeError("配置里 pooled=True，组合页回放却没走合并训练")
 
+        # 口径锁：多品种是「一个账户的钱按品种数均分」。每条腿只拿 1/N，
+        # 组合曲线仍从**全额**本金起步。2026-11-19 之前这里每条腿都拿满一份，
+        # 回测的手数是实盘的 N 倍
+        legs_ic = [float(r.metrics.get("initial_cash") or 0)
+                   for r in rp_pool.res.legs.values()]
+        want = float(cfg.principal) / len(frames)
+        if not legs_ic or any(abs(x - want) > 1 for x in legs_ic):
+            raise RuntimeError(f"每条腿的本金不是「总本金 ÷ 品种数」：{legs_ic}")
+        comb_ic = float(rp_pool.res.metrics.get("initial_cash") or 0)
+        if abs(comb_ic - float(cfg.principal)) > 1:
+            raise RuntimeError(f"组合本金不是全额：{comb_ic}，配置 {cfg.principal}")
+
         # 逐品种那条路：曲线必须不一样，否则说明 pooled 只是个摆设
         off = cfg.clone()
         off.factor_cfg = dict(off.factor_cfg, pooled=False)
@@ -4351,9 +4454,13 @@ def _run() -> tuple[bool, list[str]]:
         # 和手工调的合并训练对齐（同一条路，逐位一致）
         outs = orig(frames, keys, fc)
         manual = []
+        # 手工口径也要按「总本金 ÷ 品种数」拆，和 `run_multi` 一致（2026-11-19）。
+        # 不拆的话每腿多拿一倍本金，`lots_round` 取整会差一手，两条曲线对不上
+        per_sym = cfg.per_symbol_principal(len(frames))
         for key, out in outs.items():
             one = cfg.clone(symbol=key.split("_")[0], exchange="SHFE",
                             multi_symbols=[], cross_symbols=[])
+            one.principal = per_sym
             # 手工口径的「允许做空」必须和 `run_multi` 走同一个判据 ——
             # 这里以前硬编码 False，于是批量扫描的批次标签把策略裁成只做多时
             # 两边还「对得上」，掩盖了 #145
@@ -5109,6 +5216,10 @@ def _run() -> tuple[bool, list[str]]:
         交给一键对齐）；只有信号真的把 `target` 改了，才按台账调仓。
         换月不走这条 —— 老合约该平还得平。
 
+        2026-11-19 补两个例外（用户连续两天报「平仓/开仓没发出去」）：
+        目标没变但要**减仓**时照发；账本与账户都空时要**建仓**也照发 ——
+        这两种都没有「重复开一笔」的风险，挡着等于把当天的信号吞掉。
+
         顺带钉住台账的另一半：账本比账户多时要按账户收窄（只减不增）。
         """
         from ttrade import strategy_store as SStore
@@ -5208,7 +5319,58 @@ def _run() -> tuple[bool, list[str]]:
         r3._rebalance(st3)
         if not r3.book or r3.book[0][1] != -2:
             raise RuntimeError(f"账本比账户多时要收窄到可平量：{r3.book}")
-        return ("加载首轮不发单、目标不变一直不发、目标改了才按台账调；"
+
+        # ⑥ 目标没变、但账本有仓、信号要平 ⇒ **必须发单**（2026-11-19 用户报的）
+        #    昨天最后一根 bar 出的平仓信号，执行时点就是今天开盘：加载时算出来的
+        #    `target` 已经是 0，正好等于 `based_target`。老写法在这里 return，
+        #    这笔平仓永远发不出去，账户里的仓一直挂着，只有一键对齐能平
+        r4 = _runner()
+        st4 = _slot(r4, target=0)
+        st4.based = True
+        st4.based_target = 0
+        st4.held = {"SHFE.rb2701": -2}
+        r4._pos = {"SHFE.rb2701": _P(0, 2)}
+        r4._rebalance(st4)
+        if not r4.book or r4.book[0][1] != 2:
+            raise RuntimeError(f"目标没变但该平仓时没发单：{r4.book}")
+
+        # ⑦a 目标没变、账本空、账户里也没有这个合约 ⇒ **纯建仓，必须发**
+        #     2026-11-19 用户截图那一行：目标 -1、账本 0，工具提示叫他「点一键
+        #     对齐」。这不是历史差额，是今天的信号，没有仓可以重复开
+        r5 = _runner()
+        st5 = _slot(r5, target=-2)
+        st5.based = True
+        st5.based_target = -2
+        st5.held = {}
+        r5._pos = {}
+        r5._rebalance(st5)
+        if not r5.book or r5.book[0][1] != -2:
+            raise RuntimeError(f"账本空、账户也空时该建仓却没发：{r5.book}")
+
+        # ⑦b 但账户上多出 1 手没人认领（重启丢了账本）⇒ 仍然挡住，不许再开一笔
+        r6 = _runner()
+        st6 = _slot(r6, target=-2)
+        st6.based = True
+        st6.based_target = -2
+        st6.held = {}
+        r6._pos = {"SHFE.rb2701": _P(0, 1)}
+        r6._rebalance(st6)
+        if r6.book:
+            raise RuntimeError(f"账户上有无主的仓时仍按目标开仓了：{r6.book}")
+
+        # ⑦c 账户持仓还没拉回来（_pos 为 None）⇒ 一律不发，不能凭空的账本开仓
+        r7 = _runner()
+        st7 = _slot(r7, target=-2)
+        st7.based = True
+        st7.based_target = -2
+        st7.held = {}
+        r7._pos = None
+        r7._rebalance(st7)
+        if r7.book:
+            raise RuntimeError(f"持仓还没就绪就发单了：{r7.book}")
+
+        return ("加载首轮不发单、目标不变不加仓、目标改了才按台账调；"
+                "目标不变但该减仓时照发；账本与账户都空时纯建仓照发；"
                 "换月不受限；账本比账户多时按可平量收窄")
 
     check("加载策略时不按台账自动交易", _load_no_trade)
@@ -9429,7 +9591,70 @@ def _run() -> tuple[bool, list[str]]:
 
     check("逐账户登录 / 登出（一条会话一个账户）", _per_account_sessions)
 
+    def _tl0_naming():
+        """品种键 `品种_交易所` → CTP 合约。30 年期国债踩过的那个坑。
+
+        `TL0_CFFEX` 是策略配置里的品种键（下划线分隔）。以前只认点号写法，
+        整串被当成合约名：字母串拼成 `TLCFFEX`、数字只剩那个 `0`，最后发出
+        `tlcffex0`；柜台认不出交易所，回 `[148] 无效的 ExchangeID 字段` ——
+        而这条错**完全不提合约名**，只能靠人肉反查（2026-11-19）。
+
+        顺便钉住正名：数据源把品种代码写成 `TL0`（`0` 是连续合约标记），
+        本地文件、库、策略配置一律用 `TL`。
+        """
+        import json
+        import os
+
+        from ttrade.broker_api import _split
+        from ttrade.ctp_live import (ctp_instrument, exchange_of_contract,
+                                     looks_contract, main_contract,
+                                     variety_exchange)
+        from ttrade.paths import data_dir
+
+        bad = []
+        for src, want_ins in (("TL0_CFFEX", "TL"), ("TL_CFFEX", "TL"),
+                              ("CFFEX.TL2612", "TL2612"),
+                              ("TL2612.CFFEX", "TL2612"),
+                              ("CFFEX.TL0", "TL"), ("TL0.CFX", "TL"),
+                              ("TL0", "TL"), ("TL", "TL")):
+            ex, code = _split(src)
+            ins = ctp_instrument(code, ex)
+            if ins != want_ins:
+                bad.append(f"{src} → {ins!r}（应 {want_ins!r}）")
+            if "cffex" in ins.lower():
+                bad.append(f"{src} → {ins!r} 里混进了交易所名")
+        if bad:
+            raise RuntimeError("品种键归一错：" + "；".join(bad))
+        if exchange_of_contract("TL0_CFFEX") != "CFFEX":
+            raise RuntimeError("TL0_CFFEX 的交易所没解析出来，报单会被柜台回 [148]")
+        if variety_exchange("TL") != "CFFEX":
+            raise RuntimeError("TL 查不到交易所（data_futures 里的文件正名了吗）")
+        if looks_contract("TL0") or looks_contract("TL"):
+            raise RuntimeError("TL0 / TL 被当成了具体合约")
+        if not looks_contract("TL2612"):
+            raise RuntimeError("TL2612 没被当成具体合约")
+        if main_contract("TL", "CFFEX") != "TL2612":
+            raise RuntimeError("TL 的主力合约查不到")
+
+        # 数据文件要真的是正名后的（库里/配置里的迁移由 _tools/rename_tl0.py 做）
+        d = data_dir("cn")
+        if os.path.exists(os.path.join(d, "TL0_CFFEX.csv")):
+            raise RuntimeError("data_futures 里还有 TL0_CFFEX.csv，没正名")
+        if not os.path.exists(os.path.join(d, "TL_CFFEX.csv")):
+            raise RuntimeError("data_futures 里没有 TL_CFFEX.csv")
+        mp = os.path.join(d, "_manifest.json")
+        if os.path.exists(mp):
+            with open(mp, encoding="utf-8") as fh:
+                for it in json.load(fh):
+                    if str(it.get("ts_code", "")).startswith("TL0"):
+                        if it.get("symbol") != "TL" or it.get("file") != "TL_CFFEX.csv":
+                            raise RuntimeError(f"manifest 里 TL 条目没正名：{it}")
+        return ("品种键四种写法都归一（TL0_CFFEX / TL_CFFEX / CFFEX.TL2612 / "
+                "TL2612.CFFEX），交易所解析到 CFFEX、主力 TL2612；"
+                "TL0 不再被当合约；数据文件与 manifest 已正名 TL_CFFEX")
+
     check("合约手输 → 天勤写法（不带交易所前缀）", _contract_input)
+    check("品种键 TL0_CFFEX → CTP 合约（[148] 无效 ExchangeID 回归）", _tl0_naming)
 
     check("存入策略库的动作（strategy_save）", _strategy_save_action)
     check("K线与信号：持仓与交易记录同源（含手数）", _chart_from_trades)

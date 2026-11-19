@@ -308,6 +308,25 @@ class StrategyConfig:
         """「按止损金额」每笔最多亏的钱。"""
         return self.principal * self.risk_pct / 100.0
 
+    def per_symbol_principal(self, n: int = 0) -> float:
+        """多品种拆成 n 份时，**每个品种**分到的本金。
+
+        多品种的含义是「一个账户的钱按品种数均分」，不是「每个品种各拿一份
+        本金」。所以 540 万配 27 个品种 = 每个品种 20 万，总敞口还是一份 540 万。
+
+        实盘（`PortfolioRunner.children_of`）和回测（`replay.run_multi`、研究页
+        `_backtest_job`）必须走同一个算法，否则同一份配置在两边跑出 N 倍的
+        手数差 —— 2026-11-19 用户报的「查看回测里每个品种都按本金全额算手数、
+        策略交易里却按品种数分」就是这个分歧。
+
+        `fixed` 口径不看本金（手数写死在配置里），原样返回；只拆 `capital` /
+        `risk` / `budget` / `unit` 这些「按钱定手数」的口径。
+        """
+        n = int(n or 0)
+        if n < 2 or (self.sizing or "capital").lower() == "fixed":
+            return float(self.principal or 0)
+        return float(self.principal or 0) / n
+
     def key(self) -> str:
         """品种键，和 `DataStore` 里的键对齐。
 

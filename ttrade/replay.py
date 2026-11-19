@@ -189,6 +189,12 @@ def make_bt(market: str, allow_short: bool = False,
                     getattr(cfg, "cost_profile", "") or None, market="cn")
     if cfg is None:
         return bt
+    # 交易记录页要按品种分开看。品种只有一个来源：这次回测跑的是谁。
+    # 放在这里是因为「策略交易 / 查看回测 / 研究页」三条路都经过 `make_bt`
+    try:
+        bt.symbol = str(cfg.key() or "")
+    except Exception:  # noqa: BLE001 - 批量脚本自造的配置可能没有 key()
+        bt.symbol = ""
     # 方向：`resolve_allow_short()` 是唯一判据（市场默认 + 兼容老 note），
     # `short_only` 是「禁止做多」。后者只有在允许做空的前提下才有意义
     bt.short_only = bool(getattr(cfg, "short_only", False)) and bt.long_only is False
@@ -532,6 +538,11 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
         and len(fkeys) >= 2
     )
     results, named, failed = [], [], []
+    # 每个品种分到的本金 = 总本金 ÷ 品种数，和实盘 `children_of` 同一个口径。
+    # 分母取**配置里勾的品种数**，不是「这次成功读到行情的品种数」—— 有品种
+    # 读不到数据时整批会报错返回，不该因为少一个就悄悄把别人的钱分多。
+    n_sym = len(getattr(cfg, "symbols", None) or keys) or len(keys)
+    per_sym_principal = cfg.per_symbol_principal(n_sym)
     if pooled:
         # 区间要先裁：`run_pooled_strategy` 不认 `range_years`，喂进去多少就学
         # 多少。逐品种那条路是 `run()` 里裁的，这里得自己来
@@ -556,6 +567,7 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
             sym, ex = split_key(key, mk)
             one = cfg.clone(symbol=sym, exchange=ex, multi_symbols=[],
                             cross_symbols=[])
+            one.principal = per_sym_principal
             bt = make_bt(mk, resolve_allow_short(one), one)
             bt.bars_per_year = bars_per_year(out.df.index)
             try:
@@ -570,6 +582,7 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
             # 上一个品种的 tick 带到下一个头上（研究页那边踩过同一个坑）
             one = cfg.clone(symbol=sym, exchange=ex, multi_symbols=[],
                             cross_symbols=[])
+            one.principal = per_sym_principal
             rp = run(one, frames[key], market=market, with_bh=False,
                      extra=(extras or {}).get(key))
             if not rp.ok:
@@ -592,11 +605,12 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
                   % (len(failed), len(keys), "；".join(failed[:4]))
                   + "　—— 常见原因是内存不足或该品种行情太短")
     # 🔴 组合的「本金」是**一个账户**的钱，不是各品种之和。多品种等权是「同一个
-    # 策略在 N 个品种上各跑一遍、净值取均值」，每个品种那份回测都拿满了同一笔
-    # 本金（`run()` 里 `initial_cash = principal`），把它们加起来是 N 倍本金 ——
-    # 绩效页上「本金」那一行会难看地对不上配置，而后面每一个金额列都跟着错。
-    # 以前这里吃 `combine` 的默认 100,000，配置改成本金 15 万之后页面还写 10 万。
-    base = float((results[0].metrics or {}).get("initial_cash") or 0.0)
+    # 策略在 N 个品种上各跑一遍、净值取均值」；每条腿只带 1/N 的本金（见上面
+    # `per_sym_principal`），归一化后再乘回**全额**本金，组合的金额才等于
+    # 「一个 540 万的账户同时铺 27 个品种」的真实盈亏。
+    # 拿 `results[0].initial_cash` 当基数会只剩 1/N —— 2026-11-19 之前这里就是这么错的
+    base = float(getattr(cfg, "principal", 0) or 0) \
+        or float((results[0].metrics or {}).get("initial_cash") or 0.0)
     res = combine(results, label=f"多品种等权 · {len(results)} 个",
                   initial_cash=base or 100_000.0)
     # 逐品种留给绩效页的「品种」下拉框：组合是等权的，切进去看单个品种才分得清

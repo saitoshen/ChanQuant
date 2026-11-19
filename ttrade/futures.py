@@ -160,6 +160,18 @@ class FutContract:
     exchange_cn: str  # 上期所
 
 
+#: 数据源把品种代码写错的，在这里纠正一次。
+#:
+#: 30 年期国债在 Tushare 的 `fut_basic` 里品种代码就是 `TL0.CFX` —— 那个 `0`
+#: 是**连续合约**的标记，不该出现在品种名里。以前直接拿 ts_code 前缀当品种名，
+#: 于是本地文件叫 `TL0_CFFEX.csv`、策略里配成 `TL0_CFFEX`、下单时被拼成
+#: `tlcffex0` 发给柜台，CTP 回 `[148] 无效的 ExchangeID`（2026-11-19）。
+#:
+#: `ts_code` 保持原样（那是调数据源要用的真名），只规范 `symbol`：
+#: 文件名、品种键、策略配置一律用 `TL`。
+_SYMBOL_FIX = {"TL0": "TL"}
+
+
 def _clean_name(name: str, exchange: str = "") -> str:
     for suffix in ("主力", "连续"):
         if name.endswith(suffix):
@@ -198,7 +210,9 @@ def get_universe(include_cffex: bool = True) -> list[FutContract]:
         for _, r in df.iterrows():
             name = str(r.get("name") or "")
             ts_code = str(r["ts_code"])
-            sym = ts_code.split(".")[0]
+            # 品种名（文件名 / 品种键）用规范化后的；ts_code 保持数据源原样
+            sym = _SYMBOL_FIX.get(ts_code.split(".")[0].upper(),
+                                  ts_code.split(".")[0])
 
             # 排除「月均价」与「TAS 指令」等非独立品种
             if "月均价" in name or "TAS" in name.upper() or "_F" in sym:

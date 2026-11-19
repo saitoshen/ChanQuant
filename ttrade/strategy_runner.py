@@ -795,8 +795,9 @@ class PortfolioRunner:
             # 资金按品种数均分。组合回测里每个品种各占一份账户、再把净值等权
             # 平均，换算到一个真实账户上就是「每个品种只分到 1/N 的钱」。
             # 不拆的话 19 个品种各按 30% 满仓，实际敞口是配置的 19 倍
-            if (one.sizing or "capital").lower() != "fixed":
-                one.principal = float(cfg.principal or 0) / n
+            # 口径收在 `per_symbol_principal()` 里，回测那边读同一个函数，
+            # 免得实盘除以 N、回测不除，同一份配置两边差 N 倍
+            one.principal = cfg.per_symbol_principal(n)
             out.append(one)
         return out
 
@@ -2008,6 +2009,21 @@ class PortfolioRunner:
         except (TypeError, ValueError):
             return 0
 
+    def _others_book(self, st: SlotState, symbol: str) -> int:
+        """别的策略在这个合约上的账本合计。
+
+        用途只有一个：从账户净仓里把「别人的仓」剥掉，剩下的才可能算本策略的。
+        账户 -11 手、别的策略账本合计 -11 手 ⇒ 账户里没有无主的仓，本策略的账本
+        是 0 就是真的 0（纯建仓可以放行）；反过来差 -1 手，说明账户上那 1 手没人
+        认领（多半是重启丢了账本），这时不能照着目标再开一笔。
+        """
+        total = 0
+        for other in self._slots.values():
+            if other is st:
+                continue
+            total += int(other.held.get(symbol, 0))
+        return total
+
     def _side_pair(self, symbol: str) -> tuple[int, int]:
         """(多头手数, 空头手数)。**锁仓时两边都非零**。
 
@@ -2067,9 +2083,32 @@ class PortfolioRunner:
             self._log(f"{st.title()}：{st.last_action}")
             return
         if int(st.target) == st.based_target:
-            # 目标没变过 ⇒ 这一轮不发单。这正是「加载即发单」被挡住的地方：
-            # 重启后目标往往和停机前一样，而账本/账户差了十几手
-            return
+            # 目标没变过 ⇒ **默认**这一轮不发单。这正是「加载即发单」被挡住的地方：
+            # 重启后目标往往和停机前一样，而账本/账户差了十几手。
+            #
+            # 但「目标没变」不等于「什么都不该做」，两种情形必须放行（2026-11-19）：
+            #
+            # ① **减仓**。每天开盘执行的那笔平仓正好落在 `target == based_target`
+            #    上 —— 信号出在昨天最后一根 bar，今天开盘执行（T+1），加载时算出来
+            #    的 target 已经是 0，于是这笔平仓被这条闸永久挡住，账户里的仓一直
+            #    挂着，只有点「一键对齐」才会平（用户 11-18、11-19 报的定时平仓）。
+            #    减敞口造不出双倍仓位，交易所侧还按可平量校验，放行是安全的。
+            #
+            # ② **纯建仓**：账本 0、账户上也没有一分钱算得到这条策略头上。
+            #    这时没有任何历史仓可以重复开，挡着只是把信号白白吞掉 ——
+            #    用户看到的就是「目标 -1、账本 0，要我自己点一键对齐」。
+            #
+            # 真正要挡的是 11-17 说的那种：账本有仓（或账户上有「无主」的仓），
+            # 重启后目标与停机前一样，一加载就把差额补出去。判据因此取「账户净仓
+            # 减去其它策略账本」：不为 0 说明账户里有本策略说不清的仓，宁可不发。
+            held_now = int(st.held.get(st.underlying, 0)) if st.underlying else 0
+            if held_now and abs(int(st.target)) < abs(held_now):
+                pass                                  # ① 减仓
+            elif (self._pos is not None and not held_now and int(st.target)
+                  and self._net_pos(st.underlying) == self._others_book(st, st.underlying)):
+                pass                                  # ② 纯建仓
+            else:
+                return
 
         # 只跟**自己记的仓位**比。账户净仓是所有策略 + 手工单 + 别的平台的和，
         # 拿它当基准，同品种两条策略就会互相把对方的仓当成自己的 —— 一条想
@@ -2081,6 +2120,10 @@ class PortfolioRunner:
             # 仓位对上了，之前的拒单记录可以清了
             st.rejects = 0
             st.reject_msg = ""
+            # 基准跟着「已对齐的仓位」往前挪。不挪的话，加载时那个目标值在本进程
+            # 里永远不可再交易：信号走一圈回到它，就会被当成「目标没变」挡住。
+            if st.based_target != int(st.target):
+                st.based_target = int(st.target)
             return
         if st.rejects >= MAX_REJECTS:
             return                       # `_chase` 已经停机，这里只是兜底
@@ -2356,6 +2399,17 @@ class PortfolioRunner:
         if not self._open_now(st.cfg):
             st.last_action = CLOSED_NOTE
             return 0
+        # 同一个出口还要按**这一个合约**再判一次。上面那句看的是 `st.cfg`
+        # （策略有没有在跑的品种），而「一键对齐」的槽位没有 symbol，永远判成
+        # 开市 —— 于是午休 / 收盘点对齐时，`_price_at` 要么拿不到价（静默不发），
+        # 要么拿到**收盘前最后一次 tick** 的陈旧价去报单。两种都不对：前者让
+        # 用户以为「平今平昨写错了」，后者直接把昨天的价报进今天的交易所。
+        # 注意拆分方向：`symbol` 是「交易所.合约」（`SHFE.ni2612`），
+        # 前半段才是交易所 —— 反了的话 `in_session` 解析不出时段会一律放行。
+        ex, _, code = str(symbol or "").partition(".")
+        if code and ex and not symbols_info.in_session(code, ex):
+            st.last_action = "非交易时段：这个合约现在不能下单（开盘后再点对齐）"
+            return 0
         legs = self._legs(symbol, delta, closeable)
         if legs is None:
             st.last_action = "持仓今昨明细未就绪，等下一轮"
@@ -2365,7 +2419,7 @@ class PortfolioRunner:
         direction = "BUY" if delta > 0 else "SELL"
         price = self._price_at(symbol, direction)
         if not price or price != price:      # NaN / 0 都说明盘口还没来
-            st.last_action = "等盘口"
+            st.last_action = "等盘口（这个合约还没收到行情，可能是冷门合约或刚开盘）"
             return 0
         parts = []
         for offset, vol in legs:
@@ -2633,6 +2687,7 @@ class PortfolioRunner:
         self._align_ts = now
         self._align_slot.rejects = 0
         self._align_slot.reject_msg = ""
+        self._align_slot.last_action = ""
         n = 0
         for row in self.mismatch(fresh=True):
             if not row["managed"] and not close_orphans:
@@ -2648,6 +2703,11 @@ class PortfolioRunner:
             n += sent
         if n:
             self._log(f"对齐已下发 {n} 笔，剩下的交给追单")
+        else:
+            # 一笔都没发时**必须说话**。以前这里静默返回 0，用户点了按钮看不到
+            # 任何反应，只能猜「是不是平今平昨写错了」—— 实际多半是收盘/午休、
+            # 冷门合约没有盘口，或者本轮已经有单在途。
+            self._log(f"对齐没有发出委托：{self._align_slot.last_action or '没有需要调整的仓位'}")
         return n
 
     def _send_row(self, st: SlotState, row: dict) -> int:

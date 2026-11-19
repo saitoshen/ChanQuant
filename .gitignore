@@ -22,8 +22,9 @@ data*.bak_*/
 data_contracts/
 data_options_raw/
 
-# 工具内部的工作记忆，不属于项目源码
+# 工具内部的工作记忆，不属于项目源码（旧名 .workbuddy-ai 一并留着）
 .workbuddy-ai/
+.workbuddy/
 
 # 密钥：Tushare token 走环境变量或本地文件，绝不入库
 token.txt
@@ -44,3 +45,7 @@ tq_account.txt
 
 # 天勤行情仓库（DuckDB，5m 全品种十年约 1GB，由 download_tq.py 生成）
 data_tq/
+
+# Dukascopy 汇率/美元指数的 1m 原始 JSON 缓存与合成出的 5m。
+# 由 `_tools/duka_fx/duka_fx.py fetch` 生成，随时可重建；几 GB，不入库。
+data_duka/

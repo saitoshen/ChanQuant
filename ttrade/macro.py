@@ -88,7 +88,7 @@ SERIES: dict[str, tuple[str, str, str, str]] = {
     "us_y2":      ("美债 2 年", "D", "%", "tushare.us_tycr"),
     "us_y10":     ("美债 10 年", "D", "%", "tushare.us_tycr"),
     "us_10y2y":   ("美债 10Y−2Y", "D", "%", "派生：us_y10 − us_y2"),
-    "us_real10":  ("美债实际 10 年", "D", "%", "tushare.us_trycr"),
+    "us_real10":  ("美债实际 10 年", "D", "%", "treasury.real_yield"),
     "dxy":        ("美元指数", "D", "点", "eastmoney.UDI"),
     "usdcnh":     ("美元兑离岸人民币", "D", "元", "tushare.fx_daily"),
     "spx":        ("标普 500", "D", "点", "tushare.index_global"),
@@ -441,6 +441,20 @@ def fetch(code: str, api=None) -> pd.Series:
             return pd.Series(dtype=float)
         if code == "spx_vol20":
             return pd.Series(dtype=float)
+        if code == "us_real10":
+            # 🔴 走财政部原始出处，不走 Tushare（见 `macro_treasury` 模块说明）：
+            #   ① 早一天 —— 财政部每天 ~15:50 UTC 更新当天，Tushare 要隔一天；
+            #   ② 补得上 Tushare 漏的 3 个交易日（2020-08-05 / 08-20 / 2021-06-28）；
+            #   ③ 逐值完全一致（2026-11 实测重叠 470 天最大差异 0.0000）。
+            # 取不到就往下走 Tushare，不因为换了源把这条序列弄空。
+            try:
+                from . import macro_treasury as _MT
+
+                s = _MT.fetch_recent(2)
+                if s is not None and len(s):
+                    return s
+            except Exception:  # noqa: BLE001
+                pass
         if api is None:
             from .futures import get_pro
 

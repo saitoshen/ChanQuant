@@ -99,6 +99,30 @@ MIN_OBS = 60
 
 _cache: dict[str, pd.Series] = {}
 
+# ── 「每天几点才真正取得到」的序列 ──────────────────────────────────────────
+# 用户 2026-11-19 钉死：Tushare 的日频汇率 **D+1 08:00 之后才更新**，凌晨取不到。
+# 后果很具体：商品夜盘 21:00 ~ 次日 02:30 里，00:00 之后那一段如果照「自然日 − 1」
+# 取数，拿到的是**当时还没发布**的那一行 —— 这是真正的未来函数，而且只在凌晨
+# 两三个小时里发生，日盘完全看不出来。
+#
+# 🔴🔴 美债实际利率（`us_real10`）同理，用户 2026-11-19 追加要求套这条。
+# 原因是时区链，不是「8 点」这个数字本身：
+#
+#     纽约不是 UTC+0 —— 是 **UTC−5（EST 冬）/ UTC−4（EDT 夏）**
+#     财政部按**美国交易日 D** 发布（美东当天约 15:30~18:00 收完盘才出）
+#     ⇒ 换成北京时间 = **D+1 的 04:30~07:00**（夏）/ **05:30~07:00**（冬）
+#
+# 也就是说 bar 11-19 02:00（商品夜盘）绝不可能拿到「11-18」那行 —— 它在
+# 北京 11-19 早上才发布。用 `avail_hour=8` 后凌晨取到的是 D−2，比实际可用
+# 时刻**保守 1~3.5 小时**（宁可晚用，不会早用）。实测发布侧证据：
+# 财政部 XML feed 的 `updated` 是 UTC 15:48（北京 23:48），但那是**上一交易日**
+# 那批数据的写入戳；同一天 FRED 的 `DFII10` 到北京 11-19 09:30 还没有 11-18
+# （财政部有），说明财政部的 D+1 更新确实集中在北京次日早晨，不在前一夜。
+#
+# 只作用于这三项。其余宏观量（PMI / CPI / SHIBOR 等）本来就是低频、各走各的
+# 发布节奏，不套这条。
+AVAIL_08 = ("dxy", "usdcnh", "us_real10")
+
 
 def clear_cache() -> None:
     _cache.clear()
@@ -137,17 +161,41 @@ def _pct_series(code: str) -> pd.Series:
     return s
 
 
-def _asof(series: pd.Series, index, lag_days: int = 1) -> pd.Series:
+def _asof(series: pd.Series, index, lag_days: int = 1,
+          avail_hour: int = 0) -> pd.Series:
     """把分位序列 as-of 铺到 bar 上。宏观数据没有品种维度，所有品种同值。
 
-    滞后 1 个日历日：宏观数据存的是发布日，再退一天把「当天发布当天就能用」
-    这种乐观假设也挡掉。
+    `lag_days` 是**日历日**滞后：宏观数据存的是发布日，再退一天把「当天发布当天
+    就能用」这种乐观假设也挡掉。
+
+    `avail_hour` 是**这一天几点才真正取得到**。默认 0（只按日期算，不区分时刻）。
+
+    🔴🔴 为什么要这个参数（用户 2026-11-19 钉死的口径）：Tushare 的日频汇率
+    **D+1 08:00 之后才更新**，凌晨取不到。而商品夜盘是 21:00 ~ 次日 02:30：
+
+        bar 11-17 02:00（夜盘）  按「自然日 − 1」→ 取 ≤ 11-16 的行
+                                 而 11-16 那行要到 11-17 08:00 才发布 ⇒ 偷未来
+
+    传 `avail_hour=8` 后，目标时刻先减 8 小时再减 1 天：
+
+        bar 11-17 02:00  →  11-15 18:00  →  取 ≤ 11-15（即「自然日 − 2」）
+        bar 11-17 09:30  →  11-16 01:30  →  取 ≤ 11-16（仍是「前一天」）
+        bar 11-17 08:00  →  11-16 00:00  →  取 ≤ 11-16（刚好接上）
+
+    两种时段用同一个公式，不需要在夜盘/日盘之间分支 —— 分支写两遍判据正是这个
+    项目最容易出 bug 的地方。
+
+    ⚠️ 实现上**不能再 `normalize()`**：一旦把时刻抹掉，08:00 这条边界就没了，
+    目标时刻退化成整天，凌晨段又会退回「自然日 − 1」。
     """
     if series is None or len(series) == 0:
         return pd.Series(np.nan, index=index, dtype=float)
-    left = pd.DataFrame({"t": pd.DatetimeIndex(index).normalize()})
+    target = pd.DatetimeIndex(index)
+    if avail_hour:
+        target = target - pd.Timedelta(hours=int(avail_hour))
     if lag_days:
-        left["t"] = left["t"] - pd.Timedelta(days=int(lag_days))
+        target = target - pd.Timedelta(days=int(lag_days))
+    left = pd.DataFrame({"t": target}, index=np.arange(len(target)))
     right = pd.DataFrame({
         "t": pd.DatetimeIndex(series.index).normalize(),
         "v": series.to_numpy(dtype=float),
@@ -159,8 +207,11 @@ def _asof(series: pd.Series, index, lag_days: int = 1) -> pd.Series:
 
 
 def _make(code: str):
+    # 汇率类要到 08:00 才可用（见 AVAIL_08 的说明），其余按日期算
+    avail = 8 if code in AVAIL_08 else 0
+
     def f(df: pd.DataFrame) -> pd.Series:
-        return _asof(_pct_series(code), df.index)
+        return _asof(_pct_series(code), df.index, avail_hour=avail)
 
     f.__name__ = f"f_macro_{code}"
     f.__doc__ = _DESC.get(code, "")

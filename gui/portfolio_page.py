@@ -160,7 +160,7 @@ from ttrade import workspace_store as WS
 from ttrade.tqlive import merge_live
 from ttrade.backtest import combine, combine_trades
 from ttrade.strategies import STRATEGIES, param_label
-from ttrade.strategy_runner import PortfolioRunner, hole_days
+from ttrade.strategy_runner import GROUP_SEP, PortfolioRunner, hole_days
 from ttrade.universe import cn_name
 
 # 与 trade_page.py / app.py 同一套配色。不 import 那两处：app 会 import 本模块。
@@ -753,6 +753,44 @@ def _split_key(key: str, market: str = "") -> tuple[str, str]:
     return k, ""
 
 
+def _is_multi_cfg(cfg) -> bool:
+    """这条策略能不能「展开成一个品种一行」。
+
+    只有多品种等权可以：截面策略的品种是一篮子同时按权重调仓，拆成一行行说
+    「这个品种的目标仓是多少手」本身就没有意义（它只有权重）。
+    """
+    if str(getattr(cfg, "family", "") or "") == "cross":
+        return False
+    try:
+        return len(list(getattr(cfg, "symbols", None) or [])) >= 2
+    except Exception:  # noqa: BLE001 - 坏配置不该把整页带崩
+        return False
+
+
+def _child_size_text(cfg) -> str:
+    """展开出来的子行「仓位」列：**这个品种**分到多少钱。
+
+    父策略那格写的是总本金（540 万）；子行要写它自己那份 ——
+    `children_of` 先按品种数均分，再按 `capital_pct` 取比例，两步都要算进来，
+    否则 27 个品种的行全都写着 540 万，看着像每个品种都拿全额。
+    """
+    n = len(list(getattr(cfg, "symbols", None) or [])) or 1
+    mode = str(getattr(cfg, "sizing", "") or "capital").lower()
+    if mode == "fixed":
+        return f"固定 {int(getattr(cfg, 'volume', 0) or 1)} 手"
+    try:
+        per = float(cfg.per_symbol_principal(n))
+    except Exception:  # noqa: BLE001 - 老配置没有这个方法
+        per = float(getattr(cfg, "principal", 0) or 0) / n
+    if mode == "risk":
+        pct = float(getattr(cfg, "risk_pct", 0) or 0)
+        return f"止损 {pct:g}% · {per * pct / 100 / 10000:g} 万"
+    if mode == "unit":
+        return "本金全额"
+    pct = float(getattr(cfg, "capital_pct", 0) or 0)
+    return f"资金 {pct:g}% · {per * pct / 100 / 10000:,.1f} 万"
+
+
 def _sym_text(cfg) -> str:
     """策略表「标的」列。
 
@@ -1147,6 +1185,16 @@ class PortfolioPage(QWidget):
         # 只会留下最后写进来的那个 —— 想显示「这条策略在每个账户上分别多少手」
         # 就得留着这份。单账户时两个结构内容一致
         self._slot_multi: dict[str, dict] = {}
+        # 多品种策略在列表里「展开 / 收起」的状态（存父 sid）。展开后每个品种
+        # 单独一行，看得到它自己的目标、手数和状态 —— 27 个品种混成一行时，
+        # 「哪个品种没开出来」根本看不出来（2026-11-19 用户要的）
+        self._expanded: set[str] = set()
+        # 双击「多品种名称」= 展开，可双击的两次 release 会各自发一次 clicked，
+        # 那两次 clicked 会先展开再收起，净效果等于没点。双击时打一个时间戳，
+        # 窗口内的 clicked 直接忽略
+        self._no_toggle_ts = 0.0
+        # 当前表格每一行对应什么：{"kind": "parent"|"child", "cfg":…, "key":…}
+        self._rows: list[dict] = []
         self._render_ts = 0.0                     # 上次重画两张表的时刻
         self._mon_sig = None                      # 监控表上次画的内容
         # 单策略视图的实时 K 线。`_live_base` 是本地库里的历史，实时段每 5 秒
@@ -1430,13 +1478,20 @@ class PortfolioPage(QWidget):
         # 多选是为了组合报告。双击原来是「启动 / 停止」，但那个动作有同名按钮，
         # 而「看一眼这条策略的历史表现」没有别的入口 —— 双击给后者更值。
         self.tbl_strat.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.tbl_strat.doubleClicked.connect(lambda _i: self._open_single())
+        self.tbl_strat.doubleClicked.connect(self._on_row_double)
+        # 多品种策略：点一下名称展开成「一个品种一行」，再点收起。
+        # 注意 `cellClicked` 是 (row, col) 两个 int，**不是** QModelIndex ——
+        # 早先按 QModelIndex 写，单击时 `index.column()` 抛 AttributeError，
+        # 被 PySide 吞掉，表现成「点一下没反应」（2026-11-19 用户反馈）
+        self.tbl_strat.cellClicked.connect(self._on_cell_clicked)
         self.tbl_strat.itemSelectionChanged.connect(self._sync_buttons)
         lay.addWidget(self.tbl_strat, 1)
 
         hint = QLabel(
             "双击一行 = 打开它的 K 线与绩效。按住 Ctrl 多选后点「组合报告」，"
             "看这几条策略等权组合的资金曲线。\n"
+            "多品种策略的名称前有 ▸：点一下名称（或者双击名称）展开成「一个品种一行」，"
+            "再点名称收起 —— 双击名称不再打开回测，双击别的列才是打开回测。\n"
             "「启动 / 停止」只作用于选中的那一条：账户还没连上时会把它的账户单独连上。"
         )
         hint.setObjectName("Hint")
@@ -2016,33 +2071,76 @@ class PortfolioPage(QWidget):
     # ---------------------------------------------------------- 渲染
 
     def _fill_strategies(self) -> None:
-        """重建策略表。选中行按 sid 找回，不然每次刷新都会跳回第一行。"""
+        """重建策略表。选中行按 sid 找回，不然每次刷新都会跳回第一行。
+
+        多品种策略展开后，每个品种**单独占一行**（缩进 + `└`）。数据来自引擎的
+        子槽位快照（sid = `父sid#品种键`）：父行还是原来那一行，「理论」列照旧
+        写「—」，逐个品种的目标仓在这一行里才看得到。
+        """
         keep = set(self._selected_sids())
         t = self.tbl_strat
+        rows: list[dict] = []
+        for cfg in self._items:
+            multi = _is_multi_cfg(cfg)
+            rows.append({"kind": "parent", "cfg": cfg, "key": "", "multi": multi})
+            if multi and str(cfg.sid) in self._expanded:
+                for k in (cfg.symbols or []):
+                    rows.append({"kind": "child", "cfg": cfg, "key": str(k),
+                                 "multi": True})
+        self._rows = rows
         t.blockSignals(True)
         try:
-            t.setRowCount(len(self._items))
-            for i, cfg in enumerate(self._items):
+            t.setRowCount(len(rows))
+            for i, row in enumerate(rows):
+                cfg = row["cfg"]
+                child = row["kind"] == "child"
                 accs = cfg.account_list(self.cb_acct.currentData() or "")
                 acc_txt = ("默认" if not accs else
                            (accs[0] if len(accs) == 1 else
                             f"{accs[0]} 等 {len(accs)} 个"))
-                vals = [
-                    cfg.name.strip() or cfg.title(),
-                    _sym_text(cfg),
-                    cfg.strategy_label(),
-                    cfg.size_text(),
-                    acc_txt,
-                ]
+                if child:
+                    name = f"　　└ {row['key']}"
+                    sym_txt = row["key"]
+                    strat_txt = "同一策略"
+                    size_txt = _child_size_text(cfg)
+                else:
+                    mark = ("▾ " if str(cfg.sid) in self._expanded else "▸ ") \
+                        if row["multi"] else ""
+                    name = mark + (cfg.name.strip() or cfg.title())
+                    sym_txt = _sym_text(cfg)
+                    strat_txt = cfg.strategy_label()
+                    size_txt = cfg.size_text()
+                vals = [name, sym_txt, strat_txt, size_txt, acc_txt]
                 for j, v in enumerate(vals):
                     item = QTableWidgetItem(v)
+                    # 子行的 sid 也写父 sid：选中子行等于选中这条策略，
+                    # 「启动 / 停止」「组合报告」都还能用
                     item.setData(Qt.UserRole, cfg.sid)
                     if j == 3:
                         item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    if child:
+                        item.setForeground(QColor(C_MUTED))
                     t.setItem(i, j, item)
+                if child:
+                    it0 = t.item(i, 0)
+                    if it0 is not None:
+                        it0.setToolTip(
+                            f"这条多品种策略里的 {row['key']}\n"
+                            f"预算 {size_txt}（总本金 ÷ 品种数）\n"
+                            "右侧的「理论 / 状态」是它自己的，不是整条策略的合计")
+                    for j in (5, 6, 7, 8, 9):
+                        t.setItem(i, j, QTableWidgetItem("—"))
+                    continue
                 it = t.item(i, 1)
                 if it is not None:
                     it.setToolTip(_sym_tip(cfg))
+                if row["multi"]:
+                    it0 = t.item(i, 0)
+                    if it0 is not None:
+                        it0.setToolTip(
+                            f"多品种策略，共 {len(cfg.symbols or [])} 个品种。\n"
+                            "点一下名称展开成「一个品种一行」，再点收起 —— "
+                            "逐个品种看理论手数和运行状态")
                 if len(accs) > 1:
                     it4 = t.item(i, 4)
                     if it4 is not None:
@@ -2054,6 +2152,9 @@ class PortfolioPage(QWidget):
                     t.setItem(i, j, QTableWidgetItem("—"))
             if keep:
                 for i in range(t.rowCount()):
+                    # 只选父行：子行带着同一个 sid，一起选中会整片变蓝
+                    if self._rows[i]["kind"] != "parent":
+                        continue
                     it = t.item(i, 0)
                     if it is not None and it.data(Qt.UserRole) in keep:
                         t.selectRow(i)
@@ -2062,15 +2163,67 @@ class PortfolioPage(QWidget):
         self._sync_buttons()
         self._ws_hint()
 
+    def _multi_row_at(self, row: int):
+        """这一行是不是「多品种父行」；不是就返回 None。"""
+        if row < 0 or row >= len(self._rows):
+            return None
+        r = self._rows[row]
+        if r.get("kind") != "parent" or not r.get("multi"):
+            return None
+        return r
+
+    def _on_cell_clicked(self, row: int, col: int) -> None:
+        """点「名称」列展开 / 收起多品种策略。
+
+        `cellClicked(row, col)` 给的是两个整数（不是 QModelIndex）。
+        """
+        if int(col) != 0:
+            return
+        if time.monotonic() < self._no_toggle_ts:
+            return          # 双击的第二下，交给 `_on_row_double` 处理
+        r = self._multi_row_at(int(row))
+        if r is None:
+            return
+        sid = str(r["cfg"].sid)
+        if sid in self._expanded:
+            self._expanded.discard(sid)
+        else:
+            self._expanded.add(sid)
+        self._fill_strategies()
+        # 表格重画会把「理论 / 状态」清成「—」，立刻补回来
+        self._render()
+
+    def _on_row_double(self, index) -> None:
+        """双击：多品种的**名称**列 = 展开（用户直觉就是双击展开），别的照旧开 K 线。
+
+        双击的两次 release 各发一次 `clicked`，会先展开再收起；这里打个时间戳，
+        让那两下 `clicked` 直接失效，展开由本函数一次做到位。
+        """
+        if index is not None and int(index.column()) == 0:
+            r = self._multi_row_at(int(index.row()))
+            if r is not None:
+                sid = str(r["cfg"].sid)
+                self._no_toggle_ts = time.monotonic() + 0.8
+                if sid not in self._expanded:
+                    self._expanded.add(sid)
+                    self._fill_strategies()
+                    self._render()
+                return
+        self._open_single()
+
     def _selected_sids(self) -> list[str]:
         model = self.tbl_strat.selectionModel()
         if model is None:
             return []
         out = []
+        seen = set()
         for i in sorted({i.row() for i in model.selectedRows()}):
             it = self.tbl_strat.item(i, 0)
             sid = "" if it is None else str(it.data(Qt.UserRole) or "")
-            if sid:
+            # 展开后父行和它的子行都带着同一个 sid，全选时会重复 ——
+            # 组合报告按 sid 取配置，重复了会把同一条策略算两遍
+            if sid and sid not in seen:
+                seen.add(sid)
                 out.append(sid)
         return out
 
@@ -2667,17 +2820,85 @@ class PortfolioPage(QWidget):
                 "30% 仓位 + 利用率 28% → 它每次都几乎用满；\n"
                 "利用率只有 8% 说明大部分开仓是被止损/风险口径卡住了手数。")
 
+    @staticmethod
+    def _child_status(cfg, slot: dict) -> tuple[str, str, str]:
+        """子行的「状态」：只挑和「这个品种自己」有关的几个分支。
+
+        父行那套状态逻辑还管着多账户、仅回测、重训原因等等，子槽位没有这些
+        花样（它就是一个品种一路信号），用同一套只会多出几段永远进不去的分支。
+        """
+        if not slot:
+            if getattr(cfg, "enabled", True):
+                return ("接入中", C_MUTED,
+                        "这条多品种策略的子槽位快照还没到（刚启动时等几秒）")
+            return "未启用", C_IDLE, "点「启动 / 停止」把它打开"
+        if slot.get("error"):
+            return "错误", C_BAD, str(slot["error"])
+        if slot.get("ml_wait"):
+            return "计算中", C_MUTED, "机器学习信号还没算出来，这段时间不动仓"
+        if slot.get("running"):
+            return "运行中", C_OK, str(slot.get("action") or "")
+        return "已停止", C_MUTED, "启动开关是开的，但这一轮没跑起来"
+
+    def _render_child(self, t, i: int, cfg, key: str) -> None:
+        """展开出来的子行：这个品种自己的手数 / 目标仓 / 状态。
+
+        数据来自引擎给每个品种建的子槽位（sid = `父sid#品种键`）—— 不是从父行
+        推算的。父槽位的 `target` 是 `—`（27 个目标仓加起来没有意义），子槽位
+        才有「这个品种该拿几手」。
+        """
+        sid = f"{cfg.sid}{GROUP_SEP}{key}"
+        slot = self._slot_view.get(sid) or {}
+        if not slot:
+            # 多账户时子槽位也按账户分开存，取第一个账户那份
+            by = self._slot_multi.get(sid) or {}
+            slot = next(iter(by.values()), {}) if by else {}
+        lots = _int(slot.get("lots"))
+        size = _child_size_text(cfg) + (f" → {lots} 手" if lots > 0 else "")
+        self._set_cell(t, i, 3, size, C_TEXT)
+        it3 = t.item(i, 3)
+        if it3 is not None:
+            it3.setToolTip(
+                f"这个品种分到的钱 = 总本金 ÷ 品种数"
+                + (f"，再乘仓位比例" if "·" in size else "")
+                + f"\n当前价下 {lots} 手" if lots > 0 else
+                "引擎还没算出实际手数（需要行情）")
+        theo = _int(slot.get("target"))
+        if slot.get("running"):
+            self._set_cell(t, i, 5, f"{theo:+d}", C_TEXT)
+            it5 = t.item(i, 5)
+            if it5 is not None:
+                it5.setToolTip(f"{key} 的目标净仓 {theo:+d} 手")
+        else:
+            self._set_cell(t, i, 5, "—", C_MUTED)
+        text, color, tip = self._child_status(cfg, slot)
+        self._set_cell(t, i, 6, text, color)
+        it6 = t.item(i, 6)
+        if it6 is not None and it6.toolTip() != tip:
+            it6.setToolTip(tip)
+        # 占用那三列是「整条策略」量出来的，摊不到单个品种头上
+        for j in (7, 8, 9):
+            self._set_cell(t, i, j, "—", C_MUTED)
+
     def _render(self) -> None:
         self._render_ts = time.monotonic()
         t = self.tbl_strat
-        for i, cfg in enumerate(self._items):
+        # 行 → 策略的映射由 `_fill_strategies` 建（展开时一个策略占多行）。
+        # 还没建过（第一次渲染早于填表）就退回「一条策略一行」
+        rows = self._rows or [{"kind": "parent", "cfg": c, "key": "",
+                               "multi": False} for c in self._items]
+        for i, row in enumerate(rows):
+            cfg = row["cfg"]
+            if i >= t.rowCount():
+                break
+            if row["kind"] == "child":
+                self._render_child(t, i, cfg, row["key"])
+                continue
             slots = self._slots_of(cfg)
             # 多账户时「这条策略的目标仓」不是唯一的一个数（每个账户一个），
             # 塞其中一个进这一列就是错的 —— 交给右下监控器逐合约列出
             many = len(slots) > 1
             slot = {} if many else next(iter(slots.values()), {})
-            if i >= t.rowCount():
-                break
             self._render_diag(t, i, cfg)
             theo = _int(slot.get("target"))
             multi = _int(slot.get("multi"))

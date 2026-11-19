@@ -440,6 +440,12 @@ class ResultView(QObject):
 
         self._pages: list[tuple[str, QWidget]] = []
         self._built = False
+        # 绩效 / 交易记录 / 阶段分析三页共用同一个「看哪一条腿」的选择。
+        # 三个下拉框都登记在这里，任何一处切换都会把另外两处同步过去 ——
+        # 否则在绩效页选了「AG_SHFE」，翻到交易记录又变回全部，得再选一次
+        self._leg_combos: list[QComboBox] = []
+        self._leg_labels: list[QLabel] = []
+        self._leg_noun = "品种"
         self._report: pd.DataFrame | None = None
         self._report_key = ""
         # 截面因子分析的缓存：算一遍要遍历所有因子 × 所有品种，切页签不该重算
@@ -596,6 +602,8 @@ class ResultView(QObject):
             self.cb_leg.addItem("全部组合（各品种合计）", "")
             self.cb_leg.currentIndexChanged.connect(self._on_leg_changed)
             top.addWidget(self.cb_leg)
+            # 交易记录 / 阶段分析两页也各有一个（见 `_leg_selector`），三处同步
+            self._leg_combos = [self.cb_leg]
         top.addStretch(1)
         # 纵轴口径：默认线性。等权组合的净值就在 1 附近走，线性才能看出
         # 「这一段跌了多少」；对数轴把 0.9~1.1 这一段拉平、把后面的暴涨拉开，
@@ -653,29 +661,71 @@ class ResultView(QObject):
         return w
 
     def _sync_leg_combo(self, res, noun: str = "品种") -> None:
-        """按结果重建下拉框。换策略时上一个策略的名字不能留着 ——
-        点进去会读到另一份数据的腿。
+        """按结果重建**所有**「看哪一条腿」下拉框。换策略时上一个策略的名字不能
+        留着 —— 点进去会读到另一份数据的腿。
 
         `noun` 是这个下拉框叫什么：多品种组合叫「品种」，多策略组合叫「策略」。
-        键都来自 `Result.legs`，只是叫法不同。"""
-        cb = getattr(self, "cb_leg", None)
-        if cb is None:
+        键都来自 `Result.legs`，只是叫法不同。
+
+        绩效 / 交易记录 / 阶段分析三页各有一个下拉框，这里一次全刷。以前只刷
+        绩效页那个，另外两页永远只有「全部」一项，等于那两页看不了单品种。
+        """
+        combos = [c for c in (getattr(self, "_leg_combos", None) or []) if c is not None]
+        if not combos:
             return
+        self._leg_noun = noun or "品种"
         lab = getattr(self, "lbl_leg", None)
         if lab is not None:
-            lab.setText(noun or "品种")
-        total = "全部组合（各品种合计）" if (noun or "品种") == "品种" \
-            else "全部策略（合计）"
+            lab.setText(self._leg_noun)
+        for l in (getattr(self, "_leg_labels", None) or []):
+            l.setText(self._leg_noun)
+        total = ("全部组合（各品种合计）" if self._leg_noun == "品种"
+                 else "全部策略（合计）")
         legs = sorted((getattr(res, "legs", None) or {}).keys()) if res is not None else []
-        cb.blockSignals(True)
-        cb.clear()
-        cb.addItem(total, "")
-        for sym in legs:
-            cb.addItem(sym, sym)
-        cb.setCurrentIndex(0)
-        cb.blockSignals(False)
-        # 没有逐项数据（老的保存结果）时置灰，别给个点不动的空框
-        cb.setEnabled(bool(legs))
+        for cb in combos:
+            cb.blockSignals(True)
+            cb.clear()
+            cb.addItem(total, "")
+            for sym in legs:
+                cb.addItem(sym, sym)
+            cb.setCurrentIndex(0)
+            cb.blockSignals(False)
+            # 没有逐项数据（老的保存结果）时置灰，别给个点不动的空框
+            cb.setEnabled(bool(legs))
+        # 口径说明：交易记录 / 阶段分析上的那个下拉框没有「品种」这两个字，
+        # 悬停得说清它切的是什么（单品种回测没这个框，所以只在有腿时挂）
+        for cb in combos[1:]:
+            cb.setToolTip(
+                f"切到某一个{self._leg_noun}，只看它自己的交易 / 阶段收益；"
+                "和绩效页那个下拉框是同一个选择")
+
+    def _leg_key(self) -> str:
+        """三页共用的「选中的那条腿」。空字符串 = 全部合计。"""
+        cb = getattr(self, "cb_leg", None)
+        return str(cb.currentData() or "") if cb is not None else ""
+
+    def _leg_selector(self, lay, noun: str = "") -> None:
+        """页首那条「看哪一条腿」的选择器（交易记录 / 阶段分析用）。
+
+        绩效页自己建那个（要和纵轴并排），所以不调这里。单品种回测没有腿，
+        一个框都不建 —— 建了也只有「全部」一项，纯占地方。
+        """
+        if self.kind == "single":
+            return
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 2)
+        lab = QLabel(noun or self._leg_noun or "品种")
+        lab.setStyleSheet("font-size: 11px; color: #6b7280;")
+        cb = QComboBox()
+        cb.setMinimumWidth(200)
+        cb.addItem("全部", "")
+        cb.currentIndexChanged.connect(self._on_leg_changed)
+        row.addWidget(lab)
+        row.addWidget(cb)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self._leg_labels.append(lab)
+        self._leg_combos.append(cb)
 
     def _perf_res(self):
         """绩效页当前该显示哪一份结果：全部组合，还是下拉框里选中的那个品种。"""
@@ -700,8 +750,26 @@ class ResultView(QObject):
         return bool(cb is not None and cb.currentData())
 
     def _on_leg_changed(self, _i: int = 0) -> None:
+        """切「看哪一条腿」。三页一起刷新。
+
+        绩效页的曲线、交易记录、阶段收益都是按腿出的 —— 只刷绩效页的话，
+        在绩效页切到「AG_SHFE」，翻到交易记录还是 27 个品种混在一起。
+        """
+        src = self.sender()
+        if isinstance(src, QComboBox):
+            key = str(src.currentData() or "")
+            for cb in (getattr(self, "_leg_combos", None) or []):
+                if cb is src:
+                    continue
+                j = cb.findData(key)
+                if j >= 0:
+                    cb.blockSignals(True)
+                    cb.setCurrentIndex(j)
+                    cb.blockSignals(False)
         self._update_table()
         self._draw_perf()
+        self._refresh_trades()
+        self._refresh_stages()
 
     def _on_yscale_changed(self, _i: int = 0) -> None:
         """切纵轴口径。只重画左边那张图，指标表不受影响。"""
@@ -860,6 +928,9 @@ class ResultView(QObject):
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
 
+        # 多品种 / 多策略才有：切到某一个，只看它自己的交易
+        self._leg_selector(lay)
+
         self.lbl_trades = QLabel("")
         self.lbl_trades.setObjectName("Hint")
         self.lbl_trades.setWordWrap(True)
@@ -910,6 +981,9 @@ class ResultView(QObject):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
+
+        # 多品种 / 多策略才有：切到某一个，只看它自己的年度与月度收益
+        self._leg_selector(lay)
 
         self.canvas_s = MplCanvas(figsize=(9, 3), dpi=100)
         self.canvas_s.installEventFilter(self)
@@ -2151,9 +2225,18 @@ class ResultView(QObject):
         # 对着资金曲线查的时候很容易看串行。这里统一按开仓时间排。
         rows = sorted(self.trades, key=lambda nt: (nt[1].entry_date, nt[1].exit_date))
         with_name = self.kind == "portfolio"
+        leg = self._leg_key()
+        if leg:
+            # 切到某一条腿就只看它自己的交易。`Trade.symbol` 是回测端盖上去的
+            # （`backtest._stamp_symbol`）；老的保存结果没有这个字段，退回按
+            # 名字匹配 —— 不匹配宁可留空，也不能把别的品种混进来
+            rows = [nt for nt in rows
+                    if str(getattr(nt[1], "symbol", "") or "") == leg
+                    or (not getattr(nt[1], "symbol", "") and str(nt[0]) == leg)]
         if with_name:
-            # 组合报告的第二列是「哪条策略」，截面策略则是「哪个品种」
-            head = "品种" if getattr(self.ctx, "cross", None) else "策略"
+            # 第二列：截面策略 / 多品种是「哪个品种」，多策略组合是「哪条策略」。
+            # 以前多品种也写「策略」，27 个品种的行全长得一样，还找不到品种名
+            head = "策略" if self._leg_noun == "策略" else "品种"
             self.tbl_trades.setHorizontalHeaderItem(1, QTableWidgetItem(head))
         n_closed = sum(1 for _n, t in rows if not t.open_position)
         n_open = len(rows) - n_closed
@@ -2166,13 +2249,17 @@ class ResultView(QObject):
         cums = cumulative_pnl([t for _n, t in rows])
 
         if not rows:
-            self.lbl_trades.setText("这次回测没有产生交易（信号全程为空仓，或者样本太短）")
+            self.lbl_trades.setText(
+                f"{leg}：这次回测里它没有产生交易（信号全程空仓，或者样本太短）"
+                if leg else
+                "这次回测没有产生交易（信号全程为空仓，或者样本太短）")
             tbl.setRowCount(0)
             return
         cost_sum = sum(float(t.cost or 0.0) for _n, t in rows)
         unit = _money_unit(self.market)[0]
         self.lbl_trades.setText(
-            f"共 {len(rows)} 笔（已平 {n_closed} 笔，持仓中 {n_open} 笔）"
+            (f"{leg}：" if leg else "")
+            + f"共 {len(rows)} 笔（已平 {n_closed} 笔，持仓中 {n_open} 笔）"
             f" · 盈利 {len(wins)} 笔 / 亏损 {len(losses)} 笔"
             f" · 平均盈利 {avg_win*100:+.2f}% / 平均亏损 {avg_loss*100:+.2f}%"
             f" · 累计盈亏 {cums[-1]:+,.0f} {unit}"
@@ -2205,7 +2292,9 @@ class ResultView(QObject):
                 note.append("持仓中")
             vals = [str(i + 1)]
             if with_name:
-                vals.append(str(name))
+                # 品种名优先：多品种回测里 `name` 往往就是策略名（27 行一样），
+                # `Trade.symbol` 才是「这一笔属于哪个品种」
+                vals.append(str(getattr(t, "symbol", "") or name))
             vals += [
                 d,
                 f"{t.entry_date:%Y-%m-%d %H:%M}" if not tqdata.is_daily(self.period)
@@ -2249,17 +2338,25 @@ class ResultView(QObject):
     # ---------------------------------------------------------- 阶段分析
 
     def _refresh_stages(self) -> None:
-        if self.res is None or not len(self.res.equity):
+        """阶段分析。跟着「看哪一条腿」走：切到 AG_SHFE 就只看它的年月收益。
+
+        以前固定读 `self.res`（整条组合），多品种 / 多策略的组合里「哪个月在亏」
+        分不清是谁亏的 —— 27 个品种的盈亏互相抵消，月度表看着挺平。
+        """
+        res = self._perf_res()
+        if res is None or not len(res.equity):
             return
-        eq = self.res.equity.dropna()
+        leg = self._leg_key()
+        eq = res.equity.dropna()
         # 本金当分母（单利口径，见 `backtest.stage_table`）。取不到就用期初权益
-        base = float(self.res.metrics.get("initial_cash") or eq.iloc[0])
+        base = float(res.metrics.get("initial_cash") or eq.iloc[0])
         yrs = stage_table(eq, "YE", base=base)
         months = month_matrix(eq, base=base)
 
         self._draw_stage_chart(yrs)
         if yrs.empty:
-            self.lbl_stage.setText("样本不足一年，没有阶段数据")
+            self.lbl_stage.setText(
+                (f"{leg}：" if leg else "") + "样本不足一年，没有阶段数据")
             self.tbl_month.setRowCount(0)
             return
 
@@ -2267,7 +2364,8 @@ class ResultView(QObject):
         best = yrs.loc[yrs["ret"].idxmax()]
         worst = yrs.loc[yrs["ret"].idxmin()]
         self.lbl_stage.setText(
-            f"{len(yrs)} 个自然年 · 盈利 {pos} 年 / 亏损 {len(yrs)-pos} 年"
+            (f"{leg}：" if leg else "")
+            + f"{len(yrs)} 个自然年 · 盈利 {pos} 年 / 亏损 {len(yrs)-pos} 年"
             f" · 最好 {best['period']:%Y} 年 {best['ret']*100:+.1f}%"
             f" · 最差 {worst['period']:%Y} 年 {worst['ret']*100:+.1f}%"
         )

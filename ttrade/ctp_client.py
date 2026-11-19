@@ -361,6 +361,12 @@ class TraderClient:
         self.orders: dict[str, dict] = {}
         self.trades: dict[str, dict] = {}
         self.positions: dict[str, dict] = {}
+        # 持仓查询的「代」。CTP 的 OnRspQryInvestorPosition 是一条一条推的，
+        # 一整轮才凑出完整快照，所以**不能**在发请求时就把 positions 清掉 ——
+        # 界面会看到半份/空仓，策略那边更会以为账户没仓而重复开仓。
+        # 这里只记「这一轮的第一条回调到了没有」：到了才清，之后整轮往里累加。
+        self._pos_req = -1            # 当前这轮查询的 RequestID
+        self._pos_started = True      # 本轮是否已经清过（True=没有进行中的查询）
         self.account: dict = {}
         self.instruments: dict[str, dict] = {}
         # 全量合约表查完没有。SimNow 上 `ReqQryInstrument` 会回 1.6 万条，
@@ -440,6 +446,16 @@ class TraderClient:
         req.InvestorID = self.cfg.user_id
         req.UserID = self.cfg.user_id
         req.InstrumentID = instrument
+        # 交易所代码。CTP 前台多数情况下能自己按合约查出来，但**查不出来时
+        # 报的是 `[148] 无效的 ExchangeID 字段`**，而且这个错跟合约名没关系，
+        # 极难反查（2026-11-19 TL 策略踩了：合约被拼成 `tlcffex0`，柜台只说
+        # ExchangeID 无效）。显式填上，填不出来就在本地抛，别发一笔注定被拒的单。
+        ex = self._exchange_of(instrument)
+        if not ex:
+            raise CtpError(
+                f"认不出 {instrument} 属于哪个交易所，不能报单"
+                "（多半是合约代码少写了交易所，或者品种代码不在本地数据里）")
+        req.ExchangeID = ex
         req.OrderRef = ref
         req.OrderPriceType = tdapi.THOST_FTDC_OPT_LimitPrice
         req.LimitPrice = float(price)
@@ -486,12 +502,22 @@ class TraderClient:
             self.api.ReqQryTradingAccount(tdapi.CThostFtdcQryTradingAccountField(), self._next_req())
 
     def query_positions(self) -> None:
+        """查持仓。🔴 **每轮必须重新攒一份**，见回调里的累加注释。
+
+        之前这里只是发请求，回调里又用 `+=`，而 `positions` 从来不清 ——
+        每查一次就把上一轮的浮盈 / 保证金再叠一遍。界面 2 秒刷一轮，跑一小时
+        浮盈就放大成千上万倍（用户看到「多了几个 0」，而且收盘后还在涨）。
+        """
         if self.api is None:
             return
         req = tdapi.CThostFtdcQryInvestorPositionField()
         req.BrokerID = self.cfg.broker_id
         req.InvestorID = self.cfg.user_id
-        self.api.ReqQryInvestorPosition(req, self._next_req())
+        rid = self._next_req()
+        with self._lock:
+            self._pos_req = rid
+            self._pos_started = False
+        self.api.ReqQryInvestorPosition(req, rid)
 
     def query_instruments(self, instrument: str = "") -> None:
         """查合约表。传 `instrument` 就只查那一个（秒回），不传就查全量。
@@ -551,6 +577,16 @@ class TraderClient:
         from ttrade.symbols_info import EXCHANGES  # noqa: F401 - 只为了保持口径一致
 
         letters = "".join(ch for ch in instrument if ch.isalpha())
+        # 本地数据目录（`data_futures/*.csv` 的文件名）比下面几张写死的前缀表
+        # 更权威，新品种上市也认得。写在前面，TL / TL0 这类就不会掉到默认分支
+        try:
+            from ttrade.ctp_live import variety_exchange
+
+            ex = variety_exchange(letters)
+            if ex:
+                return ex
+        except Exception:  # noqa: BLE001
+            pass
         for ex, names in (("CZCE", ("TA", "MA", "FG", "SA", "SR", "CF", "RM", "OI")),):
             if letters.upper().startswith(names):
                 return ex
@@ -566,7 +602,10 @@ class TraderClient:
         if letters.lower() in ("a", "b", "c", "cs", "eb", "eg", "i", "j", "jd", "jm",
                                "l", "m", "p", "pg", "pp", "rr", "v", "y", "lh", "lg"):
             return "DCE"
-        return "SHFE"
+        # 认不出来就**返回空**，别再默认上期所 —— 猜成 SHFE 的后果是报单带着
+        # 一个错误的 ExchangeID 发出去，柜台回 `[148] 无效的 ExchangeID`，
+        # 而这句话完全不提「其实是合约名错了」，反查极难（2026-11-19 TL0）
+        return ""
 
     def _make_spi(self):
         outer = self
@@ -736,6 +775,18 @@ class TraderClient:
                     }
 
             def OnRspQryInvestorPosition(self, pInvestorPosition, pRspInfo, nRequestID, bIsLast):  # noqa: N802
+                # 🔴 这一轮的第一条回调（哪怕内容为 None，空仓时就是这样）先把上一轮
+                # 的清掉，然后整轮往里累加。CTP 一次查询会推**多条**：同一合约同一
+                # 方向按今仓 / 昨仓 / 不同开仓日期拆成好几条，`Position` 只是那一条
+                # 的量。以前用 `=` 赋值，后一条把前一条盖掉 ——
+                #   · 今仓盖掉昨仓（或反过来）⇒ 持仓手数少算，界面上「好几笔成交
+                #     都没出现在持仓里」，极端情况下一条 0 手的已平记录把整行清零；
+                #   · 浮盈 / 保证金用的是 `+=`，却又从不重置 ⇒ 每查一轮叠一遍，
+                #     跑一小时就放大成千上万倍（用户看到「多了几个 0」，收盘后还在涨）。
+                with outer._lock:
+                    if nRequestID == outer._pos_req and not outer._pos_started:
+                        outer.positions.clear()
+                        outer._pos_started = True
                 if pInvestorPosition is None:
                     return
                 ins = _s(pInvestorPosition.InstrumentID)
@@ -754,21 +805,23 @@ class TraderClient:
                     yd = int(getattr(pInvestorPosition, "YdPosition", 0) or 0)
                     # 今仓单独记：上期所平今和平昨是两个指令，界面要能分开看
                     td = int(getattr(pInvestorPosition, "TodayPosition", 0) or max(0, n - yd))
+                    # 一律累加，不赋值 —— 理由见上面那段。同一方向的第 N 条记录
+                    # 是「又一个批次」，不是「把前面的改掉」。
                     if side == "long":
-                        row["long"] = n
-                        row["long_yd"] = yd
-                        row["long_today"] = td
+                        row["long"] += n
+                        row["long_yd"] += yd
+                        row["long_today"] += td
                     elif side == "short":
-                        row["short"] = n
-                        row["short_yd"] = yd
-                        row["short_today"] = td
+                        row["short"] += n
+                        row["short_yd"] += yd
+                        row["short_today"] += td
                     # OpenCost 是**总成本**（含乘数），不是单价
                     oc = _f(getattr(pInvestorPosition, "OpenCost", 0))
-                    row["price"] = oc or row["price"]
+                    row["price"] += oc
                     if side == "long":
-                        row["cost_long"] = oc
+                        row["cost_long"] += oc
                     elif side == "short":
-                        row["cost_short"] = oc
+                        row["cost_short"] += oc
                     row["profit"] += _f(getattr(pInvestorPosition, "PositionProfit", 0))
                     row["margin"] += _f(getattr(pInvestorPosition, "UseMargin", 0))
 

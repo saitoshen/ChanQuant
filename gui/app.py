@@ -1294,7 +1294,10 @@ class MultiWorker(QObject):
                     failed.append(f"{job.label}：没有产生信号")
                     continue
                 results.append(res)
-                named.append((job.label, res))
+                # 腿的键用**品种键**（AG_SHFE），不用显示标签：交易记录里
+                # `Trade.symbol` 盖的是品种键，两处不一致的话「按品种筛」
+                # 会筛出空表（2026-11-19）
+                named.append((job.key, res))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"{type(exc).__name__}: {exc}")
             return
@@ -1341,7 +1344,8 @@ class MultiWorker(QObject):
                 failed.append(f"{job.label}：{exc}")
                 continue
             results.append(res)
-            named.append((job.label, res))
+            # 同上：腿的键必须是品种键，否则交易记录按品种筛不到
+            named.append((job.key, res))
         self.done.emit((results, named, failed))
 
 
@@ -6097,18 +6101,32 @@ class MainWindow(QMainWindow):
             frames[key] = replay.window(df, rng)
         return frames, missing
 
-    def _backtest_job(self, key: str, df: pd.DataFrame) -> BacktestJob:
+    def _backtest_job(self, key: str, df: pd.DataFrame,
+                      n_legs: int = 1) -> BacktestJob:
         """把「界面上这套设置」+ 一个品种打包成一份能扔进线程的活。
 
         配置要**每个品种单独建一份**：成本按各自的 tick / 手续费算，乘数和保证金
         也各不相同。共用一份 `self.cfg` 会把上一个品种的 tick 带到下一个头上。
+
+        `n_legs` 是多品种一次跑几个。多品种的含义是「一个账户的钱按品种数均分」，
+        所以每个品种只拿 本金 ÷ N —— 和策略交易里的 `children_of` 同一个口径。
+        不减的话同一份 540 万配置在回测里每个品种都按 540 万算手数，敞口是实盘的
+        27 倍（2026-11-19 用户报的口径不一致）。
 
         这里读控件是**故意**的 —— 必须在主线程读完、打包成纯数据，线程里只跑算。
         """
         cfg = copy.copy(self.cfg)
         cfg.bars_per_year = bars_per_year(df.index)
         self._apply_sizing(cfg)
+        if n_legs >= 2 and (getattr(cfg, "sizing", "capital") or "capital").lower() != "fixed":
+            # 手数口径（capital / risk）和曲线起点都按同一份额折。
+            # `fixed` 不折：手数写死在配置里，本来就不看本金
+            cfg.capital = float(cfg.capital or 0) / n_legs
+            cfg.risk_amount = float(cfg.risk_amount or 0) / n_legs
+            cfg.initial_cash = float(cfg.initial_cash or 0) / n_legs
         sym, ex = self._key_parts(key)
+        # 交易记录页按品种分开看要用它（多品种回测的每一笔都得知道自己是哪条腿）
+        cfg.symbol = key
         if self.market == "cn":
             costs.apply(cfg, sym, ex, self.cb_cost.currentData() or None)
             si = symbols_info.info(sym, ex)
@@ -6188,7 +6206,8 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("机器学习多因子至少需要勾选 2 个因子")
             return
 
-        jobs = [self._backtest_job(key, df) for key, df in frames.items()]
+        jobs = [self._backtest_job(key, df, n_legs=len(frames))
+                for key, df in frames.items()]
         self._start_multi_worker(jobs, missing, period, pooled=self._pooled_ml())
 
     def _pooled_ml(self) -> bool:
@@ -6219,7 +6238,8 @@ class MainWindow(QMainWindow):
         worker.seq = seq
         # 反向标记一起带过去：收尾时界面上的勾选框可能已经变了，标题要按**这一批
         # 实际怎么跑的**来写
-        worker.ctx = (missing, period, bool(jobs[0].reverse) if jobs else False)
+        worker.ctx = (missing, period, bool(jobs[0].reverse) if jobs else False,
+                      float(self.sp_principal.value() or 0))
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -6315,6 +6335,9 @@ class MainWindow(QMainWindow):
         ctx = getattr(w, "ctx", ([], "", False))
         missing, period = ctx[0], ctx[1]
         rev = bool(ctx[2]) if len(ctx) > 2 else False
+        # 本金在点「回测」那一刻就定下来了。收尾时再读控件的话，用户中途改了
+        # 本金，组合曲线会按新本金缩放，和各腿实际跑的那份对不上
+        cash = float(ctx[3]) if len(ctx) > 3 else 0.0
         self._m_worker = None
         self._m_thread = None
         self.btn_stop.setVisible(False)
@@ -6322,7 +6345,8 @@ class MainWindow(QMainWindow):
             return
         self._m_applied = seq
         results, named, failed = payload
-        self._finish_multi(results, named, failed, missing, period, rev)
+        self._finish_multi(results, named, failed, missing, period, rev,
+                           base_cash=cash)
 
     def _on_multi_failed(self, msg: str) -> None:
         w = self.sender()
@@ -6336,7 +6360,8 @@ class MainWindow(QMainWindow):
         self._clear_chart(f"多品种回测失败：{msg}")
 
     def _finish_multi(self, results: list, named: list, failed: list,
-                      missing: list[str], period: str, reverse: bool = False) -> None:
+                      missing: list[str], period: str, reverse: bool = False,
+                      base_cash: float = 0.0) -> None:
         """多品种回测收尾：拼净值、画图、把结论推给 Agent 页。"""
         failed = list(failed) + [f"{m}：没有行情数据" for m in missing]
         if not results:
@@ -6351,9 +6376,12 @@ class MainWindow(QMainWindow):
         # 反向要写在标题里：同一批品种、同一套参数，正着跑和反着跑的两条曲线
         # 是镜像的，标题不写清楚就只能靠翻交易记录猜
         tag = "多品种等权" + ("（反向）" if reverse else "")
-        # 本金是**一个账户**的钱（每个品种各跑一遍、都拿满同一笔本金），不是各
-        # 品种之和 —— 加起来就是 N 倍。不传就会吃 `combine` 的默认 10 万。
-        base = float((results[0].metrics or {}).get("initial_cash") or 0.0)
+        # 本金是**一个账户**的钱。每条腿只带 1/N（见 `_backtest_job` 的 `n_legs`），
+        # 归一化后要乘回**全额**本金，组合的金额才等于「一个账户同时铺 N 个品种」。
+        # 拿 `results[0].metrics["initial_cash"]` 当基数会只剩 1/N
+        base = float(base_cash or 0) \
+            or float(self.sp_principal.value() or 0) \
+            or float((results[0].metrics or {}).get("initial_cash") or 0.0)
         res = combine(results, label=tag, initial_cash=base or 100_000.0)
         # 绩效页的「品种」下拉框读它，切到单个品种看谁在赚。标签换成品种名，
         # 腿自己的 label 原本是策略名

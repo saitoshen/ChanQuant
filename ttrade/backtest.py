@@ -89,6 +89,12 @@ class BacktestConfig:
     # 写成 0.1 的话，任何忘了填乘数/保证金率的地方都会悄悄变成 10 倍杠杆
     margin_rate: float = 1.0
 
+    # 这次回测跑的是哪个品种（`RB_SHFE` / `AAPL` / `SSE.600000`）。
+    # 交易记录页要按品种分开看，而 `Trade` 里没有品种信息 —— 多品种回测的
+    # 每一笔长得一模一样，分不出是哪条腿（2026-11-19 用户报）。截面策略
+    # 自己在 `Trade.symbol` 里填了，这里只在为空时补，不覆盖
+    symbol: str = ""
+
     # ---- K 线内成交（只有 `run_intrabar_backtest` 读它） ----
     # 🔴 **铁律：进场当根不出场**。引擎里 ① 反向突破离场 ② ATR 止损 都带
     # `i > entry_bar` 守卫，进场那一根只负责建仓，任何出场都要等到下一根。
@@ -1412,6 +1418,22 @@ def run_grid_intrabar(data: pd.DataFrame, cfg: "BacktestConfig",
     return Result(equity=eq_series, position=ps, trades=trades, metrics=m, label=label)
 
 
+def _stamp_symbol(res: Result, cfg: BacktestConfig) -> Result:
+    """给这份结果的每一笔交易盖上品种名，原样返回。
+
+    `Trade.symbol` 以前**从来没人赋值**（截面策略除外），多品种回测里 27 条腿
+    的每一笔都只能回退成策略名，交易记录页 27 个品种的行长得一模一样，也没法
+    按品种筛（2026-11-19 用户报）。品种只有一个来源：这次回测跑的是谁。
+
+    截面策略一笔对应一个品种、自己填了 `symbol`，这里不覆盖。
+    """
+    if cfg.symbol:
+        for t in res.trades:
+            if not t.symbol:
+                t.symbol = cfg.symbol
+    return res
+
+
 def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str = "") -> Result:
     """按 signal 列执行回测。df 需含 open/close 与 signal（取值 -1/0/1）。
 
@@ -1427,7 +1449,7 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     if "signal" not in data:
         raise ValueError("缺少 signal 列")
     if "entry_long" in data.columns or "entry_short" in data.columns:
-        return run_intrabar_backtest(data, cfg, label=label)
+        return _stamp_symbol(run_intrabar_backtest(data, cfg, label=label), cfg)
     # 分级仓位（网格那一族）：signal 是档位号而不是 -1/0/1。判断放在这里、
     # 而不是让老循环去兼容 3 / -3 —— 老循环里 `pos = want` 之后到处按 pos==1
     # 判多空，-3 会被当成「非多头」走进空头分支，算出来的东西是错的也不报错。
@@ -1439,8 +1461,8 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
         # 表」，走挂单模型；没有这一列（老的自造档位信号）仍走原来那条，历史
         # 结果逐位不变。
         if cfg.grid_intrabar and "grid_step" in data.columns:
-            return run_grid_intrabar(data, cfg, label=label)
-        return run_level_backtest(data, cfg, label=label)
+            return _stamp_symbol(run_grid_intrabar(data, cfg, label=label), cfg)
+        return _stamp_symbol(run_level_backtest(data, cfg, label=label), cfg)
 
     open_ = data["open"].to_numpy(dtype=float)
     close = data["close"].to_numpy(dtype=float)
@@ -1612,7 +1634,8 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig | None = None, label: str
     # 成本率 = 花掉的钱 ÷ 成交额。绩效页那一行显示的是它（百分比），不是金额 ——
     # 金额随本金和手数变，比例才是「每笔交易被吃掉多少」
     m["cost_rate"] = float(cost_total / notional_total) if notional_total > 0 else 0.0
-    return Result(equity=eq, position=ps, trades=trades, metrics=m, label=label)
+    return _stamp_symbol(
+        Result(equity=eq, position=ps, trades=trades, metrics=m, label=label), cfg)
 
 
 def buy_and_hold(df: pd.DataFrame, cfg: BacktestConfig | None = None,

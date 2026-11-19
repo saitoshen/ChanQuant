@@ -43,7 +43,8 @@ import time
 import numpy as np
 import pandas as pd
 
-from ttrade.ctp_live import _BarBuilder, ctp_instrument, main_contract, variety_exchange
+from ttrade.ctp_live import (_EX_SHORT, _BarBuilder, ctp_instrument, exchange_of_contract,
+                             looks_contract, main_contract, variety_exchange)
 from ttrade.tqlive import BACKEND_LABELS
 
 #: `get_kline_serial` 的第二个参数是秒，反过来要认出周期名
@@ -68,8 +69,11 @@ POSITION_SEC = 1.0
 #: 下单之后多久没有柜台回报就判这笔委托没报进去（见 `_expire_optimistic`）
 OPTIMISTIC_TTL = 30.0
 
-#: 本地文件名和天勤品种代码对不上的，逐个列出来（见 `tqsdk_symbols.PRODUCT_ALIAS`）
-_LOCAL_ALIAS = {"TL": "TL0"}
+#: 本地文件名和天勤品种代码对不上的，逐个列出来。
+#: 30 年期国债：数据源（Tushare）把品种代码写成 `TL0`（`0` 是连续合约标记），
+#: 本地文件曾经叫 `TL0_CFFEX.csv`。已正名为 `TL`，这里留一条反向映射，
+#: 免得还没改过来的老策略配置读不到历史（2026-11-19）
+_LOCAL_ALIAS = {"TL0": "TL"}
 
 #: CTP 的 `OrderStatus` 中文 → 天勤的三态。**只认这三种**，别的一律当活单：
 #: 把「部分成交(不在队列)」当成死单，`_chase` 会记一次拒单，三次就停机。
@@ -81,16 +85,29 @@ _STATUS_MAP = {
 
 
 def _split(symbol: str) -> tuple[str, str]:
-    """天勤写法 → `(交易所, 品种或合约)`。
+    """天勤写法 / 平台品种键 → `(交易所, 品种或合约)`。
 
-    `KQ.m@SHFE.rb` → `("SHFE", "rb")`；`SHFE.rb2701` → `("SHFE", "rb2701")`。
+    `KQ.m@SHFE.rb` → `("SHFE", "rb")`；`SHFE.rb2701` → `("SHFE", "rb2701")`；
+    **`TL0_CFFEX` → `("CFFEX", "TL0")`**。第三种是策略配置里的品种键，以前不认，
+    整串被当合约名，最后发出 `tlcffex0` 这种不存在的代码 —— 柜台报
+    「[148] 无效的 ExchangeID」（2026-11-19 TL 策略）。
     """
     s = str(symbol or "").strip()
     if "@" in s:
         s = s.split("@", 1)[1]
     if "." in s:
-        ex, _, code = s.partition(".")
-        return ex.upper(), code
+        head, _, tail = s.partition(".")
+        # 两种方向都见过：天勤 `SHFE.rb2701`，Tushare / 报表 `TL2612.CFFEX`。
+        # 只看第一段当前半段是不是交易所，`TL2612.CFFEX` 会把 `TL2612` 当交易所
+        if head.upper() in _EX_SHORT:
+            return _EX_SHORT[head.upper()], tail
+        if tail.upper() in _EX_SHORT:
+            return _EX_SHORT[tail.upper()], head
+        return head.upper(), tail
+    if "_" in s:
+        head, _, tail = s.rpartition("_")
+        if tail.upper() in _EX_SHORT:
+            return _EX_SHORT[tail.upper()], head
     return "", s
 
 
@@ -246,7 +263,8 @@ class BrokerApi:
         """
         key = str(symbol or "")
         ex, code = _split(key)
-        if "@" in key or not any(ch.isdigit() for ch in code):
+        # `TL0` 也算品种（主力连续代号 = 品种 + 0），不能因为「有数字」就当合约
+        if "@" in key or not looks_contract(ctp_instrument(code, ex)):
             obj = self._main_quote.get(key)
             if obj is None:
                 obj = _Obj(symbol=code, underlying_symbol="", datetime="",
@@ -722,7 +740,9 @@ class BrokerApi:
         """主连品种 → 当前主力合约（CTP 写法）。多级兜底，查不到返回空串。"""
         if not code:
             return ""
-        if any(ch.isdigit() for ch in code):
+        # `TL2612` 是合约；`TL` / `TL0` 是品种 —— 判据见 `looks_contract`，
+        # 不能只看「有没有数字」，否则 `TL0` 会被当成合约直接发到柜台
+        if looks_contract(code):
             return ctp_instrument(code, ex)          # 本来就是具体合约
         key = f"{str(ex).upper()}.{str(code).lower()}"
         now = time.time()

@@ -85,6 +85,14 @@ def variety_exchange(variety: str) -> str:
 
     不用写死一张表：新品种上市时只要数据文件在，这里就认得。扫一次缓存住，
     交易页每 0.4 秒刷一次状态，不能每次都 listdir。
+
+    文件名有两种形状，都要认：
+
+    - `RB_SHFE.csv` —— 品种（绝大多数）
+    - `TL0_CFFEX.csv` —— 主力连续代号被当成品种名的那种（30 年期国债在数据源里
+      叫 `TL0`）。文件已正名为 `TL_CFFEX.csv`，但老机器/老备份里可能还是旧名，
+      这里顺手把尾部数字剥掉再登记一次，免得 `variety_exchange("TL")` 返回空、
+      `ctp_instrument` 拼出小写 `tlcffex`，柜台回「[148] 无效的 ExchangeID」
     """
     global _EX_MAP
     if _EX_MAP is None:
@@ -98,35 +106,94 @@ def variety_exchange(variety: str) -> str:
                 stem = name[:-4]
                 if "_" not in stem:
                     continue
-                sym, _, ex = stem.partition("_")
-                out[sym.upper()] = ex.upper()
+                # rpartition：品种名里不带下划线，但将来带了也不会切错边
+                sym, _, ex = stem.rpartition("_")
+                sym, ex = sym.strip().upper(), ex.strip().upper()
+                if not sym or not ex:
+                    continue
+                out[sym] = ex
+                base = sym.rstrip("0123456789")
+                if base and base != sym:
+                    out.setdefault(base, ex)     # TL0_CFFEX → TL 也认得
         except Exception:  # noqa: BLE001
             out = {}
         _EX_MAP = out
     return _EX_MAP.get(str(variety or "").upper(), "")
 
 
+#: 交易所短码 / 各种写法 → CTP 的 `ExchangeID`。天勤写 `SHF` / `CFX`，
+#: 平台内部写 `SHFE` / `CFFEX`，柜台只认后者
+_EX_SHORT = {
+    "SHF": "SHFE", "SHFE": "SHFE",
+    "DCE": "DCE",
+    "ZCE": "CZCE", "CZC": "CZCE", "CZCE": "CZCE",
+    "CFE": "CFFEX", "CFX": "CFFEX", "CFFEX": "CFFEX",
+    "INE": "INE",
+    "GFE": "GFEX", "GFEX": "GFEX",
+    "SGE": "SGE",
+}
+
+
+def looks_contract(code: str) -> bool:
+    """这段代码是**具体合约**还是品种（含主力连续）？
+
+    `TL2612` / `rb2601` / `TA611` 是合约；`TL` / `TL0` / `RB0` 是品种。
+    判据不能只看「有没有数字」：主力连续代号就是 `品种 + 0`（数据源里的 `TL0`），
+    把它当合约会绕开「查主力」那一层，最后把 `TL0` 这种不存在的合约发到柜台
+    （2026-11-19：TL 策略 [148] 无效 ExchangeID 的另一半原因）。
+    """
+    digits = "".join(ch for ch in str(code or "") if ch.isdigit())
+    return bool(digits) and digits.strip("0") != ""
+
+
+def _parse_contract(contract: str, exchange: str = "") -> tuple[str, str, str, str]:
+    """合约 / 品种键 → `(代码, 字母, 数字, 交易所)`。
+
+    剥掉两种前后缀，都见过：
+
+    - 点号：`RB2601.SHF` / `SHFE.rb2601` / `CFFEX.TL2612`
+    - 下划线：`RB_SHFE` / `TL0_CFFEX` —— 这是**平台内部策略里的品种键**，
+      以前只认点号，于是 `TL0_CFFEX` 被当成一个合约名，字母串拼成
+      `TLCFFEX`，交易所查不到、数字又只剩那个 `0`，最后发出 `tlcffex0`
+      （2026-11-19 TL 策略 `[148] 无效的 ExchangeID` 就是这个）
+    """
+    s = str(contract or "").strip()
+    hint = ""
+    if s and "." in s:
+        head, _, tail = s.partition(".")
+        if tail.upper() in _EX_SHORT:
+            hint, s = _EX_SHORT[tail.upper()], head
+        elif head.upper() in _EX_SHORT:
+            hint, s = _EX_SHORT[head.upper()], tail
+    if s and "_" in s:
+        head, _, tail = s.rpartition("_")
+        if tail.upper() in _EX_SHORT:
+            hint, s = hint or _EX_SHORT[tail.upper()], head
+    letters = "".join(ch for ch in s if ch.isalpha())
+    digits = "".join(ch for ch in s if ch.isdigit())
+    ex = str(exchange or "").upper() or hint or variety_exchange(letters)
+    if ex in _EX_SHORT:                     # 传进来的可能是 `CFX` / `SHF`
+        ex = _EX_SHORT[ex]
+    return s, letters, digits, ex
+
+
+def exchange_of_contract(contract: str, exchange: str = "") -> str:
+    """合约 / 品种键 → CTP 的交易所代码（`CFFEX.TL2612` / `TL0_CFFEX` / `TL`）。"""
+    return _parse_contract(contract, exchange)[3]
+
+
 def ctp_instrument(contract: str, exchange: str = "") -> str:
     """把平台里的合约写法收敛成 CTP 的 `InstrumentID`。
 
-    认 `rb2601` / `RB2601` / `RB2601.SHF` / `SHFE.rb2601` / `RB` + `SHFE`。
-    品种（没有数字）原样返回 —— 调用方要先解析成具体合约，CTP 不认品种。
+    认 `rb2601` / `RB2601` / `RB2601.SHF` / `SHFE.rb2601` / `RB` + `SHFE`，
+    以及平台内部的**品种键** `RB_SHFE` / `TL0_CFFEX`（下划线分隔）。
+    品种（没有数字，或只有主力连续那个 `0`）原样返回 —— 调用方要先解析成
+    具体合约，CTP 不认品种。
     """
-    s = str(contract or "").strip()
+    s, letters, digits, ex = _parse_contract(contract, exchange)
     if not s:
         return ""
-    # `RB2601.SHF` / `rb2601.SHF` / `TA2611.ZCE`
-    if "." in s:
-        head, _, tail = s.partition(".")
-        if tail.upper() in ("SHF", "DCE", "ZCE", "CZC", "CFE", "CFX",
-                            "INE", "GFE", "SGE"):
-            s = head
-        elif head.upper() in ("SHFE", "DCE", "CZCE", "CFFEX", "INE", "GFEX"):
-            s = tail
-    letters = "".join(ch for ch in s if ch.isalpha())
-    digits = "".join(ch for ch in s if ch.isdigit())
-    ex = str(exchange or "").upper() or variety_exchange(letters)
-    if not digits:
+    if not looks_contract(s):
         return letters.upper() if ex in UPPER_EXCHANGES else letters.lower()
     # 郑商所的合约在 CTP 里是**三位**月份（`TA611`），Tushare 是四位（`TA2611`）。
     # 多带一位的合约代码在 CTP 上订阅不到、也下不了单，而报错只会说「合约不存在」
@@ -326,6 +393,9 @@ class CtpHub:
         self._open_cache: dict = {}
         # 「报价」框盯的合约。只存代码，行情对象按需订阅
         self._watch_syms: list[str] = []
+        # 每个盯盘合约「最后一笔交易时段内」的行情。收市后 CTP 还会推快照
+        # （`volume` / `oi` 还在动），不冻结的话界面看着像还在交易
+        self._watch_cache: dict[str, dict] = {}
 
     # ---- 柜台适配（融航覆盖这四个） ----
 
@@ -414,9 +484,10 @@ class CtpHub:
         ins = ctp_instrument(symbol, exchange)
         if not ins:
             raise ValueError("合约代码为空")
-        # 没有数字 = 还是品种，去本地主力表查一个具体合约
-        if not any(ch.isdigit() for ch in ins):
-            found = main_contract(symbol, exchange)
+        # 还是品种（含 `TL0` 这种主力连续代号）就去本地主力表查一个具体合约。
+        # 判据用 `looks_contract`，不能只看「有没有数字」—— `TL0` 带一个 0
+        if not looks_contract(ins):
+            found = main_contract(ins, exchange_of_contract(symbol, exchange))
             if not found:
                 raise ValueError(
                     f"{self.PLATFORM} 没有主连，要用具体合约（如 rb2601）。"
@@ -535,13 +606,31 @@ class CtpHub:
         except Exception:  # noqa: BLE001 - 订不上就让那几行留着空值，别炸整条会话
             pass
 
+    def _ins_exchange(self, ins: str) -> str:
+        """CTP 合约（`rb2601`，不带交易所）→ 交易所代码。"""
+        ex = ""
+        if self.trader is not None:
+            ex = str((self.trader.instruments.get(ins) or {}).get("exchange") or "")
+        if not ex:
+            try:
+                ex = variety_exchange("".join(ch for ch in ins if ch.isalpha()))
+            except Exception:  # noqa: BLE001
+                ex = ""
+        return ex
+
     def _watch_rows(self) -> list[dict]:
-        """「报价」框的数据：盯着的每个合约一行。没 tick 的给 last=0。"""
+        """「报价」框的数据：盯着的每个合约一行。没 tick 的给 last=0。
+
+        🔴 和 `_quote()` 一样要过**交易时段门禁**。收市之后 CTP 还会继续推
+        最后一次快照，`volume` / `oi` 照样在变 —— 不过滤的话「报价」框看着
+        还在跳，用户以为系统在盘中乱动。不在时段就还回最后一笔时段内的快照，
+        `source` 标成 `closed`，界面上能一眼看出是冻结的。
+        """
         out = []
         for ins in self._watch_syms:
             t = (self.md.last(ins) if self.md is not None else None) or {}
             info = (self.trader.instruments.get(ins) if self.trader is not None else None) or {}
-            out.append({
+            row = {
                 "symbol": ins,
                 "instrument": ins,
                 "last": float(t.get("last") or 0.0),
@@ -557,7 +646,23 @@ class CtpHub:
                 "tick": float(info.get("tick") or 0.0),
                 "datetime": str(t.get("datetime") or ""),
                 "source": "live",
-            })
+            }
+            code = "".join(ch for ch in ins if ch.isalpha())
+            ex = self._ins_exchange(ins)
+            open_now = True
+            if code and ex:
+                try:
+                    open_now = symbols_info.in_session(code, ex)
+                except Exception:  # noqa: BLE001
+                    open_now = True
+            if open_now:
+                self._watch_cache[ins] = dict(row)
+            else:
+                cached = self._watch_cache.get(ins)
+                if cached:
+                    row = dict(cached)
+                    row["source"] = "closed"
+            out.append(row)
         return out
 
     def state(self) -> LiveState:
@@ -675,8 +780,13 @@ class CtpHub:
             short_q = int(p.get("short") or 0)
             if not long_q and not short_q:
                 continue
-            long_td = max(0, long_q - int(p.get("long_yd") or 0))
-            short_td = max(0, short_q - int(p.get("short_yd") or 0))
+            # 今仓优先用柜台给的 `TodayPosition`（多条记录累加后的值），
+            # 拿不到才用「总 − 昨」推。两者在正常行情下相等，但今昨分两条
+            # 推送时，「总 − 昨」会把昨仓那条的 0 也算进来，累加后偏大。
+            long_td = int(p.get("long_today")
+                          or max(0, long_q - int(p.get("long_yd") or 0)))
+            short_td = int(p.get("short_today")
+                           or max(0, short_q - int(p.get("short_yd") or 0)))
             mult = self._mult(ins)
             cost = float(p.get("price") or 0.0)          # CTP 的 OpenCost 是总成本
             total = long_q + short_q

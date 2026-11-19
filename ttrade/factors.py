@@ -1186,6 +1186,7 @@ from ttrade import factors_seasonal as _FS   # noqa: E402
 from ttrade import factors_ext as _FE        # noqa: E402
 from ttrade import factors_macro as _FM      # noqa: E402
 from ttrade import factors_stock as _FK      # noqa: E402
+from ttrade import factors_fx5 as _FFX       # noqa: E402
 
 _INTRA_FACTORS = _FI.register_into(FACTORS, FactorSpec)
 _SEASON_FACTORS = _FS.register_into(FACTORS, FactorSpec)
@@ -1195,6 +1196,8 @@ _EXT_FACTORS = _FE.register_into(FACTORS, FactorSpec)
 _MACRO_FACTORS = _FM.register_into(FACTORS, FactorSpec)
 # A 股专属：基本面 / 资金流 / 概念板块 / 除权，全部标 markets=("cn_stock",)
 _STOCK_FACTORS = _FK.register_into(FACTORS, FactorSpec)
+# 汇率 5m：Dukascopy 分钟线，与日频 macro_usdcnh 并存对照（数据缺失则全 NaN）
+_FX5_FACTORS = _FFX.register_into(FACTORS, FactorSpec)
 
 # 用户因子可能带来新类别（默认叫「自定义」）。`CATEGORIES` 是界面上分组用的
 # 静态列表，不补进去的话新因子在「策略研究」页的因子下拉里根本不出现 ——
