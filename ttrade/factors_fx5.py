@@ -325,8 +325,9 @@ def _asof_daily(series: pd.Series, index, avail=None) -> pd.Series:
     }).dropna(subset=["t"]).sort_values("t")
     left = pd.DataFrame({"t": pd.DatetimeIndex(index).astype("datetime64[ns]")})
     left["_i"] = np.arange(len(left))
-    out = pd.merge_asof(left.sort_values("t"), right, on="t",
-                        direction="backward")
+    from ttrade.tsalign import merge_asof_ns
+
+    out = merge_asof_ns(left, right, on="t", direction="backward")
     return pd.Series(out.sort_values("_i")["v"].to_numpy(dtype=float), index=index)
 
 
@@ -355,8 +356,10 @@ def _asof(series: pd.Series, index, max_stale: int = MAX_STALE_BARS) -> pd.Serie
         {"t": pd.DatetimeIndex(index).astype("datetime64[ns]")}).sort_index()
     left["_i"] = np.arange(len(left))
     tol = BAR_TD * int(max_stale) if max_stale else None
-    out = pd.merge_asof(left.sort_values("t"), right, on="t",
-                        direction="backward", tolerance=tol)
+    from ttrade.tsalign import merge_asof_ns
+
+    out = merge_asof_ns(left, right, on="t", direction="backward",
+                        tolerance=tol)
     out = out.sort_values("_i")
     return pd.Series(out["v"].to_numpy(dtype=float), index=index)
 

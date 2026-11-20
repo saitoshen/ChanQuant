@@ -1,10 +1,11 @@
-"""抓宏观数据（23 个序列）进 `data_tq/edb.duckdb` 的 `macro_series` 表。
+"""抓宏观数据（25 个序列）进 `data_tq/edb.duckdb` 的 `macro_series` 表。
 
 和 `download_edb.py`（品种级基本面）、`download_tq.py`（K 线）、
 `download.py`（Tushare 日线）并列的第五条数据链路。
 
 数据源见 `ttrade/macro.py`：Tushare + 东方财富，美元指数用六个构成货币
-按 ICE 公式合成。
+按 ICE 公式合成；`usdcnh_em` / `dxy_em` 是东财的**独立口径**，和 Tushare
+那两条并存（用来核对标签偏移，不是替代）。
 
 用法：
 

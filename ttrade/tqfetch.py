@@ -995,6 +995,24 @@ def write_main_many(api, pairs: list[tuple[str, str]], period: str, years: int,
                     if report and on_row is not None:
                         on_row(key, out[key], first_seen.get(key))
                     continue
+                # 🔴 尾部**没走完**的 bar 一律不写。盘中跑下载时，天勤历史序列的
+                # 最后一行就是正在走的那根（2026-11-02 53 个品种的日线全被写成
+                # 了半根 —— 那天这根 bar 的收盘价 PTA 差 316 点、成交量只有一半，
+                # 而它永久留在库里：增量只追加更晚的，谁也修不好）。
+                # 判据和实盘补库、算信号共用 `barclock`，不在这儿另写一套。
+                from ttrade import barclock
+
+                cut = len(df)
+                while cut > 0 and barclock.is_unfinished(
+                        pd.Timestamp(df["dt"].iloc[cut - 1]), sym, ex, period):
+                    cut -= 1
+                if cut < len(df):
+                    df = df.iloc[:cut].reset_index(drop=True)
+                if df.empty:
+                    out.setdefault(key, 0)
+                    if report and on_row is not None:
+                        on_row(key, out[key], first_seen.get(key))
+                    continue
                 df["adj_factor"] = factor_at(factors[(sym, ex)], trading_days(df["dt"]))
                 n = S.upsert_bars(con, sym, ex, period, df)
                 # 上面那行只覆盖本次新下的 bar；切换表一变，历史段的因子也跟着变

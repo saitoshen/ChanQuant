@@ -855,15 +855,13 @@ class DataStore:
                 # 交易日对齐，避免把当天收盘才有的价差灌进上午的 bar。
                 #
                 # 天勤日线走 attach：那根 K 线和期限结构是同一天同一时刻的，
-                # 谁都不领先谁（和 Tushare 日线分支一个口径）。
+                # 谁都不领先谁（和 Tushare 日线分支一个口径）。**选择口径的那个
+                # 判据只在 `auxdata.attach_for_period` 里有一份** —— 实盘的
+                # `_with_aux` 也走它，两边再也不会各挑一种对齐方式。
                 try:
-                    from ttrade.auxdata import attach as attach_daily
-                    from ttrade.auxdata import attach_intraday as attach_intra
+                    from ttrade.auxdata import attach_for_period
 
-                    if tqdata.is_daily(period):
-                        df = attach_daily(df, sym, ex, AUX_DIR)
-                    else:
-                        df = attach_intra(df, sym, ex, AUX_DIR)
+                    df = attach_for_period(df, sym, ex, period, AUX_DIR)
                 except Exception:
                     pass
         except Exception as exc:  # noqa: BLE001
@@ -1530,6 +1528,12 @@ class MainWindow(QMainWindow):
         self.trade_page.disconnect_one.connect(self._on_live_stop_one)
         self._wire_live()
         self._wire_study_live()
+        # 行情源：**程序打开就连上默认源**（天勤），不等用户点。
+        # 它和账号无关、所有账户 / 策略共用一条 —— 策略因此不必等账户登录就能跑。
+        # 放后台线程：TqApi 登录要几秒，主线程等它会把首帧卡住。
+        from ttrade.market_feed import MarketFeed
+
+        MarketFeed.warm_up()
 
     def _build_page_bar(self) -> QWidget:
         bar = QWidget()
@@ -6052,27 +6056,14 @@ class MainWindow(QMainWindow):
         cfg = self._factor_cfg()
         # 跨周期因子：先把别的周期的行情读出来（主线程，走仓库缓存）
         extra = self._extra_periods(cfg, keys, period, skey)
-        if self.factor_mode == "ml":
-            self._start_factor_worker(df, keys, cfg, rule_signal,
-                                      extra=extra, base_period=period)
-            return
-
-        # 单因子 / 多因子只要几十毫秒，同步算完即可，不必起线程
-        try:
-            if rule_signal is None:
-                out = fstrat.run_factor_strategy(
-                    df, self.factor_mode, keys, cfg,
-                    extra=extra, base_period=period)
-            else:
-                out = fstrat.run_rule_with_filter(
-                    df, rule_signal, self.factor_mode, keys, cfg,
-                    extra=extra, base_period=period
-                )
-        except Exception as exc:  # noqa: BLE001
-            self.lbl_status.setText(f"因子计算失败：{exc}")
-            self._publish(f"因子计算失败：{exc}", True)
-            return
-        self._apply_outcome(out, rule_signal)
+        # 🔴 **一律走后台线程**，不再只给机器学习开。原来这里写着「单因子 /
+        # 多因子只要几十毫秒，同步算完即可」—— 那句只在几万根时成立。5m 十年
+        # 是 **22 万根**，十几个因子 + 分位标准化实测要几秒，那几秒主线程转不动，
+        # 用户看到的就是「策略研究页卡住」（2026-11-20）。
+        # `FactorWorker` 两条分支本来就都写好了（`rule_signal=None` 走纯因子、
+        # 否则走规则+过滤），和下面删掉的同步段是**同一对函数**，不存在第二套口径。
+        self._start_factor_worker(df, keys, cfg, rule_signal,
+                                  extra=extra, base_period=period)
 
     # ---------------------------------------------------- 多品种 / 截面
     def _key_parts(self, key: str) -> tuple[str, str]:
@@ -6805,10 +6796,15 @@ class MainWindow(QMainWindow):
         thread.finished.connect(thread.deleteLater)
 
         self._f_worker, self._f_thread = worker, thread
-        self.lbl_status.setText(
-            f"正在训练 {mlmodels.MODELS.get(cfg.model, {}).get('label', cfg.model)}"
-            f"（{len(keys)} 因子，{cfg.train_window} 交易日训练窗口）…"
-        )
+        # 状态文字要分开：单因子也走这条线程之后，非 ML 模式写着「正在训练…」
+        # 会让人以为它在训模型
+        if self.factor_mode == "ml":
+            self.lbl_status.setText(
+                f"正在训练 {mlmodels.MODELS.get(cfg.model, {}).get('label', cfg.model)}"
+                f"（{len(keys)} 因子，{cfg.train_window} 交易日训练窗口）…"
+            )
+        else:
+            self.lbl_status.setText(f"正在计算 {len(keys)} 个因子…")
         thread.start()
 
     def _cancel_factor_worker(self) -> None:
@@ -7182,14 +7178,19 @@ class MainWindow(QMainWindow):
         self._show_quote(st)
 
     def _show_quote(self, st) -> None:
-        q = st.quote or {}
-        # 不要求本地历史存在：没补过历史时实时段照样在跑，报价更该看得见
-        if q:
-            und = q.get("underlying") or ""
-            self.lbl_live_msg.setText(
-                f"{q.get('name', '')} {und} {q.get('last', 0):.2f}"
-                f" · 买 {q.get('bid', 0):.2f} 卖 {q.get('ask', 0):.2f}"
-            )
+        """顶部这条**只显示状态 / 日志**，不再显示报价。
+
+        用户 2026-11-20 明确要求：交易页下面已经有「报价」表（合约 / 最新 /
+        涨跌 / 买价 / 卖价 / 时间），顶部再来一行 `cu2612 ... 买 x 卖 y` 是
+        同一份数字的第二出处 —— 两处的保留位数、量口径还不一样，看的人会
+        以为行情在跳。
+
+        老实现每次 `LiveState` 推送（0.4 秒一次）都把 `lbl_live_msg` 覆盖成
+        一行报价，于是连「ProxyError」「实时已停止」这类真正要看的状态提示
+        也会被刷掉。现在这条只由 `_on_live_log` / `_on_live_failed` 写，
+        行情不再抢它。
+        """
+        return
 
     def _on_study_live_log(self, msg: str) -> None:
         self.lbl_live_msg.setText(msg)

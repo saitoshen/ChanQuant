@@ -226,16 +226,29 @@ def bars_from_serial(serial, period: str = "") -> pd.DataFrame:
     return out[~out.index.duplicated(keep="last")]
 
 
+#: 复权要跟着价格一起缩放的列。成交量 / 持仓量不是价格，不参与缩放。
+_PRICE_COLS = ("open", "high", "low", "close")
+
+
 def merge_live(local: pd.DataFrame, live: pd.DataFrame) -> pd.DataFrame:
     """把实时 K 线接到本地历史后面。
 
     只接**严格晚于**本地最后一根的实时 bar，因子用本地那份（本地已经带了正确的
     复权因子，实时段一律 1.0，混着用会在拼接处产生一次假的缩放）。
 
-    **但同一根要拿实时的价格覆盖**：本地最后一根是下载时写的半根快照，价格停在
-    那一刻，而实时这根一直在动。不覆盖的话图上最后一根永远不动 —— 日线最明显，
-    库里已经有当天那根，实时这根被整根丢掉，一天里价格怎么走图都不变，只有顶部
-    的报价标签在跳。因子仍然沿用本地那份，只换 OHLCV。
+    **重叠段用实时的 OHLC 覆盖**（乘上本地那根的 `adj_factor`）。两个理由：
+
+    1. 本地最后一根可能是**下载 / 补库时写的半根快照**，价格停在那一刻，而实时
+       这根一直在动。不覆盖的话图上最后一根永远不动 —— 日线最明显，库里已经有
+       当天那根，实时这根被整根丢掉，一天里价格怎么走图都不变。
+    2. 更糟的是**库尾半根不在最后一行**：库里停在 10:30（半根），实时段从 10:35
+       往后接，那根半根就卡在中间、`iloc[:-1]` 切不到它，指标（ATR、60 根动量、
+       突破阈值）全都按半根的 close 算。2026-11-19 库里实测到这种 bar：cu 11-03
+       21:55 的 close 比天勤差 70 元、成交量只有一半。**只覆盖最后一根是不够的**，
+       所以按整段重叠覆盖。
+
+    实时价是**原始价**、本地是「原始价 × 复权因子」，所以覆盖时必须乘回本地的
+    因子，否则接缝处会跳一下。
     """
     if live is None or live.empty:
         return local if local is not None else pd.DataFrame()
@@ -245,16 +258,27 @@ def merge_live(local: pd.DataFrame, live: pd.DataFrame) -> pd.DataFrame:
         add["trading_day"] = trading_days(add.index).to_numpy()
         return add
 
+    # 复制一份再改：`local` 是 DataStore 缓存里那张表，就地改会污染下一次回测
+    out = local.copy()
+    # 用 searchsorted 定位重叠段，别对 26 万根的索引做 intersection
+    lo = int(local.index.searchsorted(live.index[0]))
+    hi = int(local.index.searchsorted(live.index[-1], side="right"))
+    if hi > lo:
+        ov = local.index[lo:hi].intersection(live.index)
+        if len(ov):
+            if "adj_factor" in out.columns:
+                f = out.loc[ov, "adj_factor"].astype(float).to_numpy()
+            else:
+                f = 1.0
+            for c in _PRICE_COLS:
+                if c in out.columns and c in live.columns:
+                    out.loc[ov, c] = live.loc[ov, c].to_numpy() * f
+            for c in ("volume", "open_oi", "close_oi"):
+                if c in out.columns and c in live.columns:
+                    out.loc[ov, c] = live.loc[ov, c].to_numpy()
+
     add = live[live.index > local.index[-1]].copy()
     if add.empty:
-        if live.index[-1] != local.index[-1]:
-            return local      # 实时这根比本地还旧，没什么可补的
-        # 复制一份再改：`local` 是 DataStore 缓存里那张表，就地改会污染下一次回测
-        out = local.copy()
-        row = live.iloc[-1]
-        for c in ("open", "high", "low", "close", "volume", "open_oi", "close_oi"):
-            if c in out.columns and c in live.columns:
-                out.iloc[-1, out.columns.get_loc(c)] = row[c]
         return out
     add["adj_factor"] = 1.0
     add["trading_day"] = trading_days(add.index).to_numpy()
@@ -269,7 +293,29 @@ def merge_live(local: pd.DataFrame, live: pd.DataFrame) -> pd.DataFrame:
     # 在变。新 bar 缺的列留 NaN：历史段本来就有值，因子仍然算可用，只是最后一根
     # 的分数是 NaN（`mean(skipna=True)` 会跳过，不影响已走完的 bar）。
     add = add.reindex(columns=local.columns)
-    return pd.concat([local, add]).sort_index()
+    merged = pd.concat([out, add]).sort_index()
+    # 🔴 索引精度必须跟**库内那份**一致，不能跟着实时段走。
+    # DuckDB 读出来是 `datetime64[us]`，天勤推上来是 `datetime64[ns]`；
+    # `pd.concat` 取更精的那个 ⇒ 整帧变成 ns。而基本面 / 宏观因子要把外部
+    # 序列（us）`merge_asof` 上来，两侧精度不一致会**直接抛 MergeError**，
+    # 因子被静默剔除、少一票、信号翻向。
+    # 2026-11-20 白银 / 铅 1d_tq「研究页空仓、实盘 −2 手」的另一半就是它
+    # （前半是 attrs，见下面那段注释）。因子层也有兜底（`tsalign.merge_asof_ns`），
+    # 两处都留：这里保证「实盘帧 = 库内帧」同一种类型，那边保证任何来源都不炸。
+    try:
+        if merged.index.dtype != local.index.dtype:
+            merged.index = merged.index.astype(local.index.dtype)
+    except (AttributeError, TypeError):
+        pass
+    # 🔴 `pd.concat` 会丢掉 `df.attrs`，而 `factors_ext._symbol()` 就是靠
+    # `attrs["symbol"]` 认品种的。丢了以后 `_fund()` 整段返回 NaN ⇒
+    # `war_chg_5` / `war_val` / `inv_*` / `profit_*` / `spot_basis` 全列没值 ⇒
+    # `factor_matrix` → `filter_available(min_obs=60)` 把它们**静默剔除** ⇒
+    # `mean(skipna=True)` 少一票，分数符号可能直接翻转。
+    # 实测 AG 2026-11-20：带 attrs score=+0.4582 sig=0；丢 attrs
+    # score=-0.5568 sig=-1（`war_chg_5` 有效值 2438 → 0）。
+    merged.attrs = dict(local.attrs)
+    return merged
 
 
 # ------------------------------------------------------------------ 会话

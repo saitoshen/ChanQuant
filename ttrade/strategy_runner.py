@@ -52,10 +52,11 @@ import pandas as pd
 from ttrade import factor_strategy as fstrat
 from ttrade import ml_artifact
 from ttrade import replay
-from ttrade import (daylimit, orderbook, positionbook, topup, tqdata,
+from ttrade import (barclock, daylimit, orderbook, positionbook, topup, tqdata,
                     tqstore)
 from ttrade import strategy_store as SStore
 from ttrade import specs, symbols_info
+from ttrade.market_feed import MarketFeed
 from ttrade.backtest import lots_round
 from ttrade.strategies import STRATEGIES, next_levels, run_strategy
 from ttrade.tqfetch import PERIOD_SEC
@@ -112,7 +113,7 @@ ML_PRED_RETRY = 60.0
 # 实时订阅能直接用的周期。`PERIOD_SEC` 是下载链路的口径，只有 5m/1h/1d；
 # 天勤的 `get_kline_serial` 本身支持 15m / 30m / 2h / 4h，实时段不用像本地历史
 # 那样由 5m/1h 合并出来。
-RT_SEC = {**PERIOD_SEC, "15m": 900, "30m": 1800, "2h": 7200, "4h": 14400}
+RT_SEC = barclock.RT_SEC          # 与 `barclock` 共用一份，免得两处漂
 
 # 分平今 / 平昨的交易所：上期所、能源中心。其余（大商所 / 郑商所 / 中金所）
 # 一律用 CLOSE，给它们发 CLOSETODAY 会被交易所整单打回。
@@ -127,6 +128,21 @@ MAX_REJECTS = 3
 # 非交易时段的那句话。**只暂停下单，信号与理论仓位照算** —— 用户 2026-11-17：
 # 「不能不显示，只是停止信号与下单，不是停止显示信号和理论持仓数量」
 CLOSED_NOTE = "非交易时段：暂停下单（理论仓位照算）"
+#: 没接账户时的占位说明。和 `CLOSED_NOTE` 分开：一个是「现在不能下单」，一个是
+#: 「没有账户可下单」—— 前者等开盘会自己消失，后者要人去接账户
+NO_ACCOUNT_NOTE = "未接账户：只算信号、不下单"
+#: 没接账户时台账 / 委托账本用的键。**只此一处**：和界面那个
+#: `gui.portfolio_page.NO_ACCOUNT_KEY` 不是一个东西（那边带括号，是分组名）
+BOOK_NO_ACCOUNT = "未接账户"
+
+#: 补衍生数据（展期 / 期权）的全局闸。DuckDB 单写者，几个 runner 一起补会互卡
+_AUX_LOCK = threading.Lock()
+
+#: 一次 `tick()` 里最多让几个槽位真正重算信号。重启 / 换行情源之后所有槽位
+#: 都在等第一根 bar，一次性算完实测要 15 秒以上，工作线程被占住 —— 界面上的
+#: 表格和曲线整段时间不动，就是用户说的「卡住」。分摊到几轮 tick（约 8 次/秒），
+#: 首屏信号几秒内陆续出来，界面一直可交互。
+SIG_BUDGET = 2
 
 # 刚记完账（本策略成交）之后，账户持仓明细要过几百毫秒才跟上。这段时间里
 # 账本比账户多是一时的，不能当成「被手工平了」去收窄 —— 见 `_trim`。
@@ -178,6 +194,13 @@ def atr(df: pd.DataFrame, n: int = 14) -> float:
 
 # ------------------------------------------------------------------ 状态
 
+#: 理论建仓价的三个来源，值越大越可信（见 `SlotState.theo_src`）。
+#: `order` —— 策略实际下发的限价（对手价，已含滑点）；
+#: `ib`    —— K 线内触发价（`ib_entry_long/short`）；
+#: `sig`   —— 没有委托可查时按信号序列倒推的「下一根开盘 + 成本」。
+THEO_SIG, THEO_IB, THEO_ORDER = "sig", "ib", "order"
+_THEO_RANK = {THEO_SIG: 1, THEO_IB: 2, THEO_ORDER: 3}
+
 
 @dataclass
 class PendingOrder:
@@ -210,6 +233,41 @@ class SlotState:
     # `positionbook`。不是账户净仓 —— 账户是所有策略 + 手工单 + 别的平台的和，
     # 拿它当自己的仓，同品种两条策略就会互相把对方的仓当成自己的。
     held: dict = field(default_factory=dict)
+    #: 每个合约的**持仓均价**（开仓方向上的加权成本），和 `held` 同一批键。
+    #: 只用来算「持仓盈亏」，不参与任何下单判断 —— 算错了顶多是那一列数字不准，
+    #: 不会变成多下一手。落盘在 `positionbook` 的 `_costs` 段。
+    cost: dict = field(default_factory=dict)
+    #: 本交易日**已经落袋**的平仓盈亏（元）。当日盈亏 = 这个 + 持仓盈亏。
+    #: 不落盘：重启后从 0 起算，那时界面上就只剩持仓那一半 —— 宁可少算，
+    #: 也不能把上一天的落袋盈亏算进今天。换交易日自动清零（`daylimit.trading_day`）。
+    real_day: float = 0.0
+    real_day_of: str = ""
+    #: 理论建仓价 —— 「持仓盈亏 / 当日盈亏」两列**只读这三个数 + 行情**，
+    #: 既不读台账（`held`/`cost`/`real_day`），也不读账户成交。
+    #: 用户 2026-11-20 明确：这两列是「策略理论上」的数，跟实际下单无关。
+    #: `theo_sig` 是这两格对应的信号方向，方向变了就重算。
+    #:
+    #: 🔴 `theo_px` **由策略自己写**（用户 2026-11-20 第二次纠正：
+    #: 「理论开仓价格，应该是从实盘策略中直接获取，不然如果 k 线中开仓，又算不对了」）。
+    #: 显示层不许另立一套「下一根开盘 + 成本」的规则去猜 K 线内那一族的价格 ——
+    #: 触发价是盘中算出来的，推出不来。谁写、按什么优先级覆盖，看 `theo_src`：
+    #:
+    #: | `theo_src` | 谁写的 | 含义 | 含成本吗 |
+    #: |---|---|---|---|
+    #: | `order` | `_send()` | 这一笔**实际下发**的限价（对手价）| 已含滑点，不再叠 |
+    #: | `ib`    | `_intrabar_tick()` | K 线内**触发价**（`ib_entry_long/short`）| 叠一层每边成本 |
+    #: | `sig`   | `_note_theo_entry()` | 没有委托可查时的**推断**（下一根开盘 + 成本）| 叠一层每边成本 |
+    #:
+    #: 优先级 `order` > `ib` > `sig`，同级不覆盖（同向加仓不许改建仓价）。
+    #:
+    #: **不落盘**：重启后内存里是空的，`_note_theo_entry` 会按同一套信号倒推
+    #: 重新算出来（`sig` 档）。故意不落盘 —— 落盘的错值（比如库被锁时按降级帧
+    #: 算出来的那个）会一直挂着自愈不了，这正是 2026-11-20 那次的教训。
+    theo_px: float = 0.0
+    theo_day: str = ""
+    theo_sig: int = 0
+    #: 这个 `theo_px` 是哪一路给的，见上表。空串 = 还没记过。
+    theo_src: str = ""
     book_ts: float = 0.0       # 最近一次账本变动的时刻，见 `_trim` 的宽限期
     # 本进程是否已经完成**加载时的首轮同步**。加载（启动 / 重新启用）后的第一轮
     # 只把账本摆成「账户里现成的仓」并记下来，**一手都不发** —— 用户 2026-11-17：
@@ -305,6 +363,12 @@ def hole_days(df: pd.DataFrame) -> list:
     # 上限卡到日历最后一根：当天的日线还没落库，别把「今天」当成缺口
     hi = min(max(have), max(cal))
     return sorted(d for d in cal if min(have) <= d <= hi and d not in have)
+
+
+# `expected_last_bar` 的实现在 `ttrade/barclock.py`：补库、合并、算信号三处
+# 必须用同一条「这根 bar 到几点算走完」的口径，各写各的一定会漂。这里只做
+# 转发，保持 `strategy_runner.expected_last_bar` 这个老入口还能用。
+expected_last_bar = barclock.expected_last_bar
 
 
 class LiveLog:
@@ -514,15 +578,33 @@ class MlSignals:
 
 
 class PortfolioRunner:
-    """一个账户 + 一组策略。
+    """行情 + 一组策略（+ 一个**可选**的账户）。
 
     纯 Python，不依赖 Qt —— 界面层用 QThread 包一层（见 `gui/portfolio_page.py`）。
+
+    **行情和账户是两件事**（2026-11-20 重构）。行情走全局共享的
+    `MarketFeed`（天勤 / CTP / 融航 三选一），账户只负责下单和查持仓：
+
+    - 没接账户也能跑：信号照算、理论仓位照显示、台账照记，**一笔不发**。
+      实盘账户日终要登出，策略不能跟着断 —— 7×24 靠的就是这一条。
+    - 账户中途登录 / 登出不重启策略：走 `attach_account()` / `detach_account()`，
+      槽位、K 线缓存、台账全保留。
+    - 以前 `self.api` 一个对象兼着行情和交易，柜台账户（`simnow_7x24`）拿不到
+      中金所行情时，策略「算不出信号」和「真的看空」在界面上长得一样。
     """
 
-    def __init__(self, spec: AccountSpec, chase: SStore.ChaseConfig | None = None) -> None:
+    def __init__(self, spec: AccountSpec | None = None,
+                 chase: SStore.ChaseConfig | None = None) -> None:
+        # 账户可以为空：`spec` 表达的是「绑定了哪个户」，`api` 表达的是「现在
+        # 连没连上」。两者分开之后，账户登出不会把策略一起带走。
         self.spec = spec
         self.chase = chase or SStore.load_chase()
+        #: 交易连接（账户）。None = 没绑定 / 已登出 —— **策略照跑**。
         self.api = None
+        #: 行情连接（全局共享，跨账户跨策略一份）。`start()` 里**先起它**。
+        self.feed = None
+        #: 上次用的行情源编号。切源后缓存的 serial 全失效，靠它发现并清缓存
+        self._feed_gen = -1
         self.last_error = ""
         self._slots: dict[str, SlotState] = {}
         # 多品种：父 sid -> 子 sid 列表，子 sid -> 父 sid（反查），父 sid -> 父配置。
@@ -548,7 +630,8 @@ class PortfolioRunner:
         self._log_fn = None
         # 交易所对日内报单 / 撤单次数有硬上限，超了会限制交易。按账户按交易日数，
         # 落盘 —— 重启程序不清零，见 ttrade/daylimit.py
-        self.limit = daylimit.DayLimit(self.spec.label())
+        self.limit = daylimit.DayLimit(
+            self.spec.label() if self.spec is not None else BOOK_NO_ACCOUNT)
         self._halted = ""
         # 「一键对齐」发出的单放在这个槽位里。它只当在途单的容器，不参与信号：
         # 对齐是**一次性动作**，发完就交给追单，成交 / 撤完就结束。没有它的话，
@@ -573,6 +656,11 @@ class PortfolioRunner:
         # 算信号用的前复权基准，(品种_交易所@周期) -> qfq 历史。实盘必须和回测
         # 同一份复权口径（见 `_signal_frame`）。主连换月时失效重载。
         self._qfq_base: dict[str, pd.DataFrame] = {}
+        # 读 `_qfq_base` 那一刻库文件的 mtime。**库变了就整份重读** —— 用户
+        # 「数据管理」补完历史，实盘不该还要重启一次才用上新数据；而补库往往
+        # 只是覆盖了库尾的几根（行数不变），靠「库尾比手上这份新」是判不出来的
+        self._qfq_stamp: float = 0.0
+        self._qfq_stamp_at: float = 0.0
         # K 线缺交易日的提示（键同 `_qfq_base`），同样的原因只记一次
         self._gap_note: dict[str, str] = {}
         # 第一次跑持仓账本（升级上来的老用户，或者本机第一次跑）。这种时候账户里
@@ -584,6 +672,9 @@ class PortfolioRunner:
         self._factor_warned: set[str] = set()
         # 已经落过盘的槽位错误：(sid, 错误原文)。见 `snapshot`
         self._err_logged: set[tuple] = set()
+        # 每槽位「上一次记过的状态说明」。同一条说明只记一次 —— 每 tick 都刷会把
+        # 日志淹掉，而这类说明（行情没就绪 / 历史不够）恰恰要让人一眼看到
+        self._notes: dict[str, str] = {}
 
     # ---- 生命周期 ----
 
@@ -596,6 +687,19 @@ class PortfolioRunner:
                 self._log_fn(msg)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _note_once(self, st: SlotState, msg: str) -> None:
+        """同一条状态说明只记一次，并挂到 `st.last_action` 上让界面看得到。
+
+        2026-11-20 那次「盘中出了信号、重载后消失」里，`_refresh_signal` 和
+        `_signal` 各有一处**静默 return** —— 行情订不上 / 历史不够时界面显示的是
+        上一次算出的目标，和「策略真的看空」长得一模一样，日志里一条线索都没有。
+        """
+        if self._notes.get(st.cfg.sid) == msg:
+            return
+        self._notes[st.cfg.sid] = msg
+        st.last_action = msg
+        self._log(f"{st.title()}：{msg}")
 
     # 用到这几类因子的策略，启动前要把衍生快照补到最新
     _AUX_PREFIXES = ("roll_", "iv_", "near_oi", "pcr")
@@ -674,15 +778,56 @@ class PortfolioRunner:
             self._log(f"衍生数据补充失败（{type(exc).__name__}: {exc}），先用本地快照")
 
     def start(self) -> None:
+        """起行情 → 起账户（可选）。**行情失败不该挡住策略**。
+
+        顺序不能反：以前先连账户再补数据、再算信号，账户连不上整个 runner 就
+        没有 `api`，`wait()` / `tick()` 直接 return —— 策略变成账户的附属品。
+        """
+        # 行情是全局共享的那一条，程序打开就连上（`MarketFeed.get()` 首次即连）
+        if self.feed is None:
+            self.feed = MarketFeed.get()
+            self._feed_gen = self.feed.generation
+            if not self.feed.ready:
+                self._log(f"行情源未连上（{self.feed.error or '原因不明'}）："
+                          "先按最后一根已完成的 bar 算信号，不进新仓")
+        # 衍生数据（展期 / 期权）是**策略的输入**，跟有没有账户无关：不接账户
+        # 也要算因子。但补齐很慢 —— 2026-11-20 实测 `_ensure_aux()` **15.1 秒**，
+        # 放在 `start()` 里同步跑，「启动全部」时界面会僵在那儿。
+        # 改后台：策略先用本地快照算信号，补齐了下一根 bar 自然用新值。
+        threading.Thread(target=self._aux_bg, daemon=True,
+                         name="aux-warm").start()
+        # 账户是**最后一步**：绑了才连，连不上只记一条，策略照跑
+        if self.spec is not None:
+            try:
+                self._connect_account()
+            except Exception as exc:  # noqa: BLE001
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                self._log(f"账户未接入：{self.last_error}（策略继续运行，不下单）")
+        else:
+            self._log("未绑定账户：只算信号、不报单（可在交易页随时接入）")
+
+    def _aux_bg(self) -> None:
+        """后台补衍生数据。多个 runner 同时起时只让一个去补，其余直接跳过。
+
+        `_ensure_aux()` 实测 15.1 秒（要读 9 个品种的展期 / 期权快照并补缺失
+        交易日）。几个账户一起启动就并发写同一个库，DuckDB 是单写者，会互相
+        卡住 —— 所以用一把**非阻塞**的锁，抢到就补，抢不到说明别人正在补。
+        """
+        if not _AUX_LOCK.acquire(blocking=False):
+            return
+        try:
+            self._ensure_aux()
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"衍生数据检查失败（{type(exc).__name__}: {exc}），先用本地快照")
+        finally:
+            _AUX_LOCK.release()
+
+    def _connect_account(self) -> None:
+        """连账户。**只做交易那部分** —— 行情早已由 `self.feed` 提供。"""
         # 先体检账户：配错的（缺账号密码、柜台+A股）到下面连的时候才炸，而那时候
         # `_ensure_aux()` 已经补了几分钟数据。理由见 `require_live_account()`
         require_live_account(self.spec)
         backend = getattr(self.spec, "backend", "tq")
-
-        # 补数据放在连接之前：连上就要开始算信号了，那时候快照还是旧的。
-        # 柜台账户也要补 —— 展期/期权因子是策略自己的输入，跟用哪个柜台下单无关；
-        # 而且柜台没有历史行情，「当前主力是哪个合约」也读的是本地衍生数据
-        self._ensure_aux()
 
         if backend == "tq":
             from tqsdk import TqApi, TqAuth
@@ -699,11 +844,63 @@ class PortfolioRunner:
         if backend == "tq":
             self._log(f"账户已连接：{self.spec.label()}")
         else:
-            self._log(
-                f"账户已连接：{self.spec.label()}"
-                f"（行情源 {BACKEND_LABELS.get(backend, backend)}；"
-                "历史行情读本地天勤数据）")
+            self._log(f"账户已连接：{self.spec.label()}"
+                      f"（行情走 {self._feed_label()}，历史行情读本地天勤数据）")
         self._sweep_orders()
+
+    def _feed_label(self) -> str:
+        try:
+            return BACKEND_LABELS.get(self.feed.source, self.feed.source)
+        except Exception:  # noqa: BLE001
+            return "行情源"
+
+    # ---- 账户的接 / 脱（策略不中断） ----
+
+    @property
+    def account_ready(self) -> bool:
+        return self.api is not None and self._pos is not None
+
+    def attach_account(self, spec) -> bool:
+        """接入 / 切换账户。**策略不停、K 线缓存不清、台账不动。**
+
+        返回是否连上；连不上时策略继续跑（只是不发单），界面上账户状态显示未连。
+        """
+        if self.api is not None:
+            self.detach_account()
+        old = self.spec
+        self.spec = spec
+        self.limit = daylimit.DayLimit(spec.label() if spec is not None
+                                       else "未接账户")
+        try:
+            self._connect_account()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self._log(f"接入账户失败：{self.last_error}（策略继续运行，不下单）")
+            self.api = None
+            self._pos = self._orders = None
+            if old is not None:
+                self.spec = old
+            return False
+
+    def detach_account(self) -> None:
+        """登出账户。**策略继续运行**，信号 / 理论仓位 / 台账全部保留。
+
+        在途单先撤：账户登出之后撤单接口就没了，那几笔会一直挂在交易所。
+        """
+        api, self.api = self.api, None
+        self._pos = self._orders = None
+        for st in list(self._slots.values()) + [self._align_slot]:
+            try:
+                self._cancel_all(st)
+            except Exception:  # noqa: BLE001
+                st.pending.clear()
+        if api is not None:
+            try:
+                api.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._log("账户已登出：策略继续运行（只算信号，不下单）")
 
     def _broker_api(self, backend: str):
         """柜台账户的执行层：实时行情 + 下单走柜台，历史走本地天勤数据。"""
@@ -723,7 +920,7 @@ class PortfolioRunner:
         只撤**本程序自己下过**的单（order_id 记在 `live_orders.json`），
         快期客户端里手点的委托不在名单里，不会被误伤。
         """
-        ids = orderbook.load(self.spec.label())
+        ids = orderbook.load(self._book_key)
         if not ids:
             return
         if getattr(self.spec, "backend", "tq") != "tq":
@@ -744,7 +941,7 @@ class PortfolioRunner:
                 n += 1
             except Exception:  # noqa: BLE001
                 pass
-        orderbook.clear(self.spec.label())
+        orderbook.clear(self._book_key)
         if n:
             self._log(f"撤掉上次遗留的 {n} 笔委托（程序上次没有正常退出）")
 
@@ -762,6 +959,8 @@ class PortfolioRunner:
         self._klines.clear()
         self._quotes.clear()
         self._pos = self._orders = None
+        # **行情源不关**：它是全局共享的一条连接（`MarketFeed` 单例），关掉
+        # 正在跑的另一组策略 / 账户透视页会一起断
         for st in self._slots.values():
             st.running = False
             st.pending.clear()
@@ -780,7 +979,8 @@ class PortfolioRunner:
 
     @property
     def alive(self) -> bool:
-        return self.api is not None
+        """runner 在不在跑。判据是**行情**，不是账户 —— 账户登出策略仍在运行。"""
+        return self.feed is not None
 
     # ---- 槽位管理 ----
 
@@ -809,11 +1009,26 @@ class PortfolioRunner:
             out.append(one)
         return out
 
+    @property
+    def _book_key(self) -> str:
+        """台账 / 委托账本的键。
+
+        **没接账户也要有台账**：目标仓和小节流都记在这份账本里，不写的话策略
+        一停就忘了自己算到哪，界面上的「理论仓位」也会跟着变 0。
+        """
+        return self.spec.label() if self.spec is not None else BOOK_NO_ACCOUNT
+
     def _add_one(self, cfg: SStore.StrategyConfig) -> SlotState:
         st = SlotState(cfg=cfg)
         # 账本跟着「账户 + 策略 id」走，重启后接着记。不读回来的话，目标 -11
         # 会从头再开一遍，账户直接变 -22。
-        st.held = dict(positionbook.load(self.spec.label()).get(cfg.sid, {}))
+        book = positionbook.load(self._book_key)
+        st.held = dict(book.get(cfg.sid, {}))
+        st.cost = dict(positionbook.load_costs(self._book_key).get(cfg.sid, {}))
+        # 仓位还在、均价丢了（老版本升级上来）时，按当前价补一个 —— 不补的话
+        # 那一列会一直是 0 盈亏，看着像「刚开仓」。宁可写一个近似值并在日志里
+        # 说清楚，也不要让用户对着一个不动的 0 猜
+        self._seed_cost(st)
         self._slots[cfg.sid] = st
         return st
 
@@ -857,7 +1072,7 @@ class PortfolioRunner:
         if st is not None:
             self._cancel_all(st)
             # 策略删了，账本也别留着 —— 同 id 再建一条会拿到别人的仓位
-            positionbook.forget(self.spec.label(), sid)
+            positionbook.forget(self._book_key, sid)
 
     def remove(self, sid: str) -> None:
         for k in self._groups.pop(sid, []) or []:
@@ -868,7 +1083,7 @@ class PortfolioRunner:
 
     def _save_book(self, st: SlotState) -> None:
         st.book_ts = time.time()
-        positionbook.save(self.spec.label(), st.cfg.sid, st.held)
+        positionbook.save(self._book_key, st.cfg.sid, st.held, cost=st.cost)
 
     def get(self, sid: str) -> SlotState | None:
         return self._slots.get(sid)
@@ -1010,18 +1225,31 @@ class PortfolioRunner:
     # ---- 推进 ----
 
     def wait(self, timeout: float = 0.8) -> bool:
-        if self.api is None:
+        """驱动一次行情。**不再依赖账户** —— 没接账户时策略照常推进。"""
+        if self.feed is None:
             return False
+        # 切了行情源：手里那些 serial 全是上一条连接的活引用，已经不会再更新了。
+        # 不清掉的话策略会一直读一份冻住的 K 线，看着「没信号」而不报任何错。
+        gen = self.feed.generation
+        if gen != self._feed_gen:
+            self._feed_gen = gen
+            self._klines.clear()
+            self._quotes.clear()
+            self._log(f"行情源已切换：{self._feed_label()}")
         try:
-            return bool(self.api.wait_update(deadline=time.time() + timeout))
+            return bool(self.feed.wait(timeout))
         except Exception as exc:  # noqa: BLE001
             self.last_error = f"{type(exc).__name__}: {exc}"
             raise
 
     def tick(self) -> None:
         """每轮 wait_update 之后调一次：刷信号、调仓、追单。"""
-        if self.api is None:
+        if self.feed is None:
             return
+        # 没接账户：信号、理论仓位、台账全照常算，只是**一笔不发**。以前这里
+        # 直接 return，策略跟着账户一起停 —— 实盘日终登出就等于策略断线
+        can_trade = self.api is not None
+        done = 0
         for st in list(self._slots.values()):
             if not st.running:
                 # 停机**不等于**不补数据。补库只依赖那条订阅，和策略在不在跑无关；
@@ -1034,11 +1262,32 @@ class PortfolioRunner:
                 except Exception:  # noqa: BLE001
                     pass
                 continue
+            if done >= SIG_BUDGET:
+                # 这一轮配额用完了。重启 / 换源之后每个槽位都在等第一根 bar，
+                # 一口气算完实测 15 秒以上，工作线程占住、界面几秒不动一下 ——
+                # 重算分摊到后面几轮，首屏信号照样几秒内出来。
+                # 但**订阅照投**（非阻塞、几乎不花时间）：不投的话排在后面的
+                # 品种要等好几轮才开始回填
+                try:
+                    self._subscribe(st)
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
             try:
+                before = st.last_bar
                 # 订阅**不受**时段限制（在 `_refresh_signal` 里先订再判）：
                 # 策略可能是在午休、收盘之后启动的，那一刻也得把 K 线订上，
                 # 否则开盘时手上没有底料
                 self._refresh_signal(st)
+                if st.last_bar != before:
+                    done += 1          # 这一条真的重算了信号，记一笔配额
+                if not can_trade:
+                    # 没接账户：目标已经算好、台账已经记了，只是**不下单也不追单**。
+                    # 在途单直接丢掉 —— 账户都登出了，那些单不可能在本地落地
+                    st.pending.clear()
+                    if not st.last_action:
+                        st.last_action = NO_ACCOUNT_NOTE
+                    continue
                 if not self._open_now(st.cfg):
                     # 非交易时段：**只跳过下单链路**（K 线内不触发、不调仓、
                     # 不追单 —— 收盘后重报只会被柜台打回，攒够 MAX_REJECTS
@@ -1145,17 +1394,31 @@ class PortfolioRunner:
 
     def _subscribe(self, st: SlotState) -> None:
         key = self._skey(st.cfg)
-        if key in self._klines:
-            self._top_up(st)      # 第一次没订成源周期的话，这里接着试
-            return
         tq = trade_symbol(st.cfg.symbol, st.cfg.exchange)
         # 订**源周期**再本地合并（15m/30m 走 5m，2h/4h 走 1h），和本地历史的
         # 合并口径一致；直接订原生 15m 时间边界对不上，拼起来就是碎的
         src, n = tqdata.PERIODS.get(st.cfg.period, (st.cfg.period, 1))
-        self._klines[key] = self.api.get_kline_serial(
-            tq, RT_SEC[src], data_length=min(10000, KLINE_LEN * max(1, n))
-        )
-        self._quotes[key] = self.api.get_quote(tq)
+        # 行情走全局源（`self.feed`），不走账户 —— 账户只负责下单。
+        # 柜台账户（`simnow_7x24`）没有中金所行情，以前从这里订下去就是一条
+        # 永远不更新的空序列，策略「算不出信号」和「真的看空」长得一模一样
+        if self.feed is None:
+            return
+        length = min(10000, KLINE_LEN * max(1, n))
+        # 🔴 **投递后立刻返回，不等回填**。天勤首次订阅一个品种要把 3000~4500 根
+        # 历史下回来，实测 **0.5~2.3 秒/个**；一个账户 27 个「品种@周期」串着等
+        # 就是 30~60 秒，那段时间引擎卡在第一次 tick 里、界面不刷新 ——
+        # 2026-11-20 用户报的「启动 / 普通界面都卡住」就是这个。
+        # 回填由行情线程自己完成，这里下一 tick 再取，期间显示「行情未就绪」。
+        self.feed.request_kline(tq, RT_SEC[src], length)
+        self.feed.request_quote(tq)
+        kl = self.feed.peek_kline(tq)
+        if kl is not None:
+            # 只缓存拿得到的：没回填时 `_klines` 不写空值，否则上面那句
+            # `if key in self._klines` 会以为「已经订好了」，再也不重试
+            self._klines[key] = kl
+        q = self.feed.peek_quote(tq)
+        if q is not None:
+            self._quotes[key] = q
         self._top_up(st)
 
     def _top_up(self, st: SlotState) -> None:
@@ -1168,7 +1431,7 @@ class PortfolioRunner:
         失败不抛：补数据是锦上添花，不该把正在跑的策略打死。刚订阅时序列还
         没填充是常态（`ok=False`），下一 tick 再来。
         """
-        if self.api is None:
+        if self.feed is None:
             return
         if is_stock(st.cfg.symbol, st.cfg.exchange):
             # 补库那条路写的是 `data_futures/*.csv`（期货 CSV 目录），A 股在
@@ -1208,6 +1471,10 @@ class PortfolioRunner:
             return
         self._topped.add(slot)
         self._top_err.pop(slot, None)
+        # 这次是我们自己写的库：把 stamp 记成「已读」，别让
+        # `_refresh_db_stamp` 把 27 个品种的前复权历史全部重读一遍 ——
+        # 自身写库写的是实时段，`merge_live` 合并时本来就会覆盖重叠那几根
+        self._note_own_write()
         if r["added"]:
             self._log(f"{st.title()}：本地历史补到最新 +{r['added']} 根"
                       f"（{src}，到 {r['last']:%Y-%m-%d %H:%M}）")
@@ -1223,6 +1490,12 @@ class PortfolioRunner:
         key = self._skey(st.cfg)
         kl = self._klines.get(key)
         if kl is None or not len(kl):
+            # 行情没订上（行情源没连、或者还没回填）。以前这里直接 return，
+            # 界面继续显示上一次算出的目标 —— 「信号消失」在现场就是这么发生的
+            src = self._feed_label()
+            self._note_once(
+                st, f"行情未就绪（{src}）：算不出信号，理论仓位保持上次值"
+                    f"{'，原因：' + self.feed.error if self.feed is not None and self.feed.error else ''}")
             return
         q = self._quotes.get(key)
         und = getattr(q, "underlying_symbol", "") if q is not None else ""
@@ -1255,7 +1528,14 @@ class PortfolioRunner:
         # 的第一根上就是它自己）。下面那行 `iloc[:-1]` 只是给「收盘定信号」的
         # 老策略用的副本，`full` 留给 `_ib_arm`
         full = df
-        if len(df) > 1:
+        # 🔴 只有**还在走**的最后一根才切。原来无条件 `iloc[:-1]`，收盘之后那条
+        # 已经走完了还照样切掉 —— 日线策略最惨：11-19 收盘后实时序列里已经有
+        # 11-19 那根，切掉就还在用 11-18 的信号，而回测用的是 11-19（2026-11-19
+        # 17:53 的 live.log 实测：末根=2026-11-18 00:00，当天是 11-19）。这就是
+        # 「盘中出信号、更新数据/重载之后又没了」的一条直接来源。
+        live_tail = bool(len(df)) and barclock.tail_is_live(
+            df.index[-1], st.cfg.symbol, st.cfg.exchange, st.cfg.period)
+        if len(df) > 1 and live_tail:
             df = df.iloc[:-1]
         if len(df) < MIN_BARS:
             # 静默 return 是最糟的一种：界面上只看到「理论 0 手」，谁也想不到
@@ -1304,6 +1584,7 @@ class PortfolioRunner:
             return
         prev = int(st.target)
         st.target = st.signal * st.lots
+        self._sync_theo_entry(st, self._mark_price(st, df))
         if int(st.target) != prev:
             # 目标一变就**落一次盘**（不只是写进界面那份内存日志）。
             # 用户问「实盘开了仓、回测却空仓，是不是信号在闪」时，磁盘上必须
@@ -1354,6 +1635,8 @@ class PortfolioRunner:
             st.signal = max(0, st.signal)
         prev = int(st.target)
         st.target = st.signal * st.lots
+        # 机器学习那条路没有信号序列，理论建仓价只能按「目标刚变的那一刻」记
+        self._sync_theo_entry(st)
         if int(st.target) != prev:
             # 机器学习信号是后台算的，这里手上没有 df —— 末根留空，
             # 但要留下 ml_age，能反推「这份信号是多久以前出的」
@@ -1501,6 +1784,9 @@ class PortfolioRunner:
             # 止损绑**触发价**（那一刻的下单价），不是此刻的最新价 ——
             # 最新价可能已经冲过去一段，用它会悄悄把止损挪得更松
             st.ib_stop = el - d if (d == d and d > 0) else float("nan")
+            # 理论建仓价：**策略自己的触发价**（`ib` 档）。紧接着的 `_send()`
+            # 会用真实对手价把它升成 `order` 档 —— 显示层不许自己编一个价
+            self._note_ib_entry(st, float(el), 1)
             st.last_action = f"K 线内入场：现价 {price:.3f} 越过 {el:.3f}"
             self._log(f"{st.title()}：K 线内做多 {st.underlying} 触发价 {el:.3f}"
                       f"，现价 {price:.3f}，止损 {st.ib_stop:.3f}")
@@ -1513,6 +1799,7 @@ class PortfolioRunner:
             st.ib_fired = True
             st.ib_exit_pending = False
             st.ib_stop = es + d if (d == d and d > 0) else float("nan")
+            self._note_ib_entry(st, float(es), -1)
             st.last_action = f"K 线内入场：现价 {price:.3f} 跌破 {es:.3f}"
             self._log(f"{st.title()}：K 线内做空 {st.underlying} 触发价 {es:.3f}"
                       f"，现价 {price:.3f}，止损 {st.ib_stop:.3f}")
@@ -1521,6 +1808,46 @@ class PortfolioRunner:
         """这段 K 线里缺掉的交易日。判据见模块级 `hole_days()`。"""
         return hole_days(df)
 
+    def _note_own_write(self) -> None:
+        """记下「库刚刚被我写过」，避免把自己写的那一次当成「用户补了数据」。
+
+        两个后果都要避免：① 白白重读 27 个品种的前复权历史（几十秒卡顿）；
+        ② 日志里冒出一句「本地行情库有更新」，用户会去查是谁补的。
+        """
+        try:
+            from ttrade import tqstore
+
+            self._qfq_stamp = os.path.getmtime(tqstore.db_path())
+            self._qfq_stamp_at = time.time()
+        except Exception:                # noqa: BLE001
+            pass
+
+    def _refresh_db_stamp(self) -> None:
+        """库文件变了就把整份前复权缓存作废。
+
+        每 2 秒最多 stat 一次：`_signal_frame` 只在**出现新 bar** 时调用（一根
+        5m 一次），但 19 个品种加起来仍会反复问；stat 本身很便宜，攒一下更稳。
+        """
+        now = time.time()
+        if now - self._qfq_stamp_at < 2.0:
+            return
+        self._qfq_stamp_at = now
+        try:
+            from ttrade import tqstore
+
+            stamp = os.path.getmtime(tqstore.db_path())
+        except Exception:                # noqa: BLE001
+            return
+        if stamp == self._qfq_stamp:
+            return
+        first = self._qfq_stamp == 0.0
+        self._qfq_stamp = stamp
+        if first:
+            return                       # 第一次：缓存本来就是空的
+        if self._qfq_base:
+            self._qfq_base.clear()
+            self._log("本地行情库有更新，已重读前复权历史（不用重启程序）")
+
     def _signal_frame(self, st: SlotState, kl) -> pd.DataFrame:
         """算信号用的行情：**本地前复权历史 + 实时 bar**。
 
@@ -1528,10 +1855,16 @@ class PortfolioRunner:
         直接拿天勤原始价算，换月那一下的复权差会把 60 根动量推到 `entry_z` 两侧：
         回测空仓、实盘反向持仓，两边永远对不上。
 
-        `merge_live` 只接**严格晚于**本地最后一根的实时 bar，重叠的保留本地那份
-        （本地带正确复权因子，实时段因子是 1.0）。换月时调用方会清掉缓存，让新的
+        `merge_live` 只接**严格晚于**本地最后一根的实时 bar，重叠的那几根用实时
+        OHLC 覆盖（半根自愈，见那个函数的注释）。换月时调用方会清掉缓存，让新的
         换月跳空也按前复权抹平。
+
+        库文件变了（用户补完历史 / 定时补库跑过）就**整份重读**：`_qfq_base` 是
+        启动时读的一份快照，不重读的话补了数据也白补 —— 用户看到的是「补完了
+        信号还是老样子，得重启程序」。判断用 mtime 而不是「库尾更新」，因为补库
+        经常只是**覆盖**库尾几根，行数和最后一根的时间都没变。
         """
+        self._refresh_db_stamp()
         live = bars_from_serial(kl, st.cfg.period)
         n = tqdata.PERIODS.get(st.cfg.period, (st.cfg.period, 1))[1]
         if n > 1:
@@ -1553,7 +1886,13 @@ class PortfolioRunner:
                 )
                 st.frame_note = f"前复权历史读不到，用实时原始价 {len(live)} 根"
                 base = pd.DataFrame()
-            self._qfq_base[key] = base
+            if base is not None and not base.empty:
+                self._qfq_base[key] = base
+            # 🔴 读失败**不能**把一张空表写进缓存：写进去以后 `_refresh_db_stamp`
+            # 只在库文件 mtime 变化时才清，于是「锁一解除 / 库一修好」也不会重试
+            # —— 这条策略会一直跑在「实时原始价」降级帧上，而原始价带着换月跳空，
+            # 算出来的建仓价、信号全是另一个东西（2026-11-20 16:49 铅就是这么被
+            # 记成 11-13 建仓的）。空表只当「这次没读到」，下一次 tick 再读。
         if base is None or base.empty:
             st.frame_note = f"没有本地历史，用实时原始价 {len(live)} 根"
             return live
@@ -1596,6 +1935,21 @@ class PortfolioRunner:
             st.frame_note = note
             return pd.DataFrame()
         self._gap_note.pop(key, None)
+        # 🔴 帧尾整体落后：`hole_days` 查不出来（内部没断口，实时段最后一根就是
+        # 合并后最后一根），但这一帧比「此刻本该到的 bar」旧了 —— 说明本地库没补上、
+        # 实时序列也还没回补完。在这上面算出的 signal 和回测是两码事，不能拿去下单。
+        exp = expected_last_bar(st.cfg.symbol, st.cfg.exchange, st.cfg.period)
+        step = pd.Timedelta(seconds=barclock.rt_sec(st.cfg.period))
+        if exp is not None and merged.index[-1] < exp - step:
+            note = (f"行情帧停在 {merged.index[-1]:%m-%d %H:%M}，"
+                    f"按交易时段此刻该到 {exp:%m-%d %H:%M}（本地库没补上/实时未回补完），"
+                    "本根不算信号")
+            if self._gap_note.get(key) != note:
+                self._gap_note[key] = note
+                st.last_action = note
+                self._log(f"{st.title()}：{note}")
+            st.frame_note = note
+            return pd.DataFrame()
         merged = replay.window(merged, getattr(st.cfg, "range_years", 0) or 0)
         if merged is None or len(merged) < 2:
             st.frame_note = f"本地历史切片后不足 2 根，用实时原始价 {len(live)} 根"
@@ -1648,7 +2002,12 @@ class PortfolioRunner:
             st.cfg.family == "rule" and bool(mode))
         if needs_factor:
             if len(df) < FACTOR_MIN_BARS:
-                return 0                 # 历史不够，分数全是 NaN，先空仓等数据
+                # 不许静默返回 0：面板上的「理论 0 手」会被读成「策略看空」，
+                # 而真相是「历史还不够，没算出来」
+                self._note_once(
+                    st, f"数据不足 {len(df)}/{FACTOR_MIN_BARS} 根："
+                        "因子全是 NaN，暂按空仓处理（等历史补齐）")
+                return 0
             df = self._with_aux(st, df)
 
         if st.cfg.family == "factor":
@@ -1658,12 +2017,14 @@ class PortfolioRunner:
                 fc, extra=self._period_extra(st, fc), base_period=st.cfg.period,
             )
             self._note_dropped(st, list(st.cfg.factor_keys or []), out)
+            self._note_theo_entry(st, df, out.df["signal"])
             sig = out.df["signal"].iloc[-1]
             return 0 if pd.isna(sig) else int(sig)
 
         rule = run_strategy(df, st.cfg.rule_key, st.cfg.rule_params,
                             reverse=bool(getattr(st.cfg, "rule_reverse", False)))
         if not needs_factor:
+            self._note_theo_entry(st, df, rule["signal"])
             sig = rule["signal"].iloc[-1]
             return 0 if pd.isna(sig) else int(sig)
 
@@ -1675,6 +2036,7 @@ class PortfolioRunner:
             extra=self._period_extra(st, fc), base_period=st.cfg.period,
         )
         self._note_dropped(st, list(st.cfg.factor_keys or []), out)
+        self._note_theo_entry(st, df, out.df["signal"])
         sig = out.df["signal"].iloc[-1]
         return 0 if pd.isna(sig) else int(sig)
 
@@ -1692,16 +2054,17 @@ class PortfolioRunner:
         return fstrat.period_frames(
             fc, keys, st.cfg.period,
             lambda p: self._aux_frame(
-                tqdata.load_main(sym, ex, p, adjust="qfq"), sym, ex),
+                tqdata.load_main(sym, ex, p, adjust="qfq"), sym, ex, p),
             extra_keys=list(getattr(fc, "trigger_keys", None) or []),
         )
 
     @staticmethod
-    def _aux_frame(df: pd.DataFrame, sym: str, ex: str) -> pd.DataFrame:
+    def _aux_frame(df: pd.DataFrame, sym: str, ex: str,
+                   period: str = "") -> pd.DataFrame:
         """给跨周期帧补上衍生列（展期 / 期权 / 基本面）。
 
         `tqdata.load_main()` 只给 OHLCV + 持仓量。研究页那边 `DataStore.get()`
-        加载时会 `auxdata.attach()` / `attach_intraday()` 把期限结构和期权列
+        加载时会走 `auxdata.attach_for_period` 把期限结构和期权列
         并进来；实盘这条链路自己拼 df，漏了这一步 —— `roll_main_oi`、`iv_*`、
         `pcr` 这些因子在跨周期帧上整列 NaN，`factor_matrix` 把它们**静默剔除**，
         于是实盘跑的是「少几个因子」的另一条策略，界面上一个字都不提示。
@@ -1714,11 +2077,13 @@ class PortfolioRunner:
         if df is None or df.empty:
             return df
         try:
-            from ttrade.auxdata import attach, attach_intraday, bar_period
+            # 口径只有一份：`attach_for_period`（日线同日 / 分钟隔一日）。
+            # 以前这里是第三份实现（按 `bar_period(df)` 猜），`_with_aux` 又是
+            # 第四份（不分周期一律隔一日）—— 同一个「日线该用哪天的期限结构」
+            # 有四种说法，漂掉是必然的。没传周期时退回按帧形态判。
+            from ttrade.auxdata import attach_for_period, bar_period
 
-            # `bar_period` 按相邻间隔判：日线 / 2 日 / 周线都给 `1d`
-            return (attach(df, sym, ex) if bar_period(df) == "1d"
-                    else attach_intraday(df, sym, ex))
+            return attach_for_period(df, sym, ex, period or bar_period(df))
         except Exception:      # noqa: BLE001 - 衍生数据缺了不该让策略停摆
             return df
 
@@ -1752,11 +2117,18 @@ class PortfolioRunner:
         天勤的 K 线只有 OHLC 和持仓量，展期、期权那十几个因子读的 `c1_close`、
         `iv_near` 之类全在衍生表里。研究页是 `DataStore` 加载时挂的，实时这条
         链路自己拼 df，不挂就是整列 NaN —— 因子分数算不出来，策略永远空仓。
+
+        🔴 **口径必须跟研究页一模一样，所以只能走 `attach_for_period`**：
+        日线同日、分钟隔一个交易日。这里原来是不分周期一律 `attach_intraday`，
+        于是 `1d_tq` 策略回测吃当天的期限结构、实盘吃昨天的，展期因子差一天，
+        分数就分叉 —— 2026-11-20 棕榈油「回测空仓、实盘还持 2 手空单」就是它
+        （score −1.2259 vs −1.3808，正好跨过 `exit_z`）。
         """
         try:
-            from ttrade.auxdata import attach_intraday
+            from ttrade.auxdata import attach_for_period
 
-            out = attach_intraday(df, st.cfg.symbol, st.cfg.exchange)
+            out = attach_for_period(df, st.cfg.symbol, st.cfg.exchange,
+                                    st.cfg.period)
         except Exception:  # noqa: BLE001
             return df
         self._check_aux_fresh(st, out)
@@ -1807,14 +2179,26 @@ class PortfolioRunner:
 
     # ---- 手数 ----
 
-    def _contract_quote(self, symbol: str):
-        """真实合约的行情对象。拿不到就返回 None —— 定仓失败不该让策略停机。"""
-        if self.api is None or not symbol:
+    def _quote_obj(self, symbol: str):
+        """按合约取盘口。**统一走全局行情源**，源没连上才退回账户那条连接。
+
+        为什么不是「账户有就用账户的」：一条策略的盘口只该有一个来源。行情源和
+        账户各取一个价，会出现「按 A 源定价、报文发到 B 柜台」，追单时两边来回
+        跳。源断了才退化到账户，因为柜台自己也有 md，能撑一会儿。
+        """
+        if not symbol:
+            return None
+        src = self.feed if (self.feed is not None and self.feed.ready) else self.api
+        if src is None:
             return None
         try:
-            return self.api.get_quote(symbol)
+            return src.get_quote(symbol)
         except Exception:  # noqa: BLE001
             return None
+
+    def _contract_quote(self, symbol: str):
+        """真实合约的行情对象。拿不到就返回 None —— 定仓失败不该让策略停机。"""
+        return self._quote_obj(symbol)
 
     def _mark_price(self, st: SlotState, df: pd.DataFrame) -> float:
         """算手数用的价格。优先真实合约的最新价，没有就用最后一根收盘。"""
@@ -1826,6 +2210,342 @@ class PortfolioRunner:
             return float(df["close"].iloc[-1])
         except Exception:  # noqa: BLE001
             return 0.0
+
+    # ---- 品种价格 / 当日盈亏 / 持仓盈亏（界面上那三列） ----
+
+    def _last_px(self, symbol: str) -> float:
+        """合约最新价。取不到返回 0（调用方一律按「没有价」处理，不当成 0 元）。"""
+        if not symbol:
+            return 0.0
+        q = self._contract_quote(symbol)
+        try:
+            p = float(getattr(q, "last_price", 0) or 0) if q is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+        return p if p > 0 and math.isfinite(p) else 0.0
+
+    def _pre_px(self, symbol: str) -> float:
+        """昨结算价。天勤叫 `pre_close`（它就是昨结算），CTP / 融航叫
+        `pre_settlement` / `pre_close` —— 都试一遍，取到就用。"""
+        if not symbol:
+            return 0.0
+        q = self._contract_quote(symbol)
+        if q is None:
+            return 0.0
+        for name in ("pre_close", "pre_settlement"):
+            try:
+                v = float(getattr(q, name, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if v > 0 and math.isfinite(v):
+                return v
+        return 0.0
+
+    def _seed_cost(self, st: SlotState) -> None:
+        """账本上有仓、却没有开仓均价时，按当前价补一个并落盘。
+
+        什么时候会缺：老版本升级上来（那时还没有均价这个概念）、或者账本被
+        手工改过。不补的话那几列永远是 0 盈亏 —— 看着像刚开仓，用户无从判断。
+        """
+        miss = [s for s, n in st.held.items() if int(n or 0) and not st.cost.get(s)]
+        if not miss:
+            return
+        got = []
+        for sym in miss:
+            px = self._last_px(sym)
+            if px > 0:
+                st.cost[sym] = px
+                got.append(sym)
+        if not got:
+            return
+        self._save_book(st)
+        self._log(f"{st.title()}：{len(got)} 个合约没有开仓均价记录，"
+                  "已按当前价补上 —— 这些品种的持仓盈亏从 0 起算")
+
+    def _note_theo_entry(self, st: SlotState, df: pd.DataFrame,
+                         series) -> None:
+        """兜底：从信号序列倒推「理论建仓价 / 建仓交易日」。
+
+        🔴 **这不是主口径**（用户 2026-11-20）：「理论开仓价格，应该是从实盘策略
+        中直接获取，不然如果 k 线中开仓，又算不对了」。主口径是策略自己写下来的
+        那个价 —— `_send()` 记的**下单价**、`_intrabar_tick()` 记的**触发价**，
+        见 `SlotState.theo_src`。
+
+        这里只在两种情况下兜住：① 策略还没发出过委托（没行情、非交易时段、
+        刚启动第一根 bar 还没走完）；② 机器学习那条路没有信号序列可推（走
+        `_sync_theo_entry`）。写进去的记为 `sig` 档，**覆盖不了** `order`/`ib`
+        —— 否则真成交价会被「下一根开盘」这种推断冲掉。
+
+        `theo_day` 存的是**交易日**（夜盘 20 点后归下一个），不是自然日：拿自然
+        日跟 `daylimit.trading_day()` 比，夜盘那段永远不相等，「今天开的仓」会被
+        当成隔夜仓，两个数又对不上了。
+        """
+        try:
+            n = len(series)
+        except TypeError:
+            n = 0
+        if not n or len(df) != n:
+            return
+        last = series.iloc[-1]
+        sig = 0 if pd.isna(last) else int(last)
+        if sig == 0:
+            st.theo_px, st.theo_day, st.theo_sig, st.theo_src = 0.0, "", 0, ""
+            return
+        # 同一波已经拿到策略自己的价（`order`/`ib`）⇒ 推断出的开盘价原地作废，
+        # 不许覆盖。覆盖了就会出现「持仓盈亏按对手价、当日盈亏按开盘价」两套。
+        if (int(getattr(st, "theo_sig", 0) or 0) == sig
+                and self._theo_rank(st) >= _THEO_RANK[THEO_ORDER]):
+            return
+        # 🔴 **每根 bar 都重算**，不搞「方向没变就沿用上次」。
+        # 那套缓存会锁死一个错值：2026-11-20 16:49 本地库被锁、`_signal_frame`
+        # 退回「实时原始价 2642 根」，当时按降级帧记下的建仓价（15,740）就一直
+        # 挂着 —— 等真正的库内前复权回来了也不再更新，于是持仓盈亏按 15,740、
+        # 当日盈亏按昨结算 15,545，两个数永远对不上。重算一次只是往回扫几千个
+        # int，新 bar 才触发一次，可以忽略。
+        arr = series.to_numpy()
+        k = n - 1
+        while k > 0 and (int(arr[k - 1]) if not pd.isna(arr[k - 1]) else 0) == sig:
+            k -= 1                       # 回退到这波信号的起点
+        # 🔴 **成交价取下一根的「开盘」，不是收盘**（用户 2026-11-20 指出：
+        # 「开仓价格是开盘价格+成本，收盘价格比这个低，应该有亏损，不是 0」）。
+        # 信号是**收盘**才定下来的，回测里 `position(t) = signal(t-1)`，成交发生在
+        # t 那根的**开盘**。以前取 close[k+1]，于是「今天开仓」的理论价等于今天的
+        # 收盘价 —— 两列必然都是 0，看着像没仓。
+        # 已经翻到最后一根（没有下一根）时，这笔仓**还没成交**：按这根收盘记，
+        # 盈亏 0，避免拿窗口内不存在的开盘价（那是偷未来）。
+        filled = k + 1 <= n - 1
+        j = min(k + 1, n - 1)
+        col = "open" if filled else "close"
+        try:
+            px = float(df[col].iloc[j])
+        except (KeyError, IndexError, TypeError, ValueError):
+            try:
+                px = float(df["close"].iloc[j])
+            except (KeyError, IndexError, TypeError, ValueError):
+                return
+        # 🔴 帧是**前复权**价，`_last_px` / `_pre_px` 是**实时报价**（原始价）。
+        # 换月前后 adj_factor ≠ 1，直接拿前复权价当建仓价，乘出来的盈亏是错的
+        # 价格空间的差（AG 早年能差 30%）。统一折回原始价，和报价同一个口径。
+        try:
+            f = float(df["adj_factor"].iloc[j])
+            if f > 0 and f == f:
+                px /= f
+        except (KeyError, IndexError, TypeError, ValueError):
+            pass
+        if not (px == px and px > 0):
+            return
+        # 加**每边成本**（滑点 + 手续费，折成价格）：开仓价 = 开盘价 ± 成本。
+        # 多头买贵、空头卖贱，所以按信号方向加号。
+        cost = self._side_cost_px(st, px)
+        if cost > 0:
+            px += sig * cost
+        try:
+            day = tqdata.trading_days(df.index).iloc[j]
+            theo_day = pd.Timestamp(day).strftime("%Y-%m-%d")
+        except Exception:                # noqa: BLE001 - 日历读不出来就退回自然日
+            theo_day = pd.Timestamp(df.index[j]).strftime("%Y-%m-%d")
+        st.theo_px = px
+        st.theo_day = theo_day
+        st.theo_sig = sig
+        st.theo_src = THEO_SIG
+
+    # ---- 理论建仓价：由策略自己写（主口径） ----
+
+    @staticmethod
+    def _theo_rank(st: SlotState) -> int:
+        """当前 `theo_px` 的可信程度，见 `SlotState.theo_src` 那张表。"""
+        return _THEO_RANK.get(str(getattr(st, "theo_src", "") or ""), 0)
+
+    def _put_theo(self, st: SlotState, px: float, sig: int, src: str,
+                  day: str = "") -> bool:
+        """把策略自己给出的建仓价写进去（`src` 见 `SlotState.theo_src`）。
+
+        覆盖规则只有一条：**低档不许盖高档**。具体是
+
+        - `order`（真实下单价）盖 `ib`（触发价）盖 `sig`（推断）；
+        - 同档不覆盖 —— 同方向加仓会把「建仓价」刷成加仓价，持仓盈亏立刻假
+          涨一截；反过来 `order` 一直在盖 `order` 也会让每次追单都把成本往上挪。
+        - 方向变了（`sig` 和记着的那一波不同）**无条件覆盖**：这是新的一仓。
+
+        返回是否真的写了。
+        """
+        px = float(px or 0)
+        if not (px == px and px > 0) or not sig:
+            return False
+        cur_sig = int(getattr(st, "theo_sig", 0) or 0)
+        rank = _THEO_RANK.get(src, 0)
+        if cur_sig == sig and self._theo_rank(st) >= rank:
+            return False
+        st.theo_px = px
+        st.theo_day = day or daylimit.trading_day()
+        st.theo_sig = int(sig)
+        st.theo_src = src
+        return True
+
+    def _note_order_entry(self, st: SlotState, delta: int, px: float) -> None:
+        """`_send()` 出口：**策略真正下出这一笔**时记下它的价格（主口径）。
+
+        为什么用下单价而不是成交回报：成交回报要到 `_chase` 下一轮才回来，
+        而且**这张页面的两个数本来就是理论值**（用户 2026-11-20「和实际账户
+        交易无关」）—— 拿不到回报时（挂单没成、被拒、非交易时段）也得有个数。
+        下单价是策略在这一刻自己算出来的、真正报进交易所的价，已经是这一笔
+        最真实的「策略给的价格」。
+
+        成本**不再另加**：`_price_at()` 取的是**对手价**（买 ask1 / 卖 bid1），
+        滑点已经含在价差里，再叠一层 `_side_cost_px` 就是双重计算。这也和账户
+        的「开仓均价」同口径，用户两个数能直接对着看。
+
+        只在**开仓 / 反手**时写（`delta` 方向 == 目标方向）。减仓不写 —— 减仓
+        的低价不是建仓价。
+        """
+        tgt = int(getattr(st, "target", 0) or 0)
+        if not tgt or not delta:
+            return
+        if (1 if tgt > 0 else -1) != (1 if delta > 0 else -1):
+            return                      # 这一笔是平仓，不是建仓
+        self._put_theo(st, px, 1 if tgt > 0 else -1, THEO_ORDER)
+
+    def _note_ib_entry(self, st: SlotState, px: float, sig: int) -> None:
+        """K 线内触发：用**策略算出来的触发价**记建仓价（`ib` 档）。
+
+        非规则策略没有触发价这一说，`_ib_on()` 已经把这条路口关掉了。紧跟着的
+        `_send()` 会用真实对手价把它升成 `order` 档；这里兜的是「这一轮还没
+        发出去」的窗口（没盘口、刚开盘、被门禁挡住），那时候显示触发价总比
+        显示「—」或者拿下一根开盘瞎猜准。
+
+        触发价是**纯触发位**，不含滑点，所以这里把每边成本叠上去，和回测
+        `fill = max(open, entry_long) + slip` 同一个意思。
+        """
+        cost = self._side_cost_px(st, px)
+        if cost > 0:
+            px = px + sig * cost
+        self._put_theo(st, px, sig, THEO_IB)
+
+    def _side_cost_px(self, st: SlotState, px: float) -> float:
+        """**每手每一边**的成本，折成价格（元/吨、元/点）。
+
+        为什么显示上也要算成本：用户 2026-11-20 的口径是「开仓价 = 开盘价 + 成本」。
+        不算的话，理论开仓价正好等于开盘价，一跳的滑点就白送了，读起来像「白捡
+        一个开盘价」。口径和回测**同一个成本模型**（`costs.apply` 那一套：手续费
+        按手或按成交额 + 跳数滑点，或 bp 滑点），所以两边的「理论盈亏」能对得上。
+
+        取不到品种信息 / 成本档位就返回 0：显示上少算一点，不该因为读不到表就
+        把整列变成「—」。
+        """
+        try:
+            from ttrade import costs as _costs
+
+            p = _costs.profile(getattr(st.cfg, "cost_profile", "") or None)
+            si = symbols_info.info(st.cfg.symbol, st.cfg.exchange)
+            fee_mult = float(p.get("fee_mult") or 0.0)
+            # 滑点（价格单位）
+            if str(p.get("mode") or "tick") == "bp":
+                slip = px * float(p.get("slip_bp") or 0.0) / 1e4
+            else:
+                tick = float(si.get("tick") or 0.0)
+                slip = tick * float(p.get("slip_ticks") or 0.0)
+                if tick <= 0:                    # 没有 tick 时和回测一样退回 bp
+                    slip = px * 0.0002
+            # 手续费（价格单位）
+            fee_val = float(si.get("fee_value") or 0.0) * fee_mult
+            if str(si.get("fee_mode")) == "lot":
+                mult = float(si.get("mult") or 0.0) or self._volume_multiple(st)
+                fee = fee_val / mult if mult > 0 else 0.0
+            else:
+                fee = fee_val * px
+            out = slip + fee
+            return out if (out == out and out > 0) else 0.0
+        except Exception:                        # noqa: BLE001 - 只影响显示
+            return 0.0
+
+    def _sync_theo_entry(self, st: SlotState, px: float = 0.0) -> None:
+        """兜底：`_signal` 没记过理论建仓价时，用当前价补一个（`sig` 档）。
+
+        `_note_theo_entry` 从**信号序列**倒推建仓点，规则 / 因子两条路都有；
+        只有机器学习那条（信号是模型给的）没有序列可倒推，只能在「目标刚变
+        方向」的那一刻按当时的价格记一笔。方向没变就不动，否则每 tick 都会
+        把建仓价刷成最新价，两列永远显示 0。
+
+        ML 的真实下单价由 `_send()` 记（`order` 档，比这里的标记价可信），
+        这里只是「委托还没发出去」那一下的占位。
+        """
+        tgt = int(getattr(st, "target", 0) or 0)
+        sig = 1 if tgt > 0 else (-1 if tgt < 0 else 0)
+        if not sig:
+            st.theo_px, st.theo_day, st.theo_sig, st.theo_src = 0.0, "", 0, ""
+            return
+        got = float(px or 0) or self._last_px(st.underlying)
+        if not (got == got and got > 0):
+            return
+        self._put_theo(st, got, sig, THEO_SIG)
+
+    def _slot_pnl(self, st: SlotState) -> tuple[float, float, float, str]:
+        """这条策略的「品种价格 / 当日盈亏 / 持仓盈亏」——**全是理论值**。
+
+        🔴 口径（2026-11-20 用户两次明确）：
+        「持仓盈亏和当日盈亏都是策略理论上的，和实际账户交易无关」
+        「不需要和实际交易和台账的情况拿来算」
+
+        所以两个数**只读三样东西**：理论仓位 `target`（= signal × lots）、
+        理论建仓价 `theo_px`（**策略自己写下来的**，见 `SlotState.theo_src`）、
+        当前行情价。台账 `held` / 均价 `cost` / 已落袋 `real_day` **一律不参与**
+        —— 以前拿它们算，于是「实际成交和理论不一致」时这两列会跟着实际仓走，
+        看起来像策略赚了钱，其实赚的是手工单的钱。
+
+        🔴 `theo_px` 的主口径是**策略的下单价 / K 线内触发价**，不是显示层自己
+        按「下一根开盘 + 成本」推出来的（用户 2026-11-20：「理论开仓价格，应该
+        是从实盘策略中直接获取，不然如果 k 线中开仓，又算不对了」）。推断只在
+        策略还没发出过委托时兜底。
+
+        - **品种价格** = 当前主力合约最新价（没仓也显示）。
+        - **持仓盈亏** = (最新价 − 理论建仓价) × 理论手数 × 乘数。
+        - **当日盈亏** = (最新价 − 当日基准) × 理论手数 × 乘数；**当日基准**：
+          理论仓是**今天**建的 ⇒ 就是建仓价（所以当天开的仓两个数必然相等）；
+          隔夜仓 ⇒ 昨结算（只算今天这一天的波动）。这正是回测里
+          `position(t)=signal(t-1)` 那个假设下的「今天赚了多少」。
+
+        以前当日盈亏 = 昨结算持仓 + 台账已落袋。问题：新建的理论仓也拿合约的
+        昨结算当成本 ⇒ 今天开的仓会算出一个巨大的假当日盈亏（IC 11-20 实测
+        +55,400，而持仓盈亏只有 +8,080，差 6.9 倍）。
+        """
+        price = self._last_px(st.underlying)
+        qty = int(getattr(st, "target", 0) or 0)
+        if not qty:
+            # 理论空仓：没有仓就没有盈亏。不能写 None —— 用户会以为「算不出来」
+            return price, 0.0, 0.0, ""
+        mult = self._volume_multiple(st)
+        if mult <= 0:
+            return price, float("nan"), float("nan"), "乘数没维护，算不出盈亏"
+        px = price if price > 0 else 0.0
+        if px <= 0:
+            return price, float("nan"), float("nan"), "没有行情价，算不出盈亏"
+        entry = float(getattr(st, "theo_px", 0.0) or 0)
+        # 方向对不上 = 手上那个价是**上一波**的（刚翻向、这一笔还没发出去）。
+        # 拿它算会把上一波的建仓价按在新方向上，盈亏符号直接反掉
+        if int(getattr(st, "theo_sig", 0) or 0) != (1 if qty > 0 else -1):
+            entry = 0.0
+        if entry <= 0:
+            return (price, float("nan"), float("nan"),
+                    "策略还没给出建仓价（这一笔的委托还没发出去）")
+        pos = (px - entry) * qty * mult
+        theo_day = str(getattr(st, "theo_day", "") or "")
+        if theo_day and theo_day == daylimit.trading_day():
+            pre = entry                  # 今天开的仓：当日盈亏 ≡ 持仓盈亏
+        else:
+            pre = self._pre_px(st.underlying) or entry
+        day = (px - pre) * qty * mult
+        note = ""
+        if not theo_day:
+            note = "理论建仓日未知，当日盈亏按建仓价算"
+        return price, day, pos, note
+
+    def _realized_today(self, st: SlotState) -> float:
+        """本交易日已落袋的平仓盈亏。跨交易日自动清零（夜盘 20 点后算次日）。"""
+        today = daylimit.trading_day()
+        if st.real_day_of != today:
+            st.real_day_of = today
+            st.real_day = 0.0
+        return st.real_day
 
     @staticmethod
     def _terms(cfg) -> tuple[float, float, str]:
@@ -2293,7 +3013,7 @@ class PortfolioRunner:
             return None
         order = self.api.insert_order(**kw)
         # 记下来。程序下次启动时按这个名单把还挂着的撤掉
-        orderbook.remember(self.spec.label(), self._order_id(order))
+        orderbook.remember(self._book_key, self._order_id(order))
         return order
 
     def _cancel(self, order) -> None:
@@ -2387,14 +3107,21 @@ class PortfolioRunner:
 
         his = today = 0
         have = self._side_pos(symbol, side)
-        if closeable is not None:
-            have = min(have, max(0, int(closeable)))
+        cap = None if closeable is None else max(0, int(closeable))
+        if cap is not None:
+            have = min(have, cap)
         if split and have > 0:
             got = self._split_pos(symbol, side)
             if got is None:
                 return None              # 明细还没跟上，等下一轮，别瞎猜
             his, today = got
+            # 🔴 这里必须**再夹一次** `cap`。`his + today` 是**账户口径**（所有策略
+            # + 手工单），拿它覆盖 `have` 会把「自己只有 2 手」抬成「账户有 9 手」，
+            # 于是平 5 手 —— 顺手把别的策略的仓平掉了。上期所/能源中心才走这条，
+            # 其余交易所没有 `_split_pos`，所以这个洞只在 rb/au/ag/cu/ni/sc… 上出现。
             have = max(have, his + today)
+            if cap is not None:
+                have = min(have, cap)
 
         out: list[tuple[str, int]] = []
         if have > 0:
@@ -2419,9 +3146,8 @@ class PortfolioRunner:
         和 `KQ.m@...` 是两个 symbol，换月之后更是完全不同的一本盘口。
         `get_quote` 对同一合约是幂等的，重复调不会产生新订阅。
         """
-        try:
-            q = self.api.get_quote(symbol)
-        except Exception:  # noqa: BLE001
+        q = self._quote_obj(symbol)
+        if q is None:
             return float("nan")
         tick = float(getattr(q, "price_tick", 0) or 0)
         if direction == "BUY":
@@ -2491,10 +3217,20 @@ class PortfolioRunner:
             parts.append(f"{offset} {vol}")
         if not parts:
             return 0
+        # 理论建仓价**由策略自己写**：这一刻真正报进交易所的价（对手价）。
+        # 组合页那两列只认这个数，显示层不再按「下一根开盘 + 成本」去猜 ——
+        # 猜出来的价碰到 K 线内（`intrabar`）那一族必错，触发价是盘中算的。
+        if st is not self._align_slot:
+            self._note_order_entry(st, delta, price)
         st.last_action = (
             f"{'买' if direction == 'BUY' else '卖'} {' + '.join(parts)} 手 @ {price:.2f}"
         )
         self._log(f"{st.title()}：{st.last_action}")
+        # 每一笔真发出去的委托都落盘。以前只有界面日志，事后复盘时「到底发的是
+        # 平仓还是开仓、几手、什么价」全无据可查（2026-11-20 那次就只剩截图）。
+        diag = getattr(self, "_diag", None)
+        if diag is not None:
+            diag.write("ORD", f"{st.title()}：{symbol} {st.last_action}")
         return len(parts)
 
     def _cancel_all(self, st: SlotState) -> None:
@@ -2526,12 +3262,56 @@ class PortfolioRunner:
         if not filled or st is self._align_slot:
             return
         sign = 1 if o.direction == "BUY" else -1
-        cur = int(st.held.get(o.symbol, 0)) + sign * filled
+        prev = int(st.held.get(o.symbol, 0))
+        cur = prev + sign * filled
+        self._book_cost(st, o, prev, sign * filled)
         if cur:
             st.held[o.symbol] = cur
         else:
             st.held.pop(o.symbol, None)
+            st.cost.pop(o.symbol, None)
         self._save_book(st)
+
+    def _book_cost(self, st: SlotState, o: PendingOrder, prev: int,
+                   delta: int) -> None:
+        """按成交更新「持仓均价」，顺手把平掉那部分的盈亏记进当日已实现。
+
+        三种情况：
+
+        - 新开 / 反手（`prev` 为 0，或成交后方向翻过来）：均价 = 这笔成交价。
+          反手时**先结算旧仓**（已实现盈亏），再把新方向的成本设成成交价 ——
+          拿旧仓的均价给新仓当成本，持仓盈亏会直接从几十个点的错数开始。
+        - 同向加仓：按手数加权平均。
+        - 减仓：均价不变（卖剩下的还是原来那批）。
+
+        减仓（以及反手时平掉的那部分）按 `(成交价 − 均价) × 手数 × 乘数 × 方向`
+        计入 `real_day`。这一项是「当日盈亏」里已经落袋的那一半，`_slot_pnl`
+        会把持仓那一半再加上去。
+        """
+        sym = o.symbol
+        price = float(o.price or 0)
+        if price <= 0 or not delta:
+            return
+        old = float(st.cost.get(sym) or 0)
+        new = prev + delta
+        if prev and (prev > 0) != (delta > 0):
+            # 平掉 min(|prev|, |delta|) 手
+            qty = min(abs(prev), abs(delta))
+            cost = old if old > 0 else price
+            mult = self._volume_multiple(st)
+            if mult > 0:
+                pnl = (price - cost) * qty * mult * (1 if prev > 0 else -1)
+                st.real_day = self._realized_today(st) + pnl
+        if not new:
+            st.cost.pop(sym, None)
+        elif not prev or (prev > 0) != (new > 0):
+            st.cost[sym] = price
+        elif abs(new) > abs(prev):
+            if old > 0:
+                st.cost[sym] = (old * abs(prev) + price * abs(delta)) / abs(new)
+            else:
+                st.cost[sym] = price
+        # 减仓同向：均价保持不动
 
     def _chase(self, st: SlotState) -> None:
         """追单状态机：live →（超时）cancelling →（确认死）重报 → live …
@@ -2558,7 +3338,7 @@ class PortfolioRunner:
                 st.last_action = "已成交"
                 st.rejects = 0
                 st.reject_msg = ""
-                orderbook.forget(self.spec.label(), o.order_id)
+                orderbook.forget(self._book_key, o.order_id)
                 continue
 
             if status == "DEAD":
@@ -2569,7 +3349,7 @@ class PortfolioRunner:
                 if filled:
                     self._book(st, o, filled)
                     o.volume -= filled
-                orderbook.forget(self.spec.label(), o.order_id)
+                orderbook.forget(self._book_key, o.order_id)
                 if o.phase != "cancelling":
                     # 不是我们撤的：拒单、涨跌停打回、资金不足……
                     # 只记一笔是不够的 —— `_rebalance` 下一轮照样再发，而 tick
@@ -2598,7 +3378,7 @@ class PortfolioRunner:
                 if o.retries >= self.chase.retries:
                     st.last_action = f"追单 {o.retries} 次仍未成交，放弃"
                     self._log(f"{st.title()}：{st.last_action}")
-                    orderbook.forget(self.spec.label(), o.order_id)
+                    orderbook.forget(self._book_key, o.order_id)
                     continue
                 o.retries += 1
                 o.phase = "live"
@@ -2764,16 +3544,29 @@ class PortfolioRunner:
         self._mm_ts = now
         return [dict(r) for r in out]
 
-    def align(self, close_orphans: bool = True) -> int:
+    def align(self, close_orphans: bool = True,
+              rows: list[dict] | None = None) -> int:
         """把账户仓位调成和策略列表完全一致。返回下发的委托数。
 
         - 托管合约（有策略在跑）：补到理论净仓，多了减、少了加
         - 未托管合约（没有策略在管）：`close_orphans=True` 时平到 0
         - **锁仓（多空双开）**：两条腿各自减到目标，见 `_send_row`
+        - `rows`：**确认框里给用户看过的那几行**。传了就只在这几个合约上动作，
+          而且账户持仓必须还和框里写的一样。
 
         第二类是「策略停掉之后留下的仓」和「手工开的仓」。默认平掉是因为
         用户对这个按钮的预期就是「一键把账户摆成策略列表的样子」；但这是
         真金白银，调用方必须先确认过再调，别在启动流程里顺手带上。
+
+        🔴 **为什么要有 `rows`**（2026-11-20 那次）：确认框是用界面缓存的那份
+        `mismatch` 拼的，而这里又自己算了一遍 `mismatch(fresh=True)`。两份数据
+        一旦不同步，用户确认的是「2 个合约 · 平空4 / 平多2」，实际发出去的却是
+        另一批，还多了一个框里没出现过的合约。所以：
+
+          - **合约集合**以确认框为准，框里没有的一笔都不发；
+          - **持仓基数**也必须对得上，`多/空` 两条腿和框里不一样就跳过这个
+            合约并写明原因 —— 换个基数去算，会把「平空4」算成「开空2」；
+          - 量仍然按当下持仓差多少平多少（`_send_row` 只许平、不许反手开）。
 
         **一次点击只发一轮**。单子记进 `_align_slot.pending`，之后由 `_chase`
         负责追价 / 撤单 / 重报，追完为止；期间 `_rebalance` 全体让路。上一轮
@@ -2781,28 +3574,50 @@ class PortfolioRunner:
         会变成一个每秒十几次的死循环。
         """
         if self.api is None:
+            self._align_log("对齐没有发出委托：账户没有接进来（只算信号不下单）")
             return 0
         if self._pos is None:
             # 持仓还没同步就发单，等于拿着「账户是空的」去算差额 —— 会把
             # 整个理论仓位重新开一遍。宁可让用户再点一次
-            self._log("账户持仓还没同步，等连上再点一键对齐")
+            self._align_log("账户持仓还没同步，等连上再点一键对齐")
             return 0
         if self._align_slot.pending:
-            self._log("上一轮对齐还没落地，等它成交或撤掉再点")
+            self._align_log("上一轮对齐还没落地，等它成交或撤掉再点")
             return 0
         now = time.time()
         if now - self._align_ts < ALIGN_GAP:
-            self._log(f"对齐刚点过，{ALIGN_GAP:.0f} 秒内不重复下发")
+            self._align_log(f"对齐刚点过，{ALIGN_GAP:.0f} 秒内不重复下发")
             return 0
         self._align_ts = now
         self._align_slot.rejects = 0
         self._align_slot.reject_msg = ""
         self._align_slot.last_action = ""
+        wanted = None
+        if rows is not None:
+            wanted = {str(r.get("symbol")): (int(r.get("a_long") or 0),
+                                            int(r.get("a_short") or 0))
+                      for r in rows}
         n = 0
+        skipped, stale = [], []
         for row in self.mismatch(fresh=True):
+            sym = row["symbol"]
+            pair = (int(row.get("a_long") or 0), int(row.get("a_short") or 0))
+            if wanted is not None:
+                if sym not in wanted:
+                    # 确认框里没有它：多半是刚冒出来的未托管仓。绝不能顺手平掉
+                    skipped.append(sym)
+                    continue
+                if pair != wanted[sym]:
+                    stale.append(f"{sym}（确认时 {wanted[sym][0]}多/{wanted[sym][1]}空，"
+                                 f"现在 {pair[0]}多/{pair[1]}空）")
+                    continue
             if not row["managed"] and not close_orphans:
                 continue
-            sym = row["symbol"]
+            self._align_log(
+                f"对齐 {sym}：目标 {int(row['target']):+d} 手"
+                f"（多{int(row.get('t_long') or 0)} 空{int(row.get('t_short') or 0)}）"
+                f" 账户 净{int(row['actual']):+d}"
+                f"（多{pair[0]} 空{pair[1]}） 差额 {int(row['delta']):+d}")
             sent = self._send_row(self._align_slot, row)
             if sent:
                 # 对齐的目标就是 `sum(target)`，所以发完之后各策略的账本正好
@@ -2811,14 +3626,34 @@ class PortfolioRunner:
                 # 自己还空着 11 手，实际上账户是平的。
                 self._sync_after_align(sym)
             n += sent
+        if skipped:
+            self._align_log("对齐跳过（确认框里没有这几个合约）："
+                            + "、".join(skipped[:8]) + ("…" if len(skipped) > 8 else ""))
+        if stale:
+            self._align_log("对齐跳过（持仓在点确认之后变了，换个基数会把平仓算成开仓）："
+                            + "、".join(stale[:6]) + ("…" if len(stale) > 6 else "")
+                            + "　—— 看清楚了再点一次")
         if n:
-            self._log(f"对齐已下发 {n} 笔，剩下的交给追单")
+            self._align_log(f"对齐已下发 {n} 笔，剩下的交给追单")
         else:
             # 一笔都没发时**必须说话**。以前这里静默返回 0，用户点了按钮看不到
             # 任何反应，只能猜「是不是平今平昨写错了」—— 实际多半是收盘/午休、
             # 冷门合约没有盘口，或者本轮已经有单在途。
-            self._log(f"对齐没有发出委托：{self._align_slot.last_action or '没有需要调整的仓位'}")
+            self._align_log(
+                f"对齐没有发出委托：{self._align_slot.last_action or '没有需要调整的仓位'}")
         return n
+
+    def _align_log(self, msg: str) -> None:
+        """对齐的每一步都要留痕 —— 只进界面日志等于没有。
+
+        界面日志在内存里，关窗就没了；而「对齐到底发了什么、为什么没发」恰恰是
+        事后才问的（2026-11-20 那次就只剩截图）。所以除界面外再写一行 `[ALIGN]`
+        到 `live.log`。
+        """
+        self._log(msg)
+        diag = getattr(self, "_diag", None)
+        if diag is not None:
+            diag.write("ALIGN", msg)
 
     def _send_row(self, st: SlotState, row: dict) -> int:
         """按「多边 / 空边」各发一笔，返回发出的笔数。
@@ -2836,15 +3671,38 @@ class PortfolioRunner:
         a_short = int(row.get("a_short") or 0)
         t_long = int(row.get("t_long") or 0)
         t_short = int(row.get("t_short") or 0)
-        close_long = max(0, a_long - t_long)
-        close_short = max(0, a_short - t_short)
+        close_long = max(0, a_long - t_long)      # 要 SELL 平掉的多头
+        close_short = max(0, a_short - t_short)   # 要 BUY 平掉的空头
+
+        # 🔴 「本意是平」就必须在账户上查到那么多可平量，查不到**不许开反向仓**。
+        #
+        # 这是 2026-11-20 那次「一键对齐点确定后发出去的是反方向的开仓」的直接
+        # 闸门。`_legs()` 在 `have == 0` 时会把整笔当 OPEN 发出去：想平 2 手多，
+        # 账户那一刻读不到多头（刚成交、刚对齐过一轮），就变成「开 2 手空」——
+        # 方向反了、仓位还多了一倍，而且界面上的委托看起来完全正常。
+        # `_rebalance()` 早就有这道闸（见它里面 `delta * held < 0` 那段），
+        # 一键对齐这条路径漏了。
+        for side, want, cn in (("long", close_long, "多"),
+                               ("short", close_short, "空")):
+            if want and self._side_pos(sym, side) < want:
+                st.last_action = (
+                    f"{sym} 本意平{cn}{want} 手，账户只查到 "
+                    f"{self._side_pos(sym, side)} 手（持仓快照还没跟上）"
+                    "—— 不发反向开仓，等下一轮")
+                self._align_log(f"{st.title()}：{st.last_action}")
+                return 0
+
         if close_long and close_short:
-            n = self._send(st, sym, -close_long)     # SELL 平多
-            n += self._send(st, sym, close_short)    # BUY 平空
+            n = self._send(st, sym, -close_long, closeable=close_long)   # SELL 平多
+            n += self._send(st, sym, close_short, closeable=close_short)  # BUY 平空
             if n:
                 st.last_action = f"平锁仓：卖 {close_long} + 买 {close_short} 手"
             return n
-        return self._send(st, sym, int(row["delta"]))
+        # `closeable` 一定要给：不给的话 `_legs` 按账户口径算可平量，而账户里
+        # 还有别的策略的仓 —— 一笔「平自己 2 手」会变成「平账户 9 手」。
+        delta = int(row["delta"])
+        closed = min(close_long + close_short, abs(delta))
+        return self._send(st, sym, delta, closeable=closed)
 
     def _sync_after_align(self, sym: str) -> None:
         """对齐发出去之后，把各策略的账本摆成「对齐完成时的样子」。
@@ -2898,7 +3756,7 @@ class PortfolioRunner:
 
     # ---- 快照 ----
 
-    def _group_slots(self) -> list[dict]:
+    def _group_slots(self, pnl: dict | None = None) -> list[dict]:
         """多品种策略在列表里那一行：把 N 个子槽位汇成一条。
 
         没有这一行，界面上就找不到这条策略（子槽位的 sid 是 `父#品种`）。
@@ -2908,7 +3766,12 @@ class PortfolioRunner:
         倍），逐合约的目标在右下监控器里列。这条策略「有没有仓」用 `action` 回答
         —— 写成「19 个品种：5 个有仓」，比一个 0 或一个「—」清楚。
         别再往这里塞 `tgt_long`/`tgt_short` 之类的合计（那套已经被回滚过）。
+
+        **盈亏是例外，可以合计**：金额是可加的（每个品种已经按自己的手数 ×
+        乘数折成元），加起来就是「这条多品种策略今天一共赚了多少」。价格不行
+        —— 19 个品种没有一个共同的价，写 `None`，让界面显示「—」。
         """
+        pnl = pnl or {}
         out = []
         for pid, kids in self._groups.items():
             rows = [self._slots[k] for k in kids if k in self._slots]
@@ -2922,6 +3785,21 @@ class PortfolioRunner:
             action = f"{len(rows)} 个品种：{n_pos} 个有仓"
             if n_err:
                 action += f"，{n_err} 个出错"
+            # 汇总子槽位的盈亏。**只要有一个算不出来就整体不写**：拿部分品种
+            # 的和当合计，用户会以为「只有这几十块」，比显示「—」更容易误判
+            day_sum = pos_sum = 0.0
+            bad = []
+            for r in rows:
+                _px, d, p, note = pnl.get(r.cfg.sid, (0.0, 0.0, 0.0, ""))
+                if d != d or p != p:
+                    bad.append(r.cfg.symbol)
+                    continue
+                day_sum += float(d)
+                pos_sum += float(p)
+                if note:
+                    bad.append(r.cfg.symbol)
+            note = (f"{len(bad)} 个品种算不全（缺价 / 缺乘数）："
+                    + "、".join(bad[:6]) + ("…" if len(bad) > 6 else "")) if bad else ""
             out.append({
                 "sid": pid,
                 "title": cfg.title(),
@@ -2936,6 +3814,11 @@ class PortfolioRunner:
                 "signal": 0,
                 "target": None,          # 没有「一个」目标仓
                 "underlying": "",
+                # 多品种没有「一个价」；盈亏是合计（见上一段）
+                "price": None,
+                "day_pnl": float(day_sum),
+                "pos_pnl": float(pos_sum),
+                "pnl_note": note,
                 # 一个都没跑起来才把错误顶到这一行；部分失败写进 action，
                 # 免得 18/19 个品种正常、界面上却是红字「错误」
                 "error": err if (n_err and not running) else "",
@@ -2974,8 +3857,13 @@ class PortfolioRunner:
         self._log_errors()
         # 取一次就清掉。没清的话界面关掉 K 线之后，这份开销还每份快照都付
         want, self._want = self._want, []
-        slots = [
-            {
+        # 盈亏每个槽位只算一次：多品种的父行要按子槽位汇总，直接读这里的结果，
+        # 否则 27 个品种就要取 54 遍盘口
+        pnl = {sid: self._slot_pnl(st) for sid, st in self._slots.items()}
+        slots = []
+        for st in self._slots.values():
+            px, day, pos, note = pnl[st.cfg.sid]
+            slots.append({
                 "sid": st.cfg.sid,
                 "title": st.title(),
                 "key": st.cfg.key(),
@@ -2989,6 +3877,12 @@ class PortfolioRunner:
                 "signal": st.signal,
                 "target": st.target,
                 "underlying": st.underlying,
+                # 品种价格 / 当日盈亏 / 持仓盈亏。NaN 一律转 None —— 界面拿
+                # 「不知道」显示成「—」，不能显示成 0（0 会被读成「不赚不亏」）
+                "price": px if px == px and px > 0 else None,
+                "day_pnl": None if day != day else float(day),
+                "pos_pnl": None if pos != pos else float(pos),
+                "pnl_note": note,
                 "error": st.error,
                 "action": st.last_action,
                 "retired": list(st.retired),
@@ -3004,14 +3898,16 @@ class PortfolioRunner:
                 "ib_entry_short": (None if st.ib_entry_short != st.ib_entry_short
                                    else float(st.ib_entry_short)),
                 "ib_stop": None if st.ib_stop != st.ib_stop else float(st.ib_stop),
-            }
-            for st in self._slots.values()
-        ]
-        slots.extend(self._group_slots())
+            })
+        slots.extend(self._group_slots(pnl))
         return {
             "connected": self.alive,
             "error": self.last_error,
-            "account": self.spec.label(),
+            "account": self._book_key,
+            # 🔴 **账户登录**（≠ 行情）。`alive` 看的是 feed，账户登出了策略照样跑；
+            # 一键对齐必须看这一个：没登账户时发单只是空转（`align()` 直接
+            # 返回 0），界面得先把这些账户排除掉，别让用户以为点过了就平完了
+            "account_ready": self.api is not None,
             # 账户持仓是否已经拉到手。为 False 时 `mismatch()` 一定返回空 ——
             # 那不是「一致」，是「还不知道」。界面必须分开说，否则用户点一键对齐
             # 会毫无反应，还以为是按钮坏了

@@ -10,12 +10,14 @@ EDB 那个库本来就是「基本面/宏观指标」的容器，只是原来的
     macro_meta    code 主键 + 中文名 / 频率 / 单位 / 数据源
     macro_series  (code, dt) 主键 + value
 
-## 数据源有两家，因为单靠一家凑不齐 23 个
+## 数据源有两家，因为单靠一家凑不齐 25 个
 
 - **Tushare**：SHIBOR、美债收益率曲线、实际收益率、离岸人民币、标普/纳指/
   恒生/日经、CPI/PPI/M0M1M2/GDP、社融。优点是稳定、字段干净。
 - **东方财富**：制造业 PMI（Tushare 那个接口在当前账号上字段对不上）、
-  美元指数（Tushare 的 `fx_daily` 没有 UDI）。两家都是公开的行情/宏观接口。
+  美元指数（Tushare 的 `fx_daily` 没有 UDI）；外加 `usdcnh_em` / `dxy_em`
+  两条**独立口径**（不是替代品，见 `_em_fx` 的说明）。两家都是公开的
+  行情/宏观接口。
 
 **LPR 两家都没有**。它只在中国货币网的接口里，那个路径已经 404。所以
 `lpr_1y` / `lpr_5y` 两个 code 保留了定义但抓不到数据 —— 因子照样注册，
@@ -91,6 +93,8 @@ SERIES: dict[str, tuple[str, str, str, str]] = {
     "us_real10":  ("美债实际 10 年", "D", "%", "treasury.real_yield"),
     "dxy":        ("美元指数", "D", "点", "eastmoney.UDI"),
     "usdcnh":     ("美元兑离岸人民币", "D", "元", "tushare.fx_daily"),
+    "usdcnh_em":  ("美元兑离岸人民币·东财", "D", "元", "eastmoney.133.USDCNH"),
+    "dxy_em":     ("美元指数·东财", "D", "点", "eastmoney.100.UDI"),
     "spx":        ("标普 500", "D", "点", "tushare.index_global"),
     "ixic":       ("纳斯达克", "D", "点", "tushare.index_global"),
     "hsi":        ("恒生指数", "D", "点", "tushare.index_global"),
@@ -379,7 +383,17 @@ _EM_HEAD = {
 
 
 def _em_kline(secid: str, start: date) -> pd.Series:
-    """东方财富日线（前收价）。用于美元指数这种 Tushare 没有的序列。"""
+    """东方财富日线（收盘价）。美元指数、离岸人民币都走这条。
+
+    用户 2026-11-20 要求用它做**独立于 Tushare 的对照因子**，所以下面几点是
+    量过之后才写的：
+
+    - **标签就是纽约交易日**。用 dukascopy 的 5m 汇率按北京 06:00 切出纽约日
+      收盘，再和东财日线对齐：`k=0` 相关 **0.988**（`k=+1` 只有 0.03）。
+      而 Tushare 的 FXCM 表在 2021 年以后是 `k=+1`（见 `factors_macro._LABEL_LAG`）。
+    - **没有周末行**：4227 行 / 16.3 年 ≈ 259 行一年，是干净的交易日历（FXCM
+      那张表反而是「没有周五、多了周六周日」）。
+    """
     import requests
 
     url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -403,6 +417,41 @@ def _em_kline(secid: str, start: date) -> pd.Series:
         dates.append(p[0])
         vals.append(pd.to_numeric(p[1], errors="coerce"))
     return _finish(dates, pd.Series(vals, dtype=float))
+
+
+# 东财外汇 / 全球指数：code -> secid。这两条是**独立因子**，不替换 Tushare 那两条
+# —— 两条并存才能互相印证（见 `factors_macro` 里 `macro_usdcnh_em` 的说明）。
+_EM_FX = {"usdcnh_em": "133.USDCNH", "dxy_em": "100.UDI"}
+
+# 四个外盘指数在东财的 secid。**只给自检当裁判用**，不进 `SERIES`：
+# 2026-11-20 反推过，它们和 Tushare `index_global` 是同一份数据（日收益相关
+# 1.000、价位一分不差、k=0），多注册四条一模一样的因子没有意义。
+# 🔴 `100.IXIC` / `100.NKY` 取不到（返回空），纳指要用 `100.NDX`。
+_EM_INDEX = {"spx": "100.SPX", "ixic": "100.NDX",
+             "hsi": "100.HSI", "n225": "100.N225"}
+
+
+def _em_closed(secid: str) -> pd.Series:
+    """东财日线，只留**已经收完**的那一根。
+
+    🔴 东财在盘中会给「今天」那根还没走完的 bar（实测 11-20 11:38 取到
+    `11-20 6.6732`，那只是上午的价）。08:45 的定时任务要是照收，库里就把半个
+    交易日的价当成日收盘存下来了 —— 下一根 bar 用它，看起来像数据没错，其实是
+    错的价。
+
+    纽约日 D 的收盘在**北京 D+1 06:00** 才成立，恒生/日经是本地收盘（15:00），
+    都早于次日。所以判据统一成一句、也是唯一一句：**只收自然日严格早于今天的
+    行**。今天那根等明天的任务再收（增量会回看 `OVERLAP_DAYS` 天，自动覆盖）。
+    """
+    s = _em_kline(secid, DEFAULT_START)
+    if s is None or not len(s):
+        return pd.Series(dtype=float)
+    return s[s.index < pd.Timestamp.today().normalize()]
+
+
+def _em_fx(code: str) -> pd.Series:
+    """东财口径的汇率日线（`usdcnh_em` / `dxy_em`）。"""
+    return _em_closed(_EM_FX[code])
 
 
 def _em_report(report: str, cols: str, date_col: str) -> pd.DataFrame:
@@ -436,6 +485,8 @@ def fetch(code: str, api=None) -> pd.Series:
     try:
         if code == "cn_pmi_mfg":
             return _em_pmi(DEFAULT_START)
+        if code in _EM_FX:
+            return _em_fx(code)
         if code == "us_10y2y":
             # 派生序列不单独抓，由 update() 在最后合成
             return pd.Series(dtype=float)

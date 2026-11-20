@@ -271,7 +271,8 @@ class BrokerApi:
                 obj = _Obj(symbol=code, underlying_symbol="", datetime="",
                            last_price=0.0, ask_price1=0.0, bid_price1=0.0,
                            ask_volume1=0.0, bid_volume1=0.0, price_tick=0.0,
-                           volume=0.0, open_interest=0.0, expired=False)
+                           volume=0.0, open_interest=0.0, expired=False,
+                           pre_close=0.0)
                 self._main_quote[key] = obj
             self._sync_main(key, obj)
             return obj
@@ -308,7 +309,7 @@ class BrokerApi:
             return
         for name in ("underlying_symbol", "datetime", "last_price", "ask_price1",
                      "bid_price1", "ask_volume1", "bid_volume1", "price_tick",
-                     "volume", "open_interest"):
+                     "volume", "open_interest", "pre_close"):
             setattr(obj, name, getattr(src, name, getattr(obj, name, 0.0)))
         obj.symbol = ins
         if self._cur_main.get(key) == ins:
@@ -346,7 +347,7 @@ class BrokerApi:
             q = _Obj(symbol=ins, underlying_symbol=_canon(exchange, ins),
                      datetime="", last_price=0.0, ask_price1=0.0, bid_price1=0.0,
                      ask_volume1=0.0, bid_volume1=0.0, price_tick=0.0,
-                     volume=0.0, open_interest=0.0, expired=False)
+                     volume=0.0, open_interest=0.0, expired=False, pre_close=0.0)
             self._quote[ins] = q
         # 盘口偶尔会推到 NaN / 极大值（涨跌停、集合竞价），**不要**拿它盖掉上
         # 一个有效值：`_price_at` 会算出 NaN 价格，`_send` 直接判「等盘口」，
@@ -362,6 +363,11 @@ class BrokerApi:
         q.volume = float(tick.get("volume") or 0.0)
         q.open_interest = float(tick.get("oi") or 0.0)
         q.datetime = str(tick.get("datetime") or "")
+        # 昨结算：策略列表的「当日盈亏」拿它当成本重算。柜台的 tick 里叫
+        # `pre_close`（CTP 的 PreClosePrice 就是昨结算），取不到就留上一个值
+        pre = float(tick.get("pre_close") or 0.0)
+        if pre > 0 and pre == pre:
+            q.pre_close = pre
         if tick_size > 0:
             q.price_tick = tick_size
         return q

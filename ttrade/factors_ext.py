@@ -156,7 +156,13 @@ def _asof(series: pd.Series, index, lag_days: int = 0) -> pd.Series:
     }).dropna(subset=["t"]).sort_values("t")
     # 同一天有多个值（周频指标偶发重复）时保留最后一个
     right = right.groupby("t", as_index=False).last()
-    out = pd.merge_asof(left.sort_values("t"), right, on="t", direction="backward")
+    # 🔴 必须走 `merge_asof_ns`：`normalize()` 保留原精度，而**基准 bar 的索引
+    # 可能是 ns**（实盘 = `merge_live(库内 us, 天勤 ns)`），外部序列（EDB）是 us，
+    # 两侧精度不一致 `merge_asof` 直接抛 MergeError ⇒ 这个因子被静默剔除。
+    # 2026-11-20 白银 1d_tq 的「研究页空仓、实盘 −2 手」就是它（见 tsalign）。
+    from ttrade.tsalign import merge_asof_ns
+
+    out = merge_asof_ns(left, right, on="t", direction="backward")
     out = out.reindex(left.index)
     return pd.Series(out["v"].to_numpy(dtype=float), index=index)
 

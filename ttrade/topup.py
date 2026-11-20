@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from ttrade import symbols_info, tqstore
+from ttrade import barclock, symbols_info, tqstore
 from ttrade.tqdata import source_period, trading_days
 from ttrade.tqlive import bars_from_serial
 
@@ -39,14 +39,35 @@ def source_of(period: str) -> str:
     return source_period(period)
 
 
-def drop_live_tail(df: pd.DataFrame) -> pd.DataFrame:
-    """去掉最后一根还没走完的 bar。"""
+def drop_live_tail(df: pd.DataFrame, symbol: str = "", exchange: str = "",
+                   period: str = "5m", ts=None) -> pd.DataFrame:
+    """去掉尾部还没走完的 bar（可能不止一根）。
+
+    🔴 老写法是 `if df.index[-1] > now: df.iloc[:-1]` —— **从来没生效过**：
+    天勤的 `datetime` 是 bar 的**开始**时间，10:30 那根的开始时间永远 <= 现在，
+    判据为假，半根照写不误。2026-11-19 实测到库里 11-03 21:55 / 22:05 / 23:05、
+    11-04 10:55 四根 cu 的 close 与天勤差 10~70 元、成交量只有一半 —— 就是那几天
+    反复启动程序、每次把正在走的那根写进去留下的。它的危害不是「多一根」：
+    这根半成品永久留在库尾，之后增量只追加更晚的，谁也修不好它，回测和实盘
+    就永远差这一根的 high/low/close。
+
+    现在按**结束时刻**判（`barclock.is_unfinished`），日线按当日收盘判。
+    """
     if df is None or df.empty:
         return df
-    now = pd.Timestamp.now()
-    if df.index[-1] > now:
-        return df.iloc[:-1]
-    return df
+    if not symbol:
+        # 没传品种（老调用方 / 自测）时退回「开始时间 + 周期 > 现在」的粗判，
+        # 至少比 `index > now` 正确 —— 那个式子恒为假
+        now = pd.Timestamp(ts) if ts is not None else pd.Timestamp.now()
+        sec = barclock.rt_sec(period)
+        if sec <= 0:
+            return df
+        step = pd.Timedelta(seconds=sec)
+        cut = len(df)
+        while cut > 0 and df.index[cut - 1] + step > now:
+            cut -= 1
+        return df.iloc[:cut] if cut < len(df) else df
+    return barclock.drop_unfinished(df, symbol, exchange, period, ts)
 
 
 def save(serial, symbol: str, exchange: str, period: str) -> dict:
@@ -70,7 +91,7 @@ def save(serial, symbol: str, exchange: str, period: str) -> dict:
         return out
     if df is None or df.empty:
         return out
-    df = drop_live_tail(df)
+    df = drop_live_tail(df, symbol, exchange, src)
     if df.empty:
         return out
     # 🔴 交易时段门禁：天勤的模拟账户在非交易时段照样往序列里长 bar，直接落库
@@ -98,9 +119,13 @@ def save(serial, symbol: str, exchange: str, period: str) -> dict:
         out["gap"] = (f"库停在 {last:%Y-%m-%d %H:%M}，"
                       f"序列从 {df.index[0]:%Y-%m-%d %H:%M} 才开始")
     if last is not None:
-        # 只写严格晚于库里的。重叠那段库里那份 `adj_factor` 是对的，用 1.0
-        # 盖过去会让复权价在接缝处跳一下
-        df = df[df.index > last]
+        # **库尾那一根也要写**（`>=`，不是 `>`）。它可能是上一次启动留下的半根：
+        # 增量只追加更晚的，那一根就永远修不好（2026-11-19 在库里查到 4 根：
+        # close 差 10~70 元、成交量只有一半）。实时这份是完整的，覆盖上去就自愈。
+        #
+        # 重叠段的 `adj_factor` 必须沿用库里那份：实时那份算出来多半是 1.0，
+        # 盖过去会让前复权价在接缝处跳一下。
+        df = df[df.index >= last]
     out["ok"] = True
     if df.empty:
         return out
@@ -117,6 +142,20 @@ def save(serial, symbol: str, exchange: str, period: str) -> dict:
             series = switch_series_via(con, symbol, exchange)
             df["adj_factor"] = (factor_at(series, pd.Series(df["trading_day"]))
                                 if len(series) else 1.0)
+            if last is not None:
+                try:
+                    keep = con.execute(
+                        "SELECT dt, adj_factor FROM bars WHERE symbol=? AND "
+                        "exchange=? AND period=? AND dt >= ?",
+                        [symbol, exchange, src, df.index[0]]).fetchall()
+                    if keep:
+                        old = pd.Series(
+                            {pd.Timestamp(dt): float(f or 1.0) for dt, f in keep})
+                        hit = df.index.intersection(old.index)
+                        if len(hit):
+                            df.loc[hit, "adj_factor"] = old.loc[hit].to_numpy()
+                except Exception:  # noqa: BLE001
+                    pass
             d = df.reset_index().rename(columns={"datetime": "dt"})
             out["added"] = tqstore.upsert_bars(con, symbol, exchange, src, d)
     except Exception as exc:  # noqa: BLE001

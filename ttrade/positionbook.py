@@ -89,8 +89,21 @@ def load(account: str) -> dict[str, dict[str, int]]:
     return out
 
 
-def save(account: str, sid: str, held: dict[str, int]) -> None:
-    """整条策略的账本覆盖写。仓位归 0 的合约不写。"""
+#: 均价的存放位置：文件顶层一个独立键，形如
+#: `{"_costs": {账户: {策略 id: {合约: 持仓均价}}}}`。
+#: 和仓位分开放而不是塞进 `{合约: 手数}` 里，是因为那张表的每个值都必须是整数
+#: —— 混一个浮点进去，`load()` 会把它当手数读成 0 或者干脆丢掉。
+_COSTS = "_costs"
+
+
+def save(account: str, sid: str, held: dict[str, int],
+         cost: dict[str, float] | None = None) -> None:
+    """整条策略的账本覆盖写。仓位归 0 的合约不写。
+
+    `cost` 传了就连同**持仓均价**一起写；传 `None` 表示「这次不动均价」。
+    均价必须和仓位一起落盘：重启后账本还在、均价没了的话，持仓盈亏会从 0
+    重新算起，界面上刚启动那一刻永远是「0 盈亏」，看着像策略刚开仓。
+    """
     clean = {str(s): int(n) for s, n in (held or {}).items() if int(n or 0)}
     with _LOCK:
         data = _read()
@@ -105,9 +118,70 @@ def save(account: str, sid: str, held: dict[str, int]) -> None:
             data[account] = row
         else:
             data.pop(account, None)
+        if cost is not None:
+            _put_costs(data, account, sid, cost, bool(clean))
         _write(data)
 
 
+def _put_costs(data: dict, account: str, sid: str, cost: dict,
+               keep: bool) -> None:
+    box = data.get(_COSTS)
+    if not isinstance(box, dict):
+        box = {}
+    row = box.get(account)
+    if not isinstance(row, dict):
+        row = {}
+    clean = {}
+    for sym, px in (cost or {}).items():
+        try:
+            v = float(px)
+        except (TypeError, ValueError):
+            continue
+        if v > 0 and v == v:      # NaN / 0 都是「不知道」，不记
+            clean[str(sym)] = v
+    if keep and clean:
+        row[sid] = clean
+    else:
+        row.pop(sid, None)
+    if row:
+        box[account] = row
+    else:
+        box.pop(account, None)
+    if box:
+        data[_COSTS] = box
+    else:
+        data.pop(_COSTS, None)
+
+
+def load_costs(account: str) -> dict[str, dict[str, float]]:
+    """{策略 id: {合约: 持仓均价}}。没有记录就返回空 —— 均价只是显示用的参考，
+    读不出来不该阻断启动。"""
+    with _LOCK:
+        box = _read().get(_COSTS)
+    row = box.get(account) if isinstance(box, dict) else None
+    out: dict[str, dict[str, float]] = {}
+    if not isinstance(row, dict):
+        return out
+    for sid, one in row.items():
+        if not isinstance(one, dict):
+            continue
+        clean = {}
+        for sym, px in one.items():
+            try:
+                v = float(px)
+            except (TypeError, ValueError):
+                continue
+            if v > 0 and v == v:
+                clean[str(sym)] = v
+        if clean:
+            out[str(sid)] = clean
+    return out
+
+
 def forget(account: str, sid: str) -> None:
-    """删掉一条策略的账本。策略被删除时调 —— 留着只会在同 id 新建时误导。"""
-    save(account, sid, {})
+    """删掉一条策略的账本。策略被删除时调 —— 留着只会在同 id 新建时误导。
+
+    均价一起清：不清的话，同 id 新建一条会把上一轮的成本当成自己的开仓价，
+    持仓盈亏从一开始就是错的数。
+    """
+    save(account, sid, {}, cost={})

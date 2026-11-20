@@ -3293,8 +3293,23 @@ def _run() -> tuple[bool, list[str]]:
         from ttrade import factors_macro as FM
         from ttrade import macro as M
 
-        if set(FM.AVAIL_08) != {"dxy", "usdcnh", "us_real10"}:
-            raise RuntimeError(f"AVAIL_08 应正好是 dxy/usdcnh/us_real10，实际 {FM.AVAIL_08}")
+        # 🔴 不写死名单（AVAIL_08 会随新序列扩，写死一次就得跟着改一次），
+        #    改成两条结构约束 + 一条反证：
+        #      ① 里面每个 code 都得真注册过，否则这条判据在管空气；
+        #      ② 「收盘落在纽约时段」的一条都不能漏 —— 漏了凌晨就取到当天才收的行。
+        unknown = set(FM.AVAIL_08) - set(FM._LABEL)
+        if unknown:
+            raise RuntimeError(f"AVAIL_08 里有没注册的 code：{sorted(unknown)}")
+        for code in ("dxy", "usdcnh", "us_real10", "spx", "ixic", "spx_vol20"):
+            if code not in FM.AVAIL_08:
+                raise RuntimeError(
+                    f"{code} 的收盘在纽约时段（北京次日 04:00~06:00 才成立），"
+                    f"不在 AVAIL_08 里就会在夜盘凌晨用上当天才收的那一行")
+        if any(FM._avail_hour(c) != 8 for c in FM.AVAIL_08):
+            raise RuntimeError("AVAIL_08 里的 code 有 `_avail_hour` 不等于 8 的")
+        # 反证：不在名单里的必须是 0，否则「加进名单」这个动作什么也没改变
+        if FM._avail_hour("shibor_on") != 0:
+            raise RuntimeError("不在 AVAIL_08 的序列也被当成了 08:00 才可用")
 
         d0, d1, d2 = (pd.Timestamp("2026-10-19"), pd.Timestamp("2026-10-20"),
                       pd.Timestamp("2026-10-21"))
@@ -3333,11 +3348,15 @@ def _run() -> tuple[bool, list[str]]:
             pct = FM._pct_series("usdcnh")
             probe = pd.DatetimeIndex([dd[250] + pd.Timedelta(hours=2),
                                       dd[250] + pd.Timedelta(hours=10)])
-            for code in ("usdcnh", "dxy", "us_real10"):
+            for code in ("usdcnh", "dxy", "us_real10", "usdcnh_em", "dxy_em"):
                 got_by_code[code] = FM._make(code)(
                     pd.DataFrame(index=probe)).to_numpy(float)
-            w8 = FM._asof(pct, probe, avail_hour=8).to_numpy(float)
-            w0 = FM._asof(pct, probe, avail_hour=0).to_numpy(float)
+            # 期望值按**每个 code 自己的**滞后天数算：FXCM 外汇（usdcnh/dxy）标签
+            # 比真实交易日早一天，总滞后是 2；美债走财政部，是 1（见 `_LABEL_LAG`）
+            w8 = FM._asof(pct, probe, lag_days=FM._lag_days("usdcnh"),
+                          avail_hour=8).to_numpy(float)
+            w0 = FM._asof(pct, probe, lag_days=FM._lag_days("usdcnh"),
+                          avail_hour=0).to_numpy(float)
         finally:
             M.series = orig
             FM.clear_cache()
@@ -3345,19 +3364,286 @@ def _run() -> tuple[bool, list[str]]:
         if np.isnan(got).any():
             raise RuntimeError("探针落在分位的最小观测窗口里，这条断言测了个空")
         if not np.allclose(got, w8, equal_nan=True):
-            raise RuntimeError("_make('usdcnh') 没把 avail_hour=8 传下去")
+            raise RuntimeError("_make('usdcnh') 没把 avail_hour=8 / lag_days 传下去")
         if np.allclose(got, w0, equal_nan=True):
             raise RuntimeError("_make('usdcnh') 的结果与 avail_hour=0 相同 —— 参数没生效")
-        for code in ("dxy", "us_real10"):
+        for code in ("dxy", "us_real10", "usdcnh_em", "dxy_em"):
             g = got_by_code[code]
-            if not np.allclose(g, w8, equal_nan=True):
-                raise RuntimeError(f"_make('{code}') 没把 avail_hour=8 传下去")
+            want = FM._asof(pct, probe, lag_days=FM._lag_days(code),
+                            avail_hour=8).to_numpy(float)
+            if not np.allclose(g, want, equal_nan=True):
+                raise RuntimeError(f"_make('{code}') 没把 avail_hour/lag_days 传下去")
+        # 东财两条不带标签错位，滞后期必须比 Tushare 那两条少一天 ——
+        # 这不是「差不多」，是它们存在的意义：同一时点能拿到更新鲜的一行。
+        if FM._lag_days("usdcnh_em") >= FM._lag_days("usdcnh"):
+            raise RuntimeError("东财口径的滞后没有比 Tushare 短，说明 _LABEL_LAG 传染过去了")
 
         return ("07:59→D-2 / 08:00→D-1 边界精确；凌晨 02:00 取 D-2、日盘与夜盘 "
                 "21:00 取 D-1；反证 avail=0 会取到 D-1；_make 对 "
-                "usdcnh/dxy/us_real10 三条都接通")
+                "usdcnh/dxy/us_real10/usdcnh_em/dxy_em 五条都按各自的 lag_days 接通")
 
     check("汇率因子 08:00 前用自然日-2（夜盘凌晨不前视）", _macro_avail_8)
+
+    def _macro_no_same_day():
+        """**每根 bar 只能用到「严格早于它自然日」的那一行**，用真实行情扫一遍。
+
+        2026-11-20 用户报：IM 的「美元兑离岸人民币」在 9-19 09:30 用到了 9-19
+        当天的日频值。这种指控没法靠看图回答 —— 日频因子日内恒定，图上是一条
+        台阶，看不出台阶是从哪一行搬来的。所以需要一条能直接输出「第 T 根取的
+        是哪一行」的判据。
+
+        对拍**不用 `_asof`**（那是被测实现）：换成 pandas 自己的 `Series.asof()`，
+        按「时刻 − 8 小时（发布）− 1 天」独立算一遍期望值。两套实现给出的行
+        不一样就是 bug —— 同源对拍（两边都调 merge_asof）会让错的地方一起错，
+        这条项目里已经踩过（#145）。
+
+        探针**必须带夜盘**：日盘 09:30 的 bar 在 avail_hour=0/8 两种口径下取到的
+        都是 D−1（相差不到一天），只有 00:00~08:00 那段才分得开。CU 有夜盘，
+        拿它当样本；顺带覆盖 IM 那种没有夜盘的品种。
+        """
+        from ttrade import factors_macro as FM
+        from ttrade import tqdata as T
+        import numpy as _np
+        import pandas as _pd
+
+        pd, np = _pd, _np                  # 本函数自己带依赖，别指望外层作用域
+
+        pct = FM._pct_series("usdcnh")
+        if pct is None or len(pct) < 200:
+            raise RuntimeError("usdcnh 序列读不到（宏观库没同步？）")
+        idx = pd.DatetimeIndex(pct.index)
+
+        def expect(t):
+            """独立口径：发布时刻之后、再退 `_lag_days` 个自然日，取 ≤ 的那一行。"""
+            return float(pct.asof(t - pd.Timedelta(hours=8)
+                                  - pd.Timedelta(days=FM._lag_days("usdcnh"))))
+
+        def used_day(t):
+            pos = int(idx.searchsorted(pd.Timestamp(t) - pd.Timedelta(hours=8)
+                                       - pd.Timedelta(days=FM._lag_days("usdcnh")),
+                                       side="right")) - 1
+            return None if pos < 0 else idx[pos]
+
+        bad: list[str] = []
+        n_probe = 0
+        locked = ""
+        for sym, ex in (("CU", "SHFE"), ("IM", "CFFEX")):
+            try:
+                df = T.load_main(sym, ex, "5m")
+            except Exception as exc:  # noqa: BLE001 - 库没同步到就没有样本
+                # DuckDB 单文件库是排他锁：界面开着的时候这里会打不开。
+                # 那是环境状态，不是代码缺陷 —— 记下原因，别报成一条红
+                locked = f"{type(exc).__name__}: {exc}"
+                continue
+            if df is None or len(df) < 500:
+                continue
+            tail = df.tail(4000)
+            got = FM._make("usdcnh")(tail)
+            night = tail.index[tail.index.hour < 8][:60]
+            day = tail.index[(tail.index.hour == 9) & (tail.index.minute == 30)][:60]
+            probes = list(night) + list(day)
+            for t in probes:
+                n_probe += 1
+                a, b = float(got.loc[t]), expect(t)
+                if np.isnan(a) and np.isnan(b):
+                    continue
+                if a != b:
+                    bad.append(f"{sym} {t:%Y-%m-%d %H:%M} 取 {a:.6f}，应为 {b:.6f}")
+                    continue
+                # 命中的行必须比 bar 的自然日**至少老 `_lag_days` 天**：FXCM 那张表
+                # 的行标签比真实交易日早一天，纽约日 D 的收盘写进 D−1 行、要到
+                # 北京 D+1 06:00 才成立 ⇒ 标签加 2 天才是可用时刻。差一天就是前视
+                u = used_day(t)
+                need = pd.Timestamp(t).normalize() - pd.Timedelta(
+                    days=FM._lag_days("usdcnh"))
+                if u is not None and u > need:
+                    bad.append(f"{sym} {t:%Y-%m-%d %H:%M} 命中行 {u:%Y-%m-%d} "
+                               f"晚于可用边界 {need:%Y-%m-%d}")
+        if n_probe == 0:
+            if locked:
+                return f"跳过：行情库被占用（{locked[:60]}），关掉界面再跑才是真扫"
+            raise RuntimeError("没有可用的 5m 行情做探针，这条判据测了个空")
+        if bad:
+            raise RuntimeError("日频汇率因子前视：" + "；".join(bad[:4]))
+
+        # 界面十字光标显示的是 `asof_row` 给的日期，实际取数是 `_asof`。
+        # 两者必须是同一行 —— 否则界面会一本正经地报错日期，比不显示更糟
+        probe_ts = [t for t in probes[:20]]
+        rows = FM.asof_rows("usdcnh", probe_ts,
+                            lag_days=FM._lag_days("usdcnh"),
+                            avail_hour=FM._avail_hour("usdcnh"))
+        ok_row = [r for r in rows if not pd.isna(r)]
+        if len(ok_row) < len(probe_ts):
+            raise RuntimeError("asof_rows 给出了 NaT —— 光标会显示成没有来源")
+        if not np.allclose(pct.reindex(pd.DatetimeIndex(ok_row)).to_numpy(float),
+                           got.reindex(probe_ts).to_numpy(float), equal_nan=True):
+            raise RuntimeError("asof_rows 与 _asof 取到的行不一致 —— 界面会报错日期")
+
+        lag = FM._lag_days("usdcnh")
+        return (f"{n_probe} 个探针（含夜盘 00:00~08:00）全部只用到 D−{lag} 及更早的行，"
+                "与 pandas asof 独立口径逐位一致；光标显示的取数日与实际取数同源")
+
+    check("日频汇率因子不碰当日行（真实行情扫描）", _macro_no_same_day)
+
+    def _macro_label_offset():
+        """反推 Tushare 外汇表的**标签偏移**，必须等于代码里写的那一个。
+
+        `_LABEL_LAG` 写的是一条经验事实：FXCM 日线的 `trade_date` 比这根 K 线
+        真实的交易日早一天（纽约日 D 的收盘写进 D−1 那一行）。这条事实是用
+        `data_duka` 的 5m 汇率独立算出来的，所以只能用同一份数据反推 —— 一旦
+        Tushare 改了标签、或者我们换了数据源，这条会红，而不是让前视悄悄回来。
+
+        做法：两边各算日收益率（收益率平移不变、不受报价源的点差偏移影响），
+        在 k ∈ [−2, 2] 里找相关性最高的那个 k。日频汇率太平滑，**不能拿价位
+        去配**：价位差会被「源不同 + 序列断点」淹掉，之前就这么误判过一次。
+        """
+        from ttrade import factors_macro as FM
+        from ttrade import macro as M
+        import os
+        import pandas as pd
+
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "data_duka", "USDCNH_5m.parquet")
+        if not os.path.exists(path):
+            return "跳过：没有 data_duka/USDCNH_5m.parquet，无法反推标签偏移"
+        bars = pd.read_parquet(path)
+        if bars is None or bars.empty:
+            return "跳过：5m 汇率是空文件"
+        # 纽约日边界 = 北京 06:00（与 `factors_fx5.DAY_CUT_HOUR` 同一口径）
+        ny_day = (bars.index - pd.Timedelta(hours=6)).normalize()
+        ny_close = bars["close"].groupby(ny_day).last()
+        ny_ret = ny_close.pct_change()
+
+        raw = M.series("usdcnh")
+        if raw is None or len(raw) < 200:
+            raise RuntimeError("usdcnh 序列读不到")
+        mac_ret = raw.pct_change()
+
+        lo, hi = pd.Timestamp("2026-01-01"), ny_close.index[-1]
+        r1 = mac_ret.loc[lo:hi].dropna()
+        r2 = ny_ret.loc[lo:hi].dropna()
+        scores = {}
+        for k in (-2, -1, 0, 1, 2):
+            sh = r2.copy()
+            sh.index = sh.index - pd.Timedelta(days=k)
+            j = pd.concat([r1.rename("m"), sh.rename("n")], axis=1, sort=True).dropna()
+            if len(j) >= 40:
+                scores[k] = (float(j["m"].corr(j["n"])), len(j))
+        if 0 not in scores:
+            raise RuntimeError("样本不足，反推不出偏移")
+        best_k, (best_c, n) = max(scores.items(), key=lambda kv: abs(kv[1][0]))
+        want = int(FM._LABEL_LAG.get("usdcnh", 0))
+        if best_c < 0.8:
+            raise RuntimeError(f"相关性太低（{best_c:+.3f}），反推不可信")
+        if abs(best_c) - abs(scores[0][0]) < 0.3:
+            raise RuntimeError(f"最优偏移不显著：k={best_k} {best_c:+.3f} vs k=0 "
+                               f"{scores[0][0]:+.3f}")
+        if best_k != want:
+            raise RuntimeError(f"标签偏移变了：实测 k={best_k:+d}（corr {best_c:+.3f}），"
+                               f"代码里 _LABEL_LAG['usdcnh']={want} —— 前视会回来")
+        return (f"实测宏观行 D 与纽约日 D{best_k:+d} 的收益相关 {best_c:+.3f}"
+                f"（n={n}，k=0 只有 {scores[0][0]:+.3f}），与 _LABEL_LAG 写的一致")
+
+    check("Tushare 外汇表的标签偏移（用 5m 汇率反推）", _macro_label_offset)
+
+    def _macro_index_offset():
+        """四个外盘指数的**标签反推**：行 D 必须真的是 D 那天的收盘。
+
+        用户 2026-11-20 要求「spx / ixic / hsi / n225 也补一条反推判据」。
+        手法同上（日收益率、k ∈ [−2, 2] 找峰值），裁判换成东财日线 —— 东财的
+        标签就是真实交易日（`usdcnh` 那条已用 dukascopy 5m 验过 0.988@k=0）。
+
+        抓的不是「价位对不对」，而是「行 D 装的是不是 D 那天的收盘」。汇率那两条
+        实测 k=+1（红过一次，就是这次修的那个前视）；指数这四条实测 k=0、相关
+        1.000。任何一边改了标签，这里会红。
+
+        取不到就往回退成「跳过」而不是红：东财接口、宏观库锁都会让这条断网式
+        失败，那是环境问题，不是判据失效 —— 判据红了才说明数据真的变了。
+        """
+        import pandas as pd
+        from ttrade import macro as M
+
+        rows = []
+        for code, secid in M._EM_INDEX.items():
+            try:
+                em = M._em_closed(secid)
+            except Exception as e:                       # noqa: BLE001
+                return f"跳过：东财 {code} 取不到（{type(e).__name__}: {e}）"
+            if em is None or len(em) < 250:
+                return f"跳过：东财 {code} 只有 {0 if em is None else len(em)} 行"
+            try:
+                ts = M.series(code)
+            except Exception as e:                       # noqa: BLE001
+                return f"跳过：宏观库读不到（{type(e).__name__}: {e}）"
+            if ts is None or len(ts) < 250:
+                return f"跳过：库里 {code} 只有 {0 if ts is None else len(ts)} 行"
+
+            lo = max(em.index[0], ts.index[0], pd.Timestamp("2016-01-01"))
+            hi = min(em.index[-1], ts.index[-1])
+            r1 = ts.pct_change().loc[lo:hi].dropna()
+            r2 = em.pct_change().loc[lo:hi].dropna()
+            scores = {}
+            for k in (-2, -1, 0, 1, 2):
+                sh = r2.copy()
+                sh.index = sh.index - pd.Timedelta(days=k)
+                j = pd.concat([r1.rename("m"), sh.rename("n")],
+                              axis=1, sort=True).dropna()
+                if len(j) >= 100:
+                    scores[k] = float(j["m"].corr(j["n"]))
+            if 0 not in scores:
+                raise RuntimeError(f"{code} 样本不足，反推不出偏移")
+            best_k = max(scores, key=lambda k: abs(scores[k]))
+            best_c = scores[best_k]
+            if best_k != 0:
+                raise RuntimeError(
+                    f"{code} 的标签偏移变了：实测 k={best_k:+d}（corr {best_c:+.3f}），"
+                    f"k=0 只有 {scores[0]:+.3f} —— 行 D 装的不再是 D 那天的收盘")
+            if best_c < 0.99:
+                raise RuntimeError(
+                    f"{code} 与东财相关只有 {best_c:+.3f}，已经不像同一份数据了")
+            rows.append((code, best_c))
+
+        return "四条外盘指数全部 k=+0、与东财收益相关 " + " / ".join(
+            f"{c} {v:+.3f}" for c, v in rows)
+
+    check("外盘指数的标签反推（对东财日线）", _macro_index_offset)
+
+    def _em_factor_closed_only():
+        """东财日线只许收**已经收完**的那一根。
+
+        东财盘中会返回今天那根没走完的 bar（实测 2026-11-20 11:38 拿到
+        `11-20 6.6732`，那只是上午的价）。08:45 的定时任务照收，库里就把半个
+        交易日的价当成日收盘存了下来 —— 而且看起来完全正常，从数据上查不出来，
+        只能在取数这一处挡住。
+        """
+        import pandas as pd
+
+        from ttrade import macro as M
+
+        today = pd.Timestamp.today().normalize()
+        idx = pd.DatetimeIndex([today - pd.Timedelta(days=3),
+                                today - pd.Timedelta(days=1),
+                                today, today + pd.Timedelta(days=1)])
+        fake = pd.Series([1.0, 2.0, 3.0, 4.0], index=idx)
+        orig = M._em_kline
+        try:
+            M._em_kline = lambda secid, start: fake          # noqa: ARG005
+            got = M._em_fx("usdcnh_em")
+            got_idx = M._em_closed("100.SPX")
+        finally:
+            M._em_kline = orig
+        want = today - pd.Timedelta(days=1)
+        for name, s in (("_em_fx", got), ("_em_closed", got_idx)):
+            if len(s) != 2 or s.index[-1] != want:
+                raise RuntimeError(
+                    f"{name} 没有滤掉今天/未来那根，留下 {[d.date() for d in s.index]}"
+                    f"（应只剩 ≤ {want.date()} 的 2 根）")
+        # 反证：不滤的话会有 4 根 —— 说明上面那条断言不是恒真
+        if len(fake) == len(got):
+            raise RuntimeError("滤前滤后行数一样，这条断言测了个空")
+        return f"今天({today.date()})与未来那一根都被滤掉，`_em_fx` / `_em_closed` 都只留 ≤ 昨天"
+
+    check("东财日线只收已收完的那一根（盘中不给半根）", _em_factor_closed_only)
 
     def _contract_terms():
         """「从天勤刷新品种参数」这条通路：取到的真值要能写进表、回测要读到。
@@ -5207,6 +5493,172 @@ def _run() -> tuple[bool, list[str]]:
 
     check("一键对齐看得见锁仓（多空双开）", _align_lock)
 
+    def _align_no_flip():
+        """一键对齐**不许**把「平仓」变成「反方向开仓」，也不许动没确认过的合约。
+
+        2026-11-20 那次实盘的形状：确认框写的是「CFFEX.T2612 −6 手 → −2（平空4）」，
+        发出去的却是 `SELL OPEN 2`（连发 3 笔），另外还平了一个确认框里根本
+        没出现过的合约。三个独立缺陷，各验一条：
+
+          ① 持仓快照在「算差额」和「发单」之间变了 ⇒ 可平量查不到时**一枪不放**，
+             不能退化成 OPEN（`_legs` 的老行为）；
+          ② `align(symbols=...)` 只动传进来的那几个合约 —— 没同意过的仓不碰；
+          ③ `_legs(closeable=)` 的可平量上限在上期所「平今平昨」那一段也要夹住，
+             否则「平自己 2 手」会变成「平账户 9 手」，把别人的仓顺手平了。
+        """
+        from ttrade import strategy_store as SStore
+        from ttrade.strategy_runner import PortfolioRunner, SlotState
+
+        class P:
+            def __init__(self, lo, sh):
+                self.pos_long, self.pos_short = lo, sh
+                for s, v in (("long", lo), ("short", sh)):
+                    setattr(self, f"pos_{s}_his", v)
+                    setattr(self, f"pos_{s}_today", 0)
+                    setattr(self, f"volume_{s}_his", v)
+                    setattr(self, f"volume_{s}_today", 0)
+
+        r = PortfolioRunner.__new__(PortfolioRunner)
+        r._log_fn = None
+        r._diag = None
+        r._mm_cache, r._mm_ts = [], 0.0
+        r._align_ts = 0.0
+        r.api = object()
+        r._align_slot = SlotState(cfg=SStore.StrategyConfig(
+            sid="__align__", name="一键对齐", period="1d"))
+        r._slots = {}
+        sent = []
+        r._send = lambda s, sym, delta, closeable=None: (
+            sent.append((sym, delta, closeable)) or s.pending.append("x") or 1)
+        r._sync_after_align = lambda sym: None
+
+        # ① 差额已经算出来了（该平 4 手空），但账户此刻读不到空头
+        r._pos = {}
+        row = {"symbol": "CFFEX.T2612", "target": -2, "actual": -6, "delta": 4,
+               "managed": True, "t_long": 0, "t_short": 2,
+               "a_long": 0, "a_short": 6, "locked": False}
+        r._align_slot.pending.clear()
+        if r._send_row(r._align_slot, row) != 0 or sent:
+            raise RuntimeError(f"可平量查不到还是发了单：{sent}")
+        if "不发反向开仓" not in (r._align_slot.last_action or ""):
+            raise RuntimeError(f"没说明为什么没发：{r._align_slot.last_action!r}")
+
+        # 账户真有这 6 手空时，应当平 4 手（BUY），而不是开空
+        r._pos = {"CFFEX.T2612": P(0, 6)}
+        r._align_slot.pending.clear()
+        sent.clear()
+        if r._send_row(r._align_slot, row) != 1:
+            raise RuntimeError("账户有仓时一笔都没发")
+        if sent != [("CFFEX.T2612", 4, 4)]:
+            raise RuntimeError(f"该买平 4 手（closeable=4），实发 {sent}")
+
+        # ② 只动确认过的合约；持仓基数变了就不发
+        st = SlotState(cfg=SStore.StrategyConfig(sid="t", name="T", period="1h"))
+        st.running, st.underlying, st.target = True, "CFFEX.T2612", -2
+        r._slots = {"t": st}
+        r._pos = {"CFFEX.T2612": P(0, 6), "DCE.jd2701": P(0, 6)}
+        r._mm_ts = 0.0
+        r._align_ts = 0.0
+        r._align_slot.pending.clear()
+        r._align_slot.rejects, r._align_slot.reject_msg = 0, ""
+        r._align_slot.last_action = ""
+        sent.clear()
+        r.align(rows=[{"symbol": "CFFEX.T2612", "a_long": 0, "a_short": 6}])
+        touched = {s for s, _d, _c in sent}
+        if touched != {"CFFEX.T2612"}:
+            raise RuntimeError(f"动了没确认过的合约：{sorted(touched)}")
+
+        # 确认时写的是「空 6」，可账户此刻读到空 0 —— 换个基数会把「平空4」
+        # 算成「开空2」，所以必须整笔跳过（而不是照新基数发）
+        r._pos = {"CFFEX.T2612": P(0, 0), "DCE.jd2701": P(0, 6)}
+        r._mm_ts = 0.0
+        r._align_ts = 0.0
+        r._align_slot.pending.clear()
+        r._align_slot.last_action = ""
+        sent.clear()
+        r.align(rows=[{"symbol": "CFFEX.T2612", "a_long": 0, "a_short": 6}])
+        if sent:
+            raise RuntimeError(f"持仓基数变了还照发（会变成反向开仓）：{sent}")
+
+        # ③ 上期所的平今平昨分支：可平量不许被「账户口径」抬上去
+        r._pos = {"SHFE.rb2701": P(9, 0)}
+        legs = r._legs("SHFE.rb2701", -5, closeable=2)
+        if legs != [("CLOSE", 2), ("OPEN", 3)]:
+            raise RuntimeError(f"可平量没夹住（会平掉别人的仓）：{legs}")
+        # 反证：不给 closeable 时仍是账户口径 —— 说明上面那条不是恒真
+        if r._legs("SHFE.rb2701", -5, closeable=None) != [("CLOSE", 5)]:
+            raise RuntimeError("closeable=None 时应按账户口径平 5 手")
+
+        return ("可平量查不到时一枪不放（写明原因）；只动确认过的合约；"
+                "上期所分支的可平量上限夹住了（平 2 + 开 3，不是平 5）")
+
+    check("一键对齐不许把平仓变成反向开仓", _align_no_flip)
+
+    def _align_logged_in():
+        """账户没登录的，一键对齐不许动它的仓（用户 2026-11-20 要求）。
+
+        为什么必须挡：账户登出后 `api is None`，`align()` 一句「账户没有接进来」
+        就返回 0 —— 可界面上那些合约照样列在确认框里，用户点完看不到任何反应，
+        还以为平完了。更隐蔽的是「半登录」：`_pos` 还留着登出前的旧数，
+        `mismatch()` 照常算出差额，看起来一切正常。
+
+        所以判据用**账户登录**（`api is not None` ⇒ `account_ready`），不是行情
+        （`alive` 看的是 feed，账户登出策略照样在跑），也不是 `pos_ready`。
+        """
+        from gui.portfolio_page import split_alignable
+
+        snaps = {
+            "已登录账户": {"account_ready": True,
+                      "mismatch": [{"symbol": "CFFEX.T2612",
+                                    "a_long": 0, "a_short": 6}]},
+            "未登录账户": {"account_ready": False,
+                      "mismatch": [{"symbol": "SHFE.rb2701",
+                                    "a_long": 3, "a_short": 0},
+                                   {"symbol": "DCE.jd2701",
+                                    "a_long": 0, "a_short": 6}]},
+            "没差额账户": {"account_ready": True, "mismatch": []},
+        }
+        ready, blocked = split_alignable(snaps)
+        if list(ready) != ["已登录账户"]:
+            raise RuntimeError(f"可对齐的账户里混进了未登录的：{list(ready)}")
+        if len(ready["已登录账户"]) != 1:
+            raise RuntimeError("可对齐账户的合约数被改了")
+        if len(blocked) != 1 or "未登录账户" not in blocked[0] or "2 个合约" not in blocked[0]:
+            raise RuntimeError(f"未登录账户没被点名：{blocked}")
+        if any("没差额" in b for b in blocked):
+            raise RuntimeError("没有差额的账户不该进跳过名单（每次点都刷一排）")
+
+        # 反证：把 account_ready 翻成 True 后它就该进可对齐那一批 ——
+        # 说明上面那条不是「因为没写 mismatch 才没进去」的恒真断言
+        snaps["未登录账户"]["account_ready"] = True
+        ready2, blocked2 = split_alignable(snaps)
+        if "未登录账户" not in ready2 or blocked2:
+            raise RuntimeError("account_ready=True 时没放行 —— 上面那条断言抓不到东西")
+
+        # 老快照没有这个字段时按「已登录」处理：升级那一刻所有账户都不会
+        # 突然变成「没登录」而被全部跳过
+        ready3, blocked3 = split_alignable({"老账户": {"mismatch": [{"symbol": "X"}]}})
+        if list(ready3) != ["老账户"] or blocked3:
+            raise RuntimeError(f"缺 account_ready 字段时应默认已登录：{ready3} {blocked3}")
+
+        if split_alignable(None) != ({}, []):
+            raise RuntimeError("snaps 为空时应返回空结果")
+
+        # 引擎这一层也必须有同一道闸：`api is None` ⇒ 一笔不发、并且说话
+        from ttrade.strategy_runner import PortfolioRunner as _PR
+
+        rr = _PR.__new__(_PR)
+        rr.api = None
+        rr._log_fn = None
+        rr._diag = None
+        if rr.align(rows=[]) != 0:
+            raise RuntimeError("账户没登录时 align() 居然发单了")
+
+        return ("未登录账户的 2 个合约被挡下并点名；翻成已登录立刻放行；"
+                "缺字段按已登录处理（升级不会全被跳过）；align() 在 api=None 时返回 0")
+
+    check("账户没登录就不做一键对齐", _align_logged_in)
+
     def _load_no_trade():
         """加载策略时**不许**按台账自动交易（2026-11-17 用户要求）。
 
@@ -5517,6 +5969,325 @@ def _run() -> tuple[bool, list[str]]:
                 "增量起点 = 库尾/最早的洞 → 此刻，不受回溯区间夹取")
 
     check("K 线缺交易日 / 补库静默成功", _data_gap_gate)
+
+    def _stale_tail_gate():
+        """帧**尾**整体落后 —— 2026-11-19 的现场（cu 报 -1 手，回测是 0）。
+
+        `hole_days` 只查帧**内部**有没有断口。本地 5m 库两天没更新、天勤序列又
+        刚往回补（3001 根里只有 1 根比库新）时，合并出来的帧是「看着连续的旧数据」：
+        末根 11-17 14:55，和实时段最后一根同一根，一根洞都没有。信号就在一份两天前
+        的数据上算出来了。
+
+        判据改成跟「按交易时段本该走完的最后一根」比。这里验算期望值本身。
+        """
+        import pandas as pd
+
+        from ttrade import strategy_runner as R
+
+        def exp(sym, ex, per, ts):
+            v = R.expected_last_bar(sym, ex, per, ts)
+            return None if v is None else pd.Timestamp(v)
+
+        # ① 收盘之后：期望值是当天收盘前最后一根的起点（cu 日盘 15:00 收，
+        #    5m 最后一根 14:55）。这条正是漏掉的那一档
+        got = exp("CU", "SHFE", "5m", "2026-11-19 17:40")
+        if got != pd.Timestamp("2026-11-19 14:55"):
+            raise RuntimeError(f"收盘后期望帧尾算错：{got}")
+
+        # ② 午休：期望值是上午收盘那根（11:25），不是 14:55
+        got = exp("CU", "SHFE", "5m", "2026-11-19 11:31")
+        if got != pd.Timestamp("2026-11-19 11:25"):
+            raise RuntimeError(f"午休期望帧尾算错：{got}")
+
+        # ③ 没有夜盘的品种（IC）：收盘后同上，跨零点后仍是当天 14:55
+        got = exp("IC", "CFFEX", "5m", "2026-11-20 01:10")
+        if got != pd.Timestamp("2026-11-19 14:55"):
+            raise RuntimeError(f"无夜盘品种跨零点算错：{got}")
+
+        # ④ 日线 / 解析不出时段的品种：返回 None（调用方不判，宁可不判别误判）
+        if R.expected_last_bar("CU", "SHFE", "1d_tq", "2026-11-19 17:40") is not None:
+            raise RuntimeError("日线周期不该按分钟判帧尾")
+        if R.expected_last_bar("600519", "SSE", "5m", "2026-11-19 17:40") is not None:
+            raise RuntimeError("A 股没有期货时段表，不该判")
+
+        # ④b **夜盘中**（21:00→02:30 的段里）：期望值是刚走完的那根，不是凌晨
+        #     02:25。老写法对跨零点的段把 end 当成「今天 02:30」，22:00 那一刻
+        #     两个候选都不满足 `last <= now`，退回去拿昨天的 02:25 —— 守卫在
+        #     整段夜盘里形同虚设，而这正是 CTA 最活跃的一段
+        got = exp("CU", "SHFE", "5m", "2026-11-19 22:00")
+        if got != pd.Timestamp("2026-11-19 21:55"):
+            raise RuntimeError(f"夜盘中期望帧尾算错：{got}（应当 21:55）")
+        got = exp("CU", "SHFE", "5m", "2026-11-20 01:02")
+        if got != pd.Timestamp("2026-11-20 00:55"):
+            raise RuntimeError(f"夜盘跨零点后期望帧尾算错：{got}（应当 00:55）")
+
+        # ⑤ 判据本身：停两天要拦得住，只落后一根（当天 14:55）不能拦
+        e = exp("CU", "SHFE", "5m", "2026-11-19 17:40")
+        step = pd.Timedelta(seconds=R.RT_SEC["5m"])
+        stale = pd.Timestamp("2026-11-17 14:55")
+        if not (stale < e - step):
+            raise RuntimeError("帧停在前两天却没被判成落后")
+        if pd.Timestamp("2026-11-19 14:55") < e - step:
+            raise RuntimeError("当根就被判成落后，会误伤正常信号")
+
+        return ("帧尾按交易时段判落后：收盘后要 14:55、午休要 11:25、"
+                "跨零点/无夜盘都对；日线与 A 股不判；停两天拦住、当根不误伤")
+
+    check("行情帧尾部落后（本地库没补上）", _stale_tail_gate)
+
+    def _half_bar_three_places():
+        """半根 bar：补库入口、实时合并、算信号切尾**三处同一条口径**。
+
+        2026-11-19 在库里实测到 4 根 cu 的残缺 bar（11-03 21:55 / 22:05 / 23:05、
+        11-04 10:55）：close 与天勤差 10~70 元、成交量只有一半。成因是补库的判据
+        写成 `index[-1] > now` —— 天勤的时间戳是 bar 的**开始**时间，这个式子恒为
+        假，正在走的那根每次都写进去了。
+
+        危害不是「多一根」：它卡在中间，之后增量只追加更晚的，谁也修不好；
+        `iloc[:-1]` 也只切最后一行，切不到它。回测（干净库）和实盘（带着半根）
+        于是长期差一根的 high/low/close。
+        """
+        import pandas as pd
+
+        from ttrade import topup
+        from ttrade.tqlive import merge_live
+
+        idx = pd.date_range("2026-11-19 14:30", periods=6, freq="5min")
+        df = pd.DataFrame(
+            {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 10,
+             "open_oi": 0.0, "close_oi": 0.0}, index=idx)
+
+        # ① 盘中 14:52：最后一根 14:50 还在走 → 丢掉；14:45 及更早保留
+        got = topup.drop_live_tail(df, "CU", "SHFE", "5m", ts="2026-11-19 14:52")
+        if got.index[-1] != pd.Timestamp("2026-11-19 14:45"):
+            raise RuntimeError(
+                f"盘中没丢掉正在走的那根：留下 {got.index[-1]}（应当 14:45）")
+        # ② 收盘后 17:40：14:55 那根已经走完，不能丢（老写法把它丢了）
+        got = topup.drop_live_tail(df, "CU", "SHFE", "5m", ts="2026-11-19 17:40")
+        if len(got) != len(df):
+            raise RuntimeError(f"收盘后把走完的 bar 丢了：{len(got)}/{len(df)}")
+        # ③ 日线：11-19 收盘后那根是完整的；盘中 10:00 那根还在走
+        d = pd.DataFrame({"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+                          "volume": 10, "open_oi": 0.0, "close_oi": 0.0},
+                         index=pd.DatetimeIndex(["2026-11-17", "2026-11-18",
+                                                 "2026-11-19"]))
+        got = topup.drop_live_tail(d, "CU", "SHFE", "1d", ts="2026-11-19 17:40")
+        if got.index[-1] != pd.Timestamp("2026-11-19"):
+            raise RuntimeError(
+                f"日线收盘后仍在用前一天：{got.index[-1]}（应当 11-19）")
+        got = topup.drop_live_tail(d, "CU", "SHFE", "1d", ts="2026-11-19 10:00")
+        if got.index[-1] != pd.Timestamp("2026-11-18"):
+            raise RuntimeError(
+                f"日线盘中该丢掉今天那根：{got.index[-1]}（应当 11-18）")
+
+        # ④ 合并：库里最后一根是半根（close 停在 100），实时同一根已经走到 110。
+        #    必须覆盖成 110，并且乘上本地的复权因子（2.0 → 220），否则接缝会跳
+        local = pd.DataFrame(
+            {"open": [200.0, 200.0], "high": [200.0, 200.0], "low": [200.0, 200.0],
+             "close": [200.0, 200.0], "volume": [10.0, 10.0],
+             "open_oi": [0.0, 0.0], "close_oi": [0.0, 0.0],
+             "adj_factor": [2.0, 2.0]},
+            index=pd.DatetimeIndex(["2026-11-19 14:45", "2026-11-19 14:50"]))
+        live = pd.DataFrame(
+            {"open": [110.0, 120.0], "high": [110.0, 120.0], "low": [110.0, 120.0],
+             "close": [110.0, 120.0], "volume": [50.0, 60.0],
+             "open_oi": [0.0, 0.0], "close_oi": [0.0, 0.0]},
+            index=pd.DatetimeIndex(["2026-11-19 14:50", "2026-11-19 14:55"]))
+        out = merge_live(local, live)
+        if abs(float(out.loc["2026-11-19 14:50", "close"]) - 220.0) > 1e-9:
+            raise RuntimeError(
+                "库尾半根没有被实时值覆盖（或没乘复权因子）："
+                f"{float(out.loc['2026-11-19 14:50', 'close'])}（应当 220）")
+        if abs(float(out.loc["2026-11-19 14:50", "volume"]) - 50.0) > 1e-9:
+            raise RuntimeError("半根的成交量没被覆盖成实时值")
+        if abs(float(out.loc["2026-11-19 14:55", "close"]) - 120.0) > 1e-9:
+            raise RuntimeError("新 bar 没接上（或新 bar 的复权因子不是 1.0）")
+        return ("盘中丢活 bar / 收盘后保留、日线盘中丢今天收盘后保留、"
+                "库尾半根被实时值覆盖且乘回复权因子")
+
+    check("半根 bar：补库 / 合并 / 切尾同一口径", _half_bar_three_places)
+
+    def _merge_live_attrs():
+        """`merge_live` 之后 `attrs["symbol"]` 必须还在。
+
+        2026-11-20 现场：白银（AG 1d_tq）实盘理论 −2 手、研究页「空仓」，
+        回测也对不上。根因不在台账、也不在信号规则，而在 `merge_live` 结尾
+
+            return pd.concat([out, add]).sort_index()
+
+        —— `pd.concat` **不传播 `df.attrs`**，而 `factors_ext._symbol()` 正是靠
+        `attrs["symbol"]` 认品种。丢了以后 `_fund()` 整段返回 NaN，
+        `war_chg_5` / `war_val` / `inv_*` / `profit_*` / `spot_basis` 全列没值，
+        `factor_matrix` → `filter_available(min_obs=60)` 把它们**静默剔除**，
+        `mean(skipna=True)` 少一票，分数从 +0.4582 掉到 −0.5568，跨过
+        `exit_z=-0.3` ⇒ 信号 0 翻成 −1。
+
+        实测（AG 1d_tq，库尾 11-19 + 实时 11-20）：修复前 `sig=-1`，
+        修复后 `sig=0`，与回测一致。`war_chg_5` 有效值 2438 → 0 → 2439。
+
+        研究页（`DataStore.get` → `load_main`，attrs 完好）与实盘（`merge_live`
+        之后，attrs 丢了）从此走的必须是同一份「因子可用集合」。
+        """
+        import pandas as pd
+
+        from ttrade.tqlive import merge_live
+
+        cols = {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+                "volume": 10.0, "open_oi": 0.0, "close_oi": 0.0,
+                "adj_factor": 1.0}
+        local = pd.DataFrame(cols, index=pd.DatetimeIndex(
+            ["2026-11-18", "2026-11-19"]))
+        local.attrs["symbol"] = "AG"
+        local.attrs["exchange"] = "SHFE"
+        live = pd.DataFrame(cols, index=pd.DatetimeIndex(
+            ["2026-11-20"]))
+        live.attrs["symbol"] = "AG"
+
+        # ① 正常拼接（走 pd.concat 那条路）
+        got = merge_live(local, live)
+        sym = (got.attrs or {}).get("symbol")
+        if sym != "AG":
+            raise RuntimeError(
+                f"合并后 attrs['symbol'] 丢了（得到 {sym!r}）—— 基本面 / 仓单 / "
+                "基差因子会整列 NaN 并被静默剔除，实盘与回测从此各算一套")
+        if (got.attrs or {}).get("exchange") != "SHFE":
+            raise RuntimeError("合并后 attrs['exchange'] 也丢了")
+
+        # ② 没有新 bar（`add.empty` 早退）也要带
+        got = merge_live(local, live.iloc[:0])
+        if (got.attrs or {}).get("symbol") != "AG":
+            raise RuntimeError("没有新 bar 时 attrs 丢了")
+
+        # ③ 本地为空（拿实时那份起步）
+        got = merge_live(None, live)
+        if (got.attrs or {}).get("symbol") != "AG":
+            raise RuntimeError("本地为空时 attrs 丢了")
+
+        # 反证：把 attrs 摘掉以后 `_symbol()` 必须真的读不到 —— 否则上面
+        # 三条断言是假绿（比如 `_symbol` 改成了读 symbol 列）
+        from ttrade import factors_ext as _FX
+        bare = got.copy()
+        bare.attrs = {}
+        if _FX._symbol(bare):
+            raise RuntimeError(
+                f"`_symbol()` 在 attrs 为空时仍返回 {_FX._symbol(bare)!r} —— "
+                "这组断言测不到 attrs，需要改成别的手段再测一遍")
+        return "merge_live 的四个出口都保留 attrs（symbol / exchange），且 _symbol 确实读它"
+
+    check("实时合并保留 attrs（品种不丢）", _merge_live_attrs)
+
+    def _ts_precision_ns_us():
+        """时间戳精度：实盘帧是 ns、库内帧是 us —— `merge_asof` 会直接抛。
+
+        2026-11-20 现场（白银 / 铅 1d_tq「研究页空仓、实盘还有空单」），两条
+        互相独立的原因叠在一起，这是第二条：
+
+        * DuckDB 读出来 `datetime64[us]`（研究页 / 回测走这条）；
+        * 天勤推上来 `datetime64[ns]`（`tqfetch.local_time`）；
+        * `pd.concat` 取更精的 ⇒ 实盘帧整帧变 **ns**；
+        * `factors_ext._asof` 里 `merge_asof(左 ns, 右 us)` ⇒
+          `MergeError: incompatible merge keys` ⇒ 基本面因子被静默剔除 ⇒
+          少一票 ⇒ 分数从 +0.46 掉到 −0.55 ⇒ sig 0 变 −1。
+
+        三件都要测：① 反证「混精度确实会炸」；② `merge_live` 的输出精度跟
+        库内那份一致；③ 在 ns 帧上算基本面因子与 us 帧逐值相等。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factors as F
+        from ttrade.tqlive import merge_live
+
+        # ① 反证：左 ns、右 us 的 merge_asof 必须炸 —— 否则这条自检是假绿
+        left = pd.DataFrame({"t": pd.to_datetime(["2026-11-18", "2026-11-19"])
+                             .astype("datetime64[ns]"), "v": 0.0})
+        right = pd.DataFrame({"t": pd.to_datetime(["2026-11-17", "2026-11-18"])
+                              .astype("datetime64[us]"), "w": 1.0})
+        try:
+            pd.merge_asof(left.sort_values("t"), right.sort_values("t"), on="t",
+                          direction="backward")
+        except Exception:  # noqa: BLE001
+            pass
+        else:
+            raise RuntimeError(
+                "ns/us 混精度的 merge_asof 没有抛异常 —— 本机 pandas 行为已变，"
+                "这条自检的前提不成立，需要重新确认（别直接删断言）")
+
+        # ② `merge_live` 必须把结果拉回库内那份的精度
+        cols = {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+                "volume": 10.0, "open_oi": 0.0, "close_oi": 0.0,
+                "adj_factor": 1.0}
+        local = pd.DataFrame(cols, index=pd.DatetimeIndex(
+            ["2026-11-18", "2026-11-19"]).astype("datetime64[us]"))
+        local.attrs["symbol"] = "AG"
+        live = pd.DataFrame(cols, index=pd.DatetimeIndex(
+            ["2026-11-20"]).astype("datetime64[ns]"))
+        got = merge_live(local, live)
+        if got.index.dtype != local.index.dtype:
+            raise RuntimeError(
+                f"合并后索引精度是 {got.index.dtype}，库内是 {local.index.dtype}"
+                " —— 基本面 / 宏观因子的 merge_asof 会抛 MergeError")
+
+        # ③ 拿真实品种比一次：ns 帧与 us 帧的仓单因子必须逐值相等
+        from ttrade import tqdata
+        try:
+            df = tqdata.load_main("AG", "SHFE", "1d_tq", adjust="qfq")
+        except Exception:  # noqa: BLE001
+            return "反证 + 精度对齐通过（库里没有 AG，跳过逐值对比）"
+        if df is None or len(df) < 120:
+            return "反证 + 精度对齐通过（AG 行数不足，跳过逐值对比）"
+        df = df.tail(400).copy()
+        df.attrs["symbol"] = "AG"
+        us = df.copy()
+        ns = df.copy()
+        ns.index = pd.DatetimeIndex(ns.index).astype("datetime64[ns]")
+        # 走公开入口，`_asof` / 日频差分 / 分位这几条路一起覆盖
+        a = F.raw(us, "war_chg_5")
+        b = F.raw(ns, "war_chg_5")
+        if a.notna().sum() == 0:
+            return "反证 + 精度对齐通过（AG 没有仓单数据，跳过逐值对比）"
+        if not np.allclose(a.to_numpy(dtype=float), b.to_numpy(dtype=float),
+                           equal_nan=True):
+            raise RuntimeError("ns 帧与 us 帧的仓单因子不一致 —— 精度归一没生效")
+        if b.notna().sum() == 0:
+            raise RuntimeError("ns 帧上 war_chg_5 一个有效值都没有（因子被静默剔除）")
+        return (f"混精度必炸（反证通过）、merge_live 精度跟库内、"
+                f"ns 帧仓单因子逐值等于 us 帧（{int(b.notna().sum())} 个有效值）")
+
+    check("时间戳精度（ns/us）与 merge_asof", _ts_precision_ns_us)
+
+    def _db_lock_kind():
+        """DuckDB 写连接被**读**挡住要重试，被**另一个写**挡住不能重试。
+
+        2026-11-19 现场：GUI 开着时补 5m，写到第 9 个品种就报
+        「Cannot open file ... 另一个程序正在使用此文件」—— 界面是按查询
+        open/close 的，那一瞬正好有个读连接。前 8 个品种已入库、后面全没写，
+        看着像「补了一半」，其实只差几秒重试。
+        写写冲突（第二个下载器）必须原样抛，不能拿重试掩盖。
+        """
+        from ttrade import tqstore as S
+
+        ok = [
+            Exception('IO Error: Cannot open file "x.duckdb": 另一个程序正在使用此文件，'
+                      '进程无法访问。'),
+            Exception("IO Error: Cannot open file \"x.duckdb\": The process cannot "
+                      "access the file because it is being used by another process."),
+        ]
+        for exc in ok:
+            if not S._blocked_by_reader(exc):
+                raise RuntimeError(f"读连接挡住没认出来：{exc}")
+        no = [
+            Exception("TransactionContext Error: Failed to commit: Conflicting lock "
+                      "is present on database"),
+            Exception("Binder Error: no such table"),
+        ]
+        for exc in no:
+            if S._blocked_by_reader(exc):
+                raise RuntimeError(f"写写冲突被当成读挡住了（会被重试掩盖）：{exc}")
+
+        return "被界面读连接短暂挡住 ⇒ 重试（最多 5.5s）；写写冲突照抛"
+
+    check("DuckDB 写连接被读挡住会重试", _db_lock_kind)
 
     def _add_or_update():
         """新加进组合的策略要能被「启动 / 停止」接上。
@@ -6047,6 +6818,145 @@ def _run() -> tuple[bool, list[str]]:
         return f"{n_live} 个周期可实时，2 日 / 周线明确挡在门外"
 
     check("实时周期门禁", _rt_periods)
+
+    def _bar_clock_alias():
+        """`1d_tq` 必须和 `1d` 一样能判「半根」—— 否则日线策略拿未收盘的日线算信号。
+
+        2026-11-20 的现场：白银 11-19 收盘信号是 0（空单已出场），实盘那一步
+        拿到的是 **11-20 还没收盘的日线**（当天 AG 从 10805 砸到 10026），分数
+        从 +0.28 拉到 −0.56，空头信号翻回 −1，于是「图上已出场、实盘还挂着 −2
+        手、并且又去开空」。根因只有一个：`RT_SEC` 表里只有源周期 `1d`，
+        `RT_SEC.get("1d_tq")` 返回 0 ⇒ `is_unfinished` 一律 False ⇒ 半根从不被切。
+
+        这里不用写死的名单，全部按周期表推：
+        ① 每个非合成周期都要查得到秒数，且 `别名 = 源周期 × 合并根数`；
+        ② `2d` / `1w` 必须查不到（合成周期实时门禁本来就挡着）；
+        ③ 同一个时刻，`1d_tq` 与 `1d` 对「今天这根走完没有」的判断必须**逐点相同**
+           （这是「同一语义只许有一个判据」的结构断言，不写死 True/False）；
+        ④ 日线必须在**当日 15:00** 就走完 —— DCE / CZCE / GFEX 的夜盘收在 23:00
+           但不跨零点，旧口径会把它们算成 23:00，等于日线策略永远晚一天进场。
+        """
+        from ttrade import barclock as BC
+        from ttrade import symbols_info as SI
+        from ttrade import tqdata as TD
+
+        bad = []
+        n = 0
+        for p in TD.PERIOD_ORDER:
+            sec = BC.rt_sec(p)
+            if TD.is_multiday(p):
+                if sec:
+                    bad.append(f"{p} 是由日线合成的，不该有实时秒数（{sec}）")
+                continue
+            if sec <= 0:
+                bad.append(f"{p} 查不到一根多少秒")
+                continue
+            n += 1
+            src, cnt = TD.PERIODS[p]
+            want = BC.rt_sec(src) * max(1, int(cnt))
+            if sec != want:
+                bad.append(f"{p}={sec}s，按源周期 {src}×{cnt} 应是 {want}s")
+
+        # ③ 逐点比对：盘中 / 收盘后 / 夜盘 三个时刻，两个键必须同答案
+        for ts in ("2026-11-20 09:05", "2026-11-20 14:20",
+                   "2026-11-20 15:01", "2026-11-20 21:30", "2026-11-21 02:10"):
+            for sym, ex in (("AG", "SHFE"), ("P", "DCE"), ("IF", "CFFEX")):
+                a = BC.is_unfinished("2026-11-20", sym, ex, "1d_tq", ts)
+                b = BC.is_unfinished("2026-11-20", sym, ex, "1d", ts)
+                if a != b:
+                    bad.append(f"{ts} {sym}：1d_tq={a} 与 1d={b} 不一致")
+        # 反证：换成 11-21 那根，同一个时刻必须是「没走完」（否则上面那条白测）
+        if not BC.is_unfinished("2026-11-21", "AG", "SHFE", "1d_tq", "2026-11-20 21:30"):
+            bad.append("11-20 夜盘时 11-21 那根应当是活的，判成了走完")
+
+        # ④ 所有交易所的日线都在 15:00 收，不再出现 23:00
+        for sym, ex in (("P", "DCE"), ("SR", "CZCE"), ("lc", "GFEX"),
+                        ("AG", "SHFE"), ("IF", "CFFEX")):
+            end = BC.day_close(sym, ex, "2026-11-20")
+            if (end.hour, end.minute) != (15, 0) or end.day != 20:
+                bad.append(f"{sym}.{ex} 日线收盘判成 {end:%m-%d %H:%M}，应是 11-20 15:00")
+            if not SI.session_ranges(sym, ex):
+                bad.append(f"{sym}.{ex} 交易时段解析不出来，上面那条是空转")
+        if bad:
+            raise RuntimeError("；".join(bad))
+        return (f"{n} 个实时周期长度自洽（别名=源周期×根数），"
+                "1d_tq 与 1d 逐点一致，日线统一 15:00 收盘")
+
+    check("日线周期别名与半根判定", _bar_clock_alias)
+
+    def _aux_period_caliber():
+        """研究页和实盘挂衍生列必须是**同一种对齐口径**。
+
+        2026-11-20 棕榈油：回测显示「当前状态：空仓」，组合里理论还是 −2 手。
+        根因就是两处各挑了一种口径 —— 研究页日线走 `attach()`（同一天的期限
+        结构），实盘 `_with_aux` 不分周期一律 `attach_intraday()`（整体 shift 1）。
+        展期因子差一天，分数从 −1.2259 变成 −1.3808，正好跨过 `exit_z`。
+
+        所以这里钉三件事：
+        ① `attach_for_period` 按周期分派 —— 日线（含 1d_tq / 2d / 1w）与
+           `attach()` 逐值相等，分钟与 `attach_intraday()` 逐值相等；
+        ② 反证：两种口径在尾部的 `c1_close` 必须**不一样**，否则 ① 是空转；
+        ③ 结构：`strategy_runner` / `gui/app.py` 的源码里不许直接调那两个
+           底层函数，只能经过 `attach_for_period`（谁再手写一遍就红）。
+        """
+        import inspect
+
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import auxdata as AD
+        from ttrade import strategy_runner as R
+        from ttrade import tqdata as TD
+
+        bad = []
+        daily = TD.load_main("P", "DCE", "1d_tq", adjust="qfq")
+        if daily is None or daily.empty:
+            return "本地没有 P 日线，跳过（不影响其它检查）"
+        minute = TD.load_main("P", "DCE", "1h", adjust="qfq")
+        minute = minute.iloc[-200:] if minute is not None and len(minute) else minute
+
+        same = AD.attach(daily, "P", "DCE")
+        lag = AD.attach_intraday(daily, "P", "DCE")
+        col = next((c for c in ("c1_close", "c2_close", "iv_near")
+                    if c in same.columns and c in lag.columns), "")
+        if not col:
+            return "没有衍生数据（展期/期权快照），跳过口径比对"
+        got_d = AD.attach_for_period(daily, "P", "DCE", "1d_tq")
+        got_w = AD.attach_for_period(daily, "P", "DCE", "2d")
+        for tag, got, want in (("1d_tq", got_d, same), ("2d", got_w, same)):
+            a = pd.to_numeric(got[col], errors="coerce").to_numpy(float)
+            b = pd.to_numeric(want[col], errors="coerce").to_numpy(float)
+            if not np.array_equal(np.isnan(a), np.isnan(b)) or not np.allclose(
+                    a[~np.isnan(a)], b[~np.isnan(b)], atol=1e-9):
+                bad.append(f"{tag} 没走日线口径（同日）")
+        if minute is not None and len(minute):
+            got_m = AD.attach_for_period(minute, "P", "DCE", "1h")
+            want_m = AD.attach_intraday(minute, "P", "DCE")
+            a = pd.to_numeric(got_m[col], errors="coerce").to_numpy(float)
+            b = pd.to_numeric(want_m[col], errors="coerce").to_numpy(float)
+            if not np.allclose(np.nan_to_num(a), np.nan_to_num(b), atol=1e-9):
+                bad.append("1h 没走分钟口径（隔一个交易日）")
+
+        # ② 反证：两种口径在尾部必须真的有差，否则上面两条谁都能过
+        a = pd.to_numeric(same[col], errors="coerce")
+        b = pd.to_numeric(lag[col], errors="coerce")
+        tail = (a.tail(5).to_numpy(float), b.tail(5).to_numpy(float))
+        if np.allclose(np.nan_to_num(tail[0]), np.nan_to_num(tail[1]), atol=1e-9):
+            bad.append("同日与隔日在尾部完全相同，口径比对是空转（衍生数据可能停更）")
+
+        # ③ 结构：别处不许再手写一遍选择逻辑
+        for mod, name in ((R, "ttrade/strategy_runner.py"),
+                          (__import__("gui.app", fromlist=["app"]), "gui/app.py")):
+            src = inspect.getsource(mod)
+            for fn in ("attach_intraday(", "attach_daily("):
+                if fn in src:
+                    bad.append(f"{name} 里还有 {fn} —— 必须走 attach_for_period")
+        if bad:
+            raise RuntimeError("；".join(bad))
+        return (f"日线（1d_tq/2d）走同日、分钟走隔一日，"
+                f"尾部 {col} 两种口径确实不同；两个入口都只经 attach_for_period")
+
+    check("衍生列（展期/期权）的周期口径", _aux_period_caliber)
 
     def _ml_deps():
         from ttrade import mlmodels as ML
@@ -6777,6 +7687,16 @@ def _run() -> tuple[bool, list[str]]:
             win.cb_family.setCurrentIndex(win.cb_family.findData(FAMILY_RULE))
             win.run_analysis()
             app.processEvents()
+        # 2026-11-20：单因子 / 多因子也走后台线程了，`run_analysis()` 返回时
+        # `res` 可能还没算出来。这里把事件循环转几圈等那条线程收工，再判
+        # 「首屏有没有结果」—— 不等的话这一项会随机器快慢时红时绿
+        for _ in range(300):
+            app.processEvents()
+            _th = getattr(win, "_f_thread", None)
+            if _th is None or not _th.isRunning():
+                break
+            time.sleep(0.02)
+        app.processEvents()
         n = len(win.store.symbols)
         has_res = getattr(win, "res", None) is not None
         # 跑过几轮事件循环之后再看一眼：延时定时器如果有，这会儿该触发了
@@ -7170,12 +8090,24 @@ def _run() -> tuple[bool, list[str]]:
             except ValueError as _exc:
                 _msg_pwd = str(_exc)
             _src = _inspect.getsource(PortfolioRunner.start)
-            _i_guard = _src.find("require_live_account(self.spec)")
-            _i_aux = _src.find("self._ensure_aux()")
-            _i_api = _src.find("self.api = TqApi(")
-            _i_broker = _src.find("self._broker_api(backend)")
+            _conn = _inspect.getsource(PortfolioRunner._connect_account)
+            _auxsrc = _inspect.getsource(PortfolioRunner._aux_bg)
+            _i_guard = _conn.find("require_live_account(self.spec)")
+            # 衍生数据改后台（`_aux_bg` 线程）：同步跑 `_ensure_aux()` 实测 15 秒
+            # （2026-11-20「界面卡住」），所以这里查的是「start 里有没有把它甩到
+            # 后台」，以及那个后台函数里确实还在调 `_ensure_aux()`
+            _i_aux = _src.find("self._aux_bg")
+            if _auxsrc.find("self._ensure_aux()") < 0:
+                _i_aux = -1
+            _i_api = _conn.find("self.api = TqApi(")
+            _i_broker = _conn.find("self._broker_api(backend)")
+            # 2026-11-20 起账户只是**最后一步**：行情先起，衍生数据次之，账户最后。
+            # 顺序错了就退回「账户连不上 ⇒ 策略不跑」的老样子
+            _i_feed = _src.find("self.feed = MarketFeed.get()")
+            _i_acct = _src.find("self._connect_account()")
             _order = (_i_guard >= 0 and _i_aux > 0 and _i_api > 0
-                      and _i_guard < _i_aux and _i_guard < _i_api)
+                      and _i_feed > 0 and _i_acct > _i_feed
+                      and _i_aux < _i_acct and _i_guard < _i_api)
             acct_ok = (acct_ok
                        and require_live_account(_tq) is None
                        and require_live_account(_ctp) is None
@@ -7634,6 +8566,19 @@ def _run() -> tuple[bool, list[str]]:
         # 换 Figure 就会让之前 mpl_connect 的连接全部静默失效 —— 滚轮缩放
         # 正是这么失灵过一次的，而且界面不会报任何错。
         from matplotlib.backend_bases import MouseEvent
+
+        # 2026-11-20：单因子 / 多因子也改成**后台线程**了（`_start_factor_worker`
+        # 不再只给机器学习开）—— 22 万根 5m × 十几个因子实测几秒，同步跑在主线程
+        # 就是用户报的「策略研究页卡住」。代价是首屏结果不再在窗口构造返回前就位，
+        # 所以这里先等那条线程收工再断言画布；不等的话断的是「还没算完」，
+        # 不是「画布坏了」，会变成随机器快慢时红时绿的假失败。
+        for _ in range(300):
+            app.processEvents()
+            _th = getattr(win, "_f_thread", None)
+            if _th is None or not _th.isRunning():
+                break
+            time.sleep(0.02)
+        app.processEvents()
 
         def _wheel(step: int) -> tuple[int, int]:
             if not rv.canvas_k.fig.axes:
@@ -9980,6 +10925,401 @@ def _run() -> tuple[bool, list[str]]:
 
     check("组合页工作区工具条：工作区一行、资金分配一行", _ws_bar_two_rows)
 
+    def _strat_pnl_three_cols():
+        """策略列表的「品种价格 / 当日盈亏 / 持仓盈亏」三列。
+
+        🔴 口径（2026-11-20 用户两次明确）：「持仓盈亏和当日盈亏都是策略理论上
+        的，和实际账户交易无关」「不需要和实际交易和台账的情况拿来算」。
+
+        所以这两个数只能由 ①理论仓 `target`（signal × lots）②理论建仓价
+        `theo_px`（信号序列倒推）③最新价 决定。台账 `held` / 均价 `cost` /
+        已落袋 `real_day` **一律不参与** —— 这条自检就是钉住这一点：故意把台账
+        写成另一套完全不同的数（持仓、均价、已落袋都给个夸张值），两列必须
+        **一个子儿都不动**。
+
+        还要钉住用户报的那个 bug：**当天开的仓，当日盈亏必须等于持仓盈亏**。
+        以前当日盈亏拿合约的昨结算当成本，IC 11-20 实测 +55,400 vs 持仓 +8,080。
+
+        另外两件事一起钉：均价按成交逐笔累计（同向加权 / 减仓不动 / 反手重设，
+        那是**下单**用的账本，仍在维护）、表头三列在「状态」右边。
+        """
+        from ttrade import strategy_runner as R
+        from ttrade import strategy_store as SStore
+        from ttrade.tqlive import AccountSpec
+
+        spec = AccountSpec(name="__selftest_pnl__", kind="sim")
+        run = R.PortfolioRunner(spec)
+        run.add(SStore.StrategyConfig(
+            sid="__pnl_a", name="自检盈亏", symbol="RB", exchange="SHFE",
+            period="5m", family="factor", factor_mode="single",
+            factor_keys=["rev_5"], account=spec.name))
+        st = run._slots["__pnl_a"]
+        st.underlying = "SHFE.rb2701"
+        st.held.clear()
+        st.cost.clear()
+        st.real_day = 0.0
+        st.real_day_of = ""
+
+        class _Q:
+            last_price = 1200.0
+            pre_close = 1000.0
+
+        # 不连行情：直接把盘口换成固定值。乘数走真实品种信息表（和下单同源）
+        run._contract_quote = lambda sym: _Q()      # noqa: ARG005
+        mult = run._volume_multiple(st)
+        if mult <= 0:
+            raise RuntimeError("RB 的乘数读不到，品种信息表没维护")
+
+        def feed(direction, offset, vol, price):
+            o = R.PendingOrder(order_id=f"o{feed.n}", symbol="SHFE.rb2701",
+                               direction=direction, offset=offset, volume=vol,
+                               price=price, ts=0.0)
+            feed.n += 1
+            run._book(st, o, vol)
+        feed.n = 0
+
+        # 台账照旧按成交记账（下单要用）：开 2 手 @1000、加 3 手 @1100 → 均价 1060
+        feed("BUY", "OPEN", 2, 1000.0)
+        feed("BUY", "OPEN", 3, 1100.0)
+        if st.held.get("SHFE.rb2701") != 5:
+            raise RuntimeError(f"账本手数不对：{st.held}")
+        if abs(st.cost["SHFE.rb2701"] - 1060.0) > 1e-6:
+            raise RuntimeError(f"加仓均价要按手数加权到 1060：{st.cost['SHFE.rb2701']}")
+        feed("SELL", "CLOSE", 2, 1200.0)
+        if abs(st.cost["SHFE.rb2701"] - 1060.0) > 1e-6:
+            raise RuntimeError("减仓不该改均价（卖剩下的还是原来那批）")
+        real = (1200.0 - 1060.0) * 2 * mult
+        if abs(st.real_day - real) > 1e-6:
+            raise RuntimeError(f"当日已实现盈亏算错：{st.real_day} ≠ {real}")
+
+        # ---- 理论口径：只认 target / theo_px / 最新价 ----
+        from ttrade import daylimit as _dl
+
+        st.target = 3                       # 理论 3 手多
+        st.theo_px = 1180.0
+        st.theo_day = _dl.trading_day()     # 今天建的 —— 两个数必须相等
+        st.theo_sig = 1
+        px, day, pos, _note = run._slot_pnl(st)
+        if abs(px - 1200.0) > 1e-9:
+            raise RuntimeError(f"品种价格要取最新价：{px}")
+        pos_want = (1200.0 - 1180.0) * 3 * mult
+        if abs(pos - pos_want) > 1e-6:
+            raise RuntimeError(f"持仓盈亏要按理论建仓价算：{pos} ≠ {pos_want}")
+        if abs(day - pos_want) > 1e-6:
+            raise RuntimeError(
+                f"当天开的理论上仓，当日盈亏必须等于持仓盈亏：{day} ≠ {pos_want}")
+        # 🔴 台账那三个数随便怎么歪，两列都不许动一格
+        st.cost["SHFE.rb2701"] = 500.0
+        st.real_day = 98765.0
+        _px2, day2, pos2, _n2 = run._slot_pnl(st)
+        if (abs(day2 - day) > 1e-9) or (abs(pos2 - pos) > 1e-9):
+            raise RuntimeError(
+                f"改了台账（均价 500、已落袋 98765）两列就变了 —— "
+                f"又去读台账了：day {day2} pos {pos2}")
+        # 隔夜仓：当日基准换成昨结算（1000），持仓仍按建仓价 1180
+        st.theo_day = "2000-01-03"
+        _px3, day3, pos3, _n3 = run._slot_pnl(st)
+        if abs(pos3 - pos_want) > 1e-6:
+            raise RuntimeError(f"隔夜仓的持仓盈亏仍按建仓价：{pos3} ≠ {pos_want}")
+        day3_want = (1200.0 - 1000.0) * 3 * mult
+        if abs(day3 - day3_want) > 1e-6:
+            raise RuntimeError(f"隔夜仓的当日盈亏要按昨结算：{day3} ≠ {day3_want}")
+        # 理论空仓：两列写 0（不是「—」，也不是拿台账顶上）
+        st.target = 0
+        _px4, day4, pos4, _n4 = run._slot_pnl(st)
+        if pos4 != 0.0 or day4 != 0.0:
+            raise RuntimeError(f"理论空仓时两列要写 0：day {day4} pos {pos4}")
+        # 反手：均价必须重设成新方向的价（这是下单用的账本，仍在维护）
+        st.target = 3
+        feed("SELL", "OPEN", 4, 900.0)
+        if st.held.get("SHFE.rb2701") != -1:
+            raise RuntimeError(f"反手后要剩 -1 手：{st.held}")
+        if abs(st.cost["SHFE.rb2701"] - 900.0) > 1e-6:
+            raise RuntimeError(
+                f"反手后均价要重设成 900（不能沿用旧仓的 1060）："
+                f"{st.cost['SHFE.rb2701']}")
+
+        # ---- 理论建仓价怎么倒推：信号最后一波翻向的下一根 ----
+        import pandas as _pd
+        # 每边成本必须是正数（成本档位 / 品种信息表读到了）。量完先把它抹成 0，
+        # 后面几段只测「取哪根 bar / 复权折算」，免得数字里混着成本看不清。
+        # 🔴 必须在**和断言同一个价格**上量：手续费那一路是「按成交额」收的
+        # （`fee = fee_val × px`），在 100 上量、在 10 上比，会差 10 倍
+        # ——2026-11-20 就是这么红过一次（11.0001 vs 11.001）。
+        _c = run._side_cost_px(st, 10.0)
+        if not (_c > 0):
+            raise RuntimeError(
+                "每边成本算出来是 0（成本档位或品种信息表没读到）——"
+                "「开仓价 = 开盘价 + 成本」就退化成开盘价了")
+        run._side_cost_px = lambda _st, _px: 0.0
+        idx = _pd.date_range("2026-11-16", periods=6, freq="D")
+        frame = _pd.DataFrame({"close": [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]},
+                              index=idx)
+        sig = _pd.Series([0, 0, 1, 1, 1, 1], index=idx)
+        st2 = run._slots["__pnl_a"]
+        st2.theo_px, st2.theo_day, st2.theo_sig, st2.theo_src = 0.0, "", 0, ""
+        run._note_theo_entry(st2, frame, sig)
+        # 信号在 11-18 那根翻成 1 → 11-19 成交 → 建仓价取 11-19 的 close=13
+        if abs(st2.theo_px - 13.0) > 1e-9:
+            raise RuntimeError(
+                f"理论建仓价要取「翻向那根的下一根」收盘：{st2.theo_px}（应 13）")
+        if st2.theo_day != "2026-11-19":
+            raise RuntimeError(f"理论建仓交易日算错：{st2.theo_day}（应 2026-11-19）")
+        # 幂等：同一帧再算一次结果必须一样（**不是**「跳过重算」—— 那个缓存会
+        # 把降级帧算出的错值锁死，见 2026-11-20 16:49 那次「没有本地历史」）
+        run._note_theo_entry(st2, frame, sig)
+        if abs(st2.theo_px - 13.0) > 1e-9 or st2.theo_day != "2026-11-19":
+            raise RuntimeError(
+                f"重算后建仓价/日变了（应当幂等）：{st2.theo_px} @ {st2.theo_day}")
+        # 🔴 降级帧算出的错值必须能**自愈**：换一段「一直是多」的信号，建仓价要
+        # 跟着挪到最早那根之后 —— 服务过 16:49 那种「没有本地历史」的帧以后，
+        # 库内前复权回来了就得纠正过来，不能一直挂着错价。
+        frame2 = _pd.DataFrame({"close": [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]},
+                               index=idx)
+        run._note_theo_entry(st2, frame2,
+                             _pd.Series([1, 1, 1, 1, 1, 1], index=idx))
+        if abs(st2.theo_px - 11.0) > 1e-9 or st2.theo_day != "2026-11-17":
+            raise RuntimeError(
+                f"旧建仓价没跟着新帧更新（会锁死错值）："
+                f"{st2.theo_px} @ {st2.theo_day}（应 11.0 @ 2026-11-17）")
+        # 前复权帧 → 建仓价必须折回**原始价**（和实时报价同一口径）
+        frame3 = _pd.DataFrame({"close": [10.0, 11.0, 20.0, 20.0, 20.0, 20.0],
+                                "adj_factor": [1.0, 1.0, 2.0, 2.0, 2.0, 2.0]},
+                               index=idx)
+        run._note_theo_entry(st2, frame3, _pd.Series([0, 0, 1, 1, 1, 1], index=idx))
+        if abs(st2.theo_px - 10.0) > 1e-9:
+            raise RuntimeError(
+                f"前复权价没折回原始价：{st2.theo_px}（20 / adj 2.0 应当 10）")
+        # 🔴 成交价取**下一根的开盘**（不是收盘），且加上每边成本。
+        # 用户 2026-11-20：「开仓价格是开盘价格+成本，收盘价格比这个低，应该有
+        # 亏损，不是 0」—— 取收盘价时「今天开的仓」理论价正好等于今天的收盘价，
+        # 两列永远显示 0。
+        del run._side_cost_px                       # 还原真实现
+        frame4 = _pd.DataFrame({"open": [10.0] * 6, "close": [10.0] * 6,
+                                "adj_factor": [1.0] * 6}, index=idx)
+        run._note_theo_entry(st2, frame4,
+                             _pd.Series([0, 1, 1, 1, 1, 1], index=idx))
+        if abs(st2.theo_px - (10.0 + _c)) > 1e-9:
+            raise RuntimeError(
+                f"多头开仓价要取「翻向下一根的开盘 + 成本」：{st2.theo_px}"
+                f"（应 {10.0 + _c}）")
+        run._note_theo_entry(st2, frame4,
+                             _pd.Series([0, -1, -1, -1, -1, -1], index=idx))
+        if abs(st2.theo_px - (10.0 - _c)) > 1e-9:
+            raise RuntimeError(
+                f"空头开仓价要「开盘 − 成本」（卖贱）：{st2.theo_px}"
+                f"（应 {10.0 - _c}）")
+        # 信号归零 → 清掉建仓价
+        run._note_theo_entry(st2, frame, _pd.Series([0, 0, 0, 0, 0, 0], index=idx))
+        if st2.theo_px or st2.theo_sig:
+            raise RuntimeError("信号归零后要清掉理论建仓价")
+
+        # 🔴 **主口径：理论建仓价由策略自己写**（用户 2026-11-20：
+        # 「开仓价格应该就是根据策略来，而不是自己设定一个规则」
+        # 「理论开仓价格，应该是从实盘策略中直接获取，不然如果 k 线中开仓，
+        #  又算不对了」）。优先级 下单价 > 触发价 > 推断，低档不许盖高档。
+        st2.theo_px, st2.theo_day, st2.theo_sig, st2.theo_src = 0.0, "", 0, ""
+        st2.target = 3
+        run._note_order_entry(st2, 3, 5000.0)
+        if abs(st2.theo_px - 5000.0) > 1e-9 or st2.theo_src != R.THEO_ORDER:
+            raise RuntimeError(
+                f"策略的下单价没记成理论建仓价：{st2.theo_px} / {st2.theo_src}")
+        if st2.theo_day != _dl.trading_day():
+            raise RuntimeError(f"下单价要落在今天的交易日上：{st2.theo_day}")
+        # 同向再来一笔（加仓）不许改建仓价：改了持仓盈亏会凭空涨一截
+        run._note_order_entry(st2, 2, 5100.0)
+        if abs(st2.theo_px - 5000.0) > 1e-9:
+            raise RuntimeError(f"同向加仓把建仓价刷成 {st2.theo_px} 了")
+        # 平仓单更不许写：减仓的价不是建仓价
+        run._note_order_entry(st2, -3, 3000.0)
+        if abs(st2.theo_px - 5000.0) > 1e-9:
+            raise RuntimeError(f"平仓单把建仓价刷成 {st2.theo_px} 了")
+        # 显示层的推断（下一根开盘 + 成本）不许盖真实下单价
+        run._note_theo_entry(st2, frame4, _pd.Series([0, 1, 1, 1, 1, 1], index=idx))
+        if abs(st2.theo_px - 5000.0) > 1e-9:
+            raise RuntimeError(
+                f"「下一根开盘」的推断裂把真实下单价盖掉了：{st2.theo_px}")
+        # K 线内触发价：它就是策略给的价，叠一层每边成本（触发价不含滑点）
+        st2.theo_px, st2.theo_day, st2.theo_sig, st2.theo_src = 0.0, "", 0, ""
+        _c900 = run._side_cost_px(st2, 900.0)
+        run._note_ib_entry(st2, 900.0, 1)
+        if abs(st2.theo_px - (900.0 + _c900)) > 1e-9 or st2.theo_src != R.THEO_IB:
+            raise RuntimeError(
+                f"K 线内触发价没记成建仓价：{st2.theo_px}"
+                f"（应 {900.0 + _c900}）/ {st2.theo_src}")
+        # 紧跟着的那一笔真实委托要能把它升成「下单价」
+        run._note_order_entry(st2, 3, 905.0)
+        if abs(st2.theo_px - 905.0) > 1e-9 or st2.theo_src != R.THEO_ORDER:
+            raise RuntimeError(
+                f"触发价没被真实下单价升上去：{st2.theo_px} / {st2.theo_src}")
+        # 方向翻了 ⇒ 新的一仓，无条件覆盖
+        st2.target = -2
+        run._note_order_entry(st2, -2, 880.0)
+        if abs(st2.theo_px - 880.0) > 1e-9 or st2.theo_sig != -1:
+            raise RuntimeError(
+                f"翻向后建仓价没重设：{st2.theo_px} / sig {st2.theo_sig}")
+        # 方向对不上（手上是上一波的价）⇒ 两列必须写「—」，不能拿旧价算
+        # （拿旧价算会把盈亏符号直接反掉）
+        st2.theo_px, st2.theo_day, st2.theo_sig, st2.theo_src = (
+            1000.0, _dl.trading_day(), 1, R.THEO_ORDER)
+        st2.target = -2
+        _p5, _d5, _q5, _n5 = run._slot_pnl(st2)
+        if not (_q5 != _q5):
+            raise RuntimeError(
+                f"理论仓方向和建仓价对不上时不能出数：pos {_q5} note {_n5}")
+        st2.target = 0
+
+        # 清空账本，免得写进真实的持仓文件
+        st.held.clear()
+        st.cost.clear()
+        R.positionbook.forget(spec.label(), "__pnl_a")
+
+        # ---- 界面三列 ----
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])      # noqa: F841
+        from gui.portfolio_page import PortfolioPage
+
+        page = PortfolioPage()
+        try:
+            page._items = []
+            t = page.tbl_strat
+            hdr = [t.horizontalHeaderItem(j).text() for j in range(t.columnCount())]
+            want = ["品种价格", "当日盈亏", "持仓盈亏"]
+            for name in want:
+                if name not in hdr:
+                    raise RuntimeError(f"策略表没有「{name}」列：{hdr}")
+            if hdr.index("状态") > hdr.index("品种价格"):
+                raise RuntimeError(f"这三列要在「状态」右边：{hdr}")
+            t.setRowCount(1)
+            page._render_pnl(t, 0, {"price": 1200.0, "day_pnl": 1234.0,
+                                    "pos_pnl": -567.0, "underlying": "SHFE.rb2701"})
+            got = [t.item(0, j).text() for j in (7, 8, 9)]
+            if got != ["1,200.00", "+1,234", "-567"]:
+                raise RuntimeError(f"三列填出来的字不对：{got}")
+            # 不知道的数写「—」，不能写 0（0 会被读成「不赚不亏」）
+            page._render_pnl(t, 0, {"price": None, "day_pnl": None,
+                                    "pos_pnl": None, "multi": 27})
+            got = [t.item(0, j).text() for j in (7, 8, 9)]
+            if got != ["—", "—", "—"]:
+                raise RuntimeError(f"算不出来的格子要写「—」：{got}")
+        finally:
+            page.deleteLater()
+        return ("理论口径：台账改成 500/98765 两列一格不动、当天开的仓当日≡持仓、"
+                "隔夜仓按昨结算、空仓写 0；建仓价由策略自己写（下单价 > 触发价 >"
+                "推断，加仓/平仓/推断都不许盖下单价）；方向对不上写「—」；"
+                "均价加权 1060/减仓不动/反手重设 900；"
+                "三列在「状态」右侧且不知道时写「—」")
+
+    check("策略列表：品种价格 / 当日盈亏 / 持仓盈亏", _strat_pnl_three_cols)
+
+    def _strat_total_row():
+        """策略表最后一行「合计」—— 用户 2026-11-20 要的统计行。
+
+        要钉住三件事：
+
+        - 合计 = **各条策略的当日盈亏 / 持仓盈亏相加**，口径和上面每一行一样；
+        - 只加**父行**：展开出来的品种行是一条策略内部的拆分，一起加就把它
+          算了两遍（这是这类汇总行最容易犯的错）；
+        - 有策略算不出来（`None`）时，合计只加算得出来的那部分，并标一个 `*`
+          —— 写「—」会让整行失去意义，按 0 算又是在撒谎。
+        """
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])      # noqa: F841
+        from gui.portfolio_page import PortfolioPage
+        from ttrade import strategy_store as SStore
+
+        def _cfg(sid, name):
+            return SStore.StrategyConfig(
+                sid=sid, name=name, symbol="RB", exchange="SHFE", period="5m",
+                family="factor", factor_mode="single", factor_keys=["rev_5"],
+                account="__selftest_total__")
+
+        c1, c2, c3 = _cfg("__tot_a", "甲"), _cfg("__tot_b", "乙"), _cfg("__tot_c", "丙")
+        page = PortfolioPage()
+        try:
+            page._items = [c1, c2, c3]
+            page._slot_multi = {}
+            page._slot_view = {
+                "__tot_a": {"price": 1200.0, "day_pnl": 1234.0, "pos_pnl": -567.0,
+                            "target": 3, "lots": 3, "multi": 0, "running": True,
+                            "underlying": "SHFE.rb2701"},
+                "__tot_b": {"price": 900.0, "day_pnl": -234.0, "pos_pnl": 100.0,
+                            "target": -1, "lots": 1, "multi": 0, "running": True,
+                            "underlying": "SHFE.rb2701"},
+                # 丙：算不出来（没行情 / 乘数没维护）
+                "__tot_c": {"price": None, "day_pnl": None, "pos_pnl": None,
+                            "target": 0, "lots": 0, "multi": 0, "running": False,
+                            "underlying": ""},
+            }
+            page._rows = []
+            page._fill_strategies()
+            page._render()
+            t = page.tbl_strat
+            last = t.rowCount() - 1
+            if last != len(page._rows):
+                raise RuntimeError(
+                    f"合计行要正好在最后一行：row {last} / 数据 {len(page._rows)} 行")
+            if not t.item(last, 0).text().startswith("合计"):
+                raise RuntimeError(f"最后一行的名字不对：{t.item(last, 0).text()}")
+            # 甲 + 乙；丙算不出来 ⇒ 只加两个，并打 *
+            got_day = t.item(last, 8).text()
+            got_pos = t.item(last, 9).text()
+            if got_day != "+1,000*" or got_pos != "-467*":
+                raise RuntimeError(
+                    f"合计行数字不对：day {got_day} pos {got_pos}"
+                    f"（应 +1,000* / -467*）")
+            # 单行还是各自的数，没有被合计行污染
+            if t.item(0, 8).text() != "+1,234" or t.item(0, 9).text() != "-567":
+                raise RuntimeError(
+                    f"第一条策略那一行被改了：{t.item(0, 8).text()} / "
+                    f"{t.item(0, 9).text()}")
+            # 三条都能算 ⇒ 没有星号
+            page._slot_view["__tot_c"] = dict(
+                page._slot_view["__tot_b"], day_pnl=0.0, pos_pnl=0.0, price=900.0)
+            page._render()
+            if t.item(last, 8).text() != "+1,000" or t.item(last, 9).text() != "-467":
+                raise RuntimeError(
+                    f"三条都算得出来时不该带 *：{t.item(last, 8).text()} / "
+                    f"{t.item(last, 9).text()}")
+            # 🔴 展开多品种：子行不许被加进合计（不然那一条算两遍）
+            c4 = SStore.StrategyConfig(
+                sid="__tot_d", name="丁", symbol="RB", exchange="SHFE",
+                period="5m", family="factor", factor_mode="single",
+                factor_keys=["rev_5"], account="__selftest_total__",
+                multi_symbols=["RB", "HC"])
+            page._items = [c4]
+            page._expanded = {"__tot_d"}
+            page._slot_multi = {
+                "__tot_d": {
+                    "": {"price": 1200.0, "day_pnl": 50.0, "pos_pnl": -20.0,
+                         "target": 1, "lots": 1, "multi": 0, "running": True,
+                         "underlying": "SHFE.rb2701"},
+                },
+            }
+            page._slot_view = {}
+            page._fill_strategies()
+            page._render()
+            t = page.tbl_strat
+            if t.rowCount() != 1 + 2 + 1:
+                raise RuntimeError(
+                    f"展开后该是「父 1 + 子 2 + 合计 1」四行：{t.rowCount()}")
+            last = t.rowCount() - 1
+            if t.item(last, 8).text() != "+50" or t.item(last, 9).text() != "-20":
+                raise RuntimeError(
+                    f"子行被算进合计了（应当只加父行）："
+                    f"{t.item(last, 8).text()} / {t.item(last, 9).text()}")
+            if not t.item(last, 0).text().endswith("1 条策略）"):
+                raise RuntimeError(f"合计行数错了：{t.item(last, 0).text()}")
+        finally:
+            page.deleteLater()
+        return ("合计行在最后一行：甲 +1,234/−567 与 乙 −234/+100 相加得 "
+                "+1,000/−467；有策略算不出来时标 *；单行数字不受影响；"
+                "多品种展开后子行不加进合计（只有 1 条策略的量）")
+
+    check("策略列表：最后一行「合计」", _strat_total_row)
+
     check("交易页：持仓当日盈亏 / 成交平仓盈亏 / CTP 委托时间 / 报价框", _trade_pnl_quote)
 
     # 跑完就把进度文件收掉：留着会让下一轮的诊断以为"上次崩过"。
@@ -9997,6 +11337,13 @@ def _run() -> tuple[bool, list[str]]:
 def run() -> int:
     """执行自检并返回退出码。"""
     from ttrade.paths import log_dir
+
+    # 自检**不许连真行情**：`MainWindow` 一建就会调 `MarketFeed.warm_up()`，
+    # 那会拿用户的账号去登录一次天勤 —— 离线跑必红、联网跑又要等几秒，还会让
+    #「构建主窗口」那一项随网络时红时绿。开关只有 `market_feed.AUTO_CONNECT` 一处。
+    from ttrade import market_feed as _mf
+
+    _mf.AUTO_CONNECT = False
 
     # 🔴 段错误时进程直接死，`lines` 来不及落盘，`try/except Exception` 也抓不到。
     # faulthandler 能把崩溃瞬间的栈写下来，但它**不能常开**：它会把 Qt / 原生库

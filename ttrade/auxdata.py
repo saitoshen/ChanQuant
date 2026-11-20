@@ -383,6 +383,42 @@ def attach_intraday(
     return out
 
 
+def attach_for_period(
+    df: pd.DataFrame,
+    symbol: str,
+    exchange: str,
+    period: str,
+    aux_dir: str | None = None,
+) -> pd.DataFrame:
+    """按**周期**选对齐口径：日线同日、分钟隔一个交易日。全平台唯一入口。
+
+    🔴 这里原来没有这个函数，两处各写一遍，然后就漂了：
+
+    - 研究页 `gui.app.DataStore.get()`：`is_daily(period)` → `attach()`（同日）
+    - 实盘 `strategy_runner._with_aux()`：**不分周期**，一律 `attach_intraday()`
+
+    `attach_intraday` 会把衍生快照整体 `shift(1)`（分钟线 09:05 不可能知道当天
+    15:00 收盘才有的近远月价差）。于是同一个 `1d_tq` 策略，回测吃「当天」的
+    期限结构、实盘吃「昨天」的 —— 展期那两个因子差一天，分数就分叉：
+
+    2026-11-20 棕榈油实测，同一段行情、同一份配置，只换 aux 口径：
+        不挂 aux            score=-0.8160  signal= 0
+        attach()    同日    score=-1.2259  signal= 0   ← 研究页，「当前状态：空仓」
+        attach_intraday 隔日 score=-1.3808  signal=-1   ← 实盘，理论 -2 手
+    差 0.15 分就跨过了 `exit_z`，一个空仓、一个还持着空单。用户看到的
+    「回测已经出场、这边理论还是 2 手空单」就是这么来的。
+
+    日线用同一天不算偷未来：日线策略本来就「收盘定信号、下一根开盘成交」，
+    那一刻的期限结构已经算完了（见 `attach()` 的注释）。
+
+    `2d` / `1w` 由日线合成，跟着日线走。
+    """
+    from .tqdata import is_daily          # 局部导入，auxdata 不背 tqdata 的依赖
+
+    fn = attach if is_daily(period) else attach_intraday
+    return fn(df, symbol, exchange, aux_dir)
+
+
 def _use_iv_period(aux_dir: str, symbol: str, exchange: str,
                    df: pd.DataFrame) -> str:
     """这段 BAR 的期权 IV 该取哪一档。

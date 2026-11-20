@@ -60,7 +60,7 @@ from PySide6.QtWidgets import (
 )
 
 from ttrade import cross as cross_engine
-from ttrade import factor_metrics, factors, mlmodels, tqdata
+from ttrade import factor_metrics, factors, factors_macro, mlmodels, tqdata
 from ttrade.backtest import drawdown_series, month_matrix, stage_table
 from ttrade.replay import hold_text
 
@@ -456,6 +456,8 @@ class ResultView(QObject):
         self._k_total = 0
         self._k_win = K_WIN_DEFAULT
         self._k_start = 0
+        # 间隔自检的结论（正常是空串）。见 `_frame_spacing()`
+        self._k_spacing = ""
         self._k_last_draw = 0.0
         self._k_pending = False
         # 资金曲线的纵轴：默认线性。对数留给需要看等比例涨跌的曲线
@@ -1086,6 +1088,7 @@ class ResultView(QObject):
         # 把上一张图又摆回来
         self._k_view = None
         self._k_total = 0
+        self._k_spacing = ""
         self._k_score = None      # 上一个策略的分数不能留着，信息框会读到它
         self._pending_draw.clear()
         self.pages()
@@ -1160,6 +1163,49 @@ class ResultView(QObject):
         c = self.ctx
         return {"symbol": c.symbol, "name": c.name, "exchange": c.exchange}
 
+    def _frame_spacing(self, view) -> str:
+        """自检：窗口里 bar 的间隔和「声明的周期」是不是一回事。
+
+        2026-11-20 用户报「白银的 K 线画成了一片虚线，是不是取数坏了」。查下来
+        库里和回放都是干净的日线（493 根、无重复、无单日多根），也就是图上那
+        一团要么是**混进了更细的周期**，要么纯粹是蜡烛太密画不开。这两种情况的
+        处置完全不同，而**肉眼分不出来** —— 一根 3 像素宽的蜡烛和一根被压扁的
+        蜡烛看着都是虚线。
+
+        所以判据放在出图这一侧：一批正常的 bar，相邻间隔只会等于周期（遇到周末
+        / 假期只会**变长**，绝不会变短）。窗口里出现明显短于众数的间隔，就说明
+        这份 frame 里混了更细周期的 bar —— `replay.run` 不按 `cfg.period` 重采样，
+        它信的是调用方给的那份，混进来就直接画。
+
+        正常时返回空串（一个字都不显示）。只在 `_draw_kline` 里算一次：滚动 /
+        缩放不动数据，没必要每帧重算。
+        """
+        try:
+            n = len(view)
+            if n < 4:
+                return ""
+            secs = pd.Series(view.index).diff().dropna().dt.total_seconds()
+            if secs.empty:
+                return ""
+            base = float(secs.mode().iloc[0])
+            if base <= 0:
+                return ""
+            dense = int(((secs > 0) & (secs < base * 0.5)).sum())
+            if dense < 2 or dense / len(secs) <= 0.02:
+                return ""
+
+            def hm(v: float) -> str:
+                if v < 3600:
+                    return f"{v / 60:g} 分钟"
+                if v < 86400:
+                    return f"{v / 3600:g} 小时"
+                return f"{v / 86400:g} 天"
+
+            return (f"⚠ 有 {dense:,} 根的间隔只有 {hm(float(secs.min()))}，"
+                    f"其余是 {hm(base)} —— 这份数据混进了更细的周期")
+        except Exception:  # noqa: BLE001 - 自检不能反过来把出图搞挂
+            return ""
+
     def _draw_kline(self, keep_window: bool = False) -> None:
         """切好数据、定好可视窗口，再交给 _render_kline 画。
 
@@ -1184,6 +1230,7 @@ class ResultView(QObject):
         old_total, old_start, old_win = self._k_total, self._k_start, self._k_win
         self._k_view = view
         self._k_total = len(view)
+        self._k_spacing = self._frame_spacing(view)
         if keep_window and old_total > 0:
             # 实时刷新不该动用户的位置。原来贴着右端看的，就跟着新右端走；
             # 已经滚到历史里去的，原地不动 —— 否则每 5 秒被拽回最新一次
@@ -1741,8 +1788,10 @@ class ResultView(QObject):
             merged = f"（由 {src[0]} × {src[1]} 合并）" if src[1] > 1 else ""
             source = f"天勤换月前复权{merged}"
         shown = f"{start + 1:,}–{start + win:,}"
+        # 间隔异常放在**最前面**：这是「图看着不对」的第一解释，藏在末尾没人读
+        warn = f"{self._k_spacing} · " if self._k_spacing else ""
         self.lbl_chart_title.setText(
-            f"全历史 {len(self.df):,} 根 · 当前显示第 {shown} 根"
+            f"{warn}全历史 {len(self.df):,} 根 · 当前显示第 {shown} 根"
             f"（窗口 {win:,} 根）· 滚轮缩放 / 拖下方滚动条看历史 · {source}"
         )
 
@@ -1844,6 +1893,24 @@ class ResultView(QObject):
             v = float(sc[i])
             if np.isfinite(v):
                 lines.append(f"因子分 {v:+.2f}")
+        # 日频宏观因子（汇率 / 美元指数 / 美债）把「取自哪一天」写在光标上。
+        # 这类值日内恒定、图上是一条台阶，看不出台阶是从哪一行搬来的；
+        # 「这根用的是 D 还是 D−1」只能靠日期回答（2026-11-20 用户问的就是这个）。
+        # 取数口径与回测同一个函数（`factors_macro.asof_row`），不会各说一套。
+        for key in (self.selected_keys or []):
+            code = str(key).split("@")[0]
+            if not code.startswith("macro_"):
+                continue
+            code = code[len("macro_"):]
+            lab = factors_macro._LABEL.get(code)
+            if not lab:
+                continue
+            try:
+                row = factors_macro.asof_row(code, ts)
+            except Exception:  # noqa: BLE001 - 光标不该因为查日期而报错
+                continue
+            if row is not None and not pd.isna(row):
+                lines.append(f"{lab} 取自 {row:%Y-%m-%d}")
         for note in self._k_notes.get(ts, []) or []:
             lines.append(note)
         return "\n".join(lines)

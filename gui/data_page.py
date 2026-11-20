@@ -1023,21 +1023,24 @@ class DataPage(QWidget):
         self.lbl_macro_stats.setObjectName("Hint")
         self.lbl_macro_stats.setWordWrap(True)
         self.lbl_macro_stats.setToolTip(
-            "23 条宏观序列，写 data_tq/edb.duckdb 的 macro_series 表。\n\n"
+            "25 条宏观序列，写 data_tq/edb.duckdb 的 macro_series 表。\n\n"
             "数据源：Tushare（SHIBOR / 美债收益率 / 外汇 / 全球指数 / CPI·PPI·M / 社融 / GDP）\n"
-            "＋ 东方财富（制造业 PMI）；美元指数按 ICE 官方公式用六种货币合成。\n"
+            "＋ 东方财富（制造业 PMI；以及美元兑离岸人民币、美元指数的**独立口径**，\n"
+            "   与 Tushare 那两条并存，用来核对标签偏移）。\n"
+            "美元指数按 ICE 官方公式用六种货币合成。\n"
             "**LPR 1 年 / 5 年没有数据源**（中国货币网接口已下线），只保留定义，不造假数据。\n\n"
-            "频率：日频 15 条、月频 7 条、季频 1 条。日频每交易日盘后更新一次即可，\n"
+            "频率：日频 17 条、月频 7 条、季频 1 条。日频每交易日盘后更新一次即可，\n"
             "月频/季频在公布日更新。增量会从库里最后一天往前推 400 天重抓，\n"
             "覆盖 GDP 初值/终值、社融这类会被修订的指标。\n\n"
-            "**不会用到未来数据**：入库时间 = 发布日，因子层再滞后 1 个日历日，\n"
-            "5m / 1h 当天所有 bar 只能看到 T-1 及更早的宏观值。"
+            "**不会用到未来数据**：入库时间 = 发布日，因子层再按「发布时刻 + 标签错位」滞后\n"
+            "（多数退 1 个日历日；Tushare 外汇表的标签比真实交易日早一天，退 2 天；\n"
+            "汇率、美债、美股指要 08:00 之后才可用），5m / 1h 的每根 bar 只看到已发布的那一行。"
         )
         lay.addWidget(self.lbl_macro_stats, 1)
 
         self.btn_macro = QPushButton("更新宏观因子")
         self.btn_macro.setToolTip(
-            "抓全部 23 条序列（增量）。全量约 6.8 万行、3 MB，第一次十几秒。\n"
+            "抓全部 25 条序列（增量）。全量约 10 万行、4 MB，第一次十几秒。\n"
             "已经是增量：只补库里最后一天之后的部分，并回看 400 天覆盖修订。"
         )
         # 显式包一层：`clicked` 会带一个 `checked` 布尔，直接连会被当成 `auto`
@@ -1155,7 +1158,13 @@ class DataPage(QWidget):
         # 摆出来的话，用户看着「开始补充」其实是在取消，等于没有出口
         self.btn_update.setText("取消")
         self.btn_update.setEnabled(True)
-        self._log("—— 更新宏观因子（23 条序列，Tushare + 东方财富）")
+        try:
+            from ttrade import macro as _MAC
+
+            _n = len(_MAC.SERIES)
+        except Exception:  # noqa: BLE001
+            _n = 0
+        self._log(f"—— 更新宏观因子（{_n or '全部'} 条序列，Tushare + 东方财富）")
         self._macro_thread.start()
 
     def _on_macro_done(self, st: dict) -> None:

@@ -171,6 +171,9 @@ C_DOWN = "#0f9d58"
 C_OK = "#16a34a"
 C_BAD = "#dc2626"
 C_IDLE = "#94a3b8"
+#: 策略表最后一行「合计」的底色。浅灰蓝，和上面每一行的数据区分开，
+#: 又不至于像选中行（系统高亮）那样抢眼
+C_TOTAL_BG = "#eef2f7"
 
 
 def _int(v) -> int:
@@ -184,6 +187,10 @@ def _int(v) -> int:
 #: 柜台账户的**历史行情仍然读本地天勤数据**（`data_tq` 的主连 5m/1h），
 #: 只有实时行情和下单走柜台 —— 柜台本身不提供历史 K 线。
 BROKER_HINT = "实时行情/下单走柜台，历史行情读本地天勤数据"
+
+#: 没绑账户的那一组策略的键名。策略和账户解耦之后，一个 runner 可以完全不
+#: 挂账户 —— 信号照算、理论仓位照显示，接入账户时才真正开始报单。
+NO_ACCOUNT_KEY = "（未接账户）"
 
 
 def auto_ok(spec) -> bool:
@@ -218,6 +225,34 @@ def _pos_text(actual, r: dict) -> str:
     if r.get("locked"):
         return f"{actual}（多{r.get('a_long')} 空{r.get('a_short')}）"
     return f"{actual:+d} 手"
+
+
+def split_alignable(snaps: dict) -> tuple[dict, list]:
+    """把「可以对齐的账户」和「账户没登录的」分开。
+
+    返回 `(可对齐的 {账户: mismatch 行}, ['账户（N 个合约）', …])`。
+
+    🔴 **为什么必须分开**（2026-11-20 用户要求）：账户没登录时 `api is None`，
+    `align()` 会一句「账户没有接进来」直接返回 0 —— 于是用户点了确认，对话框
+    里明明列着一堆合约，实际一笔都没发，还以为是按钮坏了。更糟的是那种「半登录」
+    状态：`_pos` 还是上次登出前的旧数，`mismatch` 照常算出差额，看起来一切正常。
+
+    所以判据放在**账户登录**这一层（`api is not None`），不是行情、也不是
+    `pos_ready`：行情连着不代表账户登着（`alive` 看的是 feed）。
+
+    没有 mismatch 的账户两边都不进 —— 不登也不报，免得每次点都刷一排无关账户。
+    """
+    ready: dict[str, list] = {}
+    blocked: list[str] = []
+    for key, snap in (snaps or {}).items():
+        rows = snap.get("mismatch") or []
+        if not rows:
+            continue
+        if not snap.get("account_ready", True):
+            blocked.append(f"{key}（{len(rows)} 个合约）")
+            continue
+        ready[key] = rows
+    return ready, blocked
 
 
 def _delta_text(r: dict) -> str:
@@ -603,7 +638,13 @@ class PortfolioController(QObject):
         return list(self._workers)
 
     def start(self, spec, cfgs: list, chase) -> None:
-        key = spec.name
+        """起一条 runner。`spec` 可以为 None —— **没接账户也能起策略**。
+
+        2026-11-20 起账户只是「最后一步」：行情走全局 `MarketFeed`，账户只负责
+        下单。所以这里不再要求 spec 非空，键名退化成 `NO_ACCOUNT_KEY`，等用户
+        在交易页接入账户时再 `attach()`。
+        """
+        key = spec.name if spec is not None else NO_ACCOUNT_KEY
         if key in self._workers:
             return
         worker = RunnerWorker(key, spec, cfgs, chase)
@@ -641,6 +682,20 @@ class PortfolioController(QObject):
         if not self._workers:
             self.stopped.emit()
 
+    # ---- 账户：接入 / 登出（策略不停） ----
+
+    def attach(self, key: str, spec) -> bool:
+        """给正在跑的 runner 接入 / 切换账户。**不重启策略、不清 K 线缓存。**
+
+        这是「账户是最后一步」的落地点：先起策略（有行情就算信号），用户想
+        真下单时再把账户接进来；柜台账户日终登出、次日登录，策略一直不停。
+        """
+        return self._submit(key, lambda r: r.attach_account(spec))
+
+    def detach(self, key: str) -> bool:
+        """登出账户，策略继续跑（只算信号、不下单）。"""
+        return self._submit(key, lambda r: r.detach_account())
+
     # ---- 操作：全部排队给对应账户的 worker ----
 
     def _submit(self, key: str, fn) -> bool:
@@ -670,8 +725,14 @@ class PortfolioController(QObject):
     def update_cfg(self, key: str, cfg) -> bool:
         return self._submit(key, lambda r: r.update(cfg))
 
-    def align(self, key: str) -> bool:
-        return self._submit(key, lambda r: r.align())
+    def align(self, key: str, rows=None) -> bool:
+        """`rows` = 确认框里给用户看过的那几行（含当时的 多/空 两条腿）。
+
+        运行时以它为准：没在框里出现过的合约一笔都不发；框里的合约如果持仓已经
+        变了，也跳过并写原因。以前这里什么都不传，`align()` 自己重算一遍
+        `mismatch`，两份数据不同步时会把用户没确认过的仓也动了（2026-11-20）。
+        """
+        return self._submit(key, lambda r: r.align(rows=rows))
 
     def req_bars(self, key: str, sids: list) -> bool:
         """让引擎在下一份快照里带上这些策略的实时 K 线。"""
@@ -1338,6 +1399,17 @@ class PortfolioPage(QWidget):
         self.btn_stop.clicked.connect(self._stop_all)
         lay.addWidget(self.btn_stop)
 
+        # 账户的接 / 脱：**策略不停**。实盘账户日终要登出、次日登录，策略本身
+        # 是 7×24 的 —— 这两件事绑在一起就没法跑通（2026-11-20 重构）
+        self.btn_acct = QPushButton("登录账户")
+        self.btn_acct.setObjectName("Ghost")
+        self.btn_acct.setToolTip(
+            "把账户接进正在跑的策略（或全部登出）。\n"
+            "登出后策略继续算信号、显示理论仓位，只是不发单。")
+        self.btn_acct.clicked.connect(self._toggle_accounts)
+        self.btn_acct.setEnabled(False)
+        lay.addWidget(self.btn_acct)
+
         self.lbl_dot = QLabel("●")
         self.lbl_dot.setStyleSheet(f"color: {C_IDLE}; font-size: 15px;")
         lay.addWidget(self.lbl_dot)
@@ -1355,6 +1427,12 @@ class PortfolioPage(QWidget):
         lay.addWidget(self.lbl_limit)
 
         lay.addStretch(1)
+        # 行情源：和账户下拉框**互不影响**的一条全局连接。策略不用等账户登录
+        # 就能跑（见 `RunnerWorker`），行情从这条来
+        from .feed_bar import FeedBar
+
+        self.feed_bar = FeedBar(self)
+        lay.addWidget(self.feed_bar)
         self.lbl_msg = QLabel("")
         self.lbl_msg.setObjectName("Hint")
         lay.addWidget(self.lbl_msg)
@@ -1473,6 +1551,7 @@ class PortfolioPage(QWidget):
 
         self.tbl_strat = self._table(
             ["名称", "标的", "策略", "仓位", "账户", "理论", "状态",
+             "品种价格", "当日盈亏", "持仓盈亏",
              "平均开仓占用", "峰值占用", "利用率"]
         )
         # 多选是为了组合报告。双击原来是「启动 / 停止」，但那个动作有同名按钮，
@@ -1490,8 +1569,18 @@ class PortfolioPage(QWidget):
         hint = QLabel(
             "双击一行 = 打开它的 K 线与绩效。按住 Ctrl 多选后点「组合报告」，"
             "看这几条策略等权组合的资金曲线。\n"
+            "「品种价格 / 当日盈亏 / 持仓盈亏」跟着策略实时刷新（约 1 秒一次），"
+            "三个数**全按理论仓算**（理论仓 = 信号 × 手数，与账户成交、台账无关）：\n"
+            "    持仓盈亏 = (最新价 − 理论建仓价) × 理论手数 × 乘数；"
+            "当日盈亏 的基准「今天开的仓用建仓价、隔夜仓用昨结算」。\n"
+            "    理论建仓价由**策略自己给出**（下单价 / K 线内触发价），"
+            "所以当天开的仓（没有隔夜仓）两个数必然相等。\n"
+            "最后一行「合计」= 上面所有策略的这两个数相加（展开出来的品种行不重复计）；"
+            "有策略暂时算不出来时，合计只加算得出来的部分，并在数字后面标 `*`。\n"
             "多品种策略的名称前有 ▸：点一下名称（或者双击名称）展开成「一个品种一行」，"
-            "再点名称收起 —— 双击名称不再打开回测，双击别的列才是打开回测。\n"
+            "再点名称收起 —— 支行的价格和盈亏是那个品种自己的，"
+            "父行显示各品种的合计（价格没有合计，写「—」）。\n"
+            "双击名称不再打开回测，双击别的列才是打开回测。\n"
             "「启动 / 停止」只作用于选中的那一条：账户还没连上时会把它的账户单独连上。"
         )
         hint.setObjectName("Hint")
@@ -2090,7 +2179,12 @@ class PortfolioPage(QWidget):
         self._rows = rows
         t.blockSignals(True)
         try:
-            t.setRowCount(len(rows))
+            # 末尾多留一行「合计」（用户 2026-11-20：「策略列表下面增加一行统计
+            # 行，主要统计总的『当日盈亏』和『持仓盈亏』」）。这一行**不进**
+            # `self._rows` —— 所有「按行号取配置」的地方（展开、选中、双击）
+            # 取到 `len(rows)` 就越界返回 None / 空 sid，天然不会误伤它。
+            # 数字由 `_render_total` 每秒填，这里只搭骨架。
+            t.setRowCount(len(rows) + 1)
             for i, row in enumerate(rows):
                 cfg = row["cfg"]
                 child = row["kind"] == "child"
@@ -2128,7 +2222,7 @@ class PortfolioPage(QWidget):
                             f"这条多品种策略里的 {row['key']}\n"
                             f"预算 {size_txt}（总本金 ÷ 品种数）\n"
                             "右侧的「理论 / 状态」是它自己的，不是整条策略的合计")
-                    for j in (5, 6, 7, 8, 9):
+                    for j in (5, 6, 7, 8, 9, 10, 11, 12):
                         t.setItem(i, j, QTableWidgetItem("—"))
                     continue
                 it = t.item(i, 1)
@@ -2148,10 +2242,12 @@ class PortfolioPage(QWidget):
                             "同一条策略挂在这些账户上：\n　" + "\n　".join(accs)
                             + "\n每个账户各算各的手数（各自的本金和保证金），"
                               "策略参数只有一份")
-                for j in (5, 6, 7, 8, 9):
+                for j in (5, 6, 7, 8, 9, 10, 11, 12):
                     t.setItem(i, j, QTableWidgetItem("—"))
+            self._build_total_row(t, len(rows))
             if keep:
-                for i in range(t.rowCount()):
+                # 只扫数据行：最后那一行是「合计」，不在 `self._rows` 里
+                for i in range(min(t.rowCount(), len(self._rows))):
                     # 只选父行：子行带着同一个 sid，一起选中会整片变蓝
                     if self._rows[i]["kind"] != "parent":
                         continue
@@ -2198,7 +2294,12 @@ class PortfolioPage(QWidget):
 
         双击的两次 release 各发一次 `clicked`，会先展开再收起；这里打个时间戳，
         让那两下 `clicked` 直接失效，展开由本函数一次做到位。
+
+        最后一行的「合计」不是策略：双击什么也不做（不然会打开上一条策略的
+        回测，看着像点错了）。
         """
+        if index is not None and int(index.row()) >= len(self._rows):
+            return
         if index is not None and int(index.column()) == 0:
             r = self._multi_row_at(int(index.row()))
             if r is not None:
@@ -2775,26 +2876,26 @@ class PortfolioPage(QWidget):
         """
         u = self._usages.get(str(cfg.sid))
         if u is None:
-            for j in (7, 8, 9):
+            for j in (10, 11, 12):
                 self._set_cell(t, i, j, "—", C_MUTED)
-            it = t.item(i, 7)
+            it = t.item(i, 10)
             if it is not None:
                 it.setToolTip("还没量。点上面的「量一下占用」跑一遍历史回测")
             return
         if u.avg_margin <= 0:
-            for j in (7, 8, 9):
+            for j in (10, 11, 12):
                 self._set_cell(t, i, j, "—", C_MUTED)
-            it = t.item(i, 7)
+            it = t.item(i, 10)
             if it is not None:
                 it.setToolTip(
                     "量不出来：" + (u.note or "回测里一笔都没开过，没有占用可算"))
             return
         # 金额一律用「万」：26 条策略的占用从几千到几十万，写元位没人读得出量级
-        self._set_cell(t, i, 7, f"{u.avg_margin / 10000:,.2f} 万", C_TEXT)
-        self._set_cell(t, i, 8, f"{u.peak_margin / 10000:,.2f} 万", C_TEXT)
-        self._set_cell(t, i, 9, f"{u.util * 100:.2f}%",
+        self._set_cell(t, i, 10, f"{u.avg_margin / 10000:,.2f} 万", C_TEXT)
+        self._set_cell(t, i, 11, f"{u.peak_margin / 10000:,.2f} 万", C_TEXT)
+        self._set_cell(t, i, 12, f"{u.util * 100:.2f}%",
                        C_BAD if u.util > 0.9 else C_TEXT)
-        it = t.item(i, 7)
+        it = t.item(i, 10)
         if it is not None:
             it.setToolTip(
                 f"每笔开仓时平均压 {u.avg_margin / 10000:,.2f} 万"
@@ -2804,7 +2905,7 @@ class PortfolioPage(QWidget):
                 f"本金 {u.principal / 10000:,.1f} 万，"
                 f"开仓预算 {u.capital / 10000:,.1f} 万，"
                 f"共 {u.bars} 笔")
-        it = t.item(i, 8)
+        it = t.item(i, 11)
         if it is not None:
             it.setToolTip(
                 f"持仓期间压过的最高占用 {u.peak_margin / 10000:,.2f} 万"
@@ -2812,7 +2913,7 @@ class PortfolioPage(QWidget):
                 f"{u.peak_notional / 10000:,.2f} 万）"
                 + (f"\n= 本金的 {u.peak_margin / u.principal * 100:.1f}%"
                    if u.principal > 0 else ""))
-        it = t.item(i, 9)
+        it = t.item(i, 12)
         if it is not None:
             it.setToolTip(
                 "平均开仓占用 ÷ 本金 = **出手时用了分配额的几成**。\n"
@@ -2876,9 +2977,189 @@ class PortfolioPage(QWidget):
         it6 = t.item(i, 6)
         if it6 is not None and it6.toolTip() != tip:
             it6.setToolTip(tip)
+        # 这三列**每个品种自己算**（引擎按子槽位的持仓和成本算好推过来）
+        self._render_pnl(t, i, slot)
         # 占用那三列是「整条策略」量出来的，摊不到单个品种头上
-        for j in (7, 8, 9):
+        for j in (10, 11, 12):
             self._set_cell(t, i, j, "—", C_MUTED)
+
+    @staticmethod
+    def _money_text(v) -> str:
+        """盈亏那两格的字。带符号的元，千分位。
+
+        `None` 是「算不出来」（缺价 / 缺乘数），写「—」；写 0 会被读成
+        「不赚不亏」，那是另一回事。空仓时是真 0，就写 `+0`。
+        """
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):+,.0f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    @staticmethod
+    def _merge_pnl(slots: dict) -> dict:
+        """多账户：各账户的盈亏相加，价格取第一个有值的。
+
+        金额可加（每个账户已经按自己的手数 × 乘数折成元），所以合计有意义；
+        价格不可加，也不需要 —— 同一条策略在各账户上盯的是同一个品种。
+        任何一个账户算不出来就整体写 `None`：半个和比「—」更容易被误读。
+        """
+        day = pos = 0.0
+        px = None
+        note = ""
+        for one in (slots or {}).values():
+            d, p = one.get("day_pnl"), one.get("pos_pnl")
+            if d is None or p is None:
+                day = pos = None
+                note = note or str(one.get("pnl_note") or "")
+                break
+            day += float(d)
+            pos += float(p)
+            if px is None and one.get("price") is not None:
+                px = one["price"]
+            note = note or str(one.get("pnl_note") or "")
+        return {"price": px, "day_pnl": day, "pos_pnl": pos, "pnl_note": note,
+                "underlying": next((v.get("underlying") for v in (slots or {}).values()
+                                    if v.get("underlying")), "")}
+
+    def _render_pnl(self, t, i: int, slot: dict) -> None:
+        """「品种价格 / 当日盈亏 / 持仓盈亏」三格。
+
+        两个数都要有 tooltip 说口径，否则用户一定会问「当日盈亏为什么和我
+        在交易页看到的对不上」—— 交易页那一列是**账户**的，这里是**这条策略
+        自己账本**算的；账户里还混着别的策略和手工单。
+        """
+        px = slot.get("price")
+        day = slot.get("day_pnl")
+        pos = slot.get("pos_pnl")
+        note = str(slot.get("pnl_note") or "")
+        up = slot.get("underlying") or ""
+
+        if px is None:
+            self._set_cell(t, i, 7, "—", C_MUTED)
+            tip7 = "还没有行情（策略没启动，或者这个合约没订上盘口）"
+            if slot.get("multi"):
+                tip7 = ("多品种策略没有「一个」价格 —— 27 个品种各是各的价，"
+                        "点名称展开，逐品种看")
+            it = t.item(i, 7)
+            if it is not None and it.toolTip() != tip7:
+                it.setToolTip(tip7)
+        else:
+            self._set_cell(t, i, 7, f"{float(px):,.2f}", C_TEXT)
+            it = t.item(i, 7)
+            if it is not None and it.toolTip() != (f"{up or '当前合约'} 最新价"):
+                it.setToolTip(f"{up or '当前合约'} 最新价")
+
+        for j, v, why in ((8, day, "day"), (9, pos, "pos")):
+            text = self._money_text(v)
+            if v is None:
+                color = C_MUTED
+            else:
+                f = float(v)
+                color = C_UP if f > 0 else (C_DOWN if f < 0 else C_MUTED)
+            self._set_cell(t, i, j, text, color)
+            it = t.item(i, j)
+            if it is None:
+                continue
+            if why == "day":
+                tip = ("当日盈亏 = (最新价 − 当日基准) × 理论手数 × 乘数。\n"
+                       "当日基准：理论仓**今天**建的 ⇒ 理论建仓价（于是和持仓盈亏相等）；\n"
+                       "隔夜仓 ⇒ 昨结算（只算今天这一天的波动）。\n"
+                       "🔴 两个数都是**策略理论上的** —— 理论仓 = 信号 × 手数，\n"
+                       "不读台账、不读账户成交。实际下没下、成交价多少都不影响它。")
+            else:
+                tip = ("持仓盈亏 = (最新价 − 理论建仓价) × 理论手数 × 乘数。\n"
+                       "理论建仓价**由策略自己给出**：\n"
+                       "　· 正常调仓 ⇒ 这一笔**实际下发**的限价（对手价，已含滑点）；\n"
+                       "　· K 线内进出场 ⇒ 策略算出的**触发价**（叠加每边成本）；\n"
+                       "　· 还没发过委托 ⇒ 按信号翻向那根的下一根开盘倒推（兜底，\n"
+                       "　　　　　　　　　　　和回测 position(t)=signal(t-1) 同一个假设）。\n"
+                       "🔴 不读台账均价、不读账户成交。")
+            if note:
+                tip += "\n" + note
+            if it.toolTip() != tip:
+                it.setToolTip(tip)
+
+    def _build_total_row(self, t, i: int) -> None:
+        """「合计」行的骨架：整行浅底 + 首格写「合计」。
+
+        只搭壳不填数 —— 数字每秒变一次，走 `_render_total`；这里只在重建
+        表格时跑一遍（切账户、加删策略、展开/收起）。
+        """
+        bg = QColor(C_TOTAL_BG)
+        for j in range(t.columnCount()):
+            item = QTableWidgetItem("合计" if j == 0 else "")
+            item.setBackground(bg)
+            item.setForeground(QColor(C_TEXT))
+            if j >= 3:
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if j in (0, 8, 9):
+                # 名称和两个金额加粗：一眼能看出这是汇总，不是又一条策略
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
+            t.setItem(i, j, item)
+
+    def _render_total(self, t, rows: list, i: int) -> None:
+        """最后一行「合计」：所有策略的**当日盈亏 / 持仓盈亏**加起来。
+
+        🔴 只加**父行**（一条策略算一次）。展开出来的品种行是那一条策略内部的
+        拆分，不是额外的钱 —— 一起加，展开的那几条就被算了两遍。
+        🔴 口径和上面每一行**一模一样**（理论仓 × 价格差 × 乘数），不读台账、
+        不读账户成交。它只是各行相加，不是另算一套。
+        🔴 有策略算不出来（`None`：没行情 / 乘数没维护）时，合计只加算得出来
+        的那部分，并在这两格后面打一个 `*`、tooltip 里写清「N 条未计入」。
+        写「—」会让整行失去意义，按 0 算又是在撒谎。
+        """
+        if i < 0 or i >= t.rowCount() or i != t.rowCount() - 1:
+            return
+        day = pos = 0.0
+        n = missing = 0
+        for row in rows:
+            if row.get("kind") != "parent":
+                continue
+            slots = self._slots_of(row["cfg"])
+            n += 1
+            # 多账户：各账户的盈亏相加（和 `_render` 里那一行同一套合并规则）
+            slot = (self._merge_pnl(slots) if len(slots) > 1
+                    else next(iter(slots.values()), {}))
+            d, p = slot.get("day_pnl"), slot.get("pos_pnl")
+            if d is None or p is None:
+                missing += 1
+                continue
+            day += float(d)
+            pos += float(p)
+        star = "*" if missing else ""
+        for j, v in ((8, day), (9, pos)):
+            f = float(v)
+            color = C_UP if f > 0 else (C_DOWN if f < 0 else C_MUTED)
+            self._set_cell(t, i, j, self._money_text(v) + star, color)
+            it = t.item(i, j)
+            if it is not None:
+                fnt = it.font()
+                fnt.setBold(True)
+                it.setFont(fnt)
+                it.setBackground(QColor(C_TOTAL_BG))
+                tip = (f"全部 {n} 条策略的理论盈亏合计"
+                       f"（{'当日' if j == 8 else '持仓'}视角）。\n"
+                       "只加父行 —— 展开出来的品种行是那条策略内部的拆分，"
+                       "不是额外的钱。\n"
+                       + (f"⚠ 有 {missing} 条算不出来（没行情 / 乘数没维护），"
+                          "未计入，所以标了 *。\n" if missing else "")
+                       + "口径和上面每一行完全一样：理论仓 × 价格差 × 乘数，\n"
+                         "不读台账、不读账户成交。")
+                if it.toolTip() != tip:
+                    it.setToolTip(tip)
+        it0 = t.item(i, 0)
+        if it0 is not None:
+            txt = f"合计（{n} 条策略）"
+            if it0.text() != txt:
+                it0.setText(txt)
+            tip0 = (f"{n} 条策略的理论盈亏汇总。\n"
+                    "双击 / 展开那一套在这里不生效 —— 它不是一条策略。")
+            if it0.toolTip() != tip0:
+                it0.setToolTip(tip0)
 
     def _render(self) -> None:
         self._render_ts = time.monotonic()
@@ -2889,7 +3170,10 @@ class PortfolioPage(QWidget):
                                "multi": False} for c in self._items]
         for i, row in enumerate(rows):
             cfg = row["cfg"]
-            if i >= t.rowCount():
+            # 最后一行是「合计」（`rowCount() - 1`），数据行只到它上面一行。
+            # 用 `i + 1` 而不是 `i`：表格还没按当前行数建好时（退回上面那个
+            # 兜底列表），宁可一行都不画，也不许把策略数据写进合计行。
+            if i + 1 >= t.rowCount():
                 break
             if row["kind"] == "child":
                 self._render_child(t, i, cfg, row["key"])
@@ -2900,6 +3184,9 @@ class PortfolioPage(QWidget):
             many = len(slots) > 1
             slot = {} if many else next(iter(slots.values()), {})
             self._render_diag(t, i, cfg)
+            # 价格 / 当日盈亏 / 持仓盈亏。多账户时各账户的盈亏相加（钱是可加的），
+            # 价格取第一个有价的那个（同一条策略盯的还是同一个品种）
+            self._render_pnl(t, i, self._merge_pnl(slots) if many else slot)
             theo = _int(slot.get("target"))
             multi = _int(slot.get("multi"))
             # 仓位列写「口径 → 实际算出来的手数」。手数依赖价格和每手保证金，
@@ -3021,6 +3308,9 @@ class PortfolioPage(QWidget):
             if it is not None and it.toolTip() != tip:
                 it.setToolTip(tip)
 
+        # 最后一行「合计」—— 和上面各行同一轮渲染，数字才会同步
+        self._render_total(t, rows, len(rows))
+
         rows = []
         for key, snap in self._snaps.items():
             for r in snap.get("mismatch") or []:
@@ -3031,13 +3321,16 @@ class PortfolioPage(QWidget):
         # 几十个合约不一致的时候这活儿一秒干一次，主线程就废了
         sig = tuple((k, r["symbol"], r["target"], r["actual"], r["delta"],
                      bool(r.get("managed")), int(r.get("a_long") or 0),
-                     int(r.get("a_short") or 0)) for k, r in rows)
+                     int(r.get("a_short") or 0),
+                     bool(self._snaps.get(k, {}).get("account_ready", True)))
+                    for k, r in rows)
         if sig != self._mon_sig:
             self._mon_sig = sig
             m.setRowCount(len(rows))
             for i, (key, r) in enumerate(rows):
                 managed = bool(r.get("managed"))
                 locked = bool(r.get("locked"))
+                logged_in = bool(self._snaps.get(key, {}).get("account_ready", True))
                 have = str(r["actual"])
                 if locked:
                     # 净 0 但两条腿都有仓。只写 0 等于什么都没说
@@ -3045,6 +3338,10 @@ class PortfolioPage(QWidget):
                 note = "策略持仓" if managed else "未托管（策略已停或手工开仓）"
                 if locked:
                     note += " · 锁仓，两条腿都要平"
+                if not logged_in:
+                    # 账户登出时持仓是上次的旧数，而且对齐发不出去。必须让人一眼
+                    # 看出「这行现在动不了」，否则点确认后一笔不发，像按钮坏了
+                    note = "账户未登录，对齐会跳过 · " + note
                 vals = [
                     key, r["symbol"], str(r["target"]), have,
                     _delta_text(r), note,
@@ -3118,7 +3415,7 @@ class PortfolioPage(QWidget):
         item = t.item(row, col)
         if item is None:
             item = QTableWidgetItem()
-            if col in (5, 6):
+            if col in (5, 6, 7, 8, 9):
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             t.setItem(row, col, item)
         if item.text() != text:
@@ -3161,7 +3458,9 @@ class PortfolioPage(QWidget):
                 if not getattr(c, "enabled", False):
                     continue
                 p = float(getattr(c, "principal", 0) or 0)
-                for acct in c.account_list(default):
+                # 没绑账户、也没有默认账户 ⇒ 归到「未接账户」那一组。以前这里是
+                # 空清单，策略直接被跳过：界面上「启用」打着勾却什么都没跑
+                for acct in (c.account_list(default) or [NO_ACCOUNT_KEY]):
                     k = (acct, str(c.sid))
                     if k in seen:
                         if abs(seen[k] - p) > 1.0:
@@ -3177,6 +3476,8 @@ class PortfolioPage(QWidget):
         # 跑不了 —— 柜台没有 A 股可报。留在计划里等到启动那一刻才抛，同批的
         # 其他账户也跟着白启一轮，所以这里先剔掉并说清楚。
         for acct in list(plan):
+            if acct == NO_ACCOUNT_KEY:
+                continue          # 没接账户的那组不走柜台体检
             sp = self._spec(acct)
             if sp is not None and not auto_ok(sp):
                 be = tqlive.BACKEND_LABELS.get(getattr(sp, "backend", ""), "")
@@ -3190,9 +3491,6 @@ class PortfolioPage(QWidget):
     def _start_all(self) -> None:
         if not self._pool:
             self._on_failed("还没有策略，先在某个工作区里「从策略库添加」")
-            return
-        if not self._accounts:
-            self._on_failed("还没有交易账户，请先到「账户透视和交易」页添加")
             return
 
         groups, warn = self._live_plan()
@@ -3211,7 +3509,7 @@ class PortfolioPage(QWidget):
             if not name:
                 self._on_failed("有策略没有可用账户（既没绑账户，也没有默认账户）")
                 return
-            if self._spec(name) is None:
+            if name != NO_ACCOUNT_KEY and self._spec(name) is None:
                 self._on_failed(f"账户「{name}」已不存在，请重新绑定")
                 return
 
@@ -3224,7 +3522,9 @@ class PortfolioPage(QWidget):
                         self.ctl.add_or_update(name, cfg)
                     self.ctl.enable(name, cfg.sid, True)
                 continue
-            self.ctl.start(self._spec(name), cfgs, self._chase)
+            # 没绑账户的那组传 None：runner 照常算信号，只是不报单
+            spec = None if name == NO_ACCOUNT_KEY else self._spec(name)
+            self.ctl.start(spec, cfgs, self._chase)
             newly += 1
         if newly:
             self._on_log(f"启动 {newly} 个账户的连接，共 "
@@ -3232,6 +3532,33 @@ class PortfolioPage(QWidget):
         else:
             self._on_log("连接本来就在跑，已把其余启用的策略补进来")
         self._refresh_conn_label()
+
+    def _toggle_accounts(self) -> None:
+        """登录 / 登出账户，**策略不停**。
+
+        判据看引擎里现在有没有任何一个账户在线（不是看按钮文字，也不看磁盘上
+        的什么开关）：有就全部登出，一个都没有就按各组记着的账户接回去。
+        """
+        keys = [k for k in self.ctl.keys() if k != NO_ACCOUNT_KEY]
+        if not keys:
+            self._on_failed("现在没有在跑的策略，先「启动全部」")
+            return
+        online = [k for k in keys
+                  if (self._snaps.get(k) or {}).get("pos_ready")]
+        if online:
+            for k in online:
+                self.ctl.detach(k)
+            self._on_log(f"已登出 {len(online)} 个账户：策略继续运行，只算信号")
+            return
+        n = 0
+        for k in keys:
+            sp = self._spec(k)
+            if sp is None:
+                self._on_log(f"账户「{k}」已不存在，跳过")
+                continue
+            self.ctl.attach(k, sp)
+            n += 1
+        self._on_log(f"正在接入 {n} 个账户（登录成功后即开始按理论仓位下单）")
 
     def _stop_all(self) -> None:
         if not self.ctl.running:
@@ -3249,6 +3576,7 @@ class PortfolioPage(QWidget):
     def _on_stopped(self) -> None:
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self.btn_acct.setEnabled(False)
         self.lbl_dot.setStyleSheet(f"color: {C_IDLE}; font-size: 15px;")
         self.lbl_conn.setText("已停止")
         self.lbl_conn.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
@@ -3382,11 +3710,21 @@ class PortfolioPage(QWidget):
             self.lbl_conn.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
             self.btn_start.setEnabled(True)
             self.btn_stop.setEnabled(False)
+            self.btn_acct.setEnabled(False)
             return
+        # 账户在线与否和策略在不在跑是两件事：策略跑了但账户全登出，是**正常**
+        # 状态（收盘后、日终登出），状态灯不能因此变红
+        online = [k for k in keys
+                  if k != NO_ACCOUNT_KEY
+                  and (self._snaps.get(k) or {}).get("pos_ready")]
+        self.btn_acct.setEnabled(True)
+        self.btn_acct.setText("登出账户" if online else "登录账户")
         n = sum(1 for _a, cs in self._live_plan()[0].items() if _a in keys
                 for c in cs)
         self.lbl_dot.setStyleSheet(f"color: {C_OK}; font-size: 15px;")
-        self.lbl_conn.setText(f"运行中 · {len(keys)} 个账户 / {n} 条策略")
+        acct = (f"{len(online)} 个账户已接入" if online
+                else "未接账户（只算信号）")
+        self.lbl_conn.setText(f"运行中 · {len(keys)} 组 / {n} 条策略 · {acct}")
         self.lbl_conn.setStyleSheet(f"color: {C_OK}; font-size: 11px;")
         # 只单独启动过一条时，「启动全部」还要能用 —— 它会把剩下的补齐
         self.btn_start.setEnabled(True)
@@ -3517,16 +3855,32 @@ class PortfolioPage(QWidget):
             # 这时候再发一轮就是「平了又开、开了又平」。
             self._on_failed("上一轮对齐还在执行（等成交或撤单），稍后再点")
             return
-        blind = [k for k, v in self._snaps.items() if not v.get("pos_ready", True)]
+        # ① 账户没登录的，根本没法对齐：`api is None` 时 `align()` 只会空转；
+        #    而且登出时 `_pos` 一并清掉了 —— 连「差多少」都算不出来。
+        # ② 登录了但持仓还没同步的，等几秒再点（拿「账户是空的」算差额会把仓位
+        #    重开一遍）。这两类必须分开说，否则登出账户会一直被提示「等几秒再点」。
+        no_login = [k for k, v in self._snaps.items()
+                    if not v.get("account_ready", True)]
+        blind = [k for k, v in self._snaps.items()
+                 if v.get("account_ready", True) and not v.get("pos_ready", True)]
         if blind:
             self._on_failed("、".join(blind) + " 的账户持仓还没同步，等几秒再点"
                             "（现在对齐会拿「账户是空的」去算差额，把仓位重开一遍）")
             return
-        rows = [r for snap in self._snaps.values() for r in (snap.get("mismatch") or [])]
-        if not rows:
-            self._on_log("账户仓位与策略理论持仓已经一致，不用对齐")
+        ready, blocked = split_alignable(self._snaps)
+        # 没登录的账户即使没有 mismatch 行也要点名：登出后 `_pos` 被清掉，
+        # `mismatch()` 恒为空 —— 不点名的话，这些账户的仓永远没人管，还看不出来
+        for k in no_login:
+            if not any(b.startswith(k) for b in blocked):
+                blocked.append(f"{k}（未登录，无法核对持仓）")
+        if not ready:
+            if blocked:
+                self._on_failed("没有可对齐的账户：先到「账户透视和交易」页登录 —— "
+                                + "；".join(blocked))
+            else:
+                self._on_log("账户仓位与策略理论持仓已经一致，不用对齐")
             return
-
+        rows = [r for rs in ready.values() for r in rs]
         managed = [r for r in rows if r.get("managed")]
         orphans = [r for r in rows if not r.get("managed")]
 
@@ -3535,19 +3889,21 @@ class PortfolioPage(QWidget):
         lines = []
         if managed:
             lines.append(f"按策略理论持仓调整 {len(managed)} 个合约：")
-            for r in managed[:10]:
+            for r in managed[:20]:
                 lines.append(f"　{r['symbol']}　{_pos_text(r['actual'], r)} → "
                              f"{r['target']}（{_delta_text(r)}）")
-            if len(managed) > 10:
-                lines.append(f"　…… 还有 {len(managed) - 10} 个")
+            if len(managed) > 20:
+                # 剩下的**一样会被调整**，只是框里不逐条列了 —— 所以要把这句话
+                # 写出来，不能让人以为「还有 N 个」是不动
+                lines.append(f"　…… 还有 {len(managed) - 20} 个，同样按理论持仓调整")
         if orphans:
             lines.append("")
             lines.append(f"平掉 {len(orphans)} 个没有策略在管的合约：")
-            for r in orphans[:10]:
+            for r in orphans[:20]:
                 lines.append(f"　{r['symbol']}　持有 {_pos_text(r['actual'], r)} "
                              f"→ 0（{_delta_text(r)}）")
-            if len(orphans) > 10:
-                lines.append(f"　…… 还有 {len(orphans) - 10} 个")
+            if len(orphans) > 20:
+                lines.append(f"　…… 还有 {len(orphans) - 20} 个，同样平到 0")
             lines.append("")
             lines.append("这些仓位多半是策略停掉之后留下的，或者手工开的。"
                          "平掉之后无法撤销。")
@@ -3556,6 +3912,15 @@ class PortfolioPage(QWidget):
             lines.append("")
             lines.append(f"其中 {n_lock} 个是锁仓（多空双开）：净额是 0，但两条腿都占着"
                          "保证金，会拆成「卖平多 + 买平空」两笔一起发。")
+        if blocked:
+            lines.append("")
+            lines.append("这几个账户**没登录**，它们的仓位一笔都不动：")
+            for b in blocked:
+                lines.append(f"　{b}")
+            lines.append("要对齐它们，先到「账户透视和交易」页把账户登上去。")
+        lines.append("")
+        lines.append("只动上面列出的这几个合约。点确认之后持仓又变了的合约会跳过，"
+                     "不会拿新基数去算成开仓。")
 
         ans = QMessageBox.question(
             self, "一键对齐", "\n".join(lines) + "\n\n继续下发委托？",
@@ -3565,11 +3930,18 @@ class PortfolioPage(QWidget):
             return
 
         n = 0
-        for key, snap in self._snaps.items():
-            if snap.get("mismatch"):
-                self.ctl.align(key)
-                n += len(snap["mismatch"])
-        self._on_log(f"已下发对齐委托，覆盖 {n} 个合约；剩下交给追单，成交前不用再点")
+        for key, want_rows in ready.items():
+            # 🔴 变量别叫 `rows` —— 外面那个 `rows` 是确认框的内容，同名会把它
+            # 盖掉。真出过一次事故就是「执行的不是确认过的那批」。
+            if not want_rows:
+                continue
+            # 把确认框里这几行原样传下去。`align()` 会在同样的合约上按当下持仓
+            # 重算差额，但**只在这几个合约上**动作，而且持仓基数变了就跳过 ——
+            # 框里没有的（比如刚冒出来的未托管仓）一律不碰。
+            self.ctl.align(key, rows=want_rows)
+            n += len(want_rows)
+        extra = f"；{len(blocked)} 个账户没登录，已跳过" if blocked else ""
+        self._on_log(f"已下发对齐委托，覆盖 {n} 个合约{extra}；剩下交给追单，成交前不用再点")
 
     # ---------------------------------------------------------- 追单设置
 

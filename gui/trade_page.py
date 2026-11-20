@@ -632,23 +632,28 @@ class TradePage(QWidget):
         lay.addWidget(self.lbl_conn)
 
         lay.addStretch(1)
-        # 行情源：多个柜台同时登录时，K 线和盘口只取一家。两个柜台的 tick 拼在
-        # 一条 K 线上会来回跳（时间戳、合约、口径都不是同一个），所以不给「混用」
-        # 这个选项。只有一个柜台时这个下拉框没有意义，直接藏起来。
+        # 行情源：**独立于账户**的一条连接（2026-11-20 重构）。以前这个框跟着
+        # 勾选的账户变 —— 账户一登出，行情就没了，策略跟着断。现在它有自己的
+        # 连接 / 断开按钮，所有账户共用这一条。
+        from .feed_bar import FeedBar
+
+        self.feed_bar = FeedBar(self)
+        self.feed_bar.changed.connect(self._on_feed_changed)
+        lay.addWidget(self.feed_bar)
+        # 老的下拉框（按勾选账户所属柜台生成）保留成**内部状态**，不再显示：
+        # 它决定「登录会话的 K 线取哪家柜台」，跟着全局行情源走。显示两份
+        # 「行情源」只会让用户以为是同一件事。
         self.lbl_feed = QLabel("行情源")
         self.lbl_feed.setObjectName("Hint")
         self.cb_feed = QComboBox()
-        self.cb_feed.setToolTip(
-            "多个柜台同时登录时，K 线和右侧盘口取哪一家。\n"
-            "持仓 / 委托 / 成交不受影响 —— 所有柜台的都合并显示。")
         self.lbl_feed.setVisible(False)
         self.cb_feed.setVisible(False)
         lay.addWidget(self.lbl_feed)
         lay.addWidget(self.cb_feed)
 
-        self.lbl_quote = QLabel("")
-        self.lbl_quote.setStyleSheet(f"color: {C_TEXT}; font-size: 13px; font-weight: 600;")
-        lay.addWidget(self.lbl_quote)
+        # 顶部不再单独摆一行报价：下面「报价」表里合约/最新/涨跌/买卖价/时间
+        # 都有，同一份数字在屏幕上出现两次只会互相打架（2026-11-20 用户要求去掉）。
+        # 这里原来挂 `lbl_quote`，留着空 QLabel 会在账户卡下方压出一条 20px 的空白。
         return card
 
     def _sync_feed_box(self) -> None:
@@ -672,14 +677,26 @@ class TradePage(QWidget):
         if keep in backs:
             self.cb_feed.setCurrentIndex(backs.index(keep))
         self.cb_feed.blockSignals(False)
-        multi = len(backs) > 1
-        self.lbl_feed.setVisible(multi)
-        self.cb_feed.setVisible(multi)
-        if multi:
-            self.cb_feed.setToolTip(
-                "多个柜台同时登录时，K 线和右侧盘口取哪一家。\n"
-                "持仓 / 委托 / 成交不受影响 —— 所有柜台的都合并显示。")
-            self.lbl_feed.setToolTip(self.cb_feed.toolTip())
+        # 选谁：**跟全局行情源走**。全局源不在勾选账户的柜台里（比如只登了一个
+        # CTP 账户、而全局源是天勤）时退回第一个可用的 —— 登录会话总得有个
+        # 行情才能画 K 线。
+        glob = self.feed_bar.current_source() if getattr(self, "feed_bar", None) else ""
+        pick = glob if glob in backs else (keep if keep in backs
+                                           else (backs[0] if backs else ""))
+        if pick in backs:
+            self.cb_feed.blockSignals(True)
+            self.cb_feed.setCurrentIndex(backs.index(pick))
+            self.cb_feed.blockSignals(False)
+        # 永远藏着：界面上只有工具栏那一个「行情源」，这里是内部状态
+        self.lbl_feed.setVisible(False)
+        self.cb_feed.setVisible(False)
+
+    def _on_feed_changed(self, key: str) -> None:
+        """用户在工具栏切了行情源：同步给登录会话，别让它还按老柜台画 K 线。"""
+        if not key:
+            return
+        self._sync_feed_box()
+        self.on_log(f"行情源：{BACKEND_LABELS.get(key, key)}（账户登录状态不受影响）")
 
     def _wrap(self, title: str, table: QTableWidget, with_btn: str | None,
               hint: str = "") -> QWidget:
@@ -1541,15 +1558,10 @@ class TradePage(QWidget):
         q = st.quote or {}
         if q:
             last = q.get("last") or 0
-            self.lbl_quote.setText(
-                f"{q.get('name', '')} {q.get('underlying', '')}  "
-                f"{last:.2f}  "
-                f"买 {q.get('bid', 0):.2f}/{int(q.get('bid_vol', 0))}  "
-                f"卖 {q.get('ask', 0):.2f}/{int(q.get('ask_vol', 0))}"
-            )
-            # 下单面板的合约默认跟当前主力走，但不要覆盖用户手动输入的内容。
-            # 填进去的是**裸合约代码**（`rb2601`）：界面口径就是「不需要交易所」，
-            # 交易所由解析函数反查，显示带前缀反而要多打 5 个字符
+            # 🔴 这里**只留下单面板要用到的副作用**（默认合约 / 最小变动价位 /
+            # 首帧价格），不再往顶部写一行报价文本 —— 报价框那张表才是唯一出处
+            # （2026-11-20 用户要求；两处同时显示时小数位/量口径不一致，看着
+            # 像行情在跳）。
             und = q.get("underlying")
             shown = und if self._stock_mode else str(und or "").rsplit(".", 1)[-1]
             if shown and self.cb_contract.currentText() in (

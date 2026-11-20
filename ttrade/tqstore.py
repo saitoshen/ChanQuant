@@ -198,6 +198,24 @@ def _seed_full_from_lite(full: str) -> None:
     os.replace(tmp, full)
 
 
+def _blocked_by_reader(exc: BaseException) -> bool:
+    """这个异常是不是「被别的**读**连接挡住」（Windows 共享冲突），而不是写写冲突。
+
+    DuckDB / Windows 的文案跟着版本和语言变，这里放宽到几个关键片段：
+    中文系统是「另一个程序正在使用此文件」，英文是 `being used by another process`；
+    `Conflicting lock` 是**写写**冲突（第二个下载器），必须原样抛出去，不能重试。
+    """
+    msg = str(exc)
+    if "Conflicting lock" in msg or "conflicting" in msg.lower():
+        return False
+    for needle in ("另一个程序正在使用此文件", "正由另一进程使用",
+                   "being used by another process", "used by another process",
+                   "另一个程序正在使用", "sharing violation"):
+        if needle.lower() in msg.lower():
+            return True
+    return False
+
+
 @contextmanager
 def connect(read_only: bool = False):
     """打开仓库。
@@ -208,8 +226,13 @@ def connect(read_only: bool = False):
 
     因此只读打开会先重试几次（下载器是「一批一个写连接」，批次之间有空隙），
     实在拿不到就把错误往上抛，由界面提示「正在下载」，而不是假装没数据。
-    写入仍然是单写多读：同一时刻只允许一个写连接，第二个写会拿到 Conflicting lock，
-    这是预期行为，不要用重试掩盖。
+
+    **写入也要重试，但只重试「被界面读连接短暂挡住」这一种**：界面是按查询
+    open/close 的，两个查询之间有几毫秒的空隙；定时补库恰好落在这个空隙里就会
+    拿到 `另一个程序正在使用此文件`（2026-11-19 现场：GUI 开着时补 5m，写到第 9
+    个品种就断了，前 8 个已入库 —— 看着像「补了一半」，实际是被一次读挡了一下）。
+    这种重试几秒就能过。真正的 `Conflicting lock`（另一个**写**连接）仍然不重试：
+    那说明确实有第二个下载器在跑，掩盖它只会让两边互相踩。
     """
     import duckdb
 
@@ -218,16 +241,22 @@ def connect(read_only: bool = False):
     if not read_only and not os.environ.get("TRENDDESK_TQ_DB"):
         _seed_full_from_lite(p)
     last = None
-    for attempt in range(3 if read_only else 1):
+    tries = 3 if read_only else 12
+    for attempt in range(tries):
         try:
             con = duckdb.connect(p, read_only=read_only)
             break
         except Exception as exc:  # noqa: BLE001
             last = exc
-            if attempt == 0:
-                time.sleep(0.4)
-            else:
+            if read_only:
+                if attempt == 0:
+                    time.sleep(0.4)
+                else:
+                    raise
+                continue
+            if not _blocked_by_reader(exc) or attempt == tries - 1:
                 raise
+            time.sleep(0.5)          # 最多等 5.5 秒，够跨过界面的查询间隙
     else:  # pragma: no cover - 循环必然 break 或 raise
         raise last
     try:
