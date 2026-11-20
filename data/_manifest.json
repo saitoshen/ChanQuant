@@ -4,9 +4,9 @@
     "name": "苹果",
     "exchange": "NASDAQ",
     "secid": "105.AAPL",
-    "rows": 5054,
+    "rows": 5057,
     "start": "2006-10-12",
-    "end": "2026-11-13",
+    "end": "2026-11-18",
     "file": "AAPL.csv",
     "source": "tushare",
     "adjusted": false
