@@ -223,6 +223,95 @@ def info(symbol: str, exchange: str) -> dict:
     return out
 
 
+# 常见的三字母缩写 → 天勤全称。交易所自己发的行情里两种写法都有（`rb2601.SHF`
+# 这种是外部数据源的写法），不折一下下游 `specs.multiplier(sym, ex)` 会落空，
+# 手续费跟着退化成「算不出来」。
+_EX_ALIAS = {"SHF": "SHFE", "CZC": "CZCE", "CFX": "CFFEX",
+             "GFX": "GFEX", "ZCE": "CZCE"}
+
+
+def contract_product(contract: str) -> tuple[str, str]:
+    """`SHFE.rb2701` → `("RB", "SHFE")`；`rb2601.SHF` / 裸 `rb2601` 也认。
+
+    只给**显示**用（查 tick 决定价格显示几位小数），认不出来返回 `("", "")`，
+    调用方自己退回「2 位小数」。不要拿它做合约校验 —— 真正的归一在
+    `ttrade.tqstore` / `broker_api` 那两处。
+
+    交易所那半段会折成天勤写法：`rb2601.SHF` 给出 `("RB", "SHFE")` 而不是
+    `("RB", "SHF")` —— 下游 `specs.multiplier(sym, ex)` 只认全称，`SHF` 进去
+    查不到乘数，手续费会跟着退化成「算不出来」。
+    """
+    s = str(contract or "").strip()
+    if not s:
+        return "", ""
+    ex = ""
+    if "." in s:
+        head, _, tail = s.partition(".")
+        if head.isalpha() and len(head) <= 6 and any(c.isdigit() for c in tail):
+            ex, s = head.upper(), tail            # SHFE.rb2701
+        elif tail.isalpha():
+            ex, s = tail.upper(), head            # rb2601.SHF
+    return ("".join(c for c in s if c.isalpha()).upper(),
+            _EX_ALIAS.get(ex, ex))
+
+
+def tick_of(symbol: str, exchange: str = "") -> float:
+    """最小变动价位。品种代码或 `交易所.合约` 都认；查不到返回 0。
+
+    0 表示「不知道」—— 显示层要据此退回 2 位小数，而不是当成「一跳 0 元」。
+    """
+    sym, ex = str(symbol or ""), str(exchange or "")
+    if not ex and "." in sym:
+        sym, ex = contract_product(sym)
+    try:
+        return float(info(sym, ex).get("tick") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def tick_decimals(tick: float) -> int:
+    """最小变动价位要几位小数：10 → 0、0.5 → 1、0.2 → 1、0.01 → 2、0.005 → 3。
+
+    用「反复 `round` 看能不能对上」而不是 `log10`：0.2 / 0.05 这种不是 10 的
+    整数次幂，`log10` 算出来会少一位或负一位，价格就显示成 `8240.0` 或者把
+    0.05 抹成 0.1。`tick <= 0`（不知道）按 2 位，和以前的硬编码保持一致。
+    """
+    if not (tick > 0 and tick == tick):
+        return 2
+    for d in range(0, 5):
+        if abs(round(tick, d) - tick) < 1e-9:
+            return d
+    return 4
+
+
+def price_text(v, symbol: str = "", exchange: str = "", *, tick: float = 0.0,
+               signed: bool = False, dash: str = "—") -> str:
+    """按**最小变动价位**把价格显示成该有的位数，带千分位。
+
+    为什么显示层要收位数：铜 `90,040.00`、国债 `118.150`、棉花 `5,902.00`
+    —— 全是 `:.2f` 硬编码出来的「假精度」，看着像行情在小数位上来回跳。
+    位数本来就该由 tick 决定（用户 2026-11-20 提的）。
+
+    🔴 **不许为了好看抹掉真实价位**：值在 tick 的位数下表示不出来（比如均价
+    5942.8 配一个跳 1 的品种）就多留几位，最多 4 位。宁可多显示，也不能把
+    真实的 0.5 舍成整数 —— 那是把用户的钱显示错了。
+
+    `tick` 传 0 时按 `symbol` / `exchange` 查；两者都查不到就 2 位。
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return dash
+    if f != f:
+        return dash
+    t = float(tick or 0) or tick_of(symbol, exchange)
+    d = tick_decimals(t)
+    while d < 4 and abs(f - round(f, d)) > 1e-9:
+        d += 1
+    sign = "+" if (signed and f > 0) else ""
+    return f"{sign}{f:,.{d}f}"
+
+
 def set_override(symbol: str, exchange: str, manual: bool = True,
                  **fields) -> None:
     """写覆盖。`manual=True`（默认）表示**用户在界面上填的**，会给相应字段

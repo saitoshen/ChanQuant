@@ -535,6 +535,53 @@ def est_close_pnl(trades, cache: dict, mult_of=None, now: float = 0.0,
     return trades
 
 
+def est_commission(trades, mult_of=None, exchange_of=None,
+                   profile_key: str | None = None) -> list[dict]:
+    """给成交行补 `commission`（这一笔的手续费，元）。
+
+    **天勤的成交回报自带 `commission`**，直接透传 —— 那是柜台算的，和结算单
+    一致。CTP / 融航的 `OnRtnTrade` 里**没有**逐笔手续费（只有账户级的汇总），
+    所以只能按品种的成本档案估算，标 `commission_est=True`，界面上加个「≈」。
+
+    `mult_of` / `exchange_of` 是给「合约代码不带交易所」的柜台用的（CTP 给的是
+    光秃秃的 `rb2601`）：乘数查不到会退回 1.0，那手续费就差一个数量级；交易所
+    查不到会退回「万分之一」的通用费率，也不准。两个都让调用方把更准的递进来。
+
+    🔴 估算的**只算手续费、不含滑点**（见 `costs.commission`）：滑点是机会成本，
+    不是账单。混进去这一列就没法和结算单对账了。
+
+    `commission=None` 表示「算不出来」（乘数没维护 / 价格缺失），界面画「—」；
+    0 表示「这一笔真的不收费」，两个不能混。
+    """
+    from . import costs as _costs
+
+    for t in trades or ():
+        if t.get("commission") is not None:
+            t["commission_est"] = False
+            continue
+        sym = str(t.get("symbol") or "")
+        head, _, tail = sym.partition(".")
+        ex, code = (head, tail) if tail else ("", sym)
+        prod = "".join(c for c in code if c.isalpha()).upper()
+        if not ex and exchange_of is not None:
+            try:
+                ex = str(exchange_of(sym) or "")
+            except Exception:  # noqa: BLE001 - 查不到就退回通用费率
+                ex = ""
+        mult = 0.0
+        if mult_of is not None:
+            try:
+                mult = float(mult_of(sym) or 0.0)
+            except Exception:  # noqa: BLE001
+                mult = 0.0
+        fee = _costs.commission(prod, ex, t.get("price") or 0.0,
+                                int(t.get("volume") or 0), profile_key,
+                                mult=mult)
+        t["commission"] = fee
+        t["commission_est"] = fee is not None
+    return trades
+
+
 @dataclass
 class LiveState:
     """一次快照，界面拿去直接刷控件。全是普通 dict/list，不持有天勤对象。
@@ -911,6 +958,7 @@ class LiveHub:
                 # 顺序不能反 —— 刚平光的仓这一轮已经不在持仓里了，靠的正是缓存
                 update_open_avg(self._open_cache, pos)
                 est_close_pnl(trds, self._open_cache)
+                est_commission(trds, mult_of=_mult_of)
             except Exception as exc:  # noqa: BLE001
                 # 单个账户查不出来不该拖垮整页：其余账户照样能看能下单
                 self.last_error = f"{spec.name}：{type(exc).__name__}: {exc}"
@@ -1133,6 +1181,13 @@ class LiveHub:
         items.sort(key=lambda kv: -self._num(kv[1], "trade_date_time"))
         out = []
         for tid, t in items[:SNAP_ROWS]:
+            # 天勤的 Trade 带 `commission`（元，柜台算的）。老版本 / 别的源可能
+            # 没有这个键 —— 用 `None` 表示「没有」，交给 `est_commission` 估；
+            # 不能写 0，0 的意思是「这一笔真的不收费」
+            try:
+                fee = float(getattr(t, "commission"))
+            except (AttributeError, TypeError, ValueError):
+                fee = None
             out.append({
                 "trade_id": tid,
                 "order_id": getattr(t, "order_id", ""),
@@ -1141,6 +1196,7 @@ class LiveHub:
                 "offset": getattr(t, "offset", ""),
                 "price": self._num(t, "price"),
                 "volume": int(self._num(t, "volume")),
+                "commission": fee,
                 "trade_date_time": self._num(t, "trade_date_time"),
                 "time": _stamp(getattr(t, "trade_date_time", 0)),
             })

@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTimeEdit,
@@ -64,6 +65,7 @@ from ttrade.tqsdk_symbols import contract_from_input, to_ts
 # 顶层互相 import 会成环。
 C_TEXT = "#1f2937"
 C_MUTED = "#6b7280"
+C_TOTAL_BG = "#eef2f7"  # 合计行底色（与组合页策略表最后一行同色）
 C_UP = "#d92b2b"      # 红涨 / 盈利
 C_DOWN = "#0f9d58"    # 绿跌 / 亏损
 C_OK = "#16a34a"
@@ -98,10 +100,29 @@ def _pnl(v) -> str:
     return "—" if f is None else f"{f:+,.2f}"
 
 
-def _px(v) -> str:
-    """盘口价：0 / NaN 都是「没有这一档」，画「—」而不是 0.00。"""
+def _fee_text(fee, est=False) -> str:
+    """一笔成交的手续费。
+
+    - `None` → 「—」。**不是 0**：拿不到乘数 / 费率没维护时算不出来，写 0.00
+      等于告诉用户「这单免佣」，是撒谎。
+    - 估算值前面带 `≈`（天勤回报自带 `commission`，CTP / 融航没有逐笔手续费，
+      只能按品种费率倒推）。灰字 + `≈` 两个记号，一眼能看出这不是柜台给的数。
+    """
+    f = _num(fee)
+    if f is None:
+        return "—"
+    # 手续费只会是正数，不画正号；异常负值也照原样显示，好排查
+    return f"{'≈' if est else ''}{f:,.2f}"
+
+
+def _px(v, sym: str = "") -> str:
+    """盘口价：0 / NaN 都是「没有这一档」，画「—」而不是 0.00。
+
+    小数位跟着这个合约的**最小变动价位**走（见 `symbols_info.price_text`）：
+    铜写 90,040、国债写 118.115、棉花写 5,902 —— 不再一律 `:.2f`。
+    """
     f = _num(v)
-    return "—" if not f else f"{f:,.2f}"
+    return "—" if not f else symbols_info.price_text(f, sym)
 
 
 def _hms(v) -> str:
@@ -115,6 +136,12 @@ def _hms(v) -> str:
     if not t:
         return ""
     return t.rsplit(" ", 1)[-1][:8]
+
+
+def _tick_decimals(tick: float) -> int:
+    """最小变动价位要几位小数。实现在 `symbols_info` —— 组合页的价格列用的是
+    同一个换算，两边各写一份早晚会走样。这里留个名字，自检按这个名字取。"""
+    return symbols_info.tick_decimals(tick)
 
 
 def _avg_price(r: dict) -> str:
@@ -848,17 +875,70 @@ class TradePage(QWidget):
         )
         return self.tbl_orders
 
-    def _build_trades(self) -> QTableWidget:
+    def _build_trades(self) -> QWidget:
+        """「成交」框：明细表 + 「按品种统计」汇总表，同一个开关切。
+
+        用户 2026-11-20：
+        - 「成交框增加一栏『手续费』，显示每笔成交的手续费」
+        - 「再在成交框下面增加一个统计选项，选中后可以显示按照品种来统计」
+
+        两张表叠在 `QStackedWidget` 里而不是共用一个表格换表头：列数不同、
+        该吃剩余宽度的那一列也不同（明细是「合约」，汇总是「品种」），换表头
+        两套列宽会互相串。
+        """
         self.tbl_trades = self._table(
-            ["资金账户", "时间", "合约", "方向", "开平", "价格", "手数", "平仓盈亏"],
+            ["资金账户", "时间", "合约", "方向", "开平", "价格", "手数",
+             "手续费", "平仓盈亏"],
             stretch=2,
         )
+        # 先建好「上一次填进去的成交」再连 toggled：勾选框一旦在构建期被
+        # `setChecked()`（将来恢复界面状态会这么做），`_on_trade_sum` 会立刻被
+        # 调起来重绘，这时候 `_trade_rows` 还不存在就是 AttributeError。
+        self._trade_rows: list[dict] = []
         self.tbl_trades.setToolTip(
             "平仓盈亏是**估算值**：两个柜台的成交回报里都没有盈亏字段，只能按\n"
             "「成交价 − 该方向开仓均价」× 手数 × 乘数倒推。\n"
-            "开仓单记 0；开仓均价取不到时显示「—」（不是 0）。"
+            "开仓单记 0；开仓均价取不到时显示「—」（不是 0）。\n\n"
+            "手续费：天勤回报里自带，直接用；CTP / 融航的回报没有逐笔手续费，\n"
+            "按「数据管理 → 品种信息」里的费率估算（前面带 ≈）。只算手续费、\n"
+            "不含滑点 —— 滑点是机会成本，不是账单。"
         )
-        return self.tbl_trades
+
+        self.tbl_trade_sum = self._table(
+            ["品种", "笔数", "手数", "手续费", "平仓盈亏"], stretch=0)
+        self.tbl_trade_sum.setToolTip(
+            "按品种把上面那张表汇总一遍。最后一行是合计。\n"
+            "手续费前面的 ≈ 表示这一格里混了估算值（柜台没给逐笔手续费）；\n"
+            "某一行有算不出来的那几笔时，数字后面带一个 *，表示只加了算得出来的。"
+        )
+
+        self.stack_trades = QStackedWidget()
+        self.stack_trades.addWidget(self.tbl_trades)
+        self.stack_trades.addWidget(self.tbl_trade_sum)
+
+        self.chk_trade_sum = QCheckBox("按品种统计")
+        self.chk_trade_sum.setToolTip(
+            "勾上：按品种汇总笔数 / 手数 / 手续费 / 平仓盈亏；\n"
+            "不勾：看逐笔成交（默认）")
+        self.chk_trade_sum.toggled.connect(self._on_trade_sum)
+
+        box = QWidget()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        lay.addWidget(self.stack_trades, 1)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
+        row.addWidget(self.chk_trade_sum)
+        lay.addLayout(row)
+
+        return box
+
+    def _on_trade_sum(self, on: bool) -> None:
+        """切「明细 / 按品种统计」。两张表都已经填好，这里只翻页。"""
+        self.stack_trades.setCurrentIndex(1 if on else 0)
+        self._fill_trade_sum(self._trade_rows)
 
     def _build_quotes(self) -> QTableWidget:
         """「报价」框：盯着的合约各一行。
@@ -1056,18 +1136,23 @@ class TradePage(QWidget):
         text = self.cb_contract.currentText().strip()
         if not text:
             return
-        sym, ex = self._resolve_contract(text)
+        sym, _ex = self._resolve_contract(text)
         if not sym:
             self.lbl_order_msg.setText(
                 f"「{text}」不是能认的合约代码，填真实合约代码，如 rb2601")
             return
+        self._order_symbol = sym
+        # 🔴 最小变动价位**必须在下面所有 early return 之前设**。用户 2026-11-20
+        # 报的「铜 8240 按一下箭头只跳 1」就是这么来的：以前这段写在「正在取价 /
+        # 本地库没有 / 已经填过价」三个分支的后面，它们一 return，价格框就停在
+        # 默认的步长 1 上。交易所一跳 10 元（铜）、1 元（螺纹）、0.5（部分品种），
+        # 步长错了按一下要么跳两跳、要么得按十下。
+        self._apply_tick(sym)
         # 同一个合约已经填过价就不再去取：`editingFinished` 在焦点离开时也会发，
         # 而取一次价要让 worker 线程等 1~3 秒（等行情推一帧），不能让切窗口
         # 这种动作反复触发
         if sym == self._priced_for and self.sp_price.value() > 0:
-            self._order_symbol = sym
             return
-        self._order_symbol = sym
         acc = self._order_account()
         if self.live.running and acc:
             if self.live.quote_of(sym, account=acc):
@@ -1078,17 +1163,49 @@ class TradePage(QWidget):
             self.lbl_order_msg.setText(
                 f"没取到 {text} 的最新价：连上柜台后会自动填，也可以手填价格")
             return
-        # 交易所的最小变动价位：价格框的步长跟着它走，用 1 做步长在
-        # 0.5 一档的品种上按一下就跳两跳
-        try:
-            vari = sym.rsplit(".", 1)[-1]
-            info = symbols_info.info("".join(c for c in vari if c.isalpha()), ex)
-            tick = float(info.get("tick") or 0)
-            if tick > 0:
-                self.sp_price.setSingleStep(tick)
-        except Exception:  # noqa: BLE001
-            pass
         self._fill_price_local(sym, text)
+
+    def _apply_tick(self, sym: str = "", tick: float = 0.0) -> float:
+        """把「价格」框的上下调节幅度设成**这个合约的最小变动价位**。
+
+        为什么必须跟着 tick 走：铜一跳 10 元、螺纹 1 元、还有 0.5 / 0.2 一档的
+        品种。固定步长 1 的结果是「按一下跳两跳」（0.5 一档）或者「按十下才动
+        一格」（铜）。`QDoubleSpinBox` 的上下按钮、滚轮、上下键全按 `singleStep`
+        走，所以调这一个值就够。
+
+        `tick` 传 0 时按品种表查（`symbols_info` 内部会 upper，`cu` 也认）。
+        顺手把小数位对齐到 tick —— 铜不该显示 `8240.0000`。**但只在不丢信息时
+        才减位数**：现值在目标位数下表示不出来（说明 tick 和现价不是一套），
+        就保留原来的位数，宁可多显示两位，也不能把 3550.5 抹成 3551。
+
+        返回最终用上的 tick（0 = 查不到，什么都没动）。
+        """
+        if not (tick > 0) and sym:
+            try:
+                vari = sym.rsplit(".", 1)[-1]
+                ex = sym.split(".", 1)[0] if "." in sym else ""
+                # 郑商所的合约是 `TA706` 这种，去掉数字剩下的就是品种代码
+                info = symbols_info.info(
+                    "".join(c for c in vari if c.isalpha()), ex)
+                tick = float(info.get("tick") or 0)
+            except Exception:  # noqa: BLE001 - 查不到就维持原样
+                tick = 0.0
+        if not (tick > 0) and getattr(self, "_stock_mode", False):
+            # A 股不在品种表里（那张表是期货的），但一档就是 0.01 元 ——
+            # 留步长 1 会按一下就跳一块钱
+            tick = 0.01
+        if not (tick > 0 and tick == tick):
+            return 0.0
+        if abs(float(self.sp_price.singleStep()) - tick) > 1e-12:
+            self.sp_price.setSingleStep(tick)
+        want = _tick_decimals(tick)
+        cur = float(self.sp_price.value())
+        if abs(cur - round(cur, want)) > 1e-9:
+            # 现价表示不出来 ⇒ 别动位数（动了就会悄悄改掉用户填的价）
+            want = max(want, self.sp_price.decimals())
+        if want != self.sp_price.decimals():
+            self.sp_price.setDecimals(want)
+        return tick
 
     def _fill_price_local(self, sym: str, text: str) -> None:
         """没有实时价时，退回本地库的最后一根收盘价。
@@ -1125,10 +1242,11 @@ class TradePage(QWidget):
             self._fill_price_local(want, self.cb_contract.currentText().strip())
             return
         tick = float(info.get("tick") or 0)
-        if tick > 0:
-            self.sp_price.setSingleStep(tick)
         if not self.chk_market.isChecked():
             self.sp_price.setValue(last)
+        # 先落价再对齐位数：反过来会对着一根「上一个合约的价」判断要不要收小数，
+        # 那一根表示不出来就白等一次行情
+        self._apply_tick(sym, tick)
         self._priced_for = sym
         stamp = _hms(info.get("datetime"))
         self.lbl_order_msg.setText(
@@ -1569,9 +1687,10 @@ class TradePage(QWidget):
                 self.cb_contract.setCurrentText(shown)
                 self._auto_contract = shown
             if q.get("price_tick"):
-                self.sp_price.setSingleStep(float(q["price_tick"]))
                 if self.sp_price.value() <= 0:
                     self.sp_price.setValue(float(last or 0))
+                # 价格框的上下调节幅度 = 这个合约的最小变动价位
+                self._apply_tick(str(und or ""), float(q["price_tick"]))
 
         # 按账户摊平成三张表，顺手补上账户名。快照里本来就带，但测试桩 / 老
         # 版本快照可能没有 —— 缺了会撤单撤到「空账户」上（天勤静默忽略，单子
@@ -1735,25 +1854,117 @@ class TradePage(QWidget):
 
     def _fill_trades(self, rows: list[dict]) -> None:
         t = self.tbl_trades
-        t.setRowCount(len(rows))
-        for i, r in enumerate(rows):
+        self._trade_rows = list(rows or [])
+        t.setRowCount(len(self._trade_rows))
+        for i, r in enumerate(self._trade_rows):
             pnl = r.get("close_profit")
+            fee = r.get("commission")
             vals = [
                 r.get("account", ""), r.get("time", ""),
                 r["symbol"], r["direction"], r["offset"],
-                f"{r['price']:.2f}", str(r["volume"]),
+                symbols_info.price_text(r["price"], r["symbol"]),
+                str(r["volume"]),
+                _fee_text(fee, r.get("commission_est")),
                 _pnl(pnl),
             ]
             for j, v in enumerate(vals):
                 item = QTableWidgetItem(v)
-                if j == 7:
+                if j == 8:
                     item.setForeground(QColor(_color(pnl)))
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                elif j == 7:
+                    # 估算值用灰字：一眼能看出「这不是柜台给的钱」
+                    item.setForeground(
+                        QColor(C_MUTED if r.get("commission_est") else C_TEXT))
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    item.setToolTip(
+                        "这一笔是按品种费率估算的（柜台回报里没有逐笔手续费）"
+                        if r.get("commission_est") else "柜台回报里的手续费")
                 elif j in (5, 6):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 t.setItem(i, j, item)
         self._fit_columns(t, stretch=2)
         self._clamp_col(t, 0, 110)
+        self._fill_trade_sum(self._trade_rows)
+
+    def _fill_trade_sum(self, rows: list[dict]) -> None:
+        """按**品种**把成交汇总成一张表：笔数 / 手数 / 手续费 / 平仓盈亏。
+
+        品种取合约代码里的字母部分（`rb2601` / `SHFE.rb2601` 都是 `RB`），认不出
+        来的保留原合约名 —— 宁可显示一行奇怪的，也不能把这几笔丢掉。
+
+        🔴 手续费 / 平仓盈亏有「算不出来」（`None`）的那几笔：合计只加算得出来的
+        部分，并在数字后面打 `*`，和策略表最后那行「合计」同一套口径。写「—」
+        等于整行没有，按 0 算又是撒谎。
+        🔴 `fee_est` 的意思统一成「这个数里**有**估算成分」（任一行为估算即真），
+        不是「全是估算」：5.00 真单 + 3.50 估算混在一起写个不带 `≈` 的 8.50，
+        等于把猜的那半也算成柜台给的。合计行同理，按「有」往下传。
+        最后一行是全部品种的合计。
+        """
+        t = self.tbl_trade_sum
+        agg: dict[str, dict] = {}
+        for r in rows or ():
+            sym = str(r.get("symbol") or "")
+            key = symbols_info.contract_product(sym)[0] or sym or "—"
+            a = agg.setdefault(key, {"n": 0, "vol": 0, "fee": 0.0, "fee_ok": True,
+                                     "fee_est": False, "pnl": 0.0, "pnl_ok": True})
+            a["n"] += 1
+            a["vol"] += int(r.get("volume") or 0)
+            fee = r.get("commission")
+            if fee is None:
+                a["fee_ok"] = False
+            else:
+                a["fee"] += float(fee)
+                if r.get("commission_est"):
+                    a["fee_est"] = True
+            pnl = r.get("close_profit")
+            if pnl is None:
+                a["pnl_ok"] = False
+            else:
+                a["pnl"] += float(pnl)
+
+        keys = sorted(agg)
+        tot = {"n": 0, "vol": 0, "fee": 0.0, "fee_ok": True, "fee_est": False,
+               "pnl": 0.0, "pnl_ok": True}
+        t.setRowCount(len(keys) + (1 if keys else 0))
+        for i, k in enumerate(keys):
+            a = agg[k]
+            self._sum_row(t, i, k, a)
+            for f in ("n", "vol"):
+                tot[f] += a[f]
+            tot["fee"] += a["fee"]
+            tot["pnl"] += a["pnl"]
+            tot["fee_ok"] = tot["fee_ok"] and a["fee_ok"]
+            tot["pnl_ok"] = tot["pnl_ok"] and a["pnl_ok"]
+            tot["fee_est"] = tot["fee_est"] or a["fee_est"]
+        if keys:
+            self._sum_row(t, len(keys), "合计", tot, bold=True)
+        self._fit_columns(t, stretch=0)
+
+    def _sum_row(self, t, i: int, name: str, a: dict, bold: bool = False) -> None:
+        """汇总表的一行。`*` = 有算不出来的那几笔，只加了能加的。"""
+        fee = "—" if not a["fee_ok"] and not a["fee"] else (
+            f"{'≈' if a['fee_est'] else ''}"
+            f"{a['fee']:,.2f}{'' if a['fee_ok'] else '*'}")
+        pnl = "—" if not a["pnl_ok"] and not a["pnl"] else (
+            f"{a['pnl']:+,.2f}{'' if a['pnl_ok'] else '*'}")
+        vals = [name, str(a["n"]), str(a["vol"]), fee, pnl]
+        for j, v in enumerate(vals):
+            item = QTableWidgetItem(v)
+            if j:
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if bold:
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
+                item.setBackground(QColor(C_TOTAL_BG))
+            if j == 4:
+                item.setForeground(QColor(_color(a["pnl"] if a["pnl_ok"] else None)))
+            elif j == 3:
+                item.setForeground(QColor(C_MUTED if a["fee_est"] else C_TEXT))
+            t.setItem(i, j, item)
+        if bold:
+            t.item(i, 0).setToolTip("全部品种的合计（只加算得出来的那部分）")
 
     # ---------------------------------------------------------- 报价框
 
@@ -1876,10 +2087,12 @@ class TradePage(QWidget):
             chg = (last - pre) if (last > 0 and pre > 0) else None
             vals = [
                 code,
-                f"{last:.2f}" if last else "—",
-                _pnl(chg) if chg is not None else "—",
-                _px(r.get("bid")),
-                _px(r.get("ask")),
+                # 小数位跟着这个合约的最小变动价位走：铜 90,040、国债 118.115、
+                # 棉花 5,902。一律 `:.2f` 是「假精度」，看着像行情在小数位跳
+                symbols_info.price_text(last, sym) if last else "—",
+                symbols_info.price_text(chg, sym, signed=True) if chg is not None else "—",
+                _px(r.get("bid"), sym),
+                _px(r.get("ask"), sym),
                 _hms(r.get("datetime")),
             ]
             for j, v in enumerate(vals):

@@ -10862,6 +10862,79 @@ def _run() -> tuple[bool, list[str]]:
             if page.tbl_trades.item(1, k).text() != "—":
                 raise RuntimeError("拿不到均价的平仓盈亏要显示「—」，不是 0")
 
+            # ---- 4b 手续费列：柜台给的直接显示、估算的带 ≈、算不出来的画「—」
+            from ttrade import costs as _costs
+            if "手续费" not in trd_hdr:
+                raise RuntimeError(f"成交表没有「手续费」列：{trd_hdr}")
+            # 逐笔口径（costs.commission）：按手 / 按成交额两种都要对
+            if abs(_costs.commission("M", "DCE", 3200.0, 2) - 3.0) > 1e-6:
+                raise RuntimeError(
+                    f"豆粕按手收的手续费不对：{_costs.commission('M', 'DCE', 3200.0, 2)}"
+                    "（1.5 元/手 × 2 手 = 3.0）")
+            rb_fee = _costs.commission("RB", "SHFE", 3550.0, 2)
+            if rb_fee is None or abs(rb_fee - 0.71) > 1e-3:
+                raise RuntimeError(
+                    f"螺纹按成交额收的手续费不对：{rb_fee}"
+                    "（0.00001 × 3550 × 2 手 × 乘数 10 = 0.71）")
+            if _costs.commission("RB", "SHFE", 0.0, 2) is not None:
+                raise RuntimeError("没有价格时手续费要返回 None，不能返回 0（界面要画「—」）")
+            if _costs.commission("ZZZZ", "", 3550.0, 2) is not None:
+                raise RuntimeError(
+                    "品种表里没有的合约要返回 None —— specs 对未知品种会悄悄退回"
+                    "乘数 1.0，按它算出来的手续费差一个数量级")
+
+            fee_j = trd_hdr.index("手续费")
+            page._fill_trades([
+                {"account": "甲", "time": "11-18 14:00:00",
+                 "symbol": "SHFE.rb2601", "direction": "SELL", "offset": "CLOSE",
+                 "price": 3550.0, "volume": 2, "close_profit": 250.0,
+                 "commission": 5.0, "commission_est": False},
+                {"account": "甲", "time": "11-18 14:01:00",
+                 "symbol": "DCE.m2601", "direction": "BUY", "offset": "CLOSE",
+                 "price": 3200.0, "volume": 1, "close_profit": 120.0,
+                 "commission": 3.5, "commission_est": True},
+                {"account": "甲", "time": "11-18 14:02:00",
+                 "symbol": "DCE.m2601", "direction": "BUY", "offset": "OPEN",
+                 "price": 3210.0, "volume": 1, "close_profit": 0.0,
+                 "commission": None, "commission_est": False},
+            ])
+            for i, want_fee in enumerate(("5.00", "≈3.50", "—")):
+                got = page.tbl_trades.item(i, fee_j).text()
+                if got != want_fee:
+                    raise RuntimeError(
+                        f"成交表第 {i} 行手续费是 {got!r}，应 {want_fee!r}"
+                        "（柜台给的直接写；估算的带 ≈；算不出来的画「—」不是 0.00）")
+
+            # ---- 4c 「按品种统计」：勾上翻到汇总表，按品种聚合，末行合计
+            sum_hdr = [page.tbl_trade_sum.horizontalHeaderItem(i).text()
+                       for i in range(page.tbl_trade_sum.columnCount())]
+            if sum_hdr != ["品种", "笔数", "手数", "手续费", "平仓盈亏"]:
+                raise RuntimeError(f"汇总表列不对：{sum_hdr}")
+            if page.stack_trades.currentIndex() != 0:
+                raise RuntimeError("默认应该看逐笔成交（明细页）")
+            page.chk_trade_sum.setChecked(True)
+            if page.stack_trades.currentIndex() != 1:
+                raise RuntimeError("勾上「按品种统计」没切到汇总表")
+            st_sum = page.tbl_trade_sum
+            # 品种 笔数 手数 手续费 平仓盈亏
+            want = [
+                ("M", "2", "2", "≈3.50*", "+120.00"),
+                ("RB", "1", "2", "5.00", "+250.00"),
+                ("合计", "3", "4", "≈8.50*", "+370.00"),
+            ]
+            for i, row in enumerate(want):
+                got = tuple(st_sum.item(i, j).text() for j in range(5))
+                if got != row:
+                    raise RuntimeError(f"汇总表第 {i} 行是 {got}，应 {row}")
+            if not st_sum.item(2, 0).font().bold():
+                raise RuntimeError("汇总表最后一行「合计」没有加粗")
+            page.chk_trade_sum.setChecked(False)
+            if page.stack_trades.currentIndex() != 0:
+                raise RuntimeError("取消「按品种统计」没切回明细表")
+            page._fill_trades([])
+            if page.tbl_trade_sum.rowCount() != 0:
+                raise RuntimeError("没有成交时汇总表不该留着一行空的「合计」")
+
             # 「资金账户」列不许吃 Stretch；该宽的那列才 Stretch
             for tbl, wide in ((page.tbl_pos, 1), (page.tbl_orders, 9),
                               (page.tbl_trades, 2)):
@@ -10883,9 +10956,12 @@ def _run() -> tuple[bool, list[str]]:
             }])
             if page.tbl_quotes.item(0, 0).text() != "rb2601":
                 raise RuntimeError("报价框合约显示的不是裸代码")
-            if page.tbl_quotes.item(0, 1).text() != "3550.00":
-                raise RuntimeError("报价框最新价没填对")
-            if page.tbl_quotes.item(0, 2).text() != "+50.00":
+            # 最新价 / 涨跌的小数位跟着合约的最小变动价位走：RB 一跳 1 ⇒ 3550，
+            # 不是 3550.00（用户 2026-11-20 要求，和品种价格列同一套）
+            if page.tbl_quotes.item(0, 1).text() != "3,550":
+                raise RuntimeError(
+                    f"报价框最新价没填对：{page.tbl_quotes.item(0, 1).text()!r}")
+            if page.tbl_quotes.item(0, 2).text() != "+50":
                 raise RuntimeError(
                     f"涨跌算错：{page.tbl_quotes.item(0, 2).text()!r}（要 3550−3500）")
             # 天勤的 datetime 带微秒，`[-8:]` 会截出 `2.000000`
@@ -10921,7 +10997,9 @@ def _run() -> tuple[bool, list[str]]:
         return ("持仓当日盈亏走 position_profit（-80.00）、成交平仓盈亏按多空各侧均价"
                 "（+250.00 / 拿不到均价画「—」）、CTP 委托时间=11-18 14:35:02 而不是"
                 "委托说明、三表资金账户列不再吃 Stretch、报价框双击带入 "
-                "rb2601@3550 且合约去重归一")
+                "rb2601@3550 且合约去重归一；手续费逐笔显示（柜台 5.00 / 估算≈3.50 / "
+                "算不出来「—」）、按品种汇总 M 2 笔 2 手 ≈3.50*、RB 1 笔 2 手 5.00、"
+                "合计 3 笔 4 手 ≈8.50*/+370.00 且加粗，开关翻页、空成交不留空合计行")
 
     check("组合页工作区工具条：工作区一行、资金分配一行", _ws_bar_two_rows)
 
@@ -11195,7 +11273,9 @@ def _run() -> tuple[bool, list[str]]:
             page._render_pnl(t, 0, {"price": 1200.0, "day_pnl": 1234.0,
                                     "pos_pnl": -567.0, "underlying": "SHFE.rb2701"})
             got = [t.item(0, j).text() for j in (7, 8, 9)]
-            if got != ["1,200.00", "+1,234", "-567"]:
+            # 品种价格的小数位跟合约的最小变动价位走（RB 一跳 1 ⇒ 写 1,200，
+            # 不是 1,200.00）—— 用户 2026-11-20 要求
+            if got != ["1,200", "+1,234", "-567"]:
                 raise RuntimeError(f"三列填出来的字不对：{got}")
             # 不知道的数写「—」，不能写 0（0 会被读成「不赚不亏」）
             page._render_pnl(t, 0, {"price": None, "day_pnl": None,
@@ -11320,7 +11400,152 @@ def _run() -> tuple[bool, list[str]]:
 
     check("策略列表：最后一行「合计」", _strat_total_row)
 
-    check("交易页：持仓当日盈亏 / 成交平仓盈亏 / CTP 委托时间 / 报价框", _trade_pnl_quote)
+    def _lib_scroll_and_tick():
+        """策略库对话框记住滚动位置 + 价格框步长 = 合约的最小变动价位。
+
+        两条都是用户 2026-11-20 提的：
+
+        - 「加载策略的时候，记住滚动滑轮的位置，下次打开继续在这个位置，方便
+          找策略」—— 记的是**那一行的 sid**，库里增删过后仍能找回同一条；
+          sid 没了退回行号；两者都没有就停在顶部。
+        - 「价格框里头，上下调节价格的按钮，按照合约的最小跳动来自动调整幅度
+          为最小跳动」—— 铜一跳 10、螺纹 1、还有 0.5 一档的品种，固定步长 1
+          会「按一下跳两跳」或「按十下才动一格」。
+        """
+        from PySide6.QtWidgets import (
+            QAbstractItemView, QApplication, QDoubleSpinBox)
+
+        app = QApplication.instance() or QApplication([])      # noqa: F841
+        from gui.portfolio_page import LibraryDialog
+        from gui.trade_page import TradePage, _tick_decimals
+        from ttrade import strategy_store as SStore
+
+        items = [SStore.StrategyConfig(
+            sid=f"__scr_{i:02d}", name=f"滚动{i:02d}", symbol="RB",
+            exchange="SHFE", period="5m", family="rule", rule_key="ma_cross",
+            account="__selftest__") for i in range(40)]
+
+        def top_row(dlg) -> int:
+            return dlg.lst.indexAt(dlg.lst.viewport().rect().topLeft()).row()
+
+        # ---- ① 滚到第 12 行再关，重开要回到 12 ----
+        d1 = LibraryDialog(items, title="加载策略")
+        d1.resize(720, 260)
+        d1.show()
+        app.processEvents()
+        app.processEvents()
+        d1.lst.scrollToItem(d1.lst.item(12), QAbstractItemView.PositionAtTop)
+        app.processEvents()
+        if top_row(d1) != 12:
+            raise RuntimeError(f"策略库列表滚不动，视口顶行是 {top_row(d1)}")
+        d1.close()
+        app.processEvents()
+        got = SStore.ui_state(LibraryDialog.SCROLL_KEY, {})
+        if not isinstance(got, dict) or got.get("sid") != "__scr_12":
+            raise RuntimeError(f"滚动位置没落盘：{got}")
+
+        d2 = LibraryDialog(items, title="加载策略")
+        d2.resize(720, 260)
+        d2.show()
+        app.processEvents()
+        app.processEvents()
+        if top_row(d2) != 12:
+            raise RuntimeError(
+                f"重开没回到上次那一行（视口顶行 {top_row(d2)}，应 12）")
+        d2.close()
+        app.processEvents()
+
+        # 库里那条被删了 ⇒ 退回行号，不许崩、不许跳回顶部
+        SStore.put_ui_state(LibraryDialog.SCROLL_KEY,
+                            {"sid": "__gone__", "row": 9})
+        d3 = LibraryDialog(items, title="加载策略")
+        d3.resize(720, 260)
+        d3.show()
+        app.processEvents()
+        app.processEvents()
+        if top_row(d3) != 9:
+            raise RuntimeError(
+                f"sid 找不到时要退回行号 9：{top_row(d3)}")
+        d3.close()
+        app.processEvents()
+
+        # ---- ② 价格框步长 = 最小变动价位 ----
+        class _Stub:
+            def __init__(self, stock=False):
+                self._stock_mode = stock
+                self.sp_price = QDoubleSpinBox()
+                self.sp_price.setDecimals(4)          # 出厂就是 4 位
+                self.sp_price.setRange(0, 9_999_999)
+                self.sp_price.setSingleStep(1)        # 和出厂默认一致
+
+        def apply(sym, value, tick=0.0, stock=False):
+            o = _Stub(stock)
+            o.sp_price.setValue(value)
+            got_tick = TradePage._apply_tick(o, sym, tick)
+            return (got_tick, o.sp_price.singleStep(),
+                    o.sp_price.decimals(), o.sp_price.value())
+
+        # 铜一跳 10：步长 10，且不再显示 8240.0000
+        t, step, dec, val = apply("SHFE.cu2701", 8240.0)
+        if abs(t - 10) > 1e-9 or abs(step - 10) > 1e-9 or dec != 0:
+            raise RuntimeError(f"铜的步长不对：tick {t} 步长 {step} 位数 {dec}")
+        if abs(val - 8240.0) > 1e-9:
+            raise RuntimeError(f"对齐位数时把价格改掉了：{val}")
+        # 螺纹一跳 1
+        t, step, dec, _v = apply("SHFE.rb2701", 3550.0)
+        if abs(t - 1) > 1e-9 or abs(step - 1) > 1e-9 or dec != 0:
+            raise RuntimeError(f"螺纹的步长不对：tick {t} 步长 {step} 位数 {dec}")
+        # 0.5 一档：步长 0.5、留 1 位
+        _t, step, dec, val = apply("", 3550.5, tick=0.5)
+        if abs(step - 0.5) > 1e-9 or dec != 1 or abs(val - 3550.5) > 1e-9:
+            raise RuntimeError(f"0.5 一档不对：步长 {step} 位数 {dec} 值 {val}")
+        # 现值在目标位数下表示不出来（tick 和价不是一套）⇒ 不许四舍五入
+        _t, _s, dec, val = apply("", 3550.55, tick=1.0)
+        if abs(val - 3550.55) > 1e-9:
+            raise RuntimeError(f"不该把 3550.55 抹成 {val}（tick=1 时）")
+        # 0.01 → 10 一档，小数位要能收回来
+        if (_tick_decimals(0.01), _tick_decimals(0.2),
+                _tick_decimals(10.0), _tick_decimals(0.005)) != (2, 1, 0, 3):
+            raise RuntimeError("最小变动价位 → 小数位换算错了")
+        # A 股不在品种表里，但一档就是 0.01 元
+        t, step, dec, val = apply("SSE.600000", 12.34, stock=True)
+        if abs(step - 0.01) > 1e-9 or dec != 2 or abs(val - 12.34) > 1e-9:
+            raise RuntimeError(f"A 股步长不对：{t} 步长 {step} 位数 {dec} 值 {val}")
+
+        # ---- ③ 显示位数：品种价格列 / 报价框都按 tick 收 ----
+        from ttrade import symbols_info as SI
+
+        if SI.contract_product("SHFE.cu2701") != ("CU", "SHFE"):
+            raise RuntimeError("交易所.合约 拆品种错了")
+        if SI.contract_product("rb2601") != ("RB", ""):
+            raise RuntimeError("裸合约代码拆错了")
+        for sym, raw, want in (
+                ("GFEX.lc2701", 90040.0, "90,040"),      # 一跳 20
+                ("ZF.CF2601", 5056.0, "5,056"),          # 一跳 5
+                ("CFFEX.T2612", 118.115, "118.115"),     # 一跳 0.005
+                ("SHFE.rb2701", 5942.8, "5,942.8"),      # 表示不出来就多留一位
+        ):
+            got = SI.price_text(raw, sym)
+            if got != want:
+                raise RuntimeError(f"{sym} 的价格位数不对：{got}（应 {want}）")
+        # 涨跌带符号；不知 tick 退回 2 位；None 写「—」
+        if SI.price_text(-1460.0, "GFEX.lc2701", signed=True) != "-1,460":
+            raise RuntimeError("涨跌的符号/位数不对")
+        if SI.price_text(1.2, "") != "1.20":
+            raise RuntimeError("不知道 tick 时要退回 2 位小数")
+        if SI.price_text(None, "GFEX.lc2701") != "—":
+            raise RuntimeError("没有价格要写「—」")
+
+        SStore.put_ui_state(LibraryDialog.SCROLL_KEY, {})     # 别留给下一次用例
+        return ("策略库对话框：滚到第 12 行→关掉重开仍是 12、sid 失效退回行号 9；"
+                "价格框步长跟着 tick 走（铜 10 / 螺纹 1 / 0.5 一档），"
+                "小数位顺带对齐但不改价；品种价格与报价框的显示位数也按 tick 收"
+                "（lc 90,040 / CF 5,056 / T 118.115），且不抹掉真实价位")
+
+    check("策略库对话框滚动位置 / 价格框步长", _lib_scroll_and_tick)
+
+    check("交易页：持仓当日盈亏 / 成交手续费与按品种统计 / CTP 委托时间 / 报价框",
+          _trade_pnl_quote)
 
     # 跑完就把进度文件收掉：留着会让下一轮的诊断以为"上次崩过"。
     # 崩溃时走不到这里，文件正好留下最后一项的名字。

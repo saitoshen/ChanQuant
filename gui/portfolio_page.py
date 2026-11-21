@@ -155,6 +155,7 @@ from ttrade import replay
 from ttrade import cross as cross_engine
 from ttrade import portfolio_plan as PL
 from ttrade import strategy_store as SStore
+from ttrade import symbols_info as SI
 from ttrade import tqlive
 from ttrade import workspace_store as WS
 from ttrade.tqlive import merge_live
@@ -747,7 +748,19 @@ class PortfolioController(QObject):
 
 
 class LibraryDialog(QDialog):
-    """从策略库挑一条。两处用：加进组合、在研究页加载参数。"""
+    """从策略库挑一条。两处用：加进组合、在研究页加载参数。
+
+    会记住**上次滚到哪一行**（用户 2026-11-20：「加载策略的时候，记住滚动滑轮的
+    位置，下次打开继续在这个位置，方便找策略」）。库长了以后每次打开都回到顶部，
+    等于每次都要重新滚一遍找同一条。
+
+    记的是**那一行策略的 sid** 而不只是滚动条的像素值：库中间增删过条目之后，
+    像素值对应的是另一条策略，而 sid 还能找回同一条（找不到了再退回行号）。
+    """
+
+    #: `strategy_store.ui_state` 里的键。两个入口（加进组合 / 加载参数）共用 ——
+    #: 它们列的是同一份库，滚到哪儿就该是哪儿
+    SCROLL_KEY = "library_scroll"
 
     def __init__(self, items: list, parent=None, title: str = "从策略库添加",
                  hint: str = "") -> None:
@@ -778,6 +791,55 @@ class LibraryDialog(QDialog):
         box.accepted.connect(self.accept)
         box.rejected.connect(self.reject)
         lay.addWidget(box)
+
+        # 恢复滚动位置。**必须等窗口显示、列表排完版再滚**：`__init__` 里
+        # viewport 还没有真实高度，`scrollToItem` 算出来的位置会被随后的
+        # 布局动作冲掉（表现成「记了但没生效」）
+        self._scroll_done = False
+        self._saved = SStore.ui_state(self.SCROLL_KEY, {}) or {}
+        self.finished.connect(lambda _r: self._save_scroll())
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        super().showEvent(event)
+        if self._scroll_done:
+            return
+        self._scroll_done = True
+        QTimer.singleShot(0, self._restore_scroll)
+
+    def _row_of_sid(self, sid: str) -> int:
+        if not sid:
+            return -1
+        for i in range(self.lst.count()):
+            it = self.lst.item(i)
+            if it is not None and str(it.data(Qt.UserRole) or "") == sid:
+                return i
+        return -1
+
+    def _restore_scroll(self) -> None:
+        """滚回上次那一行。sid 找不到（那条策略被删了）就退回行号。"""
+        row = self._row_of_sid(str(self._saved.get("sid") or ""))
+        if row < 0:
+            try:
+                row = int(self._saved.get("row") or 0)
+            except (TypeError, ValueError):
+                row = 0
+        if row <= 0 or row >= self.lst.count():
+            return                       # 第一行本来就是默认位置，不用滚
+        self.lst.scrollToItem(self.lst.item(row),
+                              QAbstractItemView.PositionAtTop)
+
+    def _save_scroll(self) -> None:
+        """记下**视口最上面那一行**。窗口已经关掉也照记，值不依赖可见性。"""
+        try:
+            idx = self.lst.indexAt(self.lst.viewport().rect().topLeft())
+            row = idx.row() if idx.isValid() else 0
+            it = self.lst.item(row)
+            SStore.put_ui_state(self.SCROLL_KEY, {
+                "row": int(row),
+                "sid": "" if it is None else str(it.data(Qt.UserRole) or ""),
+            })
+        except (RuntimeError, AttributeError):
+            pass                         # 控件已经销毁：这次不记就是了
 
     def sid(self) -> str:
         it = self.lst.currentItem()
@@ -1922,8 +1984,6 @@ class PortfolioPage(QWidget):
         `margin_src`：空 = 从没刷过，`live` = 刷过，`user` = 手填。
         """
         try:
-            from ttrade import symbols_info as SI
-
             stale = []
             for cfg, _kind, _payload in jobs:
                 sym = str(getattr(cfg, "symbol", "") or "")
@@ -3046,7 +3106,9 @@ class PortfolioPage(QWidget):
             if it is not None and it.toolTip() != tip7:
                 it.setToolTip(tip7)
         else:
-            self._set_cell(t, i, 7, f"{float(px):,.2f}", C_TEXT)
+            # 小数位跟着这个合约的最小变动价位走（用户 2026-11-20）：
+            # 铜 90,040、棉花 5,056、国债 118.115 —— 一律 `:.2f` 是假精度
+            self._set_cell(t, i, 7, SI.price_text(px, up), C_TEXT)
             it = t.item(i, 7)
             if it is not None and it.toolTip() != (f"{up or '当前合约'} 最新价"):
                 it.setToolTip(f"{up or '当前合约'} 最新价")

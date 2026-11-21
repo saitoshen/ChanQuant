@@ -43,7 +43,8 @@ from ttrade.ctp_client import (
     MdClient,
     TraderClient,
 )
-from ttrade.tqlive import LiveState, _mult_of, est_close_pnl, update_open_avg
+from ttrade.tqlive import (LiveState, _mult_of, est_close_pnl,
+                           est_commission, update_open_avg)
 
 # 大写合约代码的交易所。CZCE 的合约是 `TA601` 这种，郑商所历史上一直用大写；
 # 中金所 `IF2601` 也是大写。其余（上期/大商/能源/广期）全小写。
@@ -723,6 +724,8 @@ class CtpHub:
         # 的均价；所以先刷新缓存，再倒推成交的平仓盈亏
         update_open_avg(self._open_cache, positions)
         est_close_pnl(trades, self._open_cache, self._mult)
+        # 柜台回报里没有逐笔手续费，按品种成本档案估（标 est，界面上加「≈」）
+        est_commission(trades, mult_of=self._mult, exchange_of=self._ex_of)
         name = self.spec.name if self.spec is not None else self.PLATFORM
         row = self._account_row(name, account, positions, trades)
         st.account = account
@@ -739,17 +742,31 @@ class CtpHub:
         st.quotes = self._watch_rows()
         return st
 
+    def _ex_of(self, instrument: str) -> str:
+        """合约 → 交易所。CTP 给的合约代码不带交易所，得自己补。
+
+        优先问柜台（订阅过就有），没订阅过就扫本地数据文件名
+        （见 `variety_exchange`）—— 手数、成交金额、手续费都要它，缺了就全错。
+        """
+        ins = str(instrument or "")
+        if not ins:
+            return ""
+        head, _, tail = ins.partition(".")
+        if tail:                      # 已经是 `SHFE.rb2601` 这种写法
+            return head.upper()
+        if self.trader is not None:
+            ex = str((self.trader.instruments.get(ins) or {}).get("exchange") or "")
+            if ex:
+                return ex
+        return variety_exchange("".join(ch for ch in ins if ch.isalpha()))
+
     def _mult(self, instrument: str) -> float:
         """合约乘数。`_mult_of` 认的是 `SHFE.rb2601` 这种带交易所的写法，
         CTP 给的是光秃秃的 `rb2601` —— 直接传进去乘数会变成 1.0，杠杆和
         成交金额就全错一个数量级。所以先补上交易所。
         """
         ins = str(instrument or "")
-        ex = ""
-        if self.trader is not None:
-            ex = str((self.trader.instruments.get(ins) or {}).get("exchange") or "")
-        if not ex:
-            ex = variety_exchange("".join(ch for ch in ins if ch.isalpha()))
+        ex = self._ex_of(ins)
         try:
             return float(_mult_of(f"{ex}.{ins}") if ex else _mult_of(ins)) or 1.0
         except Exception:  # noqa: BLE001

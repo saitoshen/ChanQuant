@@ -198,6 +198,46 @@ def apply(bt, symbol: str, exchange: str, profile_key: str | None = None,
     return bt
 
 
+def commission(symbol: str, exchange: str, price: float, volume: int,
+               profile_key: str | None = None, mult: float = 0.0) -> float | None:
+    """一笔成交的**手续费**（元）—— 交易所口径，和回测同一个公式。
+
+    按手（`fee_mode == "lot"`）：`fee_value × 倍数 × 手数`
+    按成交额（其余）：`fee_value × 倍数 × 价 × 手数 × 乘数`
+
+    `mult` 传了就用它（调用方手上已经有更准的乘数 —— CTP 的合约代码不带交易所，
+    这里自己查表会退回 1.0，那就差一个数量级）。
+
+    🔴 滑点**不算**进来：手续费是期货公司实收的钱，滑点是机会成本，不是账单。
+    混在一起，用户拿这一列和结算单永远对不上。
+    🔴 拿不到乘数 / 价格时返回 `None`，**不返回 0** —— 「这一笔不收费」和
+    「不知道收多少」是两回事，后者界面上要画「—」。
+    """
+    try:
+        px = float(price)
+        vol = int(volume or 0)
+    except (TypeError, ValueError):
+        return None
+    if not (px > 0) or vol <= 0:
+        return None
+    p = profile(profile_key)
+    si = symbols_info.info(symbol, exchange)
+    # `tick <= 0` = 品种信息表里根本没有它（`specs.multiplier` 对未知品种会
+    # 悄悄退回 1.0）。这时候再按乘数 1.0 算出来的手续费会差一个数量级，不如
+    # 老老实实说「算不出来」。
+    if not (float(si.get("tick") or 0.0) > 0):
+        return None
+    fee = float(si.get("fee_value") or 0.0) * float(p.get("fee_mult") or 1.0)
+    if not (fee > 0):
+        return None
+    if str(si.get("fee_mode")) == "lot":
+        return fee * vol
+    m = float(mult or 0.0) or float(si.get("mult") or 0.0)
+    if not (m > 0):
+        return None
+    return fee * px * vol * m
+
+
 def describe(symbol: str, exchange: str, profile_key: str | None = None) -> str:
     """一句话说明这一档在这个品种上到底收多少，给界面上的提示用。"""
     p = profile(profile_key)

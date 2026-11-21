@@ -5,6 +5,8 @@
 - `strategy_lib.json` —— 策略库。用户在「策略研究」里存的配置模板，可复用、可导出。
 - `portfolio.json`    —— 交易组合。`策略交易和组合` 页面里那一列正在跑的策略。
 - `last_config.json`  —— 策略研究页上次的配置，下次打开自动恢复。
+- `ui_state.json`     —— 纯界面状态（策略库对话框滚到第几行）。丢了不影响任何东西，
+                         所以和上面三份分开存。
 
 除了这三份，还有一个**不在磁盘上**的策略库成员：`ttrade.strategy_templates`
 里的内置模板。它随版本发布，只读，`library_view()` 把两边拼起来给界面用；
@@ -46,6 +48,10 @@ LAST_FILE = "last_config.json"
 # 组合工作区。放在这里是为了让 `set_store_dir()` 一处就能把它们一起重定向 ——
 # 常量分散在两个模块里，早晚会漏掉一个（漏掉的正好就是用户数据）
 WS_FILE = "workspaces.json"
+# 纯界面的「上次停在哪」：策略库对话框滚到第几行、以后可能还有折叠状态之类。
+# 和上面那几份分开存，是因为它**丢了不影响任何东西** —— 混进组合文件里，
+# 一份显示状态就能把用户的交易配置写坏
+UI_FILE = "ui_state.json"
 
 # 截面策略「腿内怎么分钱」的中文名。策略库表格里要显示，界面下拉也用它，
 # 放一处免得两边慢慢走偏
@@ -762,7 +768,7 @@ def set_store_dir(path: str, seed: bool = True) -> str:
     if seed:
         import shutil
 
-        for name in (LIB_FILE, PORT_FILE, LAST_FILE, CHASE_FILE, WS_FILE):
+        for name in (LIB_FILE, PORT_FILE, LAST_FILE, CHASE_FILE, WS_FILE, UI_FILE):
             src = os.path.join(user_dir(), name)
             if os.path.exists(src):
                 try:
@@ -806,6 +812,31 @@ def _save(name: str, data) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+
+
+def ui_state(key: str, default=None):
+    """界面上的「上次停在哪」—— 策略库对话框滚到第几行这类纯显示状态。
+
+    为什么单独一份文件：它**丢了不影响任何东西**，而 `portfolio.json` 一份写坏
+    就是策略列表没了。所以这里也不做类型/范围校验 —— 读到一个怪值由调用方
+    自己夹到合法范围里。
+    """
+    data = _load(UI_FILE)
+    if not isinstance(data, dict):
+        return default
+    return data.get(str(key), default)
+
+
+def put_ui_state(key: str, value) -> None:
+    """记一条界面状态。写不进去就算了，不能因为记不住滚动位置把界面弄崩。"""
+    data = _load(UI_FILE)
+    if not isinstance(data, dict):
+        data = {}
+    data[str(key)] = value
+    try:
+        _save(UI_FILE, data)
+    except OSError:
+        pass
 
 
 def _ensure_sid(cfg: StrategyConfig) -> None:
