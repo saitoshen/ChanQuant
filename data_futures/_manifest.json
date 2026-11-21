@@ -924,7 +924,7 @@
     "start": "2019-08-16",
     "end": "2026-11-20",
     "med_amount": 6901.2,
-    "adj_factor_end": 0.764145,
+    "adj_factor_end": 0.772521,
     "adj_factor_span": 1.4571,
     "adjusted": true,
     "file": "RR_DCE.csv"
