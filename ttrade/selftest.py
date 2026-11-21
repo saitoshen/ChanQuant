@@ -3410,7 +3410,22 @@ def _run() -> tuple[bool, list[str]]:
 
         pct = FM._pct_series("usdcnh")
         if pct is None or len(pct) < 200:
-            raise RuntimeError("usdcnh 序列读不到（宏观库没同步？）")
+            # 🔴 宏观库（`edb.duckdb`）和天勤轻量库一样**不在 git 里**（几百 MB，
+            # 由 `macro.py` 的定时任务从天勤 / Tushare / 东财抓）。CI 与全新安装
+            # 本来就没有这份数据 —— 那是环境状态，不是代码缺陷。
+            # v3.8.1 就是栽在这里：本地有库、扫得很漂亮，CI 上直接
+            # 「usdcnh 序列读不到」，三个平台的自检全红，Release 发出一个**空壳**
+            # （零资产，见 v3.8.1 的 release）。
+            # 判据：库里**一条宏观数据都没有** ⇒ 跳过（没同步过）；库里有数据但
+            # 唯独没有 usdcnh ⇒ 红（真出了事，比如序列名改了）。
+            from ttrade import macro as _M
+            st = _M.stats()
+            if not st.get("exists") or not st.get("rows"):
+                return ("跳过：宏观库 edb.duckdb 没有数据（它不在 git 里，CI / 全新"
+                        "安装本来就没有）。本地跑过宏观同步之后这条才会真扫")
+            raise RuntimeError(
+                f"usdcnh 序列读不到，但库里有 {st.get('rows')} 行宏观数据"
+                f"（{st.get('codes')} 个指标）—— 序列名或同步链路出问题了")
         idx = pd.DatetimeIndex(pct.index)
 
         def expect(t):
@@ -3516,7 +3531,12 @@ def _run() -> tuple[bool, list[str]]:
 
         raw = M.series("usdcnh")
         if raw is None or len(raw) < 200:
-            raise RuntimeError("usdcnh 序列读不到")
+            # 同上：宏观库不在 git 里，没同步过就是「跳过」，不是「代码坏了」。
+            st = M.stats()
+            if not st.get("exists") or not st.get("rows"):
+                return "跳过：宏观库 edb.duckdb 没有数据，反推不了标签偏移"
+            raise RuntimeError(
+                f"usdcnh 序列读不到，但库里有 {st.get('rows')} 行宏观数据")
         mac_ret = raw.pct_change()
 
         lo, hi = pd.Timestamp("2026-01-01"), ny_close.index[-1]
