@@ -58,6 +58,15 @@ LITE_DB = os.path.join(ROOT, "data_tq", "tq_lite.duckdb")
 if os.path.isfile(LITE_DB):
     DATAS.append((LITE_DB, "data_tq"))
 
+# 宏观库（14MB / 23 个指标 / 7.8 万行，2003 起）：**这个入库了**（见 .gitignore
+# 里的 `!data_tq/edb.duckdb`），所以 CI 上 checkout 下来就有，安装包也带得上。
+# 不带它的后果很具体：宏观因子（美元指数 / 离岸人民币 / 美债实际利率 / PMI…）
+# 在新装机器上全是 NaN，会被 `factor_matrix` 静默剔除 —— 参与打分的票数比
+# 开发机少几票，信号就翻到另一边去（2026-11-17 两条 IM 策略就是这么来的）。
+EDB_DB = os.path.join(ROOT, "data_tq", "edb.duckdb")
+if os.path.isfile(EDB_DB):
+    DATAS.append((EDB_DB, "data_tq"))
+
 # xgboost 的原生库是 ctypes 在**运行时**按路径找的（xgboost/libpath.py 里
 # 第一个候选就是 <包目录>/lib），PyInstaller 的静态分析看不到，也不会自动收集。
 # 少了它打包后 `import xgboost` 直接抛 XGBoostLibraryNotFound，界面上模型下拉

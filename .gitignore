@@ -46,8 +46,15 @@ desktop.ini
 # 天勤账户（两行：用户名、密码），与 Tushare token 同级别保护
 tq_account.txt
 
-# 天勤行情仓库（DuckDB，5m 全品种十年约 1GB，由 download_tq.py 生成）
-data_tq/
+# 天勤行情仓库（DuckDB，5m 全品种十年约 1GB，由 download_tq.py 生成）。
+# 注意这里忽略的是**目录内容**而不是目录本身：下面要把 14MB 的宏观库
+# `edb.duckdb` 放进来（git 不允许 re-include 一个「父目录已被排除」里的文件，
+# 所以不能写 `data_tq/`）。
+data_tq/*
+# 宏观库：14MB / 23 个指标 / 7.8 万行（2003 起），随包发给用户就能开箱算宏观
+# 因子，CI 的自检也能真扫那两条汇率前视判据（否则只能跳过）。
+# 其余几个库（tq 11GB / tq_lite 274MB / option 18GB / stock 9.6GB）照旧不入库。
+!data_tq/edb.duckdb
 
 # Dukascopy 汇率/美元指数的 1m 原始 JSON 缓存与合成出的 5m。
 # 由 `_tools/duka_fx/duka_fx.py fetch` 生成，随时可重建；几 GB，不入库。

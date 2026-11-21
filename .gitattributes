@@ -14,3 +14,5 @@
 *.ico binary
 *.icns binary
 *.zip binary
+# DuckDB 是页式存储的二进制库：既不能做换行转换，也别让 git 去算文本 diff
+*.duckdb -text
