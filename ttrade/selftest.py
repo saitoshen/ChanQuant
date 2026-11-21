@@ -10886,22 +10886,41 @@ def _run() -> tuple[bool, list[str]]:
             from ttrade import costs as _costs
             if "手续费" not in trd_hdr:
                 raise RuntimeError(f"成交表没有「手续费」列：{trd_hdr}")
-            # 逐笔口径（costs.commission）：按手 / 按成交额两种都要对
-            if abs(_costs.commission("M", "DCE", 3200.0, 2) - 3.0) > 1e-6:
-                raise RuntimeError(
-                    f"豆粕按手收的手续费不对：{_costs.commission('M', 'DCE', 3200.0, 2)}"
-                    "（1.5 元/手 × 2 手 = 3.0）")
-            rb_fee = _costs.commission("RB", "SHFE", 3550.0, 2)
-            if rb_fee is None or abs(rb_fee - 0.71) > 1e-3:
-                raise RuntimeError(
-                    f"螺纹按成交额收的手续费不对：{rb_fee}"
-                    "（0.00001 × 3550 × 2 手 × 乘数 10 = 0.71）")
-            if _costs.commission("RB", "SHFE", 0.0, 2) is not None:
-                raise RuntimeError("没有价格时手续费要返回 None，不能返回 0（界面要画「—」）")
-            if _costs.commission("ZZZZ", "", 3550.0, 2) is not None:
-                raise RuntimeError(
-                    "品种表里没有的合约要返回 None —— specs 对未知品种会悄悄退回"
-                    "乘数 1.0，按它算出来的手续费差一个数量级")
+            # 逐笔口径（costs.commission）：按手 / 按成交额两种都要对。
+            #
+            # 🔴 断言必须**与用户覆盖表无关**。品种费率有两层：`defaults()` 的
+            # 出厂值 + `symbols_info.json` 的用户覆盖（本机 74 条，豆粕被改成
+            # 1.5 元/手）。原先这里直接写死 3.0 / 0.71 —— 本机对得上是因为覆盖表
+            # 正好那样填，CI 上没有覆盖表，豆粕走 DCE 的默认「万分之一」算出 6.4，
+            # 这条自检当场红（v3.8.2 第一次 CI 就是栽在这里，三个平台一起）。
+            # 所以先把覆盖表清空，拿**出厂值**当基准：
+            #     郑商所默认按手 3 元/张（TA 乘数 5）；上期所默认按成交额万分之一。
+            from ttrade import symbols_info as _SI
+            _ov = _SI.load_overrides
+            try:
+                _SI.load_overrides = lambda: {}
+                lot_fee = _costs.commission("TA", "CZCE", 5900.0, 2)
+                if lot_fee is None or abs(lot_fee - 6.0) > 1e-6:
+                    raise RuntimeError(
+                        f"按手收的手续费不对：{lot_fee}（3 元/手 × 2 手 = 6.0）")
+                rb_fee = _costs.commission("RB", "SHFE", 3550.0, 2)
+                if rb_fee is None or abs(rb_fee - 7.1) > 1e-3:
+                    raise RuntimeError(
+                        f"按成交额收的手续费不对：{rb_fee}"
+                        "（0.0001 × 3550 × 2 手 × 乘数 10 = 7.1）")
+                # `rb2601.SHF` 这种写法必须折成 SHFE，否则乘数退化成 1.0
+                if abs(_costs.commission("RB", "SHF", 3550.0, 2) - rb_fee) > 1e-6:
+                    raise RuntimeError(
+                        "交易所缩写 SHF 没折成 SHFE —— 乘数会退化成 1.0，手续费差 10 倍")
+                if _costs.commission("RB", "SHFE", 0.0, 2) is not None:
+                    raise RuntimeError(
+                        "没有价格时手续费要返回 None，不能返回 0（界面要画「—」）")
+                if _costs.commission("ZZZZ", "", 3550.0, 2) is not None:
+                    raise RuntimeError(
+                        "品种表里没有的合约要返回 None —— specs 对未知品种会悄悄"
+                        "退回乘数 1.0，按它算出来的手续费差一个数量级")
+            finally:
+                _SI.load_overrides = _ov
 
             fee_j = trd_hdr.index("手续费")
             page._fill_trades([

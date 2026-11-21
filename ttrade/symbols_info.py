@@ -101,6 +101,19 @@ _FEE_BY_EXCH = {
     "CZCE": ("lot", 3.0),          # 郑商所多数品种按手收
     "CFFEX": ("lot", 3.0),
 }
+# 常见的三字母缩写 → 天勤全称。外部数据源会写 `rb2601.SHF`，交易所自己发的
+# 行情里两种写法都有。不折一下，`_FEE_BY_EXCH` 和 `specs.multiplier(sym, ex)`
+# 都会落空：手续费按「万分之一 × 乘数 1.0」算出来，差一个数量级还不报错。
+_EX_ALIAS = {"SHF": "SHFE", "CZC": "CZCE", "CFX": "CFFEX",
+             "GFX": "GFEX", "ZCE": "CZCE"}
+
+
+def norm_exchange(exchange: str) -> str:
+    """交易所写法归一。`SHF` → `SHFE`、`CZC` → `CZCE`，其余原样大写。"""
+    e = str(exchange or "").strip().upper()
+    return _EX_ALIAS.get(e, e)
+
+
 _FEE_OVERRIDE = {
     # 股指按成交额万分之 0.23 收，比商品低一个数量级
     "IF": ("rate", 0.000023), "IH": ("rate", 0.000023),
@@ -211,7 +224,14 @@ def save_overrides(d: dict) -> None:
 
 
 def info(symbol: str, exchange: str) -> dict:
-    """品种信息 = 默认值 + 用户覆盖。永远返回完整字典。"""
+    """品种信息 = 默认值 + 用户覆盖。永远返回完整字典。
+
+    🔴 进来第一件事是把交易所写法归一（`SHF` → `SHFE`）。这里是全项目唯一
+    的入口 —— `costs.commission` / `tick_of` / 策略页查乘数都走它。原先只有
+    `contract_product` 做了归一，于是「按 `SHF` 查品种信息」这条路照样落空：
+    手续费按乘数 1.0 算，差 10 倍而且不报错（v3.8.2 自检抓到的）。
+    """
+    exchange = norm_exchange(exchange)
     key = f"{symbol}_{exchange}" if exchange else symbol
     out = defaults(symbol, exchange)
     for k, v in (load_overrides().get(key) or {}).items():
@@ -221,13 +241,6 @@ def info(symbol: str, exchange: str) -> dict:
             except (TypeError, ValueError):
                 continue
     return out
-
-
-# 常见的三字母缩写 → 天勤全称。交易所自己发的行情里两种写法都有（`rb2601.SHF`
-# 这种是外部数据源的写法），不折一下下游 `specs.multiplier(sym, ex)` 会落空，
-# 手续费跟着退化成「算不出来」。
-_EX_ALIAS = {"SHF": "SHFE", "CZC": "CZCE", "CFX": "CFFEX",
-             "GFX": "GFEX", "ZCE": "CZCE"}
 
 
 def contract_product(contract: str) -> tuple[str, str]:
@@ -251,8 +264,7 @@ def contract_product(contract: str) -> tuple[str, str]:
             ex, s = head.upper(), tail            # SHFE.rb2701
         elif tail.isalpha():
             ex, s = tail.upper(), head            # rb2601.SHF
-    return ("".join(c for c in s if c.isalpha()).upper(),
-            _EX_ALIAS.get(ex, ex))
+    return "".join(c for c in s if c.isalpha()).upper(), norm_exchange(ex)
 
 
 def tick_of(symbol: str, exchange: str = "") -> float:
