@@ -8267,14 +8267,12 @@ def _run() -> tuple[bool, list[str]]:
         assert cfg2.td_front == "", \
             "空交易前置被预设补上了 —— 那会连到 SimNow，融航 dll 直接崩"
 
-        # 通道互斥的错误文案必须把人话讲清楚（这里只验措辞，不真的绑第二个通道：
-        # 一旦在本进程加载融航 dll，后面的 CTP 用例就没法跑了）
-        assert "段错误" in ctp_channel.ChannelError(
-            "两套 CTP 库在同一进程里会段错误崩溃").args[0]
+        # 🔴 两套 dll 能不能同进程 —— 2026-11-23 改判成「能」，见下面的
+        # `_dual_channel` 那一块（这里不重复加载，免得这一块的耗时翻倍）
 
         # ---- 市价单（2026-11-23 用户：「融航也要支持市价单」）
         #
-        # 只查源码不真报单：绑融航 dll 会把 CTP 那套 dll 挤掉，后面的用例全崩。
+        # 只查源码不真报单（这一块不连柜台，报单路径没有真会话可打）。
         # 要钉住的是「字段跟 CTP 一个规矩」——AnyPrice + 价格 0 + IOC，
         # 以及那句「只收限价单」的老闸门真的删掉了
         import inspect
@@ -8360,6 +8358,77 @@ def _run() -> tuple[bool, list[str]]:
                 "空包也算读完")
 
     check("融航客户端（可选依赖）", _rohon)
+
+    def _dual_channel() -> str:
+        """标准 CTP 与融航两套 dll **可以同时在同一个进程里**（2026-11-23 改判）。
+
+        用户问：「现在 CTP 和融航不能同时登录，说设计独立进程可以支持同时登录，
+        评估下可行吗」。评估的第一步不是设计进程，而是确认这条限制还成不成立。
+
+        原来的依据是「同进程建两套 API 必 exit 139」，据此做了**进程级互斥**：
+        一绑一个通道，再要另一个就抛 `ChannelError`，界面只能二选一。
+
+        2026-11-23 用 `_probe_dll.py` 分四阶段重测：只用标准 / 只用融航 /
+        两套同时建对象 / 两套**同时 Init**（四条会话线程同跑 3 秒再全 Release）
+        —— 全部正常，无段错误。原因在目录里看得见：融航那份 dll 是**改名后的**
+        （`thosttraderapi_se-5906db0c….dll`，delvewheel 的哈希后缀就是为此存在），
+        且以独立顶层包名 `rohon_openctp_ctp` 加载，两套不共享模块也不共享符号。
+
+        所以真正要钉的是两件事：
+          ① `load()` 不许再因为「已经绑了另一个」抛异常（互斥锁已拆）；
+          ② 🔴 请求结构体必须**按客户端各取各的**：`mdapi`/`tdapi` 原先挂在模块上，
+             后绑的会覆盖先绑的 ⇒ 先建的那个客户端按**另一套 dll 的结构体布局**
+             造请求（价格/手数变垃圾值，甚至崩）。现在走 `TraderClient._td`。
+        """
+        from ttrade import ctp_channel
+        from ttrade import ctp_client as C
+
+        ok, why = ctp_channel.available("rohon")
+        if not ok:
+            raise RuntimeError(f"融航运行时缺失，这条验不了：{why}")
+
+        # ① 两家都要能拿到，而且是**不同**的模块对象
+        md_c, td_c = ctp_channel.load("ctp")
+        md_r, td_r = ctp_channel.load("rohon")
+        if td_c is td_r or md_c is md_r:
+            raise RuntimeError(
+                "两个通道返回了同一套模块 —— 结构体必然串（价格/手数会变垃圾值），"
+                "说明 `load()` 的缓存按错了键")
+        if td_c.CThostFtdcInputOrderField is td_r.CThostFtdcInputOrderField:
+            raise RuntimeError("两家的报单结构体是同一个类 —— 根本没加载到两套 dll")
+        # 反过来再取一次：先绑的那家不许被后绑的挤掉（缓存要按通道分开存）
+        if ctp_channel.load("ctp")[1] is not td_c:
+            raise RuntimeError("先绑 CTP、再绑融航之后，CTP 那套被换掉了")
+
+        # ② 两个客户端同时活着，各自的请求必须来自各自的 dll
+        def mk(kind: str, who: str):
+            return C.TraderClient(C.CtpConfig(
+                name=who, preset="", channel=kind,
+                td_front="tcp://127.0.0.1:1",      # 只建对象，不 start()
+                broker_id="9999", user_id=who, password="p"))
+
+        c1 = mk("ctp", "自检CTP")
+        c2 = mk("rohon", "自检融航")
+        if c1._td is not td_c or c2._td is not td_r:
+            raise RuntimeError(
+                "客户端的结构体模块没按各自通道取 —— "
+                f"ctp={getattr(c1._td, '__name__', c1._td)}，"
+                f"rohon={getattr(c2._td, '__name__', c2._td)}")
+        r1 = c1._td.CThostFtdcInputOrderField()
+        r2 = c2._td.CThostFtdcInputOrderField()
+        if type(r1) is type(r2):
+            raise RuntimeError("两个客户端造出了同一种报单结构体 —— 一定是共用了一套 dll")
+        # 后建的那个不许污染先建的（这就是「模块级全局」那个坑的正面证据）
+        c3 = mk("ctp", "自检CTP2")
+        if type(c3._td.CThostFtdcInputOrderField()) is not type(r1):
+            raise RuntimeError("又建了一个 CTP 客户端之后，先前那个的结构体变了")
+
+        return ("两套 dll 同进程共存（load 两家都成、互不挤掉）；"
+                f"请求结构体各取各的（{type(r1).__module__} / {type(r2).__module__}），"
+                "后建的客户端不影响先建的 —— 所以 CTP 户和融航户可以同时登录，"
+                "不需要独立进程")
+
+    check("CTP + 融航同时登录（同进程两套 dll）", _dual_channel)
 
     def _ctp_live():
         """CTP 会话层：合约归一 / 主力解析 / tick 聚合 / 快照映射。

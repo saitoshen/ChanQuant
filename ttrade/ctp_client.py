@@ -38,22 +38,27 @@ from dataclasses import asdict, dataclass, field
 from ttrade import ctp_channel
 from ttrade.ctp_channel import ChannelError
 
-# 注意：模块级**不再**直接 import openctp-ctp。为什么见 `ttrade/ctp_channel.py`：
-# 融航那套（6.7.2.8 + 融航 dll）和标准那套（6.7.11）不能同进程共存，
-# 一旦在 import 时就钉死成标准通道，融航账户就没法用了。改成用到时才绑定。
+# 注意：模块级**不**直接 import openctp-ctp —— 用到哪个通道才取哪个，
+# 原因见 `ttrade/ctp_channel.py`（两套 dll 各有各的 ABI 与加载方式）。
+#
+# 🔴 下面这三个模块级变量**只是「最近一次绑定」的兼容壳**（给自检和日志看），
+# 真正跑请求的结构体一律走实例属性 `self._td` / `self._md`（见 `_ChannelApi`）。
+# 2026-11-23 之前它们是唯一来源，于是「CTP 户 + 融航户同时活着」时后绑的会
+# 覆盖先绑的 ⇒ 另一个客户端按错的结构体布局造请求。
 
-mdapi = None          # 绑定后才有的模块；`_make_spi()` 里按名字取结构体
-tdapi = None
-HAS_CTP = False       # 绑定成功后才为真
+mdapi = None          # 最近一次绑定的行情模块（**不要**在业务代码里用它）
+tdapi = None          # 最近一次绑定的交易模块（同上）
+HAS_CTP = False       # 最近一次绑定是否成功
 CTP_IMPORT_ERROR = "尚未绑定 CTP 通道"
 BOUND_CHANNEL = ""    # "" / "ctp" / "rohon"
 
 
 def bind_channel(kind: str = "ctp") -> bool:
-    """把本模块的 `mdapi` / `tdapi` 绑到某个通道。重复绑定同一通道是安全的。
+    """探一下这个通道能不能用，返回是否可用（不可用时 `CTP_IMPORT_ERROR` 是人话）。
 
-    返回是否可用（不可用时 `CTP_IMPORT_ERROR` 里有人话）。换通道会抛
-    `ctp_channel.ChannelError` —— 那是进程级限制，不是能用 try/except 绕过的。
+    2026-11-23 起**换通道不再抛异常**：标准 CTP 和融航两套 dll 可以同时活着
+    （见 `ctp_channel` 顶部的四阶段实测），所以「已经绑了另一个」不是错误。
+    真正要保证的是：请求结构体从**自己那套**取 —— 那是 `_ChannelApi` 的事。
     """
     global mdapi, tdapi, HAS_CTP, CTP_IMPORT_ERROR, BOUND_CHANNEL
 
@@ -62,10 +67,15 @@ def bind_channel(kind: str = "ctp") -> bool:
         return True
     try:
         md, td = ctp_channel.load(kind)
-    except Exception as exc:  # noqa: BLE001 - ImportError / DLL 加载失败 / 通道冲突
-        # 通道冲突（已经绑了另一个）必须往上抛：那是调用方用错了，不能静默降级
-        if isinstance(exc, ChannelError):
-            raise CtpError(str(exc)) from exc
+    except ChannelError as exc:
+        # 通道本身用不了（没装 / dll 加载失败 / pyd 与 dll 的 ABI 不匹配）。
+        # 不当成崩溃往上抛：另一家可能好好的，`check_deps()` 会把原因翻成人话
+        mdapi = tdapi = None
+        HAS_CTP = False
+        CTP_IMPORT_ERROR = str(exc)
+        BOUND_CHANNEL = kind
+        return False
+    except Exception as exc:  # noqa: BLE001 - ImportError / DLL 加载失败
         mdapi = tdapi = None
         HAS_CTP = False
         CTP_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
@@ -275,9 +285,46 @@ class CtpError(RuntimeError):
     """连接 / 登录 / 下单失败。带 CTP 原始错误码，便于查表。"""
 
 
+# ------------------------------------------------------------------ 通道
+
+class _ChannelApi:
+    """按 `self.cfg.channel` 拿**自己那套** CTP 模块（实例级，不是模块全局）。
+
+    🔴 为什么必须是实例级（2026-11-23「CTP 和融航同时登录」那次）：
+    `mdapi` / `tdapi` 原先挂在模块上，`bind_channel()` 一绑就覆盖。两个客户端
+    （一个标准 CTP 户、一个融航户）同时活着时，后构造的那个会把全局换成自己
+    那套 ⇒ 先构造的那个 `place()` / `_fill_positions()` 仍然按**另一套 dll 的
+    结构体布局**造请求 —— 轻则字段错位（价格/手数变成垃圾值），重则段错误。
+    这正是当初「同进程只能连一类账户」的真正来源（不是 dll 本身，见
+    `ctp_channel` 里 `_probe_dll.py` 的四阶段实测）。
+
+    现在两个客户端各拿各的：`_md_api` / `_td_api` 都是实例属性，只在第一次
+    用到时取（`start()` 里已经先 `bind_channel()` 探过一次，失败会在那里就返回）。
+    """
+
+    cfg = None              # 由子类在 `__init__` 里设
+    _md_api = None
+    _td_api = None
+
+    def _channel(self) -> tuple:
+        """(mdapi, tdapi)。同一个客户端只取一次。"""
+        if self._md_api is None or self._td_api is None:
+            self._md_api, self._td_api = ctp_channel.load(
+                getattr(self.cfg, "channel", "ctp") or "ctp")
+        return self._md_api, self._td_api
+
+    @property
+    def _td(self):
+        return self._channel()[1]
+
+    @property
+    def _md(self):
+        return self._channel()[0]
+
+
 # ------------------------------------------------------------------ 行情
 
-class MdClient:
+class MdClient(_ChannelApi):
     """行情：连接 → 登录 → 订阅 → 回调推 tick。
 
     用法：
@@ -305,7 +352,7 @@ class MdClient:
         spi = self._make_spi()
         self._spi = spi
         flow = os.path.join(_flow_dir(), f"md_{int(time.time())}")
-        api = mdapi.CThostFtdcMdApi.CreateFtdcMdApi(flow)
+        api = self._md.CThostFtdcMdApi.CreateFtdcMdApi(flow)
         api.RegisterFront(self.cfg.md_front)
         api.RegisterSpi(spi)
         api.Init()
@@ -339,10 +386,10 @@ class MdClient:
     def _make_spi(self):
         outer = self
 
-        class _Spi(mdapi.CThostFtdcMdSpi):
+        class _Spi(self._md.CThostFtdcMdSpi):
             def OnFrontConnected(self):  # noqa: N802 - CTP 规定的方法名
                 try:
-                    req = mdapi.CThostFtdcReqUserLoginField()
+                    req = self._md.CThostFtdcReqUserLoginField()
                     req.BrokerID = outer.cfg.broker_id
                     req.UserID = outer.cfg.user_id
                     req.Password = outer.cfg.password
@@ -459,7 +506,7 @@ def _req_why(n) -> str:
     return f"{code} {why}"
 
 
-class TraderClient:
+class TraderClient(_ChannelApi):
     """交易：认证 → 登录 → 结算确认 → 下单 / 撤单 / 查持仓。
 
     **下单前必须确认结算结果**（`ReqSettlementInfoConfirm`），否则柜台会拒单，
@@ -547,12 +594,12 @@ class TraderClient:
         spi = self._make_spi()
         self._spi = spi
         flow = os.path.join(_flow_dir(), f"td_{int(time.time())}")
-        api = tdapi.CThostFtdcTraderApi.CreateFtdcTraderApi(flow)
+        api = self._td.CThostFtdcTraderApi.CreateFtdcTraderApi(flow)
         api.RegisterFront(self.cfg.td_front)
         api.RegisterSpi(spi)
         # 私有流用 QUICK：成交 / 委托回报尽快到，实盘下单后等一秒就能看到状态
-        api.SubscribePrivateTopic(tdapi.THOST_TERT_QUICK)
-        api.SubscribePublicTopic(tdapi.THOST_TERT_QUICK)
+        api.SubscribePrivateTopic(self._td.THOST_TERT_QUICK)
+        api.SubscribePublicTopic(self._td.THOST_TERT_QUICK)
         api.Init()
         self.api = api
 
@@ -605,7 +652,7 @@ class TraderClient:
             return False
         self._settle_at = now
         try:
-            req = tdapi.CThostFtdcSettlementInfoConfirmField()
+            req = self._td.CThostFtdcSettlementInfoConfirmField()
             req.BrokerID = self.cfg.broker_id
             req.InvestorID = self.cfg.user_id
             self.api.ReqSettlementInfoConfirm(req, self._next_req())
@@ -689,7 +736,7 @@ class TraderClient:
         with self._ord_lock:
             self._order_ref += 1
             ref = str(self._order_ref)
-        req = tdapi.CThostFtdcInputOrderField()
+        req = self._td.CThostFtdcInputOrderField()
         req.BrokerID = self.cfg.broker_id
         req.InvestorID = self.cfg.user_id
         req.UserID = self.cfg.user_id
@@ -705,24 +752,24 @@ class TraderClient:
                 "（多半是合约代码少写了交易所，或者品种代码不在本地数据里）")
         req.ExchangeID = ex
         req.OrderRef = ref
-        req.OrderPriceType = (tdapi.THOST_FTDC_OPT_AnyPrice if market
-                              else tdapi.THOST_FTDC_OPT_LimitPrice)
+        req.OrderPriceType = (self._td.THOST_FTDC_OPT_AnyPrice if market
+                              else self._td.THOST_FTDC_OPT_LimitPrice)
         req.LimitPrice = 0.0 if market else px
         req.Direction = d
-        req.CombOffsetFlag = {"0": tdapi.THOST_FTDC_OF_Open,
-                              "1": tdapi.THOST_FTDC_OF_Close,
-                              "3": tdapi.THOST_FTDC_OF_CloseToday}[off]
+        req.CombOffsetFlag = {"0": self._td.THOST_FTDC_OF_Open,
+                              "1": self._td.THOST_FTDC_OF_Close,
+                              "3": self._td.THOST_FTDC_OF_CloseToday}[off]
         # 投机单。套保 / 套利要提前在柜台备案，写死投机最省事也最不容易被拒
-        req.CombHedgeFlag = tdapi.THOST_FTDC_HF_Speculation
+        req.CombHedgeFlag = self._td.THOST_FTDC_HF_Speculation
         req.VolumeTotalOriginal = int(volume)
         # 当日有效。**市价单必须换 IOC**：GFD + AnyPrice 会被交易所打回
         # 「该合约不支持此时间条件」
-        req.TimeCondition = (tdapi.THOST_FTDC_TC_IOC if market
-                             else tdapi.THOST_FTDC_TC_GFD)
-        req.VolumeCondition = tdapi.THOST_FTDC_VC_AV      # 任意数量成交
+        req.TimeCondition = (self._td.THOST_FTDC_TC_IOC if market
+                             else self._td.THOST_FTDC_TC_GFD)
+        req.VolumeCondition = self._td.THOST_FTDC_VC_AV      # 任意数量成交
         req.MinVolume = 1
-        req.ContingentCondition = tdapi.THOST_FTDC_CC_Immediately
-        req.ForceCloseReason = tdapi.THOST_FTDC_FCC_NotForceClose
+        req.ContingentCondition = self._td.THOST_FTDC_CC_Immediately
+        req.ForceCloseReason = self._td.THOST_FTDC_FCC_NotForceClose
         req.IsAutoSuspend = 0
         req.UserForceClose = 0
         # 🔴 返回值必须看（2026-11-23 融航那四笔）：`ReqOrderInsert` 返回非 0
@@ -737,13 +784,13 @@ class TraderClient:
         """撤单。有 `OrderSysID` 就用它（柜台单号），没有就用本地 `OrderRef`。"""
         if self.api is None:
             raise CtpError("还没连接")
-        req = tdapi.CThostFtdcInputOrderActionField()
+        req = self._td.CThostFtdcInputOrderActionField()
         req.BrokerID = self.cfg.broker_id
         req.InvestorID = self.cfg.user_id
         req.UserID = self.cfg.user_id
         req.InstrumentID = instrument
         req.ExchangeID = self._exchange_of(instrument)
-        req.ActionFlag = tdapi.THOST_FTDC_AF_Delete
+        req.ActionFlag = self._td.THOST_FTDC_AF_Delete
         if order_sys_id:
             req.OrderSysID = order_sys_id
         else:
@@ -785,7 +832,7 @@ class TraderClient:
         """查资金。**要看返回值** —— 非 0 表示柜台根本没受理（见 `_qry_note`）。"""
         if self.api is None:
             return
-        n = self.api.ReqQryTradingAccount(tdapi.CThostFtdcQryTradingAccountField(),
+        n = self.api.ReqQryTradingAccount(self._td.CThostFtdcQryTradingAccountField(),
                                          self._next_req())
         self._qry_note("资金", n)
 
@@ -798,7 +845,7 @@ class TraderClient:
         """
         if self.api is None:
             return
-        req = tdapi.CThostFtdcQryInvestorPositionField()
+        req = self._td.CThostFtdcQryInvestorPositionField()
         req.BrokerID = self.cfg.broker_id
         req.InvestorID = self.cfg.user_id
         rid = self._next_req()
@@ -825,7 +872,7 @@ class TraderClient:
         """
         if self.api is None:
             return
-        req = tdapi.CThostFtdcQryOrderField()
+        req = self._td.CThostFtdcQryOrderField()
         req.BrokerID = self.cfg.broker_id
         req.InvestorID = self.cfg.user_id
         self._qry_note("委托", self.api.ReqQryOrder(req, self._next_req()))
@@ -838,7 +885,7 @@ class TraderClient:
         """
         if self.api is None:
             return
-        req = tdapi.CThostFtdcQryTradeField()
+        req = self._td.CThostFtdcQryTradeField()
         req.BrokerID = self.cfg.broker_id
         req.InvestorID = self.cfg.user_id
         self._qry_note("成交", self.api.ReqQryTrade(req, self._next_req()))
@@ -853,7 +900,7 @@ class TraderClient:
         """
         if self.api is None:
             return
-        req = tdapi.CThostFtdcQryInstrumentField()
+        req = self._td.CThostFtdcQryInstrumentField()
         if instrument:
             req.InstrumentID = instrument
         else:
@@ -951,13 +998,13 @@ class TraderClient:
     def _make_spi(self):
         outer = self
 
-        class _Spi(tdapi.CThostFtdcTraderSpi):
+        class _Spi(self._td.CThostFtdcTraderSpi):
             # ---- 连接 / 登录 ----
 
             def OnFrontConnected(self):  # noqa: N802
                 outer.connected.set()
                 try:
-                    req = tdapi.CThostFtdcReqAuthenticateField()
+                    req = self._td.CThostFtdcReqAuthenticateField()
                     req.BrokerID = outer.cfg.broker_id
                     req.UserID = outer.cfg.user_id
                     req.AppID = outer.cfg.app_id
@@ -978,7 +1025,7 @@ class TraderClient:
                     outer.last_error = f"认证失败：{err}"
                     return
                 try:
-                    req = tdapi.CThostFtdcReqUserLoginField()
+                    req = self._td.CThostFtdcReqUserLoginField()
                     req.BrokerID = outer.cfg.broker_id
                     req.UserID = outer.cfg.user_id
                     req.Password = outer.cfg.password

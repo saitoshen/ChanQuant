@@ -1,4 +1,4 @@
-"""CTP API 通道：标准 CTP 与融航，二选一，**一个进程只绑一个**。
+"""CTP API 通道：标准 CTP 与融航，**两套可以同时在同一个进程里活着**。
 
 ## 为什么要有这个模块
 
@@ -6,7 +6,7 @@
 约 218 KB，配 `RohonBaseV64.dll` + VC2010 运行时）。把它塞进 openctp-ctp 的
 `openctp_ctp.libs`，就能用现成的 CTP 接口连融航，不需要 `vnpy_rohon`。
 
-但这条路有三条**实测**出来的硬约束（2026-11-19，本机）：
+这条路有两条**实测**出来的硬约束（2026-11-19，本机）：
 
 1. **pyd 版本必须和 dll 的 API 版本对齐**。
    `openctp-ctp 6.7.11` 的 pyd 配融航 6.7.2 的 dll 会
@@ -19,12 +19,31 @@
    全局替换 site-packages 里的 dll** —— 那会把普通 CTP 账户一连就带崩，
    整个界面连同所有在跑的策略一起死。
 
-3. **两套库不能同进程共存**。
-   同进程先建 6.7.11 的 API、再建 6.7.2.8 的 API，无论并发还是顺序，
-   都 exit 139。因此这里做**进程级互斥**：一旦绑定了一个通道，
-   再要另一个就直接抛 `ChannelError`，而不是让 CTP 在某个回调里崩掉。
+## 两套能不能同进程？（2026-11-23 改判：能）
 
-所以：普通 CTP 账户和融航账户要么分进程跑，要么同一时间只连一边。
+原来这里写着「两套库不能同进程共存，同进程建两套 API 都 exit 139」，
+并据此做了**进程级互斥**（一绑一个通道再要另一个就抛 `ChannelError`）。
+
+2026-11-23 用 `_probe_dll.py` 分四阶段重测，结论反过来了：
+
+| 阶段 | 内容 | 结果 |
+|---|---|---|
+| A | 只用标准那套建 trader+md、`Init`、线程跑、`Release` | 正常 |
+| B | 只用融航那套，同上 | 正常 |
+| C | 两套同时建 4 个 api 对象（`a is b` → False） | 正常 |
+| D | 两套**同时 `Init`**，四条会话线程同跑 3 秒再全 `Release` | **无段错误** |
+
+原因在目录里看得见：融航那份 dll 是**改过名的** ——
+`openctp_ctp.libs/thosttraderapi_se-5906db0c....dll`（delvewheel 的哈希后缀，
+它存在的唯一目的就是避免同名 dll 冲突），而且以独立顶层包名
+`rohon_openctp_ctp` 加载，不和系统 `openctp_ctp` 抢模块名。
+早先那次 exit 139 来自「把融航替换 dll **覆盖**进 site-packages」的装法，
+那种装法确实只能二选一。
+
+所以现在的契约是：**`load()` 每个通道各返回一套，互不影响、可同时持有**。
+真正要小心的不是 dll，而是**别用模块级全局存这两套**（后绑的会把先绑的
+覆盖掉，另一个客户端的请求结构体就用错了 dll）—— 见 `ctp_client` 里
+`TraderClient._td` / `MdClient._md` 为什么是实例属性。
 
 ## 融航其实有行情
 
@@ -52,12 +71,15 @@ CHANNELS = {
 }
 
 _LOCK = threading.Lock()
-_BOUND = ""          # "" / "ctp" / "rohon"
+_BOUND = ""          # 最后**加载过**的通道（只用于显示；不再是互斥锁，见 `load()`）
 _MODULES: dict[str, tuple] = {}
 
 
 class ChannelError(RuntimeError):
-    """通道不可用，或者想在一个进程里用两个通道。"""
+    """通道不可用（没装 / dll 加载失败 / ABI 不匹配）。
+
+    2026-11-23 起**不再**因为「已经加载了另一个通道」而抛 —— 两套可以同时活着。
+    """
 
 
 def vendor_dir() -> str:
@@ -137,21 +159,25 @@ def _load_vendored():
 
 
 def load(kind: str = "ctp"):
-    """绑定并返回 `(mdapi, tdapi)`。同一个进程只能绑一次。"""
+    """返回这个通道的 `(mdapi, tdapi)`。**两个通道可以同时持有**。
+
+    🔴 2026-11-23 起不再互斥（原来是「一绑一个，另一个直接抛」）。
+    依据是 `_probe_dll.py` 的实测：标准 6.7.11 与融航 6.7.2.3 两套 dll
+    可以同进程各自建 API、同时 `Init`、线程同跑，无段错误。
+    机制上的原因：融航那份 dll 是改名后的（`thosttraderapi_se-5906db0c….dll`），
+    且以独立顶层包名 `rohon_openctp_ctp` 加载，两套不共享任何模块/符号。
+
+    ⚠️ 拿到之后**别塞进模块级全局**：两个客户端同时活着时，后绑的会把先绑的
+    覆盖掉，另一个客户端的 `CThostFtdcXxxField()` 就会用错 dll 的结构体布局。
+    正确用法见 `ctp_client.TraderClient._td` / `MdClient._md`（实例属性）。
+    """
     global _BOUND
     kind = (kind or "ctp").strip().lower()
     with _LOCK:
-        if _BOUND:
-            if _BOUND == kind:
-                return _MODULES[kind]
-            raise ChannelError(
-                f"本进程已经绑定「{CHANNELS.get(_BOUND, _BOUND)}」，"
-                f"不能再加载「{CHANNELS.get(kind, kind)}」。\n"
-                "两套 CTP 库（6.7.11 与融航 6.7.2）在同一进程里会段错误崩溃，"
-                "这是柜台 dll 层面的限制，绕不过去。\n"
-                "办法：把融航账户和普通 CTP 账户分到两个进程里跑 —— "
-                "同一个界面里请只连同一类账户。"
-            )
+        hit = _MODULES.get(kind)
+        if hit is not None:
+            _BOUND = kind
+            return hit
         if kind == "ctp":
             from openctp_ctp import thostmduserapi as mdapi
             from openctp_ctp import thosttraderapi as tdapi
@@ -164,8 +190,14 @@ def load(kind: str = "ctp"):
         return mdapi, tdapi
 
 
+def loaded_kinds() -> list[str]:
+    """已经躺进这个进程的通道（诊断用）。"""
+    with _LOCK:
+        return list(_MODULES)
+
+
 def reset_for_test() -> None:
-    """把绑定状态清掉。**只给自测用** —— dll 已经进进程了，真实场景清不掉。"""
+    """把缓存清掉。**只给自测用** —— dll 已经进进程了，这个清不掉。"""
     global _BOUND
     with _LOCK:
         _BOUND = ""
