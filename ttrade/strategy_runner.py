@@ -494,6 +494,12 @@ class SlotState:
     # 「实盘开了仓、回测却是空仓，是不是信号在闪」时，光有 target 一条数字
     # 什么都证明不了，必须知道**当时喂进去的是什么**（2026-11-19）。
     frame_note: str = ""
+    #: 这一轮的行情帧**是不是可信**（`_signal_frame()` 给）。
+    #: `False` = 降级帧（没有本地前复权历史，拿实时原始价顶的；或者库没补上）。
+    #: 那种帧上的建仓价 / 手数和回测是两码事 —— 2026-11-23 白银基本面分位组合
+    #: 就这么把「回测 11-18 已平仓、应该是 0」显示成 −2。所以降级帧只用来**算
+    #: 信号是否照常跑**，**不许写理论值**（`_note_theo_entry` 开头就挡掉）。
+    frame_ok: bool = True
     error: str = ""
     last_action: str = ""
     pending: list = field(default_factory=list)
@@ -1894,6 +1900,22 @@ class PortfolioRunner:
         st.last_bar = last
 
         df = self._signal_frame(st, kl)
+        if not st.frame_ok:
+            # 🔴 降级帧（没有本地前复权历史 / 库没补上 / 库里有断口）：**这一轮
+            # 不算信号、不动目标仓、不写理论值**，等下一轮重读成功再恢复。
+            #
+            # 为什么不再「将就用原始价」：用户 2026-11-23 报「白银基本面分位组合
+            # 回测最后一笔 11-18 就平了、持仓应该是 0，界面理论还显示 −2」——
+            # 那条策略当时跑的就是「没有本地历史，用实时原始价 2643 根」。原始价
+            # 带着换月跳空，算出来的 signal 和回测压根不是两回事。同一类事故
+            # 2026-11-20 也发生过（铅按 15,740 记建仓，回测是 15,545）。
+            #
+            # `target` 保持上一次的值是**故意**的：写成 0 会让 `_rebalance` 把仓
+            # 全平掉，一次读库失败就清仓比不交易糟糕得多。
+            self._note_once(
+                st, f"{st.frame_note} ⇒ 本轮暂停算信号（理论列与下单都不动，"
+                    "等本地历史读回来）")
+            return
         # 最后一根是正在走的活 bar，**K 线内策略要用它**（「当日开盘价」在一天
         # 的第一根上就是它自己）。下面那行 `iloc[:-1]` 只是给「收盘定信号」的
         # 老策略用的副本，`full` 留给 `_ib_arm`
@@ -2285,6 +2307,31 @@ class PortfolioRunner:
         if live.empty:
             return live
         key = self._skey(st.cfg)
+
+        def _degrade(note: str, out=None, *, retry: bool = True):
+            """降级帧：打上标记，并按节流丢掉 `last_bar` 让下一轮重读。
+
+            🔴 为什么必须丢 `last_bar`：`_refresh_signal()` 是**先**把
+            `st.last_bar = last` 写掉、**再**调这里的。只要这一次拿到的是降级帧
+            （库被锁 / 补库没跟上 / 刚启动还没读回来），「同一根 bar 不重算」那道
+            闸门就会把这条策略**永久**钉在降级帧上 —— 2026-11-23 19:14 的白银
+            基本面分位组合就是这样：库里明明有 2445 根日线，它却一直用「实时原始
+            价 2643 根」算信号，理论列显示 −2，而回测最后一笔 11-18 就平了（该 0）。
+
+            节流 5 秒：真·没有历史时不能每个 tick 都去读一遍几十万行。
+            """
+            st.frame_ok = False
+            st.frame_note = note
+            if retry:
+                now = time.time()
+                seen = getattr(self, "_frame_retry", None)
+                if seen is None:
+                    seen = self._frame_retry = {}
+                if now - seen.get(key, 0.0) > 5.0:
+                    seen[key] = now
+                    st.last_bar = None       # 逼下一轮重读，别把坏帧钉死
+            return live if out is None else out
+
         base = self._qfq_base.get(key)
         if base is None:
             try:
@@ -2297,7 +2344,6 @@ class PortfolioRunner:
                     f"{st.title()}：读前复权历史失败，暂用实时原始价"
                     f"（{type(exc).__name__}: {exc}）"
                 )
-                st.frame_note = f"前复权历史读不到，用实时原始价 {len(live)} 根"
                 base = pd.DataFrame()
             if base is not None and not base.empty:
                 self._qfq_base[key] = base
@@ -2307,16 +2353,14 @@ class PortfolioRunner:
             # 算出来的建仓价、信号全是另一个东西（2026-11-20 16:49 铅就是这么被
             # 记成 11-13 建仓的）。空表只当「这次没读到」，下一次 tick 再读。
         if base is None or base.empty:
-            st.frame_note = f"没有本地历史，用实时原始价 {len(live)} 根"
-            return live
+            return _degrade(f"没有本地历史，用实时原始价 {len(live)} 根")
         if live.index[0] > base.index[-1]:
             # 本地历史太旧，和实时段接不上（中间断了一截）。硬拼会在断口造一次
             # 假跳空，比用原始价更糟 —— 退回实时原始价，并记一条日志
             self._log(f"{st.title()}：本地历史与实时段接不上，暂用实时原始价")
-            st.frame_note = (f"本地历史与实时段接不上（本地止于 "
-                             f"{base.index[-1]:%m-%d %H:%M}），用实时原始价 "
-                             f"{len(live)} 根")
-            return live
+            return _degrade(f"本地历史与实时段接不上（本地止于 "
+                            f"{base.index[-1]:%m-%d %H:%M}），用实时原始价 "
+                            f"{len(live)} 根")
         # **和回测同源同长**：`replay.run` 先按 `range_years` 切一刀（还多留
         # `WARMUP_BARS` 根预热），这里切同一刀。详情页画多少根、从哪根开始算，
         # 实盘就用同样那些根 —— 所见即所得，不再截 KLINE_LEN。
@@ -2336,6 +2380,10 @@ class PortfolioRunner:
                 self._qfq_base.pop(key, None)
                 self._log(f"{st.title()}：本地库已补到 {db_last:%m-%d %H:%M}，"
                           "重读前复权历史（不用重启）")
+                # 🔴 这里原来只 `return pd.DataFrame()`，`st.last_bar` 早在调用前
+                # 就写好了 ⇒ 下一轮「同一根不重算」直接返回 ⇒ 这句「不用重启」
+                # 其实永远不会生效（2026-11-23 与白银那条一起查出来的）。
+                st.last_bar = None
                 return pd.DataFrame()
             # 🔴 缺交易日就**不算信号**：跨着断口算出来的指标是错的，拿它下单就是
             # 「回测持仓、实盘空仓」这种对不上账。保持原仓，把原因写出来。
@@ -2345,8 +2393,7 @@ class PortfolioRunner:
                 self._gap_note[key] = note
                 st.last_action = note
                 self._log(f"{st.title()}：{note}")
-            st.frame_note = note
-            return pd.DataFrame()
+            return _degrade(note, pd.DataFrame())
         self._gap_note.pop(key, None)
         # 🔴 帧尾整体落后：`hole_days` 查不出来（内部没断口，实时段最后一根就是
         # 合并后最后一根），但这一帧比「此刻本该到的 bar」旧了 —— 说明本地库没补上、
@@ -2361,12 +2408,11 @@ class PortfolioRunner:
                 self._gap_note[key] = note
                 st.last_action = note
                 self._log(f"{st.title()}：{note}")
-            st.frame_note = note
-            return pd.DataFrame()
+            return _degrade(note, pd.DataFrame())
         merged = replay.window(merged, getattr(st.cfg, "range_years", 0) or 0)
         if merged is None or len(merged) < 2:
-            st.frame_note = f"本地历史切片后不足 2 根，用实时原始价 {len(live)} 根"
-            return live
+            return _degrade(f"本地历史切片后不足 2 根，用实时原始价 {len(live)} 根")
+        st.frame_ok = True
         st.frame_note = (f"前复权本地 {len(base)} 根 + 实时 {len(live)} 根"
                          f"（合并后 {len(merged)} 根，起点 "
                          f"{merged.index[0]:%Y-%m-%d %H:%M}）")
@@ -2789,6 +2835,14 @@ class PortfolioRunner:
             n = 0
         if not n or len(df) != n:
             return
+        # 🔴 **降级帧一律不写理论值**（用户 2026-11-23：白银基本面分位组合回测
+        # 最后一笔 11-18 就平了、理论该是 0，界面却显示 −2）。原因就是那一轮
+        # 行情是「没有本地历史，用实时原始价 2643 根」（见 `_signal_frame`）——
+        # 原始价带换月跳空，算出来的信号和回测压根不是一回事。信号照算、单照下
+        # （那是交易链路的事），但「理论」这一列只认**和回测同源**的前复权帧；
+        # 帧一降级就冻住上一次的值，宁可不更新，也不给一个看着像真的错数字。
+        if not bool(getattr(st, "frame_ok", True)):
+            return
         last = series.iloc[-1]
         sig = 0 if pd.isna(last) else int(last)
         if sig == 0:
@@ -2838,13 +2892,30 @@ class PortfolioRunner:
         # 少一个属性就 AttributeError，整条策略直接判「错误」
         prev_lots = int(getattr(st, "theo_lots", 0) or 0)
         prev_sig = int(getattr(st, "theo_lots_sig", 0) or 0)
-        if (prev_lots <= 0 or prev_sig != sig
-                or getattr(st, "theo_lots_src", "") == ""):
-            # 状态机已经给了手数就直接用（那是回测同一台机器算出来的数）；
-            # 给不出（还没开仓 / 缺列 / 降级帧）才退回按「信号下一根」估一个，
-            # 总比显示 0 手强 —— 这条只在异常路径上才会走到
-            got = got or self._entry_lots_at(st, df, j, ref, stop_dist)
-            if got > 0:
+        prev_src = str(getattr(st, "theo_lots_src", "") or "")
+        if got > 0:
+            # 状态机报得出「有一笔没平的开仓」⇒ 它**就是**回测口径，每根都按它写。
+            # 置的同一个输入不会变（同一笔持仓算出来恒等），所以不会漂。
+            # 🔴 它可以盖掉 `ib` 档：`ib` 档记的是「盘中触发那一刻 `st.lots` 是多少」，
+            # 而 `st.lots` 是按**当根** ATR 重算的 —— 正是用户说不许拿来当显示值的
+            # 那个数（2026-11-23：AG 理论 −1、回测 −2，其余 6 个品种都对上）。
+            if int(got) != prev_lots or prev_sig != sig or prev_src != THEO_SIG:
+                st.theo_lots = int(got)
+                st.theo_lots_sig = int(sig)
+                st.theo_lots_src = THEO_SIG
+                # 只在**变了**的时候落一行，方便事后核「这一笔到底怎么来的」
+                # （自检里的精简桩没有 `_diagw`，所以 getattr 兜一下）
+                diag = getattr(self, "_diagw", None)
+                if diag is not None:
+                    diag("LOTS", f"{st.title()}：开仓手数 {prev_lots} → {int(got)}"
+                                 f"（回测口径，开仓根 {df.index[j]:%m-%d %H:%M}）")
+        elif prev_src != THEO_IB:
+            # 状态机说现在空仓：才退回「信号下一根」估一个（总比 0 手强）。
+            # `ib` 档（盘中真触发过、这一根还没收盘）不许盖 —— 那是最接近实时
+            # 真相的一档，收盘后状态机会自己追上并把来源降回 `sig`。
+            got = self._entry_lots_at(st, df, j, ref, stop_dist)
+            if got > 0 and (int(got) != prev_lots or prev_sig != sig
+                            or prev_src != THEO_SIG):
                 st.theo_lots = int(got)
                 st.theo_lots_sig = int(sig)
                 st.theo_lots_src = THEO_SIG

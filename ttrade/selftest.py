@@ -1786,6 +1786,7 @@ def _run() -> tuple[bool, list[str]]:
         #    是 10-22，那确实会很多错误的」）。这一段的回测配置也必须走
         #    `replay.make_bt()`，和 `_ib_open_trade()` 完全同一个出口。
         note6 = ""
+        t6 = None                             # 给下面 ⑨ 段用，别留 NameError
         try:
             d1h = tqdata.load_main("RB", "SHFE", "1h").tail(1500)
             r6 = run_strategy(d1h, "sbbox_ib", {})
@@ -1839,11 +1840,53 @@ def _run() -> tuple[bool, list[str]]:
                 "起点没按整日锚定，实盘和回测会错开一根")
         note7 = f"；起点按整日锚定（同日 15:00 / 盘中两种末根都切到 {w_close.index[0]}）"
 
+        # ⑧ 降级帧不许写理论值：信号照算，但「理论」列只认同源前复权帧。
+        #    2026-11-23 白银基本面分位组合回测最后一笔 11-18 就平了（该 0），
+        #    界面却显示 −2 —— 原因就是那一轮用的是「实时原始价 2643 根」。
+        st8 = SR.SlotState(cfg=st.cfg)
+        st8.frame_ok = True
+        f._note_theo_entry(st8, df, sig)
+        keep_lots, keep_px = st8.theo_lots, st8.theo_px
+        if keep_lots <= 0:
+            raise RuntimeError("⑧ 前置条件不成立：降级帧断言需要先有一个非 0 的手数")
+        st8.frame_ok = False
+        f._note_theo_entry(st8, df, pd.Series([-sig0] * len(df), index=df.index))
+        if (st8.theo_lots, st8.theo_px) != (keep_lots, keep_px):
+            raise RuntimeError(
+                f"⑧ 降级帧把理论值改掉了（{keep_lots}→{st8.theo_lots}）—— "
+                "原始价帧算出来的信号和回测不是一回事，不许写进理论列")
+        note8 = "；降级帧不写理论值（冻结上一份）"
+
+        # ⑨ 状态机赢过 `ib` 档：`ib` 记的是「触发那一刻 st.lots」，而 st.lots 是
+        #    按当根 ATR 重算的数；状态机只要有笔没平的开仓，它就是回测口径。
+        #    2026-11-23 AG 理论 −1 / 回测 −2 就是 `ib` 档把正确的 2 盖成了 1。
+        note9 = "；K 线内那半段未跑，⑨ 跳过"
+        if r6 is not None and "stop_dist" in r6.columns and sg6 and t6 is not None \
+                and t6.open_position:
+            st9 = SR.SlotState(cfg=cfg6)
+            st9.frame_ok = True
+            st9.lots = 9
+            f._latch_to_order(st9, sg6)          # 假装盘中触发、当时 9 手
+            if st9.theo_lots != 9 or st9.theo_lots_src != SR.THEO_IB:
+                raise RuntimeError("⑨ 前置条件不成立：ib 档没锁上")
+            f._note_theo_entry(st9, d1h, s6, r6["stop_dist"],
+                               r6["entry_long"], r6["entry_short"],
+                               r6["exit_long"], r6["exit_short"])
+            if st9.theo_lots_src != SR.THEO_SIG:
+                raise RuntimeError(
+                    "⑨ 状态机报得出开仓，来源却没降回 sig 档 —— "
+                    "`ib` 档会把「触发那一刻按当根 ATR 算的手数」永久钉住")
+            if int(st9.theo_lots) != int(t6.lots):
+                raise RuntimeError(
+                    f"⑨ 状态机这笔是 {int(t6.lots)} 手，理论列写成 {st9.theo_lots} 手")
+            note9 = f"；ib 档（9 手）被状态机的 {st9.theo_lots} 手盖回来"
+
         return (f"手数在「开仓那一根」定死：RB 日线实测 {entry_lots} 手，"
                 f"与回测同一笔的 Trade.lots 逐位相等；"
                 f"波幅翻倍后仍是 {entry_lots} 手不漂"
                 f"（按当前 K 线重算会变成 {drifted} 手）；翻方向才重算；"
-                "K 线内触发后用实际下单手数，推断不覆盖" + note6 + note7)
+                "K 线内触发后用实际下单手数，推断不覆盖" + note6 + note7
+                + note8 + note9)
 
     check("理论手数取开仓那一根（不按当前 K 线重算）", _theo_entry_lots)
 
