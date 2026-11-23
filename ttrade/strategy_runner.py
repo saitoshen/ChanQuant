@@ -1302,7 +1302,15 @@ class PortfolioRunner:
     # ---- 推进 ----
 
     def wait(self, timeout: float = 0.8) -> bool:
-        """驱动一次行情。**不再依赖账户** —— 没接账户时策略照常推进。"""
+        """驱动一次：行情推一步，**账户也推一步**。
+
+        行情走全局 `MarketFeed`（跨账户跨策略一份），账户走 `self.api` ——
+        两者是两件事，缺一条就少一半。🔴 2026-11-23 用户报「一键对齐发了单、
+        监控器还是不动」，真根因就在这：这里以前只推行情，柜台的
+        `BrokerApi.wait_update()` 除了 `start()` 里那一次再没被调过，持仓 / 委托
+        / 资金全冻在「连上账户那一刻」（`[MM]` 那句「已经不一致 122 秒」＝连接
+        至今），对齐单的柜台回报其实早到了，只是没人去读 `snapshot()`。
+        """
         if self.feed is None:
             return False
         # 切了行情源：手里那些 serial 全是上一条连接的活引用，已经不会再更新了。
@@ -1313,6 +1321,15 @@ class PortfolioRunner:
             self._klines.clear()
             self._quotes.clear()
             self._log(f"行情源已切换：{self._feed_label()}")
+        # 账户：只对柜台（`BrokerApi`）推。天勤那条 `TqApi` 自己有后台线程在
+        # 收数据，`get_position()` 就是活引用，不需要（也不能）在这里再
+        # `wait_update()` —— 那会把同一个 TqApi 从两个线程驱动。
+        refresh = getattr(self.api, "refresh_account", None)
+        if refresh is not None:
+            try:
+                refresh()
+            except Exception as exc:  # noqa: BLE001 - 查询失败不能拖累调仓
+                self.last_error = f"{type(exc).__name__}: {exc}"
         try:
             return bool(self.feed.wait(timeout))
         except Exception as exc:  # noqa: BLE001
@@ -2989,9 +3006,20 @@ class PortfolioRunner:
           - `_reanchor()` → 账户接口的活引用断了也能续上（见那个方法的长注释）；
           - `_mm_ts = 0` → 下一次 `mismatch()` 不走缓存。
 
+        🔴 还要**先把这一拍的查询抢出去**（`refresh_account(force=True)` 绕过
+        每秒一个的闸门），再等一小会儿让回包落地 —— 否则「刷新」只是把手里
+        那份旧数据重挂一遍，点完看着毫无变化（用户说的「点刷新也没用」）。
+
         返回的是**此刻**的不一致行；界面也会在 0.4 秒内收到一份新快照（worker 的
         推送节拍），两处内容一致。
         """
+        pump = getattr(getattr(self, "api", None), "refresh_account", None)
+        if pump is not None:
+            try:
+                pump(force=True)          # 这一拍一定要发出去
+                time.sleep(0.35)          # 柜台回包几十到几百毫秒，等一轮再读
+            except Exception:  # noqa: BLE001 - 账户抖动：沿用上一份
+                pass
         self._pos_ts = 0.0
         self._reanchor()
         self._mm_ts = 0.0

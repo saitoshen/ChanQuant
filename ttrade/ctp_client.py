@@ -501,6 +501,11 @@ class TraderClient:
         # 而这两件事对一键对齐是天壤之别（2026-11-23 融航：交易页 6 个合约有仓，
         # 组合页那条连接一条持仓回调都没来，监控器却报「一致」）
         self.positions_loaded = False
+        #: 最近一次**整轮**持仓查询回完的时刻。`positions_loaded` 只说「读到过」，
+        #: 不说明那份数据有多旧 —— 组合页一旦没人推这条连接，`positions` 会永远
+        #: 停在连接那一刻，而界面照旧把旧数当现值画（2026-11-23 融航）。见
+        #: `BrokerApi.positions_ready()` 的 `POS_STALE_SEC`
+        self.pos_at = 0.0
         # 全量合约表查完没有。SimNow 上 `ReqQryInstrument` 会回 1.6 万条，
         # 要 80 秒左右才流完，而**流没结束时后续请求全部排队**：查资金、报单
         # 都一声不响地卡着。所以这个事件是给调用方判断「现在能不能安全下单」
@@ -855,6 +860,9 @@ class TraderClient:
                 # 「查完了没有」必须和表一起透出去：`positions` 为空分不清
                 # 「账户真没仓」和「柜台一条回调都没来」，后者报「一致」就是撒谎
                 "positions_loaded": self.positions_loaded,
+                # 那一轮是什么时候回来的。「读到过」和「刚才读过」是两件事，
+                # 界面要拿它判手上这份持仓有多旧（见 `POS_STALE_SEC`）
+                "pos_at": self.pos_at,
                 "orders_loaded": self.orders_loaded,
                 "trades_loaded": self.trades_loaded,
             }
@@ -1108,6 +1116,7 @@ class TraderClient:
                     # 否则界面永远停在「还没读到」，真有仓了也不敢说一致
                     if bIsLast:
                         outer.positions_loaded = True
+                        outer.pos_at = time.time()
                     return
                 # 兜底：主探针在 `OnRspQryTradingAccount`（空仓时持仓查询只回空包，
                 # 探不到日期）。这里再补一刀，多重保险且不会重复确认 ——
@@ -1150,6 +1159,7 @@ class TraderClient:
                     row["margin"] += _f(getattr(pInvestorPosition, "UseMargin", 0))
                 if bIsLast:
                     outer.positions_loaded = True
+                    outer.pos_at = time.time()
 
             def OnRspQryOrder(self, pOrder, pRspInfo, nRequestID, bIsLast):  # noqa: N802
                 """补查回来的当日委托。

@@ -13264,6 +13264,95 @@ def _run() -> tuple[bool, list[str]]:
 
     check("一个账户一条会话（交易页与组合页共用同一条连接）", _one_session)
 
+    def _acct_pump() -> str:
+        """组合页每轮必须**同时**推行情和账户（2026-11-23 融航「监控器不动」）。
+
+        用户报「一键对齐之后委托和成交都出来了，监控器这边还是没有及时更新账户
+        的持仓」。日志里的决定性数字：`[MM]` 写着「已经不一致 **122 秒**」，而
+        账户是 122 秒前刚连上的 —— 也就是说 `_pos` 从**连接那一刻**起就没变过。
+
+        真根因：`PortfolioRunner.wait()` 只推全局行情 `MarketFeed`，柜台的
+        `BrokerApi.wait_update()`（也就是 `_refresh()`）除了 `start()` 里那一次
+        `force` 之后再没被调用过。于是持仓 / 委托 / 资金全冻住：
+        `[POS]` 里那句「发过 **0 拍**持仓查询」就是这个 —— 一拍都没人发。
+        对齐单的柜台回报其实早就到了，只是没人去读 `snapshot()`，界面只能说
+        「柜台 N 秒没回委托」。
+
+        另外一个必须一起钉的：`positions_loaded` 只说「读到过」，不说「刚才读过」。
+        所以 `positions_ready()` 还得看 `pos_at`（最近一轮回包的时刻），超过
+        `POS_STALE_SEC` 就改口说「还没同步」，不能让旧数冒充现值。
+        """
+        import time as _t
+        import types
+
+        from ttrade.broker_api import POS_STALE_SEC, BrokerApi
+        from ttrade.strategy_runner import PortfolioRunner
+
+        class _Feed:
+            generation = 1
+
+            def __init__(self):
+                self.waits = 0
+
+            def wait(self, timeout=0.0):
+                self.waits += 1
+                return True
+
+        class _Api:
+            def __init__(self):
+                self.calls = 0
+
+            def refresh_account(self):
+                self.calls += 1
+
+        r = PortfolioRunner.__new__(PortfolioRunner)
+        r.feed = _Feed()
+        r._feed_gen = 1                 # 已经对齐，别走「切源」分支
+        r._klines, r._quotes = {}, {}
+        r._log = lambda _m: None
+        r.last_error = ""
+        r.api = _Api()
+        r.wait(0.01)
+        r.wait(0.01)
+        assert r.api.calls == 2, (
+            "`PortfolioRunner.wait()` 没推账户连接 —— 柜台的 `_refresh()` 只在"
+            f"连上那一刻跑过一次，持仓/委托从此冻住（推了 {r.api.calls} 次）")
+        assert r.feed.waits == 2, "行情那一步被账户挤掉了"
+
+        # 天勤那种接口没有 `refresh_account`，不能因此抛异常（策略照跑）
+        r.api = object()
+        r.wait(0.01)
+        r.api = None
+        r.wait(0.01)
+
+        # ---- 持仓「读到过」≠「刚才读过」
+        class _T:
+            positions_loaded = True
+
+            def __init__(self, at):
+                self.pos_at = at
+                self.account = {"margin": 0.0}
+
+        api = BrokerApi.__new__(BrokerApi)
+        api._pos = {"SHFE.sn2612": object()}
+        api.last_error = ""
+        api.hub = types.SimpleNamespace(
+            trader=_T(_t.time() - POS_STALE_SEC - 5))
+        assert api.positions_ready() is False, \
+            "持仓几十秒没刷新过还算「读到了」，界面会拿旧数冒充现值"
+        assert "没从柜台刷新" in api.last_error, api.last_error
+        api.hub.trader.pos_at = _t.time()
+        assert api.positions_ready() is True, "刚刷过的持仓被判成没读到"
+        # 老后端（没有 `pos_at`）不受影响：不能因为加了新判据就把它们拦住
+        api.hub.trader = _T(0.0)
+        assert api.positions_ready() is True
+
+        return ("组合页每轮同时推行情和账户（`refresh_account` 被调用，"
+                "没有这个方法的接口不受影响）；持仓「读到过」还必须「刚才读过」"
+                f"（超过 {POS_STALE_SEC:.0f} 秒没刷新 ⇒ 判未同步并写明原因）")
+
+    check("组合页每轮同时推账户（否则持仓/委托冻在连接那一刻）", _acct_pump)
+
     # 跑完就把进度文件收掉：留着会让下一轮的诊断以为"上次崩过"。
     # 崩溃时走不到这里，文件正好留下最后一项的名字。
     if _prog is not None:

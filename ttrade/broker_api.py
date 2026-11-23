@@ -73,6 +73,11 @@ MAIN_TTL = 60.0
 #: 下单之后多久没有柜台回报就判这笔委托没报进去（见 `_expire_optimistic`）
 OPTIMISTIC_TTL = 30.0
 
+#: 持仓**多久没刷新**就判「手上这份不作数」（见 `positions_ready`）。
+#: 轮转是 1 Hz（资金/持仓交替 ⇒ 持仓约 2 秒一轮），30 秒足够宽松：
+#: 真停了说明查询压根没在跑，界面必须改口说「还没同步」，不能拿旧数当现值
+POS_STALE_SEC = 30.0
+
 #: 本地文件名和天勤品种代码对不上的，逐个列出来。
 #: 30 年期国债：数据源（Tushare）把品种代码写成 `TL0`（`0` 是连续合约标记），
 #: 本地文件曾经叫 `TL0_CFFEX.csv`。已正名为 `TL`，这里留一条反向映射，
@@ -501,6 +506,38 @@ class BrokerApi:
             self._refresh()
         return True
 
+    def refresh_account(self, force: bool = False) -> None:
+        """只推账户这一步：攒 tick → 刷主连盘口 → 轮转查询 → 重读持仓/委托。
+
+        🔴 为什么要单独一个入口（2026-11-23 用户「一键对齐发了单，监控器还是不动」）：
+        组合页的行情走**全局 `MarketFeed`**（`PortfolioRunner.feed`），账户走
+        `self.api`，而 `PortfolioRunner.wait()` 以前只推 feed —— 于是
+        `wait_update()`（也就是 `_refresh()`）**除了 `start()` 里那一次 force，
+        再也没有被调用过**。后果是持仓 / 委托 / 资金全冻在「连上账户那一刻」：
+
+          - 监控器的「账户实际」永远不变（`[MM]` 会写「已经不一致 122 秒」，
+            而那 122 秒正好等于「连接至今」）；
+          - 对齐单的柜台回报其实早就到了，但没人去读 `snapshot()`，界面只能说
+            「柜台 N 秒没回委托」；
+          - `[POS]` 诊断里 `发过 0 拍持仓查询` —— 就是「一拍都没人发」。
+
+        所以组合页的循环必须每轮调一次这里（`PortfolioRunner.wait()`）。
+        只做账户这一半：睡到 deadline 的活儿由调用方的循环负责。
+        `force=True`（界面「刷新」按钮）绕过「每秒一个查询」的闸门，立刻要一轮。
+        """
+        if self._closed or self.hub is None or getattr(self.hub, "trader", None) is None:
+            return
+        try:
+            self._pump()
+        except Exception as exc:  # noqa: BLE001 - 行情抖动不能拖累账户查询
+            self.last_error = f"拼实时 bar 失败：{exc}"
+        for key, obj in list(self._main_quote.items()):
+            try:
+                self._sync_main(key, obj)
+            except Exception as exc:  # noqa: BLE001
+                self.last_error = f"刷新主连盘口失败：{exc}"
+        self._refresh(force=force)
+
     # ---- 内部：行情 ----
 
     def _build(self, key: tuple, code: str, ex: str, period: str) -> None:
@@ -721,6 +758,16 @@ class BrokerApi:
         if t is None:
             return False
         if not bool(getattr(t, "positions_loaded", True)):
+            return False
+        # 🔴 读过一轮 ≠ 现在手上这份是真的（2026-11-23 融航「监控器不动」）：
+        # 持仓是**主动查询**的，只要没人推这条连接，`positions` 就永远停在
+        # 连接那一刻那一份 —— 而 `positions_loaded` 还是真，界面照样把旧数当
+        # 现值画出来。所以「多久没刷新」必须算进判据（`POS_STALE_SEC`）。
+        at = float(getattr(t, "pos_at", 0.0) or 0.0)
+        if at and time.time() - at > POS_STALE_SEC:
+            self.last_error = (
+                f"持仓已经 {time.time() - at:.0f} 秒没从柜台刷新过"
+                f"（每秒一个查询的轮转没跑起来）")
             return False
         # 柜台说「查完了」，可拿回来的是**空表**，而资金那边占用保证金大于 0：
         # 有保证金必有持仓，这是一份自相矛盾的快照。宁可说「还不知道」，
