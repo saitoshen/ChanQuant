@@ -57,7 +57,7 @@ from ttrade import (barclock, daylimit, orderbook, positionbook, topup, tqdata,
 from ttrade import strategy_store as SStore
 from ttrade import specs, symbols_info
 from ttrade.market_feed import MarketFeed
-from ttrade.backtest import lots_round
+from ttrade.backtest import lots_round, size_lots_intrabar
 from ttrade.strategies import STRATEGIES, next_levels, run_strategy
 from ttrade.tqfetch import PERIOD_SEC
 from ttrade.tqlive import (BACKEND_LABELS, AccountSpec, bars_from_serial,
@@ -226,6 +226,160 @@ THEO_SIG, THEO_IB, THEO_ORDER = "sig", "ib", "order"
 _THEO_RANK = {THEO_SIG: 1, THEO_IB: 2, THEO_ORDER: 3}
 
 
+def _as_float_seq(v, n: int):
+    """把一列（Series / ndarray / None）统一成 `n` 个 float 的 list。
+
+    长度对不上就返回 `None` —— **绝不按位置硬塞**：差一根就会把止损距离错配到
+    另一根 K 线上，手数看着「有值」其实全是错的，比直接不给还糟。
+    """
+    if v is None:
+        return [math.nan] * n
+    try:
+        s = pd.to_numeric(pd.Series(v), errors="coerce")
+        a = s.to_numpy(dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if len(a) != n:
+        return None
+    return [float(x) for x in a]
+
+
+def ib_open_trade(df: pd.DataFrame, bt, e_long=None, e_short=None,
+                  x_long=None, x_short=None, stop_d=None):
+    """K 线内那一族：**照回测那台状态机**走一遍，返回最近一笔还没平的开仓。
+
+    返回 `(开仓那根的下标, 不含滑点的成交基准价, 手数)`；走完整段还空仓 ⇒ `None`。
+
+    🔴 为什么必须是「同一台状态机」而不是「从信号段起点倒推」：K 线内那一族的
+    `signal` 列**不是持仓状态**。实测（7 品种 / 1h / 真实配置）——
+
+    | 品种 | `signal` 段起点 | 回测真正开仓 |
+    |---|---|---|
+    | AG | 09-24 00:00 | **09-23 21:00**（比段起点还早） |
+    | RB | 10-22 09:00 | **09-09 22:00**（早六周）|
+    | C  | 11-10 14:00 | **11-10 09:00** |
+
+    用户 2026-11-23 的原话：「signal 段起点如果是 10-22，那确实会很多错误的」。
+    段起点只说明「从这根起连着一串同向信号」，和「哪根真正碰到触发价成交」
+    没有关系 —— 中间可能止损过、可能离场过、可能反手过。
+
+    🔴 「和回测一致」的另一半是**起点一致**：这份 `df` 必须就是回测喂进去的
+    那一份（同样经过 `replay.window(..., range_years)`）。调用方
+    `_signal_frame()` 已经保证了这一点，`replay.window()` 也改成按整日锚定
+    起点，免得回测末根 15:00、实盘末根盘中而错开一根。
+
+    这里刻意**不建 Trade / 不算净值**：只要状态和手数。实测 2.6 万根 1h 约
+    二三十毫秒，配合调用方的「新 bar 才算」缓存，一小时一次，可以忽略。
+    """
+    n = len(df)
+    if n < 2:
+        return None
+    try:
+        o = [float(x) for x in df["open"].to_numpy(dtype=float)]
+        hi = [float(x) for x in (df["high"] if "high" in df.columns
+                                 else df["open"]).to_numpy(dtype=float)]
+        lo = [float(x) for x in (df["low"] if "low" in df.columns
+                                 else df["open"]).to_numpy(dtype=float)]
+        scale = ([float(x) for x in pd.to_numeric(df["price_scale"], errors="coerce")
+                  .fillna(1.0).to_numpy(dtype=float)]
+                 if "price_scale" in df.columns else None)
+    except (KeyError, TypeError, ValueError):
+        return None
+    up = _as_float_seq(e_long, n)
+    dn = _as_float_seq(e_short, n)
+    xl = _as_float_seq(x_long, n)
+    xs = _as_float_seq(x_short, n)
+    sd = _as_float_seq(stop_d, n)
+    if up is None or dn is None or xl is None or xs is None or sd is None:
+        return None
+    # 「只做多 / 只做空」的方向裁剪和 `run_intrabar_backtest` 同一处、同一写法
+    if getattr(bt, "long_only", False):
+        dn = [math.nan] * n
+    if getattr(bt, "short_only", False):
+        up = [math.nan] * n
+
+    mult = float(getattr(bt, "multiplier", 0) or 1.0)
+    cash = float(getattr(bt, "initial_cash", 0) or 0.0)
+    reentry = bool(getattr(bt, "intrabar_reentry_samebar", False))
+    pos = 0
+    lots = 0.0
+    entry_px = 0.0
+    entry_raw = 0.0
+    entry_bar = -1
+    stop_px = math.nan
+    closed_i = -1
+
+    def _slip(px: float, i: int) -> float:
+        try:
+            return float(bt.slip_amount(px, scale[i] if scale is not None else 1.0))
+        except Exception:                # noqa: BLE001 - 成本算不出就当 0
+            return 0.0
+
+    def _fee(q: float, px: float) -> float:
+        try:
+            return float(bt.fee_amount(abs(q), mult, px))
+        except Exception:                # noqa: BLE001
+            return 0.0
+
+    for i in range(n):
+        oi, hii, loi = o[i], hi[i], lo[i]
+        # 进场当根不出场（和引擎同一个 `i > entry_bar` 守卫，见
+        # `BacktestConfig.intrabar_samebar_stop` 上面那段）
+        live = pos != 0 and i > entry_bar
+        # ① 上一根收盘给的出场：本根开盘执行
+        if live and i > 0:
+            want = (xl[i - 1] > 0.5) if pos == 1 else (xs[i - 1] > 0.5)
+            if want:
+                sp = _slip(oi, i)
+                fill = oi - sp if pos == 1 else oi + sp
+                cash += lots * mult * (fill - entry_px) - _fee(lots, fill)
+                pos, lots, entry_px = 0, 0.0, 0.0
+                stop_px, closed_i = math.nan, i
+        # ② 已有仓位的止损（开盘已穿过就按开盘价，更差）
+        if live and math.isfinite(stop_px):
+            if pos == 1 and loi <= stop_px:
+                raw = min(oi, stop_px)
+                sp = _slip(raw, i)
+                fill = raw - sp
+                cash += lots * mult * (fill - entry_px) - _fee(lots, fill)
+                pos, lots, entry_px = 0, 0.0, 0.0
+                stop_px, closed_i = math.nan, i
+            elif pos == -1 and hii >= stop_px:
+                raw = max(oi, stop_px)
+                sp = _slip(raw, i)
+                fill = raw + sp
+                cash += lots * mult * (fill - entry_px) - _fee(lots, fill)
+                pos, lots, entry_px = 0, 0.0, 0.0
+                stop_px, closed_i = math.nan, i
+        # ③ 空仓才看本根有没有触发入场；本根刚平过仓就不再开新仓
+        if pos == 0 and (reentry or closed_i != i):
+            ready = math.isfinite(sd[i]) and sd[i] > 0
+            long_ok = ready and math.isfinite(up[i]) and hii >= up[i]
+            short_ok = ready and math.isfinite(dn[i]) and loi <= dn[i]
+            if long_ok and short_ok:
+                long_ok = short_ok = False     # 两头都打穿，分不出先后
+            if long_ok or short_ok:
+                d = 1 if long_ok else -1
+                raw = max(oi, up[i]) if d > 0 else min(oi, dn[i])
+                sp = _slip(raw, i)
+                fill = raw + sp if d > 0 else raw - sp
+                q = float(size_lots_intrabar(bt, fill, cash, sd[i], mult))
+                if q > 0:
+                    cash -= _fee(q, fill)
+                    lots = q if d > 0 else -q
+                    pos = d
+                    entry_px = float(fill)
+                    entry_raw = float(raw)
+                    entry_bar = i
+                    # 止损绑**实际成交价**，和引擎一致
+                    stop_px = fill - sd[i] if d > 0 else fill + sd[i]
+
+    if pos == 0 or entry_bar < 0:
+        return None
+    return (int(entry_bar), float(entry_raw), int(round(abs(lots))))
+
+
+
 @dataclass
 class PendingOrder:
     """一笔正在追的委托。"""
@@ -308,8 +462,13 @@ class SlotState:
     #:
     #: 回测口径是：**开仓那一根算一次，之后固定到平仓**（`size_lots(cfg, 开盘价,
     #: 现金, 开仓那根的 ATR)`）。这里的 `theo_lots` 就是那个数，由
-    #: `_note_theo_entry()` 从信号波段的**起点**倒推出来（与 `theo_px` 同一根），
+    #: `_note_theo_entry()` 交给 `ib_open_trade()` / `_entry_lots_at()` 算出来，
     #: 一波之内不再重算；方向翻了 / 配置改了才重算。
+    #:
+    #: 🔴 K 线内那一族（`sbbox_ib` / `im_orb`）**不能拿 `signal` 段起点推**：
+    #: 那一列不是持仓状态，段起点和真正的开仓那根毫无关系（RB 1h 实测差六周）。
+    #: 现在整段交给 `ib_open_trade()` —— 照 `run_intrabar_backtest` 那台状态机
+    #: 走一遍，取「最近一笔还没平」的开仓。
     #:
     #: 0 = 还没算出来（历史不够、机器学习那族在等信号），此时退回 `lots` 兜一下。
     theo_lots: int = 0
@@ -2209,7 +2368,8 @@ class PortfolioRunner:
             st.frame_note = f"本地历史切片后不足 2 根，用实时原始价 {len(live)} 根"
             return live
         st.frame_note = (f"前复权本地 {len(base)} 根 + 实时 {len(live)} 根"
-                         f"（合并后 {len(merged)} 根）")
+                         f"（合并后 {len(merged)} 根，起点 "
+                         f"{merged.index[0]:%Y-%m-%d %H:%M}）")
         return merged
 
     def _note_target(self, st: SlotState, prev: int, bar) -> None:
@@ -2278,15 +2438,18 @@ class PortfolioRunner:
         rule = run_strategy(df, st.cfg.rule_key, st.cfg.rule_params,
                             reverse=bool(getattr(st.cfg, "rule_reverse", False)))
         if not needs_factor:
-            # K 线内那一族要带上策略自己给的止损距离与触发价：`risk` 口径的手数
-            # 必须用**触发那一根**的止损距离算（`stop_mult × ATR` 反推要求两个
-            # 配置和策略参数一字不差），开仓那根也要按价格路径找，不能假设
-            # 「信号下一根就成交」
+            # K 线内那一族要带上策略自己给的止损距离、触发价和出场标志：
+            # `risk` 口径的手数必须用**触发那一根**的止损距离算（`stop_mult × ATR`
+            # 反推要求两个配置和策略参数一字不差），开仓那一根也要按回测那台
+            # 状态机找（进出场都会改变「当前这笔是哪根开的」），不能假设
+            # 「信号下一根就成交」，也不能只看 signal 列
             self._note_theo_entry(
                 st, df, rule["signal"],
                 rule["stop_dist"] if "stop_dist" in rule.columns else None,
                 rule["entry_long"] if "entry_long" in rule.columns else None,
-                rule["entry_short"] if "entry_short" in rule.columns else None)
+                rule["entry_short"] if "entry_short" in rule.columns else None,
+                rule["exit_long"] if "exit_long" in rule.columns else None,
+                rule["exit_short"] if "exit_short" in rule.columns else None)
             sig = rule["signal"].iloc[-1]
             return 0 if pd.isna(sig) else int(sig)
 
@@ -2524,43 +2687,38 @@ class PortfolioRunner:
         self._log(f"{st.title()}：{len(got)} 个合约没有开仓均价记录，"
                   "已按当前价补上 —— 这些品种的持仓盈亏从 0 起算")
 
-    def _ib_entry_bar(self, df: pd.DataFrame, k: int, sig: int,
-                      e_long=None, e_short=None) -> tuple[int, float]:
-        """K 线内那一族：从第 `k+1` 根起，按**价格路径**找真正被触发开仓的那一根。
+    def _ib_open_trade(self, st: SlotState, df: pd.DataFrame,
+                       e_long=None, e_short=None, x_long=None, x_short=None,
+                       stop_dist=None):
+        """K 线内那一族：拿到「最近一笔还没平的开仓」＝ (哪根, 成交基准价, 手数)。
 
-        判据和 `run_intrabar_backtest` 的进场条件**同一个**（`hi >= entry_long` /
-        `lo <= entry_short`，成交基准价 = `max(开, 触发价)` / `min(...)`）——
-        不这么做就只能假设「信号确定后的下一根成交」，而 K 线内那一族经常要等
-        好几根才碰到触发价，那一根的止损距离和信号那根差得很远（RB 1h 实测
-        62 手 vs 77 手），用户拿「理论」和交易记录对账又会说对不上。
+        真正的活儿在模块级 `ib_open_trade()`（照 `run_intrabar_backtest` 那台
+        状态机走一遍）。这里只负责两件事：① 按策略配置造出**和回测同一份**
+        `BacktestConfig`（`replay.make_bt`，研究页 / 实盘共用这一个出口，免得
+        两边乘数、保证金率、多空方向各写一遍）；② 同一帧只算一次。
 
-        找不到（还没触发）⇒ 返回 `k+1` 那根和它的开盘价，理论值按假设成交估。
+        缓存键是 `(策略, 根数, 末根时间)`：新 bar 才重算。不加缓存的话，2.6 万
+        根 1h 每次算信号都要扫一遍 —— 25 个品种每小时同一秒一起到点，界面会
+        卡一下。
         """
-        n = len(df)
-        # 🔴 起点是 `k`（这波信号的**第一根**），不是 `k+1`。收盘定信号那一族是
-        # 「第 k 根收盘出信号、第 k+1 根开盘成交」，所以差一根；K 线内这一族的
-        # `signal` 列含义是「**这根收盘时手上该有仓**」，触发就发生在这一根里
-        # （RB 1h 实测：信号的起点那根正是回测的进场那根，开仓价 3062）。
-        # 写成 k+1 会漏掉那笔真正的开仓，手数退回下一根（62 vs 77）。
-        j0 = min(k, n - 1)
+        if len(df) < 2:
+            return None
         try:
-            o = df["open"].to_numpy(dtype=float)
-            hi = df["high"].to_numpy(dtype=float)
-            lo = df["low"].to_numpy(dtype=float)
-            lv = (e_long if sig > 0 else e_short)
-            if lv is None:
-                raise TypeError
-            lv = pd.Series(lv).to_numpy(dtype=float)
-        except Exception:                    # noqa: BLE001 - 没这几列就退回 k+1
-            return j0, float(df["open"].iloc[j0])
-        for i in range(j0, n):
-            if not math.isfinite(lv[i]):
-                continue
-            hit = hi[i] >= lv[i] if sig > 0 else lo[i] <= lv[i]
-            if hit:
-                raw = max(o[i], lv[i]) if sig > 0 else min(o[i], lv[i])
-                return i, float(raw)
-        return j0, float(df["open"].iloc[j0])
+            bt = replay.make_bt(st.cfg.market, replay.resolve_allow_short(st.cfg),
+                                st.cfg)
+        except Exception:                    # noqa: BLE001 - 造不出配置就当没仓
+            return None
+        cache = getattr(self, "_ibt_cache", None)
+        if cache is None:
+            cache = self._ibt_cache = {}
+        key = (st.cfg.sid, len(df), df.index[-1])
+        if key in cache:
+            return cache[key]
+        got = ib_open_trade(df, bt, e_long, e_short, x_long, x_short, stop_dist)
+        if len(cache) > 400:
+            cache.clear()
+        cache[key] = got
+        return got
 
     def _entry_lots_at(self, st: SlotState, df: pd.DataFrame, j: int,
                        px: float, stop_dist=None) -> int:
@@ -2599,7 +2757,8 @@ class PortfolioRunner:
 
     def _note_theo_entry(self, st: SlotState, df: pd.DataFrame,
                          series, stop_dist=None,
-                         e_long=None, e_short=None) -> None:
+                         e_long=None, e_short=None,
+                         x_long=None, x_short=None) -> None:
         """兜底：从信号序列倒推「理论建仓价 / 建仓交易日 / **开仓手数**」。
 
         🔴 **价格这一半不是主口径**（用户 2026-11-20）：「理论开仓价格，应该是从
@@ -2637,25 +2796,36 @@ class PortfolioRunner:
             st.theo_lots, st.theo_lots_sig, st.theo_lots_src = 0, 0, ""
             return
 
-        # ---- 先倒推到这波信号的起点，把「开仓那一根」的手数定下来 ----
+        # ---- 开仓那一根：按**回测那台状态机**找，不再拿「信号段起点」当它 ----
         # 顺序很重要：手数**必须在下面那个 `rank >= order` 早退之前算**。早退是
         # 「价格已经有更可信的来源了，别再改价」，和手数是两件事 —— 放在早退
         # 后面，一旦这一波发过委托，`theo_lots` 就永远停在上一波的值上。
+        #
+        # 🔴 2026-11-23 用户两次点出这里的病根：
+        #   「signal 段起点如果是 10-22，那确实会很多错误的」
+        #   「实盘引擎的开始时间要和回测的一致」
+        # `signal` 列**不是持仓状态**：AG 的段起点（09-24 00:00）比回测真正的
+        # 开仓（09-23 21:00）还晚，RB 的段起点（10-22 09:00）比回测开仓
+        # （09-09 22:00）晚六周 —— 拿它推手数当然对不上。现在整段交给
+        # `ib_open_trade()`：同一份帧、同一个起点、同一台状态机。
         arr = series.to_numpy()
         k = n - 1
         while k > 0 and (int(arr[k - 1]) if not pd.isna(arr[k - 1]) else 0) == sig:
-            k -= 1                       # 回退到这波信号的起点
+            k -= 1                       # 信号段起点（只在状态机给不出时兜底用）
         filled = k + 1 <= n - 1
+        got = 0
+        j = min(k + 1, n - 1)
+        try:
+            ref = float(df["open" if filled else "close"].iloc[j])
+        except (KeyError, IndexError, TypeError, ValueError):
+            ref = 0.0
         if e_long is not None or e_short is not None:
-            # K 线内那一族：开仓不是「信号的下一根」，而是**真正碰到触发价**的那根
-            j, _raw = self._ib_entry_bar(df, k, sig, e_long, e_short)
-            ref = float(_raw)
-        else:
-            j = min(k + 1, n - 1)
-            try:
-                ref = float(df["open" if filled else "close"].iloc[j])
-            except (KeyError, IndexError, TypeError, ValueError):
-                ref = 0.0
+            # K 线内那一族：开仓不是「信号的下一根」，而是状态机说**真正成交过**的
+            # 那根 —— 那一根定了手数，整笔持有期间不再变
+            hit = self._ib_open_trade(st, df, e_long, e_short,
+                                      x_long, x_short, stop_dist)
+            if hit is not None:
+                j, ref, got = hit
         # 🔴 价格**不折回原始价**（和 `theo_px` 那里相反），因为要跟回测对齐：
         # 回测就是用这份（前复权）帧算 `size_lots(cfg, open[i], ...)` 的。前后复权
         # 只差一个常数因子，`risk` 口径（ATR 也在同一空间）逐位相等；`capital`
@@ -2670,7 +2840,10 @@ class PortfolioRunner:
         prev_sig = int(getattr(st, "theo_lots_sig", 0) or 0)
         if (prev_lots <= 0 or prev_sig != sig
                 or getattr(st, "theo_lots_src", "") == ""):
-            got = self._entry_lots_at(st, df, j, ref, stop_dist)
+            # 状态机已经给了手数就直接用（那是回测同一台机器算出来的数）；
+            # 给不出（还没开仓 / 缺列 / 降级帧）才退回按「信号下一根」估一个，
+            # 总比显示 0 手强 —— 这条只在异常路径上才会走到
+            got = got or self._entry_lots_at(st, df, j, ref, stop_dist)
             if got > 0:
                 st.theo_lots = int(got)
                 st.theo_lots_sig = int(sig)
@@ -2694,14 +2867,19 @@ class PortfolioRunner:
         # 收盘价 —— 两列必然都是 0，看着像没仓。
         # 已经翻到最后一根（没有下一根）时，这笔仓**还没成交**：按这根收盘记，
         # 盈亏 0，避免拿窗口内不存在的开盘价（那是偷未来）。
+        # 🔴 开仓价优先取 `ref`：K 线内那一族它是状态机算出来的**成交基准价**
+        # （`max(开, 触发价)`，跳空时就是开盘价），和回测 `Trade.entry_price`
+        # 的毛价口径一致；其余策略 `ref` 本来就是「下一根开盘」。
         col = "open" if filled else "close"
-        try:
-            px = float(df[col].iloc[j])
-        except (KeyError, IndexError, TypeError, ValueError):
+        px = float(ref) if (ref == ref and ref > 0) else 0.0
+        if not px:
             try:
-                px = float(df["close"].iloc[j])
+                px = float(df[col].iloc[j])
             except (KeyError, IndexError, TypeError, ValueError):
-                return
+                try:
+                    px = float(df["close"].iloc[j])
+                except (KeyError, IndexError, TypeError, ValueError):
+                    return
         # 🔴 帧是**前复权**价，`_last_px` / `_pre_px` 是**实时报价**（原始价）。
         # 换月前后 adj_factor ≠ 1，直接拿前复权价当建仓价，乘出来的盈亏是错的
         # 价格空间的差（AG 早年能差 30%）。统一折回原始价，和报价同一个口径。
@@ -2908,8 +3086,9 @@ class PortfolioRunner:
         不能根据当前 k 线来算，实际上应该就从开仓那边获取，而不是自己擅自计算」）。
         以前用 `st.lots`（每根 bar 重算）时，risk 口径下 ATR 从 12 掉到 4.7，
         同一笔仓的理论手数就从 39 手漂到 106 手，和回测交易记录里那一笔永远
-        对不上。现在 `theo_lots` 由 `_note_theo_entry()` 从信号波段起点算一次，
-        持有期间不动；K 线内那一族真的触发时会刷新成实际下单的手数。
+        对不上。现在 `theo_lots` 只在开仓那根算一次（K 线内那族由
+        `ib_open_trade()` 按回测状态机给出开仓那根），持有期间不动；真的触发
+        时会刷新成实际下单的手数。
 
         🔴 与账户、台账、成交一律无关（用户 2026-11-20 两次强调的口径）。
         也**不**能拿它去下单（K 线内那族的下单目标必须由触发价给，见

@@ -392,6 +392,13 @@ def window(df: pd.DataFrame | None, years: float) -> pd.DataFrame | None:
     日线近一年就只剩 40 根有信号 —— 图上看起来像「策略一直空仓」。
     留出预热段之后，窗口内的每一根都是有信号的；代价是窗口前那一段也进了
     指标计算，收益从预热段开始累计（预热段不开仓，对总收益几乎没有影响）。
+
+    🔴 **起点必须落在整日上，不能落在「末根那一刻减 N 年」**（2026-11-23 用户
+    三次强调「实盘引擎的开始时间要和回测的一致」）。按末根时刻算的话，回测的
+    末根是 15:00 收盘、实盘的末根是盘中 14:37 那根，两个 `start` 差几个小时，
+    `searchsorted` 就可能落在**相邻两根**上 ⇒ 进窗口的第一根不一样 ⇒ 后面
+    整条状态机（谁先开的仓、开到第几根）全都跟着错开一根，手数自然对不上。
+    折成整日之后，同一天跑的回测和实盘切出来的是**同一根**起始 bar。
     """
     if df is None or df.empty:
         return df
@@ -401,7 +408,8 @@ def window(df: pd.DataFrame | None, years: float) -> pd.DataFrame | None:
         years = 0.0
     if years <= 0:
         return df
-    start = pd.Timestamp(df.index[-1]) - pd.DateOffset(days=int(round(years * 365.25)))
+    anchor = pd.Timestamp(df.index[-1]).normalize()
+    start = anchor - pd.DateOffset(days=int(round(years * 365.25)))
     if start <= pd.Timestamp(df.index[0]):
         return df
     i = int(df.index.searchsorted(start))

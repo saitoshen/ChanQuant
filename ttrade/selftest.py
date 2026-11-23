@@ -1661,7 +1661,7 @@ def _run() -> tuple[bool, list[str]]:
             _theo_qty = SR.PortfolioRunner._theo_qty
             _theo_lots_qty = SR.PortfolioRunner._theo_lots_qty
             _ib_on = staticmethod(SR.PortfolioRunner._ib_on)
-            _ib_entry_bar = SR.PortfolioRunner._ib_entry_bar
+            _ib_open_trade = SR.PortfolioRunner._ib_open_trade
             _latch_theo_lots = SR.PortfolioRunner._latch_theo_lots
             _latch_to_order = SR.PortfolioRunner._latch_to_order
             _theo_rank = staticmethod(SR.PortfolioRunner._theo_rank)
@@ -1780,10 +1780,11 @@ def _run() -> tuple[bool, list[str]]:
         if "st.target = self._theo_lots_qty(st)" not in body:
             raise RuntimeError("`_refresh_signal` 没用 `_theo_lots_qty()` 定目标仓")
 
-        # ⑥ K 线内那一族（用户最早报的 sbbox）：开仓那根要按**价格路径**找出来，
-        #    手数要和回测未平那笔逐位相等。起点写成 k+1 会漏掉真正的开仓那根
-        #    （实测 62 vs 77）；`stop_dist` 拿整数下标索引 Series 会静默退回 ATR
-        #    那条路（实测 61 vs 77）。
+        # ⑥ K 线内那一族（用户最早报的 sbbox）：开仓那根要由**回测那台状态机**
+        #    给出来，不许再从「signal 段起点」倒推 —— 实测 AG 的段起点比回测开仓
+        #    还晚、RB 的段起点比回测开仓晚六周（用户 11-23：「signal 段起点如果
+        #    是 10-22，那确实会很多错误的」）。这一段的回测配置也必须走
+        #    `replay.make_bt()`，和 `_ib_open_trade()` 完全同一个出口。
         note6 = ""
         try:
             d1h = tqdata.load_main("RB", "SHFE", "1h").tail(1500)
@@ -1794,42 +1795,55 @@ def _run() -> tuple[bool, list[str]]:
         if r6 is not None and "stop_dist" in r6.columns:
             s6 = r6["signal"]
             sg6 = int(s6.iloc[-1])
-            st6 = SR.SlotState(cfg=SStore.StrategyConfig(
+            cfg6 = SStore.StrategyConfig(
                 sid="t-ib-lots", name="t-ib-lots", symbol="RB",
                 exchange="SHFE", period="1h", family="rule",
                 rule_key="sbbox_ib", sizing="risk", principal=1_000_000.0,
-                risk_pct=1.0, stop_atr_n=14, stop_mult=2.0))
+                risk_pct=1.0, stop_atr_n=14, stop_mult=2.0)
+            st6 = SR.SlotState(cfg=cfg6)
             if sg6:
                 f._note_theo_entry(st6, d1h, s6, r6["stop_dist"],
-                                   r6["entry_long"], r6["entry_short"])
+                                   r6["entry_long"], r6["entry_short"],
+                                   r6["exit_long"], r6["exit_short"])
+                bt6 = SR.replay.make_bt("cn", SR.replay.resolve_allow_short(cfg6),
+                                        cfg6)
                 res6 = BT.run_backtest(d1h.assign(
                     signal=s6, stop_dist=r6["stop_dist"],
                     entry_long=r6["entry_long"], entry_short=r6["entry_short"],
-                    exit_long=r6["exit_long"], exit_short=r6["exit_short"]),
-                    BT.BacktestConfig(
-                        initial_cash=1_000_000.0, sizing="risk",
-                        risk_amount=10_000.0, stop_atr_n=14, stop_mult=2.0,
-                        multiplier=10.0, margin_rate=0.10, fee_rate=0.0,
-                        fee_per_lot=0.0, tick_size=0.0, slippage_ticks=0.0,
-                        slippage=0.0, bars_per_year=244.0 * 6))
+                    exit_long=r6["exit_long"], exit_short=r6["exit_short"]), bt6)
                 t6 = res6.trades[-1] if res6.trades else None
                 if t6 is not None and t6.open_position and t6.direction == sg6:
                     if int(t6.lots) != st6.theo_lots:
                         raise RuntimeError(
                             f"K 线内：理论 {st6.theo_lots} 手 ≠ 回测这笔 "
                             f"{int(t6.lots)} 手 —— 开仓那根没找对"
-                            "（起点该是信号第一根 k，不是 k+1）")
+                            "（要按回测状态机，不能拿 signal 段起点）")
                     note6 = f"；K 线内实测 {st6.theo_lots} 手也等于回测 Trade.lots"
                 else:
                     note6 = "；K 线内那笔已平仓，对拍跳过"
             else:
                 note6 = "；K 线内末根信号是 0，对拍跳过"
 
+        # ⑦ 起点对齐：`replay.window()` 的切点必须落在**整日**上，否则回测末根
+        #    15:00 收盘、实盘末根盘中，同一天切出相邻两根当起点，整条状态机
+        #    错开一根（用户 11-23：「实盘引擎的开始时间要和回测的一致」）。
+        d = pd.date_range("2024-01-01", periods=900, freq="h")
+        px = pd.Series(100.0, index=d)
+        frame = pd.DataFrame({"open": px, "high": px, "low": px, "close": px})
+        w_close = SR.replay.window(frame, 0.05)
+        w_intra = SR.replay.window(frame.iloc[:-1], 0.05)
+        if w_close.index[0] != w_intra.index[0]:
+            raise RuntimeError(
+                f"回测（末根 {frame.index[-1]}）切到 {w_close.index[0]}，"
+                f"实盘（末根 {frame.index[-2]}）切到 {w_intra.index[0]} —— "
+                "起点没按整日锚定，实盘和回测会错开一根")
+        note7 = f"；起点按整日锚定（同日 15:00 / 盘中两种末根都切到 {w_close.index[0]}）"
+
         return (f"手数在「开仓那一根」定死：RB 日线实测 {entry_lots} 手，"
                 f"与回测同一笔的 Trade.lots 逐位相等；"
                 f"波幅翻倍后仍是 {entry_lots} 手不漂"
                 f"（按当前 K 线重算会变成 {drifted} 手）；翻方向才重算；"
-                "K 线内触发后用实际下单手数，推断不覆盖" + note6)
+                "K 线内触发后用实际下单手数，推断不覆盖" + note6 + note7)
 
     check("理论手数取开仓那一根（不按当前 K 线重算）", _theo_entry_lots)
 
