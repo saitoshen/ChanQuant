@@ -522,6 +522,18 @@ def _normalized(cfg):
         return cfg
 
 
+def _bound(cfg, index):
+    """配置里的窗口（交易日）→ 计算用的窗口（bar 根数）。
+
+    和回测同一条换算（`fstrat.bind_window`）：训练、离线预测、实盘预测**三处
+    必须走同一个函数，否则「回测 252 天、实盘 252 根」这种错只在实盘上显形。
+    """
+    try:
+        return fstrat.bind_window(cfg, index)
+    except Exception:      # noqa: BLE001
+        return cfg
+
+
 def _cfg_digest(cfg: "fstrat.FactorConfig") -> dict:
     """参与「模型是否还对得上」判断的配置项。
 
@@ -533,6 +545,9 @@ def _cfg_digest(cfg: "fstrat.FactorConfig") -> dict:
     return {
         "model": cfg.model,
         "window": int(cfg.window),
+        # 窗口单位也算进去：老存档是根、新配置是交易日，`window=252` 在两者
+        # 里根本不是同一个窗口，摘要撞成一样会让「同一个模型」被误用
+        "window_unit": str(getattr(cfg, "window_unit", "day") or "day"),
         "method": cfg.method,
         "horizon": int(cfg.horizon),
         "train_window": int(cfg.train_window),
@@ -619,20 +634,23 @@ def train_artifact(
     if df is None or len(df) < 200:
         raise ValueError(f"数据太少（{0 if df is None else len(df)} 根），训不了模型")
     _no_cross_periods(cfg, keys)
+    # `cfg` 本体留着**交易日**口径（摘要 / 产物元信息都按它比，实盘那边拿到的
+    # 也是交易日）。算因子矩阵、触发计划这些要根数的地方一律用 `bcfg`
+    bcfg = _bound(cfg, df.index)
 
     # ---- 因子矩阵 + 标签（和 build_score 里一样）----
     use = F.filter_available(df, keys)
     if not use:
         raise ValueError("选中的因子在这个标的上都没有足够数据")
-    fmat = F.factor_frame(df, use, window=cfg.window, method=cfg.method)
+    fmat = F.factor_frame(df, use, window=bcfg.window, method=cfg.method)
     fwd = M.forward_return(df, cfg.horizon)
 
     # ---- 触发计划（要跟训练用同一份，否则样本集不一致）----
     mask = None
     plan = None
     if str(cfg.sample_mode or "all") == "trigger":
-        st, armed, _tn, rule_sig = fstrat.trigger_signal(df, cfg)
-        m, _mn = fstrat.trigger_mask(st, armed, cfg)
+        st, armed, _tn, rule_sig = fstrat.trigger_signal(df, bcfg)
+        m, _mn = fstrat.trigger_mask(st, armed, bcfg)
         mask = np.asarray(m, dtype=bool)
         plan = fstrat.TriggerPlan(
             mask=mask,
@@ -645,7 +663,8 @@ def train_artifact(
         )
 
     # ---- 跑一遍完整流程：既拿预测序列，也拿状态机结果 ----
-    out = fstrat.run_factor_strategy(df, "ml", use, cfg, progress=progress, cancel=cancel)
+    out = fstrat.run_factor_strategy(df, "ml", use, bcfg, progress=progress,
+                                     cancel=cancel)
     pack = out.pack
     pred = pack.pred if pack.pred is not None else pd.Series(np.nan, index=df.index)
     score = pack.score
@@ -654,7 +673,7 @@ def train_artifact(
     # `walk_forward` 不返回模型，这里重训一次「最后一折」那个模型。多花 ~0.65s，
     # 换来产物里有一个能直接 predict 的模型。折边界必须跟 walk_forward 一致，
     # 否则训出来的就不是「最后一折」那个模型了。
-    model = _fit_last_fold(fmat, fwd, cfg, mask, cancel)
+    model = _fit_last_fold(fmat, fwd, bcfg, mask, cancel)
 
     if model is None:
         raise ValueError(
@@ -668,7 +687,7 @@ def train_artifact(
         )
 
     # ---- 状态：迟滞状态机 + 触发计划 + z 分数窗口 ----
-    state = _extract_state(out, pack, cfg, plan)
+    state = _extract_state(out, pack, bcfg, plan)
 
     art = MlArtifact(
         sid=sid or "",
@@ -877,6 +896,9 @@ class LivePredictor:
         # 上一根的 |分数|：出场后要判断「这一根是不是刚越过进场阈值」，
         # 也就是「算不算一笔新交易」。和回测 `apply_exit_rules` 里的 fresh 同一口径
         self._prev_abs_z = float("nan")
+        # 当前这根 bar 上折好的窗口（bar 根数）。`self.cfg` 始终是**交易日**口径
+        # （它要和产物摘要比、要和回测配置比），算的时候用这份，见 `_score_of`
+        self._bcfg = None
 
     # ---- 状态机 ----
 
@@ -1110,7 +1132,12 @@ class LivePredictor:
         回测里 `score.where(plan.mask).ffill()` 用的是 `mask`。用 `armed` 代替
         的话，冷却期内的 bar 也会刷新分数，和回测对不上（实测差 0.4 个 z）。
         """
-        fmat = F.factor_frame(df, self.keys, window=self.cfg.window,
+        # 窗口：配置是交易日，算的时候必须是根数。每根 bar 都现折一次 ——
+        # 夜盘收得早的品种 `bars_per_day` 会在 7 和 8 之间变，缓存住会让
+        # 「同一段历史的窗口」在实盘里慢慢漂
+        bcfg = _bound(self.cfg, df.index)
+        self._bcfg = bcfg
+        fmat = F.factor_frame(df, self.keys, window=bcfg.window,
                               method=self.cfg.method)
         if fmat.empty:
             raise ValueError("因子矩阵算不出来")
@@ -1135,7 +1162,7 @@ class LivePredictor:
         if ts != self._pred_idx:
             self._zbuf.append(pred)
             self._pred_idx = ts
-            w = max(20, int(self.cfg.window))
+            w = max(20, int(bcfg.window))
             if len(self._zbuf) > w:
                 self._zbuf = self._zbuf[-w:]
         z = self._rolling_z_last()
@@ -1144,14 +1171,14 @@ class LivePredictor:
         if not trig:
             return z, float("nan"), False, 0.0, False, False, pred
 
-        st_s, armed_s, _tn, rule_s = fstrat.trigger_signal(df, self.cfg)
+        st_s, armed_s, _tn, rule_s = fstrat.trigger_signal(df, bcfg)
         strength = float(st_s.to_numpy(dtype=float)[-1]) if len(st_s) else float("nan")
         rule_sig = float(rule_s.to_numpy(dtype=float)[-1]) if len(rule_s) else 0.0
         armed = bool(armed_s.to_numpy(dtype=bool)[-1]) if len(armed_s) else False
         # 决策点：和回测用同一个 `trigger_mask`。这里要**整段重算** mask ——
         # 冷却是跨 bar 的，只看最后一根不知道它是不是被冷却掉了
         try:
-            m, _mn = fstrat.trigger_mask(st_s, armed_s, self.cfg)
+            m, _mn = fstrat.trigger_mask(st_s, armed_s, bcfg)
             is_point = bool(np.asarray(m, dtype=bool)[-1]) if len(m) else False
         except Exception:  # noqa: BLE001
             is_point = armed
@@ -1169,10 +1196,15 @@ class LivePredictor:
         （回测的滚动窗口也只看最近 window 根）。
         """
         s = pd.Series(np.asarray(self._zbuf, dtype=float))
-        mp = max(20, int(self.cfg.window) // 4)
+        # 缓冲区里是「最近 w 根」，w 必须是**这根 bar 上折出来的根数**。
+        # 退回 `self.cfg.window` 会把「252 天」当成 252 根，在 5 分钟图上
+        # 就是「最近 252 根」—— 两个窗口差 48 倍，分数不可比
+        _b = getattr(self, "_bcfg", None)
+        win = int(getattr(_b, "window", 0) or 0) or int(self.cfg.window)
+        mp = max(20, win // 4)
         if len(s) < mp:
             return float("nan")
-        roll = s.rolling(int(self.cfg.window), min_periods=mp)
+        roll = s.rolling(win, min_periods=mp)
         m = roll.mean()
         sd = roll.std(ddof=1)
         if not np.isfinite(m.iloc[-1]) or not np.isfinite(sd.iloc[-1]):
@@ -1398,13 +1430,15 @@ def train_fold_set(
     use = F.filter_available(df, keys)
     if not use:
         raise ValueError("选中的因子在这个标的上都没有足够数据")
+    # 窗口按这份数据折成根数（配置本体保持交易日，摘要按交易日比）
+    bcfg = _bound(cfg, df.index)
 
     # ---- 触发计划（要和训练用同一份，否则样本集不一致）----
     mask = None
     plan = None
     if str(cfg.sample_mode or "all") == "trigger":
-        st, armed, _tn, rule_sig = fstrat.trigger_signal(df, cfg)
-        m, _mn = fstrat.trigger_mask(st, armed, cfg)
+        st, armed, _tn, rule_sig = fstrat.trigger_signal(df, bcfg)
+        m, _mn = fstrat.trigger_mask(st, armed, bcfg)
         mask = np.asarray(m, dtype=bool)
         plan = fstrat.TriggerPlan(
             mask=mask,
@@ -1418,8 +1452,8 @@ def train_fold_set(
 
     # ---- 跑一遍完整流程，把每一折的模型都收上来 ----
     collected: list = []
-    out = fstrat.run_factor_strategy(df, "ml", use, cfg, progress=progress,
-                                      cancel=cancel, collect_models=collected)
+    out = fstrat.run_factor_strategy(df, "ml", use, bcfg, progress=progress,
+                                     cancel=cancel, collect_models=collected)
     pack = out.pack
     if not collected:
         raise ValueError(
@@ -1511,9 +1545,12 @@ def train_fold_set_pooled(
         raise ValueError("合并训练至少要 2 个品种")
     _no_cross_periods(cfg, keys)
 
+    # 合并训练：密度取第一个品种（同池同一周期），和 `pooled_score` 一致
+    _idx0 = next((d.index for d in frames.values() if d is not None and len(d)), None)
+    bcfg = _bound(cfg, _idx0) if _idx0 is not None else cfg
     collected: list = []
     outs = fstrat.run_pooled_strategy(
-        frames, keys, cfg, progress=progress, cancel=cancel,
+        frames, keys, bcfg, progress=progress, cancel=cancel,
         collect_models=collected,
     )
     if not collected:
@@ -1552,7 +1589,7 @@ def train_fold_set_pooled(
         pack = out.pack
         plan = pack.trigger
         # 触发计划：合训里每个品种有自己的 trigger plan
-        state = _extract_state(out, pack, cfg, plan)
+        state = _extract_state(out, pack, bcfg, plan)
         states[sym] = state
         df = frames[sym]
         sym_meta[sym] = {

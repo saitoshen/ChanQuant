@@ -7,10 +7,12 @@
 两种玩法：
 
 - **截面对冲**（`mode="hedge"`）：按截面分数排序，多最强的 top X%、空最弱的
-  bottom X%，等权，定期调仓。净敞口约等于 0，赚的是「强弱差」。
+  bottom X%，定期调仓。选中的多空品种**合在一起**按 `weight` 分钱，赚的是
+  「强弱差」。（2026-11-23 之前是多空各占 50% 名义额、净敞口 ≈ 0；改成合并
+  分钱之后两边不必等值，净敞口由两边的分数 / 波动和腿数天然决定。）
 - **截面选品种 + 时序交易**（`mode="select"`）：**池内所有品种**都交给各自的
   时序策略（规则或因子），由时序信号决定这一腿是多是空还是空仓。截面不负责
-  「挑几只」—— 挑几只由第一步的筛池决定，截面分数在这里只决定**腿内谁多分点
+  「挑几只」—— 挑几只由第一步的筛池决定，截面分数在这里只决定**池内谁多分点
   钱**（`weight="score"` / `"tier"`）。时序负责「什么时候」，截面负责「分多少」。
 
   两种模式对 `top_pct` / `bot_pct` 的用法不一样：对冲模式拿它定腿数，选品种
@@ -290,12 +292,17 @@ def _cross_z(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def _factor_cfg(cfg: "CrossConfig"):
-    """截面因子那一套参数（窗口 / 模型 / 训练窗口 …）转成 `FactorConfig`。"""
+    """截面因子那一套参数（窗口 / 模型 / 训练窗口 …）转成 `FactorConfig`。
+
+    和 `replay.factor_config` 同一条兼容规则：存档里没有 `window_unit` 的
+    （3.9.12 之前存的）一律按 **bar 根数** 读，见那里那段说明。
+    """
     d = dict(getattr(cfg, "factor_cfg", None) or {})
-    return fstrat.FactorConfig(
-        **{k: v for k, v in d.items()
-           if k in fstrat.FactorConfig.__dataclass_fields__}
-    )
+    kw = {k: v for k, v in d.items()
+          if k in fstrat.FactorConfig.__dataclass_fields__}
+    if "window_unit" not in kw:
+        kw["window_unit"] = "bar"
+    return fstrat.FactorConfig(**kw)
 
 
 def _rev_of(spec, rev) -> bool:
@@ -461,6 +468,12 @@ def ml_score_panel(frames: dict[str, pd.DataFrame], keys: list[str], fcfg,
         raise ValueError("这批品种上没有共同可用的 2 个因子（各自缺的数据不一样）")
 
     fcfg = fcfg or fstrat.FactorConfig()
+    # 窗口按这份数据的密度折成根数（配置里是交易日）。密度取第一个品种：
+    # 同一个池子是同一个周期，1h 上各品种的差别只有夜盘收得早晚那几根
+    _idx0 = next((df.index for df in frames.values()
+                  if df is not None and len(df)), None)
+    if _idx0 is not None:
+        fcfg = fstrat.bind_window(fcfg, _idx0)
     horizon = max(1, int(fcfg.horizon or 1))
 
     blocks = []
@@ -1430,59 +1443,108 @@ def _apply_pool(score: pd.DataFrame, pool: pd.DataFrame,
 def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig,
                    vol: pd.DataFrame | None = None,
                    step: int | None = None) -> pd.DataFrame:
-    """多强空弱。多空各占一半名义，净敞口 ≈ 0。
+    """多强空弱。**多空合在一起分钱**，净敞口不再钉在 0（见下面那段）。
 
     多空腿数可以不一样（`top_pct` / `bot_pct`）：多 10% 空 10% 是常见的对称
-    写法，但「多最强的 10%、空最弱的 20%」也讲得通（下跌时弱者更弱）。两边
-    各自按自己的腿数平分 0.5 的名义额，净敞口仍然是 0。
+    写法，但「多最强的 10%、空最弱的 20%」也讲得通（下跌时弱者更弱）。
 
-    腿内怎么分（`weight`）：等权 / 按分数 / 风险平价 / 分档。风险平价是**每一腿
-    内部**按 1/σ 分 —— 波动大的品种少给钱，多空两侧各自的风险贡献才拉得平；
-    跨腿的 0.5 / 0.5 不动，否则净敞口就不是 0 了。
+    ## 资金分配：**多空合在一起算**（2026-11-23 改）
+
+    用户原话：「多空腿不必等值，所有多的和空的品种合在一起做资金分配，比如风险
+    平价（等权、按分数加权、分档）等」。
+
+    原来是「多头腿分 0.5、空头腿分 0.5，各自腿内再平分」，好处是净敞口恒为 0，
+    代价是**腿内怎么分完全不管两边谁更该多拿钱**：多头这边是 5 只低波动品种、
+    空头那边是 1 只高波动妖票，两条腿照样各拿一半 —— 按风险平价的本意，这时候
+    应该给多头更多钱。
+
+    现在改成：选中的**全部品种（多 + 空）放在一张表里**归一化，`weight` 决定每只
+    拿多少份，符号跟着它是多头还是空头。于是 Σ|w| 仍然 = 1（×杠杆），但
+    **多头合计不必等于空头合计，净敞口不再是 0** —— 这是这个口径的代价，
+    界面上写在摘要里，不能让用户以为还是对冲：
+
+    - 等权：每只 1/N（N = 多头数 + 空头数）
+    - 按分数：`w ∝ |分数|`
+    - 风险平价：`w ∝ 1/σ`（波动越小给越多，同一个意思：让每只的风险贡献接近）
+    - 分档：按 |分数| 降序切 N 档，第 1 档拿最多份
+
+    分档用 **|分数|** 排序而不是「多头降序、空头升序」：合并之后只有一个队列，
+    强弱是「信号有多确定」，多空两侧对称 —— 空头里最弱的那只 |分数| 最大，照样
+    进第一档。
     """
     rows, top, bot, k_long, k_short, ok = _rank(score, cfg, step=step)
-    inv_l = 1.0 / np.maximum(k_long, 1)
-    inv_s = 1.0 / np.maximum(k_short, 1)
-    if cfg.weight == "tier" and int(cfg.tiers or 0) >= 2:
-        mat = score.to_numpy(dtype=float)[rows]
+    mat = score.to_numpy(dtype=float)[rows]
+    w = np.zeros(mat.shape, dtype=float)
+    use_tier = cfg.weight == "tier" and int(cfg.tiers or 0) >= 2
+    use_risk = cfg.weight == "risk" and vol is not None
+    if use_tier:
         units = _tier_units(cfg)
-        w = np.zeros(mat.shape, dtype=float)
-        for i in range(len(rows)):
-            if not ok[i]:
-                continue
-            if not cfg.short_only:
-                w[i] = 0.5 * _tier_share(mat[i], top[i], int(cfg.tiers), units)
-            if not cfg.long_only:
-                w[i] -= 0.5 * _tier_share(mat[i], bot[i], int(cfg.tiers), units,
-                                          ascending=True)
-    elif cfg.weight == "risk" and vol is not None:
+    if use_risk:
         vmat = vol.to_numpy(dtype=float)[rows]
-        w = np.zeros(vmat.shape, dtype=float)
-        for i in range(len(rows)):
-            if not ok[i]:
-                continue
-            if not cfg.short_only:
-                w[i] = _rp_share(vmat[i], top[i], 0.5)
-            if not cfg.long_only:
-                w[i] -= _rp_share(vmat[i], bot[i], 0.5)
-    elif cfg.weight == "score":
-        mat = score.to_numpy(dtype=float)[rows]
-        pos = np.where(top, np.clip(np.nan_to_num(mat), 0.0, None), 0.0)
-        s = pos.sum(axis=1)
-        good = s > 0
-        share = np.zeros_like(pos)
-        share[good] = pos[good] / s[good, None]
-        w = np.where(good[:, None], 0.5 * share, top * (0.5 * inv_l)[:, None])
-        if cfg.short_only:
-            w = np.zeros_like(w)          # 禁止做多：多头腿整腿不建
-        if not cfg.long_only:
-            w = w - bot * (0.5 * inv_s)[:, None]
-    else:
-        w = (np.zeros(top.shape, dtype=float) if cfg.short_only
-             else top * (0.5 * inv_l)[:, None])
-        if not cfg.long_only:
-            w = w - bot * (0.5 * inv_s)[:, None]
+    for i in range(len(rows)):
+        if not ok[i]:
+            continue
+        sel = top[i] | bot[i]
+        if not sel.any():
+            continue
+        if use_tier:
+            raw = _tier_row(mat[i], sel, int(cfg.tiers), units)
+        elif use_risk:
+            v = vmat[i]
+            raw = np.where(np.isfinite(v) & (v > 1e-12),
+                           1.0 / np.maximum(v, 1e-12), np.nan)
+        elif cfg.weight == "score":
+            raw = np.abs(np.nan_to_num(mat[i], nan=0.0))
+        else:
+            raw = np.ones(mat.shape[1], dtype=float)
+        w[i] = _pooled_share(raw, top[i], bot[i])
     return _place(score, rows, w, ok)
+
+
+def _tier_row(mat_row: np.ndarray, sel_row: np.ndarray, tiers: int,
+              units: list[float]) -> np.ndarray:
+    """一行的分档份数（**不归一化**，交给 `_pooled_share` 统一归一）。
+
+    按 `|分数|` 降序切档：合并之后多空是同一个队列，|分数| 大 = 信号确定。
+    """
+    out = np.zeros(len(mat_row), dtype=float)
+    idx = np.nonzero(sel_row)[0]
+    if not len(idx):
+        return out
+    v = np.abs(np.nan_to_num(mat_row[idx], nan=0.0))
+    order = idx[np.argsort(-v, kind="stable")]
+    chunks = np.array_split(order, min(max(1, int(tiers)), len(order)))
+    for ci, ch in enumerate(chunks):
+        if not len(ch):
+            continue
+        out[ch] = float(units[ci]) if ci < len(units) else float(units[-1])
+    return out
+
+
+def _pooled_share(raw: np.ndarray, top: np.ndarray, bot: np.ndarray,
+                  total: float = 1.0) -> np.ndarray:
+    """多空混在一起按 `raw` 分 `total` 的名义额，符号跟着多空走。
+
+    `raw` 是「每只该拿多少份」的正数（等权全 1 / |分数| / 1/σ / 分档份数），
+    归一化到 Σ|w| = total。缺值的用**同组中位数**顶上 —— 既不让它变 0 权重
+    （它明明是刚被选中的），也不让它因为「分母小」反而拿最大一份。
+
+    一个品种同时落在 top 和 bot 里时按多头算（`_rank` 的 `n_valid // 2` 上限
+    本来就不该让两边相交，这里是兜底）。
+    """
+    out = np.zeros(len(raw), dtype=float)
+    sel = top | bot
+    idx = np.nonzero(sel)[0]
+    if not len(idx):
+        return out
+    v = np.asarray(raw, dtype=float)[idx]
+    v = np.where(np.isfinite(v) & (v > 0), v, np.nan)
+    if not np.isfinite(v).any():
+        v = np.ones(len(idx), dtype=float)
+    v = np.where(np.isfinite(v), v, np.nanmedian(v))
+    out[idx] = total * v / v.sum()
+    out[bot & ~top] *= -1.0
+    return out
 
 
 def _rank(score: pd.DataFrame, cfg: CrossConfig, all_in: bool = False,
@@ -1643,8 +1705,11 @@ def _timing_signal(df: pd.DataFrame, cfg: CrossConfig,
     try:
         from ttrade import factor_strategy as fstrat
 
-        fc = fstrat.FactorConfig(**{k: v for k, v in (cfg.timing_factor_cfg or {}).items()
-                                    if k in fstrat.FactorConfig.__dataclass_fields__})
+        _td = {k: v for k, v in (cfg.timing_factor_cfg or {}).items()
+               if k in fstrat.FactorConfig.__dataclass_fields__}
+        # 老存档没有 `window_unit` ⇒ window 是 bar 根数（见 `replay.factor_config`）
+        _td.setdefault("window_unit", "bar")
+        fc = fstrat.FactorConfig(**_td)
         fc.reverse = dict(cfg.timing_factor_reverse or {})
         out = fstrat.run_factor_strategy(
             df, cfg.timing_factor_mode or "single", keys, fc,

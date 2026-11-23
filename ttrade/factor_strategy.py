@@ -108,10 +108,18 @@ def _clean_tiers(tiers) -> list[list[float]]:
 @dataclass
 class FactorConfig:
     # 因子构造
-    # window 是 **bar 根数**，不做任何周期换算（见 `factors.win_bars`）。
-    # 日线 252 根 ≈ 一年；5m 上 252 根 ≈ 五个交易日 —— 量的是「本周期自己的
-    # 近期状态」，日内策略就该跟着这五天走，而不是去和日线的「一年」对齐。
-    window: int = 252            # 标准化窗口（也是 IC 统计窗口，单位：根）
+    #
+    # window 的口径是**交易日**（也是 IC 统计窗口）。`window=252` 在日线上是
+    # 一年、在 5 分钟图上自动折成约一万两千根（同样是一年），不用自己乘 48。
+    # 换算在 `bind_window()` 里按**这份数据自己的**密度做（`bars_per_day`），
+    # 计算层拿到的 `cfg.window` 已经是 bar 根数。
+    #
+    # 🔴 `window_unit == "bar"` 只是**兼容老存档**：库里 778 条老策略的 window
+    # 存的是 bar 根数（1h 的 1764、30m 的 2822，都是「252 × 每天根数」算出来的）。
+    # 把它们当交易日读，1h 上就变成 12348 根、七年历史，因子整条全空、策略
+    # 静默空仓。所以老配置照旧按根用（见 `replay.factor_config`），一个数字都不动。
+    window: int = 252            # 标准化窗口（也是 IC 统计窗口，单位见 window_unit）
+    window_unit: str = "day"     # day = 交易日（新口径）/ bar = bar 根数（老存档）
     method: str = "z"            # z / rank —— 全局默认口径
     # 逐因子覆盖：`{因子键: "z" | "rank"}`，没列到的走 `method`。
     #
@@ -295,6 +303,14 @@ class FactorConfig:
     # 反向的趋势里，仓位靠 ATR 止损退出，而不是靠分数。
     exit_no_flip: bool = False
 
+    # ---- 「window 已经折成 bar 根数了」的标记（见 `bind_window`）
+    #
+    # 不落盘、不参与配置比较，只防一件事：`build_score` → `factor_matrix` →
+    # …这串嵌套调用里**同一个窗口被换算两遍**。换算两遍不报错，表现是
+    # 「窗口变成天文数字 ⇒ 因子全空 ⇒ 策略静默空仓」，最难查的那一类。
+    # 它是 dataclass 字段，`normalized()` 里那句整表复制会自动带走它。
+    _window_resolved: bool = False
+
     def reversed_keys(self) -> set[str]:
         """真正打开反转的因子。顺手把非真值过滤掉，调用方不用自己判。"""
         return {k for k, v in dict(self.reverse or {}).items() if v}
@@ -354,7 +370,24 @@ class FactorConfig:
         c = FactorConfig(**{k: getattr(self, k) for k in self.__dataclass_fields__})
         # dict 是可变对象，复制一份，免得调用方事后改原配置影响已经算好的结果
         c.reverse = {k: True for k in c.reversed_keys()}
-        c.window = int(max(60, c.window))
+        # 窗口下限分三种情况，判据是「这个数现在是什么单位」：
+        #   · 已折成 bar 根数（`_window_resolved`）→ 20 根。不能再按交易日卡 60：
+        #     20 天的窗口在 5 分钟图上是 960 根、在日线上是 20 根，一刀卡 60
+        #     会把日线那个 20 悄悄改成 60，也就是**替用户改了参数**
+        #   · 老存档的 bar 根数（`window_unit == "bar"`）→ 60 根，和改口径之前一样
+        #   · 交易日 → 20 天，和界面滑杆的下限对齐
+        if c._window_resolved:
+            c.window = int(max(20, c.window))
+        elif str(c.window_unit or "day").strip().lower() == "bar":
+            c.window = int(max(60, c.window))
+        else:
+            c.window = int(max(20, c.window))
+        # 单位只认两个值。写错一个词就静默换成交易日，等于让「几百根」变成
+        # 「几百天」—— 窗口放大几倍，因子看着还在出数，只是全变了个样
+        if str(c.window_unit or "").strip().lower() not in ("day", "bar"):
+            c.window_unit = "day"
+        else:
+            c.window_unit = str(c.window_unit).strip().lower()
         c.horizon = int(max(1, c.horizon))
         c.entry_z = float(max(0.0, c.entry_z))
         # 离场阈值下限 -2：负值是「反向到足够强才平」，持仓更长。上限仍压在
@@ -1272,7 +1305,9 @@ def factor_matrix(
     单周期（全是纯键、`factor_periods` 为空）时走的就是原来的 `factor_frame`
     那条路，结果与以前逐位相同 —— 加了跨周期不该动老策略的每一个数字。
     """
-    cfg = cfg.normalized()
+    # 窗口的单位在这里落地：配置里是交易日，算的时候必须是根数。放在最外层
+    # 这一处 + `_window_resolved` 标记，`build_score` 已经换过的话这里不换第二遍
+    cfg = bind_window(cfg, df.index)
     # 去重但保序：同一个实例重复出现（配置手改过）不该算两遍
     seen: set[str] = set()
     inst: list[tuple[str, str, str]] = []      # (实例 id, 因子键, 周期)
@@ -1366,7 +1401,7 @@ def build_score(
     `base_period` 是策略本身的周期（见 `period_frames`）。不配跨周期因子时
     两个都不用传，走的就是原来那条单周期路径。
     """
-    cfg = cfg.normalized()
+    cfg = bind_window(cfg, df.index)
     keys = [str(k) for k in keys if F.is_factor(k)]
     if not keys:
         raise ValueError("没有选中任何可用因子")
@@ -1660,6 +1695,9 @@ def trigger_signal(df: pd.DataFrame, cfg: FactorConfig,
     返回 `(strength, armed, notes, rule_sig)`，都对齐到 `df.index`。
     """
     idx = df.index
+    # 触发强度是 `_rolling_z(raw, cfg.window)`，这里的 window 必须是**根数**。
+    # 调用方（`build_score` / 实盘）多数已经换过，`_window_resolved` 保证不换第二遍
+    cfg = bind_window(cfg, idx)
     strength = pd.Series(np.nan, index=idx, dtype=float)
     armed = pd.Series(False, index=idx)
     rule_sig = pd.Series(0.0, index=idx, dtype=float)
@@ -1830,6 +1868,50 @@ def _to_bars(days: int, bpd: float) -> int:
     的预测会不一样，净值每天都变。数据不够就老老实实不出信号。
     """
     return int(max(60, round(int(days) * bpd)))
+
+
+def window_bars(days, bpd: float) -> int:
+    """「标准化窗口（交易日）」→ bar 根数。
+
+    和 `_to_bars`（训练窗口 / 重训间隔）同一个换算，只有下限不同：标准化要的是
+    「够算出有意义的均值方差」，20 根就够（`min_periods` 还会再取 1/4），没必要
+    像训练窗口那样卡 60。
+
+    🔴 `bpd` 必须来自**这份数据自己的**密度（`bars_per_day`），不能写死 48：
+    日线是 1、小时线七八根、5 分钟 48~68（夜盘收盘晚的品种更多），周线上还是
+    **0.2**（一周五分之一根/天）。写死会让「252 个交易日」在周线上变成 252 周。
+    """
+    return int(max(20, round(float(days) * max(float(bpd or 0.0), 1e-9))))
+
+
+def bind_window(cfg: "FactorConfig", index) -> "FactorConfig":
+    """把 `cfg.window`（交易日）按这份数据的密度折成 bar 根数，返回**副本**。
+
+    配置层（界面 / 策略库）的单位是**交易日**：`window=252` 就是一年，换到 5
+    分钟图上自动变成 12,096 根，不用用户自己乘 48。真正参与计算的地方拿到的
+    必须是 bar 根数，所以统一在这里换一次。
+
+    **老存档照旧按根用**（`window_unit == "bar"`）：库里 778 条策略存的是
+    「252 × 每天根数」，1h 的 1764、30m 的 2822。当交易日读就变成七八年历史、
+    因子整条全空，而界面上只能看到「策略没信号」—— 一个数字都不许动。
+
+    **幂等**：换过之后打一个 `_window_resolved` 标记，`normalized()` 会带着它
+    复制。`build_score` → `factor_matrix` 这种嵌套调用不会换两遍（换两遍等于
+    把窗口乘成一个天文数字，而且不报错，表现是「因子全空」）。
+    """
+    if getattr(cfg, "_window_resolved", False):
+        return cfg
+    c = cfg.normalized()
+    if str(c.window_unit or "day") == "bar":
+        # 老口径：`window` 本来就是根数，原样用（`normalized()` 的 60 根下限
+        # 也和改口径之前一致）
+        c._window_resolved = True
+        return c
+    # 用**原始**的天数算，不能被 `normalized()` 里那道下限钳住 —— 那道钳位是
+    # 按天写的，60 天对 5 分钟图是 2880 根，两回事
+    c.window = window_bars(cfg.window, bars_per_day(index))
+    c._window_resolved = True
+    return c
 
 
 def walk_forward(
@@ -2068,7 +2150,9 @@ def run_factor_strategy(
 
     `extra` / `base_period` 给跨周期因子用（见 `period_frames`）。
     """
-    cfg = cfg.normalized()
+    # 顶层入口：窗口在这里折成根数（`build_score` / `trigger_hysteresis` 后面
+    # 都直接读 `cfg.window`，拿到手必须是根数）
+    cfg = bind_window(cfg, df.index)
     pack = build_score(df, mode, keys, cfg, progress=progress, cancel=cancel,
                        collect_models=collect_models,
                        extra=extra, base_period=base_period)
@@ -2148,7 +2232,12 @@ def pooled_score(
     返回 `{品种: ScorePack}`，触发模式下每个 pack 都带自己的 `trigger` 计划
     （决策点 / 强度 / 规则信号都是逐品种的，训练才是合并的）。
     """
-    cfg = cfg.normalized()
+    # 密度取**第一个有数据的品种**：同池里的品种是同一个周期，密度只差夜盘
+    # 收得早晚那几根（1h 上 7 和 8），不用逐品种各换一套 —— 那会让「同一个
+    # 窗口」在池子里变成几种长度，训练出来的模型没法解释
+    _idx = next((df.index for df in (frames or {}).values()
+                 if df is not None and len(df)), None)
+    cfg = bind_window(cfg, _idx) if _idx is not None else cfg.normalized()
     keys = [k for k in (keys or []) if F.is_factor(k)]
     if len(keys) < 2:
         raise ValueError("机器学习多因子至少需要 2 个因子")
@@ -2339,7 +2428,9 @@ def run_pooled_strategy(
 
     `extras` 是逐品种的跨周期行情（`{品种: {周期: 行情}}`），见 `period_frames`。
     """
-    cfg = cfg.normalized()
+    _idx = next((df.index for df in (frames or {}).values()
+                 if df is not None and len(df)), None)
+    cfg = bind_window(cfg, _idx) if _idx is not None else cfg.normalized()
     packs = pooled_score(frames, keys, cfg, progress=progress, cancel=cancel,
                          collect_models=collect_models,
                          extras=extras, base_period=base_period)
@@ -2499,6 +2590,9 @@ def outcome_report(df: pd.DataFrame, pack: ScorePack, cfg: FactorConfig) -> pd.D
     还都会算在基准周期上。
     """
     fwd = M.forward_return(df, cfg.horizon)
+    # IC 的统计窗口也是「交易日」口径，落到这里必须已经是根数（和 `score`
+    # 用的是同一个窗口，两处口径不同会让「IC 好但策略不赚」看着像矛盾）
+    cfg = bind_window(cfg, df.index)
     rows = []
     for c in pack.fmat.columns:
         base, _p = F.split_spec(c)

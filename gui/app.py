@@ -304,13 +304,14 @@ FAMILIES = [
 
 # 截面策略的两种玩法
 CROSS_MODES = [
-    ("hedge", "截面对冲", "多最强的 top X%、空最弱的 bottom X%，净敞口≈0"),
+    ("hedge", "截面对冲", "多最强的 top X%、空最弱的 bottom X%，多空合在一起分钱"),
     ("select", "截面选品种 + 时序交易",
      "池内每个品种各分一份钱，由自己的时序策略决定多空；截面分数只决定分多少钱"),
 ]
 
-# 截面策略「腿内怎么分钱」。**默认风险平价**：铜的日波动是玉米的两三倍，等权
-# 等于让铜一个人决定整条净值曲线；按波动率倒数分，每条腿承担的风险才拉得平
+# 截面策略「资金分配」（多空**合在一起**分）。**默认风险平价**：铜的日波动是
+# 玉米的两三倍，等权等于让铜一个人决定整条净值曲线；按波动率倒数分，各品种
+# 承担的风险才拉得平。2026-11-23 之前是「多空各 50%、腿内再分」，见 cross.py
 CROSS_WEIGHTS = [
     ("risk", "风险平价", "波动率越大分到的钱越少，让每条腿承担的风险差不多"),
     ("equal", "等权", "每一条腿分到同样的名义金额"),
@@ -411,12 +412,17 @@ SIZE_MODES = [
 
 # 因子策略的参数：名字 -> (标签, 最小, 最大, 步长, 默认值)
 FACTOR_PARAMS = {
-    # 上限 3000：`window` 是 **bar 根数**，扫描/注册端按「252 个交易日 × 每日根数」
-    # 折算，30m 上就是 2822（AU 30m 每天 19 根 → 4788）。原来卡在 500，载入库里
-    # 这些策略时滑块会把值静默钳到 500，再保存就把策略改掉了 —— 见 `_apply_factor_cfg`
-    # 里那道「超量程先撑量程」的补丁。
-    "window": ("标准化窗口（根）", 120, 3000, 20, 252),
-    "horizon": ("预测期数", 1, 20, 1, 5),
+    # 窗口的单位是**交易日**（3.9.12 起）：252 就是一年，5m 上自动折成一万
+    # 两千根，不用自己乘 48。换算在 `factor_strategy.bind_window` 里按数据的
+    # bar 密度做。
+    #
+    # 🔴 库里 778 条老策略存的是 **bar 根数**（1h 的 1764、30m 的 2822 = 252 ×
+    # 每天根数），载入时靠 `window_unit="bar"` 认出来、照旧按根用，标签也会换成
+    # 「（根・旧口径）」。老策略当交易日读会变成七八年窗口、因子整条全空。
+    "window": ("标准化窗口（交易日）", 20, 1000, 10, 252),
+    # 上限放到 100：预测期数就是前向收益的跨度，做周级调仓 / 月级品种轮动时
+    # 5 天不够用。下限仍是 1
+    "horizon": ("预测期数", 1, 100, 1, 5),
     # 下限 0.1：分数在 ±4 之间，0.1 大约是十分位，想「几乎一直有仓」时能设到。
     # 离场阈值会跟着压到它下面（见 _tie_exit_to_entry）
     "entry_z": ("进场阈值", 0.1, 3.0, 0.1, 1.0),
@@ -2015,7 +2021,7 @@ class MainWindow(QMainWindow):
         self.btn_cross_setup.setToolTip(
             "打开两步配置窗：左边第一步只筛品种（截面模式、第一步因子周期、\n"
             "筛池因子与筛池频率）；右边第二步选多空（因子模式 / 截面因子表 /\n"
-            "等权、因子参数、调仓频率、多空腿数、腿内分钱、时序腿）。\n"
+            "等权、因子参数、调仓频率、多空腿数、资金分配、时序腿）。\n"
             "截面对冲没有时序腿，右边就不显示那一块。"
         )
         self.btn_cross_setup.clicked.connect(self._open_cross_setup)
@@ -3034,7 +3040,7 @@ class MainWindow(QMainWindow):
         # ---- 因子参数（从第一步「借」过来的那一块，见 `_sync_family_panels`）
         #
         # 为什么放第二步：截面策略的「窗口 / 预测期数 / 标准化口径」不是「选哪些
-        # 品种」，而是「怎么把分数变成仓位」—— 和腿数、腿内分钱是一组。左边第一
+        # 品种」，而是「怎么把分数变成仓位」—— 和腿数、资金分配是一组。左边第一
         # 步已经有「截面因子」和「先筛品种池」两处选品种的设置，再堆一套参数只会
         # 让人以为它也管排名。用户 2026-11-23 指的就是这个。
         self.cross_fparam_host = QWidget()
@@ -3114,18 +3120,19 @@ class MainWindow(QMainWindow):
         self.sp_cross_bot.setSuffix(" %")
         self.sp_cross_bot.setToolTip(
             "空头腿：选截面分数最低的 bottom X%。\n"
-            "多空两边各自平分 50% 的名义额，所以腿数不同也不会产生净敞口。"
+            "多空**合在一起**按「资金分配」那一项分钱，所以腿数不同、两边的钱也\n"
+            "不必相等 —— 净敞口不再是 0。"
         )
         gleg.addWidget(self.sp_cross_bot)
         p2.addWidget(self.grp_legs)
 
-        # ---- 腿内分钱：两种模式都有（对冲是「多空两端各自怎么分」，
+        # ---- 资金分配：两种模式都有（对冲是「选中的多空品种合在一起怎么分」，
         #      选品种是「池内这几只怎么分」）
         self.grp_legweight = QWidget()
         gl = QVBoxLayout(self.grp_legweight)
         gl.setContentsMargins(0, 0, 0, 0)
         gl.setSpacing(8)
-        gl.addWidget(self._section("资金分配（腿内）"))
+        gl.addWidget(self._section("资金分配"))
         self.cb_cross_w = QComboBox()
         for key, label, tip in CROSS_WEIGHTS:
             self.cb_cross_w.addItem(label, key)
@@ -4554,12 +4561,12 @@ class MainWindow(QMainWindow):
             legs_s = max(1, int(round(n_pool * pct_s / 100.0)))
             text = (pool_note + f"每次调仓多最强的 {legs_l} 个、"
                     + ("只做多。" if self.cfg.long_only else f"空最弱的 {legs_s} 个。")
-                    + f"腿内按{self.cb_cross_w.currentText()}分配。")
+                    + f"多空合在一起按{self.cb_cross_w.currentText()}分钱（两边不必等值）。")
         else:
             text = (pool_note + f"池内 {n_pool} 个品种各分 1/{n_pool}，"
                     "由时序策略决定每个品种是多是空还是空仓。"
                     "没出信号的那几只，那部分钱留现金（不会加到别的品种上）。"
-                    f"腿内按{self.cb_cross_w.currentText()}分钱。"
+                    f"再按{self.cb_cross_w.currentText()}分钱。"
                     "\n截面是**一个**账户：权重每根都拉回目标，个别品种亏光不会"
                     "把组合亏穿。「多品种回测」是 N 个独立账户各 10 万再取平均，"
                     "个别品种亏光就少一份本金 —— 同样的品种、同样的时序策略，"
@@ -4621,12 +4628,14 @@ class MainWindow(QMainWindow):
             lines.append(f"名义敞口：×{lev:.1f}（{self.cb_size.currentText()}）")
         if mode == "select":
             leg = "规则" if self._timing_family() == "rule" else "因子"
-            lines.append(f"时序腿：{leg} · 腿内{self.cb_cross_w.currentText()}")
+            # 选品种模式没有多空两条腿：方向是逐品种的时序信号给的，钱分的是
+            # **整个池子**的 1.0，所以这里写「池内」
+            lines.append(f"时序腿：{leg} · 池内{self.cb_cross_w.currentText()}")
         else:
             # 腿数只对冲模式有，摘要里得带上 —— 它已经不在第一步面板里了
             lines.append(f"多 {self.sp_cross_pct.value():g}% / "
                          f"空 {self.sp_cross_bot.value():g}% · "
-                         f"腿内{self.cb_cross_w.currentText()}")
+                         f"资金{self.cb_cross_w.currentText()}（多空合并）")
         return "\n".join(lines)
 
     def _on_cross_mode_changed(self, *_a) -> None:
@@ -5081,6 +5090,9 @@ class MainWindow(QMainWindow):
         box.addWidget(row)
         widgets[pname] = sld
         scales[pname] = scale
+        # 标签挂在滑杆上（不用另开一张表）：`_apply_factor_cfg` 载入老策略时
+        # 要把「标准化窗口（交易日）」改成「（根・旧口径）」，得摸到这个 label
+        sld._label = lbl
 
     def _rebuild_params(self, spec) -> None:
         self._clear_param_box(self.param_box, self.param_widgets, self.param_scales)
@@ -5118,6 +5130,9 @@ class MainWindow(QMainWindow):
                 self.fparam_box, self.fparam_widgets, self.fparam_scales,
                 pname, label, lo, hi, step, default,
             )
+        # 重建会把标签换成 `FACTOR_PARAMS` 里那句默认文案，这里补一次：
+        # 载入的是老策略就得立刻显示「（根・旧）」，不能等下一次载入
+        self._sync_window_unit_label()
         self._tie_exit_to_entry()
         if "exit_z" in names:
             # 滑杆量程从 0 放开到 -2 之后，「负的离场阈值是什么意思」必须写出来：
@@ -5535,9 +5550,39 @@ class MainWindow(QMainWindow):
             self.tbl_fmulti.blockSignals(False)
         self._sync_single_period()
 
+    def _sync_window_unit_label(self) -> None:
+        """把「标准化窗口」那一行的单位写清楚：交易日 / 根（旧口径）。
+
+        两种口径差几十倍（1h 上 252 天 = 1764 根），标签写错等于让用户以为
+        自己在调一年窗口、实际在调七年 —— 而且数字看着完全合法。
+        """
+        sld = (getattr(self, "fparam_widgets", {}) or {}).get("window")
+        lbl = getattr(sld, "_label", None) if sld is not None else None
+        if lbl is None:
+            return
+        if str(getattr(self, "_fwin_unit", "day")) == "bar":
+            lbl.setText("标准化窗口（根・旧）")
+            lbl.setToolTip(
+                "这条策略是老口径：窗口单位是 **bar 根数**（当年按「252 × 每天\n"
+                "根数」算出来直接存下来的）。数值原样保留，一个数字都没动。\n\n"
+                "新建的策略按**交易日**：252 = 一年，换到分钟周期会自动折算。")
+        else:
+            lbl.setText("标准化窗口（交易日）")
+            lbl.setToolTip(
+                "单位是**交易日**。252 = 一年。\n"
+                "5 分钟图上会自动折成约一万两千根（同一段时间），不用自己乘 48。\n"
+                "这条窗口同时是标准化窗口和 IC 统计窗口。")
+
     def _apply_factor_cfg(self, cfg: dict) -> None:
         if not cfg:
             return
+        # 窗口单位先定：老存档里没有 `window_unit`，那批 window 存的是 **bar
+        # 根数**（库里 778 条策略，1h 的 1764、30m 的 2822 都是「252 × 每天
+        # 根数」）。当交易日显示的话，用户看到的「252」其实是一条七年窗口，
+        # 标签必须跟着说实话；保存时也照旧写回「根」，不动它的数字
+        unit = str(cfg.get("window_unit") or "bar").strip().lower()
+        self._fwin_unit = "bar" if unit == "bar" else "day"
+        self._sync_window_unit_label()
         for name, wdg in self.fparam_widgets.items():
             if name not in cfg:
                 continue
@@ -6028,6 +6073,10 @@ class MainWindow(QMainWindow):
         _ex = self.exit_cfg if self.family == FAMILY_FACTOR else {}
         return fstrat.FactorConfig(
             window=int(get("window", 252)),
+            # 单位跟着**载入的那条策略**走：老策略是「根」，改任何别的参数
+            # 都不该顺手把它换成交易日（那会把 252 根变成 252 天，窗口直接
+            # 放大几十倍，而且存下去就再也回不来了）
+            window_unit=str(getattr(self, "_fwin_unit", "day") or "day"),
             horizon=int(get("horizon", 5)),
             entry_z=float(get("entry_z", 1.0)),
             exit_z=float(get("exit_z", 0.3)),

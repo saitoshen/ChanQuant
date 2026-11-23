@@ -233,9 +233,19 @@ def factor_config(d: dict) -> fstrat.FactorConfig:
 
     过滤掉不认识的键：配置文件是跨版本存的，新版本删掉的字段留在 json 里
     会让 `FactorConfig(**d)` 直接 TypeError，而用户只是打开一个旧策略看看图。
+
+    🔴 **没有 `window_unit` 的一律当「根」处理**（`window_unit="bar"`）。
+    3.9.12 之前 window 存的是 bar 根数：库里有 778 条策略，1h 的 1764、
+    30m 的 2822，都是「252 个交易日 × 每天根数」算出来的。按交易日读的话
+    1h 上就变成 12348 根 ≈ 七年，`min_periods` 都凑不满 ⇒ 因子整条全空 ⇒
+    策略静默空仓，而界面上只能看到「没信号」，查不到根上。老配置照旧按根用，
+    一个数字都不动；新建的策略默认交易日。
     """
     known = fstrat.FactorConfig.__dataclass_fields__
-    return fstrat.FactorConfig(**{k: v for k, v in (d or {}).items() if k in known})
+    kw = {k: v for k, v in (d or {}).items() if k in known}
+    if "window_unit" not in kw:
+        kw["window_unit"] = "bar"
+    return fstrat.FactorConfig(**kw)
 
 
 def hold_text(bars: float, period: str, bars_per_year: float = 252.0) -> str:

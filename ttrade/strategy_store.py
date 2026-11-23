@@ -53,8 +53,8 @@ WS_FILE = "workspaces.json"
 # 一份显示状态就能把用户的交易配置写坏
 UI_FILE = "ui_state.json"
 
-# 截面策略「腿内怎么分钱」的中文名。策略库表格里要显示，界面下拉也用它，
-# 放一处免得两边慢慢走偏
+# 截面策略「资金分配」的中文名（多空合在一起分）。策略库表格里要显示，界面
+# 下拉也用它，放一处免得两边慢慢走偏
 _WEIGHT_CN = {"risk": "风险平价", "equal": "等权", "score": "按分数", "tier": "分档"}
 # 调仓间隔的单位，只用在参数摘要里（「调仓=5天」比「调仓=5」好读）
 _REB_UNIT_CN = {"bar": "根", "day": "天", "month": "月"}
@@ -490,7 +490,11 @@ class StrategyConfig:
                     bits.append("合训")
             return " ".join(bits)
         cfg = self.factor_cfg or {}
-        bits = [f"窗口={cfg.get('window', 252)}", f"阈值={cfg.get('entry_z', 1.0)}"]
+        # 窗口单位要写出来：老策略是根、新策略是交易日，光看数字「252」
+        # 两者差几十倍（1h 上 252 天 = 1764 根），摘要里不区分等于骗自己
+        _wu = "根" if str(cfg.get("window_unit") or "bar") == "bar" else "天"
+        bits = [f"窗口={cfg.get('window', 252)}{_wu}",
+                f"阈值={cfg.get('entry_z', 1.0)}"]
         # 离场阈值现在能取负，对持仓时长的影响不比窗口小：同样的进场阈值，
         # 0.3 和 -1.0 是两条策略（后者要反向坐实才平）。默认值不写，免得刷屏
         _xz = float(cfg.get("exit_z", 0.3) or 0.0)

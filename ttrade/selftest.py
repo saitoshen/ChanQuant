@@ -14700,6 +14700,190 @@ def _run() -> tuple[bool, list[str]]:
 
     check("监控设置：账户重读周期（默认 5 秒，改完立刻生效）", _monitor_cfg)
 
+    def _window_unit():
+        """标准化窗口按交易日 + 老存档按根 + 预测期数放到 100。"""
+        import inspect
+
+        import pandas as pd
+
+        from ttrade import factor_strategy as FS
+        from ttrade import replay as RP
+
+        # ---- ① 交易日 → 根数，按**这份数据自己的**密度
+        idx_d = pd.date_range("2024-01-01", periods=400, freq="B")
+        idx_h = pd.date_range("2024-01-01", periods=400, freq="h")
+        assert FS.bars_per_day(idx_d) == 1.0, "日线的密度不是 1"
+        bpd_h = FS.bars_per_day(idx_h)
+        assert bpd_h > 1.0, f"小时线的密度算成 {bpd_h}，等于没折"
+        assert FS.window_bars(252, 1.0) == 252, "日线 252 天应当还是 252 根"
+        assert FS.window_bars(252, 7.0) == 1764, "252 天 × 每天 7 根 ≠ 1764"
+        # 下限 20 根：0 / 负数不能让 `rolling(0)` 抛异常
+        assert FS.window_bars(0, 1.0) == 20 and FS.window_bars(-5, 1.0) == 20
+
+        c = FS.bind_window(FS.FactorConfig(window=252), idx_h)
+        assert c.window == FS.window_bars(252, bpd_h), \
+            f"小时线上 252 天没折成根数（实际 {c.window}）"
+        assert c.window > 252, "小时线上窗口还是 252 根 ⇒ 折算是假的"
+        assert c._window_resolved is True
+
+        # 幂等：嵌套调用（build_score → factor_matrix）不许换两遍
+        assert FS.bind_window(c, idx_h).window == c.window, "折了两遍，窗口翻倍"
+        assert FS.bind_window(c.normalized(), idx_h).window == c.window, \
+            "过了 `normalized()` 又折了一遍"
+        # 日线不动：252 天 = 252 根，老基线（所有历史 IC 锚点）不许移位
+        assert FS.bind_window(FS.FactorConfig(window=252), idx_d).window == 252
+
+        # ---- ② 老存档按根：window 原样，一个数字都不动
+        old = RP.factor_config({"window": 1764, "entry_z": 1.0})
+        assert old.window_unit == "bar", \
+            f"老配置（没有 window_unit）被当成 {old.window_unit} 了"
+        assert FS.bind_window(old, idx_h).window == 1764, (
+            "老策略的 1764 根被按交易日折了 —— 1h 上会变成七年窗口、因子整条全空")
+        new = RP.factor_config({"window": 252, "window_unit": "day"})
+        assert new.window_unit == "day"
+        assert FS.bind_window(new, idx_h).window == FS.window_bars(252, bpd_h)
+        # 两种口径的窗口下限各不相同，谁都不许被另一条顶掉
+        assert FS.FactorConfig(window=30, window_unit="bar").normalized().window == 60
+        assert FS.FactorConfig(window=5).normalized().window == 20
+        # 单位写错一个词 ⇒ 归一到交易日，不许静默按根跑
+        assert FS.FactorConfig(window_unit="days").normalized().window_unit == "day"
+
+        # ---- ③ 预测期数上限 100
+        assert FS.FactorConfig(horizon=100).normalized().horizon == 100, \
+            "预测期数被钳回去了"
+        from gui import app as GA
+
+        _lb, _lo, _hi, _st, _df = GA.FACTOR_PARAMS["horizon"]
+        assert _hi == 100 and _df == 5, f"预测期数滑杆上限还是 {_hi}"
+        _lb, _lo, _hi, _st, _df = GA.FACTOR_PARAMS["window"]
+        assert "交易日" in _lb and (_lo, _hi, _df) == (20, 1000, 252), \
+            f"窗口滑杆没改成交易日口径：{_lb} {_lo}~{_hi} 默认 {_df}"
+
+        # 模型摘要必须带单位：老 252 根和新 252 天不是同一个窗口
+        from ttrade import ml_artifact as MA
+
+        assert MA._cfg_digest(FS.FactorConfig(window=252)).get("window_unit") == "day"
+        assert MA._cfg_digest(
+            FS.FactorConfig(window=252, window_unit="bar")).get("window_unit") == "bar"
+
+        # ---- ④ 界面：标签跟着单位变，保存时把单位写回去
+        class _Lbl:
+            def __init__(self):
+                self.text = ""
+                self.tip = ""
+
+            def setText(self, t):
+                self.text = t
+
+            def setToolTip(self, t):
+                self.tip = t
+
+        class _Sld:
+            def __init__(self):
+                self._label = _Lbl()
+                self._v = 252
+
+            def maximum(self):
+                return 1000
+
+            def setMaximum(self, v):
+                pass
+
+            def setValue(self, v):
+                self._v = int(v)
+
+            def value(self):
+                return self._v
+
+        stub = GA.MainWindow.__new__(GA.MainWindow)
+        stub.fparam_widgets = {"window": _Sld()}
+        stub.fparam_scales = {"window": 1}
+        # 这三处 `_apply_factor_cfg` 会直接读（不是 `hasattr` 兜的），给 None 就跳过；
+        # 另外两处「同步」在这个精简桩上没有意义，挡掉
+        stub.cb_fmodel = stub.cb_forient = stub.cb_filter_when = None
+        stub._sync_trigger_src = lambda: None
+        stub._sync_exit_summary = lambda: None
+
+        stub._apply_factor_cfg({"window": 1764})
+        assert stub._fwin_unit == "bar", "老配置（无 window_unit）没认成「根」"
+        assert "根" in stub.fparam_widgets["window"]._label.text, \
+            f"老口径的标签没说实话：{stub.fparam_widgets['window']._label.text}"
+        assert stub.fparam_widgets["window"]._v == 1764, "载入老配置把窗口改掉了"
+
+        stub._apply_factor_cfg({"window": 252, "window_unit": "day"})
+        assert stub._fwin_unit == "day"
+        assert "交易日" in stub.fparam_widgets["window"]._label.text, \
+            "新口径的标签没写「交易日」"
+        # 保存时必须把当前单位写回去，否则载入一次就悄悄换成另一种含义
+        assert "window_unit=" in inspect.getsource(GA.MainWindow._factor_cfg), \
+            "`_factor_cfg()` 没把 window_unit 写进配置"
+        # 重建参数面板后标签要重新同步（否则载入老策略后切一下模式就变回「交易日」）
+        assert "_sync_window_unit_label()" in inspect.getsource(
+            GA.MainWindow._rebuild_fparams), "重建参数面板后没同步窗口单位标签"
+
+        # ---- ⑤ 截面资金分配：多空合在一起分
+        from ttrade.cross import CrossConfig, _hedge_weights
+
+        idx = pd.date_range("2024-01-01", periods=3, freq="B")
+        cols = ["A_SHFE", "B_SHFE", "C_SHFE", "D_DCE", "E_DCE", "F_CZCE"]
+        # 一次调仓、强弱分明：多头 A/B，空头 F
+        score = pd.DataFrame([[3.0, 2.0, 1.0, 0.0, -0.5, -1.0]] * 3,
+                             index=idx, columns=cols)
+        cfg = CrossConfig(top_pct=40.0, bot_pct=20.0, weight="equal")
+        w = _hedge_weights(score, cfg, step=1)
+        row = w.iloc[0]
+        longs, shorts = row[row > 0], row[row < 0]
+        assert len(longs) == 2 and len(shorts) == 1, \
+            f"腿数不对：多 {len(longs)} 空 {len(shorts)}"
+        assert abs(row.abs().sum() - 1.0) < 1e-9, \
+            f"合并后 Σ|w| 应当还是 1（×杠杆），实际 {row.abs().sum()}"
+        # 🔴 关键：两边**不必等值**（老口径是多头合计 0.5 / 空头合计 −0.5）
+        assert abs(longs.sum() - 2.0 / 3.0) < 1e-9, f"多头合计 {longs.sum()}"
+        assert abs(shorts.sum() + 1.0 / 3.0) < 1e-9, f"空头合计 {shorts.sum()}"
+        assert abs(longs.sum() + shorts.sum()) > 0.1, "净敞口又被钉回 0 了"
+
+        # 按分数加权：w ∝ |分数|（3:2:1 ⇒ 0.5 / 1/3 / −1/6）
+        w2 = _hedge_weights(score, CrossConfig(top_pct=40.0, bot_pct=20.0,
+                                              weight="score"), step=1).iloc[0]
+        assert abs(w2["A_SHFE"] - 0.5) < 1e-9 and abs(w2["F_CZCE"] + 1.0 / 6.0) < 1e-9, \
+            f"按分数分钱不对：{dict(w2.round(4))}"
+        assert abs(w2.abs().sum() - 1.0) < 1e-9
+
+        # 分档：按 |分数| 排**同一个队列**，空头最弱那只进第一档
+        # （3 个选中 / 3 档 ⇒ 每档一只，份数 4:2:1）
+        w3 = _hedge_weights(score, CrossConfig(top_pct=40.0, bot_pct=20.0,
+                                              weight="tier", tiers=3),
+                            step=1).iloc[0]
+        assert abs(w3.abs().sum() - 1.0) < 1e-9, "分档之后 Σ|w| 不等于 1"
+        assert abs(w3["A_SHFE"]) > abs(w3["B_SHFE"]) > abs(w3["F_CZCE"]), \
+            f"分档没按 |分数| 排（应当是 A > B > F）：{dict(w3.round(4))}"
+        assert abs(abs(w3["A_SHFE"]) - 4.0 / 7.0) < 1e-9, \
+            f"第一档没拿 4/7：{abs(w3['A_SHFE']):.4f}"
+        # 风险平价：波动越小给越多（这里只验 Σ|w| 和方向）
+        vol = pd.DataFrame([[0.1, 0.2, 0.2, 0.2, 0.2, 0.4]] * 3,
+                           index=idx, columns=cols)
+        w4 = _hedge_weights(score, CrossConfig(top_pct=40.0, bot_pct=20.0,
+                                               weight="risk"), vol=vol, step=1).iloc[0]
+        assert abs(w4.abs().sum() - 1.0) < 1e-9
+        assert w4["A_SHFE"] > w4["B_SHFE"] > 0 > w4["F_CZCE"], \
+            f"风险平价没按 1/σ 分：{dict(w4.round(4))}"
+
+        # 界面上不许再写「腿内」
+        hint_src = inspect.getsource(GA.MainWindow._sync_cross_controls)
+        for fn in (GA.MainWindow._sync_cross_controls, GA.MainWindow._cross_summary):
+            assert "腿内" not in inspect.getsource(fn), \
+                f"{fn.__name__} 里还留着「腿内」的说法"
+        assert "合在一起" in hint_src, "对冲模式的提示没写「多空合在一起分钱」"
+
+        return ("窗口=交易日（日线 252→252 根、1h 252→按密度折，幂等不翻倍）；"
+                "老存档 window_unit 缺失 ⇒ 按根、1764 原样不动、下限 60 根；"
+                "预测期数上限 100、窗口滑杆 20~1000 默认 252；"
+                "标签按单位写「交易日 / 根・旧」且重建后仍同步；"
+                "截面 Σ|w|=1 但多空各自合计不必相等（2/3 vs −1/3），"
+                "等权/分数/分档|分数|/风险平价四种都在合并队列上分")
+
+    check("标准化窗口按交易日（老存档按根）+ 预测期数 100 + 资金分配合并", _window_unit)
+
     # 跑完就把进度文件收掉：留着会让下一轮的诊断以为"上次崩过"。
     # 崩溃时走不到这里，文件正好留下最后一项的名字。
     if _prog is not None:
