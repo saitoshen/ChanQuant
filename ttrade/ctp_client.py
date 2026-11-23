@@ -32,6 +32,7 @@ manylinux x86_64；macOS 最后一份带轮子的是 **6.7.0.9**（cp314 的
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import threading
@@ -290,6 +291,10 @@ class CtpError(RuntimeError):
 
 # ------------------------------------------------------------------ 通道
 
+#: 懒建 `_api_lock` 的时候用（见 `_ChannelApi._guard`）。只保护「造那把锁」这一下
+_GUARD_LOCK = threading.Lock()
+
+
 class _ChannelApi:
     """按 `self.cfg.channel` 拿**自己那套** CTP 模块（实例级，不是模块全局）。
 
@@ -308,6 +313,62 @@ class _ChannelApi:
     cfg = None              # 由子类在 `__init__` 里设
     _md_api = None
     _td_api = None
+    _api_lock = None        # 由子类在 `__init__` 里建（`RLock`）
+
+    def _guard(self) -> threading.RLock:
+        """那把「句柄 + Release」的锁。**懒建**，缺了就补。
+
+        为什么要懒建：自检里大量用 `TraderClient.__new__(TraderClient)` 造精简
+        桩，再直接 `r.api = object()` 去试查询路径 —— 那些桩没跑过 `__init__`，
+        `_api_lock` 是类上的 `None`。`with None:` 抛的是 `TypeError`，会把
+        「查询被流控丢掉」这类断言带偏成「测试框架坏了」。
+        """
+        lk = getattr(self, "_api_lock", None)
+        if lk is not None:
+            return lk
+        with _GUARD_LOCK:               # 两个线程同时进来要拿到**同一把**
+            lk = getattr(self, "_api_lock", None)
+            if lk is None:
+                lk = threading.RLock()
+                self._api_lock = lk
+        return lk
+
+    def _send(self, what: str, fn, quiet: bool = False):
+        """取句柄 + 发请求，**做成一个原子动作**。行情 / 交易共用这一份。
+
+        为什么必须有这一层（2026-11-23 21:09 / 20:32 两次 `0xc0000005`，错误
+        模块都是 `openctp_ctp.libs\\thosttraderapi_se-….dll`）：原来每个调用点
+        都是
+
+            if self.api is None: return
+            n = self.api.Req*Xxx(...)
+
+        两步走。`stop()` 恰好挤在两步之间时，`Release()` 已经把 C++ 对象回收，
+        第二句接着拿那个**悬空指针**调进去 —— 这是原生访问违例，Python 层拦
+        不到，进程直接没了（`exit=139` / `0xc0000005`）。中间态还有别的样子：
+        `Release()` 正在退出工作线程，`Req*` 返回 `-1 交易核心未初始化`（融航
+        日志里那一串全是它）。
+
+        现在「读 `self.api`」和「用它」在同一把 `RLock` 里，`stop()` 换掉句柄
+        也要这把锁，于是「刚看到句柄就被回收」这个时间窗不存在了。
+
+        `quiet=True`：没连接时直接回 `None`，不抛 —— 查询路径本来就是「发不出去
+        就下一轮再发」，不该在 0.4 秒一次的主循环里抛异常。返回 `None` 和返回
+        `-1` 是两件事：`-1` 是 CTP 说的「网络连接失败」，而 `-1` 若也当「已关闭」
+        处理，就会把「柜台真拒了」误吞成「不用管」。报单 / 撤单必须是
+        `quiet=False`，它们要的就是「没发出去就得让调用方知道」。
+
+        🔴 **`Release()` 不能在持锁时调用**：CTP 的 `Release()` 会等自己的工作
+        线程退出，而那条线程上的回调这时候正想拿这把锁 ⇒ 互相等死。所以
+        `stop()` 的做法是「锁内摘句柄、锁外 Release」，两边都不越界。
+        """
+        with self._guard():
+            api = self.api
+            if api is None:
+                if quiet:
+                    return None
+                raise CtpError(f"{what}没发出去：会话已经关闭")
+            return int(fn(api) or 0)
 
     def _channel(self) -> tuple:
         """(mdapi, tdapi)。同一个客户端只取一次。"""
@@ -346,25 +407,34 @@ class MdClient(_ChannelApi):
         self.ticks: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._spi = None
+        # 和交易侧同一套（见 `_ChannelApi._send`）：行情也会「订阅 / 登录请求」
+        # 和 `stop()` 撞在同一毫秒。`send()` 与 `Release()` 共用这把锁
+        self._api_lock = threading.RLock()
 
     # ---- 生命周期 ----
 
     def start(self, instruments=()) -> None:
         if not bind_channel(getattr(self.cfg, "channel", "ctp") or "ctp"):
             raise CtpError(f"用不了 CTP 行情（{CTP_IMPORT_ERROR}）")
+        if self.api is not None:            # 同上：重复 start 先把老的 Release 掉
+            self.stop()
         spi = self._make_spi()
         self._spi = spi
-        flow = os.path.join(_flow_dir(), f"md_{int(time.time())}")
-        api = self._md.CThostFtdcMdApi.CreateFtdcMdApi(flow)
-        api.RegisterFront(self.cfg.md_front)
-        api.RegisterSpi(spi)
-        api.Init()
-        self.api = api
-        self._instruments = list(instruments)
+        flow = _new_flow_dir("md")
+        # 建 → Init → 挂句柄整段持锁，理由同 `TraderClient.start()`
+        with self._guard():
+            api = self._md.CThostFtdcMdApi.CreateFtdcMdApi(flow)
+            api.RegisterFront(self.cfg.md_front)
+            api.RegisterSpi(spi)
+            api.Init()
+            self.api = api
+            self._instruments = list(instruments)
 
     def stop(self) -> None:
-        api, self.api = self.api, None
-        self.ready.clear()
+        # 锁内摘句柄、锁外 Release，理由见 `_ChannelApi._send`
+        with self._guard():
+            api, self.api = self.api, None
+            self.ready.clear()
         if api is not None:
             _release_api(api)
 
@@ -393,7 +463,7 @@ class MdClient(_ChannelApi):
                     req.BrokerID = outer.cfg.broker_id
                     req.UserID = outer.cfg.user_id
                     req.Password = outer.cfg.password
-                    outer.api.ReqUserLogin(req, 1)
+                    outer._send("行情登录", lambda a: a.ReqUserLogin(req, 1))
                 except Exception as exc:  # noqa: BLE001
                     outer.last_error = f"行情登录请求失败：{exc}"
 
@@ -458,7 +528,8 @@ class MdClient(_ChannelApi):
             return
         items = [i.encode("utf-8") for i in instruments]
         try:
-            self.api.SubscribeMarketData(items, len(items))
+            self._send("订阅", lambda a: a.SubscribeMarketData(items, len(items)),
+                       quiet=True)
         except Exception as exc:  # noqa: BLE001
             self.last_error = f"订阅异常：{exc}"
 
@@ -476,6 +547,28 @@ def _flow_dir() -> str:
     from ttrade.paths import cache_dir
 
     d = os.path.join(cache_dir(), "ctp_flow")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+#: 每条会话一个独立流目录的序号（同一毫秒里连开两条也不会撞）
+_FLOW_SEQ = itertools.count(1)
+
+
+def _new_flow_dir(kind: str) -> str:
+    """给一条新会话造一个**唯一**的流目录。
+
+    🔴 这里原来写的是 `f"td_{int(time.time())}"` —— **秒级**。而「启动全部」
+    是把所有账户并行连的（融航 + CTP 几个户几乎同一秒），两条会话于是拿到
+    同一个目录，两个 `CThostFtdcTraderApi` 往同一组 `td_*.con / *.dat` 里写，
+    CTP 内部状态互相踩 ⇒ `0xc0000005`（2026-11-23 21:09 事件日志里那条
+    `openctp_ctp.libs\thosttraderapi_se-….dll` 就是它）。
+
+    CTP 自己不会检查目录是否被占用，撞了也不报错，只是偶尔崩一下 —— 所以只能
+    在造目录这一步保证唯一：秒级时间 + 进程内自增序号 + pid。
+    """
+    d = os.path.join(_flow_dir(),
+                     f"{kind}_{os.getpid()}_{int(time.time())}_{next(_FLOW_SEQ)}")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -607,6 +700,12 @@ class TraderClient(_ChannelApi):
         #   另一笔单上 —— 表现是「下单成功、成交记在别人头上」。
         self._req_lock = threading.Lock()
         self._ord_lock = threading.Lock()
+        # 🔴 所有 `Req*` 和 `Release()` 共用这把锁。
+        # 原来每个调用点都是「`if self.api is None: return` + `self.api.Req*Xxx()`」
+        # 两步走：`stop()` 恰好挤在两步之间时，api 已经被 Release，Req 返回
+        # `-1 交易核心未初始化`（融航日志里那一串就是这个），更糟的是继续拿那个
+        # 指针调进去 ⇒ 0xc0000005。锁把「看句柄」和「用它」变成一个原子动作。
+        self._api_lock = threading.RLock()
         self._order_ref = int(time.time()) % 100000
         self._spi = None
 
@@ -615,22 +714,39 @@ class TraderClient(_ChannelApi):
     def start(self) -> None:
         if not bind_channel(getattr(self.cfg, "channel", "ctp") or "ctp"):
             raise CtpError(f"用不了 CTP 交易（{CTP_IMPORT_ERROR}）")
+        # 已经在跑就先收掉。否则同一个账户会有两条 TCP 会话同时登着，柜台按后
+        # 登的为准 —— 先登那条从此一条回报都收不到，而下单可能走的是它。
+        # 老客户端被丢弃不 Release 的话，C++ 那边的回调线程还活着，越积越多。
+        if self.api is not None:
+            self.stop()
         spi = self._make_spi()
         self._spi = spi
-        flow = os.path.join(_flow_dir(), f"td_{int(time.time())}")
-        api = self._td.CThostFtdcTraderApi.CreateFtdcTraderApi(flow)
-        api.RegisterFront(self.cfg.td_front)
-        api.RegisterSpi(spi)
-        # 私有流用 QUICK：成交 / 委托回报尽快到，实盘下单后等一秒就能看到状态
-        api.SubscribePrivateTopic(self._td.THOST_TERT_QUICK)
-        api.SubscribePublicTopic(self._td.THOST_TERT_QUICK)
-        api.Init()
-        self.api = api
+        flow = _new_flow_dir("td")
+        # 🔴 建 → Init → 挂句柄，整段必须在锁里。`Init()` 是异步的：它一返回
+        # 就可能已经连上前置，`OnFrontConnected` 在另一条线程上跑，而那个回调
+        # 要 `self.api.ReqAuthenticate(...)`。不持锁的话这儿有个真实的空窗：
+        # 回调先到 ⇒ `self.api` 还是 None ⇒ `None.ReqAuthenticate` /
+        # `AttributeError` 被 SPI 自己的 except 吞成「认证请求失败」。
+        with self._guard():
+            api = self._td.CThostFtdcTraderApi.CreateFtdcTraderApi(flow)
+            api.RegisterFront(self.cfg.td_front)
+            api.RegisterSpi(spi)
+            # 私有流用 QUICK：成交 / 委托回报尽快到，实盘下单后等一秒就能看到状态
+            api.SubscribePrivateTopic(self._td.THOST_TERT_QUICK)
+            api.SubscribePublicTopic(self._td.THOST_TERT_QUICK)
+            api.Init()
+            self.api = api
 
     def stop(self) -> None:
-        api, self.api = self.api, None
-        for ev in (self.connected, self.logged_in, self.settled):
-            ev.clear()
+        # 🔴 锁内只做「摘句柄」，`_release_api` 必须放到锁外：
+        # `Release()` 会等 CTP 自己的工作线程退出，而那条线程上的回调此刻可能
+        # 正阻塞在这把锁上（它也要发 `Req*`）⇒ 持锁 Release 就是死锁。
+        # 这个顺序同时也保证了「不会有新的 `Req*` 在 Release 之后进 C++」：
+        # 句柄一置空，`_send()` 就再也拿不到它了。
+        with self._guard():
+            api, self.api = self.api, None
+            for ev in (self.connected, self.logged_in, self.settled):
+                ev.clear()
         if api is not None:
             _release_api(api)
 
@@ -676,7 +792,14 @@ class TraderClient(_ChannelApi):
             req = self._td.CThostFtdcSettlementInfoConfirmField()
             req.BrokerID = self.cfg.broker_id
             req.InvestorID = self.cfg.user_id
-            self.api.ReqSettlementInfoConfirm(req, self._next_req())
+            # 走 `_send`：这条也在 SPI 回调链上（`OnRspUserLogin` → 这里），
+            # 而回调线程不归我们管，句柄随时可能被 `stop()` 收走
+            n = self._send("结算确认",
+                           lambda a: a.ReqSettlementInfoConfirm(req, self._next_req()),
+                           quiet=True)
+            if n:
+                self.last_error = f"结算确认没发出去：{_req_why(n)}"
+                return False
         except Exception as exc:  # noqa: BLE001
             self.last_error = f"结算确认请求失败：{exc}"
             return False
@@ -796,7 +919,8 @@ class TraderClient(_ChannelApi):
         # 🔴 返回值必须看（2026-11-23 融航那四笔）：`ReqOrderInsert` 返回非 0
         # 意味着柜台**根本没受理**，之后不会有任何委托回报 —— 而调用方以为
         # 发出去了，在途列表里挂 30 秒「ALIVE」再撤掉，委托框里一笔都没有。
-        n = self.api.ReqOrderInsert(req, self._next_req())
+        # 走 `_send`：句柄为 None 时抛（报单不能静默丢弃），有句柄则原子发出。
+        n = self._send("报单", lambda a: a.ReqOrderInsert(req, self._next_req()))
         if n:
             raise CtpError("报单没发出去：" + _req_why(n))
         return ref
@@ -820,7 +944,7 @@ class TraderClient(_ChannelApi):
             req.SessionID = self.session_id
         # 同样要看返回值：非 0 表示撤单请求没有受理，那笔单**还在交易所挂着**。
         # 以前静默丢掉，界面却按「已撤」处理了。
-        n = self.api.ReqOrderAction(req, self._next_req())
+        n = self._send("撤单", lambda a: a.ReqOrderAction(req, self._next_req()))
         if n:
             raise CtpError("撤单没发出去：" + _req_why(n))
 
@@ -851,10 +975,13 @@ class TraderClient(_ChannelApi):
 
     def query_account(self) -> None:
         """查资金。**要看返回值** —— 非 0 表示柜台根本没受理（见 `_qry_note`）。"""
-        if self.api is None:
+        n = self._send("资金",
+                       lambda a: a.ReqQryTradingAccount(
+                           self._td.CThostFtdcQryTradingAccountField(),
+                           self._next_req()),
+                       quiet=True)
+        if n is None:                   # 会话已经关了，不是「被流控」
             return
-        n = self.api.ReqQryTradingAccount(self._td.CThostFtdcQryTradingAccountField(),
-                                         self._next_req())
         self._qry_note("资金", n)
 
     def query_positions(self) -> None:
@@ -864,8 +991,6 @@ class TraderClient(_ChannelApi):
         每查一次就把上一轮的浮盈 / 保证金再叠一遍。界面 2 秒刷一轮，跑一小时
         浮盈就放大成千上万倍（用户看到「多了几个 0」，而且收盘后还在涨）。
         """
-        if self.api is None:
-            return
         req = self._td.CThostFtdcQryInvestorPositionField()
         req.BrokerID = self.cfg.broker_id
         req.InvestorID = self.cfg.user_id
@@ -877,7 +1002,15 @@ class TraderClient(_ChannelApi):
                 self._pos_dropped += 1
                 self._pos_stage = None
             self._pos_req = rid
-        self._qry_note("持仓", self.api.ReqQryInvestorPosition(req, rid))
+        n = self._send("持仓", lambda a: a.ReqQryInvestorPosition(req, rid), quiet=True)
+        if n is None:
+            # 会话已关：刚占上的这一轮不会再有回包，就地收掉，否则 `pos_partial`
+            # 永远为真、「有开头没结尾的轮数」白涨一次
+            with self._lock:
+                if self._pos_req == rid:
+                    self._pos_stage = None
+            return
+        self._qry_note("持仓", n)
 
     def query_orders(self) -> None:
         """查**当日全部委托**（历史补全）。🔴 登录后必须查一次。
@@ -891,12 +1024,13 @@ class TraderClient(_ChannelApi):
         副作用是好的：`_sweep_orders()`（启动时撤掉自己留下的挂单）终于能
         看见上一次进程留下的单子，不再是空跑一遍。
         """
-        if self.api is None:
-            return
         req = self._td.CThostFtdcQryOrderField()
         req.BrokerID = self.cfg.broker_id
         req.InvestorID = self.cfg.user_id
-        self._qry_note("委托", self.api.ReqQryOrder(req, self._next_req()))
+        n = self._send("委托", lambda a: a.ReqQryOrder(req, self._next_req()), quiet=True)
+        if n is None:
+            return
+        self._qry_note("委托", n)
 
     def query_trades(self) -> None:
         """查**当日全部成交**（历史补全）。理由同 `query_orders()`。
@@ -909,7 +1043,10 @@ class TraderClient(_ChannelApi):
         req = self._td.CThostFtdcQryTradeField()
         req.BrokerID = self.cfg.broker_id
         req.InvestorID = self.cfg.user_id
-        self._qry_note("成交", self.api.ReqQryTrade(req, self._next_req()))
+        n = self._send("成交", lambda a: a.ReqQryTrade(req, self._next_req()), quiet=True)
+        if n is None:
+            return
+        self._qry_note("成交", n)
 
     def query_instruments(self, instrument: str = "") -> None:
         """查合约表。传 `instrument` 就只查那一个（秒回），不传就查全量。
@@ -926,7 +1063,7 @@ class TraderClient(_ChannelApi):
             req.InstrumentID = instrument
         else:
             self.instruments_done.clear()
-        self.api.ReqQryInstrument(req, self._next_req())
+        self._send("合约", lambda a: a.ReqQryInstrument(req, self._next_req()), quiet=True)
 
     # ---- 读 ----
 
@@ -1030,7 +1167,10 @@ class TraderClient(_ChannelApi):
                     req.UserID = outer.cfg.user_id
                     req.AppID = outer.cfg.app_id
                     req.AuthCode = outer.cfg.auth_code
-                    outer.api.ReqAuthenticate(req, outer._next_req())
+                    # 走 `outer._send`：回调线程上直接摸 `outer.api` 有两条路会踩空
+                    # —— `start()` 还没把句柄挂上（Init 是异步的），或者 `stop()`
+                    # 已经把它收走（这正是 #202「融航认证请求失败」之外的另一半）
+                    outer._send("认证", lambda a: a.ReqAuthenticate(req, outer._next_req()))
                 except Exception as exc:  # noqa: BLE001
                     outer.last_error = f"认证请求失败：{exc}"
 
@@ -1050,7 +1190,7 @@ class TraderClient(_ChannelApi):
                     req.BrokerID = outer.cfg.broker_id
                     req.UserID = outer.cfg.user_id
                     req.Password = outer.cfg.password
-                    outer.api.ReqUserLogin(req, outer._next_req())
+                    outer._send("登录", lambda a: a.ReqUserLogin(req, outer._next_req()))
                 except Exception as exc:  # noqa: BLE001
                     outer.last_error = f"登录请求失败：{exc}"
 

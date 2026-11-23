@@ -14243,6 +14243,141 @@ def _run() -> tuple[bool, list[str]]:
 
     check("登录失败后不反复 Release+Init（融航段错误）", _hub_fail_cooldown)
 
+    def _no_dangling_api() -> str:
+        """会话收掉之后，任何 `Req*` 都不许再碰 C++（2026-11-23 两次 0xc0000005）。
+
+        现场：事件日志 20:32:57 与 21:09:26 两条一模一样 —— `pythonw.exe`、
+        错误模块 `openctp_ctp.libs\\thosttraderapi_se-….dll`、`0xc0000005`、
+        偏移量都是 `0x25d9e0`。崩溃前日志一切正常（全是 `[ALIGN]` / `[ORD]`
+        下单），融航那边整天在刷 `[-1] 交易核心未初始化`。
+
+        两个真根因，都在「句柄的生命周期」上：
+
+        1. **流目录撞车**。`_flow_dir` 原来是 `td_{int(time.time())}` —— 秒级。
+           而「启动全部」是把账户**并行**连的（融航 + CTP 几个户同一秒），两条
+           `CThostFtdcTraderApi` 于是落在同一个目录，往同一组 `td_*.con` 里写。
+        2. **`Req*` 与 `Release()` 之间没有锁**。每个调用点都是「先看一眼
+           `self.api is None`、再用它发」两步，`stop()` 挤在中间就是拿悬空指针
+           调进 C++ —— 这是访问违例，Python 层拦不到，进程直接没了。
+
+        钉住四条：流目录唯一；关掉之后报单要**抛**、查询要**静默**；
+        `Release()` 必须在**锁外**调用（持锁 Release 会和回调线程互等死锁）；
+        `start()` 重复调用要先把老会话收掉。
+        """
+        import inspect as _ins
+        import os as _os
+        import threading as _th
+
+        from ttrade import ctp_client as CC
+
+        # ① 同一秒里连开两条也不许撞目录
+        a = CC._new_flow_dir("td")
+        b = CC._new_flow_dir("td")
+        if a == b:
+            raise RuntimeError(f"两个会话拿到同一个流目录（{a}）—— 必崩")
+        for d in (a, b):
+            if not _os.path.isdir(d):
+                raise RuntimeError(f"流目录没建出来：{d}")
+
+        # ② 句柄为 None：报单 / 撤单必须抛（调用方要知道没发出去），查询不许抛
+        t = CC.TraderClient.__new__(CC.TraderClient)     # `__new__`：不碰 dll
+        t.api = None
+        t._api_lock = _th.RLock()
+        if t._send("查询", lambda ap: 0, quiet=True) is not None:
+            raise RuntimeError("会话已关，查询路径还在往下走（应该返回 None）")
+        try:
+            t._send("报单", lambda ap: 0)
+        except CC.CtpError:
+            pass
+        else:
+            raise RuntimeError("会话已关，报单路径没报错 —— 调用方会以为单子发出去了")
+
+        # ③ `stop()`：锁内摘句柄、**锁外** Release
+        holder = {}
+
+        class _Api:
+            def __init__(self):
+                self.released = 0
+                self.lock_free = False
+
+            def RegisterSpi(self, _spi):
+                pass
+
+            def Release(self):
+                self.released += 1
+                # 这条最关键：Release 时锁必须是空的。CTP 的 `Release()` 会等
+                # 自己的回调线程退出，而那条线程上的回调也要这把锁 ⇒ 持锁
+                # `Release()` 就是互等，界面直接卡死（比崩溃更难查）
+                cli = holder["cli"]
+                got = cli._api_lock.acquire(blocking=False)
+                self.lock_free = bool(got)
+                if got:
+                    cli._api_lock.release()
+
+        api = _Api()
+        t2 = CC.TraderClient.__new__(CC.TraderClient)
+        t2.api = api
+        t2._api_lock = _th.RLock()
+        t2.connected, t2.logged_in, t2.settled = _th.Event(), _th.Event(), _th.Event()
+        for ev in (t2.connected, t2.logged_in, t2.settled):
+            ev.set()
+        holder["cli"] = t2
+        t2.stop()
+        if t2.api is not None:
+            raise RuntimeError("`stop()` 之后 `api` 没置空 —— 下一句还会用它")
+        if api.released != 1:
+            raise RuntimeError(f"`stop()` 没 Release 掉底层会话（{api.released} 次）")
+        if not api.lock_free:
+            raise RuntimeError("`Release()` 是在锁里调的 —— 会和回调线程互等死锁")
+        if any(ev.is_set() for ev in (t2.connected, t2.logged_in, t2.settled)):
+            raise RuntimeError("`stop()` 没清连接 / 登录 / 结算标志")
+        try:
+            t2._send("报单", lambda ap: 0)
+        except CC.CtpError:
+            pass
+        else:
+            raise RuntimeError("`stop()` 之后还能发单 —— 悬空句柄就是这么来的")
+        # 重复 stop 不许再 Release 一次（第二次 Release 同一对象也是原生崩溃）
+        t2.stop()
+        if api.released != 1:
+            raise RuntimeError("`stop()` 调两次会 Release 两次 —— CTP 侧会崩")
+
+        # ④ 重复 `start()` 要先把老会话收掉（同一个账户两条 TCP 会话，柜台按
+        #    后登的为准，先登那条从此收不到回报；老 api 不 Release 还漏线程）
+        src = _ins.getsource(CC.TraderClient.start)
+        if src.find("self.stop()") < 0 or \
+                src.index("self.stop()") > src.index("CreateFtdcTraderApi"):
+            raise RuntimeError("`start()` 重复调用没收掉老会话")
+        # 建 → Init → 挂句柄必须在同一把锁里：`Init()` 是异步的，
+        # `OnFrontConnected` 可能先到，那时 `self.api` 还是 None
+        if src.index("with self._guard()") > src.index("api.Init()"):
+            raise RuntimeError("`start()` 建会话的整段没在锁里（回调会先到）")
+
+        # ⑤ 所有 `Req*` 都必须走 `_send`（不许再有裸 `self.api.Req*`）。
+        #    🔴 用 AST 而不是字符串匹配：注释和 docstring 里写着
+        #    「原来那个调用点是 `self.api.Req*Xxx()`」这种说明，字符串匹配会假红
+        import ast as _ast
+
+        bad = []
+        for node in _ast.walk(_ast.parse(_ins.getsource(CC))):
+            if not isinstance(node, _ast.Call):
+                continue
+            fn = node.func
+            if not isinstance(fn, _ast.Attribute):
+                continue
+            base = fn.value
+            if (isinstance(base, _ast.Attribute) and base.attr == "api"
+                    and isinstance(base.value, _ast.Name)
+                    and base.value.id in ("self", "outer")):
+                bad.append(f"{base.value.id}.api.{fn.attr}")
+        if bad:
+            raise RuntimeError(f"还有裸的句柄调用（那一步没有锁）：{sorted(set(bad))}")
+        return ("流目录按「进程+秒+序号」唯一；会话关掉后报单抛错、查询静默返回"
+                " None；`Release()` 在锁外且只调一次；`start()` 重复调用先收老会话；"
+                "全部 `Req*` 走 `_send`（读句柄和用它是一个原子动作）")
+
+    check("会话收掉后不许再碰 C++ 句柄（0xc0000005）", _no_dangling_api)
+
 
     def _acct_pump() -> str:
         """组合页每轮必须**同时**推行情和账户（2026-11-23 融航「监控器不动」）。
