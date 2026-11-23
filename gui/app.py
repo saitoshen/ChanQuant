@@ -321,6 +321,18 @@ CROSS_WEIGHTS = [
      "默认按 2 的幂递减：3 档是 4/2/1，4 档是 8/4/2/1。"),
 ]
 
+# 资金分配的**范围**：分母取「多+空合起来」还是「各腿自己」
+CROSS_SCOPES = [
+    ("pooled", "合并分配（默认）",
+     "选中的多头和空头放在一张表里归一化。\n"
+     "✅ 谁更该多拿钱由风险/分数决定，不被腿数绑住。\n"
+     "⚠️ 代价是**净敞口不再钉 0** —— 多头整体波动更低时，组合会自己偏向多头。"),
+    ("legs", "多空各半仓",
+     "多头腿内归一、空头腿内归一，两边各占一半。\n"
+     "✅ 净敞口恒为 0，是「对冲」的定义式（HL point 那类严格中性策略用这个）。\n"
+     "⚠️ 两边谁更该多拿钱完全不看 —— 多头 5 只低波动、空头 1 只高波动，照样平分。"),
+]
+
 # 截面机器学习的标签口径。默认 volret：铁矿的日常波动是玉米的两三倍，
 # 直接用收益当标签，模型会偏爱高波动品种
 CROSS_LABELS = [
@@ -3148,7 +3160,8 @@ class MainWindow(QMainWindow):
         self.sp_cross_bot.setToolTip(
             "空头腿：选截面分数最低的 bottom X%。\n"
             "多空**合在一起**按「资金分配」那一项分钱，所以腿数不同、两边的钱也\n"
-            "不必相等 —— 净敞口不再是 0。"
+            "不必相等 —— 净敞口不再是 0。\n"
+            "要净敞口恒为 0（严格对冲）就把下面的资金分配范围改成「多空各半仓」。"
         )
         gleg.addWidget(self.sp_cross_bot)
         p2.addWidget(self.grp_legs)
@@ -3166,6 +3179,15 @@ class MainWindow(QMainWindow):
             self.cb_cross_w.setItemData(
                 self.cb_cross_w.count() - 1, tip, Qt.ToolTipRole)
         gl.addWidget(self.cb_cross_w)
+
+        # 资金分配的范围（分母取「多+空合起来」还是「各腿自己」）。默认合并；
+        # 复现 HL point 那类严格中性策略时切成「多空各半仓」
+        self.cb_cross_scope = QComboBox()
+        for key, label, tip in CROSS_SCOPES:
+            self.cb_cross_scope.addItem(label, key)
+            self.cb_cross_scope.setItemData(
+                self.cb_cross_scope.count() - 1, tip, Qt.ToolTipRole)
+        gl.addWidget(self.cb_cross_scope)
 
         # 分档：排名越靠前拿越多。选「分档」时才显示
         self.row_tiers = QWidget()
@@ -4403,6 +4425,12 @@ class MainWindow(QMainWindow):
             return "bar"
         return self.cb_cross_reb_unit.currentData() or "bar"
 
+    def _cross_scope(self) -> str:
+        """资金分配范围：pooled（多空合并，默认）/ legs（多空各半仓）。"""
+        if not hasattr(self, "cb_cross_scope"):
+            return "pooled"
+        return self.cb_cross_scope.currentData() or "pooled"
+
     def _sync_step1_period_items(self) -> None:
         """把「和策略周期一样」的那一项灰掉。
 
@@ -4676,9 +4704,10 @@ class MainWindow(QMainWindow):
             lines.append(f"时序腿：{leg} · 池内{self.cb_cross_w.currentText()}")
         else:
             # 腿数只对冲模式有，摘要里得带上 —— 它已经不在第一步面板里了
+            _scope_cn = "多空合并" if self._cross_scope() == "pooled" else "多空各半仓"
             lines.append(f"多 {self.sp_cross_pct.value():g}% / "
                          f"空 {self.sp_cross_bot.value():g}% · "
-                         f"资金{self.cb_cross_w.currentText()}（多空合并）")
+                         f"资金{self.cb_cross_w.currentText()}（{_scope_cn}）")
         return "\n".join(lines)
 
     def _on_cross_mode_changed(self, *_a) -> None:
@@ -5253,6 +5282,10 @@ class MainWindow(QMainWindow):
             "pool_reb": int(self._pool_reb()[0]),
             "pool_reb_unit": self._pool_reb()[1],
             "label": self.cb_label.currentData() or "volret",
+            # 资金分配范围：pooled / legs。取不到控件（自检替身）就按默认
+            "scope": (self.cb_cross_scope.currentData()
+                      if getattr(self, "cb_cross_scope", None) is not None
+                      else "pooled") or "pooled",
         }
 
     def _current_config(self) -> SStore.StrategyConfig:
@@ -5320,6 +5353,7 @@ class MainWindow(QMainWindow):
             cross_top_pct=float(self.sp_cross_pct.value()),
             cross_bot_pct=float(self.sp_cross_bot.value()),
             cross_weight=self.cb_cross_w.currentData() or "risk",
+            cross_weight_scope=_cx["scope"],
             cross_tiers=_cx["tiers"],
             cross_tier_units=_cx["units"],
             cross_pool_mode="single" if _cx["pool_key"] else "off",
@@ -5479,6 +5513,10 @@ class MainWindow(QMainWindow):
             cw = self.cb_cross_w.findData(cfg.cross_weight or "risk")
             if cw >= 0:
                 self.cb_cross_w.setCurrentIndex(cw)
+            cs = self.cb_cross_scope.findData(
+                getattr(cfg, "cross_weight_scope", "pooled") or "pooled")
+            if cs >= 0:
+                self.cb_cross_scope.setCurrentIndex(cs)
             tf = self.cb_timing.findData(cfg.timing_family or "rule")
             if tf >= 0:
                 self.cb_timing.setCurrentIndex(tf)
@@ -6804,6 +6842,7 @@ class MainWindow(QMainWindow):
             long_only=self.cfg.long_only,
             short_only=self.cfg.short_only,
             weight=self.cb_cross_w.currentData() or "risk",
+            weight_scope=_cx["scope"],
             tiers=_cx["tiers"],
             tier_units=_cx["units"],
             pool_mode="single" if _cx["pool_key"] else "off",

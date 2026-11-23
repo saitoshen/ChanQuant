@@ -83,6 +83,22 @@ class CrossConfig:
     # tier = 按分数分档给份数（见 tiers / tier_units）
     weight: str = "risk"
 
+    # 资金分配的**范围**（只对冲模式用）：
+    #
+    #   pooled —— 多 + 空合在一张表里归一化（默认，2026-11-23 起的口径）。
+    #             Σ|w| = 1×杠杆，**两边不必等值、净敞口不再钉 0**。
+    #   legs   —— 多空各分一半，各自腿内归一化。Σ|w| 仍是 1，但多头合计
+    #             恒等于空头合计，净敞口恒为 0。
+    #
+    # 为什么留 `legs` 这个口子：`pooled` 是用户明确要的新口径，但**外部策略
+    # 复现需要老语义**。future_quant 的 HL point 截面对冲，组合日收益写的是
+    # `Σ(w·r)/2` —— 多腿内 w 归一、空腿内 w 归一、各占半仓，那是「对冲」的
+    # 定义式（净敞口恒 0）。用 pooled 跑它，多头波动低于空头时净敞口会自己
+    # 变成多头，曲线和原策略不是一回事。
+    #
+    # 默认必须是 `pooled`：这是用户要的行为，不能让老语义偷偷回来。
+    weight_scope: str = "pooled"        # pooled / legs
+
     # ---- 资金分档（`weight="tier"` 时生效，参考 HL-trend 的 4/2/1 份）
     #
     # 选出来的几只不该一样重：排第一的比排第三的确定性高得多。做法是把选中的
@@ -1490,10 +1506,20 @@ def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig,
     分档用 **|分数|** 排序而不是「多头降序、空头升序」：合并之后只有一个队列，
     强弱是「信号有多确定」，多空两侧对称 —— 空头里最弱的那只 |分数| 最大，照样
     进第一档。
+
+    ## `weight_scope="legs"`：回到「多空各半仓」
+
+    合并分配是用户 2026-11-23 明确要的口径，但它**不是**对冲的定义式。
+    需要净敞口恒为 0 的场合（复现 future_quant 的 HL point，或者就是要一条
+    严格市场中性的曲线）把 `weight_scope` 设成 `"legs"`，走 `_legs_share`：
+    多头腿内归一、空头腿内归一、两边各 0.5。默认仍是 `pooled`。
     """
     rows, top, bot, k_long, k_short, ok = _rank(score, cfg, step=step)
     mat = score.to_numpy(dtype=float)[rows]
     w = np.zeros(mat.shape, dtype=float)
+    scope = str(getattr(cfg, "weight_scope", "pooled") or "pooled").strip().lower()
+    if scope not in ("pooled", "legs"):
+        scope = "pooled"
     use_tier = cfg.weight == "tier" and int(cfg.tiers or 0) >= 2
     use_risk = cfg.weight == "risk" and vol is not None
     if use_tier:
@@ -1516,7 +1542,10 @@ def _hedge_weights(score: pd.DataFrame, cfg: CrossConfig,
             raw = np.abs(np.nan_to_num(mat[i], nan=0.0))
         else:
             raw = np.ones(mat.shape[1], dtype=float)
-        w[i] = _pooled_share(raw, top[i], bot[i])
+        if scope == "legs":
+            w[i] = _legs_share(raw, top[i], bot[i])
+        else:
+            w[i] = _pooled_share(raw, top[i], bot[i])
     return _place(score, rows, w, ok)
 
 
@@ -1563,6 +1592,38 @@ def _pooled_share(raw: np.ndarray, top: np.ndarray, bot: np.ndarray,
     v = np.where(np.isfinite(v), v, np.nanmedian(v))
     out[idx] = total * v / v.sum()
     out[bot & ~top] *= -1.0
+    return out
+
+
+def _legs_share(raw: np.ndarray, top: np.ndarray, bot: np.ndarray,
+                total: float = 1.0) -> np.ndarray:
+    """多空**各自**归一：两边各拿 `total/2`，符号跟着多空走。
+
+    这是 `weight_scope="legs"` 用的老语义，也是「对冲」的定义式：多头合计
+    恒等于空头合计 ⇒ 净敞口恒为 0。future_quant 的 HL point 就按这个算
+    （组合日收益写 `Σ(w·r)/2`，等价于两边各 0.5）。
+
+    和 `_pooled_share` 的差别只在**分母**：这里的 Σ 是「这条腿内的 Σ」，
+    那边是「多 + 空合起来的 Σ」。所以选出来的多空只数不等、或者两边波动
+    水平系统性不同时，两者结果不一样 —— 这不是精度差异，是两条不同的策略。
+
+    **只有一边有持仓时**，把全部 `total` 给这一边：否则「只做多」的策略会
+    凭空变成半仓，敞口砍掉一半还不报错（和 `_pooled_share` 的兜底一致）。
+    """
+    out = np.zeros(len(raw), dtype=float)
+    bot_only = bot & ~top
+    both = bool(top.any()) and bool(bot_only.any())
+    each = (total * 0.5) if both else total
+    for mask, sign in ((top, 1.0), (bot_only, -1.0)):
+        idx = np.nonzero(mask)[0]
+        if not len(idx):
+            continue
+        v = np.asarray(raw, dtype=float)[idx]
+        v = np.where(np.isfinite(v) & (v > 0), v, np.nan)
+        if not np.isfinite(v).any():
+            v = np.ones(len(idx), dtype=float)
+        v = np.where(np.isfinite(v), v, np.nanmedian(v))
+        out[idx] = sign * each * v / v.sum()
     return out
 
 

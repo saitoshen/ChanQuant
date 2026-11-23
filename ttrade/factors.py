@@ -903,6 +903,7 @@ _reg(FactorSpec("pcr", "看跌看涨持仓比", f_pcr, "期权",
 CATEGORIES: list[str] = [
     "趋势", "反转", "波动", "量能", "形态",
     "日内", "时段",
+    "MACD 风洞",
     "展期", "展期 OI3", "展期 OI6", "期权",
     "季节性", "品种季节",
     "基本面", "板块行业", "宏观",
@@ -1183,6 +1184,9 @@ from ttrade import factors_ext as _FE        # noqa: E402
 from ttrade import factors_macro as _FM      # noqa: E402
 from ttrade import factors_stock as _FK      # noqa: E402
 from ttrade import factors_fx5 as _FFX       # noqa: E402
+# HL point 截面对冲（future_quant/cross_section）的 42 个因子：MACD 风洞族、
+# 动量二阶导、缩量族、持仓比、以及 EDB 现货/库存同比那几条
+from ttrade import factors_hl as _FHL        # noqa: E402
 
 _INTRA_FACTORS = _FI.register_into(FACTORS, FactorSpec)
 _SEASON_FACTORS = _FS.register_into(FACTORS, FactorSpec)
@@ -1194,6 +1198,8 @@ _MACRO_FACTORS = _FM.register_into(FACTORS, FactorSpec)
 _STOCK_FACTORS = _FK.register_into(FACTORS, FactorSpec)
 # 汇率 5m：Dukascopy 分钟线，与日频 macro_usdcnh 并存对照（数据缺失则全 NaN）
 _FX5_FACTORS = _FFX.register_into(FACTORS, FactorSpec)
+# HL point 截面对冲的 42 个因子（MACD 风洞 / 缩量 / 持仓比 / 现货库存）
+_HL_FACTORS = _FHL.register_into(FACTORS, FactorSpec)
 
 # 用户因子可能带来新类别（默认叫「自定义」）。`CATEGORIES` 是界面上分组用的
 # 静态列表，不补进去的话新因子在「策略研究」页的因子下拉里根本不出现 ——

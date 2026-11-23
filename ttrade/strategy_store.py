@@ -216,6 +216,12 @@ class StrategyConfig:
     cross_top_pct: float = 10.0         # 多头：选最强的百分比
     cross_bot_pct: float = 10.0         # 空头：选最弱的百分比（可以和上面不同）
     cross_weight: str = "risk"          # risk / equal / score / tier
+    # 资金分配的范围：pooled = 多空合在一起归一（默认，净敞口不钉 0）；
+    # legs = 多空各半仓、腿内各自归一（净敞口恒 0，对冲的定义式）。
+    # 存盘必须带上：HL point 那类「严格中性」的策略靠它，丢了就悄悄变回合并口径，
+    # 同一份配置跑出两倍的净敞口差。老配置没有这个字段 ⇒ 落到 pooled，
+    # 和 2026-11-23 之后的行为一致。
+    cross_weight_scope: str = "pooled"
     # 分档：weight == "tier" 时把选中的几只按分数切成 N 档，各档拿不同份数
     cross_tiers: int = 0                # 0/1 = 不分档
     cross_tier_units: list = field(default_factory=list)   # 空则按 4/2/1 递减
@@ -470,6 +476,9 @@ class StrategyConfig:
             bits = [f"{mode}·{len(self.factor_keys or [])}因子",
                     f"调仓={int(self.cross_rebalance or 1)}{_REB_UNIT_CN.get(self.cross_rebalance_unit, '根')}",
                     f"权重={_WEIGHT_CN.get(self.cross_weight, '风险平价')}"]
+            # 只有非默认的 legs 才写出来：默认口径写上去只是噪音
+            if str(getattr(self, "cross_weight_scope", "pooled") or "pooled") == "legs":
+                bits.append("多空各半仓")
             if str(self.cross_pool_mode or "off").lower() != "off" and self.cross_pool_keys:
                 _pu = "月" if self.cross_pool_reb_unit == "month" else "交易日"
                 bits.append(f"筛池={float(self.cross_pool_pct or 0):g}%"
@@ -716,6 +725,9 @@ class StrategyConfig:
             cfg.cross_mode = "hedge"
         if cfg.cross_weight not in ("risk", "equal", "score", "tier"):
             cfg.cross_weight = "risk"
+        # 资金分配范围：只认这两个值，手改 JSON 写错的落到 pooled（默认口径）
+        _ws = str(getattr(cfg, "cross_weight_scope", "") or "").strip().lower()
+        cfg.cross_weight_scope = _ws if _ws in ("pooled", "legs") else "pooled"
         # 分档：档数夹到 0~6，份数只留正数。手改 JSON 写成字符串时不该让
         # 整个配置加载失败
         try:

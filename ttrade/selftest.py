@@ -14959,6 +14959,138 @@ def _run() -> tuple[bool, list[str]]:
 
     check("截面两步各有独立的因子周期（第一步筛池 / 第二步排名）", _cross_two_periods)
 
+    def _hl_point():
+        """HL point 复现：新因子注册齐全、两种资金分配范围、策略库往返。"""
+        import dataclasses
+        import inspect
+
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factors as FF
+        from ttrade import strategy_store as SS
+        from ttrade.cross import CrossConfig, _hedge_weights
+
+        # ---- ① 42 个新因子都注册了，而且算得出值（不是整列空）
+        new_keys = [k for k, s in FF.FACTORS.items()
+                    if s.category == "MACD 风洞"] + [
+            "mom_5", "mom_accel", "slope_20", "slope_60", "ma_align",
+            "pos_60", "new_high_10", "bb_width_20", "bb_width_60", "dev_60",
+            "high_ma_gap_20", "vol_5", "vol_surge_5", "vol_shrink",
+            "atr_ratio", "range_ratio", "vol_price_diverge",
+            "contraction_score", "oi_change_10", "oi_vol_ratio",
+            "oi_price_corr_5", "intraday_strength", "gap_fill_ratio",
+            "spot_mom_5", "spot_mom_20", "warehouse_chg_20", "inventory_yoy",
+            "profit_pct", "deliv_pct",
+        ]
+        missing = [k for k in new_keys if k not in FF.FACTORS]
+        assert not missing, f"HL point 的因子没注册：{missing}"
+        assert "MACD 风洞" in FF.CATEGORIES, "新类别没进 CATEGORIES（界面上选不到）"
+
+        rng = pd.date_range("2021-01-04", periods=900, freq="B")
+        rnd = np.random.RandomState(3)
+        c = 3000 * np.exp(np.cumsum(rnd.normal(0.0002, 0.012, len(rng))))
+        o = c * (1 + rnd.normal(0, 0.002, len(rng)))
+        df = pd.DataFrame(
+            {"open": o,
+             "high": np.maximum(o, c) * (1 + np.abs(rnd.normal(0, 0.004, len(rng)))),
+             "low": np.minimum(o, c) * (1 - np.abs(rnd.normal(0, 0.004, len(rng)))),
+             "close": c,
+             "volume": np.abs(rnd.normal(1e5, 4e4, len(rng))),
+             "open_interest": np.abs(rnd.normal(5e5, 5e4, len(rng)))},
+            index=rng)
+        df.attrs["symbol"] = "RB"
+        dead = []
+        for k in new_keys:
+            s = FF.raw(df, k).replace([np.inf, -np.inf], np.nan)
+            if int(s.notna().sum()) < 100:
+                dead.append((k, int(s.notna().sum())))
+        assert not dead, f"这些新因子在 900 根日线上几乎全空：{dead}"
+
+        # 🔴 mom_accel 与 mom_diverge 数学恒等（(a−1)−(b−1) ≡ a−b），
+        # 原项目当两列用，这边只注册一列 —— 注册两列等于给模型喂重复特征
+        from ttrade import factors_hl as FH
+
+        assert "mom_diverge" not in FF.FACTORS, "mom_diverge 不该注册（和 mom_accel 恒等）"
+        a = FF.raw(df, "mom_accel")
+        b = FH.f_mom_diverge(df)
+        bad = (a - b).abs()
+        bad = bad[bad.notna()]
+        assert len(bad) and float(bad.max()) < 1e-12, \
+            f"mom_accel 和 mom_diverge 不再恒等了（最大差 {float(bad.max())}）—— 可以当两列用了"
+
+        # ---- ② 资金分配范围：legs = 多空各半仓（净敞口恒 0）
+        idx = pd.date_range("2024-01-01", periods=3, freq="B")
+        cols = ["A_SHFE", "B_SHFE", "C_SHFE", "D_DCE", "E_DCE", "F_CZCE"]
+        score = pd.DataFrame([[3.0, 2.0, 1.0, -1.0, -2.0, -3.0]] * 3,
+                             index=idx, columns=cols)
+        flat = pd.DataFrame(0.01, index=idx, columns=cols)
+        # 两边波动完全一样时，两种口径必须给出同一组权重
+        w_p = _hedge_weights(score, CrossConfig(top_pct=50.0, bot_pct=50.0,
+                                               weight="risk",
+                                               weight_scope="pooled"),
+                             vol=flat, step=1).iloc[0]
+        w_l = _hedge_weights(score, CrossConfig(top_pct=50.0, bot_pct=50.0,
+                                               weight="risk",
+                                               weight_scope="legs"),
+                             vol=flat, step=1).iloc[0]
+        assert (w_p - w_l).abs().max() < 1e-12, "同波动下两种口径不该有差别"
+        assert abs(w_l.abs().sum() - 1.0) < 1e-9
+
+        # 多头低波动、空头高波动：pooled 会把钱全压到多头（净敞口跑偏），
+        # legs 仍然两边各半。这就是复现 HL point 必须切 legs 的原因
+        skew = pd.DataFrame({"A_SHFE": 0.005, "B_SHFE": 0.005, "C_SHFE": 0.005,
+                             "D_DCE": 0.05, "E_DCE": 0.05, "F_CZCE": 0.05},
+                            index=idx, dtype=float)
+        r_p = _hedge_weights(score, CrossConfig(top_pct=50.0, bot_pct=50.0,
+                                               weight="risk",
+                                               weight_scope="pooled"),
+                            vol=skew, step=1).iloc[0]
+        r_l = _hedge_weights(score, CrossConfig(top_pct=50.0, bot_pct=50.0,
+                                               weight="risk",
+                                               weight_scope="legs"),
+                            vol=skew, step=1).iloc[0]
+        assert abs(r_p.sum()) > 0.5, \
+            f"合并口径在波动不对称时应当明显偏多头，实际净敞口 {r_p.sum():.3f}"
+        assert abs(r_l.sum()) < 1e-12, f"legs 口径净敞口必须是 0，实际 {r_l.sum():.3f}"
+        assert abs(r_l.abs().sum() - 1.0) < 1e-9
+        # 只有一边有仓：不应该凭空变成半仓
+        one = _hedge_weights(score, CrossConfig(top_pct=50.0, bot_pct=0.0,
+                                              weight="equal",
+                                              weight_scope="legs"),
+                             vol=flat, step=1).iloc[0]
+        assert abs(one.abs().sum() - 1.0) < 1e-9, \
+            f"legs 口径下「只做多」被砍成半仓了：{one.abs().sum():.3f}"
+
+        # ---- ③ 落盘往返 + 默认值
+        names = {f.name for f in dataclasses.fields(SS.StrategyConfig)}
+        assert "cross_weight_scope" in names, "策略库少了 cross_weight_scope"
+        assert SS.StrategyConfig().cross_weight_scope == "pooled", \
+            "默认口径必须是 pooled（2026-11-23 之后的行为），不能是 legs"
+        rec = SS.StrategyConfig.from_dict({"cross_weight_scope": "legs"})
+        assert rec.cross_weight_scope == "legs"
+        rec2 = SS.StrategyConfig.from_dict({"cross_weight_scope": "随便写的"})
+        assert rec2.cross_weight_scope == "pooled", "手改 JSON 写错应当落到默认口径"
+        # 摘要里得写出来，否则两条曲线差在哪看不出来。
+        # 注意 `params_text()` 按 `family` 分支，不写 family="cross" 会走规则那条
+        assert "多空各半仓" in SS.StrategyConfig(
+            family="cross", cross_weight_scope="legs").params_text(), \
+            "legs 口径没进策略摘要"
+        assert "多空各半仓" not in SS.StrategyConfig(family="cross").params_text(), \
+            "默认口径不该在摘要里多一行噪音"
+        # replay 必须把口径透传下去（漏了就悄悄按 pooled 回测）
+        from ttrade import replay as _RP
+
+        assert "weight_scope=getattr(cfg" in inspect.getsource(_RP.run_cross), \
+            "replay.run_cross 没把 cross_weight_scope 透传给 CrossConfig"
+
+        return ("HL point 的 42 个因子全部注册且非空（MACD 风洞 13 个自成一类）；"
+                "mom_accel ≡ mom_diverge 只注册一列；"
+                "资金分配范围 legs = 多空各半仓（净敞口恒 0、只做多不砍半仓）、"
+                "pooled 在波动不对称时净敞口会跑偏 —— 复现严格中性策略必须切 legs")
+
+    check("HL point 复现：新因子 + 资金分配范围（多空各半仓 / 合并）", _hl_point)
+
     # 跑完就把进度文件收掉：留着会让下一轮的诊断以为"上次崩过"。
     # 崩溃时走不到这里，文件正好留下最后一项的名字。
     if _prog is not None:
