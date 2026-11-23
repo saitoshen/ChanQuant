@@ -2664,8 +2664,11 @@ class PortfolioRunner:
         # 来的手数是同一个。
         # 🔴 只有「换了方向」或「还没算过」才重算手数。同一波里每根都重算，就等于
         # 又拿当前 K 线算了一遍 —— 那正是用户 11-23 报的 bug。
+        # 🔴 一律 `getattr` 取：自检里常有 `__new__` 造的精简桩（`_St`），
+        # 少一个属性就 AttributeError，整条策略直接判「错误」
+        prev_lots = int(getattr(st, "theo_lots", 0) or 0)
         prev_sig = int(getattr(st, "theo_lots_sig", 0) or 0)
-        if (st.theo_lots <= 0 or prev_sig != sig
+        if (prev_lots <= 0 or prev_sig != sig
                 or getattr(st, "theo_lots_src", "") == ""):
             got = self._entry_lots_at(st, df, j, ref, stop_dist)
             if got > 0:
@@ -2847,7 +2850,8 @@ class PortfolioRunner:
         if not sig:
             st.theo_lots, st.theo_lots_sig, st.theo_lots_src = 0, 0, ""
             return
-        if sig != int(getattr(st, "theo_lots_sig", 0) or 0) or st.theo_lots <= 0:
+        if (sig != int(getattr(st, "theo_lots_sig", 0) or 0)
+                or int(getattr(st, "theo_lots", 0) or 0) <= 0):
             st.theo_lots = max(1, int(st.lots or 1))
             st.theo_lots_sig = int(sig)
             st.theo_lots_src = THEO_SIG
