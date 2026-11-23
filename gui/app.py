@@ -2500,8 +2500,18 @@ class MainWindow(QMainWindow):
         )
         sf.addWidget(self.chk_ml_pool)
 
+        # ---- 因子参数。**单独做成一个 QWidget**，不摊在 `box_fsel` 里：
+        # 截面策略要把这一整块借到「第二步 策略落地」那一栏（截面对冲的右栏本来
+        # 是空的，而「窗口 / 预测期数 / 标准化口径」这类参数属于「怎么把分数变成
+        # 仓位」，不是「选哪些品种」）。做成布局就搬不动了 —— QWidget 才能
+        # `_lend()`。用户 2026-11-23 明确要求，见 `_sync_family_panels`。
+        self.box_fparams = QWidget()
+        fp = QVBoxLayout(self.box_fparams)
+        fp.setContentsMargins(0, 0, 0, 0)
+        fp.setSpacing(8)
+
         self.lbl_fparam = self._section("因子参数")
-        sf.addWidget(self.lbl_fparam)
+        fp.addWidget(self.lbl_fparam)
 
         # 标准化口径。两种都落在 ±4，所以阈值在两者之间可以照抄 ——
         # 但**同一个阈值的含义不一样**：z 的 1.0 是 84 分位，分位的 1.0 是
@@ -2528,7 +2538,7 @@ class MainWindow(QMainWindow):
         # 之前**没连信号**：改了口径不会重算，图上还是旧的，只能手动点回测。
         # 换口径等于换了一条策略（阈值含义都不同），不重算等于让界面说谎。
         self.cb_fmethod.currentIndexChanged.connect(self._on_global_method_changed)
-        sf.addWidget(self.cb_fmethod)
+        fp.addWidget(self.cb_fmethod)
 
         # 方向口径。这一项之前只在 FactorConfig 里存在、界面没暴露，导致「反转」
         # 是相对「自动定向」的 —— 而自动定向取 sign(扩张 IC)，每个品种不一样、
@@ -2538,13 +2548,19 @@ class MainWindow(QMainWindow):
         for label, key, tip in FACTOR_ORIENTS:
             self.cb_forient.addItem(label, key)
             self.cb_forient.setItemData(self.cb_forient.count() - 1, tip, Qt.ToolTipRole)
-        sf.addWidget(self.cb_forient)
+        fp.addWidget(self.cb_forient)
 
         self.fparam_box = QVBoxLayout()
         self.fparam_box.setContentsMargins(0, 0, 0, 0)
         self.fparam_box.setSpacing(8)
-        sf.addLayout(self.fparam_box)
+        fp.addLayout(self.fparam_box)
+        # 🔴 必须挂在 `cl` 上、和 `box_fsel` 做**兄弟**，不能 `sf.addWidget`：
+        # `sf` 是 `box_fsel` 自己的布局，挂进去就成了它的子控件，`_lend(box_fsel)`
+        # 时整块跟着走（搬不到第二步），而且它不在 `_panel_slots` 里 —— 截面对冲
+        # 一切就直接 KeyError，把后面的 `_sync_cross_controls` / `_sync_factor_panel`
+        # 全跳过（表现为「切了策略类型参数区不刷新」）。2026-11-23 实测。
         cl.addWidget(self.box_fsel)
+        cl.addWidget(self.box_fparams)
 
         # ---------------------------------------------- 出场规则（因子策略专用）
         #
@@ -2825,7 +2841,8 @@ class MainWindow(QMainWindow):
         # 原处，不然来回切几次策略类型，侧边栏的顺序会乱
         self._panel_slots = {
             w: (cl, cl.indexOf(w))
-            for w in (self.box_factor, self.box_fsel, self.box_rule, self.box_filter)
+            for w in (self.box_factor, self.box_fsel, self.box_fparams,
+                      self.box_rule, self.box_filter)
         }
 
         wrap.setFixedWidth(360)
@@ -2998,6 +3015,18 @@ class MainWindow(QMainWindow):
         ht.setSpacing(8)
         gt.addWidget(self.cross_timing_host)
         p2.addWidget(self.grp_timing)
+
+        # ---- 因子参数（从第一步「借」过来的那一块，见 `_sync_family_panels`）
+        #
+        # 为什么放第二步：截面策略的「窗口 / 预测期数 / 标准化口径」不是「选哪些
+        # 品种」，而是「怎么把分数变成仓位」—— 和腿数、腿内分钱是一组。左边第一
+        # 步已经有「截面因子」和「先筛品种池」两处选品种的设置，再堆一套参数只会
+        # 让人以为它也管排名。用户 2026-11-23 指的就是这个。
+        self.cross_fparam_host = QWidget()
+        hfp = QVBoxLayout(self.cross_fparam_host)
+        hfp.setContentsMargins(0, 0, 0, 0)
+        hfp.setSpacing(8)
+        p2.addWidget(self.cross_fparam_host)
 
         # ---- 多空腿数：**只有截面对冲要**。
         #
@@ -4237,6 +4266,10 @@ class MainWindow(QMainWindow):
         if is_cross:
             self._lend(self.box_factor, self.cross_factor_host)
             self._lend(self.box_fsel, self.cross_factor_host)
+            # 因子参数整块去**第二步**（不是第一步）：它管的是「分数怎么变成
+            # 仓位」，不是「选哪些品种」。截面对冲时右栏只有腿数和分钱，把它
+            # 放过去正好（用户 2026-11-23 提的）。
+            self._lend(self.box_fparams, self.cross_fparam_host)
             if timing == "rule":
                 self._lend(self.box_rule, self.cross_timing_host)
             else:
@@ -4973,14 +5006,24 @@ class MainWindow(QMainWindow):
             )
 
     def _rebuild_fparams(self) -> None:
-        """因子参数。按模式动态增减：ML 才有训练参数，过滤才有门槛参数。"""
+        """因子参数。按模式动态增减：ML 才有训练参数，过滤才有门槛参数。
+
+        🔴 **截面对冲不摆进场 / 离场阈值**（用户 2026-11-23）：对冲那条路根本
+        没有「单腿进场」这回事 —— 它对着一排品种比强弱，多头腿 = 排名最高那
+        几个、空头腿 = 最低那几个，换仓由调仓周期决定。阈值摆在那里既不会被读，
+        又会让人以为「分数不过 1.0 就不开仓」，调半天仓位不动。
+        「选品种 + 时序腿=因子」仍然要这两个参数（时序腿按分数过阈值开平），
+        所以只在对冲模式下拿掉。
+        """
         self._clear_param_box(self.fparam_box, self.fparam_widgets, self.fparam_scales)
         filtering = self._filter_active()
+        hedge = (self.family == FAMILY_CROSS and self._cross_mode() == "hedge")
         names = ["window", "horizon"]
         if filtering:
             names += ["long_th", "short_th"]
         else:
-            names += ["entry_z", "exit_z"]
+            if not hedge:
+                names += ["entry_z", "exit_z"]
             if self.factor_mode == "ml":
                 names += ["train_window", "step"]
         for pname in names:

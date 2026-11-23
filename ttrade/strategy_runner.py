@@ -1804,9 +1804,14 @@ class PortfolioRunner:
         # 就是 30~60 秒，那段时间引擎卡在第一次 tick 里、界面不刷新 ——
         # 2026-11-20 用户报的「启动 / 普通界面都卡住」就是这个。
         # 回填由行情线程自己完成，这里下一 tick 再取，期间显示「行情未就绪」。
-        self.feed.request_kline(tq, RT_SEC[src], length)
+        dur = RT_SEC[src]
+        # 🔴 **取的时候必须带上同一个周期秒数**：行情源的 K 线缓存按
+        # `(合约, 周期)` 建键（同一品种的日线和 1h 是两条序列，见
+        # `market_feed.__init__`）。这里原来只传合约，等于去取「0 秒」那一档 ——
+        # 2026-11-23 棕榈油就是这样拿到别人订的 1h 序列、日线策略按小时线算信号。
+        self.feed.request_kline(tq, dur, length)
         self.feed.request_quote(tq)
-        kl = self.feed.peek_kline(tq)
+        kl = self.feed.peek_kline(tq, dur)
         if kl is not None:
             # 只缓存拿得到的：没回填时 `_klines` 不写空值，否则上面那句
             # `if key in self._klines` 会以为「已经订好了」，再也不重试
@@ -2592,16 +2597,29 @@ class PortfolioRunner:
             return
         kept = set(getattr(fmat, "columns", []))
         gone = [str(k) for k in keys if str(k) not in kept]
-        sid = str(getattr(st.cfg, "sid", "") or st.title())
+        sid = str(getattr(st.cfg, "sid", "") or "")
+        # 名字只是给人看的，**不许在这条路上抛异常**：日志函数一炸，整轮信号都
+        # 没了。自检里借的是个没有 `title()` 的壳，实盘配置也可能没有 sid
+        try:
+            name = str(st.title() or "")
+        except Exception:                    # noqa: BLE001
+            name = ""
+        name = name or sid or str(getattr(st, "symbol", "") or "槽位")
         # 自检里只借 `_signal` 一条路，不会走完整 __init__
         warned = getattr(self, "_factor_warned", None)
         if warned is None:
             warned = self._factor_warned = set()
-        if not gone or sid in warned:
-            return
-        warned.add(sid)
-        self._log(f"{st.title()}：{len(gone)} 个因子在实盘链路上算不出值，已剔除"
-                  f"（{'、'.join(gone[:4])}）—— 过滤条件比回测少，结果会对不上")
+        # 🔴 **「实际参与合成几个」这条一定要记**（哪怕一个都没被剔除）：
+        # 回测和实盘对不上时，第一个要问的就是「两边喂进去的列一样吗」。
+        # 只记「谁被剔了」不够 —— 情况反过来（实盘比回测**多**几票）时它是
+        # 一条线索都没有的，2026-11-23 集运欧线就是这么查了半天：回测空仓、
+        # 实盘 +1 手，而日志里既没有剔除也没有报错。
+        key = sid or name
+        if key not in warned:
+            warned.add(key)
+            self._log(f"{name}：{len(kept)}/{len(keys)} 个因子参与合成"
+                      + (f"，缺 {'、'.join(gone[:4])}" if gone else "")
+                      + "（回测若与这里不同，就是两条链路喂进去的列不一样）")
 
     def _with_aux(self, st: SlotState, df: pd.DataFrame) -> pd.DataFrame:
         """给实时序列挂上期限结构 / 期权列。
@@ -2615,14 +2633,30 @@ class PortfolioRunner:
         于是 `1d_tq` 策略回测吃当天的期限结构、实盘吃昨天的，展期因子差一天，
         分数就分叉 —— 2026-11-20 棕榈油「回测空仓、实盘还持 2 手空单」就是它
         （score −1.2259 vs −1.3808，正好跨过 `exit_z`）。
+
+        🔴 **失败不许静默**（2026-11-23 补）：原来 `except Exception: return df`
+        一个字都不写，于是「挂不上衍生列」和「这个品种本来就没有衍生数据」在看
+        日志时长得一模一样。实测代价：集运欧线多因子日内 15 个因子里 7 个读衍生
+        列，挂不上只剩 8 个参与合成 ⇒ 末根 signal `+1`；挂上 12 个 ⇒ `0`。
+        回测（`DataStore` 挂过）显示空仓、实盘显示 +1 手，而日志里没有任何线索。
+        现在失败会写一行原因（每槽位每周期只报一次），下次一眼能看到。
         """
         try:
             from ttrade.auxdata import attach_for_period
 
             out = attach_for_period(df, st.cfg.symbol, st.cfg.exchange,
                                     st.cfg.period)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - 挂不上也要能算信号（只是因子少几票）
+            self._note_once(
+                st, f"衍生列挂不上（{type(exc).__name__}: {exc}）⇒ 展期 / 期权那几个"
+                    "因子本轮没有值，信号会比回测少几票 —— 回测是挂过衍生列的")
             return df
+        if len(out.columns) <= len(df.columns):
+            # 不报错但也没挂上：品种没有衍生文件，或文件里没有重叠的交易日。
+            # 前者正常（纯价格因子照样能跑），后者是数据没更新 —— 说清楚是哪种
+            self._note_once(
+                st, "衍生列没挂上任何一列（没有该品种的期限结构 / 期权文件，"
+                    "或文件与行情没有重叠日期）—— 展期、期权类因子本轮无值")
         self._check_aux_fresh(st, out)
         return out
 

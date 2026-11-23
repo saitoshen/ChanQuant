@@ -183,11 +183,19 @@ class _Chan:
         self.spec = spec
         self._api = None
         self._cond = threading.Condition(threading.RLock())
-        self._serials: dict[str, object] = {}
+        # 🔴 K 线缓存按 **(合约, 周期秒数)** 建键。只按合约建键时，同一个品种被
+        # 两个周期的槽位订阅会**互相串号** —— 谁先订成功谁占坑，另一条直接拿去
+        # 用，而且不报错。2026-11-23 实测：品种池里那条 1h 的「sbbox多品种波段」
+        # 含 `P_DCE`，它先订成功占住了坑，于是棕榈油的 `1d_tq` 策略拿到的是
+        # **1h 序列** —— 合并后 497 根（日线本该 492 根）、末根 `14:00`，因子在
+        # 小时线上重算，signal 从 0 翻成 −1，用户看到「回测空仓、实盘 −2 手」。
+        # 盘口没有周期概念，仍然按合约建键。
+        self._serials: dict[tuple[str, int], object] = {}
         self._quotes: dict[str, object] = {}
-        # (tq, kind) -> (duration, length, kind)。**用二元键**：同一个合约
-        # 的 K 线和盘口是两件事，只用 tq 当键的话后投的会把前一个覆盖掉
-        self._pending: dict[tuple[str, str], tuple] = {}
+        # 待订阅：键 = (tq, 周期秒, kind)，值 = (tq, 周期秒, 根数, kind)。
+        # **键里必须带周期**：只用 (tq, kind) 的话，同一合约的日线和 1h 是同一个
+        # 键，后投的请求会被当成「已经在队列里了」而丢掉
+        self._pending: dict[tuple[str, int, str], tuple] = {}
         self._tick = 0
         self._last_ts = 0.0
         self._last_drive = 0.0
@@ -300,12 +308,12 @@ class _Chan:
             with self._cond:
                 jobs = list(self._pending.items())
                 self._pending.clear()
-            for (tq, kind), (dur, length, _k) in jobs:
+            for _pkey, (tq, dur, length, kind) in jobs:
                 try:
                     got = self._subscribe(api, tq, dur, length, kind)
                     with self._cond:
                         if kind == "k":
-                            self._serials[tq] = got
+                            self._serials[self._kk(tq, dur)] = got
                         else:
                             self._quotes[tq] = got
                 except Exception as exc:         # noqa: BLE001
@@ -319,21 +327,28 @@ class _Chan:
 
     # ---- 订阅 / 读 ----
 
+    @staticmethod
+    def _kk(tq: str, dur: int) -> tuple[str, int]:
+        """K 线缓存的键 = 合约 + 周期秒数。**别退化成只用合约**（见 `__init__`）。"""
+        return (str(tq), int(dur or 0))
+
     def _ask(self, tq: str, dur: int, length: int, kind: str, timeout: float = 8.0):
+        d = int(dur or 0) if kind == "k" else 0
+        kk = self._kk(tq, d)
         with self._cond:
-            if kind == "k" and tq in self._serials:
-                return self._serials[tq]
+            if kind == "k" and kk in self._serials:
+                return self._serials[kk]
             if kind == "q" and tq in self._quotes:
                 return self._quotes[tq]
             if self._api is None:
                 return None                      # 没连上：调用方用本地历史兜底
-            self._pending[(tq, kind)] = (dur, length, kind)
+            self._pending[(tq, d, kind)] = (tq, d, int(length), kind)
             ok = self._cond.wait_for(
-                lambda: (tq in self._serials if kind == "k" else tq in self._quotes)
+                lambda: (kk in self._serials if kind == "k" else tq in self._quotes)
                         or self._api is None, timeout)
             if not ok:
                 return None
-            return self._serials.get(tq) if kind == "k" else self._quotes.get(tq)
+            return self._serials.get(kk) if kind == "k" else self._quotes.get(tq)
 
     def kline(self, tq: str, duration_sec: int, length: int = 3000):
         return self._ask(tq, int(duration_sec), int(length), "k")
@@ -352,21 +367,28 @@ class _Chan:
         （2026-11-20）。改成投递后立刻返回，回填由 `_loop` 自己完成，下一 tick
         再取；期间策略显示「行情未就绪」，不影响界面。
         """
-        if kind == "k" and tq in self._serials:
+        if kind == "k" and self._kk(tq, duration_sec) in self._serials:
             return
         if kind == "q" and tq in self._quotes:
             return
+        d = int(duration_sec or 0) if kind == "k" else 0
         with self._cond:
             if self._api is None:
                 return                            # 没连上，投也没用
-            if (tq, kind) in self._pending:
+            if (tq, d, kind) in self._pending:
                 return
-            self._pending[(tq, kind)] = (int(duration_sec), int(length), kind)
+            self._pending[(tq, d, kind)] = (tq, d, int(length), kind)
 
-    def peek(self, tq: str, kind: str = "k"):
-        """取已经回填好的活引用（没回填就 None）。**不阻塞**。"""
+    def peek(self, tq: str, dur: int = 0, kind: str = "k"):
+        """取已经回填好的活引用（没回填就 None）。**不阻塞**。
+
+        `dur` 是**周期秒数**，K 线必传 —— 缓存按 (合约, 周期) 建键，不传等于
+        取「0 秒」那一档，永远拿不到东西。
+        """
         with self._cond:
-            return (self._serials if kind == "k" else self._quotes).get(tq)
+            if kind != "k":
+                return self._quotes.get(tq)
+            return self._serials.get(self._kk(tq, dur))
 
     def counts(self) -> tuple[int, int]:
         with self._cond:
@@ -375,9 +397,9 @@ class _Chan:
     def lock(self):
         return self._cond
 
-    def read_kline(self, tq: str, copy: bool = True):
+    def read_kline(self, tq: str, copy: bool = True, duration_sec: int = 0):
         with self._cond:
-            ser = self._serials.get(tq)
+            ser = self._serials.get(self._kk(tq, duration_sec))
             if ser is None:
                 return None
             return ser.copy() if copy else ser
@@ -679,17 +701,17 @@ class MarketFeed:
     def request_quote(self, tq: str) -> None:
         self.chan().request(tq, 0, 0, "q")
 
-    def peek_kline(self, tq: str):
-        return self.chan().peek(tq, "k")
+    def peek_kline(self, tq: str, duration_sec: int = 0):
+        return self.chan().peek(tq, duration_sec, "k")
 
     def peek_quote(self, tq: str):
-        return self.chan().peek(tq, "q")
+        return self.chan().peek(tq, 0, "q")
 
     def lock(self):
         return self.chan().lock()
 
-    def read_kline(self, tq: str, copy: bool = True):
-        return self.chan().read_kline(tq, copy)
+    def read_kline(self, tq: str, copy: bool = True, duration_sec: int = 0):
+        return self.chan().read_kline(tq, copy, duration_sec)
 
     def read_quote(self, tq: str):
         return self.chan().read_quote(tq)

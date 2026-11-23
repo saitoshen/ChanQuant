@@ -5810,10 +5810,14 @@ def _run() -> tuple[bool, list[str]]:
 
         if len(logs) != 1:
             raise RuntimeError(f"剔除提示应恰好 1 条，实际 {len(logs)} 条：{logs}")
-        if "1 个因子" not in logs[0] or "roll_main_oi@1d_tq" not in logs[0]:
-            raise RuntimeError(f"提示内容不对：{logs[0]}")
+        if "1/2 个因子参与合成" not in logs[0]:
+            raise RuntimeError(f"提示没说清「实际参与几个」：{logs[0]}")
+        if "roll_main_oi@1d_tq" not in logs[0]:
+            raise RuntimeError(f"提示没指出缺哪个因子：{logs[0]}")
 
-        # 一个都没少时不许吭声
+        # 一个都没少时**也要记一条**（"2/2 个因子参与合成"），但不该说「缺」。
+        # 集运欧线那次就是反过来的情形：实盘比回测**多**几票，日志里既没有剔除
+        # 也没有任何线索 —— 只有「实际参与几个」能让人回头去数回测那边。
         class _Full:
             class pack:                      # noqa: N801
                 fmat = pd.DataFrame(columns=keys)
@@ -5821,9 +5825,11 @@ def _run() -> tuple[bool, list[str]]:
         r._factor_warned.clear()
         seen = len(logs)
         r._note_dropped(_St(), keys, _Full())
-        if len(logs) != seen:
-            raise RuntimeError(f"没剔除还报了：{logs[seen:]}")
-        return f"剔除 1 个时报 1 条并去重：{logs[0][:30] if logs else logs}"
+        if len(logs) != seen + 1:
+            raise RuntimeError(f"一个都没剔也要记一条（否则没法比对两边列数）：{logs[seen:]}")
+        if "2/2 个因子参与合成" not in logs[-1] or "缺" in logs[-1]:
+            raise RuntimeError(f"全在时的提示不对：{logs[-1]}")
+        return f"剔除 1 个时报 1 条并去重、全在时记参与数：{logs[0][:30]}"
 
     check("实盘因子被剔除要提示", _live_dropped_note)
 
@@ -8112,6 +8118,100 @@ def _run() -> tuple[bool, list[str]]:
         return f"{n_live} 个周期可实时，2 日 / 周线明确挡在门外"
 
     check("实时周期门禁", _rt_periods)
+
+    def _feed_serial_keyed_by_period():
+        """行情源的 K 线缓存必须按 **(合约, 周期秒数)** 建键。
+
+        2026-11-23 用户报「棕榈油回测空仓、实盘理论 −2 手」。真因不是策略：
+        组合里另有一条 **1h** 的板块级策略，品种池含 `P_DCE`，它先订成功占住了
+        `_serials[tq]`；随后 `1d_tq` 的棕榈油槽位去取同一个 tq，**拿回的是那条
+        1h 序列**。`bars_from_serial` 于是给出小时线，帧尾多 5 根、末根从
+        `00:00` 变成 `14:00` —— 因子在小时线上重算，signal 从 0 翻成 −1。
+
+        只按合约建键的写法在界面上**完全看不出来**：不报错、不冲突、策略照跑。
+        这里钉三件事：
+        ① 同一合约的两个周期是不同的键；
+        ② 两条序列各自取得回来，互不覆盖；
+        ③ `bars_from_serial` 拿错序列时末根确实会变成小时线（反向证明这条
+           污染链是真的，而不是理论猜测）。
+        """
+        import pandas as pd
+        import threading
+
+        from ttrade import market_feed as MF
+        from ttrade.tqlive import bars_from_serial
+
+        # 缓存挂在**每条会话**（`_Chan`）上，不是 `MarketFeed` 那层门面上
+        kk = MF._Chan._kk
+        if kk("DCE.p2601", 300) == kk("DCE.p2601", 86400):
+            raise RuntimeError("同一合约的 5m 和 1d 是同一个缓存键 —— 会互相串号")
+        if kk("DCE.p2601", 300) != kk("DCE.p2601", 300):
+            raise RuntimeError("同一个 (合约, 周期) 两次算出的键不一样")
+
+        ch = MF._Chan.__new__(MF._Chan)   # 只测键和取，不连天勤
+        ch._cond = threading.RLock()
+        ch._serials = {}
+        ch._quotes = {}
+        ch._api = None
+        s5 = object()
+        s1d = object()
+        ch._serials[kk("DCE.p2601", 300)] = s5
+        ch._serials[kk("DCE.p2601", 86400)] = s1d
+        if ch.peek("DCE.p2601", 300) is not s5:
+            raise RuntimeError("按 5 分钟取不到自己的序列")
+        if ch.peek("DCE.p2601", 86400) is not s1d:
+            raise RuntimeError("按日线取到了别人的序列（串号没修好）")
+        if ch.peek("DCE.p2601", 3600) is not None:
+            raise RuntimeError("没订过的周期不该返回任何序列")
+
+        # 门面那层必须把周期原样转下去 —— 少传一个参数就退化成「0 秒」那一档，
+        # 键对上了也取不到东西（这种 bug 只有真实订阅时才暴露，最难查）
+        class _FakeChan:
+            def __init__(self):
+                self.seen = []
+
+            def request(self, tq, dur, length, kind="k"):
+                self.seen.append(("request", tq, dur, length, kind))
+
+            def peek(self, tq, dur=0, kind="k"):
+                self.seen.append(("peek", tq, dur, kind))
+                return "SER"
+
+            def read_kline(self, tq, copy=True, duration_sec=0):
+                self.seen.append(("read", tq, copy, duration_sec))
+                return None
+
+        fake = _FakeChan()
+        mf = MF.MarketFeed.__new__(MF.MarketFeed)
+        mf.chan = lambda source=None, _f=fake: _f     # type: ignore[method-assign]
+        mf.request_kline("DCE.p2601", 86400, 100)
+        if mf.peek_kline("DCE.p2601", 86400) != "SER":
+            raise RuntimeError("peek_kline 没把序列透传出来")
+        mf.read_kline("DCE.p2601", duration_sec=86400)
+        want = [("request", "DCE.p2601", 86400, 100, "k"),
+                ("peek", "DCE.p2601", 86400, "k"),
+                ("read", "DCE.p2601", True, 86400)]
+        if fake.seen != want:
+            raise RuntimeError(f"门面没把周期转下去：{fake.seen}（应 {want}）")
+
+        # ③ 反向证明：把小时线当成日线帧的尾巴，末根就是 14:00
+        t0 = pd.Timestamp("2026-11-23 02:00", tz="UTC")   # +8h = 北京 10:00
+        ser = pd.DataFrame({
+            "datetime": [int((t0 + pd.Timedelta(hours=k)).value) for k in range(5)],
+            "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+            "volume": 1.0, "open_oi": 1.0, "close_oi": 1.0,
+        })
+        got = bars_from_serial(ser, "1h")
+        last = got.index[-1] if len(got) else None
+        if last != pd.Timestamp("2026-11-23 14:00"):
+            raise RuntimeError(
+                f"小时线末根应为 14:00，实际 {last} —— 反证链不成立，"
+                "说明这个测试没复现出实盘那种帧")
+        return ("K 线缓存按 (合约, 周期秒数) 建键：5m 与 1d 不互相覆盖、"
+                "没订过的周期取回 None；串源时末根会从 00:00 变成 14:00"
+                "（日线策略按小时线算信号的那条链）")
+
+    check("行情源不串号（同合约多周期各订各的）", _feed_serial_keyed_by_period)
 
     def _bar_clock_alias():
         """`1d_tq` 必须和 `1d` 一样能判「半根」—— 否则日线策略拿未收盘的日线算信号。
@@ -11032,6 +11132,11 @@ def _run() -> tuple[bool, list[str]]:
             hedge_ok = (
                 win.box_fsel.parentWidget() is win.cross_factor_host
                 and win.box_factor.parentWidget() is win.cross_factor_host
+                # 因子参数整块在**第二步**（第一步只负责「选哪些品种」）
+                and win.box_fparams.parentWidget() is win.cross_fparam_host
+                # 截面对冲没有单腿进场，阈值一个都不该出现
+                and "entry_z" not in win.fparam_widgets
+                and "exit_z" not in win.fparam_widgets
                 and win.grp_timing.isHidden()
                 # 多空腿数只在第二步、只在截面对冲模式下出现
                 and not win.grp_legs.isHidden()
@@ -11085,12 +11190,23 @@ def _run() -> tuple[bool, list[str]]:
                 and "交易日" in win.lbl_cross_sum.text()
                 and p1_ok and p1_pick and p1_note and p1_back and lev_ok
             )
+            # 时序腿换成「因子」：阈值必须回来 —— 那条腿就是靠分数过阈值开平的。
+            # 截面对冲拿掉阈值是因为**没有这条腿**，不是「截面不用阈值」。
+            win.cb_timing.setCurrentIndex(win.cb_timing.findData("factor"))
+            app.processEvents()
+            tf_ok = ("entry_z" in win.fparam_widgets
+                     and "exit_z" in win.fparam_widgets
+                     and win.box_fparams.parentWidget() is win.cross_fparam_host)
+            win.cb_timing.setCurrentIndex(win.cb_timing.findData("rule"))
+            app.processEvents()
+            stage_ok = tf_ok
             win.cb_family.setCurrentIndex(win.cb_family.findData("rule"))
             app.processEvents()
             win.cross_dlg.close()
             back_ok = _order(side_lay) == before
-            cross_dlg_ok = hedge_ok and select_ok and back_ok
+            cross_dlg_ok = hedge_ok and select_ok and stage_ok and back_ok
             cross_dlg_info = (f"对冲 {hedge_ok} / 选品种 {select_ok} / "
+                              f"时序因子阈值回来 {stage_ok} / "
                               f"还回侧边栏 {back_ok} / 第一步周期 "
                               f"{p1_ok},{p1_pick},{p1_note},{p1_back} / 杠杆 {lev_ok}")
         except Exception as exc:  # noqa: BLE001
