@@ -116,6 +116,16 @@ def available(kind: str) -> tuple[bool, str]:
         libs = os.path.join(vendor_dir(), "openctp_ctp.libs")
         if not os.path.isdir(libs):
             return False, f"没有融航 DLL 目录（缺 {libs}）"
+        # 🔴 vendor 里装的是 Windows 的 .pyd + .dll（融航中台只给 Windows 客户端）。
+        # `available()` 只数文件存不存在，而 macOS / Linux 上这些文件**一个不少**
+        # ——所以上面两条检查照样通过，真正炸的地方在 `_load_vendored()`：
+        # import 一个 PE 文件，报的是 `No module named 'openctp_ctp'` 这种
+        # 完全看不出原因的话（2026-11-23 CI：macOS x64 的自检就是这么红的）。
+        # 平台不对必须在这里就刹住，报人话。
+        if not sys.platform.startswith("win"):
+            return False, (
+                f"融航的 CTP 运行时是 Windows 版（.pyd），当前平台 "
+                f"{sys.platform} 加载不了 —— 只有 Windows 发布包带这个通道")
         # ABI 必须对得上。vendor 里的 .pyd 是按某个 Python 大版本编的
         # （cp314 依赖 python314.dll），跨版本只会得到一句
         # `DLL load failed while importing _thosttraderapi`，看不出所以然

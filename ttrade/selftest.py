@@ -8215,6 +8215,25 @@ def _run() -> tuple[bool, list[str]]:
 
     check("CTP 客户端（可选依赖）", _ctp)
 
+    def _opt_runtime(kind: str, what: str) -> str:
+        """可选运行时缺了怎么办：Windows 上必须红，其它平台跳过。
+
+        macOS 上 `openctp-ctp` 根本没有 wheel（CI 第 6 步在 macOS 是 skipped），
+        融航的 vendor 又只有 Windows 的 .pyd —— 这两样在 macOS 上一定拿不到。
+        2026-11-23 加「两套 dll 同进程」那条自检时忘了分平台，macOS x64 直接红在
+        `No module named 'openctp_ctp'`，整个 run 判失败，三个平台的包全被 Release
+        扣住（Windows 已经打好了也发不出去）。但在 Windows 上缺了就是真事故
+        ——发布包本该带它，静默跳过等于把护栏拆了。
+        """
+        from ttrade import ctp_channel
+
+        ok, why = ctp_channel.available(kind)
+        if ok:
+            return ""
+        if sys.platform.startswith("win"):
+            raise RuntimeError(f"{what}缺失（Windows 上发布包必须带它）：{why}")
+        return f"跳过：{what}在当前平台拿不到（{why}）"
+
     def _rohon():
         """融航资管中台：和 CTP 一样是可选依赖，没装必须优雅降级。
 
@@ -8240,9 +8259,9 @@ def _run() -> tuple[bool, list[str]]:
         assert _tcp_addr("tcp://1.2.3.4:1000") == "tcp://1.2.3.4:1000"
         assert _tcp_addr("  ") == "", "空地址被补成了 tcp://"
 
-        ok, why = ctp_channel.available("rohon")
-        if not ok:
-            raise RuntimeError(f"融航运行时缺失：{why}")
+        skip = _opt_runtime("rohon", "融航运行时")
+        if skip:
+            return skip
 
         # 配置构造：**不能走 fill_preset**。走了的话，交易前置漏填会被
         # SimNow 预设悄悄补成 182.254.243.31，融航 dll 一 connect 就段错误
@@ -8383,9 +8402,14 @@ def _run() -> tuple[bool, list[str]]:
         from ttrade import ctp_channel
         from ttrade import ctp_client as C
 
-        ok, why = ctp_channel.available("rohon")
-        if not ok:
-            raise RuntimeError(f"融航运行时缺失，这条验不了：{why}")
+        # 🔴 两家都得真装齐才验得了。macOS 上 `openctp-ctp` 没有 wheel、
+        # 融航 vendor 只有 Windows 的 .pyd —— 少一家就不是「同进程共存」的场景，
+        # 直接跳过（`_opt_runtime` 在 Windows 上照样会红）
+        for kind, what in (("rohon", "融航运行时"),
+                           ("ctp", "标准 CTP 运行时（openctp-ctp）")):
+            skip = _opt_runtime(kind, what)
+            if skip:
+                return skip
 
         # ① 两家都要能拿到，而且是**不同**的模块对象
         md_c, td_c = ctp_channel.load("ctp")
