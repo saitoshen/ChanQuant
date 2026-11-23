@@ -543,10 +543,17 @@ def _f(v) -> float:
 
 
 def _flow_dir() -> str:
-    """CTP 的流文件目录。必须存在且可写，否则 Init() 直接崩。"""
+    """CTP 的流文件目录。必须存在且可写，否则 Init() 直接崩。
+
+    🔴 用 `cache_dir("ctp")` 而不是 `cache_dir()`：后者默认是 **`cache/mpl`**，
+    也就是 matplotlib 的字体缓存目录。真出现字体问题时的标准动作是「把
+    `cache/mpl` 删掉重开」—— 那会连**正在跑的会话**的 `td_*.con` 一起删掉，
+    CTP 对这类文件消失没有任何恢复能力，下一次写就是访问违例。
+    流文件和别人的缓存不能住在同一个目录里。
+    """
     from ttrade.paths import cache_dir
 
-    d = os.path.join(cache_dir(), "ctp_flow")
+    d = os.path.join(cache_dir("ctp"), "ctp_flow")
     os.makedirs(d, exist_ok=True)
     return d
 
