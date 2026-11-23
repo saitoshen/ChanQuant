@@ -618,11 +618,19 @@ class PortfolioRunner:
     """
 
     def __init__(self, spec: AccountSpec | None = None,
-                 chase: SStore.ChaseConfig | None = None) -> None:
+                 chase: SStore.ChaseConfig | None = None,
+                 monitor: SStore.MonitorConfig | None = None) -> None:
         # 账户可以为空：`spec` 表达的是「绑定了哪个户」，`api` 表达的是「现在
         # 连没连上」。两者分开之后，账户登出不会把策略一起带走。
         self.spec = spec
         self.chase = chase or SStore.load_chase()
+        #: 监控器（一键对齐）多久重读一次账户。走 property，**改完立刻生效**
+        self._monitor = monitor or SStore.load_monitor()
+        # 监控器（一键对齐）多久重读一次账户。见 `MonitorConfig` / `wait()`
+        self._acct_sec = max(1.0, min(60.0, float(
+            getattr(self._monitor, "refresh_sec", 5) or 5)))
+        # 上一次真的重读账户的时刻（单调钟）。0 = 还没读过，第一次立刻读
+        self._acct_at = 0.0
         #: 交易连接（账户）。None = 没绑定 / 已登出 —— **策略照跑**。
         self.api = None
         #: 行情连接（全局共享，跨账户跨策略一份）。`start()` 里**先起它**。
@@ -838,6 +846,28 @@ class PortfolioRunner:
                 self._log(f"  {res.failed} 天失败，下次启动会再试")
         except Exception as exc:  # noqa: BLE001
             self._log(f"衍生数据补充失败（{type(exc).__name__}: {exc}），先用本地快照")
+
+    # ---- 监控设置（一键对齐的刷新周期） ----
+
+    @property
+    def monitor(self) -> "SStore.MonitorConfig":
+        """界面「监控设置」里的那份配置（`refresh_sec` = 账户重读周期）。"""
+        return self._monitor
+
+    @monitor.setter
+    def monitor(self, cfg) -> None:
+        """改完**立刻生效**，不用重启策略。
+
+        界面那边是 `setattr(runner, "monitor", cfg)`（见 `PortfolioController.
+        set_chase` 的同一套写法），所以节流用的 `_acct_sec` 必须在这里一起换 ——
+        只换 `_monitor` 的话用户改完看不到任何变化，会以为按钮坏了。
+        """
+        self._monitor = cfg
+        try:
+            self._acct_sec = max(1.0, min(60.0, float(
+                getattr(cfg, "refresh_sec", 5) or 5)))
+        except (TypeError, ValueError):
+            self._acct_sec = 5.0
 
     def start(self) -> None:
         """起行情 → 起账户（可选）。**行情失败不该挡住策略**。
@@ -1302,7 +1332,7 @@ class PortfolioRunner:
     # ---- 推进 ----
 
     def wait(self, timeout: float = 0.8) -> bool:
-        """驱动一次：行情推一步，**账户也推一步**。
+        """驱动一次：行情推一步，**账户按周期也推一步**。
 
         行情走全局 `MarketFeed`（跨账户跨策略一份），账户走 `self.api` ——
         两者是两件事，缺一条就少一半。🔴 2026-11-23 用户报「一键对齐发了单、
@@ -1310,6 +1340,9 @@ class PortfolioRunner:
         `BrokerApi.wait_update()` 除了 `start()` 里那一次再没被调过，持仓 / 委托
         / 资金全冻在「连上账户那一刻」（`[MM]` 那句「已经不一致 122 秒」＝连接
         至今），对齐单的柜台回报其实早到了，只是没人去读 `snapshot()`。
+
+        账户这一步按 `_acct_sec`（默认 5 秒，「监控设置」可改）节流，不是每轮都推：
+        柜台「每秒一个查询」和报单共用同一个名额，推太密只会和报单抢。
         """
         if self.feed is None:
             return False
@@ -1324,12 +1357,21 @@ class PortfolioRunner:
         # 账户：只对柜台（`BrokerApi`）推。天勤那条 `TqApi` 自己有后台线程在
         # 收数据，`get_position()` 就是活引用，不需要（也不能）在这里再
         # `wait_update()` —— 那会把同一个 TqApi 从两个线程驱动。
+        #
+        # 🔴 按 `_acct_sec` 节流（默认 5 秒，界面「监控设置」可改）。为什么不是
+        # 每个循环都推：柜台限制「同一会话每秒一个查询，和报单共用」，
+        # 太快只会和报单抢名额；而监控比对用几秒前的持仓完全够。
+        # 点「刷新」走 `refresh_now()`，不受这里限制。
         refresh = getattr(self.api, "refresh_account", None)
         if refresh is not None:
-            try:
-                refresh()
-            except Exception as exc:  # noqa: BLE001 - 查询失败不能拖累调仓
-                self.last_error = f"{type(exc).__name__}: {exc}"
+            sec = float(getattr(self, "_acct_sec", 0.0) or 0.0)
+            now = time.monotonic()
+            if now - getattr(self, "_acct_at", 0.0) >= sec:
+                self._acct_at = now
+                try:
+                    refresh()
+                except Exception as exc:  # noqa: BLE001 - 查询失败不能拖累调仓
+                    self.last_error = f"{type(exc).__name__}: {exc}"
         try:
             return bool(self.feed.wait(timeout))
         except Exception as exc:  # noqa: BLE001
@@ -3894,12 +3936,18 @@ class PortfolioRunner:
             margin = 0.0
         hint = ("（占用保证金 %.0f 却一条持仓都没读到 —— 这不是「没仓」，"
                 "是柜台没把持仓给这条连接）" % margin) if margin > 0 else ""
+        # 有一轮收到了半截 / 有几轮有开头没结尾（柜台丢包）。这两个数只在这里
+        # 才有意义：`positions` 现在**只存收全的整轮**，所以「少一个合约」不可能
+        # 再是半份表造成的，只可能是柜台这轮真没给（或查询被丢了）
+        partial = "、正在收一轮（还没收全）" if getattr(trader, "_pos_stage", None) is not None else ""
+        dropped = int(getattr(trader, "_pos_dropped", 0) or 0)
         self._diagw("POS", (
             f"{who} 的持仓已经 {now - since:.0f} 秒没从柜台读到："
             f"发过 {int(getattr(hub, '_pos_try', 0) or 0)} 拍持仓查询、"
             f"positions_loaded={bool(getattr(trader, 'positions_loaded', False))}、"
             f"最近一轮回包 {int(getattr(trader, '_pos_rows', -1) or 0)} 行、"
-            f"_pos 里 {len(self._pos or {})} 个合约"
+            f"_pos 里 {len(self._pos or {})} 个合约、"
+            f"丢包 {dropped} 轮{partial}"
             f" ｜ 柜台最后一句：{err}{hint}"
             " ｜ 只要还在这个状态，界面上所有「一致」都不作数"
             "（不是比对算错，是一条持仓都没读到）"))

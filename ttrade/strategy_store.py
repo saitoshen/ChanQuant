@@ -1214,3 +1214,53 @@ def load_chase() -> ChaseConfig:
 
 def save_chase(cfg: ChaseConfig) -> None:
     _save(CHASE_FILE, cfg.to_dict())
+
+
+# ------------------------------------------------------------------ 监控设置
+
+
+@dataclass
+class MonitorConfig:
+    """监控器 / 一键对齐的**账户刷新周期**（用户 2026-11-23 要求）。
+
+    原话：「一键对齐的刷新时间改为每 5 秒刷新一次，增加一个监控设置按钮，
+    可以设置一键对齐的刷新时间，目前 1-2 秒太少」。
+
+    🔴 为什么不能太快：柜台限制「同一会话每秒最多**一个**查询，查询和报单共用
+    这一个名额」。早先组合页是 0.8 秒一轮 + 1 Hz 闸门（资金/持仓交替 ⇒ 持仓约
+    2 秒一轮），账户一多、策略一密集发单，查询就会和报单抢名额 —— 抢输的往往
+    是报单（`_last_order_ts` 只能让查询主动退一步，退不干净）。而监控比对用
+    「几秒前」的持仓完全够：差额是给人做决策用的，不是拿去做高频控制。
+
+    要「此刻就准」有「刷新」按钮，它走 `refresh_now()`，**不受这个周期限制**。
+    """
+
+    refresh_sec: int = 5
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MonitorConfig":
+        keep = {k: v for k, v in (d or {}).items() if k in cls.__dataclass_fields__}
+        cfg = cls(**keep)
+        # 1 秒是柜台允许的下限，60 秒再慢就没意义了（那时候刷新按钮都嫌烦）
+        cfg.refresh_sec = max(1, min(60, int(cfg.refresh_sec or 5)))
+        return cfg
+
+
+MONITOR_FILE = "monitor.json"
+
+
+def load_monitor() -> MonitorConfig:
+    raw = _load(MONITOR_FILE)
+    if isinstance(raw, dict) and raw:
+        try:
+            return MonitorConfig.from_dict(raw)
+        except Exception:  # noqa: BLE001
+            pass
+    return MonitorConfig()
+
+
+def save_monitor(cfg: MonitorConfig) -> None:
+    _save(MONITOR_FILE, cfg.to_dict())

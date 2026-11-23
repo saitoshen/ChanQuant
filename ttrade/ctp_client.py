@@ -481,13 +481,24 @@ class TraderClient:
         self._settle_warn = 0.0
         self.orders: dict[str, dict] = {}
         self.trades: dict[str, dict] = {}
+        #: **最近一次收全的整轮**持仓，对外只读这一份，绝不原地清空。
+        #: 理由见下面 `_pos_stage`（2026-11-23「有时 5 行、有时 4 行」）。
         self.positions: dict[str, dict] = {}
         # 持仓查询的「代」。CTP 的 OnRspQryInvestorPosition 是一条一条推的，
         # 一整轮才凑出完整快照，所以**不能**在发请求时就把 positions 清掉 ——
         # 界面会看到半份/空仓，策略那边更会以为账户没仓而重复开仓。
-        # 这里只记「这一轮的第一条回调到了没有」：到了才清，之后整轮往里累加。
+        # 🔴 也不能「开轮就地清、之后原地累加」（早先那版）：从清表到最后一包
+        # 之间的任何一次 `snapshot()` 读到的都是**半份持仓** —— 5 个合约掉成
+        # 4 个，掉的那个恰好是还没到的那一包，而 `positions_loaded` 还是真，
+        # 引擎于是拿半份表去 `mismatch()`，把缺的合约当成「账户没有」。
+        # 现在两级：`_pos_stage` 收，收满（`bIsLast`）才整份替换 `positions`。
+        self._pos_stage: dict[str, dict] | None = None
+        self._pos_stage_req = -1      # stage 属于哪一轮
+        self._pos_stage_rows = 0      # stage 收了几行（诊断用）
+        self._pos_done_req = -1       # 最后一次成功提交的轮（挡重复的 `bIsLast`）
+        self._pos_dropped = 0         # 有开头没结尾的轮数（柜台丢包，诊断用）
         self._pos_req = -1            # 当前这轮查询的 RequestID
-        self._pos_started = True      # 本轮是否已经清过（True=没有进行中的查询）
+        self._pos_rows = 0            # 最近**收全**的那轮有几行（诊断用）
         self.account: dict = {}
         self.instruments: dict[str, dict] = {}
         # 当日委托 / 成交的**历史**查到没有。柜台只在登录之后推
@@ -791,9 +802,13 @@ class TraderClient:
         req.BrokerID = self.cfg.broker_id
         req.InvestorID = self.cfg.user_id
         rid = self._next_req()
+        # 上一轮还没收到 `bIsLast` 就又发了新一轮：那一轮作废（计数只用于诊断）。
+        # **不在这里清 `positions`** —— 清表只和「整份替换」一起发生。
         with self._lock:
+            if self._pos_stage is not None:
+                self._pos_dropped += 1
+                self._pos_stage = None
             self._pos_req = rid
-            self._pos_started = False
         self._qry_note("持仓", self.api.ReqQryInvestorPosition(req, rid))
 
     def query_orders(self) -> None:
@@ -863,6 +878,12 @@ class TraderClient:
                 # 那一轮是什么时候回来的。「读到过」和「刚才读过」是两件事，
                 # 界面要拿它判手上这份持仓有多旧（见 `POS_STALE_SEC`）
                 "pos_at": self.pos_at,
+                # 有一轮正在收（还没到 `bIsLast`）。诊断用：此时对外那份仍是
+                # 上一轮的**完整**快照，不代表「少了一个合约」
+                "pos_partial": self._pos_stage is not None,
+                # 有开头没结尾的轮数（柜台丢包 / 被流控吃掉）。一直涨说明查询在丢
+                "pos_dropped": self._pos_dropped,
+                "pos_rows": self._pos_rows,
                 "orders_loaded": self.orders_loaded,
                 "trades_loaded": self.trades_loaded,
             }
@@ -1098,35 +1119,55 @@ class TraderClient:
                 if err:
                     outer.last_error = f"查持仓失败：{err}"
                     return
-                # 🔴 这一轮的第一条回调（哪怕内容为 None，空仓时就是这样）先把上一轮
-                # 的清掉，然后整轮往里累加。CTP 一次查询会推**多条**：同一合约同一
-                # 方向按今仓 / 昨仓 / 不同开仓日期拆成好几条，`Position` 只是那一条
-                # 的量。以前用 `=` 赋值，后一条把前一条盖掉 ——
-                #   · 今仓盖掉昨仓（或反过来）⇒ 持仓手数少算，界面上「好几笔成交
-                #     都没出现在持仓里」，极端情况下一条 0 手的已平记录把整行清零；
-                #   · 浮盈 / 保证金用的是 `+=`，却又从不重置 ⇒ 每查一轮叠一遍，
-                #     跑一小时就放大成千上万倍（用户看到「多了几个 0」，收盘后还在涨）。
-                with outer._lock:
-                    if nRequestID == outer._pos_req and not outer._pos_started:
-                        outer.positions.clear()
-                        outer._pos_started = True
-                if pInvestorPosition is None:
-                    # 空仓时柜台只回一条空包（`bIsLast=True`、内容为 None）。
-                    # 「查完了、确实一条持仓都没有」是有效结论，必须置真 ——
-                    # 否则界面永远停在「还没读到」，真有仓了也不敢说一致
-                    if bIsLast:
-                        outer.positions_loaded = True
-                        outer.pos_at = time.time()
+                # 🔴 **整轮收满才提交**（`_pos_stage` → `positions`），清表只和
+                # 「整份替换」一起发生。早先是「这一轮的第一条回调先把上一轮清掉，
+                # 之后原地累加」—— 从清表到 `bIsLast` 之间的任何一次 `snapshot()`
+                # 读到的都是**半份持仓**：5 个合约掉成 4 个，掉的那个恰好是还没到
+                # 的那一包（2026-11-23「融航有时正常、有时少一个品种」的真因）。
+                # 更糟的是 `positions_loaded` 一直为真 ⇒ 引擎拿半份表去 `mismatch()`
+                # ⇒ 缺的合约被判成「账户没有」⇒ 一键对齐再发一笔单。
+                #
+                # CTP 一次查询会推**多条**：同一合约同一方向按今仓 / 昨仓 / 不同
+                # 开仓日期拆成好几条，`Position` 只是那一条的量，所以 stage 里
+                # 一律 `+=`（不能赋值，赋值会把前一条盖掉，持仓手数直接少一半）。
+                try:
+                    rid = int(nRequestID or 0)
+                except (TypeError, ValueError):
+                    rid = 0
+                # 只认当前这一轮：上一轮迟到的尾巴不许污染新一轮
+                if rid and outer._pos_req > 0 and rid != outer._pos_req:
                     return
-                # 兜底：主探针在 `OnRspQryTradingAccount`（空仓时持仓查询只回空包，
-                # 探不到日期）。这里再补一刀，多重保险且不会重复确认 ——
-                # `_note_trading_day` 更新完 `trading_day` 之后，第二个调用方就相等了
-                outer._note_trading_day(_s(getattr(pInvestorPosition, "TradingDay", "")))
-                ins = _s(pInvestorPosition.InstrumentID)
-                pos_dir = _s(getattr(pInvestorPosition, "PosiDirection", ""))
-                side = {"2": "long", "3": "short"}.get(pos_dir, "net")
                 with outer._lock:
-                    row = outer.positions.setdefault(
+                    if not rid:
+                        rid = outer._pos_req
+                    # 同一轮只提交一次（重复的 `bIsLast` 会把表刷成空）
+                    if rid >= 0 and rid == outer._pos_done_req:
+                        return
+                    if outer._pos_stage is None or outer._pos_stage_req != rid:
+                        # 开新一轮：拿一个空 stage，**不动**对外那份 `positions`
+                        outer._pos_stage = {}
+                        outer._pos_stage_req = rid
+                        outer._pos_stage_rows = 0
+                    if pInvestorPosition is None:
+                        # 空仓时柜台只回一条空包（`bIsLast=True`、内容为 None）。
+                        # 「查完了、确实一条持仓都没有」是有效结论，必须提交并置真
+                        # —— 否则界面永远停在「还没读到」，真有仓了也不敢说一致
+                        if bIsLast:
+                            outer.positions = outer._pos_stage
+                            outer._pos_stage = None
+                            outer._pos_done_req = rid
+                            outer.positions_loaded = True
+                            outer.pos_at = time.time()
+                            outer._pos_rows = len(outer.positions)
+                        return
+                    # 兜底：主探针在 `OnRspQryTradingAccount`（空仓时持仓查询只回空包，
+                    # 探不到日期）。这里再补一刀，多重保险且不会重复确认 ——
+                    # `_note_trading_day` 更新完 `trading_day` 之后，第二个调用方就相等了
+                    outer._note_trading_day(_s(getattr(pInvestorPosition, "TradingDay", "")))
+                    ins = _s(pInvestorPosition.InstrumentID)
+                    pos_dir = _s(getattr(pInvestorPosition, "PosiDirection", ""))
+                    side = {"2": "long", "3": "short"}.get(pos_dir, "net")
+                    row = outer._pos_stage.setdefault(
                         ins, {"instrument": ins, "long": 0, "short": 0,
                               "long_yd": 0, "short_yd": 0,
                               "long_today": 0, "short_today": 0,
@@ -1157,9 +1198,15 @@ class TraderClient:
                         row["cost_short"] += oc
                     row["profit"] += _f(getattr(pInvestorPosition, "PositionProfit", 0))
                     row["margin"] += _f(getattr(pInvestorPosition, "UseMargin", 0))
-                if bIsLast:
-                    outer.positions_loaded = True
-                    outer.pos_at = time.time()
+                    outer._pos_stage_rows += 1
+                    if bIsLast:
+                        # 整轮收满：这一瞬间才把旧表换掉（外界读不到半份）
+                        outer.positions = outer._pos_stage
+                        outer._pos_stage = None
+                        outer._pos_done_req = rid
+                        outer.positions_loaded = True
+                        outer.pos_at = time.time()
+                        outer._pos_rows = len(outer.positions)
 
             def OnRspQryOrder(self, pOrder, pRspInfo, nRequestID, bIsLast):  # noqa: N802
                 """补查回来的当日委托。

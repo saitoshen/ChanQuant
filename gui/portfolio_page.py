@@ -562,12 +562,14 @@ class RunnerWorker(QObject):
     log = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, key: str, spec, cfgs: list, chase) -> None:
+    def __init__(self, key: str, spec, cfgs: list, chase, monitor=None) -> None:
         super().__init__()
         self.key = key
         self.spec = spec
         self.cfgs = cfgs
         self.chase = chase
+        # 监控设置（账户重读周期）。None = runner 自己去 `monitor.json` 读
+        self.monitor = monitor
         self._stop = False
         self._queue: queue.Queue = queue.Queue()
 
@@ -578,7 +580,7 @@ class RunnerWorker(QObject):
         self._stop = True
 
     def run(self) -> None:
-        runner = PortfolioRunner(self.spec, self.chase)
+        runner = PortfolioRunner(self.spec, self.chase, self.monitor)
         for cfg in self.cfgs:
             runner.add(cfg)
         runner.on_log(self.log.emit)
@@ -648,7 +650,7 @@ class PortfolioController(QObject):
     def keys(self) -> list[str]:
         return list(self._workers)
 
-    def start(self, spec, cfgs: list, chase) -> None:
+    def start(self, spec, cfgs: list, chase, monitor=None) -> None:
         """起一条 runner。`spec` 可以为 None —— **没接账户也能起策略**。
 
         2026-11-20 起账户只是「最后一步」：行情走全局 `MarketFeed`，账户只负责
@@ -658,7 +660,7 @@ class PortfolioController(QObject):
         key = spec.name if spec is not None else NO_ACCOUNT_KEY
         if key in self._workers:
             return
-        worker = RunnerWorker(key, spec, cfgs, chase)
+        worker = RunnerWorker(key, spec, cfgs, chase, monitor)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -761,6 +763,17 @@ class PortfolioController(QObject):
         for key in list(self._workers):
             self._submit(key, lambda r, c=chase: setattr(r, "chase", c))
 
+    def set_monitor(self, monitor) -> None:
+        """把「监控设置」下发给每条正在跑的 runner（改完立刻生效）。
+
+        `_submit` 的回调拿到的是 **runner** 本体（`fn(runner)`），不是 worker，
+        所以这里 `setattr` 直接改到跑着的那条实例上 —— `PortfolioRunner.monitor`
+        的 setter 会顺手换掉节流用的 `_acct_sec`。只写文件的话，用户点完「确定」
+        界面上什么都不会变，只能重启策略才生效。
+        """
+        for key in list(self._workers):
+            self._submit(key, lambda r, c=monitor: setattr(r, "monitor", c))
+
 
 # ------------------------------------------------------------------ 对话框
 
@@ -824,6 +837,61 @@ class WatchDialog(QDialog):
         """勾上的账户名（保持列表顺序）。"""
         return [self.lst.item(i).text() for i in range(self.lst.count())
                 if self.lst.item(i).checkState() == Qt.Checked]
+
+
+class MonitorDialog(QDialog):
+    """监控设置：账户（= 一键对齐的差额）**多久重读一次**。
+
+    用户原话（2026-11-23）：「一键对齐的刷新时间改为每 5 秒刷新一次，增加一个
+    监控设置按钮，可以设置一键对齐的刷新时间，目前 1-2 秒太少。」
+
+    🔴 为什么默认 5 秒、为什么下限是 1 秒：柜台限制同一会话「每秒最多一个查询」，
+    而且**查询和报单共用这一个名额**。周期压到 1~2 秒时，账户一多、策略一密集
+    发单，查询就会和报单抢 —— 抢输的常常是报单（表现成「点了没反应 / 单子晚到」）。
+    监控比对用「几秒前」的持仓完全够，差额是给人做决策的。
+
+    要「此刻就准」有监控器上的「刷新」按钮，它走 `refresh_now()`，不受这个周期
+    限制 —— 所以这里不需要把周期调得很小。
+    """
+
+    def __init__(self, cfg, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("监控设置")
+        self.setMinimumWidth(430)
+        lay = QVBoxLayout(self)
+
+        tip = QLabel("监控器（含「一键对齐」算差额）**多久重新读一次账户**。")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("每"))
+        self.sp_sec = QSpinBox()
+        self.sp_sec.setRange(1, 60)
+        self.sp_sec.setSuffix(" 秒")
+        self.sp_sec.setMinimumWidth(90)
+        self.sp_sec.setValue(max(1, min(60, int(getattr(cfg, "refresh_sec", 5) or 5))))
+        row.addWidget(self.sp_sec)
+        row.addWidget(QLabel("重读一次账户"))
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        hint = QLabel(
+            "提醒：柜台每秒只受理**一个**查询，而且查询和报单共用这个名额。\n"
+            "周期调到 1~2 秒，账户一多就会和报单抢，单子可能晚到甚至被流控挡掉；\n"
+            "5 秒是「够新」和「不添乱」的折中。\n"
+            "要立刻看准数，点监控器上的「刷新」—— 它不受这个周期限制。")
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def refresh_sec(self) -> int:
+        return max(1, min(60, int(self.sp_sec.value())))
 
 
 class LibraryDialog(QDialog):
@@ -1380,6 +1448,9 @@ class PortfolioPage(QWidget):
         self._ms_worker = None
         self._accounts = tqlive.load_accounts()
         self._chase = SStore.load_chase()
+        # 监控设置：账户多久重读一次（用户 2026-11-23）。落 `monitor.json`，
+        # 引擎起来时也从这里读 —— 界面上改完立刻下发到在跑的 runner
+        self._monitor = SStore.load_monitor()
         self._snaps: dict[str, dict] = {}
         # 监控范围：只盯着这几个账户（空 = 全监控）。用户 2026-11-23 要求
         # 「配置需要选择监控哪个账户，没有选的账户就不做监控」。
@@ -1437,6 +1508,7 @@ class PortfolioPage(QWidget):
         self._build()
         self._load_chase_widgets()
         self._chase_hint(self._chase)
+        self._monitor_hint()
         self.reload()
 
         self.ctl.snapshot.connect(self._on_snapshot)
@@ -1803,6 +1875,16 @@ class PortfolioPage(QWidget):
         btn_watch.clicked.connect(self._pick_watch)
         head.addWidget(btn_watch)
 
+        # 监控设置：账户多久重读一次（用户 2026-11-23 要求）。
+        # 原话「一键对齐的刷新时间改为每 5 秒刷新一次……目前 1-2 秒太少」——
+        # 太快会和报单抢「每秒一个查询」的名额，见 `MonitorConfig`。
+        btn_mon = QPushButton("监控设置")
+        btn_mon.setToolTip("设置监控器 / 一键对齐**多久重读一次账户**（1~60 秒）。\n"
+                           "太快会和报单抢柜台的查询名额，默认 5 秒。\n"
+                           "要「此刻就准」请点「刷新」，它不受这个周期限制")
+        btn_mon.clicked.connect(self._pick_monitor)
+        head.addWidget(btn_mon)
+
         # 多账户时同一个合约会在两张连接里各出现一次，必须带上账户才分得清
         self.tbl_mon = self._table(
             ["账户", "合约", "策略理论", "账户实际", "差额", "说明"], stretch=5
@@ -1813,6 +1895,12 @@ class PortfolioPage(QWidget):
         self.lbl_mon.setObjectName("Hint")
         self.lbl_mon.setWordWrap(True)
         lay.addWidget(self.lbl_mon)
+
+        # 当前的重读周期。用户调过之后必须看得见，否则「怎么还是 5 秒」
+        self.lbl_mon_sec = QLabel("")
+        self.lbl_mon_sec.setObjectName("Hint")
+        self.lbl_mon_sec.setWordWrap(True)
+        lay.addWidget(self.lbl_mon_sec)
         return card
 
     def _build_chase_card(self) -> QWidget:
@@ -3743,7 +3831,7 @@ class PortfolioPage(QWidget):
                 continue
             # 没绑账户的那组传 None：runner 照常算信号，只是不报单
             spec = None if name == NO_ACCOUNT_KEY else self._spec(name)
-            self.ctl.start(spec, cfgs, self._chase)
+            self.ctl.start(spec, cfgs, self._chase, self._monitor)
             newly += 1
         if newly:
             self._on_log(f"启动 {newly} 个账户的连接，共 "
@@ -3869,7 +3957,7 @@ class PortfolioPage(QWidget):
                         self._save_cfg(cfg)
                         self._on_failed(f"账户「{key}」已不存在，请重新绑定")
                         return
-                    self.ctl.start(spec, [cfg], self._chase)
+                    self.ctl.start(spec, [cfg], self._chase, self._monitor)
                     self._on_log(f"已单独启动「{cfg.title()}」（账户 {key}）")
                     self._warn_solo_start(key, cfg)
                     continue
@@ -4169,6 +4257,39 @@ class PortfolioPage(QWidget):
         self._on_log("监控账户：" + ("全部账户" if not self._watch else "、".join(self._watch)))
 
     # ---------------------------------------------------------- 对齐
+
+    def _pick_monitor(self) -> None:
+        """「监控设置」：设置监控器多久重读一次账户（= 一键对齐算差额的频率）。
+
+        改完**立刻生效**，不用重启策略：`ctl.set_monitor()` 会把新配置塞进每条
+        正在跑的 runner，`PortfolioRunner.monitor` 的 setter 同时换掉节流用的
+        `_acct_sec`（只存文件不换节奏的话，用户改完看不到任何变化）。
+        """
+        dlg = MonitorDialog(self._monitor, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        sec = dlg.refresh_sec()
+        old = int(getattr(self._monitor, "refresh_sec", 5) or 5)
+        self._monitor = SStore.MonitorConfig(refresh_sec=sec)
+        try:
+            SStore.save_monitor(self._monitor)
+        except Exception as exc:  # noqa: BLE001
+            self._on_failed(f"监控设置没存下来：{type(exc).__name__}: {exc}")
+        self.ctl.set_monitor(self._monitor)
+        self._monitor_hint()
+        if sec == old:
+            self._on_log(f"监控设置没变：账户仍每 {sec} 秒重读一次")
+        else:
+            self._on_log(f"监控设置已改成每 {sec} 秒重读一次账户（立刻生效，"
+                         f"之前是 {old} 秒）")
+
+    def _monitor_hint(self) -> None:
+        """把周期写进监控器底下那行提示，省得用户忘了自己调过。"""
+        lbl = getattr(self, "lbl_mon_sec", None)
+        if lbl is None:
+            return
+        sec = int(getattr(self._monitor, "refresh_sec", 5) or 5)
+        lbl.setText(f"账户每 {sec} 秒重读一次（「监控设置」可改；要立刻看准数点「刷新」）")
 
     def _align(self) -> None:
         """把账户仓位摆成和策略列表完全一致。**会平掉没有策略在管的仓位**。"""

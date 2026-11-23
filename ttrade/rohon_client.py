@@ -391,19 +391,37 @@ class RohonTraderClient:
         self.last_error = ""
         self.orders: dict[str, dict] = {}
         self.trades: dict[str, dict] = {}
+        #: **最近一次收全的整轮**持仓。只整份替换，绝不原地清空 —— 理由见
+        #: `_pos_stage` 那段（2026-11-23「有时 5 行、有时 4 行」）。
         self.positions: dict[str, dict] = {}
         # 有没有**完整**读回来过一轮持仓（`bIsLast` 那一包到了才算）。
         # 🔴 和 CTP 上那份同一个语义（见 `ctp_client` 里 2026-11-23 融航那次）：
         # 「空表」既可能是真没仓，也可能是柜台还没回 —— 后者不能拿去做对齐。
         self.positions_loaded = False
-        # 🔴 持仓查询的「代」：柜台一秒一个查询，上一轮的回包可能迟到现在才到；
-        # 不认 RequestID 的话，它的 `last` 会把新一轮当成自己的整份快照提交。
-        # 2026-11-23 那些「交易页有 7 个合约、监控器全是 0」就是这一路丢的。
-        # 语义和 `ctp_client.TraderClient` 完全一致：**开轮清一次、之后原地累加**，
-        # 不再攒 buf 整份替换（替换版一旦被多余的 `last` 空包碰上就把表刷成空的）。
+        # 🔴🔴 持仓表是**两级**的（2026-11-23 用户：「有时候显示正确的持仓，
+        # 有时会少一些持仓品种」）：
+        #   `positions`     = 最近一次**收全**的整轮（对外只读这一份）
+        #   `_pos_stage`    = 正在收的那一轮，收满（`last`）才整份提交
+        # 早先是「开轮就地 clear、之后原地累加」，从清表到最后一包之间，
+        # 任何一次 `snapshot()` 读到的都是**半份持仓**：5 个合约变成 4 个，
+        # 少的那一行恰恰是还没到的那一包。界面上看是「柜台少给了仓」，
+        # 引擎那边更糟 —— `mismatch()` 拿半份表去比，会把缺的那个合约当成
+        # 已经平掉/还没开，一键对齐于是又发一笔单。
+        # 清表是**唯一**能凭空少掉一行的动作，所以它必须和「整轮收满」原子地
+        # 一起发生：攒到 stage、`last` 时换对象。
+        # （为什么不是「攒 buf + `last` 整份替换」的老写法：那版在 buf 已被
+        # 置空时会把空 dict 提交上去 ⇒ 表被刷成空的。stage 只在开轮时新建、
+        # 提交后置 None，且多余的终止包由 `_pos_done_req` 挡掉。）
+        self._pos_stage: dict[str, dict] | None = None
+        self._pos_stage_req = -1      # stage 属于哪一轮（RequestID）
+        self._pos_stage_rows = 0      # stage 里收了几行（诊断用，不影响对外那份）
+        self._pos_done_req = -1       # 最后一次成功提交的轮（挡多余的 `last` 空包）
+        self._pos_dropped = 0         # 有开头没结尾的轮数（柜台丢包，诊断用）
         self._pos_req = 0             # 当前这一轮查询的 RequestID
-        self._pos_started = True      # True = 没有进行中的查询（下一轮要清一次）
-        self._pos_rows = 0            # 最近一轮回包的行数，只用于诊断
+        self._pos_rows = 0            # 最近**收全**的那一轮有几行，只用于诊断
+        #: 最近一次整轮提交的时刻。`positions_loaded` 只说「读到过」，
+        #: 「刚才读过」得看它（`BrokerApi.positions_ready` 的 `POS_STALE_SEC`）
+        self.pos_at = 0.0
         self.account: dict = {}
         self.instruments: dict[str, dict] = {}
         self.instruments_done = threading.Event()
@@ -413,6 +431,9 @@ class RohonTraderClient:
         self.session_id = 0
         self._lock = threading.Lock()
         self._req = 0
+        #: `_next_req()` 的锁。RequestID 是「哪一轮查询」的判据，重号会把别的
+        #: 回包认进来（交易页和组合页共用一条会话，详见 `_next_req`）
+        self._req_lock = threading.Lock()
         self._order_ref = int(time.time()) % 100000
 
     # ---- 生命周期 ----
@@ -572,12 +593,16 @@ class RohonTraderClient:
     def query_positions(self) -> None:
         if self.api is None:
             return
-        # 记下这一轮的 RequestID，回包只认它；同时把「开轮清表」的闸门放下，
-        # 由这一轮的第一条回包负责清（不能在这里清：清早了界面会看到半份持仓）
+        # 记下这一轮的 RequestID，回包只认它。**不在这里清表**，也不动对外那份
+        # `positions` —— 清表在 `last` 那一包里和整份替换一起发生（`_commit_pos`）。
+        with self._lock:
+            if self._pos_stage is not None:
+                # 上一轮还没收到 `last` 就又发了新一轮：那一轮作废。计数只为
+                # 诊断（`[POS]` 会带上它）—— 丢包多了说明柜台在丢查询。
+                self._pos_dropped += 1
+                self._pos_stage = None
         rid = self._next_req()
         self._pos_req = rid
-        self._pos_started = False
-        self._pos_rows = 0
         self._qry_note("持仓", self.api.reqQryInvestorPosition(
             {"BrokerID": self.cfg.broker_id, "InvestorID": self.cfg.user_id},
             rid,
@@ -608,6 +633,14 @@ class RohonTraderClient:
                 "positions": {k: dict(v) for k, v in self.positions.items()},
                 # 「持仓真读回来了吗」—— 空表不等于没仓（`BrokerApi.positions_ready`）
                 "positions_loaded": self.positions_loaded,
+                # 手上这份是**什么时候**读回来的。`positions_loaded` 只说「读到过」，
+                # 判它作不作数看这个（`BrokerApi.POS_STALE_SEC`）
+                "pos_at": self.pos_at,
+                # 有一轮正在收（还没到 `last`）。诊断用：此时对外那份仍是上一轮
+                # 的**完整**快照，不代表「少了一个合约」
+                "pos_partial": self._pos_stage is not None,
+                # 有开头没结尾的轮数（柜台丢包 / 被流控吃掉）。一直涨说明查询在丢
+                "pos_dropped": self._pos_dropped,
                 # 最近一轮持仓查询**回了几行**。0 行 + `loaded=True` 只有两种可能：
                 # 真没仓，或者柜台回了个空包 —— 诊断行里带上它才分得清
                 "pos_rows": self._pos_rows,
@@ -618,8 +651,13 @@ class RohonTraderClient:
     # ---- 内部 ----
 
     def _next_req(self) -> int:
-        self._req += 1
-        return self._req
+        # 加锁：交易页的 worker 和组合页会同时进这条会话（`ttrade/hubreg.py`）。
+        # `+=` 是「读—改—写」三步，两个线程撞上会拿到**同一个号** ——
+        # 而 RequestID 正是「哪一轮持仓查询」的判据：重号会把上一轮的回包
+        # 认成这一轮的（半份持仓 / 重复累加都从这里来）
+        with self._req_lock:
+            self._req += 1
+            return self._req
 
     def _exchange_of(self, instrument: str) -> str:
         """合约 → 交易所。按「查表 → 外部解析器 → 品种前缀猜」三级兜底。
@@ -810,19 +848,32 @@ def _make_td(outer: RohonTraderClient):
                 }
 
         def onRspQryInvestorPosition(self, data, error, reqid, last):  # noqa: N802
-            """查持仓回包。**开轮清一次、之后原地累加**，和 `ctp_client` 同一套。
+            """查持仓回包。**整轮收满才提交**（`_pos_stage` → `positions`）。
 
-            🔴 三个坑，前两个是 2026-11-23 下午「交易页有 7 个合约、监控器全 0」
-            的真因：
+            🔴 2026-11-23 用户报「融航有时候显示正确的持仓，有时会少一些持仓
+            品种」，缺的那一行每次都是某个合约（那次是 TL2612）。真因不是柜台
+            少给了仓，是这份表**在收的过程中被读走了**：
+
+            早先的写法是「开轮就地 `clear()`、之后原地累加」。从清表到最后一包
+            之间，`snapshot()` 读到的必然是**半份持仓** —— 5 个合约掉成 4 个，
+            掉的那个恰好是还没到的那一包。窗口有多长取决于柜台逐包推送的节奏
+            （中台一包一条，几十到几百毫秒，且随时可能丢包），所以表现成
+            「有时候对、有时候少」，而且**交易页和组合页各自采样、结论不一致**。
+            更糟的是 `positions_loaded` 一直是真 ⇒ 引擎拿半份表去 `mismatch()`，
+            缺的那个合约被判成「策略该有、账户没有」，一键对齐会再发一笔单。
+
+            现在改成两级：`_pos_stage` 收，收满（`last`）才整份替换 `positions`。
+            清表这个动作**只**在替换的同一刻发生，外界永远读不到半份。
+
+            另外三个坑（都还在防）：
 
             1. **没有按 RequestID 归轮**。柜台一秒一个查询，上一轮的回包可能迟到；
                它的 `last` 一到，就把新一轮刚攒的东西当成自己的整份快照提交了。
-            2. **`outer._pos_buf or {}` 会把表刷成空**。攒 buf、`last` 时整份替换
-               的写法，一旦碰上多余的 `last`（有的中台会多发一个空终止包），
-               `buf` 已经是 None ⇒ 提交一个空 dict ⇒ 持仓全变 0，还顺手把
-               `positions_loaded` 置真 —— 于是连「还没读到」都不说了，界面直接画 0。
+            2. **多余的 `last` 空终止包**（有的中台会多发一个）。同一轮只许提交
+               一次 —— `_pos_done_req` 挡住重复包，否则空 dict 会把表刷成空、
+               还顺手把 `positions_loaded` 置真，界面直接画 0。
             3. `profit` / `margin` 早先用 `+=` 且从不重置（问第二遍就翻倍），
-               平掉的仓也永不删。改成开轮清一次，两个问题一起没了。
+               平掉的仓也永不删。每轮一个全新 stage，两个问题一起没了。
 
             还有一条：上期所 / 能源中心的持仓回包**同一方向会有两行**（今仓、昨仓
             各一行），所以六个数一律 `+=`，不能赋值 —— 赋值的话后一行把前一行
@@ -837,18 +888,29 @@ def _make_td(outer: RohonTraderClient):
                 rid = int(reqid or 0)
             except (TypeError, ValueError):
                 rid = 0
-            if rid and outer._pos_req and rid != outer._pos_req:
+            if rid and outer._pos_req > 0 and rid != outer._pos_req:
                 return
             with outer._lock:
-                if not outer._pos_started:
-                    outer.positions.clear()
-                    outer._pos_started = True
+                if not rid:
+                    rid = outer._pos_req
+                # 同一轮只提交一次：重复的终止包（含内容为空的那种）一律忽略
+                if rid and rid == outer._pos_done_req:
+                    return
+                if outer._pos_stage is None or outer._pos_stage_req != rid:
+                    # 开新一轮：拿一个空 stage，**不动**对外那份 `positions`
+                    outer._pos_stage = {}
+                    outer._pos_stage_req = rid
+                    outer._pos_stage_rows = 0
                 if not data:
                     # 空仓时柜台只回一条空包（`last=True`、内容为空）。「查完了、
-                    # 确实一条持仓都没有」是有效结论，必须置真，否则界面永远停在
-                    # 「还没读到」，真有仓了也不敢说一致
+                    # 确实一条持仓都没有」是有效结论，必须提交并置真，否则界面
+                    # 永远停在「还没读到」，真有仓了也不敢说一致
                     if last:
+                        outer.positions = outer._pos_stage
+                        outer._pos_stage = None
+                        outer._pos_done_req = rid
                         outer.positions_loaded = True
+                        outer.pos_at = time.time()
                         outer._pos_rows = len(outer.positions)
                     return
                 ins = _s(data.get("InstrumentID"))
@@ -857,7 +919,7 @@ def _make_td(outer: RohonTraderClient):
                 n = int(_f(data.get("Position")))
                 yd = int(_f(data.get("YdPosition")))
                 td = int(_f(data.get("TodayPosition"))) or max(0, n - yd)
-                row = outer.positions.setdefault(
+                row = outer._pos_stage.setdefault(
                     ins, {"instrument": ins, "long": 0, "short": 0,
                           "long_yd": 0, "short_yd": 0,
                           "long_today": 0, "short_today": 0,
@@ -883,9 +945,15 @@ def _make_td(outer: RohonTraderClient):
                 row["price"] += oc
                 row["profit"] += _f(data.get("PositionProfit"))
                 row["margin"] += _f(data.get("UseMargin"))
-                outer._pos_rows += 1
+                outer._pos_stage_rows += 1
                 if last:
+                    # 整轮收满：这一瞬间才把旧表换掉（外界读不到半份）
+                    outer.positions = outer._pos_stage
+                    outer._pos_stage = None
+                    outer._pos_done_req = rid
                     outer.positions_loaded = True
+                    outer.pos_at = time.time()
+                    outer._pos_rows = len(outer.positions)
 
         def onRspQryInstrument(self, data, error, reqid, last):  # noqa: N802
             if last:

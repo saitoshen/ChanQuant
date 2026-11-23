@@ -6329,21 +6329,32 @@ def _run() -> tuple[bool, list[str]]:
         对齐没生效、反复发单。真因是融航那条连接的 `positions` 被刷成了空表，
         而且 `positions_loaded=True` —— 连「还没读到」都不说。
 
-        两个成因：
-          - 早先是「攒 buf、`last` 时整份替换」，`outer._pos_buf or {}` 在 buf
-            已经被清空时会提交一个**空 dict**：柜台多发一个空终止包就整表清零；
-          - 没认 RequestID：上一轮迟到的 `last` 会把新一轮刚攒的当成自己的快照。
+        🔴 2026-11-23 用户报「融航账户有时候显示正确的持仓，有时会少一些持仓
+        品种」（那次少的是 TL2612，占用保证金总额两张截图一模一样 ⇒ 柜台没少
+        给仓，是这张表**在收的过程中被读走了**）。
 
-        现在和 `ctp_client` 一套：`query_positions()` 记 reqid + 放下「开轮清表」
-        闸门，回包只认这个 reqid，第一条负责清、之后原地累加。
+        真因：早先是「开轮就地 `clear()`、之后原地累加」。从清表到最后一包之间，
+        任何一次 `snapshot()` 读到的都是**半份持仓** —— 5 个合约掉成 4 个，掉的
+        那个恰好是还没到的那一包。窗口长短取决于柜台逐包推送的节奏，所以表现成
+        「有时候对、有时候少」；交易页和组合页各自采样，于是两边结论还不一致。
+        更糟的是 `positions_loaded` 一直是真 ⇒ 引擎拿半份表去 `mismatch()`，
+        缺的合约被判成「账户没有」⇒ 一键对齐再发一笔单。
 
-        另外钉住上期所那条：同一方向会推今仓 / 昨仓**两行**，六个数必须 `+=`，
-        赋值会把前一行盖掉（持仓手数少一半）。
+        现在的判据：`_pos_stage` 收，收满（`last`）才**整份替换** `positions`。
+        清表只和替换同一刻发生，外界永远读不到半份 —— 本块第 ② 条专门钉这个。
+
+        另外四条：
+          - 按 RequestID 归轮：上一轮迟到的尾巴不许污染新一轮；
+          - 同一轮只提交一次：多余的空终止包不许把表刷成空（老写法就死在这）；
+          - 有开头没结尾的轮（柜台丢包）只许计数（`_pos_dropped`），不许动表；
+          - 上期所同一方向会推今仓 / 昨仓**两行**，六个数必须 `+=`，赋值会把
+            前一行盖掉（持仓手数少一半）。
         """
         import ast
         import inspect
         import textwrap
         import threading
+        import time
         import types
 
         from ttrade import rohon_client as R
@@ -6364,12 +6375,24 @@ def _run() -> tuple[bool, list[str]]:
 
         outer = _Outer()
         outer._lock = threading.Lock()
+        outer._req_lock = threading.Lock()
         outer.positions = {}
+        outer._pos_stage = None
+        outer._pos_stage_req = -1
+        outer._pos_stage_rows = 0
+        outer._pos_done_req = -1
+        outer._pos_dropped = 0
         outer._pos_req = 0
-        outer._pos_started = True
         outer._pos_rows = 0
+        outer.pos_at = 0.0
         outer.positions_loaded = False
         outer.last_error = ""
+        outer.orders = {}
+        outer.trades = {}
+        outer.account = {}
+        outer.logged_in = threading.Event()
+        outer.logged_in.set()
+        outer.settled = threading.Event()
         outer._req = 0
         outer._next_req = lambda: setattr(outer, "_req", outer._req + 1) or outer._req
         outer.cfg = types.SimpleNamespace(broker_id="9999", user_id="tester")
@@ -6404,9 +6427,11 @@ def _run() -> tuple[bool, list[str]]:
         # ---- ① 一轮正常：两个合约，多空各一行
         start_round(outer)
         rid1 = outer._pos_req
-        if sent != [rid1] or outer._pos_started:
-            raise RuntimeError(f"开轮没记 reqid / 没放下清表闸门：{sent} {outer._pos_started}")
+        if sent != [rid1] or outer._pos_stage is not None:
+            raise RuntimeError(f"开轮没记 reqid / 没开 stage：{sent} {outer._pos_stage}")
         row("IM2612", "2", 1, last=False)
+        if outer.positions:
+            raise RuntimeError("第一条回包到了就往外写了半份持仓（旧写法就是这样）")
         row("TL2612", "3", 2, last=True)
         if not outer.positions_loaded:
             raise RuntimeError("`bIsLast` 到了却没记「读完了」")
@@ -6414,31 +6439,69 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"一轮持仓没累加对：{outer.positions}")
         if outer._pos_rows != 2:
             raise RuntimeError(f"回包行数记错了：{outer._pos_rows}")
+        if not outer.pos_at:
+            raise RuntimeError("整轮收满了却没记 `pos_at`（`POS_STALE_SEC` 判不了新旧）")
+        if outer._pos_stage is not None:
+            raise RuntimeError("提交之后 stage 没释放，下一轮会往旧 stage 里继续加")
 
-        # ---- ② 多余的 `last` 空终止包：**不许**把表刷成空
+        # ---- ② 🔴 半份持仓不许外泄（2026-11-23「有时 5 行、有时 4 行」）
+        # 新一轮只喂第一条，对外那份必须还是**上一轮收全的整份**
+        start_round(outer)
+        row("SA701", "3", 3, last=False)
+        snap = R.RohonTraderClient.snapshot(outer)["positions"]
+        if set(snap) != {"IM2612", "TL2612"}:
+            raise RuntimeError(
+                f"新一轮收到一半就把表换掉了 —— 界面这一瞬间会少一个合约：{list(snap)}")
+        if snap["TL2612"]["short"] != 2:
+            raise RuntimeError(f"半份窗口里把上一轮的合约改坏了：{snap}")
+        # 收满才换
+        row("sn2612", "3", 1, last=True)
+        if set(outer.positions) != {"SA701", "sn2612"}:
+            raise RuntimeError(f"整轮收满没换上新的：{list(outer.positions)}")
+
+        # ---- ③ 多余的 `last` 空终止包：**不许**把表刷成空
         cb(None, None, rid1, True)
         if not outer.positions:
             raise RuntimeError("多一个空 `last` 包就把持仓整表清空了（旧写法就是这个）")
         if not outer.positions_loaded:
             raise RuntimeError("空包之后「读完了」被清掉了")
 
-        # ---- ③ 上一轮迟到的回包：不许污染新一轮
+        # ---- ④ 上一轮迟到的回包：不许污染新一轮
         start_round(outer)
-        row("SA701", "3", 3, last=False)          # 新一轮第一条：先把旧表清掉
-        if set(outer.positions) != {"SA701"}:
-            raise RuntimeError(f"新一轮开轮没清掉上一轮的合约：{list(outer.positions)}")
-        row("TL2612", "3", 2, last=True, rid=rid1)      # 上一轮的尾巴
-        if set(outer.positions) != {"SA701"} or outer.positions["SA701"]["short"] != 3:
-            raise RuntimeError(f"迟到的旧回包污染了新一轮：{outer.positions}")
+        rid_prev = outer._pos_req
+        row("SA701", "3", 3, last=False)
+        row("TL2612", "3", 2, last=True)                 # 这一轮收满
+        start_round(outer)                               # 下一轮开跑
+        row("cu2701", "2", 1, last=False)
+        row("TL2612", "3", 2, last=True, rid=rid_prev)   # 上一轮的尾巴
+        snap = R.RohonTraderClient.snapshot(outer)["positions"]
+        if set(snap) != {"SA701", "TL2612"}:
+            raise RuntimeError(f"迟到的旧回包污染了新一轮：{list(snap)}")
+        row("cu2701", "2", 1, last=True)                 # 本轮收满
+        if set(outer.positions) != {"cu2701"}:
+            raise RuntimeError(f"新一轮收满后应该是 cu2701：{list(outer.positions)}")
 
-        # ---- ④ 真没仓：一条空包 + last ⇒ 空表且「读完了」
+        # ---- ⑤ 有开头没结尾的轮（柜台丢包）：只计数，不许动表
+        start_round(outer)
+        row("SA701", "3", 3, last=False)                 # 只来一条，没有 `last`
+        good = dict(outer.positions)
+        drop0 = outer._pos_dropped
+        start_round(outer)                               # 下一拍接着发
+        if outer._pos_dropped != drop0 + 1:
+            raise RuntimeError(f"没收全的轮没计数：{outer._pos_dropped} vs {drop0}")
+        snap = R.RohonTraderClient.snapshot(outer)["positions"]
+        if snap != good:
+            raise RuntimeError(
+                f"没收全的那轮把对外那份改了（会少合约）：{list(snap)}")
+
+        # ---- ⑥ 真没仓：一条空包 + last ⇒ 空表且「读完了」
         start_round(outer)
         cb(None, None, outer._pos_req, True)
         if outer.positions or not outer.positions_loaded:
             raise RuntimeError(f"空仓这一轮判错了：{outer.positions} / "
                                f"loaded={outer.positions_loaded}")
 
-        # ---- ⑤ 上期所：同一方向推今仓 + 昨仓两行，必须相加
+        # ---- ⑦ 上期所：同一方向推今仓 + 昨仓两行，必须相加
         start_round(outer)
         row("sn2612", "2", 1, yd=0, last=False)        # 今仓 1
         row("sn2612", "2", 2, yd=2, last=True)         # 昨仓 2
@@ -6446,7 +6509,7 @@ def _run() -> tuple[bool, list[str]]:
         if (got["long"], got["long_today"], got["long_yd"]) != (3, 1, 2):
             raise RuntimeError(f"上期所今昨两行没累加（赋值会把前一行盖掉）：{got}")
 
-        # ---- ⑥ 柜台报错：不许当成「查完了」
+        # ---- ⑧ 柜台报错：不许当成「查完了」
         start_round(outer)
         before = outer.positions_loaded
         outer.positions_loaded = False
@@ -6457,11 +6520,13 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"查持仓失败的原因没记下来：{outer.last_error!r}")
         outer.positions_loaded = before
 
-        return ("持仓按 RequestID 归轮（迟到的旧回包不污染新一轮）；开轮清一次、"
-                "之后原地累加；多余的空 `last` 包不会把表刷成空；真没仓时记「读完了」；"
-                "上期所今昨两行累加（1+2=3）；柜台报错不冒充「查完了」")
+        return ("持仓整轮收满才提交（新一轮收到一半时对外那份仍是上一轮的整份，"
+                "界面不会少一个合约）；按 RequestID 归轮，迟到的旧回包不污染；"
+                "多余的空 `last` 包不会把表刷成空；没收全的轮只计数不动表；"
+                "真没仓时记「读完了」；上期所今昨两行累加（1+2=3）；"
+                "柜台报错不冒充「查完了」")
 
-    check("融航持仓：按 RequestID 归轮，空包不许刷表", _pos_round)
+    check("融航持仓：整轮收满才提交，半份不许外泄", _pos_round)
 
     def _load_no_trade():
         """加载策略时**不许**按台账自动交易（2026-11-17 用户要求）。
@@ -8244,7 +8309,7 @@ def _run() -> tuple[bool, list[str]]:
         if tr.positions_loaded:
             raise RuntimeError("新建的客户端不该自称「已读过持仓」")
         spi.onRspQryInvestorPosition(one, None, 1, False)
-        spi.onRspQryInvestorPosition(two, None, 2, True)
+        spi.onRspQryInvestorPosition(two, None, 1, True)
         pos = tr.positions["rb2601"]
         if (pos["long"], pos["short"]) != (2, 1) or \
                 (pos["cost_long"], pos["cost_short"]) != (60000.0, 30000.0):
@@ -8256,21 +8321,31 @@ def _run() -> tuple[bool, list[str]]:
                 "收尾包到了却没置 positions_loaded —— 对齐那边就分不清"
                 "「账户真没仓」和「柜台没回」")
         # 第二轮：柜台又给了一份。浮盈不许翻倍、已平掉的空头要消失。
-        # 契约是「**开轮清一次**、之后原地累加」（`query_positions()` 每下发一轮
-        # 就放下闸门），不是「`last` 时整份替换」—— 后者碰上多余的空终止包会把
-        # 持仓表刷成 0，2026-11-23 下午「交易页 7 个合约、监控器全 0」就是它
-        tr._pos_req, tr._pos_started = 3, False
+        # 🔴 契约是「**整轮收满才提交**」：`_pos_stage` 收，`bIsLast` 那一包
+        # 才整份替换 `positions`。早先是「开轮就地清一次、之后原地累加」——
+        # 从清表到最后一包之间读到的都是**半份持仓**，界面就会「少一个合约」
+        # （2026-11-23 用户报的融航那个现象），引擎还会拿半份表去判「账户没有」
+        tr._pos_req = 3
         spi.onRspQryInvestorPosition(one, None, 3, True)
         pos = tr.positions["rb2601"]
         if pos["profit"] != 100.0 or pos["short"] != 0:
             raise RuntimeError(f"第二轮没清掉上一轮（浮盈翻倍/旧仓没清）：{pos}")
+        # 半份窗口：新一轮只到了一条，对外那份必须还是**上一轮整份**
+        tr._pos_req = 4
+        spi.onRspQryInvestorPosition(two, None, 4, False)
+        if tr.positions["rb2601"]["short"] != 0:
+            raise RuntimeError(
+                "新一轮收到一半就把表换掉了 —— 界面这一瞬间会少一个合约")
+        spi.onRspQryInvestorPosition(None, None, 4, True)     # 本轮收尾
+        if tr.positions["rb2601"]["short"] != 1:
+            raise RuntimeError(f"整轮收满没换上新表：{tr.positions['rb2601']}")
         # 同一轮里再补一个空终止包：**不许**把表刷成空
-        spi.onRspQryInvestorPosition(None, None, 3, True)
+        spi.onRspQryInvestorPosition(None, None, 4, True)
         if not tr.positions:
             raise RuntimeError("多一个空 `last` 包就把持仓清空了（旧写法就是这个）")
         # 上一轮迟到的回包：不许污染当前这一轮
-        spi.onRspQryInvestorPosition(one, None, 2, True)
-        if tr.positions["rb2601"]["long"] != 2:
+        spi.onRspQryInvestorPosition(one, None, 3, True)
+        if tr.positions["rb2601"]["long"] != 0:
             raise RuntimeError("上一轮迟到的回包又累进当前这一轮了（手数会翻倍）")
         # 真的没仓：空包也要算「读完了」
         tr2 = RC.RohonTraderClient(types.SimpleNamespace(user_id="u", broker_id="b"))
@@ -8280,8 +8355,9 @@ def _run() -> tuple[bool, list[str]]:
 
         return ("融航走 CTP 兼容 dll（6.7.2.8），行情/交易地址归一正确；"
                 "市价单字段与 CTP 一致（AnyPrice + 0 价 + IOC）；"
-                "持仓回包按 RequestID 归轮、开轮清一次（浮盈不翻倍、平掉的仓"
-                "会消失、多余空包不刷表、迟到的旧回包不污染、空包也算读完）")
+                "持仓回包整轮收满才提交（半份不外泄 ⇒ 不会少一个合约）、"
+                "浮盈不翻倍、平掉的仓会消失、多余空包不刷表、迟到的旧回包不污染、"
+                "空包也算读完")
 
     check("融航客户端（可选依赖）", _rohon)
 
@@ -13352,6 +13428,132 @@ def _run() -> tuple[bool, list[str]]:
                 f"（超过 {POS_STALE_SEC:.0f} 秒没刷新 ⇒ 判未同步并写明原因）")
 
     check("组合页每轮同时推账户（否则持仓/委托冻在连接那一刻）", _acct_pump)
+
+    def _monitor_cfg() -> str:
+        """「监控设置」：账户重读周期 —— 默认 5 秒、钳到 1~60、改完**真的生效**。
+
+        用户原话（2026-11-23）：「一键对齐的刷新时间改为每 5 秒刷新一次，增加一个
+        监控设置按钮，可以设置一键对齐的刷新时间，目前 1-2 秒太少。」
+
+        🔴 为什么下限是 1 秒而不是「随便填」：柜台同一会话「每秒最多**一个**查询，
+        而且查询和报单共用这个名额」。周期压到 1~2 秒时账户一多就会和报单抢，
+        抢输的常常是报单（表现成「点了没反应 / 单子晚到」）。
+
+        三个判据：
+          ① 默认 5 秒；文件缺失 / 内容坏掉都退回 5（不能因为一个坏 json 就起不来）
+          ② 范围钳在 1~60
+          ③ **改完立刻生效** —— `setattr(runner, "monitor", cfg)` 必须同时换掉节流
+             用的 `_acct_sec`。只写文件的话用户点完「确定」界面毫无变化，只能重启
+             策略才生效（`set_chase` 当年就是只改了 worker 属性，白改一场）
+        """
+        import inspect
+
+        from ttrade import strategy_store as SS
+        from ttrade.strategy_runner import PortfolioRunner
+
+        # ---- ① 默认值 / ② 钳位
+        assert SS.MonitorConfig().refresh_sec == 5, "默认不是 5 秒"
+        # 0 / None 当「没设过」⇒ 退回默认 5（`cfg.refresh_sec or 5`），
+        # 负数 / 超上限才走钳位
+        cases = [(0, 5), (None, 5), (-5, 1), (1, 1), (5, 5), (60, 60), (999, 60),
+                 ("7", 7)]
+        for raw, want in cases:
+            got = SS.MonitorConfig.from_dict({"refresh_sec": raw}).refresh_sec
+            assert got == want, f"周期 {raw!r} 应该钳到 {want}，实际 {got}"
+        # 多出来的键不许炸（老版本写过的字段留在文件里很正常）
+        assert SS.MonitorConfig.from_dict(
+            {"refresh_sec": 9, "what": 1}).refresh_sec == 9
+
+        # 文件坏掉 → 退回默认，而不是让引擎起不来
+        old_load = SS._load
+        try:
+            for junk in ({"refresh_sec": "abc"}, {}, None, {"refresh_sec": None}):
+                SS._load = lambda _n, _j=junk: _j
+                assert SS.load_monitor().refresh_sec == 5, \
+                    f"monitor.json 里是 {junk!r} 时没退回默认 5 秒"
+        finally:
+            SS._load = old_load
+
+        # ---- ③ 改完立刻生效：setter 必须同换 `_acct_sec`
+        class _Feed:
+            generation = 1
+
+            def __init__(self):
+                self.waits = 0
+
+            def wait(self, timeout=0.0):
+                self.waits += 1
+                return True
+
+        class _Api:
+            def __init__(self):
+                self.calls = 0
+
+            def refresh_account(self):
+                self.calls += 1
+
+        r = PortfolioRunner.__new__(PortfolioRunner)
+        r.feed, r._feed_gen = _Feed(), 1
+        r._klines, r._quotes = {}, {}
+        r._log = lambda _m: None
+        r.last_error = ""
+        r.api = _Api()
+        r._acct_at = 0.0
+        r.monitor = SS.MonitorConfig(refresh_sec=2)
+        assert r._acct_sec == 2.0, (
+            f"下发了新的重读周期，节流用的 `_acct_sec` 没跟着变（还是 {r._acct_sec}）"
+            " —— 用户点完「确定」什么都不会改")
+        # 节流真的按 2 秒走：连推两拍只查一次，过了 2 秒才再查
+        r.wait(0.01)
+        r.wait(0.01)
+        assert r.api.calls == 1, f"2 秒的周期里连查了 {r.api.calls} 次"
+        r._acct_at -= 3.0
+        r.wait(0.01)
+        assert r.api.calls == 2, "过了周期还不去查，等于设置被无视"
+        # 越界的值也钳住（界面上手输 / 老文件都可能超）
+        r.monitor = SS.MonitorConfig(refresh_sec=-3)
+        assert r._acct_sec == 1.0, f"负数没钳到 1：{r._acct_sec}"
+        r.monitor = SS.MonitorConfig(refresh_sec=0)
+        assert r._acct_sec == 5.0, f"0（= 没设过）没退回 5：{r._acct_sec}"
+
+        # ---- ④ 界面这条链：按钮 → set_monitor → 每条 runner
+        from gui.portfolio_page import PortfolioController, RunnerWorker
+
+        ctl = PortfolioController.__new__(PortfolioController)
+        ctl._workers = {"甲": object(), "乙": object()}
+        got: list[tuple[str, float]] = []
+
+        class _R:
+            def __init__(self, key):
+                self._key = key
+
+            @property
+            def monitor(self):
+                return None
+
+            @monitor.setter
+            def monitor(self, cfg):
+                got.append((self._key, float(cfg.refresh_sec)))
+
+        recs = {k: _R(k) for k in ctl._workers}
+        ctl._submit = lambda key, fn: fn(recs[key])
+        ctl.set_monitor(SS.MonitorConfig(refresh_sec=8))
+        assert sorted(got) == [("乙", 8.0), ("甲", 8.0)], \
+            f"「监控设置」没下发到每条在跑的 runner：{got}"
+        # 起新线程时也要带上这份配置，否则下次启动又退回文件里的（而不是界面上的）
+        src = inspect.getsource(RunnerWorker.run)
+        assert "PortfolioRunner(self.spec, self.chase, self.monitor)" in src, \
+            "新起的 runner 没把监控周期传进去"
+        src_c = inspect.getsource(PortfolioController.start)
+        assert "monitor=None" in src_c and "RunnerWorker(key, spec, cfgs, chase, monitor)" in src_c, \
+            "`PortfolioController.start` 没把 monitor 透给 worker"
+
+        return ("监控周期默认 5 秒、钳在 1~60（0/空当「没设过」⇒ 退回 5，负数→1，"
+                "999→60，字符串数字能转）、文件坏掉退回默认；下发后 `_acct_sec` "
+                "当场换掉，节流真的按新周期走（2 秒内只查一拍）；"
+                "按钮 → `set_monitor` → 每条在跑的 runner，新起的 runner 也带着这份配置")
+
+    check("监控设置：账户重读周期（默认 5 秒，改完立刻生效）", _monitor_cfg)
 
     # 跑完就把进度文件收掉：留着会让下一轮的诊断以为"上次崩过"。
     # 崩溃时走不到这里，文件正好留下最后一项的名字。
