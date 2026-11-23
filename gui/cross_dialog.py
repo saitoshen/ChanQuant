@@ -51,10 +51,11 @@ class CrossSetupDialog(QDialog):
         lay.setSpacing(9)
 
         head = QLabel(
-            "截面策略分两步：第一步横向比强弱，决定拿哪些品种、多哪几个空哪几个；"
-            "第二步决定这些品种怎么下单。左边改第一步，右边跟着变。\n"
-            "两边各有一处「选因子」，管的不是同一件事：截面因子（左）只管横向排名"
-            "和分多少钱，时序因子（右，仅选品种模式）只管每只什么时候进、做多还是做空。"
+            "截面策略分两步：**左边只筛品种**（谁有资格进场），"
+            "**右边选多空**（用哪些因子排名、多久调一次仓、腿数、腿内怎么分钱）。\n"
+            "两边各有一处「选因子」，管的不是同一件事：第一步的筛池因子只决定"
+            "「能不能交易」（金额、持仓），右边的截面因子才决定谁强谁弱；"
+            "时序因子（右，仅选品种模式）只管每只什么时候进、做多还是做空。"
         )
         head.setObjectName("Hint")
         head.setWordWrap(True)
@@ -63,10 +64,10 @@ class CrossSetupDialog(QDialog):
         cols = QHBoxLayout()
         cols.setSpacing(10)
         self._step1, self.step1_lay, self.lbl_step1_sub = self._pane(
-            "第一步", "截面选品种", "按截面因子横向排序，定下多空两端"
+            "第一步", "筛品种池", "谁有资格进场：模式、第一步因子周期、筛池与筛池频率"
         )
         self._step2, self.step2_lay, self.lbl_step2_sub = self._pane(
-            "第二步", "策略落地", "选出来的品种怎么下单、腿内怎么分钱"
+            "第二步", "截面选多空", "选哪些因子排强弱、多久调一次仓、腿数、腿内怎么分钱"
         )
         cols.addWidget(self._step1, 1)
         cols.addWidget(self._step2, 1)
@@ -121,9 +122,16 @@ class CrossSetupDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("background: transparent; border: none;")
+        # 🔴 这里原来写的是 `scroll.setStyleSheet("background: transparent;")`
+        # 和 `body.setStyleSheet("background: transparent;")` —— **没有选择器**
+        # 的规则会作用到整棵子树，Qt 于是把每个后代 item view 的 `palette.Base`
+        # 解析成 `#000000`，而表格里的勾选框正是拿 Base 填底的：因子表「用 / 反」
+        # 两列全变成实心黑方块，「先筛品种池」那个 QCheckBox 也一样（2026-11-23
+        # 用户截图）。透明这件事根本不用 QSS：QScrollArea 的 viewport 默认会填
+        # Base，这里关掉自动填底就够了，底色由外层 `QFrame#SubCard` 提供。
+        scroll.viewport().setAutoFillBackground(False)
         body = QWidget()
-        body.setStyleSheet("background: transparent;")
+        body.setAutoFillBackground(False)
         bl = QVBoxLayout(body)
         bl.setContentsMargins(0, 2, 4, 0)
         bl.setSpacing(8)
@@ -148,18 +156,21 @@ class CrossSetupDialog(QDialog):
         if select:
             leg = "规则策略" if timing == "rule" else "因子策略"
             self.lbl_step1_sub.setText(
-                "截面因子只决定谁强谁弱、每只分多少钱 —— 不决定做多还是做空")
+                "谁有资格进场：第一步因子周期 / 筛池因子 / 筛池频率。"
+                "这一步不改方向，也不决定谁强谁弱")
             self.lbl_step2_sub.setText(
-                f"池内每个品种都由时序{leg}决定是多是空还是空仓，截面分数只决定分多少钱"
-            )
+                f"截面因子定谁强谁弱、每只分多少钱；池内每个品种都由时序{leg}"
+                "决定是多是空还是空仓")
             self.lbl_foot.setText(
                 "选品种模式：没有「多几个空几个」这回事 —— 方向由时序信号逐品种给。"
                 "要缩品种池请用第一步的筛池，池内剩下的品种各拿一份钱，没出信号的留现金。"
             )
         else:
-            self.lbl_step1_sub.setText("按截面因子横向排序，定下多空两端")
+            self.lbl_step1_sub.setText(
+                "谁有资格进场：第一步因子周期 / 筛池因子 / 筛池频率"
+            )
             self.lbl_step2_sub.setText(
-                "多空两端各占 50% 名义额，这一步定腿数和腿内怎么分钱"
+                "这一步定因子（模式 / 表 / 等权）、调仓频率、多空腿数和腿内分钱"
             )
             self.lbl_foot.setText(
                 "对冲模式：多头腿和空头腿各占 50% 名义额，多空两边各自平分 —— "

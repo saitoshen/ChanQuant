@@ -99,6 +99,12 @@ class CrossConfig:
     pool_reverse: dict = field(default_factory=dict)
     pool_top_pct: float = 60.0          # 池里保留分数最高的百分之几
     pool_min: int = 0                   # 池子至少留几个（不够就全留）
+    # 多久重排一次池：数量 + 单位（day / month）。1 = 每个交易日重排，
+    # 两次重排之间**沿用上一次的池**（判好的布尔蒙版 ffill 下去）。
+    # 为什么要有这个：筛池因子是慢变量（成交额 20 日、持仓），每根 bar 重排
+    # 一次不但是白算，盘中的抖动还会让边界品种进进出出、换手凭空变高。
+    pool_reb: int = 1
+    pool_reb_unit: str = "day"
 
     # 第一步（截面排名 + 筛池）用**哪个周期**的因子算。空 = 跟随策略周期。
     #
@@ -820,7 +826,9 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
         except Exception as exc:  # noqa: BLE001
             return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
                                error=f"第一步选品种失败：{exc}")
-        score_src = _apply_pool(score_src, pool_src, cfg.pool_top_pct, cfg.pool_min)
+        score_src = _apply_pool(score_src, pool_src, cfg.pool_top_pct, cfg.pool_min,
+                                reb=getattr(cfg, "pool_reb", 1) or 1,
+                                reb_unit=getattr(cfg, "pool_reb_unit", "day") or "day")
         if score_src.dropna(how="all").empty:
             return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
                                error="第一步筛完之后池子是空的 —— 把保留比例调大")
@@ -1279,8 +1287,37 @@ def _tier_share(mat_row: np.ndarray, mask_row: np.ndarray, tiers: int,
     return out / total if total > 0 else out
 
 
+def _pool_tick_rows(index: pd.Index, every: int, unit: str) -> pd.Series:
+    """哪些行是「重排品种池」的时点。
+
+    `unit="day"`：每个交易日的第一根；`=1` 就是天天重排，`=3` 是每 3 个
+    交易日一次。`unit="month"`：每个自然月的第一根。
+
+    **不能按「第 N 根」算**：一天的根数在不同品种上差别很大（夜盘到 02:30 的
+    品种一天 68 根，股指只有 48 根），按根数写死会让「每 3 个交易日」在短
+    交易日的品种上变成「每 1.5 天」。
+    """
+    every = max(1, int(every or 1))
+    idx = pd.DatetimeIndex(index)
+    if len(idx) == 0:
+        return pd.Series(dtype=bool, index=index)
+    if str(unit or "day").lower() == "month":
+        lab = idx.to_period("M")
+    else:
+        lab = idx.normalize()          # 交易日（含夜盘归属：天勤的 bar 已归到交易日）
+    codes = pd.factorize(lab, use_na_sentinel=False)[0]
+    # 每个周期的**第一根**才是候选采样点。不能用 `codes % every == 0` ——
+    # codes 是周期序号，`every=1` 时它对每一行都成立，等于没采样（第一版就是
+    # 这么写的，「按月」实测月内照样变）
+    first = np.r_[True, codes[1:] != codes[:-1]]
+    seq = np.cumsum(first) - 1         # 周期的序号 0,1,2,…
+    pick = first & ((seq % every) == 0)
+    return pd.Series(pick, index=index)
+
+
 def _apply_pool(score: pd.DataFrame, pool: pd.DataFrame,
-                top_pct: float, min_keep: int = 0) -> pd.DataFrame:
+                top_pct: float, min_keep: int = 0,
+                reb: int = 1, reb_unit: str = "day") -> pd.DataFrame:
     """第一步：把池外的品种打成 NaN，后面那一步就只看池内。
 
     用**逐 bar 的横截面分位**判池，不是「整段一次算完再定池」：金额因子每天
@@ -1289,6 +1326,10 @@ def _apply_pool(score: pd.DataFrame, pool: pd.DataFrame,
 
     池因子那天整行没值（新品种上市前、数据缺口）时**不筛**，原样放行 ——
     宁可在缺数据的那几天少一层过滤，也不要凭空整组空仓。
+
+    `reb / reb_unit` = 多久重排一次池。判好的布尔蒙版只在重排时点采样一次，
+    其余行沿用上一次的结果（ffill）—— 这就是「每 N 个交易日筛一次」的落地：
+    间隔内池子不动，池外的品种哪怕这几天变强也进不来。
     """
     p = pool.reindex(index=score.index, columns=score.columns).ffill()
     if p.empty or not p.notna().any().any():
@@ -1304,6 +1345,13 @@ def _apply_pool(score: pd.DataFrame, pool: pd.DataFrame,
     keep = r.gt(thr, axis=0) & p.notna()
     blank = p.notna().sum(axis=1) < MIN_CROSS
     keep = keep | np.repeat(blank.to_numpy()[:, None], p.shape[1], axis=1)
+    # 采样只在「重排时点」上取值，其余行沿用上一次的结果。
+    # 日线数据上每一个时点都是它自己的采样点，所以这一段对日线等价于逐 bar；
+    # 分钟线上才会真正把池子「钉住」到下一次重排（这正是这个参数要的效果）。
+    tick = _pool_tick_rows(keep.index, int(reb or 1), str(reb_unit or "day"))
+    if tick.any():
+        staged = keep.astype(float).where(tick, np.nan).ffill()
+        keep = staged.fillna(1.0).astype(bool)
     return score.where(keep)
 
 

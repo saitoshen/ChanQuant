@@ -2013,9 +2013,10 @@ class MainWindow(QMainWindow):
         pc.setSpacing(8)
         self.btn_cross_setup = QPushButton("配置截面策略（两步）…")
         self.btn_cross_setup.setToolTip(
-            "打开两步配置窗：左边第一步「截面选品种」（模式、截面因子、筛池、\n"
-            "调仓、多空腿数），右边第二步「策略落地」（时序腿 / 腿内分钱）。\n"
-            "截面对冲没有时序腿，右边只显示腿内分配。"
+            "打开两步配置窗：左边第一步只筛品种（截面模式、第一步因子周期、\n"
+            "筛池因子与筛池频率）；右边第二步选多空（因子模式 / 截面因子表 /\n"
+            "等权、因子参数、调仓频率、多空腿数、腿内分钱、时序腿）。\n"
+            "截面对冲没有时序腿，右边就不显示那一块。"
         )
         self.btn_cross_setup.clicked.connect(self._open_cross_setup)
         pc.addWidget(self.btn_cross_setup)
@@ -2894,13 +2895,14 @@ class MainWindow(QMainWindow):
         )
         p1.addWidget(self.cb_step1_period)
 
-        # 截面因子（模式下拉 + 因子表）本来在侧边栏里，切到截面策略时由
-        # `_sync_family_panels` 借进这个空槽 —— 见 `_lend()` 的说明
+        # 截面因子（模式下拉 + 因子表 + 等权 / 全选清空）本来在侧边栏里，切到
+        # 截面策略时由 `_sync_family_panels` 借进这个空槽 —— 见 `_lend()`。
+        # 🔴 2026-11-23 起这块归**第二步**：它决定的是「怎么选多空、怎么合成
+        # 强度」，不是「筛哪些品种」。左边第一步只留筛池那几项，槽位在下面 `p2`。
         self.cross_factor_host = QWidget()
         hf = QVBoxLayout(self.cross_factor_host)
         hf.setContentsMargins(0, 0, 0, 0)
         hf.setSpacing(8)
-        p1.addWidget(self.cross_factor_host)
 
         # ---- 筛品种池
         self.grp_pool = QWidget()
@@ -2940,42 +2942,47 @@ class MainWindow(QMainWindow):
         rp.addWidget(self.cb_pool_factor, 1)
         rp.addWidget(self.sp_pool_pct)
         gp.addWidget(self.row_pool)
+
+        # ---- 筛品种频率（2026-11-23 用户要求，单位：交易日 / 月）
+        #
+        # 池子是按「第一步因子」的横截面分位判的，那个分位一天才动一次（金额 20
+        # 这种因子更是慢变量）。每根 bar 重排一次不只是白算：盘中的抖动会让池子
+        # 边界上的品种进进出出，换手凭空变高，而池子本身根本没变。
+        # 间隔内**沿用上一次的池**（回测里就是把那一段的判定 ffill 下去）。
+        self.row_pool_reb = QWidget()
+        rpp = QHBoxLayout(self.row_pool_reb)
+        rpp.setContentsMargins(0, 0, 0, 0)
+        rpp.setSpacing(6)
+        self.sp_pool_reb = QSpinBox()
+        self.sp_pool_reb.setRange(1, 240)
+        self.sp_pool_reb.setValue(1)
+        self.sp_pool_reb.setPrefix("每 ")
+        self.sp_pool_reb.setToolTip(
+            "多久重排一次品种池。\n\n"
+            "1 个交易日 = 每天开盘按筛池因子重排一次（默认，和大多数人手工筛池的\n"
+            "节奏一致）；3 个月 = 一个季度调一次池，换手最低。\n\n"
+            "两次重排之间**沿用上一次的池** —— 池外的品种这一段不参与排名，\n"
+            "池内的照常比强弱。"
+        )
+        self.cb_pool_reb_unit = QComboBox()
+        self.cb_pool_reb_unit.addItem("交易日", "day")
+        self.cb_pool_reb_unit.addItem("个月", "month")
+        self.cb_pool_reb_unit.setToolTip(
+            "筛池的频率单位。只有「交易日 / 个月」两种 —— 按根筛没有意义：\n"
+            "筛池因子本身是按天算的，同一根日线里换几次都是同一组数。"
+        )
+        rpp.addWidget(self.sp_pool_reb, 1)
+        rpp.addWidget(self.cb_pool_reb_unit)
+        gp.addWidget(self.row_pool_reb)
+        self.lbl_pool_reb = QLabel()
+        self.lbl_pool_reb.setObjectName("Hint")
+        self.lbl_pool_reb.setWordWrap(True)
+        gp.addWidget(self.lbl_pool_reb)
         p1.addWidget(self.grp_pool)
 
-        p1.addWidget(self._section("调仓"))
-        # 「每 N 根」和「每 N 天/月」是两种口径，摆在一起比藏在两处好：
-        # 截面对冲按根给（多空同时换，换手天然低），选品种按天/月给（一次换
-        # 整篮子，5 分钟周期上按根给等于每半小时重下一遍，成本能把收益吃光）
-        row_reb = QWidget()
-        rb = QHBoxLayout(row_reb)
-        rb.setContentsMargins(0, 0, 0, 0)
-        rb.setSpacing(6)
-        self.sp_cross_reb = QSpinBox()
-        self.sp_cross_reb.setRange(1, 2000)
-        self.sp_cross_reb.setValue(5)
-        self.sp_cross_reb.setPrefix("每 ")
-        self.cb_cross_reb_unit = QComboBox()
-        self.cb_cross_reb_unit.addItem("根", "bar")
-        self.cb_cross_reb_unit.addItem("交易日", "day")
-        self.cb_cross_reb_unit.addItem("个月", "month")
-        rb.addWidget(self.sp_cross_reb, 1)
-        rb.addWidget(self.cb_cross_reb_unit)
-        p1.addWidget(row_reb)
-        self.lbl_cross_reb = QLabel()
-        self.lbl_cross_reb.setObjectName("Hint")
-        self.lbl_cross_reb.setWordWrap(True)
-        p1.addWidget(self.lbl_cross_reb)
-
-        # ---- 机器学习标签口径（只在因子模式=机器学习时显示）
-        self.lbl_label = QLabel("机器学习标签")
-        self.lbl_label.setObjectName("SectionTitle")
-        p1.addWidget(self.lbl_label)
-        self.cb_label = QComboBox()
-        for key, label, tip in CROSS_LABELS:
-            self.cb_label.addItem(label, key)
-            self.cb_label.setItemData(
-                self.cb_label.count() - 1, tip, Qt.ToolTipRole)
-        p1.addWidget(self.cb_label)
+        # 调仓频率 / 机器学习标签原来在左边，2026-11-23 挪到第二步 —— 它们
+        # 管的是「怎么下单」（多久换一次、预测什么），和筛哪些品种无关。
+        # 创建代码在第二步那一段里，见 `_build_cross_panels` 的 p2 部分。
 
         # ------------------------------------------------ 第二步：策略落地
         step2 = QWidget()
@@ -3016,6 +3023,14 @@ class MainWindow(QMainWindow):
         gt.addWidget(self.cross_timing_host)
         p2.addWidget(self.grp_timing)
 
+        # ---- 因子模式 + 截面因子表（从第一步挪过来）
+        #
+        # 「多因子组合 / 打分范围 / 用哪几个因子 / 等权 / 全选清空」全是**选多空**
+        # 的事：它们决定谁强谁弱、强度怎么合成（乘以名义额才是钱）。第一步只
+        # 负责「哪些品种有资格进场」，那是筛池那几项的事。用户 2026-11-23 明说
+        # 「左边的选项都是用于第一步筛选品种的，第二步截面选多空的内容放在右边」。
+        p2.addWidget(self.cross_factor_host)
+
         # ---- 因子参数（从第一步「借」过来的那一块，见 `_sync_family_panels`）
         #
         # 为什么放第二步：截面策略的「窗口 / 预测期数 / 标准化口径」不是「选哪些
@@ -3027,6 +3042,43 @@ class MainWindow(QMainWindow):
         hfp.setContentsMargins(0, 0, 0, 0)
         hfp.setSpacing(8)
         p2.addWidget(self.cross_fparam_host)
+
+        # ---- 机器学习标签口径（只在因子模式=机器学习时显示）
+        self.lbl_label = QLabel("机器学习标签")
+        self.lbl_label.setObjectName("SectionTitle")
+        p2.addWidget(self.lbl_label)
+        self.cb_label = QComboBox()
+        for key, label, tip in CROSS_LABELS:
+            self.cb_label.addItem(label, key)
+            self.cb_label.setItemData(
+                self.cb_label.count() - 1, tip, Qt.ToolTipRole)
+        p2.addWidget(self.cb_label)
+
+        # ---- 调仓频率（2026-11-23 从第一步挪到第二步）
+        #
+        # 「每 N 根」和「每 N 天/月」是两种口径，摆在一起比藏在两处好：
+        # 截面对冲按根给（多空同时换，换手天然低），选品种按天/月给（一次换
+        # 整篮子，5 分钟周期上按根给等于每半小时重下一遍，成本能把收益吃光）
+        p2.addWidget(self._section("调仓"))
+        row_reb = QWidget()
+        rb = QHBoxLayout(row_reb)
+        rb.setContentsMargins(0, 0, 0, 0)
+        rb.setSpacing(6)
+        self.sp_cross_reb = QSpinBox()
+        self.sp_cross_reb.setRange(1, 2000)
+        self.sp_cross_reb.setValue(5)
+        self.sp_cross_reb.setPrefix("每 ")
+        self.cb_cross_reb_unit = QComboBox()
+        self.cb_cross_reb_unit.addItem("根", "bar")
+        self.cb_cross_reb_unit.addItem("交易日", "day")
+        self.cb_cross_reb_unit.addItem("个月", "month")
+        rb.addWidget(self.sp_cross_reb, 1)
+        rb.addWidget(self.cb_cross_reb_unit)
+        p2.addWidget(row_reb)
+        self.lbl_cross_reb = QLabel()
+        self.lbl_cross_reb.setObjectName("Hint")
+        self.lbl_cross_reb.setWordWrap(True)
+        p2.addWidget(self.lbl_cross_reb)
 
         # ---- 多空腿数：**只有截面对冲要**。
         #
@@ -3181,6 +3233,8 @@ class MainWindow(QMainWindow):
             self.chk_pool.toggled.connect(self._on_cross_param_changed)
             self.cb_pool_factor.currentIndexChanged.connect(self._on_cross_param_changed)
             self.sp_pool_pct.valueChanged.connect(self._on_cross_param_changed)
+            self.sp_pool_reb.valueChanged.connect(self._on_cross_param_changed)
+            self.cb_pool_reb_unit.currentIndexChanged.connect(self._on_cross_param_changed)
             self.cb_label.currentIndexChanged.connect(self._on_cross_param_changed)
             for _w in (self.cb_trig1, self.cb_trig2, self.cb_trig_rule, self.cb_trig_side):
                 _w.currentIndexChanged.connect(lambda *_: self._on_trigger_src_changed())
@@ -4394,6 +4448,32 @@ class MainWindow(QMainWindow):
             "交易日 / 个月：按天数给，回测时按实际密度换算成根数\n"
             "（不同品种夜盘时长不同，一天可能是 48 根也可能是 68 根）。")
 
+    def _pool_reb(self) -> tuple[int, str]:
+        """筛品种频率：(数量, 单位)。单位只有 day / month。"""
+        if not hasattr(self, "sp_pool_reb"):
+            return 1, "day"
+        n = max(1, int(self.sp_pool_reb.value()))
+        unit = self.cb_pool_reb_unit.currentData() or "day"
+        return n, ("month" if unit == "month" else "day")
+
+    def _sync_pool_reb(self) -> None:
+        """筛品种频率那一行的提示。
+
+        和调仓频率分开说清楚：**筛池**决定「谁有资格进场」，**调仓**决定「多久
+        换一次仓」。两个都按交易日/月给，但语义完全不同 —— 筛池不动的时候，
+        池外的品种这一段连排名都不参与，哪怕它这几天变强了也进不来。
+        """
+        if not hasattr(self, "lbl_pool_reb"):
+            return
+        n, unit = self._pool_reb()
+        if unit == "month":
+            head = f"筛品种频率：每 {n} 个月重排一次池。"
+            tail = "一个月按 21 个交易日折算。间隔内沿用上一次的池。"
+        else:
+            head = f"筛品种频率：每 {n} 个交易日重排一次池。"
+            tail = "间隔内沿用上一次的池（池外的品种这一段不参与排名）。"
+        self.lbl_pool_reb.setText(head + tail)
+
     def _cross_leverage(self) -> float | None:
         """截面组合的名义敞口倍数（按「仓位」那一组控件算）。
 
@@ -4441,6 +4521,10 @@ class MainWindow(QMainWindow):
         self.row_tiers.setVisible(tier_on)
         # 池过滤两种模式都能用：对冲是「池内多强空弱」，选品种是「池内全进时序腿」
         self.row_pool.setVisible(self.chk_pool.isChecked())
+        # 筛池频率跟着「先筛品种池」的开关走：没开筛池就没有频率这回事
+        for w in (self.row_pool_reb, self.lbl_pool_reb):
+            w.setVisible(self.chk_pool.isChecked())
+        self._sync_pool_reb()
         ml_on = self.factor_mode == "ml"
         for w in (self.lbl_label, self.cb_label):
             w.setVisible(ml_on)
@@ -4520,8 +4604,10 @@ class MainWindow(QMainWindow):
         lines.append(f"截面因子：{fac or '（未选）'}")
 
         if self.chk_pool.isChecked():
+            _pn, _pu = self._pool_reb()
             lines.append(f"先筛池：{self.cb_pool_factor.currentText()} 留 "
-                         f"{self.sp_pool_pct.value():.0f}%")
+                         f"{self.sp_pool_pct.value():.0f}%"
+                         f"（每 {_pn} {'个月' if _pu == 'month' else '个交易日'}重排）")
         # 跨周期是「同一组参数、两套数据」，不写出来就没法解释两次结果为什么不同
         p1 = self._step1_period()
         if p1:
@@ -5105,6 +5191,9 @@ class MainWindow(QMainWindow):
             "units": units,
             "pool_key": pool_key,
             "pool_pct": float(self.sp_pool_pct.value()),
+            # 筛品种频率：多久重排一次池（单位 day / month）
+            "pool_reb": int(self._pool_reb()[0]),
+            "pool_reb_unit": self._pool_reb()[1],
             "label": self.cb_label.currentData() or "volret",
         }
 
@@ -5178,6 +5267,8 @@ class MainWindow(QMainWindow):
             cross_pool_mode="single" if _cx["pool_key"] else "off",
             cross_pool_keys=[_cx["pool_key"]] if _cx["pool_key"] else [],
             cross_pool_pct=_cx["pool_pct"],
+            cross_pool_reb=_cx["pool_reb"],
+            cross_pool_reb_unit=_cx["pool_reb_unit"],
             cross_step1_period=self._step1_period(),
             cross_label_mode=_cx["label"],
             timing_family=self._timing_family(),
@@ -5295,6 +5386,31 @@ class MainWindow(QMainWindow):
                 self.cb_step1_period.setCurrentIndex(sp1)
             self.sp_cross_pct.setValue(float(cfg.cross_top_pct or 10.0))
             self.sp_cross_bot.setValue(float(getattr(cfg, "cross_bot_pct", 0) or 10.0))
+            # ---- 先筛品种池（含 2026-11-23 新增的筛池频率）
+            #
+            # 这一段以前**完全没恢复**：存下来的 `cross_pool_keys / pct` 只在
+            # `_current_config` 里写、回放时读，界面上却永远是「不筛池」。
+            # 用户从策略库双击一条带筛池的截面策略，看到的是一份没筛池的配置。
+            pkeys = list(getattr(cfg, "cross_pool_keys", []) or [])
+            p_on = (str(getattr(cfg, "cross_pool_mode", "off") or "off").lower()
+                    != "off") and bool(pkeys)
+            self.chk_pool.blockSignals(True)
+            self.chk_pool.setChecked(p_on)
+            self.chk_pool.blockSignals(False)
+            if p_on:
+                pi = self.cb_pool_factor.findData(pkeys[0])
+                if pi >= 0:
+                    self.cb_pool_factor.setCurrentIndex(pi)
+            self.sp_pool_pct.setValue(
+                float(getattr(cfg, "cross_pool_pct", 60.0) or 60.0))
+            # 频率：先数量、后单位（和上面调仓同一套理由：setValue 会触发一次
+            # 摘要重算，那时单位还是旧的）
+            self.sp_pool_reb.setValue(
+                max(1, int(getattr(cfg, "cross_pool_reb", 1) or 1)))
+            pu = self.cb_pool_reb_unit.findData(
+                getattr(cfg, "cross_pool_reb_unit", "day") or "day")
+            if pu >= 0:
+                self.cb_pool_reb_unit.setCurrentIndex(pu)
             cw = self.cb_cross_w.findData(cfg.cross_weight or "risk")
             if cw >= 0:
                 self.cb_cross_w.setCurrentIndex(cw)
@@ -6575,6 +6691,8 @@ class MainWindow(QMainWindow):
             pool_mode="single" if _cx["pool_key"] else "off",
             pool_keys=[_cx["pool_key"]] if _cx["pool_key"] else [],
             pool_top_pct=_cx["pool_pct"],
+            pool_reb=_cx["pool_reb"],
+            pool_reb_unit=_cx["pool_reb_unit"],
             label_mode=_cx["label"],
             period=period,
             factor_mode=self.factor_mode,
@@ -6607,7 +6725,9 @@ class MainWindow(QMainWindow):
         label = (f"{mode_cn} · {fcn} · {len(frames)} 品种 · "
                  f"{ccfg.step_text(_bpd)}调仓")
         if ccfg.pool_keys:
-            label += f" · 先筛池 {ccfg.pool_top_pct:g}%"
+            _pu = "月" if str(getattr(ccfg, "pool_reb_unit", "day")) == "month" else "交易日"
+            label += (f" · 先筛池 {ccfg.pool_top_pct:g}%"
+                      f"/每{int(getattr(ccfg, 'pool_reb', 1) or 1)}{_pu}")
         if ccfg.step1_period:
             # 跨周期是「同一组参数、两套数据」，不写出来就没法解释两次结果为什么
             # 不一样

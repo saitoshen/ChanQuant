@@ -2259,6 +2259,84 @@ def _run() -> tuple[bool, list[str]]:
 
     check("截面逐笔金额口径", _cross_trade_money)
 
+    def _pool_reb_cycle():
+        """筛品种频率：每 N 个交易日 / 每 N 个月重排一次池，间隔内沿用上一份。
+
+        用户在 2026-11-23 要求「筛品种池下面增加一个筛品种的频率，单位是交易日
+        或者月」。语义必须先钉死，否则界面上给了个旋钮、回测里却还在逐 bar 重排
+        （看起来完全正常，只是换手悄悄变高）：
+
+        ① `reb=1/day` 就是原来那套（逐 bar 判池），一行都不能变；
+        ② `reb=3/day` 每 3 个交易日才采一次，块内**完全相同**；
+        ③ 月份口径按**自然月**切，不是按「30 天」；
+        ④ 中间那一段真的会和逐 bar 版不同（否则等于这个参数没生效）；
+        ⑤ 存读往返：3 个月 ⇒ 3/"month"；脏数据（0 / "bar" / 999）要被夹回。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import cross as CX
+        from ttrade import strategy_store as SStore
+
+        idx = pd.bdate_range("2026-01-05", periods=24)      # 跨 1、2 两个月
+        cols = ["A", "B", "C", "D"]
+        # 池分数每天轮换一次名次：这样「重排」一定改变入选名单
+        pool = pd.DataFrame(
+            [[float((i + j) % 4) for j in range(4)] for i in range(len(idx))],
+            index=idx, columns=cols)
+        score = pd.DataFrame(1.0, index=idx, columns=cols)
+
+        base = CX._apply_pool(score, pool, 50.0).notna()    # reb 缺省 = 逐 bar
+
+        def _same_rows(a, b) -> bool:
+            return bool((a.fillna(False) == b.fillna(False)).all().all())
+
+        # ② 每 3 个交易日
+        d3 = CX._apply_pool(score, pool, 50.0, reb=3, reb_unit="day").notna()
+        for a in range(0, len(idx), 3):
+            blk = d3.iloc[a:a + 3]
+            if blk.nunique().max() > 1:
+                raise RuntimeError(f"每 3 个交易日的块内池子变了（第 {a} 行起）")
+            if not _same_rows(blk.iloc[[0]], base.iloc[[a]]):
+                raise RuntimeError(f"第 {a} 行不是按那一根判的池")
+        # ④ 必须真的和逐 bar 不同，否则参数等于没生效
+        if _same_rows(d3, base):
+            raise RuntimeError("每 3 个交易日重排的结果和逐 bar 完全一样 —— 频率没落地")
+
+        # ③ 自然月
+        dm = CX._apply_pool(score, pool, 50.0, reb=1, reb_unit="month").notna()
+        months = pd.DatetimeIndex(idx).to_period("M")
+        for m in months.unique():
+            blk = dm[months == m]
+            if blk.nunique().max() > 1:
+                raise RuntimeError(f"{m} 这个月内池子变了 —— 没有按自然月切")
+        # 夏令时 / 月末长度都不用管：月份是日历口径，不是 30 天
+        if _same_rows(dm, base):
+            raise RuntimeError("按月重排和逐 bar 完全一样 —— 月份口径没落地")
+
+        # ⑤ 存读往返 + 脏数据
+        good = SStore.StrategyConfig.from_dict(
+            {"symbol": "RB", "exchange": "SHFE", "family": "cross",
+             "cross_pool_reb": 3, "cross_pool_reb_unit": "month"})
+        if (int(good.cross_pool_reb), good.cross_pool_reb_unit) != (3, "month"):
+            raise RuntimeError(
+                f"筛池频率存读往返丢了：{good.cross_pool_reb}/{good.cross_pool_reb_unit}")
+        bad = SStore.StrategyConfig.from_dict(
+            {"symbol": "RB", "exchange": "SHFE", "family": "cross",
+             "cross_pool_reb": 0, "cross_pool_reb_unit": "bar"})
+        if (int(bad.cross_pool_reb), bad.cross_pool_reb_unit) != (1, "day"):
+            raise RuntimeError(
+                f"脏数据没夹回来：{bad.cross_pool_reb}/{bad.cross_pool_reb_unit}")
+        big = SStore.StrategyConfig.from_dict(
+            {"symbol": "RB", "exchange": "SHFE", "family": "cross",
+             "cross_pool_reb": 999, "cross_pool_reb_unit": "month"})
+        if int(big.cross_pool_reb) != 240:
+            raise RuntimeError(f"超大值没夹住：{big.cross_pool_reb}")
+        return ("逐 bar = 踩点采样（块内一致）；3 个交易日 / 自然月都真的换了池；"
+                "存读往返 3 个月、脏数据夹回 1 个交易日、999 夹到 240")
+
+    check("筛品种频率（交易日 / 月）", _pool_reb_cycle)
+
     check("收益与年化口径一致", _return_basis)
 
     def _lib_name_rules():
@@ -11216,6 +11294,72 @@ def _run() -> tuple[bool, list[str]]:
                 f"截面两步配置窗异常（{cross_dlg_info}）：参数面板借进弹窗、切走还回"
                 "侧边栏，或者侧边栏顺序被搬乱了，或者「第一步因子周期」选不动"
             )
+
+        # ---- 两步窗的**归属**：左边只筛品种，右边选多空 ----
+        #
+        # 用户 2026-11-23 两次要求：先把「因子模式 / 截面因子 / 等权」挪到右边、
+        # 再把「调仓频率」也挪过去，并明确「左边的选项都是用于第一步筛选品种的」。
+        # 这里钉的是归属而不是长相：换了布局、但某个控件还留在错的栏里，界面上
+        # 几乎看不出来（两栏都能滚），只有这条断言会红。
+        place_ok, place_info = False, ""
+        _pool_was = win.chk_pool.isChecked()
+        try:
+            win.cb_family.setCurrentIndex(win.cb_family.findData("cross"))
+            app.processEvents()
+            s1, s2 = win.cross_step1, win.cross_step2
+
+            def _in(w, host):
+                return w is host or host.isAncestorOf(w)
+
+            left = (_in(win.grp_pool, s1) and _in(win.sp_pool_reb, s1)
+                    and _in(win.cb_pool_reb_unit, s1)
+                    and _in(win.cb_step1_period, s1)
+                    and _in(win.cb_cross_mode, s1))
+            right = (_in(win.cross_factor_host, s2) and _in(win.box_fsel, s2)
+                     and _in(win.cross_fparam_host, s2)
+                     and _in(win.sp_cross_reb, s2)
+                     and _in(win.cb_cross_reb_unit, s2)
+                     and _in(win.grp_legs, s2))
+            wrong = [nm for nm, w in (("截面因子", win.cross_factor_host),
+                                      ("调仓频率", win.sp_cross_reb),
+                                      ("多空腿数", win.grp_legs))
+                     if _in(w, s1)]
+            units = [win.cb_pool_reb_unit.itemData(i)
+                     for i in range(win.cb_pool_reb_unit.count())]
+            unit_ok = units == ["day", "month"]      # 只要交易日 / 月，不要「根」
+            # 频率控件跟着「先筛品种池」的开关走：没开筛池就没有频率可谈。
+            # 🔴 这里**屏蔽信号**再手动同步显隐：`setChecked` 会走
+            # `_on_cross_param_changed` → `_schedule()` → 后台起一次截面回测，
+            # 而窗口马上要被销毁，线程还在跑 ⇒ 收尾时偶发段错误（实测 exit=139）。
+            # 这条验的是「谁跟谁一起显示」，不需要真算一遍。
+            win.chk_pool.blockSignals(True)
+            win.chk_pool.setChecked(False)
+            win.chk_pool.blockSignals(False)
+            win._sync_cross_controls()
+            app.processEvents()
+            hide_ok = not win.row_pool_reb.isVisible()
+            win.chk_pool.blockSignals(True)
+            win.chk_pool.setChecked(True)
+            win.chk_pool.blockSignals(False)
+            win._sync_cross_controls()
+            app.processEvents()
+            show_ok = win.row_pool_reb.isVisible()
+            # 侧边栏摘要里要写出频率：不开窗也得看得见「多久重排一次」
+            sum_ok = "重排" in win.lbl_cross_sum.text()
+            place_ok = (left and right and not wrong and unit_ok
+                        and hide_ok and show_ok and sum_ok)
+            place_info = (f"左筛品种 {left} / 右选多空 {right} / 留在左边的 {wrong} / "
+                          f"单位 {units} / 藏-显 {hide_ok}-{show_ok} / 摘要 {sum_ok}")
+        except Exception as exc:  # noqa: BLE001
+            place_info = f"{type(exc).__name__}: {exc}"
+        finally:
+            win.chk_pool.blockSignals(True)
+            win.chk_pool.setChecked(_pool_was)
+            win.chk_pool.blockSignals(False)
+            win._sync_cross_controls()
+            app.processEvents()
+        if not place_ok:
+            raise RuntimeError(f"截面两步窗归属不对（{place_info}）")
 
         # ---- 组合页「查看回测」必须在后台线程跑 ----
         #

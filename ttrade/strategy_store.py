@@ -225,6 +225,10 @@ class StrategyConfig:
     cross_pool_keys: list = field(default_factory=list)
     cross_pool_reverse: dict = field(default_factory=dict)
     cross_pool_pct: float = 60.0        # 池里保留分数最高的百分之几
+    # 多久重排一次品种池：数量 + 单位（day / month）。老配置没有这两个字段，
+    # 落到「每个交易日重排一次」，和原来的行为最接近
+    cross_pool_reb: int = 1
+    cross_pool_reb_unit: str = "day"
     # 第一步（排名 + 筛池）用哪个周期的因子。空 = 跟随策略周期。
     # 5 分钟策略用日线成交额筛池是常见用法，存盘必须带上 —— 只存因子不存周期，
     # 重开一次就悄悄变回「5 分钟成交额」，同一份配置跑出两个结果
@@ -462,6 +466,10 @@ class StrategyConfig:
             bits = [f"{mode}·{len(self.factor_keys or [])}因子",
                     f"调仓={int(self.cross_rebalance or 1)}{_REB_UNIT_CN.get(self.cross_rebalance_unit, '根')}",
                     f"权重={_WEIGHT_CN.get(self.cross_weight, '风险平价')}"]
+            if str(self.cross_pool_mode or "off").lower() != "off" and self.cross_pool_keys:
+                _pu = "月" if self.cross_pool_reb_unit == "month" else "交易日"
+                bits.append(f"筛池={float(self.cross_pool_pct or 0):g}%"
+                            f"/{int(self.cross_pool_reb or 1)}{_pu}")
             if self.cross_mode == "select":
                 # 选品种模式没有腿数（池内全进时序腿），写出来是假信息
                 bits.append(f"时序={'规则' if self.timing_family != 'factor' else '因子'}")
@@ -688,6 +696,14 @@ class StrategyConfig:
             cfg.cross_rebalance_unit = "day" if cfg.cross_mode == "select" else "bar"
         cfg.cross_top_pct = _clamp_pct(cfg.cross_top_pct, 10.0, 50.0)
         cfg.cross_bot_pct = _clamp_pct(getattr(cfg, "cross_bot_pct", 10.0), 10.0, 50.0)
+        # 筛品种频率：数量夹到 1~240，单位只认 day / month（手改 JSON 写成
+        # "bar" 的话按 day 处理 —— 筛池因子按根筛没有意义）
+        try:
+            cfg.cross_pool_reb = max(1, min(240, int(cfg.cross_pool_reb or 1)))
+        except (TypeError, ValueError):
+            cfg.cross_pool_reb = 1
+        if getattr(cfg, "cross_pool_reb_unit", None) not in ("day", "month"):
+            cfg.cross_pool_reb_unit = "day"
         if cfg.cross_mode not in ("hedge", "select"):
             cfg.cross_mode = "hedge"
         if cfg.cross_weight not in ("risk", "equal", "score", "tier"):
