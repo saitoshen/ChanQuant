@@ -144,6 +144,31 @@ def _tick_decimals(tick: float) -> int:
     return symbols_info.tick_decimals(tick)
 
 
+def _sym_info(sym: str) -> dict:
+    """合约 → 品种表信息（`tick` / `mult` / `margin` …），查不到给空表。
+
+    🔴 **裸合约代码（CTP 的 `IM2612`）必须先把交易所补上**（2026-11-23）：
+    `symbols_info.info("IM", "")` 的 `tick` 是对的，但 **`mult` 会退回默认 1.0**
+    —— 双击报价后那句「乘数 1」就是这么来的（IM 一手其实是 200 倍），用户按它
+    算一手多少钱会差两个数量级。交易所从品种前缀表补，和 CTP 那边
+    `_exchange_of()` 用的是同一张表（`ctp_live.variety_exchange`）。
+    """
+    vari, ex = symbols_info.contract_product(str(sym or ""))
+    if not vari:
+        return {}
+    if not ex:
+        try:
+            from ttrade.ctp_live import variety_exchange
+
+            ex = variety_exchange(vari) or ""
+        except Exception:  # noqa: BLE001 - 补不出来就按无交易所查
+            ex = ""
+    try:
+        return symbols_info.info(vari, ex)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _avg_price(r: dict) -> str:
     """开仓均价。锁仓时两边都有，按净头寸取；只有一边就取那一边。"""
     pl = _num(r.get("open_price_long"))
@@ -358,7 +383,8 @@ class AccountDialog(QDialog):
             "股票模拟（TqSimStock / TqKqStock）用同一个天勤账户，但**数量单位是股**"
             "（100 股起、必须整百），方向只有买入 / 卖出，T+1 当天买的当天不能卖。\n"
             "CTP 柜台**不走天勤**：填柜台预设 + 投资者账号密码即可，前置地址留空就"
-            "按预设补（SimNow 7x24 可以随时连）。CTP 只收限价单，下单必须填价格。\n"
+            "按预设补（SimNow 7x24 可以随时连）。限价 / 市价都支持（市价走"
+            "AnyPrice + IOC，全部交易所已开放）。\n"
             "融航资管中台**也不走天勤**：用户名 / 密码 / 经纪商代码 / 交易服务器 / "
             "行情服务器 / 产品名称 / 授权编码这七项要填全，缺一项柜台就登不上。\n"
             "**不同柜台的账户可以同时勾选、一起登录**，那时上面会出现「行情源」"
@@ -1165,6 +1191,16 @@ class TradePage(QWidget):
             return
         self._fill_price_local(sym, text)
 
+    def _tick_sym(self, und: str = "") -> str:
+        """价格框的步长该按**哪个合约**算：合约框里手填的那个优先。
+
+        🔴 不能拿报价里的合约（2026-11-23 用户报「上下键的跳动不对，很多都跑到
+        10 了，连 SA、IM 也是」）：`st.quote` 可能是上一个合约的残留（刚改完合约、
+        新报价还没到），按它设步长就停在上一个品种的 tick 上 —— 铜一跳 10，之后
+        看什么品种都跳 10。合约框才是用户真正要下的那个合约。
+        """
+        return self.cb_contract.currentText().strip() or str(und or "")
+
     def _apply_tick(self, sym: str = "", tick: float = 0.0) -> float:
         """把「价格」框的上下调节幅度设成**这个合约的最小变动价位**。
 
@@ -1173,23 +1209,25 @@ class TradePage(QWidget):
         一格」（铜）。`QDoubleSpinBox` 的上下按钮、滚轮、上下键全按 `singleStep`
         走，所以调这一个值就够。
 
-        `tick` 传 0 时按品种表查（`symbols_info` 内部会 upper，`cu` 也认）。
+        🔴 **给了 `sym` 就一律以品种表为准**（`symbols_info`），`tick` 只在表里
+        查不到时兜底。以前是反过来的（调用方传进来的 tick 优先），而传进来的那个
+        数可能是**上一个合约**的报价 tick —— 于是「铜之后看 IM，跳一档就是 10」。
+        品种表也是保证金 / 手续费 / 追单跳数用的同一张表，口径必须一致。
+
         顺手把小数位对齐到 tick —— 铜不该显示 `8240.0000`。**但只在不丢信息时
         才减位数**：现值在目标位数下表示不出来（说明 tick 和现价不是一套），
         就保留原来的位数，宁可多显示两位，也不能把 3550.5 抹成 3551。
 
         返回最终用上的 tick（0 = 查不到，什么都没动）。
         """
-        if not (tick > 0) and sym:
+        if sym:
+            dinfo = _sym_info(sym)
             try:
-                vari = sym.rsplit(".", 1)[-1]
-                ex = sym.split(".", 1)[0] if "." in sym else ""
-                # 郑商所的合约是 `TA706` 这种，去掉数字剩下的就是品种代码
-                info = symbols_info.info(
-                    "".join(c for c in vari if c.isalpha()), ex)
-                tick = float(info.get("tick") or 0)
-            except Exception:  # noqa: BLE001 - 查不到就维持原样
-                tick = 0.0
+                tbl = float(dinfo.get("tick") or 0)
+            except (TypeError, ValueError):
+                tbl = 0.0
+            if tbl > 0:
+                tick = tbl
         if not (tick > 0) and getattr(self, "_stock_mode", False):
             # A 股不在品种表里（那张表是期货的），但一档就是 0.01 元 ——
             # 留步长 1 会按一下就跳一块钱
@@ -1302,18 +1340,23 @@ class TradePage(QWidget):
         """
         sel = self._checked_specs() or self._accounts
         stock = bool(sel) and all(s.is_stock for s in sel)
-        # 柜台口径（CTP / 融航）统一：都只收限价单。判据走 `backend`，
-        # 别再逐家写 == "ctp" —— 加了融航之后那样写会漏掉一家
+        # 柜台口径（CTP / 融航）统一，判据走 `backend`，别再逐家写 == "ctp"
         ctp = bool(sel) and all(getattr(s, "backend", "tq") != "tq" for s in sel)
         self._stock_mode = stock
         self._ctp_mode = ctp
         if not hasattr(self, "lbl_vol"):
             return
-        # 柜台只收限价单：市价那个勾直接禁掉，别让人勾完再被柜台拒一次
-        self.chk_market.setEnabled(not ctp)
-        if ctp:
+        # 市价单：柜台（CTP / 融航）**现在支持**了（2026-11-23，所有交易所都已
+        # 开放，含上期所 / 能源所），所以不再禁用；A 股仍然没有市价单 ——
+        # 交易所只有限价，勾了会被柜台拒，直接禁掉并说清原因
+        self.chk_market.setEnabled(not stock)
+        if stock:
             self.chk_market.setChecked(False)
-            self.chk_market.setToolTip("柜台（CTP / 融航）只收限价单，必须填价格")
+            self.chk_market.setToolTip("A 股只有限价委托，没有市价单")
+        elif ctp:
+            self.chk_market.setToolTip(
+                "市价单：价格字段留空，按 AnyPrice + IOC 报给柜台"
+                "（全部交易所已开放，含上期所 / 能源所）")
         else:
             self.chk_market.setToolTip("")
         self.lbl_vol.setText("股数" if stock else "手数")
@@ -1676,21 +1719,24 @@ class TradePage(QWidget):
         q = st.quote or {}
         if q:
             last = q.get("last") or 0
-            # 🔴 这里**只留下单面板要用到的副作用**（默认合约 / 最小变动价位 /
-            # 首帧价格），不再往顶部写一行报价文本 —— 报价框那张表才是唯一出处
+            # 🔴 这里**只留下单面板要用到的副作用**（最小变动价位 / 首帧价格），
+            # 不再往顶部写一行报价文本 —— 报价框那张表才是唯一出处
             # （2026-11-20 用户要求；两处同时显示时小数位/量口径不一致，看着
             # 像行情在跳）。
+            #
+            # 🔴 也**不再自动改合约框**（2026-11-23 用户要求「合约框只保留双击
+            # 报价后显示合约信息 + 手动敲入补全」）：以前行情推送会把框里的合约
+            # 换成报价里的那个（`_auto_contract`），用户正在填的单子被悄悄换掉
+            # 是能出人命的 —— 合约那条红线只能由人动手改。
             und = q.get("underlying")
-            shown = und if self._stock_mode else str(und or "").rsplit(".", 1)[-1]
-            if shown and self.cb_contract.currentText() in (
-                    "", getattr(self, "_auto_contract", "")):
-                self.cb_contract.setCurrentText(shown)
-                self._auto_contract = shown
             if q.get("price_tick"):
                 if self.sp_price.value() <= 0:
                     self.sp_price.setValue(float(last or 0))
-                # 价格框的上下调节幅度 = 这个合约的最小变动价位
-                self._apply_tick(str(und or ""), float(q["price_tick"]))
+            # 价格框的上下调节幅度 = **合约框里那个合约**的最小变动价位。
+            # 不能拿报价里的 tick 直接设：`st.quote` 可能还是上一个合约的
+            # （刚改完合约、新报价还没到），步长就会停在上一个品种上 ——
+            # 用户看到的「很多都跑到 10 了，连 SA、IM 也是」（10 是之前看过的铜）
+            self._apply_tick(self._tick_sym(und))
 
         # 按账户摊平成三张表，顺手补上账户名。快照里本来就带，但测试桩 / 老
         # 版本快照可能没有 —— 缺了会撤单撤到「空账户」上（天勤静默忽略，单子
@@ -2006,6 +2052,10 @@ class TradePage(QWidget):
     def _on_quote_dbl(self, item) -> None:
         """双击报价行 → 合约和最新价填进最底下的手动下单行。
 
+        这是**唯一**会自动改「合约」框的入口（用户 2026-11-23 明确要求）：
+        合约是能出人命的一条线，只接受**人的动作**（双击报价行 / 手敲合约名）。
+        行情推送、切账户、持仓变化都不许替用户换合约。
+
         填的是**裸合约代码**（`rb2601`），和下单面板的口径一致（交易所在
         `_resolve_contract` 里反查）。勾了「市价」就不动价格框 —— 市价单
         填数字没有意义，改了反而让人以为那个价会生效。
@@ -2021,17 +2071,30 @@ class TradePage(QWidget):
         if not code:
             return
         self.cb_contract.setCurrentText(code)
+        # 步长跟着这个合约走（`_apply_tick` 内部查品种表，报价的 tick 只兜底）
+        tick = self._apply_tick(code)
         self._order_symbol = sym
-        self._auto_contract = ""      # 别让行情推送把合约改回主力
+        # 「显示合约信息」：双击之后不只填价，顺手把**这个合约自己的**一档 / 乘数
+        # 说出来 —— 用户接下来要按上下键调价，得知道一格是多少钱。
+        # 🔴 查乘数要走 `_sym_info()`：裸代码 `IM2612` 直接查表会给默认的 1.0，
+        # 界面上写「乘数 1」而 IM 一手是 200 倍
+        dinfo = _sym_info(code) or _sym_info(sym)
+        info = f"一跳 {tick:g}" if tick > 0 else "一档未知（品种表里没有）"
+        try:
+            mult = float(dinfo.get("mult") or 0)
+        except (TypeError, ValueError):
+            mult = 0.0
+        if mult > 0:
+            info += f" · 乘数 {mult:g}"
         last = _num(cell.data(Qt.UserRole + 1), 0.0) or 0.0
         if last > 0:
             if not self.chk_market.isChecked():
                 self.sp_price.setValue(last)
             self._priced_for = sym
             self.lbl_order_msg.setText(
-                f"已带入 {code} @ {last:g}，确认手数和方向后点「下单」")
+                f"已带入 {code} @ {last:g}（{info}），确认手数和方向后点「下单」")
             return
-        self.lbl_order_msg.setText(f"已带入 {code}，还没拿到最新价，正在取…")
+        self.lbl_order_msg.setText(f"已带入 {code}（{info}），还没拿到最新价，正在取…")
         self._fill_price()
 
     def _watch_targets(self, pos_rows: list[dict]) -> list[str]:
@@ -2140,8 +2203,10 @@ class TradePage(QWidget):
             return
         self._order_symbol = contract
         price = None if self.chk_market.isChecked() else self.sp_price.value()
-        if self._ctp_mode and (price is None or price <= 0):
-            self.on_failed("CTP 只收限价单：取消「市价」并填一个价格")
+        # 限价必须有个价；市价（`price is None`）柜台和天勤都认，不用拦。
+        # 🔴 以前这里挡的是「CTP 只收限价单」，2026-11-23 起柜台支持市价单了
+        if price is not None and price <= 0:
+            self.on_failed("限价单要填一个大于 0 的价格（要市价就勾上「市价」）")
             return
         acc = self._order_account()
         if acc is None:

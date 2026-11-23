@@ -32,6 +32,7 @@ import time
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from ttrade import hubreg
 from ttrade.tqlive import BACKENDS, BACKEND_LABELS, LiveHub, LiveState, merge_states
 
 
@@ -57,15 +58,22 @@ def group_specs(spec) -> dict:
 
 def make_hub(backend: str, specs: list):
     """按柜台造一个 hub。三家的对外接口完全一致（start/subscribe/wait/bars/
-    state/place/cancel/set_target），worker 循环不需要知道底下是谁。"""
+    state/place/cancel/set_target），worker 循环不需要知道底下是谁。
+
+    🔴 **CTP / 融航走进程内注册表**（`ttrade/hubreg.py`，2026-11-23）：同一个
+    账户如果组合页已经在用，这里拿到的就是**同一条连接**，`hub.start()` 会
+    直接短路返回。一个账户在柜台那边只能有一条会话 —— 两条会话的委托回报互不
+    相通、查询额度各抢一份，界面表现就是「交易页有仓、监控器说不一致」。
+    天勤不进注册表：`TqApi` 是单线程语义，两个页面共用一个对象会写坏订阅状态。
+    """
     if backend == "ctp":
         from ttrade.ctp_live import CtpHub
 
-        return CtpHub(specs)
+        return hubreg.acquire("ctp", specs, lambda: CtpHub(specs))
     if backend == "rohon":
         from ttrade.ctp_live import RohonHub
 
-        return RohonHub(specs)
+        return hubreg.acquire("rohon", specs, lambda: RohonHub(specs))
     return LiveHub(specs)
 
 
@@ -80,6 +88,10 @@ class HubSet:
 
     def __init__(self, hubs: dict, feed: str = "") -> None:
         self.hubs = dict(hubs)          # 后端 → hub（断线时会被移掉）
+        # 台账：收尾时要放手的**全部**连接。`hubs` 会因为断线被 pop，只按它
+        # 收尾的话，被摘掉那条的引用永远不还（`hubreg` 里 refs 卡在 2），
+        # 组合页那条会话再也关不掉。
+        self._opened = list(self.hubs.values())
         self.feed = feed if feed in self.hubs else (
             next(iter(self.hubs), ""))
         self.period = ""
@@ -128,11 +140,19 @@ class HubSet:
                             self.feed)
 
     def close(self) -> None:
-        for hub in list(self.hubs.values()):
+        """放手。**只有最后一个使用者才真的关连接**（见 `ttrade/hubreg.py`）。
+
+        组合页可能正在用同一条 CTP 会话跑策略 —— 这里无脑 `hub.close()` 会把
+        它的持仓和委托回报一起掐掉，而组合页那边看着只是「数据不更新了」。
+        `release()` 还对天勤的 hub 返回 True（它不进注册表），行为不变。
+        """
+        for hub in self._opened:
             try:
-                hub.close()
+                if hubreg.release(hub):
+                    hub.close()
             except Exception:  # noqa: BLE001
                 pass
+        self._opened = []
         self.hubs.clear()
 
     # ---- 写：按账户路由 ----
@@ -248,13 +268,27 @@ class LiveWorker(QObject):
         errors: dict = {}
         for name, specs in groups.items():
             label = BACKEND_LABELS.get(name, name)
+            hub = None
             try:
                 hub = make_hub(name, specs)
-                self.log.emit(f"正在连接{label}…")
-                hub.start()
+                if hubreg.refs(hub) > 1:
+                    # 组合页已经为这个账户连过了：拿的是同一条连接。直说，省得
+                    # 用户以为这里又登了一次（账户表上的「已连接」也不会重复）
+                    self.log.emit(f"{label} 复用组合页已连的会话，不再重复登录")
+                else:
+                    self.log.emit(f"正在连接{label}…")
+                hub.start()          # 幂等：复用已有会话时立刻返回
             except Exception as exc:  # noqa: BLE001
                 errors[name] = f"{type(exc).__name__}: {exc}"
                 self.log.emit(f"{label} 连接失败：{errors[name]}")
+                if hub is not None:
+                    # 借到手却没连上：把引用还回去，否则注册表里永远多一个
+                    # 「refs 卡着不降」的僵尸，组合页那条会话再也关不掉
+                    try:
+                        if hubreg.release(hub):
+                            hub.close()
+                    except Exception:  # noqa: BLE001
+                        pass
                 continue
             hubs[name] = hub
 

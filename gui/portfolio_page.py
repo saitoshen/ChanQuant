@@ -88,11 +88,21 @@ K 线，而策略的信号窗口要几百到几千根。柜台那条连接只负
 
 ## 为什么持仓没同步时不让点
 
-`mismatch()` 在 `_pos is None`（刚连上、持仓还没推过来）时一定返回空。
-那是「还不知道」，不是「一致」。这时候点一键对齐，等于拿「账户是空的」
-去算差额，会把整个理论仓位重新开一遍。所以快照里带 `pos_ready`，
-界面分开提示、`align()` 直接拒。同理，没挂策略的账户根本没有连接，
-它的持仓一律不在比对范围 —— 标签里会点名，不能让「一致」两个字蒙过去。
+`mismatch()` 在持仓还没到手时一定返回空。那是「还不知道」，不是「一致」。
+这时候点一键对齐，等于拿「账户是空的」去算差额，会把整个理论仓位重新开一遍。
+
+判据有两条，**别混用**：
+
+- `pos_ready`：账户接口挂上了（`_pos is not None`）。界面用它判断「账户在不在线、
+  按钮该写登录还是登出」。
+- `pos_synced`：持仓**真从柜台读回来过一整轮**。界面用它判断「比对结果作不作数」。
+
+只有 `pos_ready` 是不够的：柜台可能一条持仓回调都没回，这时 `_pos` 是个**空字典**
+（不是 None），和「账户真的空仓」长得一模一样 —— 2026-11-23 融航就是这样，
+账户里 6 个合约有仓，监控器却写「账户仓位与策略理论持仓一致」。
+
+同理，没挂策略的账户根本没有连接，它的持仓一律不在比对范围 —— 标签里会点名，
+不能让「一致」两个字蒙过去。
 
 ## 为什么策略列表里没有「实际仓位」
 
@@ -739,12 +749,81 @@ class PortfolioController(QObject):
         """让引擎在下一份快照里带上这些策略的实时 K 线。"""
         return self._submit(key, lambda r: r.want_bars(sids))
 
+    def refresh(self, key: str) -> bool:
+        """让这个账户**立刻**重挂持仓引用、清掉比对缓存。
+
+        监控器上的「刷新」按钮走这里。不重启策略、不清 K 线、不动台账 ——
+        只是把「账户现在到底持着什么」重新读一遍并重算差额。
+        """
+        return self._submit(key, lambda r: r.refresh_now())
+
     def set_chase(self, chase) -> None:
         for key in list(self._workers):
             self._submit(key, lambda r, c=chase: setattr(r, "chase", c))
 
 
 # ------------------------------------------------------------------ 对话框
+
+
+class WatchDialog(QDialog):
+    """选要**监控哪几个账户**（用户 2026-11-23 要求）。
+
+    「没选的账户就不做监控」有两条后果，框里必须写清楚，否则用户勾掉一个之后
+    会以为它的仓凭空消失了：
+
+      - 不进监控器：它的不一致**不会**出现在右下那张表里（不是「它对齐了」）；
+      - 一键对齐不会动它：`_align()` 只按监控范围内的账户算差额。
+    """
+
+    def __init__(self, names: list, checked: list, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("监控账户")
+        self.setMinimumWidth(420)
+        lay = QVBoxLayout(self)
+
+        tip = QLabel("勾上的账户才监控：持仓比对、监控器列表、一键对齐都只按勾上的算。")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        box = QHBoxLayout()
+        btn_all = QPushButton("全选")
+        btn_none = QPushButton("全不选")
+        btn_all.clicked.connect(lambda: self._set_all(True))
+        btn_none.clicked.connect(lambda: self._set_all(False))
+        box.addWidget(btn_all)
+        box.addWidget(btn_none)
+        box.addStretch(1)
+        lay.addLayout(box)
+
+        self.lst = QListWidget()
+        on = set(checked or [])
+        for name in names:
+            it = QListWidgetItem(name)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked if (not on or name in on) else Qt.Unchecked)
+            self.lst.addItem(it)
+        lay.addWidget(self.lst, 1)
+
+        hint = QLabel("提示：勾掉 ≠ 登出。账户照常连接、策略照常下单，只是这边的监控器"
+                      "和「一键对齐」不管它了。\n"
+                      "全勾等于「全部监控」—— 以后新加的账户会自动纳入，不用再来勾一次。")
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def _set_all(self, on: bool) -> None:
+        for i in range(self.lst.count()):
+            self.lst.item(i).setCheckState(Qt.Checked if on else Qt.Unchecked)
+
+    def picked(self) -> list[str]:
+        """勾上的账户名（保持列表顺序）。"""
+        return [self.lst.item(i).text() for i in range(self.lst.count())
+                if self.lst.item(i).checkState() == Qt.Checked]
 
 
 class LibraryDialog(QDialog):
@@ -1302,6 +1381,10 @@ class PortfolioPage(QWidget):
         self._accounts = tqlive.load_accounts()
         self._chase = SStore.load_chase()
         self._snaps: dict[str, dict] = {}
+        # 监控范围：只盯着这几个账户（空 = 全监控）。用户 2026-11-23 要求
+        # 「配置需要选择监控哪个账户，没有选的账户就不做监控」。
+        # 落 `ui_state`：它是纯显示偏好，丢了不影响策略/台账（和滚动位置同一份）
+        self._watch: list[str] = self._load_watch()
         # sid -> 快照里的 slot（单账户时的主来源）
         self._slot_view: dict[str, dict] = {}
         # sid -> {账户: slot}。多账户策略在每个账户上各有一个槽位，`_slot_view`
@@ -1703,6 +1786,22 @@ class PortfolioPage(QWidget):
                              "没有策略在管的仓位平掉（会先弹确认框）")
         btn_align.clicked.connect(self._align)
         head.addWidget(btn_align)
+
+        # 🔴 刷新（2026-11-23 用户要求）：比对结果缓存 5 秒、持仓引用 2 秒才重挂一次，
+        # 成交之后想马上确认「齐没齐」，等缓存过期太难受。这个按钮把那两个节拍
+        # 一起清零，再让引擎重读一遍持仓。
+        btn_refresh = QPushButton("刷新")
+        btn_refresh.setToolTip("重新读一遍账户持仓、立刻重算「哪些合约需要对」\n"
+                              "（只在监控范围内的账户；不动任何仓位）")
+        btn_refresh.clicked.connect(self._refresh_monitor)
+        head.addWidget(btn_refresh)
+
+        # 监控账户：只盯着勾选的那几个。没勾的账户不进这张表、也不参与一键对齐
+        btn_watch = QPushButton("监控账户")
+        btn_watch.setToolTip("选要监控哪几个账户。没勾的账户：不进监控器、\n"
+                             "也不被「一键对齐」动（默认全选）")
+        btn_watch.clicked.connect(self._pick_watch)
+        head.addWidget(btn_watch)
 
         # 多账户时同一个合约会在两张连接里各出现一次，必须带上账户才分得清
         self.tbl_mon = self._table(
@@ -3375,6 +3474,8 @@ class PortfolioPage(QWidget):
 
         rows = []
         for key, snap in self._snaps.items():
+            if not self._in_watch(key):
+                continue                     # 没勾的账户不监控（见「监控账户」）
             for r in snap.get("mismatch") or []:
                 rows.append((key, r))
         rows.sort(key=lambda kr: (not kr[1].get("managed"), kr[0], kr[1]["symbol"]))
@@ -3384,7 +3485,12 @@ class PortfolioPage(QWidget):
         sig = tuple((k, r["symbol"], r["target"], r["actual"], r["delta"],
                      bool(r.get("managed")), int(r.get("a_long") or 0),
                      int(r.get("a_short") or 0),
-                     bool(self._snaps.get(k, {}).get("account_ready", True)))
+                     bool(self._snaps.get(k, {}).get("account_ready", True)),
+                     # 持仓有没有真读回来也要进签名：它是「账户实际」这一格的
+                     # 画法之一（读不到要画「—」），不进签名就不会重绘
+                     bool(self._snaps.get(k, {}).get("pos_synced", True)),
+                     # 「用户主动登出」和「压根没接上」说明文字不一样，同样要进
+                     bool(self._snaps.get(k, {}).get("user_detached", False)))
                     for k, r in rows)
         if sig != self._mon_sig:
             self._mon_sig = sig
@@ -3392,58 +3498,102 @@ class PortfolioPage(QWidget):
             for i, (key, r) in enumerate(rows):
                 managed = bool(r.get("managed"))
                 locked = bool(r.get("locked"))
-                logged_in = bool(self._snaps.get(key, {}).get("account_ready", True))
+                snap = self._snaps.get(key, {})
+                logged_in = bool(snap.get("account_ready", True))
+                # 🔴 「读不到」和「读到了、是 0」必须长得不一样（2026-11-23 融航
+                # SA701：柜台一条持仓回包都没给，`_pos` 是空字典，这里就写了个
+                # 「账户实际 0」，看着像账户真的平了）。读不到一律画「—」。
+                synced = bool(snap.get("pos_synced", True))
                 have = str(r["actual"])
                 if locked:
                     # 净 0 但两条腿都有仓。只写 0 等于什么都没说
                     have = (f"{r['actual']}（多{r['a_long']} 空{r['a_short']}）")
+                delta_txt = _delta_text(r)
                 note = "策略持仓" if managed else "未托管（策略已停或手工开仓）"
                 if locked:
                     note += " · 锁仓，两条腿都要平"
                 if not logged_in:
                     # 账户登出时持仓是上次的旧数，而且对齐发不出去。必须让人一眼
-                    # 看出「这行现在动不了」，否则点确认后一笔不发，像按钮坏了
-                    note = "账户未登录，对齐会跳过 · " + note
+                    # 看出「这行现在动不了」，否则点确认后一笔不发，像按钮坏了。
+                    # 🔴 两种「没有账户」要分开说（2026-11-23）：用户自己点了登出
+                    # 是一个意思，这条连接压根没接上（启动失败 / 在交易页重新登录
+                    # 过）是另一个意思 —— 后者点「刷新」就能接回来，不说清楚用户
+                    # 只会反复点刷新然后觉得按钮坏了。
+                    if snap.get("user_detached"):
+                        note = ("已手动登出账户（点上面的「登录 / 登出账户」接回来），"
+                                "对齐会跳过 · ") + note
+                    else:
+                        note = ("这条连接没接上账户（不是「账户没仓」，也不是持仓没"
+                                "读回来）；点「刷新」会按账户配置重新登录，对齐会跳过 · "
+                                ) + note
+                    have = delta_txt = "—"
+                elif not synced:
+                    note = ("持仓还没从柜台读回来（这一格不是 0，是还不知道） · "
+                            + note)
+                    have = delta_txt = "—"
                 vals = [
                     key, r["symbol"], str(r["target"]), have,
-                    _delta_text(r), note,
+                    delta_txt, note,
                 ]
                 for j, v in enumerate(vals):
                     item = QTableWidgetItem(v)
                     if j in (2, 3, 4):
                         item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                     if j == 4:
-                        item.setForeground(QColor(C_BAD if managed else C_MUTED))
-                    if j == 5 and not managed:
+                        # 差额是「—」（持仓没读到 / 没登录）时不能染成红色：
+                        # 红字的意思是「这一行真的差这么多」，读不到时没这个结论
+                        loud = managed and delta_txt != "—"
+                        item.setForeground(QColor(C_BAD if loud else C_MUTED))
+                    if j == 5 and (not managed or not synced or not logged_in):
                         item.setForeground(QColor(C_MUTED))
                     m.setItem(i, j, item)
 
-        limits = [v.get("limits") for v in self._snaps.values() if v.get("limits")]
+        limits = [v.get("limits") for k, v in self._snaps.items()
+                  if v.get("limits") and self._in_watch(k)]
         if limits:
             self.lbl_limit.setText(" · ".join(limits))
-            used = any(v.get("limit_used") for v in self._snaps.values())
+            used = any(v.get("limit_used") for k, v in self._snaps.items()
+                       if self._in_watch(k))
             self.lbl_limit.setStyleSheet(
                 f"color: {C_BAD if used else C_MUTED}; font-size: 11px;")
         else:
             self.lbl_limit.setText("")
 
-        aligning = sum(int(v.get("aligning") or 0) for v in self._snaps.values())
+        aligning = sum(int(v.get("aligning") or 0) for k, v in self._snaps.items()
+                       if self._in_watch(k))
         # 跑起来的账户（有策略绑在它上面）才有连接、才看得到持仓。剩下的账户
         # 无论有没有仓，这里都是**瞎的** —— 不能笼统说「一致」
-        idle = [s.name for s in self._accounts if s.name not in self._snaps]
+        idle = [s.name for s in self._accounts
+                if s.name not in self._snaps and self._in_watch(s.name)]
         idle_txt = ""
         if idle and (self.ctl.running or self._snaps):
             idle_txt = ("\n" + "、".join(idle)
                         + " 没有策略在跑，它们的持仓不在比对范围（先给该账户挂一条策略）。")
-        # `_pos` 还没拉到时 `mismatch()` 必定为空。那不是一致，是还不知道
-        blind = [k for k, v in self._snaps.items() if not v.get("pos_ready", True)]
+        # 监控范围收窄过就要**说出来**：不然用户看到「一致」会以为所有账户都对了，
+        # 实际他只勾了一个（2026-11-23 加的「监控账户」）
+        off = [k for k in self._snaps if not self._in_watch(k)]
+        scope_txt = ""
+        if self._watch:
+            scope_txt = ("\n只监控：" + "、".join(self._watch)
+                         + ("（另有 " + "、".join(off) + " 不在监控范围，它们的不一致"
+                            "不会出现在上表，也不会被一键对齐动）" if off else ""))
+        # 持仓没读到（或还没拉回来）时 `mismatch()` 必定为空。那不是一致，
+        # 是还不知道 —— 用 `pos_synced` 判，别用 `pos_ready`：
+        # `pos_ready` 只代表「账户接口挂上了」，它同时被用来判断账户在不在线。
+        # 2026-11-23 融航就是这样报的「一致」：柜台一条持仓回调都没回来，
+        # `_pos` 是空字典，而账户里实际有 6 个合约的仓。
+        blind = [k for k, v in self._snaps.items() if not v.get("pos_synced", True)]
         if not self.ctl.running:
             self.lbl_mon.setText("未启动。策略跑起来之后这里才会比对。")
             self.lbl_mon.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
-        elif blind:
+        elif blind and not rows:
+            # 只有「一条不一致都列不出来、而且确实没读到」时才整条拦住。
+            # 有别的账户算出了真正的不一致时，那些行比这句话有用得多 ——
+            # 一个柜台不吐持仓，不该把另一个账户的问题一起盖掉
             self.lbl_mon.setText(
-                "、".join(blind) + " 的账户持仓还没同步（刚连上），这会儿的比对结果不作数，"
-                "稍等几秒再点「一键对齐」。"
+                "、".join(blind) + " 的账户持仓还没读回来，这会儿的比对结果不作数"
+                "（不是「一致」，是还不知道）。等几秒；一直这样就去「账户透视和交易」页"
+                "看持仓表有没有数，那页读到了这边才有得比。" + scope_txt
             )
             self.lbl_mon.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
         elif aligning:
@@ -3453,7 +3603,7 @@ class PortfolioPage(QWidget):
             )
             self.lbl_mon.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
         elif not rows:
-            self.lbl_mon.setText("账户仓位与策略理论持仓一致。" + idle_txt)
+            self.lbl_mon.setText("账户仓位与策略理论持仓一致。" + idle_txt + scope_txt)
             self.lbl_mon.setStyleSheet(f"color: {C_OK}; font-size: 11px;")
         else:
             n_managed = sum(1 for _k, r in rows if r.get("managed"))
@@ -3466,9 +3616,16 @@ class PortfolioPage(QWidget):
                 bits.append(f"{n_orphan} 个合约没有策略在管")
             if n_lock:
                 bits.append(f"{n_lock} 个是锁仓（多空双开、净额 0，只按净额看是看不见的）")
+            blind_txt = ""
+            if blind:
+                # 这几个账户根本没读到持仓，它们的不一致**一条都列不出来** ——
+                # 不点名的话，用户会以为「列表里没有就是一致」
+                blind_txt = ("\n" + "、".join(blind) + " 的持仓还没读回来，"
+                             "它们的合约不在上面这份列表里，不是「一致」。")
             self.lbl_mon.setText(
                 "，".join(bits) + "。「一键对齐」会把账户摆成和策略列表一致，\n"
-                "未托管的仓位也会被平掉（会先列出来让你确认）。" + idle_txt
+                "未托管的仓位也会被平掉（会先列出来让你确认）。"
+                + blind_txt + idle_txt + scope_txt
             )
             self.lbl_mon.setStyleSheet(f"color: {C_BAD}; font-size: 11px;")
 
@@ -3905,6 +4062,112 @@ class PortfolioPage(QWidget):
         self.reload()
         self._on_log(f"已从「{self._ws.name}」移除：{cfg.title()}")
 
+    # ---------------------------------------------------------- 监控范围 / 刷新
+
+    #: `strategy_store.ui_state` 里的键：要监控哪几个账户（空 = 全监控）
+    WATCH_KEY = "monitor_accounts"
+
+    @classmethod
+    def _load_watch(cls) -> list[str]:
+        """上次勾的监控账户。空列表 = 全监控（也是默认值）。"""
+        try:
+            v = SStore.ui_state(cls.WATCH_KEY, [])
+        except Exception:  # noqa: BLE001 - 记不住偏好不该把界面弄崩
+            return []
+        if not isinstance(v, (list, tuple)):
+            return []
+        return [str(x) for x in v if str(x or "").strip()]
+
+    def _in_watch(self, key: str) -> bool:
+        """这个账户在不在监控范围里。空名单 = 全监控。"""
+        return (not self._watch) or (key in self._watch)
+
+    def _watch_candidates(self) -> list[str]:
+        """可勾选的账户：账户表里的 + 现在有连接的。按出现顺序去重。"""
+        out: list[str] = []
+        for name in ([s.name for s in self._accounts]
+                     + list(self._snaps) + list(self.ctl.keys())):
+            name = str(name or "")
+            # 「（未接账户）」那一组只算信号，没有持仓可监控 —— 不进名单
+            if not name or name == NO_ACCOUNT_KEY or name in out:
+                continue
+            out.append(name)
+        return out
+
+    def _refresh_monitor(self) -> None:
+        """「刷新」：重读持仓 + 立刻重算比对。**不动任何仓位**。
+
+        比对结果缓存 5 秒（`MISMATCH_GAP`）、持仓引用 2 秒才重挂一次
+        （`POS_ANCHOR_SEC`）。成交之后想马上确认「齐没齐」，等这两个节拍太难受，
+        所以给个按钮把两个都清零，再让引擎重读一遍账户。
+
+        🔴 这条连接**根本没接上账户**时，`refresh()` 只是把空引用再挂一遍，
+        什么东西都不会变 —— 用户点了刷新、界面还是「账户未登录」，看起来就是
+        按钮坏了（2026-11-23：在交易页把融航登出再登录之后就是这样）。所以这里
+        分两种：
+
+          - 用户自己点「登录/登出账户」登出的 ⇒ 尊重，不去偷偷登回来；
+          - 压根没接上（启动时接入失败、账户在交易页重新登录过）⇒ **这次真的
+            按磁盘上的账户配置去接一次**，这才是用户点刷新想要的结果。
+        """
+        if not self.ctl.running:
+            self._render()
+            self._on_failed("还没启动，没有账户连接可以刷新")
+            return
+        keys = [k for k in self.ctl.keys() if self._in_watch(k)]
+        if not keys:
+            self._render()
+            self._on_failed("监控范围里没有正在跑的账户（点「监控账户」改一下）")
+            return
+        n = 0
+        relogin: list[str] = []
+        for k in keys:
+            snap = self._snaps.get(k) or {}
+            if (k != NO_ACCOUNT_KEY and snap
+                    and not snap.get("account_ready", True)
+                    and not snap.get("user_detached", False)):
+                sp = self._spec(k)
+                if sp is not None and self.ctl.attach(k, sp):
+                    relogin.append(k)
+                    n += 1
+                    continue
+            if self.ctl.refresh(k):
+                n += 1
+        # 下一份快照（0.4 秒内）就重画，不用再等 `RENDER_GAP` 那 1 秒
+        self._render_ts = 0.0
+        if relogin:
+            self._on_log("已刷新 " + str(n) + " 个账户；其中 "
+                         + "、".join(relogin) + " 之前没有接上账户，正在重新登录"
+                         "（登录成功后监控器才会有「账户实际」）")
+        else:
+            self._on_log(f"已刷新 {n} 个账户的持仓，重新算了一遍差额")
+
+    def _pick_watch(self) -> None:
+        """「监控账户」：勾要盯着哪几个。没勾的不进监控器、也不被一键对齐动。"""
+        names = self._watch_candidates()
+        if not names:
+            self._on_failed("现在没有可监控的账户（先在「账户透视和交易」页加账户，"
+                            "或者启动一次策略）")
+            return
+        cur = [n for n in names if self._in_watch(n)] or list(names)
+        dlg = WatchDialog(names, cur, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        picked = dlg.picked()
+        if not picked:
+            # 一个都不勾等于「什么都监控不到」，那这个按钮就成了陷阱。退回全选
+            self._on_failed("至少要勾一个账户；一个都不勾等于关掉监控器，已保持原样")
+            return
+        # 全选时存空列表：以后新加的账户自动进监控范围，不用再来勾一次
+        self._watch = [] if set(picked) == set(names) else picked
+        try:
+            SStore.put_ui_state(self.WATCH_KEY, self._watch)
+        except Exception:  # noqa: BLE001
+            pass
+        self._render_ts = 0.0
+        self._render()
+        self._on_log("监控账户：" + ("全部账户" if not self._watch else "、".join(self._watch)))
+
     # ---------------------------------------------------------- 对齐
 
     def _align(self) -> None:
@@ -3915,21 +4178,35 @@ class PortfolioPage(QWidget):
         if any(int(snap.get("aligning") or 0) for snap in self._snaps.values()):
             # 上一轮还在路上。仓位没变不等于没对齐 —— 单子还在排队 / 追价。
             # 这时候再发一轮就是「平了又开、开了又平」。
+            # 这里**不按监控范围过滤**：监控范围只管「看哪些」，在途单是真的在
+            # 发钱，任何一路还在追都得等它落地
             self._on_failed("上一轮对齐还在执行（等成交或撤单），稍后再点")
             return
+        # 监控范围之外（或没录进来）的账户一概不动：它们的行根本没显示，
+        # 动它们等于背着用户下单。名单见「监控账户」按钮
+        watched = {k: v for k, v in self._snaps.items() if self._in_watch(k)}
+        skipped_acct = [k for k in self._snaps if not self._in_watch(k)]
         # ① 账户没登录的，根本没法对齐：`api is None` 时 `align()` 只会空转；
         #    而且登出时 `_pos` 一并清掉了 —— 连「差多少」都算不出来。
         # ② 登录了但持仓还没同步的，等几秒再点（拿「账户是空的」算差额会把仓位
         #    重开一遍）。这两类必须分开说，否则登出账户会一直被提示「等几秒再点」。
-        no_login = [k for k, v in self._snaps.items()
+        no_login = [k for k, v in watched.items()
                     if not v.get("account_ready", True)]
-        blind = [k for k, v in self._snaps.items()
-                 if v.get("account_ready", True) and not v.get("pos_ready", True)]
-        if blind:
-            self._on_failed("、".join(blind) + " 的账户持仓还没同步，等几秒再点"
-                            "（现在对齐会拿「账户是空的」去算差额，把仓位重开一遍）")
-            return
-        ready, blocked = split_alignable(self._snaps)
+        # 判据用 `pos_synced`（持仓真从柜台读回来过）：`pos_ready` 只代表账户
+        # 接口挂上了，而柜台可能一条持仓回调都没回 —— 那时 `_pos` 是空字典，
+        # 拿它算差额就是「把整个理论仓位重新开一遍」。
+        #
+        # 只把**这一路账户**剔出去，不整轮打回：两个账户连着，一个的柜台不吐
+        # 持仓，不该连累另一个明明能对齐的账户（那会变成「按钮永久失效」）。
+        blind = [k for k, v in watched.items()
+                 if v.get("account_ready", True) and not v.get("pos_synced", True)]
+        ready, blocked = split_alignable(watched)
+        for k in blind:
+            # 持仓没读到 → 它那几行 mismatch 不能当真（半份快照算出来的差额
+            # 会把仓位补错量），整个账户这一轮一笔都不动
+            ready.pop(k, None)
+            if not any(b.startswith(k) for b in blocked):
+                blocked.append(f"{k}（持仓还没从柜台读回来，没法核对，一笔都不动）")
         # 没登录的账户即使没有 mismatch 行也要点名：登出后 `_pos` 被清掉，
         # `mismatch()` 恒为空 —— 不点名的话，这些账户的仓永远没人管，还看不出来
         for k in no_login:
@@ -3976,10 +4253,16 @@ class PortfolioPage(QWidget):
                          "保证金，会拆成「卖平多 + 买平空」两笔一起发。")
         if blocked:
             lines.append("")
-            lines.append("这几个账户**没登录**，它们的仓位一笔都不动：")
+            lines.append("这几个账户**核对不了**（没登录 / 持仓还没读回来），"
+                         "它们的仓位一笔都不动：")
             for b in blocked:
                 lines.append(f"　{b}")
-            lines.append("要对齐它们，先到「账户透视和交易」页把账户登上去。")
+            lines.append("没登录的先到「账户透视和交易」页把账户登上去；"
+                         "持仓读不回来的先看那页的持仓表有没有数。")
+        if skipped_acct:
+            lines.append("")
+            lines.append("这几个账户不在监控范围（「监控账户」里没勾），一笔都不动："
+                         + "、".join(skipped_acct))
         lines.append("")
         lines.append("只动上面列出的这几个合约。点确认之后持仓又变了的合约会跳过，"
                      "不会拿新基数去算成开仓。")

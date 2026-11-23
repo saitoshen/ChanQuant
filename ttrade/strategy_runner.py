@@ -155,6 +155,18 @@ ALIGN_GAP = 5.0
 # 否则一个挂在盘口外的限价单能让整个账户永远停在「对齐执行中」。
 ALIGN_TIMEOUT = 30.0
 
+# 报单发出去之后，柜台多久没给**任何**委托回报就该说话了。
+#
+# CTP 的 `OnRtnOrder` 是毫秒级回的，8 秒没有就是异常。为什么要单独一条：
+# 账本里那行委托是**下单瞬间按「乐观」写的**（`status="ALIVE"` 是我们填的，
+# 不是柜台说的），8 秒没被回报覆盖，就说明柜台根本没有这笔单 —— 而界面上
+# 它长得跟「挂着等成交」一模一样。2026-11-23 融航就是：四笔 TL2612 发出去、
+# 每笔挂满 30 秒「ALIVE」被撤，委托框里一笔都没有，用户只能问「到底发了没」。
+#
+# 🔴 这个值**必须比 `ALIGN_TIMEOUT` 小**，否则「柜台没回报」的判词还没写出来，
+# 对齐那边已经先撤单并打印「ALIVE」了（30 秒撞 30 秒，实测永远看不到真相）。
+ORD_ACK_SEC = 8.0
+
 # 补历史没成功（刚订阅、序列还没填充）时隔多久再试。`tick()` 跟着行情推送跑，
 # 一秒十几次；每次都把 3000 行转一遍 DataFrame 纯属白烧。
 TOP_RETRY = 2.0
@@ -164,6 +176,18 @@ TOP_RETRY = 2.0
 # 重算，等于为了一个「秒级才变一次」的数字空转。5 秒一次够看，也够用户点
 # 对齐时拿到的新鲜度（`align()` 会强制重算，见 `mismatch(fresh=True)`）。
 MISMATCH_GAP = 5.0
+
+# 持仓 / 委托引用多久重挂一次。见 `PortfolioRunner._reanchor()`：账户接口承诺
+# 返回「活引用」，实盘里真的断过一次，而断了不报错。
+POS_ANCHOR_SEC = 2.0
+
+# 同一条不一致连续存在多久才往 `live.log` 写一行 `[MM]`。界面每 5 秒算一次，
+# 写进去的必须是「查了三分钟还没动」的那种，否则日志全是噪音。
+MM_LOG_SEC = 120.0
+
+# 账户挂着、可持仓一直没读回来，多久抱怨一次 `[POS]`。见 `_pos_note()`：
+# 这时候界面所有「一致」都是假的，必须把柜台的原始情况写进日志才查得动。
+POS_LOG_SEC = 30.0
 
 
 def default_margin_rate(symbol: str) -> float:
@@ -536,18 +560,18 @@ class MlSignals:
                         if self._log is not None:
                             self._log(f"机器学习信号暂不可用（{key}）：{why}")
                         if self._diag is not None:
-                            self._diag.write("ML", f"{key} 快路径算不出来：{why}")
+                            self._diagw("ML", f"{key} 快路径算不出来：{why}")
                         continue
                     sig = int(r["signal"])
                     if self._diag is not None:
-                        self._diag.write(
+                        self._diagw(
                             "ML", f"{key} 快路径 ok signal={sig} "
                                   f"score={r.get('score'):.4f} "
                                   f"耗时={time.time() - t0:.2f}s bar={len(job['df'])}")
                 else:
                     # ---- 慢路径：后台重训（没有训练产物时的兜底）----
                     if self._diag is not None:
-                        self._diag.write("ML", f"{key} 走慢路径（后台重训），"
+                        self._diagw("ML", f"{key} 走慢路径（后台重训），"
                                               f"bar={len(job['df'])} —— 这条要几十秒")
                     _fc = replay.factor_config(job["cfg"].factor_cfg or {})
                     out = fstrat.run_factor_strategy(
@@ -558,7 +582,7 @@ class MlSignals:
                     sig = out.df["signal"].iloc[-1]
                     sig = 0 if pd.isna(sig) else int(sig)
                     if self._diag is not None:
-                        self._diag.write("ML", f"{key} 慢路径完成 signal={sig} "
+                        self._diagw("ML", f"{key} 慢路径完成 signal={sig} "
                                               f"耗时={time.time() - t0:.1f}s")
             except Exception as exc:  # noqa: BLE001
                 why = f"{type(exc).__name__}: {exc}"
@@ -567,7 +591,7 @@ class MlSignals:
                 if self._log is not None:
                     self._log(f"机器学习实时信号计算失败（{key}）：{why}")
                 if self._diag is not None:
-                    self._diag.write("ML", f"{key} 抛异常：{why}")
+                    self._diagw("ML", f"{key} 抛异常：{why}")
                 continue
             with self._lock:
                 self._err.pop(key, None)
@@ -633,6 +657,10 @@ class PortfolioRunner:
         self.limit = daylimit.DayLimit(
             self.spec.label() if self.spec is not None else BOOK_NO_ACCOUNT)
         self._halted = ""
+        # 用户**主动**在界面上登出了账户（≠ 没接上 / 接入失败）。界面「刷新」
+        # 会把「没接上」的账户接回来，但绝不能把用户明确登出的又偷偷登回去 ——
+        # 靠这个标记分开。见 `detach_account()` / `snapshot()["user_detached"]`
+        self._detached_by_user = False
         # 「一键对齐」发出的单放在这个槽位里。它只当在途单的容器，不参与信号：
         # 对齐是**一次性动作**，发完就交给追单，成交 / 撤完就结束。没有它的话，
         # 对齐的单没人记，`_rebalance` 下一 tick 看到仓位还没变又发一遍 ——
@@ -640,9 +668,24 @@ class PortfolioRunner:
         self._align_slot = SlotState(cfg=SStore.StrategyConfig(
             sid="__align__", name="一键对齐", period="1d"))
         self._align_ts = 0.0
+        # 这一轮对齐真正发出去过的合约。超时撤单时按它判断「账本要不要回摆」，
+        # 也方便把「点了 10 个只发了 5 个」和「发了但没成交」分开看。
+        self._align_touched: set[str] = set()
+        # 已经为哪几笔委托写过「柜台没回委托回报」。每单只写一次，见 `_ack_note()`
+        self._ack_warned: set[str] = set()
         # 上一次算出来的比对结果和它的时间戳。见 `MISMATCH_GAP`。
         self._mm_cache: list[dict] = []
         self._mm_ts = 0.0
+        # 每个不一致合约「第一次看到它不一致」的时刻，以及已经抱怨过没有。
+        # 只用来写 `[MM]` 诊断行，见 `MM_LOG_SEC`
+        self._mm_since: dict[str, float] = {}
+        self._mm_logged: set[str] = set()
+        # 「账户持仓一直没读回来」这件事开始于什么时候，以及上次抱怨的时刻。
+        # 见 `_pos_note()`
+        self._pos_blind_at = 0.0
+        self._pos_warned = 0.0
+        # 上一次重挂持仓引用的时刻。见 `POS_ANCHOR_SEC` / `_reanchor()`
+        self._pos_ts = 0.0
         # 界面想看的实时 K 线。放这里而不是让界面直接读 `_klines`：那是天勤的
         # 活引用，只有 worker 线程能动，跨线程读会撞上它正在被写的时刻。
         self._want: list[str] = []
@@ -687,6 +730,25 @@ class PortfolioRunner:
                 self._log_fn(msg)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _diagw(self, tag: str, msg: str) -> None:
+        """落盘诊断日志，**带账户标签**。
+
+        🔴 为什么必须带（2026-11-23 那次）：一个组合可以同时连好几个账户，
+        每个账户一个 `PortfolioRunner`、各写各的 —— 但落的是**同一个**
+        `live.log`，两个线程的行会交错。那天排查「一键对齐只发了几笔」，日志里
+        `ALIGN` 行和 `ORD` 行错开一位，同一个合约还出现两遍（两个账户各一遍），
+        完全分不清哪条属于谁，白猜了半小时。带上账户名之后一眼就能按账户切开。
+        """
+        diag = getattr(self, "_diag", None)
+        if diag is None:
+            return
+        lab = ""
+        try:
+            lab = self.spec.label() if self.spec is not None else ""
+        except Exception:  # noqa: BLE001 - 标签取不到就别带，日志不能因此丢
+            lab = ""
+        diag.write(tag, f"[{lab}] {msg}" if lab else msg)
 
     def _note_once(self, st: SlotState, msg: str) -> None:
         """同一条状态说明只记一次，并挂到 `st.last_action` 上让界面看得到。
@@ -803,8 +865,11 @@ class PortfolioRunner:
             except Exception as exc:  # noqa: BLE001
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 self._log(f"账户未接入：{self.last_error}（策略继续运行，不下单）")
+                self._diagw("ACC", f"账户未接入：{self.last_error}"
+                            "（策略继续运行，不下单；界面点「刷新」会再试一次）")
         else:
             self._log("未绑定账户：只算信号、不报单（可在交易页随时接入）")
+            self._diagw("ACC", "未绑定账户：只算信号、不报单")
 
     def _aux_bg(self) -> None:
         """后台补衍生数据。多个 runner 同时起时只让一个去补，其余直接跳过。
@@ -846,6 +911,12 @@ class PortfolioRunner:
         else:
             self._log(f"账户已连接：{self.spec.label()}"
                       f"（行情走 {self._feed_label()}，历史行情读本地天勤数据）")
+        # 🔴 账户接上 / 断开是**最该留痕**的一件事，但 `_log()` 只进界面那块
+        # 文本框，关窗就没了 —— 2026-11-23 用户报「登出再登录后监控器还说未登录」，
+        # live.log 里一条接/脱记录都没有，只能靠猜。所以这里同时落一行 `[ACC]`。
+        self._diagw("ACC", "账户已连接："
+                    + (self.spec.label() if self.spec is not None else "（未命名）"))
+        self._detached_by_user = False
         self._sweep_orders()
 
     def _feed_label(self) -> str:
@@ -877,6 +948,7 @@ class PortfolioRunner:
         except Exception as exc:  # noqa: BLE001
             self.last_error = f"{type(exc).__name__}: {exc}"
             self._log(f"接入账户失败：{self.last_error}（策略继续运行，不下单）")
+            self._diagw("ACC", f"接入账户失败：{self.last_error}（策略继续运行，不下单）")
             self.api = None
             self._pos = self._orders = None
             if old is not None:
@@ -889,6 +961,9 @@ class PortfolioRunner:
         在途单先撤：账户登出之后撤单接口就没了，那几笔会一直挂在交易所。
         """
         api, self.api = self.api, None
+        # 用户主动登出 ≠ 没接上。界面「刷新」会自动把**没接上**的账户接回来，
+        # 但绝不能把用户明确登出的账户又偷偷登回去 —— 所以这个标记必须有
+        self._detached_by_user = True
         self._pos = self._orders = None
         for st in list(self._slots.values()) + [self._align_slot]:
             try:
@@ -901,6 +976,7 @@ class PortfolioRunner:
             except Exception:  # noqa: BLE001
                 pass
             self._log("账户已登出：策略继续运行（只算信号，不下单）")
+            self._diagw("ACC", "账户已登出（用户主动）：策略继续运行，只算信号")
 
     def _broker_api(self, backend: str):
         """柜台账户的执行层：实时行情 + 下单走柜台，历史走本地天勤数据。"""
@@ -924,13 +1000,14 @@ class PortfolioRunner:
         if not ids:
             return
         if getattr(self.spec, "backend", "tq") != "tq":
-            # 柜台没有「查历史委托」的接口（`TraderClient` 没实现 ReqQryOrder），
-            # 新会话里看不到上一个进程留下的挂单 —— 上面的循环会一笔都撤不到。
-            # 这件事必须说出来：不说的话用户以为已经撤干净了，那几笔单还在交易所
-            # 挂着，成交了就是「没点按钮它自己建了仓」。
+            # 柜台的历史委托是**登录后异步补查**的（`CtpHub._query_hist()`，
+            # 每秒一拍、和资金/持仓轮着来），跑到这里时往往还没查回来 ——
+            # 下面那圈会一笔都撤不到。这不是「柜台不支持」，是「还没轮到」，
+            # 提示要照着实际情况写，别让用户以为只能手工撤。
             self._log(
-                "柜台查不到历史委托：上一次运行遗留的挂单请在"
-                "「账户透视和交易」页对着委托列表撤掉")
+                "柜台的当日委托正在补查（登录后约几秒）。上一次运行遗留的挂单"
+                "若仍然挂着，稍后在「账户透视和交易」页对着委托列表撤掉，"
+                "或者重启一次让程序自己撤")
         n = 0
         for oid in ids:
             o = self._orders.get(oid) if self._orders is not None else None
@@ -1249,6 +1326,10 @@ class PortfolioRunner:
         # 没接账户：信号、理论仓位、台账全照常算，只是**一笔不发**。以前这里
         # 直接 return，策略跟着账户一起停 —— 实盘日终登出就等于策略断线
         can_trade = self.api is not None
+        if can_trade:
+            # 每 2 秒把持仓 / 委托的引用重挂一次。**不影响 `can_trade`**：
+            # 重挂拿不到东西时（账户刚断）沿用上一次那份，别把策略一起停了
+            self._reanchor()
         done = 0
         for st in list(self._slots.values()):
             if not st.running:
@@ -1313,12 +1394,26 @@ class PortfolioRunner:
         # 对齐发出的单也要追、也要撤。它不属于任何策略，单独走一遍。
         if self._align_slot.pending:
             oldest = min(o.ts for o in self._align_slot.pending)
-            if time.time() - oldest > ALIGN_TIMEOUT:
+            timeout = self._align_timeout()
+            if time.time() - oldest > timeout:
                 # 挂太久了。不撤的话在途列表永远不清空，`_rebalance` 就永远让路，
                 # 整个账户看着像卡死。撤掉、放开，让策略接着跑。
+                # 撤之前先把每笔的状态打出来：事后想知道「是压根没成交、还是
+                # 成交了一部分」只能靠这一行（界面上的委托表只显示最近几十条）。
+                self._diagw("ALIGN", f"对齐超时撤单（{timeout:.0f} 秒），在途明细："
+                            + "、".join(self._pending_detail(self._align_slot)))
                 self._cancel_all(self._align_slot)
+                # 🔴 账本必须跟着撤回来：`_sync_after_align` 是发单时就摆的，
+                # 撤单意味着那些仓位根本没到位。
+                moved = self._resync_books()
+                self._align_touched = set()
+                if moved:
+                    self._diagw("ALIGN", "对齐没落地，账本按账户实际回摆："
+                                + "、".join(moved[:8])
+                                + ("…" if len(moved) > 8 else ""))
                 self._log(
-                    f"对齐委托 {ALIGN_TIMEOUT:.0f} 秒未成交，已撤单，策略恢复调仓"
+                    f"对齐委托 {timeout:.0f} 秒未成交，已撤单，策略恢复调仓"
+                    + ("（账本已按账户实际回摆）" if moved else "")
                 )
             else:
                 try:
@@ -1381,14 +1476,14 @@ class PortfolioRunner:
                 self._log(f"{st.title()}：没有可用的训练产物，"
                           f"退回后台重训（{why}）")
             if self._diag is not None:
-                self._diag.write("ML", f"{st.title()}（sid={key}）退回后台重训："
+                self._diagw("ML", f"{st.title()}（sid={key}）退回后台重训："
                                        f"{why or '（原因不明）'}")
             return None
         with self._lock:
             self._ml_pred[key] = ("ok", pred, time.time())
         self._log(f"{st.title()}：用训练产物算信号（只预测，不重训）")
         if self._diag is not None:
-            self._diag.write("ML", f"{st.title()}（sid={key}）用训练产物，"
+            self._diagw("ML", f"{st.title()}（sid={key}）用训练产物，"
                                    f"走快路径（只预测）")
         return pred
 
@@ -1969,7 +2064,7 @@ class PortfolioRunner:
                f"（signal={st.signal:+d} lots={st.lots} 末根={bar}"
                + (f"；{st.frame_note}" if st.frame_note else "") + "）")
         if self._diag is not None:
-            self._diag.write("TGT", msg)
+            self._diagw("TGT", msg)
 
     @staticmethod
     def _is_ml(cfg) -> bool:
@@ -2801,6 +2896,107 @@ class PortfolioRunner:
             return 0, 0
         return self._side_pos(symbol, "long"), self._side_pos(symbol, "short")
 
+    def _pos_detail(self, symbol: str) -> str:
+        """账户这个合约的「今 / 昨」明细，拼成一句挂在 `[ALIGN]` 日志后面。
+
+        🔴 为什么值得多打这一行（2026-11-23）：那天监控器上 `lc2701` 写着
+        「账户 +3」、交易页的持仓表却写着「净 -1 空1」，同一时刻两个界面给出
+        两个数，而日志里只有一个净数 —— 分不清是 `_pos` 没跟上、还是今昨仓被
+        算重复了。把 `多/空/今多/今空/昨多/昨空` 全打出来，下次一跑就能定位。
+        取不到明细就返回空串：这只是诊断，不能因为它让对齐失败。
+        """
+        try:
+            out = []
+            for side, cn in (("long", "多"), ("short", "空")):
+                got = self._split_pos(symbol, side)
+                total = self._side_pos(symbol, side)
+                if got is None:
+                    out.append(f"{cn} {total}（今昨未就绪）")
+                else:
+                    out.append(f"{cn} {total}=昨{got[0]}+今{got[1]}")
+            return " ｜ 明细 " + "，".join(out)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _pos_raw(self, symbol: str) -> str:
+        """把账户接口里这个合约的**原始字段**打出来，给 `[MM]` 诊断用。
+
+        监控器显示「账户 -2」而交易页持仓表里根本没有这个合约时，可选的成因
+        只有两个：`_pos` 没跟上（活引用断了），或者读数口径错了（今昨仓叠了
+        一遍）。只看净数永远分不清，所以把两条腿和今昨两个字段一起打。
+        """
+        try:
+            if self._pos is None:
+                return "_pos 还没拿到"
+            p = self._pos.get(symbol)
+        except Exception:  # noqa: BLE001
+            return "读 _pos 失败"
+        if p is None:
+            return "不在 _pos 里（账户接口已经没有这个合约）"
+        out = []
+        for name in ("pos_long", "pos_short", "volume_long", "volume_short",
+                     "pos_long_today", "pos_short_today",
+                     "pos_long_his", "pos_short_his"):
+            try:
+                out.append(f"{name}={getattr(p, name, '-')}")
+            except Exception:  # noqa: BLE001
+                out.append(f"{name}=?")
+        return " ".join(out)
+
+    def _reanchor(self) -> None:
+        """按账户接口重新拿一次持仓 / 委托的**引用**，并让比对缓存失效。
+
+        🔴 为什么需要（2026-11-23）：`_pos` 只在 `_connect_account()` 里取一次，
+        指望账户接口返回的是「活引用」（`broker_api` 和天勤 `Entity` 都承诺这
+        一点）。实盘看到的却是：账户已经把 `T2612` 平掉了、交易页的持仓表里
+        也没有它，组合页的监控器还写着「账户 -2、平空2」，一直不动 —— 活引用
+        在某条链路上断了，而**断了不报错**，读到的永远是冻住的那一份。
+
+        每 2 秒重挂一次是最便宜的兜底：`broker_api.get_position()` 返回的就是
+        同一个 dict，天勤的 `get_position()` 只是重走一遍 `_data` 树，两者都
+        不发网络请求、不占柜台查询额度。
+
+        顺带把 `MISMATCH_GAP` 的缓存清掉：持仓刚变过，界面不该再等一个 5 秒
+        周期才显示「已对齐」——用户看到的「刷新太慢」就是这个缓存。
+        """
+        now = time.time()
+        if now - getattr(self, "_pos_ts", 0.0) < POS_ANCHOR_SEC:
+            return
+        self._pos_ts = now
+        try:
+            pos = self.api.get_position()
+            if pos is not None and pos is not self._pos:
+                self._pos = pos
+            # 委托同理：天勤的 `get_order()` 也是活引用，断了就看不到在途单
+            orders = self.api.get_order()
+            if orders is not None and orders is not self._orders:
+                self._orders = orders
+        except Exception:  # noqa: BLE001
+            return                       # 账户抖动：沿用上一份，别把策略带崩
+        # 引用换过了就一定重算一次（重算本身很便宜，见 `MISMATCH_GAP`）
+        self._mm_ts = 0.0
+
+    def refresh_now(self) -> list[dict]:
+        """界面「刷新」按钮：**立刻**重挂持仓引用 + 清掉比对缓存，返回当下的不一致。
+
+        为什么要专门一个方法（2026-11-23 用户要求）：「一键对齐」旁边加个刷新，
+        点一下就要看到最新的差额，而不是等 `MISMATCH_GAP=5` 秒的缓存过期、再等
+        `_reanchor()` 的 `POS_ANCHOR_SEC=2` 秒节拍。
+
+        三步每步都有用：
+          - `_pos_ts = 0` → 下面 `_reanchor()` 这一拍**必定**重挂（否则 2 秒内的
+            第二次点刷新会什么都不做，用户以为按钮坏了）；
+          - `_reanchor()` → 账户接口的活引用断了也能续上（见那个方法的长注释）；
+          - `_mm_ts = 0` → 下一次 `mismatch()` 不走缓存。
+
+        返回的是**此刻**的不一致行；界面也会在 0.4 秒内收到一份新快照（worker 的
+        推送节拍），两处内容一致。
+        """
+        self._pos_ts = 0.0
+        self._reanchor()
+        self._mm_ts = 0.0
+        return self.mismatch(fresh=True)
+
     def _rebalance(self, st: SlotState) -> None:
         if not st.underlying:
             return
@@ -3025,8 +3221,11 @@ class PortfolioRunner:
             return
         try:
             self.api.cancel_order(order)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # 🔴 撤单失败以前是**静默**的：那笔单还挂在交易所，界面却当它撤了，
+            # 之后账户突然多出一个仓谁也说不清。现在必须留痕。
+            self._log(f"撤单没成功：{exc}")
+            self._diagw("ORD", f"撤单没成功：{exc}")
 
     def _side_pos(self, symbol: str, side: str) -> int:
         """单边总持仓（手）。`side` 是 long / short。"""
@@ -3189,6 +3388,19 @@ class PortfolioRunner:
         if code and ex and not symbols_info.in_session(code, ex):
             st.last_action = "非交易时段：这个合约现在不能下单（开盘后再点对齐）"
             return 0
+        # 账户侧再问一句能不能报单（柜台接口才有这个方法：登录 + 结算确认）。
+        # 🔴 为什么要问而不是「发出去再说」：`insert_order` 抛异常会被 `tick()`
+        # 接住 → 「这条策略出错停机」。跨交易日那几秒（柜台正在结算）会把所有
+        # 策略一起停掉，用户看到一排「出错停机」，实际什么事都没有。
+        gate = getattr(self.api, "ready_to_trade", None)
+        if gate is not None:
+            try:
+                ok, why = gate()
+            except Exception:  # noqa: BLE001 - 判据出错就放行，别挡住下单
+                ok, why = True, ""
+            if not ok:
+                st.last_action = why
+                return 0
         legs = self._legs(symbol, delta, closeable)
         if legs is None:
             st.last_action = "持仓今昨明细未就绪，等下一轮"
@@ -3202,10 +3414,20 @@ class PortfolioRunner:
             return 0
         parts = []
         for offset, vol in legs:
-            order = self._order(
-                symbol=symbol, direction=direction, offset=offset,
-                volume=vol, limit_price=price,
-            )
+            # 🔴 `insert_order` / `place` 现在会**在柜台没受理时报错**
+            # （`ReqOrderInsert` 返回非 0 就抛，见 `ctp_client.place`）。以前
+            # 谁都不看返回值，「发了个寂寞」和「发出去挂着了」长得一模一样。
+            # 这里接住并落成「没发出去」，别让它冒到 `tick()` 那里变成
+            # 「这条策略出错停机」—— 一次流控不该停掉一条实盘策略。
+            try:
+                order = self._order(
+                    symbol=symbol, direction=direction, offset=offset,
+                    volume=vol, limit_price=price,
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.last_action = f"报单没发出去：{exc}"
+                self._log(f"{st.title()}：{symbol} {st.last_action}")
+                break
             if order is None:
                 st.last_action = "今日报单次数已用完，停手"
                 break
@@ -3228,10 +3450,80 @@ class PortfolioRunner:
         self._log(f"{st.title()}：{st.last_action}")
         # 每一笔真发出去的委托都落盘。以前只有界面日志，事后复盘时「到底发的是
         # 平仓还是开仓、几手、什么价」全无据可查（2026-11-20 那次就只剩截图）。
-        diag = getattr(self, "_diag", None)
-        if diag is not None:
-            diag.write("ORD", f"{st.title()}：{symbol} {st.last_action}")
+        self._diagw("ORD", f"{st.title()}：{symbol} {st.last_action}")
         return len(parts)
+
+    def _align_timeout(self) -> float:
+        """对齐单最多挂多久（秒）。
+
+        不能只写死 `ALIGN_TIMEOUT`：追单是「等 `wait_sec` 没成交就撤掉重报，
+        最多 `retries` 次」。默认 5 秒 × 3 次 + 首轮 ≈ 20 秒，30 秒的窗口是够的
+        —— 但只要用户把 `wait_sec` 调大（比如 10 秒），对齐就会在追单正做到一半
+        时把整批撤掉，用户看到的是「点了好几次，仓位还是没对齐」（2026-11-23）。
+        所以按追单参数放大：至少要覆盖「首轮 + 每次重报」各等一遍。
+        """
+        try:
+            c = self.chase
+            if not getattr(c, "enabled", False):
+                return ALIGN_TIMEOUT
+            need = float(c.wait_sec) * (int(c.retries) + 2)
+        except Exception:  # noqa: BLE001
+            return ALIGN_TIMEOUT
+        return max(ALIGN_TIMEOUT, need)
+
+    def _pending_detail(self, st: SlotState) -> list[str]:
+        """在途单的「合约 / 开平 / 委x 剩y / 状态」，给撤单前的日志用。
+
+        🔴 「ALIVE」**不许**用来描述我们自己填的那一行（2026-11-23 融航）：
+        柜台一条委托回报都没回时，`BrokerApi` 里那行是下单瞬间按「乐观」写的，
+        `status="ALIVE"` 是我们填的、不是柜台说的。日志写「剩2 ALIVE」等于告诉
+        用户「单子在交易所好好挂着」，而实际可能是根本没报进去 —— 那天四笔
+        TL2612 每笔都「ALIVE」30 秒然后被撤，委托框里一笔都没有。
+        这类行统一写「无回报」，和「挂着等成交」分开。
+        """
+        out = []
+        now = time.time()
+        for o in list(st.pending):
+            order = self._orders.get(o.order_id) if self._orders is not None else None
+            status = getattr(order, "status", "") if order is not None else "查不到"
+            left = getattr(order, "volume_left", "?") if order is not None else "?"
+            if getattr(order, "optimistic", False):
+                age = now - float(getattr(order, "ts", 0.0) or 0.0)
+                status = f"柜台 {age:.0f} 秒没回委托"
+            out.append(f"{o.symbol.split('.')[-1]} {o.offset} "
+                       f"{o.volume}手 剩{left} {status}")
+        return out
+
+    def _ack_note(self, st: SlotState, o: PendingOrder) -> None:
+        """报单发出去 `ORD_ACK_SEC` 秒柜台还没回委托回报，落一行日志（每单一次）。
+
+        `optimistic` 只在柜台真回包时才会被 `BrokerApi._fill_orders()` 覆盖成
+        False（它按 `OrderRef` 对 key，和下单那一刻写进去的那行**是同一个**），
+        所以「一直是 True」确实等于「柜台从没回过这笔」。这是唯一能回答
+        「到底发没发出去」的判据 —— 单纯看 `st.pending` 看不出来。
+        """
+        if not o.order_id:
+            return
+        order = self._orders.get(o.order_id) if self._orders is not None else None
+        if order is None or not getattr(order, "optimistic", False):
+            return
+        warned = getattr(self, "_ack_warned", None)
+        if warned is None:
+            warned = self._ack_warned = set()
+        if o.order_id in warned:
+            return
+        age = time.time() - float(getattr(order, "ts", 0.0) or 0.0)
+        if age < ORD_ACK_SEC:
+            return
+        warned.add(o.order_id)
+        msg = (f"{o.symbol} {o.offset} {o.volume} 手（OrderRef={o.order_id}）"
+               f"已发出 {age:.0f} 秒，柜台一条委托回报都没有 —— 要么报单没进柜台，"
+               f"要么回报没回来。去「账户透视和交易」页核一下这个合约有没有这笔委托")
+        if st is self._align_slot:
+            self._align_log(msg)
+        else:
+            self._log(f"{st.title()}：{msg}")
+            self._diagw("ORD", f"{st.title()}：{msg}")
 
     def _cancel_all(self, st: SlotState) -> None:
         if self.api is None:
@@ -3333,6 +3625,10 @@ class PortfolioRunner:
             status = getattr(order, "status", "") if order is not None else ""
             left = int(getattr(order, "volume_left", 0) or 0) if order is not None else 0
 
+            # 「柜台到底有没有这笔单」只有 `optimistic` 能回答。必须在状态机
+            # 之前问一句 —— 它卡在 ALIVE 上时，下面所有分支都表现得像「正常在途」
+            self._ack_note(st, o)
+
             if status == "FINISHED":
                 self._book(st, o, o.volume)
                 st.last_action = "已成交"
@@ -3396,7 +3692,9 @@ class PortfolioRunner:
                         continue
                     o.order_id = self._order_id(again)
                     o.price = price
-                    st.last_action = f"追单第 {o.retries} 次 @ {price:.2f}"
+                    # 末次追单可能是市价（`price` 是 NaN），别把「@ nan」写进日志
+                    px_txt = "市价" if price != price else f"{price:.2f}"
+                    st.last_action = f"追单第 {o.retries} 次 @ {px_txt}"
                     self._log(f"{st.title()}：{st.last_action}")
                 except Exception as exc:  # noqa: BLE001
                     st.last_action = f"追单失败：{exc}"
@@ -3495,6 +3793,89 @@ class PortfolioRunner:
                 out[st.underlying] = out.get(st.underlying, 0) + st.target
         return out
 
+    def _pos_live(self) -> bool:
+        """账户持仓到底**读到手里**没有 —— 「账户真没仓」≠「柜台一条都没回」。
+
+        🔴 为什么要单独一个判据（2026-11-23 融航）：用户账户里明明有 6 个合约的
+        持仓，组合页的监控器却写「账户仓位与策略理论持仓一致」。比对没算错，是
+        这条连接**一条持仓回调都没收到** —— `_pos` 是个空字典，而 `mismatch()`
+        的合约集合是「理论持仓 ∪ `_pos` 里有的合约」，两边都空，集合就是空的，
+        于是「一个不一致都没有」。
+
+        空字典本来有两种含义，早先被混成了一种：
+
+          - 账户真没仓     → 可以报「一致」
+          - 柜台没回 / 被拒 → 只能说「还没读到」；`align()` 更不能拿它去算差额
+                            （会以为账户是空的，把整个理论仓位重新开一遍）
+
+        判据放在账户接口那一侧（`BrokerApi.positions_ready()`），因为交易页和
+        组合页是**同一个账户的两个会话**，一条读到了不代表另一条读到了。
+        """
+        if self._pos is None:
+            return False
+        ready = getattr(self.api, "positions_ready", None)
+        if ready is None:
+            # 天勤：`get_position()` 是活引用，登上去了就在，没有「还没到」这个状态
+            return True
+        try:
+            return bool(ready())
+        except Exception:  # noqa: BLE001
+            return True                  # 判不了就别拦着用户
+
+    def _pos_note(self) -> None:
+        """持仓一直读不回来时往 `live.log` 写一行 `[POS]`，把柜台那边的情况带上。
+
+        界面这时候只会写「还没同步」，用户没法判断是「再等几秒」还是要去找中台
+        开通查询权限。日志里必须有：发过多少拍查询、`positions_loaded`、柜台最后
+        一句错话、`_pos` 里几个合约 —— 否则下次还是只能靠猜（见 `POS_LOG_SEC`）。
+        """
+        now = time.time()
+        # 没接账户（收盘后登出、只算信号）是**正常**状态，不是「读不到」——
+        # 不区分的话，登出 30 秒后就会冒出一行「持仓没从柜台读到」，纯噪音
+        if self.api is None or self._pos_live():
+            self._pos_blind_at = 0.0
+            self._pos_warned = 0.0
+            return
+        # 这两个字段同样要 `getattr` 兜：自检里常用 `__new__` 造精简桩，
+        # 而 `snapshot()`（进而 `mismatch()`）是 0.4 秒一次的实盘主路径
+        since = getattr(self, "_pos_blind_at", 0.0)
+        if not since:
+            self._pos_blind_at = since = now
+        warned = getattr(self, "_pos_warned", 0.0)
+        # 第一次等够 `POS_LOG_SEC` 才说话，之后每 4 倍时长再提一次（别刷屏）
+        if now - since < POS_LOG_SEC or (warned and now - warned < POS_LOG_SEC * 4):
+            return
+        self._pos_warned = now
+        hub = getattr(self.api, "hub", None)
+        trader = getattr(hub, "trader", None)
+        err = (getattr(self.api, "last_error", "")
+               or getattr(hub, "last_error", "") or "（柜台没有报错）")
+        # `_book_key` 是个 property（要读 `self.spec`），精简桩上可能取不到；
+        # 诊断代码绝不能把 snapshot() 这条主路径带崩
+        try:
+            who = self._book_key
+        except Exception:  # noqa: BLE001
+            who = ""
+        # 资金那边的占用保证金是**独立证据**：仓位一条都没读到、保证金却大于 0，
+        # 那就不是「账户没仓」，而是「柜台没把持仓给我们」—— 这两种情况在
+        # `_pos` 上长得一模一样，只有对一下资金才分得开
+        acct = getattr(trader, "account", None) or {}
+        try:
+            margin = float(acct.get("margin") or 0.0)
+        except Exception:  # noqa: BLE001
+            margin = 0.0
+        hint = ("（占用保证金 %.0f 却一条持仓都没读到 —— 这不是「没仓」，"
+                "是柜台没把持仓给这条连接）" % margin) if margin > 0 else ""
+        self._diagw("POS", (
+            f"{who} 的持仓已经 {now - since:.0f} 秒没从柜台读到："
+            f"发过 {int(getattr(hub, '_pos_try', 0) or 0)} 拍持仓查询、"
+            f"positions_loaded={bool(getattr(trader, 'positions_loaded', False))}、"
+            f"最近一轮回包 {int(getattr(trader, '_pos_rows', -1) or 0)} 行、"
+            f"_pos 里 {len(self._pos or {})} 个合约"
+            f" ｜ 柜台最后一句：{err}{hint}"
+            " ｜ 只要还在这个状态，界面上所有「一致」都不作数"
+            "（不是比对算错，是一条持仓都没读到）"))
+
     def mismatch(self, fresh: bool = False) -> list[dict]:
         """理论持仓与实际持仓不一致的合约。
 
@@ -3511,6 +3892,17 @@ class PortfolioRunner:
         结果缓存 `MISMATCH_GAP` 秒：快照 0.4 秒推一次，每次都重算纯属空转。
         `fresh=True` 绕过缓存 —— 真正要下单（`align()`）时必须用当下的持仓，
         拿 5 秒前的旧数去补仓，补出来的量就是错的。
+
+        🔴 **返回空表不等于「一致」**。这个函数只回答「按我知道的持仓，哪几个
+        对不上」；「我知道的持仓」是否可信，由 `_pos_live()` 单独回答：
+
+          - `_pos` 还没拿到（`None`）        → 空表是「不知道」
+          - 柜台一条持仓回调都没回来（空字典）→ 空表还是「不知道」
+
+        两种情况下 `keys` 都会是空的（理论持仓空 + `_pos` 空），一行都不产出。
+        所以界面必须按 `pos_synced` 分开说，`align()` 也必须自己再拦一道 ——
+        2026-11-23 融航就是拿这张空表报了「账户仓位与策略理论持仓一致」，
+        而账户里实际有 6 个合约的仓。
         """
         now = time.time()
         if not fresh and now - self._mm_ts < MISMATCH_GAP:
@@ -3542,7 +3934,52 @@ class PortfolioRunner:
             })
         self._mm_cache = out
         self._mm_ts = now
+        self._mm_note(out)
         return [dict(r) for r in out]
+
+    def _mm_note(self, rows: list[dict]) -> None:
+        """不一致**一直**存在时落一行 `[MM]`，把账户接口的原始读数记下来。
+
+        🔴 为什么要（2026-11-23）：监控器一直写着「`T2612` 账户 -2、平空2」，
+        而账户其实早就平了、交易页的持仓表里连这个合约都没有。日志里只有
+        `[ALIGN]` 行，没有任何「此刻 `_pos` 里是什么」的记录 —— 到底是活引用
+        断了（读到一份冻住的旧数），还是今昨仓被叠了一遍，只能猜。
+
+        只在**连续** `MM_LOG_SEC` 秒都一样的时候写一次，合约恢复一致就把记录
+        清掉：界面每 2 秒算一次，不设门槛会把 `live.log` 刷满。
+        """
+        now = time.time()
+        # 这三个容器用 `getattr` 兜一下：单元测试里常用
+        # `PortfolioRunner.__new__` 造一个只有几个字段的桩，直接 `self._mm_since`
+        # 会抛 AttributeError —— 而 `mismatch()` 在实盘是 0.4 秒一次的路径，
+        # 诊断代码把主流程带崩是最不能接受的一种崩法
+        since_map = getattr(self, "_mm_since", None)
+        if since_map is None:
+            since_map = self._mm_since = {}
+        logged = getattr(self, "_mm_logged", None)
+        if logged is None:
+            logged = self._mm_logged = set()
+        live = set()
+        for r in rows:
+            sym = str(r.get("symbol") or "")
+            if not sym:
+                continue
+            live.add(sym)
+            since = since_map.setdefault(sym, now)
+            if sym in logged or now - since < MM_LOG_SEC:
+                continue
+            logged.add(sym)
+            self._diagw("MM", (
+                f"{sym} 已经不一致 {now - since:.0f} 秒：目标 {int(r['target']):+d}"
+                f"（多{int(r.get('t_long') or 0)} 空{int(r.get('t_short') or 0)}）"
+                f" 账户 净{int(r['actual']):+d}"
+                f"（多{int(r.get('a_long') or 0)} 空{int(r.get('a_short') or 0)}）"
+                f" ｜ 账户接口原始读数：{self._pos_raw(sym)}"
+                " ｜ 一直不动就是这个合约的持仓没读对（不是「对齐没生效」）"))
+        for sym in list(since_map):
+            if sym not in live:
+                since_map.pop(sym, None)
+                logged.discard(sym)
 
     def align(self, close_orphans: bool = True,
               rows: list[dict] | None = None) -> int:
@@ -3576,10 +4013,14 @@ class PortfolioRunner:
         if self.api is None:
             self._align_log("对齐没有发出委托：账户没有接进来（只算信号不下单）")
             return 0
-        if self._pos is None:
+        if not self._pos_live():
             # 持仓还没同步就发单，等于拿着「账户是空的」去算差额 —— 会把
-            # 整个理论仓位重新开一遍。宁可让用户再点一次
-            self._align_log("账户持仓还没同步，等连上再点一键对齐")
+            # 整个理论仓位重新开一遍。宁可让用户再点一次。
+            # 🔴 判据用 `_pos_live()` 而不是 `self._pos is None`：柜台一条持仓
+            # 回调都没回来时，`_pos` 是个**空字典**（不是 None），拿它算差额
+            # 和「账户真的空仓」得到的结果一模一样（2026-11-23 融航）
+            self._align_log(
+                "账户持仓还没从柜台读回来，这会儿对齐会把仓位重开一遍，等几秒再点")
             return 0
         if self._align_slot.pending:
             self._align_log("上一轮对齐还没落地，等它成交或撤掉再点")
@@ -3599,6 +4040,7 @@ class PortfolioRunner:
                       for r in rows}
         n = 0
         skipped, stale = [], []
+        self._align_touched = set()
         for row in self.mismatch(fresh=True):
             sym = row["symbol"]
             pair = (int(row.get("a_long") or 0), int(row.get("a_short") or 0))
@@ -3617,14 +4059,30 @@ class PortfolioRunner:
                 f"对齐 {sym}：目标 {int(row['target']):+d} 手"
                 f"（多{int(row.get('t_long') or 0)} 空{int(row.get('t_short') or 0)}）"
                 f" 账户 净{int(row['actual']):+d}"
-                f"（多{pair[0]} 空{pair[1]}） 差额 {int(row['delta']):+d}")
+                f"（多{pair[0]} 空{pair[1]}） 差额 {int(row['delta']):+d}"
+                f"{self._pos_detail(sym)}")
             sent = self._send_row(self._align_slot, row)
             if sent:
+                self._align_touched.add(sym)
                 # 对齐的目标就是 `sum(target)`，所以发完之后各策略的账本正好
                 # 是「自己的 target」。不跟着摆的话：停掉的策略留着 -11 的账本，
                 # 对齐把仓平了，再启动它目标 -11、账本 -11、差额 0 —— 它会以为
                 # 自己还空着 11 手，实际上账户是平的。
+                #
+                # 🔴 这是**乐观**写法：发出去 ≠ 成交。超时撤单那一头必须把它
+                # 摆回来（见 `_resync_books`），否则账本说「到位了」、账户却是
+                # 原样，之后策略按账本发「平仓手数超过持仓量」（2026-11-23 那张
+                # 截图里 T2612 / IC2612 的拒单就是这么来的）。
                 self._sync_after_align(sym)
+            else:
+                # 这笔一笔都没发出去。原因（等盘口 / 明细未就绪 / 非交易时段 /
+                # 可平量不够）写在 `last_action` 里，**必须逐个落日志** ——
+                # 以前只在「整轮一笔都没发」时才 echo 一次，于是「监控器上 10 个
+                # 合约、委托框里只有 5 笔」在日志里完全看不出另外几个为什么不动，
+                # 用户只能反复点（2026-11-23 报的「发出的委托单很少」）。
+                self._align_log(
+                    f"对齐 {sym} 没发出去："
+                    f"{self._align_slot.last_action or '没有需要动的腿'}")
             n += sent
         if skipped:
             self._align_log("对齐跳过（确认框里没有这几个合约）："
@@ -3651,9 +4109,7 @@ class PortfolioRunner:
         到 `live.log`。
         """
         self._log(msg)
-        diag = getattr(self, "_diag", None)
-        if diag is not None:
-            diag.write("ALIGN", msg)
+        self._diagw("ALIGN", msg)
 
     def _send_row(self, st: SlotState, row: dict) -> int:
         """按「多边 / 空边」各发一笔，返回发出的笔数。
@@ -3724,6 +4180,35 @@ class PortfolioRunner:
             st.based = True
             st.based_target = int(st.target or 0)
             self._save_book(st)
+
+    def _resync_books(self) -> list[str]:
+        """对齐**没落地**时，把账本按账户实际重新摆一遍。返回改动过的清单。
+
+        🔴 为什么必须有这一步（2026-11-23）：`_sync_after_align()` 是**乐观**的
+        —— 委托一发出就把 `held` 写成 `target`。可对齐单是限价单，盘中价格一跑
+        就挂在那儿，`ALIGN_TIMEOUT` 一到整批撤掉，账户原地没动，而账本已经说
+        「我到位了」。之后策略一翻信号，就按这个假账本发「平仓 2 手」——
+        账户里那 2 手根本不存在，柜台当场打回「平仓手数超过持仓量」（那张截图
+        里 T2612 / IC2612 的说明就是它），而且被拒一次就少一次报单额度。
+
+        撤单之后账本 = 账户实际，谁都没到位，重新从真实起点算，这才是对的。
+        只改 `held`，**不动 `based` / `based_target`**：对齐没成功就不该把
+        当前目标设成新基准，否则「目标不变不发单」会把策略永久冻住。
+        """
+        changed: list[str] = []
+        for st in list(self._slots.values()):
+            for sym in list(st.held):
+                have = int(self._net_pos(sym))
+                old = int(st.held.get(sym) or 0)
+                if old == have:
+                    continue
+                if have:
+                    st.held[sym] = have
+                else:
+                    st.held.pop(sym, None)
+                changed.append(f"{st.cfg.sid} {sym} {old:+d}→{have:+d}")
+                self._save_book(st)
+        return changed
 
     # ---- 给界面看的实时 K 线 ----
 
@@ -3851,10 +4336,11 @@ class PortfolioRunner:
             if key in self._err_logged:
                 continue
             self._err_logged.add(key)
-            self._diag.write("LIVE", f"{st.title()}：{st.error}")
+            self._diagw("LIVE", f"{st.title()}：{st.error}")
 
     def snapshot(self) -> dict:
         self._log_errors()
+        self._pos_note()
         # 取一次就清掉。没清的话界面关掉 K 线之后，这份开销还每份快照都付
         want, self._want = self._want, []
         # 盈亏每个槽位只算一次：多品种的父行要按子槽位汇总，直接读这里的结果，
@@ -3908,10 +4394,26 @@ class PortfolioRunner:
             # 一键对齐必须看这一个：没登账户时发单只是空转（`align()` 直接
             # 返回 0），界面得先把这些账户排除掉，别让用户以为点过了就平完了
             "account_ready": self.api is not None,
+            # 「账户没有」有两种：用户自己登出了（要尊重），和它压根没接上
+            # （启动时接入失败 / 账户在交易页重新登录过）。后者界面「刷新」
+            # 应当真的去接一次，而不是把空引用再挂一遍装作刷新过了
+            # `getattr` 兜一下：自检里常用 `__new__` 造精简桩，而 `snapshot()`
+            # 是 0.4 秒一次的实盘主路径，不能因为桩少一个属性就抛
+            "user_detached": bool(getattr(self, "_detached_by_user", False)),
             # 账户持仓是否已经拉到手。为 False 时 `mismatch()` 一定返回空 ——
             # 那不是「一致」，是「还不知道」。界面必须分开说，否则用户点一键对齐
             # 会毫无反应，还以为是按钮坏了
             "pos_ready": self._pos is not None,
+            # 🔴 比 `pos_ready` 更严的一条：**持仓真的从柜台读回来过一整轮**。
+            # `pos_ready` 只表示「账户接口挂上了」，它同时被界面用来判断「账户在
+            # 线/该显示登出还是登录」，所以不能拿来当「比对结果作不作数」用。
+            # 为 False 时 `mismatch()` 的空表是「不知道」，不是「一致」——
+            # 2026-11-23 融航就是拿这个空表报了「账户与策略理论持仓一致」，
+            # 而账户里实际有 6 个合约的仓。
+            "pos_synced": self._pos_live(),
+            # 读到了几个合约的持仓。界面不用它做判断，出问题时一眼看得出
+            # 「读到了但比对说一致」和「一条都没读到」的区别
+            "pos_count": len(self._pos) if self._pos is not None else 0,
             "slots": slots,
             "mismatch": self.mismatch(),
             # `want_bars()` 点名的策略才带，其余时候是空字典

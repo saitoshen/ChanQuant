@@ -116,6 +116,21 @@ except Exception as exc:  # noqa: BLE001
     OFFSET_VT2ROHON = {}
     OFFSET_ROHON2VT = {}
 
+# 市价单要的两个枚举。**故意不放进上面那个大 try**：万一某个版本的
+# vnpy_rohon 没导出它们，整个模块会变成「没装」，融航就连不上了。CTP 协议里
+# 这两个值固定是 `'1'`（AnyPrice）/ `'3'`（IOC），拿不到就退回字面量。
+THOST_FTDC_OPT_AnyPrice = "1"
+THOST_FTDC_TC_IOC = "3"
+try:
+    from vnpy_rohon.api import (
+        THOST_FTDC_OPT_AnyPrice as _OPT_ANY,
+        THOST_FTDC_TC_IOC as _TC_IOC,
+    )
+
+    THOST_FTDC_OPT_AnyPrice, THOST_FTDC_TC_IOC = _OPT_ANY, _TC_IOC
+except Exception:  # noqa: BLE001
+    pass          # 拿不到就用上面那两个字面量，和市场价单没关系
+
 # 委托状态字符 → 人话。**和 CTP 是同一张表**（两者都是 CTP 协议的 OrderStatus），
 # 直接借 ctp_client 那份。那张表曾经整体错位一格：界面把活单显示成「已撤单」，
 # 用户以为单子没了。两份表必然只会改一份，所以不复制。
@@ -377,6 +392,18 @@ class RohonTraderClient:
         self.orders: dict[str, dict] = {}
         self.trades: dict[str, dict] = {}
         self.positions: dict[str, dict] = {}
+        # 有没有**完整**读回来过一轮持仓（`bIsLast` 那一包到了才算）。
+        # 🔴 和 CTP 上那份同一个语义（见 `ctp_client` 里 2026-11-23 融航那次）：
+        # 「空表」既可能是真没仓，也可能是柜台还没回 —— 后者不能拿去做对齐。
+        self.positions_loaded = False
+        # 🔴 持仓查询的「代」：柜台一秒一个查询，上一轮的回包可能迟到现在才到；
+        # 不认 RequestID 的话，它的 `last` 会把新一轮当成自己的整份快照提交。
+        # 2026-11-23 那些「交易页有 7 个合约、监控器全是 0」就是这一路丢的。
+        # 语义和 `ctp_client.TraderClient` 完全一致：**开轮清一次、之后原地累加**，
+        # 不再攒 buf 整份替换（替换版一旦被多余的 `last` 空包碰上就把表刷成空的）。
+        self._pos_req = 0             # 当前这一轮查询的 RequestID
+        self._pos_started = True      # True = 没有进行中的查询（下一轮要清一次）
+        self._pos_rows = 0            # 最近一轮回包的行数，只用于诊断
         self.account: dict = {}
         self.instruments: dict[str, dict] = {}
         self.instruments_done = threading.Event()
@@ -423,8 +450,17 @@ class RohonTraderClient:
     # ---- 下单 ----
 
     def place(self, instrument: str, direction: str, offset: str,
-              price: float, volume: int) -> str:
-        """报单。返回本地 OrderRef。"""
+              price: float, volume: int, market: bool = False) -> str:
+        """报单。返回本地 OrderRef。
+
+        `market=True` 发**市价单**（`OrderPriceType=AnyPrice`，价格填 0）。
+
+        🔴 2026-11-23 用户：「ctp 和融航的下单，现在所有交易所应该都支持市价单了
+        … 上期所和能源所在 2026 年 7 月 6 日也开放支持市价单了」。以前这里硬编码
+        「融航席位只收限价单」，界面上市价那个勾对柜台账户直接禁用。
+        时间条件必须跟着换成 **IOC**：GFD + AnyPrice 会被交易所打回「该合约不支持
+        此时间条件」（和 `ctp_client.place()` 同一条规则）。
+        """
         if self.api is None or not self.logged_in.is_set():
             raise RohonError("还没登录")
         if not self.settled.is_set():
@@ -437,17 +473,24 @@ class RohonTraderClient:
             raise RohonError(f"开平只能是 OPEN / CLOSE / CLOSETODAY，收到 {offset}")
         if volume <= 0:
             raise RohonError("手数必须大于 0")
-        if price <= 0:
-            raise RohonError("融航席位只收限价单，价格必须大于 0")
+        # `price` 允许 None / NaN（天勤那边就这么表示市价），统一折成市价
+        try:
+            px = float(price)
+        except (TypeError, ValueError):
+            px = float("nan")
+        market = bool(market) or not (px > 0)
+        if not market and px <= 0:
+            raise RohonError("限价单必须给一个大于 0 的价格")
 
         self._order_ref += 1
         ref = str(self._order_ref)
         req = {
             "InstrumentID": instrument,
             "ExchangeID": self._exchange_of(instrument),
-            "LimitPrice": float(price),
+            "LimitPrice": 0.0 if market else px,
             "VolumeTotalOriginal": int(volume),
-            "OrderPriceType": THOST_FTDC_OPT_LimitPrice,
+            "OrderPriceType": (THOST_FTDC_OPT_AnyPrice if market
+                               else THOST_FTDC_OPT_LimitPrice),
             "Direction": d,
             "CombOffsetFlag": off,
             # 投机单。套保 / 套利要在柜台提前备案
@@ -459,7 +502,7 @@ class RohonTraderClient:
             "ContingentCondition": THOST_FTDC_CC_Immediately,
             "ForceCloseReason": THOST_FTDC_FCC_NotForceClose,
             "IsAutoSuspend": 0,
-            "TimeCondition": THOST_FTDC_TC_GFD,
+            "TimeCondition": THOST_FTDC_TC_IOC if market else THOST_FTDC_TC_GFD,
             "VolumeCondition": THOST_FTDC_VC_AV,
             "MinVolume": 1,
         }
@@ -491,22 +534,54 @@ class RohonTraderClient:
             req["SessionID"] = self.session_id
         else:
             raise RohonError("撤单缺少 OrderSysID 和 OrderRef")
-        self.api.reqOrderAction(req, self._next_req())
+        # 和 `place()` 一样要看返回值：非 0 = 请求没进发送队列，那笔单还在
+        # 交易所挂着，而调用方会按「已撤」处理（2026-11-23 融航那四笔）
+        try:
+            n = self.api.reqOrderAction(req, self._next_req())
+        except Exception as exc:  # noqa: BLE001 - pybind 参数错会抛
+            raise RohonError(f"撤单请求发送失败：{exc}") from exc
+        if n:
+            raise RohonError(f"撤单没发出去，错误代码：{n}")
 
     # ---- 查询 ----
+
+    def _qry_note(self, what: str, n) -> None:
+        """`reqQry*` 的返回值翻成人话（和 `ctp_client._qry_note` 同一套判据）。
+
+        融航中台也是 CTP 那套「每秒一个查询」，超了直接返回非 0 且**不回包**。
+        不看返回值的话，「没发出去」和「账户真没仓」在界面上长得一模一样 ——
+        2026-11-23 组合页那条连接就是连发资金 + 持仓，持仓被丢掉、`_pos` 全空。
+        """
+        try:
+            code = int(n or 0)
+        except (TypeError, ValueError):
+            code = 0
+        old = str(getattr(self, "last_error", "") or "")
+        if code:
+            why = {-1: "网络连接失败", -2: "未处理请求超上限",
+                   -3: "每秒查询超限（柜台一秒只收一个）"}.get(code, "柜台拒绝")
+            self.last_error = f"查{what}没发出去：{code} {why}"
+        elif old.startswith(f"查{what}没发出去"):
+            self.last_error = ""
 
     def query_account(self) -> None:
         if self.api is not None:
             # vnpy 的融航 gateway 也是传空 dict：账户信息从登录态取
-            self.api.reqQryTradingAccount({}, self._next_req())
+            self._qry_note("资金", self.api.reqQryTradingAccount({}, self._next_req()))
 
     def query_positions(self) -> None:
         if self.api is None:
             return
-        self.api.reqQryInvestorPosition(
+        # 记下这一轮的 RequestID，回包只认它；同时把「开轮清表」的闸门放下，
+        # 由这一轮的第一条回包负责清（不能在这里清：清早了界面会看到半份持仓）
+        rid = self._next_req()
+        self._pos_req = rid
+        self._pos_started = False
+        self._pos_rows = 0
+        self._qry_note("持仓", self.api.reqQryInvestorPosition(
             {"BrokerID": self.cfg.broker_id, "InvestorID": self.cfg.user_id},
-            self._next_req(),
-        )
+            rid,
+        ))
 
     def query_instruments(self, instrument: str = "") -> None:
         """查合约表。传 `instrument` 只查那一个（秒回）。
@@ -531,6 +606,11 @@ class RohonTraderClient:
                 "error": self.last_error,
                 "account": dict(self.account),
                 "positions": {k: dict(v) for k, v in self.positions.items()},
+                # 「持仓真读回来了吗」—— 空表不等于没仓（`BrokerApi.positions_ready`）
+                "positions_loaded": self.positions_loaded,
+                # 最近一轮持仓查询**回了几行**。0 行 + `loaded=True` 只有两种可能：
+                # 真没仓，或者柜台回了个空包 —— 诊断行里带上它才分得清
+                "pos_rows": self._pos_rows,
                 "orders": {k: dict(v) for k, v in self.orders.items()},
                 "trades": {k: dict(v) for k, v in self.trades.items()},
             }
@@ -730,27 +810,82 @@ def _make_td(outer: RohonTraderClient):
                 }
 
         def onRspQryInvestorPosition(self, data, error, reqid, last):  # noqa: N802
-            if data:
+            """查持仓回包。**开轮清一次、之后原地累加**，和 `ctp_client` 同一套。
+
+            🔴 三个坑，前两个是 2026-11-23 下午「交易页有 7 个合约、监控器全 0」
+            的真因：
+
+            1. **没有按 RequestID 归轮**。柜台一秒一个查询，上一轮的回包可能迟到；
+               它的 `last` 一到，就把新一轮刚攒的东西当成自己的整份快照提交了。
+            2. **`outer._pos_buf or {}` 会把表刷成空**。攒 buf、`last` 时整份替换
+               的写法，一旦碰上多余的 `last`（有的中台会多发一个空终止包），
+               `buf` 已经是 None ⇒ 提交一个空 dict ⇒ 持仓全变 0，还顺手把
+               `positions_loaded` 置真 —— 于是连「还没读到」都不说了，界面直接画 0。
+            3. `profit` / `margin` 早先用 `+=` 且从不重置（问第二遍就翻倍），
+               平掉的仓也永不删。改成开轮清一次，两个问题一起没了。
+
+            还有一条：上期所 / 能源中心的持仓回包**同一方向会有两行**（今仓、昨仓
+            各一行），所以六个数一律 `+=`，不能赋值 —— 赋值的话后一行把前一行
+            盖掉，持仓手数直接少一半。
+            """
+            err = _err(error)
+            if err:
+                outer.last_error = f"查持仓失败：{err}"
+                return
+            # 只认当前这一轮。`reqid` 为 0（个别中台不回填）时不拦，宁可多收
+            try:
+                rid = int(reqid or 0)
+            except (TypeError, ValueError):
+                rid = 0
+            if rid and outer._pos_req and rid != outer._pos_req:
+                return
+            with outer._lock:
+                if not outer._pos_started:
+                    outer.positions.clear()
+                    outer._pos_started = True
+                if not data:
+                    # 空仓时柜台只回一条空包（`last=True`、内容为空）。「查完了、
+                    # 确实一条持仓都没有」是有效结论，必须置真，否则界面永远停在
+                    # 「还没读到」，真有仓了也不敢说一致
+                    if last:
+                        outer.positions_loaded = True
+                        outer._pos_rows = len(outer.positions)
+                    return
                 ins = _s(data.get("InstrumentID"))
                 side = {"2": "long", "3": "short"}.get(
                     _s(data.get("PosiDirection")), "net")
                 n = int(_f(data.get("Position")))
                 yd = int(_f(data.get("YdPosition")))
                 td = int(_f(data.get("TodayPosition"))) or max(0, n - yd)
-                with outer._lock:
-                    row = outer.positions.setdefault(
-                        ins, {"instrument": ins, "long": 0, "short": 0,
-                              "long_yd": 0, "short_yd": 0,
-                              "long_today": 0, "short_today": 0,
-                              "price": 0.0, "profit": 0.0, "margin": 0.0})
-                    if side == "long":
-                        row["long"], row["long_yd"], row["long_today"] = n, yd, td
-                    elif side == "short":
-                        row["short"], row["short_yd"], row["short_today"] = n, yd, td
-                    # OpenCost 是**总成本**（含乘数），不是单价
-                    row["price"] = _f(data.get("OpenCost")) or row["price"]
-                    row["profit"] += _f(data.get("PositionProfit"))
-                    row["margin"] += _f(data.get("UseMargin"))
+                row = outer.positions.setdefault(
+                    ins, {"instrument": ins, "long": 0, "short": 0,
+                          "long_yd": 0, "short_yd": 0,
+                          "long_today": 0, "short_today": 0,
+                          "cost_long": 0.0, "cost_short": 0.0,
+                          "price": 0.0, "profit": 0.0, "margin": 0.0})
+                # 一律累加，不赋值：上期所同一方向会推今仓、昨仓两行
+                if side == "long":
+                    row["long"] += n
+                    row["long_yd"] += yd
+                    row["long_today"] += td
+                elif side == "short":
+                    row["short"] += n
+                    row["short_yd"] += yd
+                    row["short_today"] += td
+                # OpenCost 是**总成本**（含乘数），不是单价。多空两边的成本必须
+                # 分开累加：`_positions()` 要按 PosiDirection 各算各的均价，
+                # 混成一个 `price` 时「成交平仓盈亏」必错（CTP 那边也是分开记的）
+                oc = _f(data.get("OpenCost"))
+                if side == "long":
+                    row["cost_long"] += oc
+                elif side == "short":
+                    row["cost_short"] += oc
+                row["price"] += oc
+                row["profit"] += _f(data.get("PositionProfit"))
+                row["margin"] += _f(data.get("UseMargin"))
+                outer._pos_rows += 1
+                if last:
+                    outer.positions_loaded = True
 
         def onRspQryInstrument(self, data, error, reqid, last):  # noqa: N802
             if last:

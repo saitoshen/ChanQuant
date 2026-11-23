@@ -29,7 +29,7 @@ import pandas as pd
 
 from . import daylimit, symbols_info
 from .paths import user_dir
-from .tqdata import PERIODS, resample, trading_days
+from .tqdata import PERIODS, daily_csv_path, resample, trading_days
 from .tqfetch import PERIOD_SEC, local_time
 from .tqsdk_symbols import contract_from_input, contract_key, is_stock, trade_symbol
 
@@ -384,6 +384,55 @@ def _mult_of(contract: str) -> float:
     return val
 
 
+#: 本地日线最后一根收盘价的缓存：{csv 路径: (mtime, close)}
+_LAST_CLOSE: dict[str, tuple[float, float]] = {}
+
+
+def _last_daily_close(symbol: str, exchange: str = "") -> float:
+    """本地日线**最后一根**的收盘价，给平仓盈亏当兜底成本基准。
+
+    用武之地只有一个（2026-11-23 用户：「平仓盈亏可以根据昨日结算价或者收盘
+    价格来计算，如果获取不到历史成交的话」）：成交流拿不到、行情也拿不到时，
+    总不能给一格「—」。
+
+    从文件**尾部**倒着取最后一行 —— 这些 CSV 是十几年的日线（rb 有 4000+ 行），
+    在 0.4 秒一刷的账户循环里整份 `read_csv` 会把界面拖死；按 mtime 缓存，
+    一天只读一次。
+
+    🔴 这是**品种指数**（`RB.SHF`）的收盘，不是具体月份合约的 —— 所以排在
+    昨结算 / 昨收 / 今收**之后**，只在前三级都拿不到时才用。量级对得上，
+    别当精确值。读不到返回 0。
+    """
+    vari, ex = symbols_info.contract_product(str(symbol or ""))
+    if not vari:
+        return 0.0
+    ex = ex or str(exchange or "").upper()
+    try:
+        path = daily_csv_path(vari.lower(), ex)
+        mtime = os.path.getmtime(path)
+    except Exception:  # noqa: BLE001 - 没下过这个品种的日线，就当没有
+        return 0.0
+    hit = _LAST_CLOSE.get(path)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    px = 0.0
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 4096))
+            chunk = f.read().decode("utf-8", "ignore")
+        # 表头有 BOM，但最后一行没有；列序 `ts_code,name,date,open,high,low,close,...`
+        for line in reversed([x for x in chunk.splitlines() if x.strip()]):
+            cols = line.split(",")
+            if len(cols) >= 7:
+                px = float(cols[6] or 0.0)
+                break
+    except Exception:  # noqa: BLE001
+        px = 0.0
+    _LAST_CLOSE[path] = (mtime, px)
+    return px if px > 0 else 0.0
+
+
 def _qnum(q, name: str, default: float = 0.0) -> float:
     """行情对象上的数值字段，**NaN 一律当 0**。
 
@@ -533,6 +582,122 @@ def est_close_pnl(trades, cache: dict, mult_of=None, now: float = 0.0,
             continue
         t["close_profit"] = sign * (price - avg) * vol * float(fn(sym) or 1.0)
     return trades
+
+
+def _trade_time_key(t: dict) -> tuple:
+    """成交行的排序键。🔴 不能用 `time` 字符串直接比大小。
+
+    两家的时间字段根本不是一回事：
+
+    * 天勤：`time` = `"MM-DD HH:MM:SS"`（`_stamp()` 出的），带日期，字典序就是
+      时序，优先用纳秒值 `trade_date_time`；
+    * CTP：`time` = `TradeTime` = **只有 `"HH:MM:SS"`**，而夜盘 21:00 开、次日
+      凌晨 02:30 收 —— 按字典序 `"01:30:00"` 会排到 `"21:00:00"` **前面**，
+      一跨零点 FIFO 的账立刻错位（开仓被当成平仓之后的）。
+
+    所以没有纳秒值时按「距夜盘开盘多少秒」重排：21:00 → 0，23:59 → 10740，
+    00:00 → 10800（+3h 让凌晨接在深夜之后），09:00 → 43200。
+    """
+    try:
+        ns = float(t.get("trade_date_time") or 0.0)
+    except (TypeError, ValueError):
+        ns = 0.0
+    tid = str(t.get("trade_id") or "")
+    if ns > 0:
+        return (0.0, ns, tid)
+    s = str(t.get("time") or "")
+    hh = mm = ss = 0
+    try:
+        p = s.split()[-1].split(":")
+        hh, mm, ss = int(p[0]), int(p[1]), int(p[2])
+    except (IndexError, ValueError):
+        pass
+    if hh >= 20:                       # 夜盘（含 20:55 集合竞价）
+        base = (hh - 21) * 3600 + mm * 60 + ss
+    elif hh < 8:                       # 夜盘跨过零点那一段
+        base = 3 * 3600 + hh * 3600 + mm * 60 + ss
+    else:                              # 日盘
+        base = 12 * 3600 + (hh - 9) * 3600 + mm * 60 + ss
+    return (1.0, float(base), tid)
+
+
+def replay_close_pnl(trades, mult_of=None, now: float = 0.0,
+                     pre_settle_of=None) -> int:
+    """用**当日成交流**按时间 FIFO 倒推每笔平仓的盈亏，返回算出来的笔数。
+
+    🔴 为什么需要（2026-11-23 用户：「这边重新登录后，平仓盈亏都归 0 了」）：
+    成交回报里没有盈亏字段（见 `est_close_pnl`），平时靠「持仓的开仓均价」倒推。
+    可程序一重启，`_open_cache` 是空的，而**已经平掉的仓**在持仓表里也找不到
+    均价 ⇒ 那些成交的平仓盈亏全变成「—」。
+
+    当日成交流本身是**查得回来的**（CTP 走 `ReqQryTrade`，天勤登录后就有），
+    按时间顺序把开仓堆进 FIFO、平仓从对面取，就能还原「这一笔平的是哪一批开仓、
+    成本多少」。同一天开的仓算出来是**精确值**，不是估的。
+
+    **成交流拿不到时按成本基准算**（2026-11-23 用户第二次拍板：「平仓盈亏可以
+    根据昨日结算价或者收盘价格来计算，如果获取不到历史成交的话」）。所以 FIFO
+    凑不齐的手数按 `pre_settle_of(sym)` 给的成本基准折算 —— 结算单的逐日盯市
+    口径就是 `（平仓价 − 昨结算价）× 手数 × 乘数`，所以这不是编数。
+
+    优先级（越前越准，都是「这笔平仓」的成本）：
+      1. 当日成交流 FIFO（同日开平）—— 精确；
+      2. `est_close_pnl` 已经写好的估算值（持仓开仓均价，只在还有仓时才有）——
+         **不覆盖**：那一份比昨结算更贴这笔交易；
+      3. 成本基准（昨结算 → 昨收 → 今收 → 本地日线昨收，由调用方给）。
+
+    调用顺序：`est_close_pnl(...)` 之后再调它 —— 它能算的覆盖估算值。
+    """
+    fn = mult_of or _mult_of
+    book: dict[tuple, list] = {}          # (合约, 多头/空头) -> [[开仓价, 剩余手数], …]
+    rows = sorted(trades or (), key=_trade_time_key)
+    done = 0
+    for t in rows:
+        sym = str(t.get("symbol") or "")
+        vol = int(t.get("volume") or 0)
+        px = float(t.get("price") or 0.0)
+        d = str(t.get("direction") or "").upper()
+        if not sym or vol <= 0 or px <= 0:
+            continue
+        if d.startswith("BUY"):
+            mine, opp = "long", "short"
+        elif d.startswith("SELL"):
+            mine, opp = "short", "long"
+        else:
+            continue
+        off = str(t.get("offset") or "").upper()
+        if not _is_close_offset(off):
+            book.setdefault((sym, mine), []).append([px, vol])
+            continue
+        lots = book.get((sym, opp)) or []
+        need, left, cost = vol, vol, 0.0
+        while left > 0 and lots:
+            lot = lots[0]
+            take = min(left, lot[1])
+            cost += lot[0] * take
+            lot[1] -= take
+            left -= take
+            if lot[1] <= 0:
+                lots.pop(0)
+        if left > 0:
+            # 成交流里缺这部分开仓记录（昨仓，或者整个成交流都查不到）。
+            # ① `est_close_pnl` 已经给了估算值 ⇒ 留着，它比昨结算更贴这笔交易
+            if t.get("close_profit") is not None:
+                continue
+            # ② 退回成本基准（昨结算 / 昨收 / 今收 / 本地日线昨收）
+            ps = 0.0
+            if pre_settle_of is not None:
+                try:
+                    ps = float(pre_settle_of(sym) or 0.0)
+                except Exception:  # noqa: BLE001
+                    ps = 0.0
+            if ps <= 0:
+                continue                 # 连基准都没有，宁可留「—」也不编
+            cost += ps * left            # 凑到的那部分按 FIFO，缺的按基准
+        # 卖出平多：价越高越赚；买入平空：反过来
+        sign = 1.0 if mine == "short" else -1.0
+        t["close_profit"] = sign * (px - cost / need) * need * float(fn(sym) or 1.0)
+        done += 1
+    return done
 
 
 def est_commission(trades, mult_of=None, exchange_of=None,
@@ -958,6 +1123,12 @@ class LiveHub:
                 # 顺序不能反 —— 刚平光的仓这一轮已经不在持仓里了，靠的正是缓存
                 update_open_avg(self._open_cache, pos)
                 est_close_pnl(trds, self._open_cache)
+                # 再用当日成交流 FIFO 精确还原一遍，覆盖估算值（2026-11-23
+                # 用户：重新登录后平仓盈亏全归 0）。重启后 `_open_cache` 是空的，
+                # 已经平掉的仓连持仓表里都没有均价 ⇒ 上面那步只能给 `None`
+                replay_close_pnl(trds, pre_settle_of=self._pre_settle)
+                # 算完再截断给界面（`_trades_snapshot()` 故意不截断，见那里注释）
+                trds = trds[:SNAP_ROWS]
                 est_commission(trds, mult_of=_mult_of)
             except Exception as exc:  # noqa: BLE001
                 # 单个账户查不出来不该拖垮整页：其余账户照样能看能下单
@@ -1180,7 +1351,11 @@ class LiveHub:
         items = list(src.items()) if hasattr(src, "items") else []
         items.sort(key=lambda kv: -self._num(kv[1], "trade_date_time"))
         out = []
-        for tid, t in items[:SNAP_ROWS]:
+        # 🔴 这里**不截断**（2026-11-23）：`replay_close_pnl` 要拿当日全部成交
+        # 按时间 FIFO 倒推平仓盈亏，只留最近 200 笔的话，早上的开仓记录就不在
+        # 里面了 —— 平仓那几笔一笔都算不出来。截断挪到 `_fill_accounts` 算完
+        # 之后（那里截一次，界面看到的仍然是 `SNAP_ROWS` 行）。
+        for tid, t in items:
             # 天勤的 Trade 带 `commission`（元，柜台算的）。老版本 / 别的源可能
             # 没有这个键 —— 用 `None` 表示「没有」，交给 `est_commission` 估；
             # 不能写 0，0 的意思是「这一笔真的不收费」
@@ -1202,8 +1377,39 @@ class LiveHub:
             })
         return out
 
-    # ---- 写 ----
+    def _pre_settle(self, symbol: str) -> float:
+        """平仓盈亏的**成本基准**：昨结算 → 昨收 → 今收 → 本地日线昨收。
 
+        `replay_close_pnl` 在「成交流凑不齐这笔平仓的开仓记录」时拿它当成本
+        （2026-11-23 用户：「平仓盈亏可以根据昨日结算价或者收盘价格来计算，
+        如果获取不到历史成交的话」）。
+
+        🔴 顺序按**口径正确性**排：`pre_settlement`（昨结算，结算单的逐日盯市
+        基准）→ `pre_close`（昨收）→ `close`（今收，收市后才有值，盘中是 NaN）。
+        盯着的表里没有这个合约时退回主连 quote —— 同品种不同月份的量级一定对得
+        上，比留一个「—」有用；再不行读本地日线的最后一根收盘。
+
+        拿不到返回 0（调用方据此不写这一笔），**绝不拿 0 当成本**。
+        """
+        q = self._watch.get(symbol)
+        if q is None:
+            mq = self._quote
+            if mq is not None:
+                inst = str(getattr(mq, "instrument_id", "") or "")
+                und = str(getattr(mq, "underlying_symbol", "") or "")
+                if symbol in (inst, und):
+                    q = mq
+        if q is not None:
+            for key in ("pre_settlement", "pre_close", "close"):
+                try:
+                    v = float(_qnum(q, key) or 0.0)
+                except Exception:  # noqa: BLE001
+                    v = 0.0
+                if v > 0:            # NaN 在这里也是 False，正好跳过
+                    return v
+        return _last_daily_close(symbol)
+
+    # ---- 写 ----
     def _acc_obj(self, name: str = ""):
         """按名字找天勤账户对象。名字为空时返回唯一的那个（单账户）。"""
         if not self._accs:
@@ -1238,6 +1444,10 @@ class LiveHub:
                 "再发会被交易所限制交易，明天再来"
             )
         direction, offset = self._stock_side(symbol, direction, offset)
+        # A 股没有市价单（交易所只有限价委托），天勤收到 `limit_price` 缺省会
+        # 按「市价」发，柜台直接拒。在这里说清楚，别让人对着「委托被拒」猜
+        if is_stock(symbol) and not (limit_price is not None and limit_price > 0):
+            raise ValueError("A 股只有限价委托：填一个价格，不能下市价单")
         kwargs = {}
         if limit_price is not None and limit_price > 0:
             kwargs["limit_price"] = float(limit_price)

@@ -31,9 +31,11 @@ dict 会原地更新，引擎每轮 `wait_update()` 之后直接读缓存就行�
   「没发出去」再发一次。乐观条目在回报到达后被真回报覆盖。
 - **不抛异常**：`wait_update()` 里行情/查询出错只记 `last_error`。抛出去会
   让界面把整条会话判成「行情中断」拆掉，而 CTP 掉一下再连上是常事。
-- **没有历史委托查询**：`TraderClient` 没实现 `ReqQryOrder`，所以上一次进程
-  留下的挂单在这儿看不见。启动时的 `_sweep_orders()` 会因此空跑一遍 ——
-  这一点在日志里说清楚，别让用户以为已经撤干净了。
+- **历史委托 / 成交靠登录后补查**：`TraderClient.query_orders()` /
+  `query_trades()`（`ReqQryOrder` / `ReqQryTrade`）。柜台只在登录**之后**推
+  `OnRtnOrder` / `OnRtnTrade`，不补查的话重启一次就是「持仓有、委托和成交
+  两张空表」（2026-11-23 融航那次）。补上之后 `_sweep_orders()` 也终于能看见
+  上一次进程留下的挂单。
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ import time
 import numpy as np
 import pandas as pd
 
+from ttrade import hubreg
 from ttrade.ctp_live import (_EX_SHORT, _BarBuilder, ctp_instrument, exchange_of_contract,
                              looks_contract, main_contract, split_today_his,
                              variety_exchange)
@@ -63,9 +66,9 @@ _REV_SEC = {
 #: 换月一天最多一次，60 秒足够灵敏又不会每轮都去读盘
 MAIN_TTL = 60.0
 
-#: 柜台限制「每秒最多一个查询请求」，资金和持仓必须错开发
-ACCOUNT_SEC = 2.0
-POSITION_SEC = 1.0
+# 柜台「每秒最多一个查询请求」的轮转不在这里：`CtpHub.pump_queries()` 统一管
+# （交易页和组合页共用一份，早先两边各有一套，撞在一起会把持仓查询挤掉 ——
+# 2026-11-23 融航「交易页有仓、组合页一条都没读到」）
 
 #: 下单之后多久没有柜台回报就判这笔委托没报进去（见 `_expire_optimistic`）
 OPTIMISTIC_TTL = 30.0
@@ -196,9 +199,12 @@ class BrokerApi:
         self._tick_at: dict[str, str] = {}       # 合约 → 上一次 tick 的时间串
         self._subbed: set[str] = set()
         self._warned: set[str] = set()
-        self._last_query = 0.0
-        self._turn = 1
+        # 查询额度不在这里管了：结算确认 / 历史补查 / 资金 / 持仓的统一轮转在
+        # `CtpHub.pump_queries()`（交易页和组合页共用同一份，见 `_refresh`）
         self._closed = False
+        #: 这条连接是从注册表**借**来的（交易页已经在用），还是自己造的。
+        #: 只影响启动时那行日志，关闭时一律走 `hubreg.release()` 判归属
+        self._shared = False
 
     # ---- 生命周期 ----
 
@@ -210,8 +216,20 @@ class BrokerApi:
                 raise ValueError(
                     f"行情源「{self.feed}」不是柜台，"
                     "这条连接只能跑 CTP / 融航")
-            self.hub = RohonHub([self.spec]) if self.feed == "rohon" else CtpHub([self.spec])
+            cls = RohonHub if self.feed == "rohon" else CtpHub
+            # 🔴 **借交易页已经连上的那条会话**（`ttrade/hubreg.py`）。一个账户在
+            # 柜台那边只能有一条会话：委托回报按会话推送、查询额度按会话算、
+            # 持仓也是两份快照。组合页自己再登一条，用户看到的就永远是「交易页
+            # 有仓、监控器说不一致」「对齐的委托在账户透视里查不到」。
+            # 拿到的可能是别人已经 start() 过的连接 —— `CtpHub.start()` 幂等，
+            # 这里直接调不会二次登录。
+            self.hub = hubreg.acquire(self.feed, [self.spec],
+                                      lambda: cls([self.spec]))
+            self._shared = hubreg.refs(self.hub) > 1
         self.hub.start()
+        if getattr(self, "_shared", False):
+            self._log(f"{BACKEND_LABELS.get(self.feed, self.feed)}：复用交易页"
+                      "已连的会话（一个账户只留一条连接，回报和持仓是同一份）")
         if getattr(self.hub, "last_error", ""):
             # 行情没连上也照样能交易（`CtpHub` 的行情是可选的），只是没有 K 线。
             # 说出来，别让用户对着不动的图猜
@@ -222,11 +240,16 @@ class BrokerApi:
     def close(self) -> None:
         self._closed = True
         hub, self.hub = self.hub, None
-        if hub is not None:
-            try:
+        if hub is None:
+            return
+        try:
+            # 🔴 交易页可能还握着同一条会话：只有最后一个使用者才真的关。
+            # 这里无脑关掉，交易页的账户表会突然全部变成「未登录」，而按钮
+            # 那句「已连接」还亮着 —— 2026-11-23 那次就是这么来的。
+            if hubreg.release(hub):
                 hub.close()
-            except Exception:  # noqa: BLE001
-                pass
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---- 行情 ----
 
@@ -383,6 +406,30 @@ class BrokerApi:
 
     # ---- 交易 ----
 
+    def ready_to_trade(self) -> tuple[bool, str]:
+        """现在能不能报单，不能就给一句人话原因。
+
+        引擎在每笔报单**之前**问一句（`PortfolioRunner._send()` 的闸门），而不是
+        直接发出去再吃异常：`insert_order` 抛出去会被 `tick()` 接住，接住就是
+        「这条策略出错停机」—— 跨交易日那几秒（柜台正在结算、结算确认还没回来）
+        会把所有策略一起停掉，用户只看到一排「出错停机」。
+
+        判据只有两条：登录了、结算确认过了。CTP / 融航都是一样的规矩：
+        没确认结算结果的账户，报单会被打回 `[39]`。
+        """
+        t = getattr(self.hub, "trader", None)
+        if t is None:
+            return False, "账户还没接上，先连账户"
+        ev = getattr(t, "logged_in", None)
+        if ev is None or not ev.is_set():
+            return False, "账户还没登录"
+        ev = getattr(t, "settled", None)
+        if ev is None or not ev.is_set():
+            # 跨交易日 / 断线重连之后会有这么几秒。**不用用户操作**，确认成功后
+            # 闸门自己就放行了，所以文案里别说「请重连」
+            return False, "结算结果还没确认（柜台确认后自动继续，不用手工操作）"
+        return True, ""
+
     def insert_order(self, **kw):
         direction = str(kw.get("direction") or "").upper()
         offset = str(kw.get("offset") or "").upper()
@@ -395,12 +442,14 @@ class BrokerApi:
             price = float(price)
         except (TypeError, ValueError):
             price = 0.0
-        if not price or price != price:
-            # 天勤用 NaN 表示市价，柜台只有限价单。静默换成 0 会被柜台拒成
-            # 「价格不合法」，用户看到的是「委托被拒」而不是「这个柜台不收市价」
-            raise ValueError(
-                f"{BACKEND_LABELS.get(self.feed, self.feed)}只收限价单，"
-                "拿不到对手价时不能下单（检查行情是否连上）")
+        # 拿不到价格（空 / 0 / NaN，天勤那边 NaN 就是市价）⇒ 发**市价单**。
+        # 🔴 以前这里抛「这个柜台只收限价单」：那时 CTP 确实不接受 AnyPrice。
+        # 2026-11-23 用户确认「所有交易所都支持市价单了，上期所和能源所也已在
+        # 2026 年 7 月 6 日开放」，所以改成交给 `hub.place()` 发市价。
+        # 引擎侧不会因此乱下单：`strategy_runner` 在 `_price_at()` 拿不到价时
+        # 直接「等盘口」，根本走不到这里。
+        if not (price > 0):        # 空 / 0 / NaN 都按市价发（价格字段填 0）
+            price = 0.0
         if volume <= 0:
             raise ValueError("手数必须大于 0")
         ex, code = _split(symbol)
@@ -628,15 +677,19 @@ class BrokerApi:
         hub = self.hub
         if hub is None or getattr(hub, "trader", None) is None:
             return
-        now = time.monotonic()
-        # 柜台限制「每秒最多一个查询请求」，资金和持仓错开一轮发（见 `CtpHub.wait`）
-        if force or now - self._last_query > ACCOUNT_SEC:
-            self._last_query = now
-            self._turn = 0
-            self._query("query_account")
-        elif self._turn == 0 and now - self._last_query > POSITION_SEC:
-            self._turn = 1
-            self._query("query_positions")
+        # 🔴 查询额度**只交给 `hub.pump_queries()` 一份**（2026-11-23 融航那次）。
+        #
+        # 这里原来自己写了一套节流：先 `confirm_settlement()`、再 `_query_hist()`
+        # （用 `_hist_at` 那个闸门）、再按 `_last_query` 发资金/持仓。问题是那三个
+        # 闸门互不相识 —— 同一毫秒里既发了「查历史委托」又发了「查持仓」，而柜台
+        # 限制每秒**一个**查询，后发的那笔被静默丢弃。交易页走 `hub.wait()`
+        # （一套轮转，正常），组合页走这里（两套轮转打架）：于是交易页的持仓表
+        # 好好的，组合页那条连接 `positions` 永远是空的，`mismatch()` 拿空表去比，
+        # 界面写「账户与策略理论持仓一致」—— 其实一条都没读到。
+        try:
+            hub.pump_queries(force=force)
+        except Exception:  # noqa: BLE001 - 查询失败不能拖累调仓
+            pass
         try:
             snap = hub.trader.snapshot()
         except Exception as exc:  # noqa: BLE001
@@ -645,12 +698,42 @@ class BrokerApi:
         self._fill_positions(snap.get("positions") or {})
         self._fill_orders(snap.get("orders") or {})
         self._expire_optimistic()
+        # 最近一轮持仓查询回了几行。诊断用：`loaded=True` 但 0 行只有两种解释
+        # ——「真没仓」和「柜台回了个空包」。写进 `[MM]` 才分得清（2026-11-23）
+        self._pos_rows = int(snap.get("pos_rows") or 0)
 
-    def _query(self, name: str) -> None:
-        try:
-            getattr(self.hub.trader, name)()
-        except Exception as exc:  # noqa: BLE001
-            self.last_error = f"{name} 失败：{exc}"
+    def pos_rows(self) -> int:
+        """最近一轮持仓查询的回包行数（`-1` = 这个后端不报）。"""
+        return int(getattr(self, "_pos_rows", -1))
+
+    def positions_ready(self) -> bool:
+        """柜台持仓**读到过一整轮**没有（空仓也算读到）。
+
+        🔴 为什么不能只看 `get_position()` 是不是空的（2026-11-23 融航）：
+        「账户真没仓」和「柜台一条持仓回调都没来」在 `_pos` 上长得一模一样 ——
+        都是空字典。前者可以报「一致」，后者只能说「还没读到」，拿它去算差额
+        更是会把整个理论仓位重新开一遍。
+
+        交易页那条连接、组合页这条连接都可能是**同一个账户的不同会话**，一条
+        读到了不代表另一条读到了，所以这个判据必须按连接算。
+        """
+        t = getattr(self.hub, "trader", None)
+        if t is None:
+            return False
+        if not bool(getattr(t, "positions_loaded", True)):
+            return False
+        # 柜台说「查完了」，可拿回来的是**空表**，而资金那边占用保证金大于 0：
+        # 有保证金必有持仓，这是一份自相矛盾的快照。宁可说「还不知道」，
+        # 也不能拿它去报「账户与策略理论持仓一致」。
+        # （2026-11-23 融航：交易页 6 个合约有仓，组合页这条连接 `_pos` 是空的）
+        if not self._pos:
+            try:
+                margin = float((getattr(t, "account", None) or {}).get("margin") or 0.0)
+            except Exception:  # noqa: BLE001
+                margin = 0.0
+            if margin > 0:
+                return False
+        return True
 
     def _fill_positions(self, src: dict) -> None:
         """柜台持仓 → 天勤字段名，**原地**写进 `self._pos`。

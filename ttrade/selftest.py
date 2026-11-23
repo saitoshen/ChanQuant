@@ -5679,6 +5679,790 @@ def _run() -> tuple[bool, list[str]]:
 
     check("账户没登录就不做一键对齐", _align_logged_in)
 
+    def _align_timeout_resync():
+        """对齐「发出去但没成交」那条路：超时窗口要够追单，撤单后账本要回摆。
+
+        2026-11-23 用户报「发了好几次一键对齐，但发出的委托单很少」，日志里是
+        这样：09:30、09:31、09:37、09:39 各点了一次，每次都发出 5~7 笔，然后
+        「对齐委托 30 秒未成交，已撤单」，而监控器上的差额**一次都没变**。
+        两个缺陷：
+
+        ① **超时窗口写死 30 秒，追单还没做完就整批撤掉**。追单是「等 wait_sec
+           没成交就撤掉重报，最多 retries 次」，默认 5×3 就要 20 秒，再加上
+           首轮、撤单确认的往返，30 秒根本不够 —— 用户把 wait_sec 调到 10 秒时
+           更是必然撕在半路。
+
+        ② 🔴 **`_sync_after_align` 是乐观的**：委托一发出去就把各策略的账本写成
+           `target`。可限价单会被撤掉，账户原地没动，账本却说「到位了」。之后
+           策略一翻信号就按假账本发「平仓 2 手」，柜台打回「平仓手数超过持仓量」
+           —— 截图里 T2612 / IC2612 的那两笔拒单就是这么来的。撤单之后必须把
+           账本按**账户实际**摆回来。
+
+        另外钉住两件观测上的事：每笔落盘日志都要带账户名（两个账户写同一个
+        live.log，不带就分不清谁是谁），以及某个合约没发出去时**逐个**记一笔
+        「没发出去 + 原因」—— 以前只在整轮一笔都没发时才 echo，于是「10 个合约
+        只动了 5 个」在日志里查不出另外 5 个为什么不动。
+        """
+        from ttrade import strategy_store as SStore
+        from ttrade.strategy_runner import (ALIGN_TIMEOUT, PortfolioRunner,
+                                            SlotState)
+
+        ChaseConfig = SStore.ChaseConfig
+
+        class P:
+            def __init__(self, lo, sh):
+                self.pos_long, self.pos_short = lo, sh
+                for side, v in (("long", lo), ("short", sh)):
+                    setattr(self, f"pos_{side}_his", v)
+                    setattr(self, f"pos_{side}_today", 0)
+                    setattr(self, f"volume_{side}_his", v)
+                    setattr(self, f"volume_{side}_today", 0)
+
+        class Spec:
+            def label(self):
+                return "自检户"
+
+        class Diag:
+            def __init__(self):
+                self.rows = []
+
+            def write(self, tag, msg):
+                self.rows.append(f"[{tag}] {msg}")
+
+        r = PortfolioRunner.__new__(PortfolioRunner)
+        r._log_fn = None
+        r._diag = Diag()
+        r.spec = Spec()
+        r._mm_cache, r._mm_ts = [], 0.0
+        r._align_ts = 0.0
+        r._align_touched = set()
+        r.api = object()
+        r._pos = {}
+        r._save_book = lambda st: None
+        r._align_slot = SlotState(cfg=SStore.StrategyConfig(
+            sid="__align__", name="一键对齐", period="1d"))
+
+        # ---- ① 超时窗口跟着追单参数走
+        r.chase = ChaseConfig()                      # wait 5 × 3 次
+        if abs(r._align_timeout() - ALIGN_TIMEOUT) > 1e-6:
+            raise RuntimeError(
+                f"默认追单下超时就该是 {ALIGN_TIMEOUT} 秒，"
+                f"实际 {r._align_timeout()}")
+        r.chase = ChaseConfig(wait_sec=10, retries=3)
+        if abs(r._align_timeout() - 50.0) > 1e-6:
+            raise RuntimeError(
+                f"wait_sec=10 × (3+2) 应该给 50 秒，实际 {r._align_timeout()}"
+                "（写死 30 秒会在追单做到一半时把整批撤掉）")
+        r.chase = ChaseConfig(enabled=False)
+        if abs(r._align_timeout() - ALIGN_TIMEOUT) > 1e-6:
+            raise RuntimeError("关掉追单时不该放大超时窗口")
+
+        # ---- ② 撤单后账本按账户实际回摆
+        st = SlotState(cfg=SStore.StrategyConfig(
+            sid="t", name="T", period="1h"))
+        st.running, st.underlying, st.target = True, "CFFEX.T2612", -2
+        # 乐观写法留下的假账本：账本 -2，账户其实平的
+        st.held = {"CFFEX.T2612": -2}
+        r._slots = {"t": st}
+        r._pos = {}
+        moved = r._resync_books()
+        if st.held:
+            raise RuntimeError(
+                f"撤单后账本还留着 {st.held}（账户是平的，之后会发"
+                "「平仓手数超过持仓量」被柜台打回）")
+        if not moved or "t CFFEX.T2612 -2" not in moved[0]:
+            raise RuntimeError(f"回摆清单没记下改了什么：{moved}")
+
+        # 账户还有 3 手空时，账本要摆成 -3（不是 0、也不是原来的 -2）
+        r._pos = {"CFFEX.T2612": P(0, 3)}
+        st.held = {"CFFEX.T2612": -2}
+        r._resync_books()
+        if st.held.get("CFFEX.T2612") != -3:
+            raise RuntimeError(f"账本没按账户实际（-3）摆：{st.held}")
+        # 反证：不回摆的话它就一直是 -2 —— 上面那条不是恒真断言
+        if int(r._net_pos("CFFEX.T2612")) == -2:
+            raise RuntimeError("账户净仓本身就是 -2，这条断言抓不到东西")
+        # `based` / `based_target` 不许被这次回摆改动：对齐没成功就不该
+        # 把当前目标当成新基准，否则「目标不变不发单」会把策略永久冻住
+        if getattr(st, "based", False) is not False:
+            raise RuntimeError("回摆账本时把 based 也改了 —— 策略会被永久冻住")
+
+        # ---- ③ 每个合约没发出去都要落一行原因
+        r._diag.rows.clear()
+        r._log_fn = lambda m: None
+        r._mm_ts = 0.0
+        r._align_ts = 0.0
+        r._align_slot.pending.clear()
+        r._align_slot.rejects, r._align_slot.reject_msg = 0, ""
+        r._align_slot.last_action = ""
+
+        def _no_send(_st, row):
+            _st.last_action = "等盘口（这个合约还没收到行情）"
+            return 0
+
+        r._send_row = _no_send
+        r.mismatch = lambda fresh=False: [{
+            "symbol": "CFFEX.T2612", "target": -2, "actual": 0, "delta": -2,
+            "managed": True, "t_long": 0, "t_short": 2,
+            "a_long": 0, "a_short": 0, "locked": False}]
+        if r.align(rows=[{"symbol": "CFFEX.T2612", "a_long": 0, "a_short": 0}]) != 0:
+            raise RuntimeError("一个没成交的合约却让 align() 报了下发")
+        joined = " ".join(r._diag.rows)
+        if "没发出去" not in joined or "等盘口" not in joined:
+            raise RuntimeError(f"没发出去的原因没落日志：{r._diag.rows}")
+        if "[自检户]" not in joined:
+            raise RuntimeError(
+                f"落盘日志没带账户名（两个账户写同一个 live.log 会分不清）："
+                f"{r._diag.rows[:2]}")
+
+        # ---- ④ 持仓引用要定期重挂，比对缓存要跟着失效
+        #
+        # 用户 2026-11-23 报「账户已经平仓和开仓对齐了，这边还是显示没有对齐」：
+        # 账户早就把 T2612 平了、交易页的持仓表里连这个合约都没有，监控器还写着
+        # 「账户 -2、平空2」。`_pos` 只在 `_connect_account()` 里取一次，靠的是
+        # 账户接口返回「活引用」，而活引用断了**不报错**。
+        from ttrade.strategy_runner import MM_LOG_SEC, POS_ANCHOR_SEC
+
+        class _Api:
+            def __init__(self):
+                self.pos = {"CFFEX.T2612": P(0, 2)}
+                self.ord = {}
+                self.n = 0
+
+            def get_position(self):
+                self.n += 1
+                return self.pos
+
+            def get_order(self):
+                return self.ord
+
+        r.api = _Api()
+        r._pos = {"CFFEX.T2612": P(0, 2)}
+        r._orders = {}
+        r._pos_ts = 0.0
+        r._mm_ts = time.time()          # 模拟「刚刚算过一次，还在缓存期内」
+        r._reanchor()
+        if r._pos is not r.api.pos:
+            raise RuntimeError(
+                "重挂之后 _pos 还是那个旧对象 —— 活引用断了就永远读一份冻住的数")
+        if r._mm_ts != 0.0:
+            raise RuntimeError(
+                "重挂之后没清比对缓存（MISMATCH_GAP=5 秒），界面会慢一拍才显示已对齐")
+        n0 = r.api.n
+        r._reanchor()
+        if r.api.n != n0:
+            raise RuntimeError(
+                f"POS_ANCHOR_SEC={POS_ANCHOR_SEC} 秒内重挂了两次（tick 是 0.8 秒一轮）")
+
+        # `_mm_note`：只有**一直**不一致才落一行，而且要带账户接口的原始读数
+        r._diag.rows.clear()
+        r._mm_since, r._mm_logged = {}, set()
+        row = {"symbol": "CFFEX.T2612", "target": 0, "actual": -2, "delta": 2,
+               "managed": True, "t_long": 0, "t_short": 0, "a_long": 0,
+               "a_short": 2, "locked": False}
+        r._mm_note([row])
+        if r._diag.rows:
+            raise RuntimeError("刚出现的不一致就写日志了，live.log 会被刷满")
+        r._mm_since["CFFEX.T2612"] = time.time() - MM_LOG_SEC - 1
+        r._mm_note([row])
+        if not r._diag.rows:
+            raise RuntimeError(
+                f"同一条不一致挂了 {MM_LOG_SEC:.0f} 秒以上，却没落 [MM] 诊断")
+        last = r._diag.rows[-1]
+        if "pos_long" not in last or "[自检户]" not in last:
+            raise RuntimeError(f"[MM] 没带账户接口的原始读数 / 账户名：{last}")
+        r._mm_note([])                  # 恢复一致
+        if r._mm_since or r._mm_logged:
+            raise RuntimeError("合约恢复一致后没清掉 [MM] 的记录，下次不会再写")
+
+        # 真跑一遍 `mismatch()`：账户平 + 目标 0 必须是「一致」，账户 -2 必须报
+        # （上面 ③ 把 `mismatch` 整个换成了替身，先撤掉）
+        r.__dict__.pop("mismatch", None)
+        r.__dict__.pop("_send_row", None)
+        r._mm_since, r._mm_logged = {}, set()
+        st2 = SlotState(cfg=SStore.StrategyConfig(sid="t2", name="T2", period="1h"))
+        st2.running, st2.underlying, st2.target = True, "CFFEX.T2612", 0
+        r._slots = {"t2": st2}
+        r._pos, r._mm_ts = {}, 0.0
+        if r.mismatch(fresh=True):
+            raise RuntimeError("账户是平的、目标也是 0，却报不一致")
+        r._pos = {"CFFEX.T2612": P(0, 2)}
+        r._mm_ts = 0.0
+        rows = r.mismatch(fresh=True)
+        if len(rows) != 1 or int(rows[0].get("a_short") or 0) != 2:
+            raise RuntimeError(f"账户空 2 手、目标 0 却没报出来：{rows}")
+        raw = r._pos_raw("CFFEX.T2612")
+        if "pos_short=2" not in raw:
+            raise RuntimeError(f"`_pos_raw` 没把账户接口的原始读数打全：{raw}")
+
+        # ---- ⑤ 柜台一条持仓都没回来：不许报「一致」，也不许对齐
+        #
+        # 用户 2026-11-23 报「融航的账户实际持仓有很多，策略理论持仓都为 0，
+        # 可一键对齐这边显示都是对齐的」。真因不是比对算错：组合页那条连接
+        # **一条持仓回调都没收到**，`_pos` 是空字典 —— 而 `mismatch()` 的合约
+        # 集合 = 理论持仓 ∪ `_pos` 里有的合约，两边都空 ⇒「一个不一致都没有」。
+        #
+        # 空字典有两种含义，早先被混成了一种：**账户真没仓** / **柜台没回**。
+        # 前者可以报「一致」，后者只能说「还没读到」，更不能拿它算差额
+        # （会以为账户是空的，把整个理论仓位重新开一遍）。
+        from ttrade.strategy_runner import POS_LOG_SEC
+
+        class _BlindApi:
+            """账户挂着，但持仓一次都没读回来（`positions_ready()` 为假）。"""
+
+            last_error = "查持仓失败：[17] 查询未就绪"
+
+            def positions_ready(self):
+                return False
+
+            def get_position(self):
+                return {}
+
+            def get_order(self):
+                return {}
+
+        class _OkApi(_BlindApi):
+            def positions_ready(self):
+                return True
+
+        r._diag.rows.clear()
+        r.api, r._pos = _BlindApi(), {}
+        if r._pos_live():
+            raise RuntimeError(
+                "柜台一条持仓都没回来，`_pos_live()` 却是真 —— 界面会报「一致」")
+        r.api = _OkApi()
+        if not r._pos_live():
+            raise RuntimeError("柜台说读到了、账户确实空仓，却仍被当成「没读到」")
+        r.api = object()                 # 天勤：没有 `positions_ready` 这一说
+        if not r._pos_live():
+            raise RuntimeError("天勤账户被当成了「持仓没读到」")
+        r.api, r._pos = _OkApi(), None   # 连持仓对象都没拿到（登录中）
+        if r._pos_live():
+            raise RuntimeError("`_pos is None` 时 `_pos_live()` 应该是假")
+
+        # 比对为空但**没读到**时，`align()` 必须拒
+        r.api, r._pos = _BlindApi(), {}
+        r._align_ts = 0.0
+        r._align_slot.pending.clear()
+        r._align_slot.last_action = ""
+        if r.align() != 0:
+            raise RuntimeError("持仓一条都没读到，却让 align() 发出去了")
+        if "读回来" not in " ".join(r._diag.rows):
+            raise RuntimeError(f"拒绝对齐时没说清原因：{r._diag.rows}")
+
+        # `[POS]` 诊断：等够 POS_LOG_SEC 才写一次，且把柜台的原始情况带上
+        r._diag.rows.clear()
+        r._pos_blind_at, r._pos_warned = 0.0, 0.0
+        r._pos_note()
+        if r._diag.rows:
+            raise RuntimeError("刚连上就写 [POS]，live.log 会被刷满")
+        r._pos_blind_at = time.time() - POS_LOG_SEC - 1
+        r._pos_note()
+        last = (r._diag.rows or [""])[-1]
+        for need in ("[POS]", "positions_loaded", "查询未就绪", "[自检户]"):
+            if need not in last:
+                raise RuntimeError(f"[POS] 诊断缺 {need}：{last}")
+        r._pos_note()                    # 刚抱怨过，不许连着写
+        if len(r._diag.rows) != 1:
+            raise RuntimeError("同一个「没读到」连着写了两行 [POS]")
+        r.api = _OkApi()                 # 读回来了：计时清掉，下次真断了才算新的一段
+        r._pos_note()
+        if r._pos_blind_at or r._pos_warned:
+            raise RuntimeError("持仓读回来之后没清 [POS] 的计时")
+
+        # ---- ⑥ 界面「刷新」：重挂持仓引用 + 清掉比对缓存（2026-11-23 用户要求）
+        #
+        # 比对缓存 5 秒、持仓引用 2 秒才重挂一次。成交之后想马上确认「齐没齐」，
+        # 等这两个节拍太难受，所以监控器上加了刷新按钮。它必须**绕过两重节流**，
+        # 否则连点两下第二下什么都不做，用户会以为按钮坏了。
+        r.api = _Api()
+        r.api.pos = {"CFFEX.T2612": P(0, 2)}
+        r._pos = {}
+        r._pos_ts = time.time()          # 刚重挂过：`_reanchor()` 自己会跳过
+        r._mm_ts = time.time()           # 缓存也在有效期内
+        r._mm_cache = [{"symbol": "OLD"}]   # 缓存里是上一轮的旧结论
+        r._slots = {"t2": st2}
+        st2.target, st2.running = 0, True
+        rows = r.refresh_now()
+        if r._pos is not r.api.pos:
+            raise RuntimeError("刷新没有重挂持仓引用（`_pos_ts` 没清零），"
+                               "账户的活引用断了就永远刷不出新数")
+        # 缓存被**重新算过**了：里面不再是那条 OLD。只清时间戳不清内容的话，
+        # 下一次 `mismatch()` 仍会把旧结论端出来
+        if not r._mm_cache or r._mm_cache[0].get("symbol") != "CFFEX.T2612":
+            raise RuntimeError(f"刷新之后缓存还是旧的：{r._mm_cache}")
+        if len(rows) != 1 or int(rows[0].get("a_short") or 0) != 2:
+            raise RuntimeError(f"刷新返回的不是当下的不一致：{rows}")
+
+        return ("超时窗口跟追单参数走（默认 30 秒 / wait 10 秒→50 秒 / 关掉追单不放大）；"
+                "撤单后账本按账户实际回摆（平→0、有 3 手空→-3），based 不动；"
+                "每个没发出去的合约都落一行原因，且日志带账户名；"
+                "持仓引用每 2 秒重挂并清掉比对缓存，长期不一致落 [MM] 原始读数；"
+                "柜台一条持仓都没读到时不报「一致」、不放开对齐，并落 [POS] 诊断；"
+                "「刷新」能绕过两重节流立刻重读持仓并重算差额")
+
+    check("一键对齐：超时窗口 / 撤单后账本回摆 / 没发出去要说原因",
+          _align_timeout_resync)
+
+    def _mon_blind():
+        """监控器：持仓没从柜台读回来时，「账户实际 / 差额」必须是「—」不是 0。
+
+        2026-11-23 融航实测：账户里明明有 `CZCE.SA701` 空 1 手，监控器那一行写
+        「账户实际 0 / 差额 -1」。真因是柜台**一条持仓回包都没给**
+        （`pump_queries()` 第一句在融航上抛 `AttributeError` 被吞），`_pos` 是空
+        字典 —— 但界面把「空字典」读成了「账户没仓」。
+
+        所以两件事必须分开判：
+
+        - `account_ready`：账户接口挂上了（界面同时拿它判「在不在线」）
+        - `pos_synced`：持仓**真读回来过一整轮**（`positions_loaded`，空仓空包
+          也算读完、柜台拒答不算）
+
+        没 `pos_synced` 的时候写 0 就是在撒谎：必须是「—」，差额也不能标红 ——
+        红字的意思是「这一行真的差这么多」，读不到时没有这个结论。
+        """
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])      # noqa: F841
+        import gui.portfolio_page as PP
+
+        page = PP.PortfolioPage()
+        try:
+            page._watch = set()          # 空名单 = 全部监控
+            page._items = []
+            page._rows = []
+            page._slot_multi = {}
+            page._slot_view = {}
+            page._snaps = {
+                # 读回来的账户：照常写数，不能被上面那条规则连坐
+                "快期模拟": {
+                    "account_ready": True, "pos_synced": True,
+                    "mismatch": [{"symbol": "SHFE.pb2701", "target": 9,
+                                  "actual": 9, "delta": 0, "managed": True,
+                                  "a_long": 0, "a_short": 0}],
+                },
+                # 没读回来的：`actual` 是「空字典里查不到」的 0，不是真 0
+                "融航zxqhmn01": {
+                    "account_ready": True, "pos_synced": False,
+                    "mismatch": [{"symbol": "CZCE.SA701", "target": -1,
+                                  "actual": 0, "delta": -1, "managed": True,
+                                  "a_long": 0, "a_short": 1}],
+                },
+            }
+            page._mon_sig = None
+            page._render()
+            m = page.tbl_mon
+            idx = {m.item(r, 0).text(): r for r in range(m.rowCount())}
+            if set(idx) != {"快期模拟", "融航zxqhmn01"}:
+                raise RuntimeError(f"监控器该有两行：{list(idx)}")
+
+            # ① 读回来的那一行：数字照旧
+            i = idx["快期模拟"]
+            if (m.item(i, 3).text(), m.item(i, 4).text()) != ("9", "0"):
+                raise RuntimeError(
+                    f"读回来的账户数字被连坐了：{m.item(i, 3).text()} / "
+                    f"{m.item(i, 4).text()}")
+
+            # ② 没读回来的那一行：账户实际 / 差额都是「—」，且说明里写清不是 0
+            i = idx["融航zxqhmn01"]
+            got = (m.item(i, 2).text(), m.item(i, 3).text(), m.item(i, 4).text())
+            if got != ("-1", "—", "—"):
+                raise RuntimeError(
+                    f"持仓没读回来时不能画 0：理论/实际/差额 = {got}"
+                    "（应 -1 / — / —）")
+            note = m.item(i, 5).text()
+            for need in ("不是 0", "还不知道"):
+                if need not in note:
+                    raise RuntimeError(f"说明里要写清「{need}」：{note}")
+            if m.item(i, 4).foreground().color().name() != PP.C_MUTED.lower():
+                raise RuntimeError(
+                    "差额是「—」的时候不能标红 —— 红字等于断言「真差了这么多」")
+
+            # ③ 读回来之后必须**当场重绘**。「账户实际」的画法是 `pos_synced`
+            # 决定的，它不进 `_mon_sig` 的话表格内容没变就不重建，用户得等下一次
+            # 别的字段变化才看得到数 —— 表现就是「刷新了还是 0」
+            page._snaps["融航zxqhmn01"]["pos_synced"] = True
+            page._render()
+            m = page.tbl_mon
+            i = {m.item(r, 0).text(): r for r in range(m.rowCount())}["融航zxqhmn01"]
+            got = (m.item(i, 3).text(), m.item(i, 4).text())
+            if got != ("0", "平空1"):
+                raise RuntimeError(
+                    f"持仓读回来之后没重绘（`pos_synced` 没进 `_mon_sig`？）：{got}")
+            if m.item(i, 4).foreground().color().name() == PP.C_MUTED.lower():
+                raise RuntimeError("读回来之后差额不该还是灰的")
+
+            # ④ 一条不一致都列不出来、又确实没读到 ⇒ 整条拦住说「还不知道」，
+            # 绝不能落到下面那句「账户仓位与策略理论持仓一致」
+            page.ctl._workers = {"融航zxqhmn01": object()}     # 假装在跑
+            page._snaps = {"融航zxqhmn01": {"account_ready": True,
+                                            "pos_synced": False,
+                                            "mismatch": []}}
+            page._mon_sig = None
+            page._render()
+            txt = page.lbl_mon.text()
+            if "一致" in txt.split("（")[0] or "不作数" not in txt:
+                raise RuntimeError(f"没读到持仓时说了「一致」：{txt}")
+            if "融航zxqhmn01" not in txt:
+                raise RuntimeError(f"要指名是哪个账户没读到：{txt}")
+        finally:
+            page.deleteLater()
+
+        return ("持仓没从柜台读回来（`pos_synced` 假）时「账户实际 / 差额」写「—」"
+                "并在说明里写「不是 0，是还不知道」、差额不标红；读回来的账户不受"
+                "影响；`pos_synced` 进比对签名，读回来当场重绘成 0 / 平空1；"
+                "一条都列不出来又没读到时不报「一致」而是「不作数」并指名账户")
+
+    check("监控器：持仓没读回来时不许画 0", _mon_blind)
+
+    def _order_ack():
+        """报单发出去之后「柜台到底有没有这笔单」必须能看出来。
+
+        2026-11-23 融航：一键对齐前后一共发了四笔 `CFFEX.TL2612`（13:00 的策略单、
+        13:05 / 13:06 / 13:08 的对齐单），日志每笔都是「剩2 ALIVE」挂满 30 秒被撤，
+        而交易页委托框里一笔都没有 —— 用户只能问「到底发出去没有」。
+
+        三个判据，缺一个就回到「说不清」：
+
+        1. `ReqOrderInsert` / `ReqOrderAction` 返回非 0 ⇒ **请求没进发送队列**，
+           必须抛出来。以前四条路径（CTP 报单 / CTP 撤单 / 融航报单 / 融航撤单）
+           谁都不看返回值；
+        2. 委托行还是「乐观」的（柜台从没回过包去覆盖它）时，日志**不许写
+           ALIVE** —— 那个词是「挂着等成交」，和「柜台没这笔单」是两件事；
+        3. 8 秒还没回就要主动落一行，不能等 30 秒撤单时才发现
+           （`ORD_ACK_SEC` 必须小于 `ALIGN_TIMEOUT`，否则两句判词撞车，
+           30 秒那边先说话，真相永远看不到）。
+        """
+        import inspect
+        import time as _t
+        import types
+
+        from ttrade import ctp_client as C
+        from ttrade import rohon_client as R
+        from ttrade import strategy_runner as S
+
+        # ---- ① 四个发送口都必须看返回值
+        for fn, label, key in (
+            (C.TraderClient.place, "CTP 报单", "ReqOrderInsert"),
+            (C.TraderClient.cancel, "CTP 撤单", "ReqOrderAction"),
+            (R.RohonTraderClient.place, "融航报单", "reqOrderInsert"),
+            (R.RohonTraderClient.cancel, "融航撤单", "reqOrderAction"),
+        ):
+            src = inspect.getsource(fn)
+            # 注释行要剔掉：这些函数里都写着「为什么必须看返回值」，注释里
+            # 就带着 `ReqOrderInsert` 几个字，直接搜会搜到那句注释
+            lines = [ln.strip() for ln in src.splitlines()
+                     if not ln.strip().startswith("#")]
+            hits = [i for i, ln in enumerate(lines) if key in ln]
+            if not hits:
+                raise RuntimeError(f"{label} 里找不到 {key}")
+            window = " ".join(lines[hits[0]:hits[0] + 4])
+            if "raise" not in window and "last_error" not in window:
+                raise RuntimeError(
+                    f"{label} 发完 {key} 不看返回值 —— 没发出去会被当成发出去了")
+        if "超限" not in C._req_why(-3) or "网络" not in C._req_why(-1):
+            raise RuntimeError(f"`_req_why` 没翻出来：{C._req_why(-3)}")
+
+        # ---- ②/③ 在途委托：乐观行不许写 ALIVE，超时要主动说
+        if not (S.ORD_ACK_SEC < S.ALIGN_TIMEOUT):
+            raise RuntimeError(
+                f"ORD_ACK_SEC({S.ORD_ACK_SEC}) 必须小于 ALIGN_TIMEOUT"
+                f"({S.ALIGN_TIMEOUT})，否则「柜台没回报」还没说出来就先撤单了")
+
+        r = S.PortfolioRunner.__new__(S.PortfolioRunner)
+        logs: list[str] = []
+        r._log = lambda m: logs.append(str(m))
+        r._diagw = lambda tag, m: logs.append(f"[{tag}] {m}")
+        r._align_log = lambda m: logs.append(f"[ALIGN] {m}")
+        r._ack_warned = set()
+        r._align_slot = object()
+
+        o = S.PendingOrder(order_id="12", symbol="CFFEX.TL2612", direction="SELL",
+                           offset="OPEN", volume=2, price=118.05, ts=_t.time())
+        r._orders = {"12": types.SimpleNamespace(
+            status="ALIVE", volume_left=2, optimistic=True, ts=_t.time())}
+        st = types.SimpleNamespace(pending=[o], title=lambda: "测试")
+
+        detail = r._pending_detail(st)
+        if "ALIVE" in detail[0]:
+            raise RuntimeError(f"柜台没回过的委托被写成 ALIVE 了：{detail}")
+        if "没回" not in detail[0]:
+            raise RuntimeError(f"在途明细要写明「柜台没回」：{detail}")
+
+        r._ack_note(st, o)                      # 刚发出去，还不该说话
+        if logs:
+            raise RuntimeError(f"{S.ORD_ACK_SEC:.0f} 秒内就报警了：{logs}")
+        # 一句进界面日志、一句进 live.log（`_log` + `_diagw`），所以数的是
+        # 「同一笔委托被提了几次」，不是列表长度
+        r._orders["12"].ts = _t.time() - S.ORD_ACK_SEC - 1.0
+        r._ack_note(st, o)
+        said = [m for m in logs if "柜台一条委托回报都没有" in m]
+        if len(said) != 2:
+            raise RuntimeError(f"超时没落日志（或落得不对）：{logs}")
+        r._ack_note(st, o)                      # 同一笔只报一次
+        said = [m for m in logs if "柜台一条委托回报都没有" in m]
+        if len(said) != 2:
+            raise RuntimeError(f"同一笔委托报了两遍：{logs}")
+
+        # 柜台真回了包（`optimistic` 被 `_fill_orders` 覆盖成 False）就不该再提
+        r._orders["12"] = types.SimpleNamespace(
+            status="ALIVE", volume_left=2, optimistic=False, ts=0.0)
+        r._ack_warned.clear()
+        logs.clear()
+        r._ack_note(st, o)
+        if logs:
+            raise RuntimeError(f"柜台已经回了包还在喊「没回报」：{logs}")
+        if "ALIVE" not in r._pending_detail(st)[0]:
+            raise RuntimeError("有柜台回报的委托应当正常显示状态")
+
+        return ("四个发送口（CTP/融航 的报单与撤单）都检查 `Req*` 返回值并翻成人话；"
+                "柜台没回过的委托写「柜台 N 秒没回委托」而不是 ALIVE；"
+                f"超过 {S.ORD_ACK_SEC:.0f} 秒主动落一行且每单只落一次；"
+                "柜台回过包之后不再误报")
+
+    check("报单回报：柜台没回这笔单时必须说出来", _order_ack)
+
+    def _refresh_relogin():
+        """「刷新」在账户没接上时必须真的去接一次；用户手动登出的不许偷偷接回。
+
+        2026-11-23：用户在交易页把融航登出再登录，交易页显示已登录、持仓表也有
+        数据，组合页监控器却一直写「账户未登录」，连点刷新都没用。
+
+        真因是「没有账户」被混成了一种：
+
+          - 用户自己点「登录 / 登出账户」登出 ⇒ 要尊重，不能偷偷登回；
+          - 这条 runner 压根没接上（启动时接入失败 / 账户在交易页重新登录过）
+            ⇒ `refresh()` 只是把空引用再挂一遍，**什么都没变**，按钮看着像坏的。
+
+        所以：`user_detached` 分开这两种，刷新只对后者真的调 `attach()`。
+        另外接 / 脱账户必须落一行 `[ACC]` 到 live.log —— `_log()` 只进界面那块
+        文本框，关窗就没了，那天 live.log 里一条接/脱记录都没有，只能猜。
+        """
+        import types
+
+        from ttrade import strategy_runner as S
+
+        # ---- ① runner 侧：两个标记 + 落盘
+        logs: list[tuple] = []
+        r = S.PortfolioRunner.__new__(S.PortfolioRunner)
+        r.api, r._pos, r._orders = object(), {}, {}
+        r._slots = {}
+        r._align_slot = types.SimpleNamespace(pending=[])
+        r._detached_by_user = False
+        r._log = lambda m: None
+        r._diagw = lambda tag, m: logs.append((tag, m))
+        r.detach_account()
+        if not r._detached_by_user:
+            raise RuntimeError("手动登出没打上 `user_detached` —— 刷新会把它偷偷登回去")
+        if r.api is not None or r._pos is not None:
+            raise RuntimeError("登出之后 api / _pos 没清干净")
+        if not any(t == "ACC" and "登出" in m for t, m in logs):
+            raise RuntimeError(f"接/脱账户没落盘（live.log 里看不到）：{logs}")
+
+        # ---- ② 界面侧：只有「没接上」才真的 attach
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])      # noqa: F841
+        import gui.portfolio_page as PP
+
+        class _Ctl:
+            def __init__(self):
+                self.calls: list[tuple[str, str]] = []
+
+            @property
+            def running(self) -> bool:
+                return True
+
+            def keys(self):
+                return ["融航zxqhmn01"]
+
+            def attach(self, k, sp):
+                self.calls.append(("attach", k))
+                return True
+
+            def refresh(self, k):
+                self.calls.append(("refresh", k))
+                return True
+
+        page = PP.PortfolioPage()
+        try:
+            page.ctl = _Ctl()
+            page._watch = set()
+            page._spec = lambda k: object()        # 磁盘上还有这个账户
+            page._items, page._rows = [], []
+            page._snaps = {"融航zxqhmn01": {"account_ready": False,
+                                            "user_detached": False,
+                                            "mismatch": []}}
+            page._refresh_monitor()
+            if not page.ctl.calls or page.ctl.calls[0][0] != "attach":
+                raise RuntimeError(
+                    f"没接上的账户，刷新应该真去接一次：{page.ctl.calls}")
+
+            page.ctl.calls.clear()
+            page._snaps["融航zxqhmn01"]["user_detached"] = True
+            page._refresh_monitor()
+            if any(c[0] == "attach" for c in page.ctl.calls):
+                raise RuntimeError(
+                    f"用户手动登出的账户被「刷新」偷偷登回去了：{page.ctl.calls}")
+
+            # 接上了就只重读，不再 attach
+            page.ctl.calls.clear()
+            page._snaps["融航zxqhmn01"].update(account_ready=True,
+                                               user_detached=False)
+            page._refresh_monitor()
+            if page.ctl.calls != [("refresh", "融航zxqhmn01")]:
+                raise RuntimeError(f"已经接上的账户不该再 attach：{page.ctl.calls}")
+        finally:
+            page.deleteLater()
+
+        return ("接/脱账户落 `[ACC]` 到 live.log；手动登出打 `user_detached`，"
+                "「刷新」不会把它偷偷登回去；没接上的账户点「刷新」会真的 attach，"
+                "已经接上的只重读持仓不重连")
+
+    check("刷新：账户没接上时要真的去接一次", _refresh_relogin)
+
+    def _pos_round():
+        """融航持仓查询：**按 RequestID 归轮 + 开轮清一次**，不许被空包刷成空表。
+
+        2026-11-23 下午的真事：交易页持仓表有 7 个合约（IM2612 多1、TL2612 空2、
+        SA701 空2、sn2612 空2…），组合页监控器却写「账户实际 0」，于是以为
+        对齐没生效、反复发单。真因是融航那条连接的 `positions` 被刷成了空表，
+        而且 `positions_loaded=True` —— 连「还没读到」都不说。
+
+        两个成因：
+          - 早先是「攒 buf、`last` 时整份替换」，`outer._pos_buf or {}` 在 buf
+            已经被清空时会提交一个**空 dict**：柜台多发一个空终止包就整表清零；
+          - 没认 RequestID：上一轮迟到的 `last` 会把新一轮刚攒的当成自己的快照。
+
+        现在和 `ctp_client` 一套：`query_positions()` 记 reqid + 放下「开轮清表」
+        闸门，回包只认这个 reqid，第一条负责清、之后原地累加。
+
+        另外钉住上期所那条：同一方向会推今仓 / 昨仓**两行**，六个数必须 `+=`，
+        赋值会把前一行盖掉（持仓手数少一半）。
+        """
+        import ast
+        import inspect
+        import textwrap
+        import threading
+        import types
+
+        from ttrade import rohon_client as R
+
+        # 从 `_make_td` 的源码里把回包函数抽出来（本机没装 vnpy_rohon，
+        # 造不出真的 `_TdApi`，但函数体本身和厂商库无关）
+        tree = ast.parse(textwrap.dedent(inspect.getsource(R._make_td)))
+        node = None
+        for n in ast.walk(tree):
+            if isinstance(n, ast.FunctionDef) and n.name == "onRspQryInvestorPosition":
+                node = n
+                break
+        if node is None:
+            raise RuntimeError("`_make_td` 里找不到 onRspQryInvestorPosition")
+
+        class _Outer:
+            pass
+
+        outer = _Outer()
+        outer._lock = threading.Lock()
+        outer.positions = {}
+        outer._pos_req = 0
+        outer._pos_started = True
+        outer._pos_rows = 0
+        outer.positions_loaded = False
+        outer.last_error = ""
+        outer._req = 0
+        outer._next_req = lambda: setattr(outer, "_req", outer._req + 1) or outer._req
+        outer.cfg = types.SimpleNamespace(broker_id="9999", user_id="tester")
+        outer._qry_note = lambda what, n: None
+
+        sent: list[int] = []
+
+        class _Api:
+            def reqQryInvestorPosition(self, req, rid):
+                sent.append(rid)
+                return 0
+
+        outer.api = _Api()
+        start_round = R.RohonTraderClient.query_positions
+
+        ns = dict(vars(R))
+        ns["outer"] = outer
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[node],
+                                                          type_ignores=[])),
+                     "rohon_client.py", "exec"), ns)
+        _raw = ns["onRspQryInvestorPosition"]
+        # 它原本是 `_Td` 上的方法（源码在 `class _Td` 里），抽出来之后第一个
+        # 参数还是 `self` —— 这里直接绑个假 self
+        cb = lambda data, error, reqid, last: _raw(None, data, error, reqid, last)  # noqa: E731
+
+        def row(ins, side, n, yd=0, last=False, rid=None, cost=0.0):
+            cb({"InstrumentID": ins, "PosiDirection": side, "Position": n,
+                "YdPosition": yd, "TodayPosition": n - yd, "OpenCost": cost,
+                "PositionProfit": 0.0, "UseMargin": 0.0},
+               None, rid if rid is not None else outer._pos_req, last)
+
+        # ---- ① 一轮正常：两个合约，多空各一行
+        start_round(outer)
+        rid1 = outer._pos_req
+        if sent != [rid1] or outer._pos_started:
+            raise RuntimeError(f"开轮没记 reqid / 没放下清表闸门：{sent} {outer._pos_started}")
+        row("IM2612", "2", 1, last=False)
+        row("TL2612", "3", 2, last=True)
+        if not outer.positions_loaded:
+            raise RuntimeError("`bIsLast` 到了却没记「读完了」")
+        if (outer.positions["IM2612"]["long"], outer.positions["TL2612"]["short"]) != (1, 2):
+            raise RuntimeError(f"一轮持仓没累加对：{outer.positions}")
+        if outer._pos_rows != 2:
+            raise RuntimeError(f"回包行数记错了：{outer._pos_rows}")
+
+        # ---- ② 多余的 `last` 空终止包：**不许**把表刷成空
+        cb(None, None, rid1, True)
+        if not outer.positions:
+            raise RuntimeError("多一个空 `last` 包就把持仓整表清空了（旧写法就是这个）")
+        if not outer.positions_loaded:
+            raise RuntimeError("空包之后「读完了」被清掉了")
+
+        # ---- ③ 上一轮迟到的回包：不许污染新一轮
+        start_round(outer)
+        row("SA701", "3", 3, last=False)          # 新一轮第一条：先把旧表清掉
+        if set(outer.positions) != {"SA701"}:
+            raise RuntimeError(f"新一轮开轮没清掉上一轮的合约：{list(outer.positions)}")
+        row("TL2612", "3", 2, last=True, rid=rid1)      # 上一轮的尾巴
+        if set(outer.positions) != {"SA701"} or outer.positions["SA701"]["short"] != 3:
+            raise RuntimeError(f"迟到的旧回包污染了新一轮：{outer.positions}")
+
+        # ---- ④ 真没仓：一条空包 + last ⇒ 空表且「读完了」
+        start_round(outer)
+        cb(None, None, outer._pos_req, True)
+        if outer.positions or not outer.positions_loaded:
+            raise RuntimeError(f"空仓这一轮判错了：{outer.positions} / "
+                               f"loaded={outer.positions_loaded}")
+
+        # ---- ⑤ 上期所：同一方向推今仓 + 昨仓两行，必须相加
+        start_round(outer)
+        row("sn2612", "2", 1, yd=0, last=False)        # 今仓 1
+        row("sn2612", "2", 2, yd=2, last=True)         # 昨仓 2
+        got = outer.positions["sn2612"]
+        if (got["long"], got["long_today"], got["long_yd"]) != (3, 1, 2):
+            raise RuntimeError(f"上期所今昨两行没累加（赋值会把前一行盖掉）：{got}")
+
+        # ---- ⑥ 柜台报错：不许当成「查完了」
+        start_round(outer)
+        before = outer.positions_loaded
+        outer.positions_loaded = False
+        cb(None, {"ErrorID": 3, "ErrorMsg": "每秒查询超限"}, outer._pos_req, True)
+        if outer.positions_loaded:
+            raise RuntimeError("查持仓报错却记成「读完了」")
+        if "每秒查询超限" not in outer.last_error:
+            raise RuntimeError(f"查持仓失败的原因没记下来：{outer.last_error!r}")
+        outer.positions_loaded = before
+
+        return ("持仓按 RequestID 归轮（迟到的旧回包不污染新一轮）；开轮清一次、"
+                "之后原地累加；多余的空 `last` 包不会把表刷成空；真没仓时记「读完了」；"
+                "上期所今昨两行累加（1+2=3）；柜台报错不冒充「查完了」")
+
+    check("融航持仓：按 RequestID 归轮，空包不许刷表", _pos_round)
+
     def _load_no_trade():
         """加载策略时**不许**按台账自动交易（2026-11-17 用户要求）。
 
@@ -7139,7 +7923,230 @@ def _run() -> tuple[bool, list[str]]:
             pass
         if not C.HAS_CTP:
             return f"openctp-ctp 未安装（CTP 不可用，其余功能不受影响）：{C.CTP_IMPORT_ERROR[:60]}"
-        return f"openctp-ctp 已装，{len(cases)} 个合约的交易所解析正确"
+
+        # ---- 历史委托 / 成交补查（2026-11-23 融航「今空有仓、委托框空」）
+        #
+        # 柜台只在登录**之后**推 OnRtnOrder / OnRtnTrade。持仓靠
+        # `query_positions` 补齐了，委托和成交不补就是两张空表。这里钉住三件事：
+        # 发的是哪两个请求、回调落进哪张表、查完（含「空表」和「柜台拒绝」）
+        # 有没有记对「查完了」。
+        sent = []
+
+        class _FakeTd:
+            def ReqQryOrder(self, req, rid):
+                sent.append(("order", req.BrokerID, req.InvestorID))
+
+            def ReqQryTrade(self, req, rid):
+                sent.append(("trade", req.BrokerID, req.InvestorID))
+
+        import threading as _thq
+
+        q = C.TraderClient.__new__(C.TraderClient)
+        q.api, q._req, q.cfg = _FakeTd(), 0, cfg
+        q._req_lock = _thq.Lock()          # `__new__` 跳过了 __init__
+        q.query_orders()
+        q.query_trades()
+        want = [("order", cfg.broker_id, cfg.user_id),
+                ("trade", cfg.broker_id, cfg.user_id)]
+        assert sent == want, f"历史查询没带经纪商/投资者账号：{sent}"
+
+        import types as _types
+
+        h = C.TraderClient(cfg)
+        spi = h._make_spi()
+        one = _types.SimpleNamespace(
+            OrderRef="12", OrderSysID="12345", InstrumentID="T2612",
+            Direction="1", CombOffsetFlag="0", LimitPrice=110.03,
+            VolumeTotalOriginal=2, VolumeTraded=2, OrderStatus="0",
+            StatusMsg="", InsertTime="09:57:48", TradingDay="20261123")
+        spi.OnRspQryOrder(one, None, 1, True)
+        assert h.orders_loaded, "历史委托查完（bIsLast）没记「查完了」"
+        row = h.orders.get("12345") or {}
+        for key, val in (("instrument", "T2612"), ("direction", "1"),
+                         ("offset", "0"), ("status", "全部成交"),
+                         ("volume", 2), ("traded", 2),
+                         ("insert_time", "09:57:48"), ("trading_day", "20261123")):
+            assert row.get(key) == val, \
+                f"历史委托的 {key} 映射错了：{row.get(key)!r}（应为 {val!r}）"
+        # 本地单号也要能查到：`_chase` / 撤单都是按 OrderRef 找单的
+        assert h.orders.get("12"), "历史委托没按 OrderRef 再存一份，撤单会找不到"
+
+        tr = _types.SimpleNamespace(
+            TradeID="T1", OrderRef="12", InstrumentID="T2612",
+            Direction="1", OffsetFlag="0", Price=110.02, Volume=2,
+            TradeTime="09:57:48")
+        spi.OnRspQryTrade(tr, None, 2, True)
+        assert h.trades_loaded, "历史成交查完（bIsLast）没记「查完了」"
+        trow = h.trades.get("T1") or {}
+        assert trow.get("price") == 110.02 and trow.get("volume") == 2, \
+            f"历史成交的价格/手数映射错了：{trow}"
+
+        # ---- 持仓查询：「查完了」和「一条都没有」必须分得开（2026-11-23 融航）
+        #
+        # 组合页靠 `positions_loaded` 判断「比对结果作不作数」。没有它的时候，
+        # `positions` 为空分不清「账户真没仓」和「柜台一条回调都没来」，
+        # 后者会拿空表去报「账户与策略理论持仓一致」—— 那正是用户看到的假象。
+        p = C.TraderClient(cfg)
+        assert not p.positions_loaded, "刚建的客户端就自称持仓读完了"
+        p._make_spi().OnRspQryInvestorPosition(None, None, 1, True)
+        assert p.positions_loaded, (
+            "空仓（柜台只回一条空包 + bIsLast）没记成「查完了」——"
+            "界面会永远停在「还没读到」，真有仓了也不敢说一致")
+        assert p.snapshot().get("positions_loaded") is True, \
+            "`snapshot()` 没把「持仓查完了」透给上层，组合页只能靠空表猜"
+
+        # 只来了一条（`bIsLast=False`）不算读完：半份快照拿去算差额会补错量
+        half = C.TraderClient(cfg)
+        hspi = half._make_spi()
+        hspi.OnRspQryInvestorPosition(_types.SimpleNamespace(
+            InstrumentID="T2612", PosiDirection="3", Position=2, YdPosition=0,
+            TodayPosition=2, OpenCost=220.0, PositionProfit=0.0,
+            UseMargin=0.0, TradingDay="20261123"), None, 1, False)
+        assert not half.positions_loaded, "只来了一条（bIsLast=False）就算读完了"
+        hspi.OnRspQryInvestorPosition(None, None, 1, True)
+        assert half.positions_loaded, "整轮收尾了还没记成「查完了」"
+        assert int(half.positions["T2612"]["short"]) == 2, \
+            f"收尾那一拍把已经攒到的持仓弄丢了：{half.positions}"
+
+        # 柜台拒绝（中台不放行查询）：不能当读到了，原因要留下
+        deny = C.TraderClient(cfg)
+        deny._make_spi().OnRspQryInvestorPosition(
+            None, _types.SimpleNamespace(ErrorID=17, ErrorMsg="查询未就绪"), 2, True)
+        assert not deny.positions_loaded, \
+            "柜台拒了却当成「持仓读到了」—— 界面会拿空表报「一致」"
+        assert "持仓" in (deny.last_error or ""), \
+            f"查持仓被拒时没留下原因：{deny.last_error!r}"
+
+        # 当天一笔都没有：柜台回一条空包 + bIsLast=True，也必须算「查完了」，
+        # 否则每 1 秒重查一次，直到 HIST_TRIES 用光都在打空枪
+        e = C.TraderClient(cfg)
+        espi = e._make_spi()
+        espi.OnRspQryOrder(None, None, 3, True)
+        espi.OnRspQryTrade(None, None, 4, True)
+        assert e.orders_loaded and e.trades_loaded, \
+            "空表（无当日委托/成交）没记成「查完了」，会一直重查"
+
+        # 柜台拒绝（有的中台不放行 ReqQryOrder）：不能当查完，原因要留下
+        bad = C.TraderClient(cfg)
+        bspi = bad._make_spi()
+        err = _types.SimpleNamespace(ErrorID=17, ErrorMsg="查询未就绪")
+        bspi.OnRspQryOrder(None, err, 5, True)
+        assert not bad.orders_loaded, "柜台拒了却当成「查完了」，历史委托永远不会重试"
+        assert "历史委托" in (bad.last_error or ""), \
+            f"柜台拒绝时没留下原因：{bad.last_error!r}"
+
+        # ---- 结算确认：登录后必须自动做，失败能重试，跨交易日要重做
+        #
+        # 没做这一步，柜台把**每一笔**报单都打回「未确认结算结果」，而界面
+        # 一切正常（已连接、策略在跑）—— 只有单子全失败。
+        import threading as _th
+
+        class _SettleApi:
+            def __init__(self):
+                self.n = 0
+                self.last = None
+
+            def ReqSettlementInfoConfirm(self, req, rid):
+                self.n += 1
+                self.last = (req.BrokerID, req.InvestorID)
+
+        s = C.TraderClient(cfg)
+        s.api = _SettleApi()
+        s.logged_in = _th.Event()
+        assert s.confirm_settlement() is False and s.api.n == 0, \
+            "还没登录就发了结算确认"
+        s.logged_in.set()
+        assert s.confirm_settlement() is True, "登录后第一次结算确认没发出去"
+        assert s.api.n == 1 and s.api.last == (cfg.broker_id, cfg.user_id), \
+            f"结算确认没带经纪商/投资者账号：{s.api.last}"
+        assert s.confirm_settlement() is False, "3 秒内重复发了结算确认（柜台有限流）"
+        s.settled.set()                 # 确认回包到了
+        s._settle_at = 0.0
+        assert s.confirm_settlement() is False, "已经确认过了还在重发"
+
+        # 跨交易日（夜盘 21:00 起算下一交易日）：标志要清掉并强制重确认
+        s.trading_day = "20261123"
+        s._note_trading_day("20261124")
+        assert not s.settled.is_set() and s.api.n == 2, (
+            f"跨交易日没重新确认（settled={s.settled.is_set()} n={s.api.n}）"
+            " —— 夜盘第一笔报单会被打回「未确认结算结果」")
+        s.settled.set()
+        s._note_trading_day("20261124")
+        assert s.settled.is_set() and s.api.n == 2, "同一天被当成切日，每轮都在重确认"
+        s._note_trading_day("")
+        assert s.settled.is_set(), "柜台没给日期时空串被当成了切日"
+        # 基准还是空的时候只记下来、不重确认（登录时刚确认过）；不记的话跨日
+        # 探测永远醒不过来
+        first = C.TraderClient(cfg)
+        first.api = _SettleApi()
+        first.logged_in.set()
+        first._note_trading_day("20261125")
+        assert first.trading_day == "20261125" and first.api.n == 0, (
+            f"第一次见到交易日就重确认了（{first.trading_day} / {first.api.n}）")
+
+        # 登录回包 → 自动发结算确认 → 回包成功才置 settled（才能下单）
+        chain = C.TraderClient(cfg)
+        capi = _SettleApi()
+        chain.api = capi
+        cspi = chain._make_spi()
+        cspi.OnRspUserLogin(_types.SimpleNamespace(
+            FrontID=1, SessionID=2, TradingDay="20261123"), None, 1, True)
+        assert chain.logged_in.is_set(), "登录回包没置 logged_in"
+        assert capi.n == 1, "登录成功之后**没有自动做结算确认**"
+        assert chain.trading_day == "20261123", chain.trading_day
+        cspi.OnRspSettlementInfoConfirm(None, None, 2, True)
+        assert chain.settled.is_set(), "结算确认成功却没置 settled（永远下不了单）"
+
+        bad2 = C.TraderClient(cfg)
+        bad2.api = _SettleApi()
+        b2 = bad2._make_spi()
+        b2.OnRspSettlementInfoConfirm(None, _types.SimpleNamespace(
+            ErrorID=26, ErrorMsg="结算结果未就绪"), 3, True)
+        assert not bad2.settled.is_set(), "柜台拒了却置了 settled，后面报单必然全被拒"
+        assert "结算" in (bad2.last_error or ""), bad2.last_error
+
+        # ---- 市价单：AnyPrice + 价格 0 + TimeCondition=IOC（2026-11-23）
+        #
+        # 🔴 三个字段必须**一起**对：AnyPrice 配 GFD 会被交易所打回「该合约不支持
+        # 此时间条件」；价格不填 0 会被当成「0 元限价单」拒掉。错一个都是「委托
+        # 被拒」，界面上看不出是哪个字段的锅
+        class _FakeTd:
+            def __init__(self):
+                self.reqs = []
+
+            def ReqOrderInsert(self, req, _nid):
+                self.reqs.append(req)
+
+        rob = C.TraderClient(cfg)
+        rob.api = _FakeTd()
+        rob.logged_in.set()
+        rob.settled.set()
+        rob.place("rb2601", "BUY", "OPEN", 0.0, 1, market=True)
+        r1 = rob.api.reqs[-1]
+        if (r1.OrderPriceType != C.tdapi.THOST_FTDC_OPT_AnyPrice
+                or float(r1.LimitPrice) != 0.0
+                or r1.TimeCondition != C.tdapi.THOST_FTDC_TC_IOC):
+            raise RuntimeError(
+                f"市价单字段错了：price_type={r1.OrderPriceType!r} "
+                f"limit={r1.LimitPrice!r} time={r1.TimeCondition!r}"
+                "（要 AnyPrice + 0 + IOC）")
+        # NaN 也当市价（天勤那边就是这么表示市价的）
+        rob.place("rb2601", "SELL", "CLOSE", float("nan"), 1)
+        r2 = rob.api.reqs[-1]
+        if r2.OrderPriceType != C.tdapi.THOST_FTDC_OPT_AnyPrice:
+            raise RuntimeError("NaN 价格没按市价发")
+        # 给了价格就还是限价单 + GFD
+        rob.place("rb2601", "BUY", "OPEN", 3000.0, 1)
+        r3 = rob.api.reqs[-1]
+        if (r3.OrderPriceType != C.tdapi.THOST_FTDC_OPT_LimitPrice
+                or r3.TimeCondition != C.tdapi.THOST_FTDC_TC_GFD):
+            raise RuntimeError("限价单被改成了市价单的字段")
+
+        return (f"openctp-ctp 已装，{len(cases)} 个合约的交易所解析正确；"
+                "历史委托/成交补查带经纪商+投资者账号，字段映射与增量回报一致，"
+                "空表和拒单都记对「查完了」；"
+                "市价单是 AnyPrice + 0 价 + IOC（NaN 也发市价，限价单不受影响）；"
+                "登录后自动确认结算、失败可重试、跨交易日会重做")
 
     check("CTP 客户端（可选依赖）", _ctp)
 
@@ -7199,7 +8206,82 @@ def _run() -> tuple[bool, list[str]]:
         # 一旦在本进程加载融航 dll，后面的 CTP 用例就没法跑了）
         assert "段错误" in ctp_channel.ChannelError(
             "两套 CTP 库在同一进程里会段错误崩溃").args[0]
-        return "融航走 CTP 兼容 dll（6.7.2.8），行情/交易地址归一正确"
+
+        # ---- 市价单（2026-11-23 用户：「融航也要支持市价单」）
+        #
+        # 只查源码不真报单：绑融航 dll 会把 CTP 那套 dll 挤掉，后面的用例全崩。
+        # 要钉住的是「字段跟 CTP 一个规矩」——AnyPrice + 价格 0 + IOC，
+        # 以及那句「只收限价单」的老闸门真的删掉了
+        import inspect
+
+        from ttrade import rohon_client as RC
+
+        src = inspect.getsource(RC.RohonTraderClient.place)
+        # 只看 `raise` 那几行：文档里还会提到「以前只收限价单」，那是解释不是闸门
+        for line in src.splitlines():
+            s = line.strip()
+            if s.startswith("raise") and "只收限价单" in s:
+                raise RuntimeError(f"融航 place() 还留着「只收限价单」的闸门：{s}")
+        for need in ("THOST_FTDC_OPT_AnyPrice", "THOST_FTDC_TC_IOC", "market"):
+            if need not in src:
+                raise RuntimeError(f"融航 place() 没处理市价单：缺 {need}")
+        if '"LimitPrice": 0.0 if market else px' not in src:
+            raise RuntimeError("融航的市价单没把 LimitPrice 填 0（会被当成 0 元限价单）")
+
+        # ---- 持仓回包：按「一轮」攒、收尾整份换掉
+        #
+        # 🔴 融航的持仓**只能**靠这个查询刷新（中台不推持仓），而柜台每秒最多
+        # 一个查询 ⇒ 同一个合约会被反复问。早先 `profit` / `margin` 是 `+=`
+        # 且从不重置，浮盈和保证金每问一遍就翻一倍；平掉的仓也永远删不掉。
+        tr = RC.RohonTraderClient(types.SimpleNamespace(user_id="u", broker_id="b"))
+        spi = RC._make_td(tr)
+        one = {"InstrumentID": "rb2601", "PosiDirection": "2", "Position": 2,
+               "YdPosition": 1, "TodayPosition": 1, "OpenCost": 60000.0,
+               "PositionProfit": 100.0, "UseMargin": 20000.0}
+        two = dict(one, PosiDirection="3", Position=1, YdPosition=0,
+                   TodayPosition=1, OpenCost=30000.0, PositionProfit=50.0,
+                   UseMargin=10000.0)
+        if tr.positions_loaded:
+            raise RuntimeError("新建的客户端不该自称「已读过持仓」")
+        spi.onRspQryInvestorPosition(one, None, 1, False)
+        spi.onRspQryInvestorPosition(two, None, 2, True)
+        pos = tr.positions["rb2601"]
+        if (pos["long"], pos["short"]) != (2, 1) or \
+                (pos["cost_long"], pos["cost_short"]) != (60000.0, 30000.0):
+            raise RuntimeError(f"多空持仓/成本没分开记：{pos}")
+        if pos["profit"] != 150.0 or pos["margin"] != 30000.0:
+            raise RuntimeError(f"浮盈/保证金累加错了：{pos}")
+        if not tr.positions_loaded:
+            raise RuntimeError(
+                "收尾包到了却没置 positions_loaded —— 对齐那边就分不清"
+                "「账户真没仓」和「柜台没回」")
+        # 第二轮：柜台又给了一份。浮盈不许翻倍、已平掉的空头要消失。
+        # 契约是「**开轮清一次**、之后原地累加」（`query_positions()` 每下发一轮
+        # 就放下闸门），不是「`last` 时整份替换」—— 后者碰上多余的空终止包会把
+        # 持仓表刷成 0，2026-11-23 下午「交易页 7 个合约、监控器全 0」就是它
+        tr._pos_req, tr._pos_started = 3, False
+        spi.onRspQryInvestorPosition(one, None, 3, True)
+        pos = tr.positions["rb2601"]
+        if pos["profit"] != 100.0 or pos["short"] != 0:
+            raise RuntimeError(f"第二轮没清掉上一轮（浮盈翻倍/旧仓没清）：{pos}")
+        # 同一轮里再补一个空终止包：**不许**把表刷成空
+        spi.onRspQryInvestorPosition(None, None, 3, True)
+        if not tr.positions:
+            raise RuntimeError("多一个空 `last` 包就把持仓清空了（旧写法就是这个）")
+        # 上一轮迟到的回包：不许污染当前这一轮
+        spi.onRspQryInvestorPosition(one, None, 2, True)
+        if tr.positions["rb2601"]["long"] != 2:
+            raise RuntimeError("上一轮迟到的回包又累进当前这一轮了（手数会翻倍）")
+        # 真的没仓：空包也要算「读完了」
+        tr2 = RC.RohonTraderClient(types.SimpleNamespace(user_id="u", broker_id="b"))
+        RC._make_td(tr2).onRspQryInvestorPosition(None, None, 1, True)
+        if tr2.positions or not tr2.positions_loaded:
+            raise RuntimeError("空仓的空包没置 positions_loaded（会被当成「没读到」）")
+
+        return ("融航走 CTP 兼容 dll（6.7.2.8），行情/交易地址归一正确；"
+                "市价单字段与 CTP 一致（AnyPrice + 0 价 + IOC）；"
+                "持仓回包按 RequestID 归轮、开轮清一次（浮盈不翻倍、平掉的仓"
+                "会消失、多余空包不刷表、迟到的旧回包不污染、空包也算读完）")
 
     check("融航客户端（可选依赖）", _rohon)
 
@@ -7282,12 +8364,30 @@ def _run() -> tuple[bool, list[str]]:
         assert st.orders[0]["direction"] == "BUY" and st.orders[0]["offset"] == "OPEN"
 
         # 没连柜台时下单要报错，而不是返回一个空单号
+        bare = CL.CtpHub([])
         try:
-            hub.place("rb2611", "BUY", "OPEN", 1, None)
+            bare.place("rb2611", "BUY", "OPEN", 1, None)
         except Exception as exc:  # noqa: BLE001
-            assert "限价" in str(exc) or "还没连接" in str(exc), f"报错信息不对：{exc}"
+            assert "还没连接" in str(exc), f"报错信息不对：{exc}"
         else:
             raise RuntimeError("没连柜台时 place() 竟然没报错")
+
+        # 市价单：价格留空 / 0 ⇒ 交给 trader 时是「价格 0 + market=True」。
+        # 🔴 以前这里抛「只收限价单」，2026-11-23 起全部交易所都支持市价单了
+        seen = []
+
+        def _rec(ins, d, o, px, vol, market=False):
+            seen.append((ins, d, o, px, vol, market))
+            return "9001"
+
+        hub.trader.place = _rec
+        assert hub.place("rb2611", "BUY", "CLOSE", 2, None) == "9001"
+        assert seen[-1] == ("rb2611", "BUY", "CLOSE", 0.0, 2, True), seen[-1]
+        hub.place("rb2611", "SELL", "OPEN", 1, 0.0)
+        assert seen[-1][3] == 0.0 and seen[-1][5] is True, seen[-1]
+        # 给了价格就还是限价单，并且按最小变动价位对齐（rb 一跳 1 元）
+        hub.place("rb2611", "SELL", "OPEN", 1, 3000.4)
+        assert (seen[-1][3], seen[-1][5]) == (3000.0, False), seen[-1]
 
         # 委托状态表：这张表错一格，界面上活单会显示成「已撤单」、成交单显示成
         # 「未成交」。CTP 的 '3' 是「未成交还在队列中」，是活单 —— SimNow 实测踩过
@@ -7335,12 +8435,129 @@ def _run() -> tuple[bool, list[str]]:
 
             td = TraderClient.__new__(TraderClient)
             td.api, td._req = _FakeTdApi(), 0
+            td._req_lock = threading.Lock()   # `__new__` 跳过了 __init__
             td.instruments_done = threading.Event()
             td.query_instruments("rb2611")
             td.query_instruments()
             assert got_req == ["rb2611", ""], f"单合约查询没带 InstrumentID：{got_req}"
 
-        return "合约归一 / 主力解析 / tick 切 bar / 资金持仓映射 / 状态表 全对"
+        # ---- 登录后补查历史委托 / 成交的排片
+        #
+        # 「今空 5 手、委托框和成交框却是空的」就是这么来的：柜台只推登录之后
+        # 的回报。补查要挤进「每秒一个查询」的轮转里，补完必须停，柜台不放行
+        # 时要放弃并记原因（不然每 2 秒打一枪，白耗柜台的流控）。
+        from ttrade.ctp_live import HIST_TRIES
+
+        class _T:
+            orders_loaded = False
+            trades_loaded = False
+
+            def __init__(self):
+                self.calls = []
+                self.stuck = False
+
+            def query_orders(self):
+                self.calls.append("orders")
+                if not self.stuck:
+                    self.orders_loaded = True
+
+            def query_trades(self):
+                self.calls.append("trades")
+                self.trades_loaded = True
+
+        hub = CL.CtpHub([])
+        hub.trader = _T()
+        hub._hist_at = 0.0
+        assert hub._query_hist() is True and hub.trader.calls == ["orders"], \
+            f"第一拍该先补委托：{hub.trader.calls}"
+        hub._hist_at = 0.0
+        assert hub._query_hist() is True and hub.trader.calls == ["orders", "trades"], \
+            f"第二拍该补成交：{hub.trader.calls}"
+        assert hub._query_hist() is False, "补完之后还在发查询（白占柜台的每秒额度）"
+
+        # 柜台只允许每秒一个查询：1 秒内第二次必须自己咽回去，否则两笔查询
+        # 里有一笔会被柜台**静默**丢掉，看起来就是「查了但没结果」
+        hub3 = CL.CtpHub([])
+        hub3.trader = _T()
+        hub3._hist_at = 0.0
+        hub3._query_hist()
+        assert hub3._query_hist() is False, "1 秒内连发了两个查询"
+
+        stuck = _T()
+        stuck.stuck = True
+        hub2 = CL.CtpHub([])
+        hub2.trader = stuck
+        for _ in range(HIST_TRIES):
+            hub2._hist_at = 0.0
+            hub2._query_hist()
+        assert hub2._query_hist() is False, f"试了 {HIST_TRIES} 拍还没放弃"
+        assert "历史委托" in (hub2.last_error or ""), \
+            f"放弃时没把原因说出来：{hub2.last_error!r}"
+
+        # 结算没确认时，查询额度要**先给结算**（没它一笔都下不出去）
+        class _Pri:
+            orders_loaded = trades_loaded = True
+
+            def __init__(self):
+                self.calls = []
+
+            def confirm_settlement(self):
+                self.calls.append("settle")
+                return True
+
+            def query_account(self):
+                self.calls.append("acct")
+
+            def query_positions(self):
+                self.calls.append("pos")
+
+        hub4 = CL.CtpHub([])
+        hub4.trader = _Pri()
+        hub4._last_query = 0.0
+        hub4.wait(0.05)
+        assert hub4.trader.calls[:1] == ["settle"], \
+            f"结算没确认，却先去查资金/持仓了：{hub4.trader.calls}"
+
+        # ---- 查询额度只能有一份轮转（2026-11-23 融航「组合页读不到持仓」）
+        #
+        # 交易页走 `hub.wait()`，组合页走 `BrokerApi._refresh()`。早先两边各写
+        # 一套节流，组合页那套在补历史委托时用的是**另一个**闸门，同一毫秒里
+        # 既发「查历史委托」又发「查持仓」；柜台限制每秒一个，后发那笔被静默
+        # 丢弃 —— 交易页持仓表好好的，组合页那条连接 `positions` 永远是空的。
+        # 现在两边都只调 `pump_queries()`，所以这里钉住它自己的行为。
+        class _Rot:
+            orders_loaded = trades_loaded = True     # 历史补查不掺进来
+
+            def __init__(self):
+                self.calls = []
+
+            def confirm_settlement(self):
+                return False                          # 已确认过，让出额度
+
+            def query_account(self):
+                self.calls.append("acct")
+
+            def query_positions(self):
+                self.calls.append("pos")
+
+        rot = CL.CtpHub([])
+        rot.trader = _Rot()
+        rot._last_query = 0.0
+        assert rot.pump_queries() == "positions", \
+            "登录后第一拍该先要持仓（界面和比对都等它）"
+        assert rot._pos_try == 1, f"发过几拍持仓查询没记账：{rot._pos_try}"
+        assert rot.pump_queries() == "", "1 秒内又发了一个查询（柜台只给每秒一个）"
+        rot._last_query = 0.0
+        assert rot.pump_queries() == "account", "持仓之后这一拍该轮到资金"
+        assert rot.trader.calls == ["pos", "acct"], rot.trader.calls
+        # `force=True` 放开 1 秒闸门（`BrokerApi._refresh(force=True)` 用）
+        assert rot.pump_queries(force=True) == "positions", "force 没放开节流"
+
+        return ("合约归一 / 主力解析 / tick 切 bar / 资金持仓映射 / 状态表 全对；"
+                "登录后补查历史委托+成交（先委托后成交、每秒一个、补完即停、"
+                "试够次数放弃并记原因）；结算没确认时查询额度优先给它；"
+                "查询额度的轮转只有 `pump_queries()` 一份（资金/持仓交替、"
+                "1 秒内不重发，force 才放开）")
 
     check("CTP 会话层（交易页后端）", _ctp_live)
 
@@ -7383,6 +8600,8 @@ def _run() -> tuple[bool, list[str]]:
                 self.instruments = {"rb2701": {"tick": 1.0, "exchange": "SHFE"}}
                 self.positions, self.orders, self.trades = {}, {}, {}
                 self.account, self.placed = {}, []
+                # 柜台「持仓读到过一整轮」的标志，见 `BrokerApi.positions_ready()`
+                self.positions_loaded = True
 
             def query_account(self):
                 pass
@@ -7395,17 +8614,22 @@ def _run() -> tuple[bool, list[str]]:
 
             def snapshot(self):
                 return {"account": self.account, "positions": self.positions,
-                        "orders": self.orders, "trades": self.trades}
+                        "orders": self.orders, "trades": self.trades,
+                        "positions_loaded": self.positions_loaded}
 
-            def place(self, ins, direction, offset, price, volume):
+            def place(self, ins, direction, offset, price, volume, market=False):
                 ref = str(9000 + len(self.placed))
-                self.placed.append((ins, direction, offset, price, volume, ref))
+                # 第 7 项是 market：市价单要靠「价格 0 + market=True」一起判，
+                # 只看价格会把「0 价的限价单」也认成市价
+                self.placed.append((ins, direction, offset, price, volume, ref,
+                                    bool(market)))
                 return ref
 
         class _Hub:
             def __init__(self):
                 self.md, self.trader, self.last_error = _Md(), _Td(), ""
                 self.cancelled = []
+                self.pumps = []
 
             def start(self):
                 pass
@@ -7413,9 +8637,21 @@ def _run() -> tuple[bool, list[str]]:
             def close(self):
                 pass
 
+            def pump_queries(self, force=False):
+                # 账户查询的唯一入口（交易页和组合页共用一份轮转）。
+                # 组合页早先自己另写一套，和补历史委托撞在同一毫秒里，
+                # 柜台只收第一个 ⇒ `positions` 永远是空的
+                self.pumps.append(bool(force))
+                self.trader.query_account()
+                return "account"
+
             def place(self, symbol, direction, offset, volume, limit_price=None):
-                return self.trader.place(symbol, direction, offset,
-                                         float(limit_price), int(volume))
+                try:
+                    px = float(limit_price)
+                except (TypeError, ValueError):
+                    px = float("nan")
+                return self.trader.place(symbol, direction, offset, px,
+                                         int(volume), market=not (px > 0))
 
             def cancel(self, order_id, account=""):
                 self.cancelled.append(str(order_id))
@@ -7480,17 +8716,70 @@ def _run() -> tuple[bool, list[str]]:
         api._refresh(force=True)
         assert api.get_order()[order.order_id].status == "DEAD", "没回报的委托要判死"
 
-        # 市价（NaN）在柜台上不存在，要报一句人话而不是静默下 0 价单
-        try:
-            api.insert_order(symbol="SHFE.rb2701", direction="BUY", offset="OPEN",
-                             volume=1, limit_price=float("nan"))
-        except ValueError as exc:
-            assert "限价" in str(exc), str(exc)
-        else:
-            raise RuntimeError("NaN 价格竟然能下单")
+        # 市价（NaN / 空价）要发**市价单**：价格填 0 + market=True
+        # （2026-11-23 用户：「所有交易所都支持市价单了，上期所和能源所 7 月 6 日
+        #   也开放了」；以前这里抛「只收限价单」，现在不能再抛）
+        o_nan = api.insert_order(symbol="SHFE.rb2701", direction="BUY",
+                                 offset="OPEN", volume=1,
+                                 limit_price=float("nan"))
+        ins_, _d, _o, px_, vol_, _ref, mkt_ = hub.trader.placed[-1]
+        assert (px_, mkt_) == (0.0, True), hub.trader.placed[-1]
+        assert o_nan.limit_price == 0.0, o_nan.limit_price
+        o_none = api.insert_order(symbol="SHFE.rb2701", direction="SELL",
+                                  offset="CLOSE", volume=1, limit_price=None)
+        ins_, _d, _o, px_, vol_, _ref, mkt_ = hub.trader.placed[-1]
+        assert (px_, mkt_) == (0.0, True), hub.trader.placed[-1]
+        assert o_none.limit_price == 0.0, o_none.limit_price
+        # 给了价格就是限价单，market 必须是 False（否则 0 价单会被当成市价）
+        api.insert_order(symbol="SHFE.rb2701", direction="BUY", offset="OPEN",
+                         volume=1, limit_price=3500.0)
+        ins_, _d, _o, px_, vol_, _ref, mkt_ = hub.trader.placed[-1]
+        assert (px_, mkt_) == (3500.0, False), hub.trader.placed[-1]
+
+        # 结算 / 登录没就绪时必须**拦住**，而且给的是「等一下就好」的人话 ——
+        # 抛异常会被 `tick()` 当成策略出错停机，跨交易日那几秒会把所有策略一起停
+        class _Ev:
+            def __init__(self, on=False):
+                self.on = on
+
+            def is_set(self):
+                return self.on
+
+        hub.trader.logged_in, hub.trader.settled = _Ev(True), _Ev(False)
+        ok, why = api.ready_to_trade()
+        assert not ok and "结算" in why, f"结算没确认却放行了：{ok} {why}"
+        hub.trader.settled = _Ev(True)
+        assert api.ready_to_trade() == (True, ""), "结算确认好了还不放行"
+        hub.trader.logged_in = _Ev(False)
+        ok, why = api.ready_to_trade()
+        assert not ok and "登录" in why, (ok, why)
+
+        # 查询额度只走 `hub.pump_queries()`：组合页自己另写一套会和补历史委托
+        # 撞在同一毫秒，柜台只收第一个 —— 持仓查询被静默丢弃（2026-11-23 融航）
+        assert hub.pumps, "`_refresh` 没走 `hub.pump_queries()`，又在自己抢柜台额度"
+
+        # 「持仓读到了没有」：`get_position()` 是空字典分不清「真没仓」和
+        # 「柜台没回」，必须由这一条判 —— 界面靠它决定报「一致」还是「还不知道」
+        assert api.positions_ready() is True, "柜台说读完了，却报「没读到」"
+        hub.trader.positions_loaded = False
+        assert api.positions_ready() is False, (
+            "柜台一条持仓都没回来，`positions_ready()` 却是真 ——"
+            "组合页会拿空表报「账户与策略理论持仓一致」")
+        hub.trader.positions_loaded = True
+        # 自相矛盾的快照：持仓空表，资金那边占用保证金却有数。有保证金必有持仓
+        hub.trader.account = {"margin": 123456.0}
+        api._pos.clear()
+        assert api.positions_ready() is False, (
+            "占用保证金有数、持仓空表，这种自相矛盾的快照被当成「已同步」了 ——"
+            "界面会报「一致」，而账户里其实有仓")
+        hub.trader.account = {}
+        assert api.positions_ready() is True, "保证金回到 0 之后该放行"
 
         api.close()
-        return "序列 300 根 + 拼 bar + 委托三态 + 今昨仓 + 无回报判死 全对"
+        return ("序列 300 根 + 拼 bar + 委托三态 + 今昨仓 + 无回报判死 全对；"
+                "结算/登录未就绪时闸门拦住并给人话；"
+                "账户查询只走 `pump_queries()` 一份轮转；"
+                "`positions_ready()` 能分清「账户真没仓」和「柜台没回」")
 
     check("柜台执行层（策略页跑 CTP / 融航）", _broker_api)
 
@@ -11534,6 +12823,20 @@ def _run() -> tuple[bool, list[str]]:
         t, step, dec, _v = apply("SHFE.rb2701", 3550.0)
         if abs(t - 1) > 1e-9 or abs(step - 1) > 1e-9 or dec != 0:
             raise RuntimeError(f"螺纹的步长不对：tick {t} 步长 {step} 位数 {dec}")
+        # 🔴 调用方传进来的 tick（可能还是**上一个合约**的报价）不许盖掉品种表。
+        # 2026-11-23 用户报「价格框上下键的跳动不对，很多都跑到 10 了，连 SA、IM
+        # 也是」—— 10 就是之前看过的铜。报价是异步的，改完合约那一刻
+        # `st.quote` 往往还是旧合约的，按它设步长就停在上一个品种上。
+        t, step, dec, _v = apply("CZCE.SA2701", 1400.0, tick=10.0)
+        if abs(step - 1) > 1e-9:
+            raise RuntimeError(f"SA 的步长被传进来的 10 带跑了：{step}")
+        t, step, dec, _v = apply("CFFEX.IM2612", 5479.0, tick=10.0)
+        if abs(step - 0.2) > 1e-9 or dec != 1:
+            raise RuntimeError(f"IM 的步长被传进来的 10 带跑了：{step} 位数 {dec}")
+        # 品种表里没有的（新上市 / 拼错的品种）：退化用传进来的 tick，别固定在 1
+        _t, step, _d, _v = apply("ZZZZ2701", 100.0, tick=2.0)
+        if abs(step - 2) > 1e-9:
+            raise RuntimeError(f"表里没有的品种没用兜底 tick：{step}")
         # 0.5 一档：步长 0.5、留 1 位
         _t, step, dec, val = apply("", 3550.5, tick=0.5)
         if abs(step - 0.5) > 1e-9 or dec != 1 or abs(val - 3550.5) > 1e-9:
@@ -11585,6 +12888,381 @@ def _run() -> tuple[bool, list[str]]:
 
     check("交易页：持仓当日盈亏 / 成交手续费与按品种统计 / CTP 委托时间 / 报价框",
           _trade_pnl_quote)
+
+    def _close_pnl_replay():
+        """重新登录后「平仓盈亏」不许整列变 0/—（2026-11-23 用户）。
+
+        `est_close_pnl` 靠持仓的开仓均价倒推，而那份缓存只在内存里：程序一重启
+        就空，**已经平掉的仓**在持仓表里也没有均价 ⇒ 那一列全变 `None`（画「—」），
+        界面看着像「平仓盈亏归 0」。真正的数据在当日成交流里（CTP 走
+        `ReqQryTrade`），按时间 FIFO 就能还原。
+
+        这些断言全是「算错了也不会报错、只会显示一个看着合理的数」的：
+        方向符号、部分平仓的加权成本、跨零点排序、平昨的盯市基准。
+        """
+        from ttrade.ctp_live import CtpHub
+        from ttrade.tqlive import (_last_daily_close, _trade_time_key,
+                                   replay_close_pnl)
+
+        def mult(_s):
+            return 10.0
+
+        # ---- ① 同日「开 → 平」：精确值（重启后 `close_profit` 是 None，要盖掉）
+        trs = [
+            {"trade_id": "1", "symbol": "SHFE.rb2601", "direction": "BUY",
+             "offset": "OPEN", "price": 3500.0, "volume": 2,
+             "time": "09:01:00", "close_profit": None},
+            {"trade_id": "2", "symbol": "SHFE.rb2601", "direction": "SELL",
+             "offset": "CLOSETODAY", "price": 3550.0, "volume": 2,
+             "time": "10:30:00", "close_profit": None},
+        ]
+        if replay_close_pnl(trs, mult) != 1:
+            raise RuntimeError("同日开→平没算出来（重启后平仓盈亏就该靠它）")
+        if abs(trs[1]["close_profit"] - 1000.0) > 1e-6:
+            raise RuntimeError(f"卖出平多算错：{trs[1]['close_profit']}"
+                               "（应 (3550−3500)×2×10 = 1000）")
+        if trs[0]["close_profit"] is not None:
+            raise RuntimeError("开仓单被写了平仓盈亏（那一列只该有平仓的）")
+
+        # ---- ② 部分平仓：成本按 FIFO 加权，不是拿最新一笔开仓价
+        trs = [
+            {"trade_id": "1", "symbol": "SHFE.rb2601", "direction": "BUY",
+             "offset": "OPEN", "price": 3500.0, "volume": 2, "time": "09:01:00"},
+            {"trade_id": "2", "symbol": "SHFE.rb2601", "direction": "BUY",
+             "offset": "OPEN", "price": 3520.0, "volume": 2, "time": "09:05:00"},
+            {"trade_id": "3", "symbol": "SHFE.rb2601", "direction": "SELL",
+             "offset": "CLOSETODAY", "price": 3560.0, "volume": 3, "time": "10:00:00"},
+        ]
+        replay_close_pnl(trs, mult)
+        # 成本 = (3500×2 + 3520×1) / 3 = 3506.667 ⇒ 盈亏 = 53.333×3×10
+        if abs(trs[2]["close_profit"] - (3560.0 - 10520.0 / 3.0) * 3 * 10) > 1e-6:
+            raise RuntimeError(f"分批开仓的 FIFO 加权成本算错：{trs[2]['close_profit']}")
+
+        # ---- ③ 平空方向符号：卖空 3600、买平 3500 ⇒ 赚（不是亏）
+        trs = [
+            {"trade_id": "1", "symbol": "SHFE.rb2601", "direction": "SELL",
+             "offset": "OPEN", "price": 3600.0, "volume": 1, "time": "09:01:00"},
+            {"trade_id": "2", "symbol": "SHFE.rb2601", "direction": "BUY",
+             "offset": "CLOSETODAY", "price": 3500.0, "volume": 1, "time": "10:00:00"},
+        ]
+        replay_close_pnl(trs, mult)
+        if abs(trs[1]["close_profit"] - 1000.0) > 1e-6:
+            raise RuntimeError(f"买入平空符号错：{trs[1]['close_profit']}（应为 +1000）")
+
+        # ---- ④ 缺昨仓开仓记录、又没给昨结算价 ⇒ **不许编**，保持 None
+        trs = [{"trade_id": "1", "symbol": "SHFE.rb2601", "direction": "SELL",
+                "offset": "CLOSE", "price": 3550.0, "volume": 1,
+                "time": "10:00:00", "close_profit": None}]
+        if replay_close_pnl(trs, mult) != 0 or trs[0]["close_profit"] is not None:
+            raise RuntimeError("缺昨仓开仓记录时硬编了一个平仓盈亏")
+
+        # ---- ⑤ 给了昨结算价 ⇒ 按逐日盯市算（平仓价 − 昨结算价）
+        trs = [{"trade_id": "1", "symbol": "SHFE.rb2601", "direction": "SELL",
+                "offset": "CLOSEYESTERDAY", "price": 3550.0, "volume": 1,
+                "time": "10:00:00", "close_profit": None}]
+        replay_close_pnl(trs, mult, pre_settle_of=lambda _s: 3500.0)
+        if abs(trs[0]["close_profit"] - 500.0) > 1e-6:
+            raise RuntimeError(f"平昨的盯市口径算错：{trs[0]['close_profit']}"
+                               "（应 (3550−3500)×1×10 = 500）")
+
+        # ---- ⑥ 成交流凑不齐（只开到 1 手却平 2 手）⇒ 缺的那手按基准价补，
+        #         凑到的那手仍按 FIFO。用户 2026-11-23：「平仓盈亏可以根据昨日
+        #         结算价或者收盘价格来计算，如果获取不到历史成交的话」
+        trs = [{"trade_id": "1", "symbol": "SHFE.rb2601", "direction": "SELL",
+                "offset": "CLOSETODAY", "price": 3550.0, "volume": 2,
+                "time": "10:00:00", "close_profit": None},
+               {"trade_id": "2", "symbol": "SHFE.rb2601", "direction": "BUY",
+                "offset": "OPEN", "price": 3400.0, "volume": 1,
+                "time": "09:01:00", "close_profit": 0.0}]
+        replay_close_pnl(trs, mult, pre_settle_of=lambda _s: 3500.0)
+        # 成本 = 3400×1（FIFO）+ 3500×1（基准）= 6900 ⇒ (3550 − 3450)×2×10
+        if trs[0]["close_profit"] is None or abs(trs[0]["close_profit"] - 2000.0) > 1e-6:
+            raise RuntimeError(f"成交流缺一块时没按基准价补齐：{trs[0]['close_profit']}"
+                               "（应 3400 那手按 FIFO、缺的手按 3500，得 2000）")
+
+        # ---- ⑦ `est_close_pnl` 已经估出来的值**不许被覆盖**（持仓开仓均价
+        #         比昨结算更贴这笔交易，只有在还有仓时才拿得到）
+        trs = [{"trade_id": "1", "symbol": "SHFE.rb2601", "direction": "SELL",
+                "offset": "CLOSE", "price": 3550.0, "volume": 2,
+                "time": "10:00:00", "close_profit": 250.0}]
+        replay_close_pnl(trs, mult, pre_settle_of=lambda _s: 3500.0)
+        if abs(trs[0]["close_profit"] - 250.0) > 1e-6:
+            raise RuntimeError(f"把 est 的估算值盖掉了：{trs[0]['close_profit']}")
+
+        # ---- ⑧ 连基准都没有 ⇒ 宁可留「—」，不许按 0 价成本编一个
+        trs = [{"trade_id": "1", "symbol": "SHFE.rb2601", "direction": "SELL",
+                "offset": "CLOSE", "price": 3550.0, "volume": 1,
+                "time": "10:00:00", "close_profit": None}]
+        replay_close_pnl(trs, mult, pre_settle_of=lambda _s: 0.0)
+        if trs[0]["close_profit"] is not None:
+            raise RuntimeError("基准价是 0 时还硬算出一笔平仓盈亏")
+
+        # ---- ⑨ 夜盘跨零点：21:05 开的仓必须排在 01:30 的平仓**之前**
+        if not _trade_time_key({"time": "01:30:00"}) > _trade_time_key({"time": "23:05:00"}):
+            raise RuntimeError("成交排序键跨零点错了（夜盘 01:30 被排到 23:05 前面）")
+        trs = [
+            {"trade_id": "2", "symbol": "SHFE.au2602", "direction": "BUY",
+             "offset": "OPEN", "price": 3000.0, "volume": 1, "time": "21:05:00"},
+            {"trade_id": "1", "symbol": "SHFE.au2602", "direction": "BUY",
+             "offset": "OPEN", "price": 3500.0, "volume": 1, "time": "23:05:00"},
+            {"trade_id": "3", "symbol": "SHFE.au2602", "direction": "SELL",
+             "offset": "CLOSETODAY", "price": 3100.0, "volume": 1, "time": "01:30:00"},
+        ]
+        replay_close_pnl(trs, mult)
+        # 先进先出 ⇒ 平掉的是 21:05 那笔 3000 的仓：(3100−3000)×1×10
+        if abs(trs[2]["close_profit"] - 1000.0) > 1e-6:
+            raise RuntimeError(f"夜盘跨零点 FIFO 错位：{trs[2]['close_profit']}"
+                               "（应平掉最早那笔 3000 的仓 = 1000）")
+
+        # ---- ⑩ 基准价的最后一级：本地日线最后一根收盘（行情/成交流都没有时）
+        lc = _last_daily_close("SHFE.rb2601")
+        if lc > 0 and abs(lc - 2999.0) > 1e-6:
+            raise RuntimeError(f"本地日线昨收读错了：{lc}（应 2999）")
+        if _last_daily_close("SHFE.zzzz9999") != 0.0:
+            raise RuntimeError("没有日线文件的品种该返回 0，不许瞎猜")
+
+        # ---- ⑧ CTP 的成交表**不许**在 replay 之前截断到 200 笔
+        src = {}
+        for i in range(205):
+            src[f"t{i}"] = {"trade_id": f"t{i}", "instrument": "rb2601",
+                            "direction": "0" if i % 2 == 0 else "1",
+                            "offset": "0", "price": 3500.0, "volume": 1,
+                            "time": "09:00:%02d" % (i % 60)}
+        got = CtpHub([])._trades(src)
+        if len(got) != 205:
+            raise RuntimeError(f"CTP 成交在倒推前就没截断了：{len(got)} 行"
+                               "（只留 200 笔的话早上的开仓记录会丢，"
+                               "平仓一笔都算不出来）")
+        # 平昨（'4'）必须映射成 CLOSE 系列，别当成开仓
+        one = CtpHub([])._trades({"x": {"trade_id": "x", "instrument": "rb2601",
+                                        "direction": "1", "offset": "4",
+                                        "price": 3500.0, "volume": 1,
+                                        "time": "09:00:00"}})
+        if not one or one[0]["offset"] != "CLOSEYESTERDAY":
+            raise RuntimeError(f"CTP 平昨（offset=4）没映射成 CLOSE 系列："
+                               f"{one[0]['offset'] if one else '—'}")
+
+        return ("平仓盈亏倒推：同日开→平 1000 元、分批开仓按 FIFO 加权、平空符号 +、"
+                "缺开仓记录按基准价补齐（3400/FIFO + 3500/基准 ⇒ 2000）、平昨盯市 500、"
+                "est 的估算值不被覆盖、没基准宁可留「—」、本地日线昨收兜底、"
+                "夜盘跨零点 21:05 的仓先平（1000），CTP 成交倒推前不截断")
+
+    check("重新登录后的平仓盈亏（成交流 FIFO + 昨结算/昨收兜底）", _close_pnl_replay)
+
+    def _one_session() -> str:
+        """一个账户一条会话（2026-11-23 融航「两块功能脱节」的彻底解法）。
+
+        组合页（`BrokerApi`）和交易页（`gui.live.LiveWorker`）早先各自
+        `CtpHub([spec]).start()` —— 同一个账户在柜台那边挂着**两条 CTP 会话**。
+        症状正好是用户说的「脱节」，三件事叠在一起：
+
+        - **委托回报按会话推送**：交易页「一键对齐」发出去的单，回报只进交易页
+          那条会话，组合页的 `_ord` 一直空 ⇒「对齐的委托在账户透视里查不到」；
+        - **查询额度各抢一份**：柜台「每秒一个查询」按会话算，两套闸门撞车时被
+          丢的那笔**不回包**，于是「一边刷得快、一边刷得慢」；
+        - **持仓两份快照** ⇒「交易页有 7 个合约，监控器全说不一致」。
+
+        现在两边都到 `ttrade/hubreg.py` 认领**同一个对象**。这个块钉四件事：
+        1. 同一账户两次 `acquire()` 拿到同一对象、refs=2；换了前置就是另一条；
+        2. 归属权：只有最后一个使用者放手才真的 `close()`（否则交易页一收尾，
+           组合页的持仓和回报当场断，还不报错）；
+        3. `CtpHub.start()` 幂等 —— 后到的一方不会再登一次（二次登录会把先到
+           那方的 `trader` 换掉，它手里的持仓/回报静默失效）；
+        4. `pump_queries()` 的闸门原子 —— 两个页面同时调，闸门被占着时放过这一
+           拍，而不是两个都通过判断、同一毫秒发两笔。
+        """
+        import inspect
+
+        from ttrade import ctp_live as CL
+        from ttrade import hubreg
+        from ttrade.tqlive import AccountSpec
+
+        hubreg.clear()
+
+        class _H:
+            """假柜台：只数 start / close 被调了几次。"""
+
+            def __init__(self, specs=None):
+                self.specs = list(specs or [])
+                self.starts = 0
+                self.closed = 0
+
+            def start(self):
+                self.starts += 1
+
+            def close(self):
+                self.closed += 1
+
+        sp = AccountSpec(name="融航户A", kind="rohon", user="u1", td_front="t1")
+        a = hubreg.acquire("rohon", [sp], lambda: _H([sp]))
+        b = hubreg.acquire("rohon", [sp], lambda: _H([sp]))
+        assert a is b, ("同一个账户拿到了两条会话 —— 委托回报互不相通、"
+                        "查询额度各抢一份，就是用户说的「脱节」")
+        assert hubreg.refs(a) == 2, f"引用数不对：{hubreg.refs(a)}"
+
+        # 换了交易前置（SimNow 改融航、换服务器）就是另一条会话：拿旧连接去发
+        # 新配置的单，等于把单打到另一个柜台上
+        other = hubreg.acquire(
+            "rohon", [AccountSpec(name="融航户A", kind="rohon", user="u1",
+                                  td_front="t2")], lambda: _H())
+        assert other is not a, "换了交易前置还是同一条会话（旧连接被复用）"
+        assert hubreg.release(other) is True, "这条会话只有它自己用，该放手"
+        assert hubreg.size() == 1, f"注册表里多出僵尸：{hubreg.describe()}"
+        other.close()
+
+        # 归属权：交易页先收尾，组合页还在用
+        assert hubreg.release(a) is False, "还有人握着引用，却把它判成该关了"
+        assert a.closed == 0, "组合页还在靠这条会话读持仓，被交易页关掉了"
+        assert hubreg.release(a) is True, "最后一个使用者放手却没资格关"
+        assert hubreg.size() == 0, f"注册表没清干净：{hubreg.describe()}"
+
+        # 不在表里的连接（天勤 / 单测注入的假柜台）照旧由调用方关
+        assert hubreg.release(_H()) is True, "不在注册表里的连接被当成了共享会话"
+
+        # ---- `start()` 幂等，但**断线之后必须重登**
+        #
+        # 幂等是为了「后到的一方不再登一次」；而「断线重连」正好相反 —— 那时
+        # `_started` 还立着、`trader` 还指着对象，只有 `logged_in` 被清了。拿
+        # `_started` 当判据，重连就变成「直接返回一条死会话」：界面写已连接，
+        # 行情/持仓/下单一样都没有。
+        import threading as _th
+
+        class _Cfg:
+            name = "测试户"
+            user_id = "u1"
+            password = "p1"
+            td_front = "tcp://127.0.0.1:1"
+            md_front = ""
+
+        class _FakeTd:
+            last_error = ""
+
+            def __init__(self):
+                self.logged_in = _th.Event()
+                self.stopped = 0
+                self.queries = []
+
+            def start(self):
+                self.logged_in.set()
+
+            def wait_ready(self, timeout=0.0):
+                return True
+
+            def confirm_settlement(self):
+                return False
+
+            def query_positions(self):
+                self.queries.append("pos")
+
+            def query_account(self):
+                self.queries.append("acct")
+
+            def stop(self):
+                self.stopped += 1
+                self.logged_in.clear()
+
+        class _Hub(CL.CtpHub):
+            made: list = []
+
+            def check_deps(self):
+                pass
+
+            def make_config(self, spec):
+                return _Cfg()
+
+            def make_trader(self, cfg):
+                t = _FakeTd()
+                type(self).made.append(t)
+                return t
+
+            def make_md(self, cfg):
+                raise AssertionError("账户没填 md_front，不该去连行情")
+
+        _Hub.made = []
+        hb = _Hub([object()])          # 内容无所谓，`make_config` 被架空了
+        hb.start()
+        hb.start()
+        hb.start()
+        assert len(_Hub.made) == 1, \
+            f"`start()` 不幂等，后到的一方又登了一次（共 {len(_Hub.made)} 次）"
+        assert hb._started is True, "登上了却没打记号，下次还会再登一遍"
+        assert _Hub.made[0].queries == ["pos"], \
+            f"登录后的第一拍只该发持仓查询（柜台每秒一个）：{_Hub.made[0].queries}"
+
+        # 连接掉了（`logged_in` 清掉，但 `_started` 还在）：必须重登，且先停旧客户端
+        hb.trader.logged_in.clear()
+        hb.start()
+        assert len(_Hub.made) == 2, ("断线后 `start()` 直接短路返回了一条死会话 —— "
+                                     "界面写已连接，持仓和下单一样都没有")
+        assert _Hub.made[0].stopped >= 1, \
+            "重登前没停掉上一条客户端（两条 TCP 会话抢同一个账户，先登的从此收不到回报）"
+        hb.close()
+        assert hb._started is False, "关掉之后还留着「已登录」的记号"
+        hb.start()
+        assert len(_Hub.made) == 3, "关掉之后重新 start 该真的重登，不该短路"
+        hb.close()
+
+        # ---- 查询闸门：两个页面同时调，一秒内也只能放一笔
+        class _R:
+            orders_loaded = trades_loaded = True
+
+            def __init__(self):
+                self.calls = []
+
+            def query_account(self):
+                self.calls.append("acct")
+
+            def query_positions(self):
+                self.calls.append("pos")
+
+        rot = CL.CtpHub([])
+        rot.trader = _R()
+        rot._last_query = 0.0
+        assert rot._q_lock.acquire(blocking=False), "闸门锁拿不到"
+        try:
+            assert rot.pump_queries(force=True) == "", \
+                "闸门被另一个页面占着时还在发查询（同一毫秒两笔，柜台丢一笔不回包）"
+            assert rot.trader.calls == [], rot.trader.calls
+        finally:
+            rot._q_lock.release()
+        assert rot.pump_queries(force=True) == "positions", "闸门放开后该能发出去"
+
+        # ---- 接线：两个页面都必须走注册表，不能自己再 new 一条
+        from gui.live import make_hub
+
+        h1 = make_hub("rohon", [sp])
+        h2 = make_hub("rohon", [sp])
+        assert h1 is h2, "交易页和组合页拿的不是同一条会话"
+        assert hubreg.refs(h1) == 2, f"两边各借一次，refs 该是 2：{hubreg.refs(h1)}"
+        hubreg.release(h1)
+        assert hubreg.release(h1) is True
+        h1.close()
+
+        from ttrade import broker_api as BA
+
+        for fn, needle, why in (
+            (BA.BrokerApi.start, "hubreg.acquire",
+             "`BrokerApi.start()` 没走注册表 —— 组合页会为同一个账户再开一条会话"),
+            (BA.BrokerApi.close, "hubreg.release",
+             "`BrokerApi.close()` 直接 close —— 会把交易页那条会话一起掐掉"),
+        ):
+            src = "\n".join(ln for ln in inspect.getsource(fn).splitlines()
+                            if not ln.strip().startswith("#"))
+            assert needle in src, why
+
+        from gui import live as GL
+
+        src = inspect.getsource(GL.HubSet.close)
+        assert "hubreg.release" in src, \
+            "`HubSet.close()` 直接关连接 —— 组合页的会话会被交易页收尾带走"
+
+        hubreg.clear()
+        return ("同一账户两次 acquire 拿到同一对象（refs=2，换前置才换会话）；"
+                "只有最后一个使用者放手才 close（交易页先收尾不掐组合页）；"
+                "start() 幂等、关掉后能重登；查询闸门是原子的（被占时放过这一拍）；"
+                "make_hub / BrokerApi / HubSet 三处接线都走 hubreg")
+
+    check("一个账户一条会话（交易页与组合页共用同一条连接）", _one_session)
 
     # 跑完就把进度文件收掉：留着会让下一轮的诊断以为"上次崩过"。
     # 崩溃时走不到这里，文件正好留下最后一项的名字。
