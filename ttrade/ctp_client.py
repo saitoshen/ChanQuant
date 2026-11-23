@@ -11,10 +11,13 @@
 
 ## 依赖是可选的
 
-`openctp-ctp` 只有 Windows / Linux 的 x86-64 wheel，macOS 上没有。所以这个模块
-**导入不成功也不该让整个程序起不来**：`HAS_CTP` 为假时，界面照常显示账户页，
-只是连接按钮会提示「装 openctp-ctp 才能用 CTP」。CI 的 macOS 构建就是靠这条
-活下来的 —— 把 `openctp-ctp` 写进 `requirements.txt` 会让 macOS 打包直接失败。
+`openctp-ctp` 是可选的：装不上也不该让整个程序起不来 —— `HAS_CTP` 为假时，
+界面照常显示账户页，只是连接按钮会提示「装 openctp-ctp 才能用 CTP」。
+
+三个平台现在都能装，但**版本不同**：最新版 6.7.11.0 只有 win32 / win_amd64 /
+manylinux x86_64；macOS 最后一份带轮子的是 **6.7.0.9**（cp314 的
+`macosx_11_0_arm64` / `macosx_10_15_x86_64` 都有），CI 在 macOS 上钉的就是它。
+所以仍然不写进 `requirements.txt`（一个版本号满足不了三个平台），由 CI 按平台装。
 
 ## 和天勤那套的差别（迁移时最容易踩的三点）
 

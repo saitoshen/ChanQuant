@@ -87,14 +87,37 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # CTP 客户端是**可选依赖**：openctp-ctp 只有 Windows / Linux 的 wheel，
-      # macOS 上装不了。所以单独一步、只装 Windows、失败也不拦构建 ——
-      # 装不上就是包里没有 CTP（自检会照实报「未安装」），其余功能不受影响。
-      # 写进 requirements.txt 会让 macOS 打包直接挂，那条路走不通。
-      - name: 安装 CTP 客户端（可选）
-        if: runner.os == 'Windows'
+      # CTP 客户端：**三个平台都装**（2026-11-23 起 macOS 也有轮子了）。
+      #
+      #   · Windows / Linux：装最新版（目前 6.7.11.0）；
+      #   · macOS：pypi 上最后一份带 macOS 轮子的是 **6.7.0.9** ——
+      #     6.7.11.0 只发了 win32 / win_amd64 / manylinux x86_64。
+      #     6.7.0.9 的 macosx 轮子是 cp314 的（`macosx_11_0_arm64` /
+      #     `macosx_10_15_x86_64`），正好对上 CI 的 Python 3.14。
+      #     同一个 6.7 系列，柜台接口一致。
+      #
+      # 为什么仍然单独一步、失败不拦构建：pypi 抽风过一次，不能让发不出版本。
+      # 但 macOS 现在**承诺**带 CTP，所以紧接着有一步「确认 CTP 运行时可加载」
+      # 兜住 —— 装不上会在那一步红，不会悄悄发一个少功能的包。
+      # 仍然不写进 requirements.txt：那条路一挂就是整个 `pip install` 失败。
+      - name: 安装 CTP 客户端
         continue-on-error: true
-        run: python -m pip install openctp-ctp
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python -m pip install "openctp-ctp==6.7.0.9"
+          else
+            python -m pip install openctp-ctp
+          fi
+
+      # 源码环境里先确认它真能加载。冻进包之后再失败就更难查了 ——
+      # PyInstaller 对 `@loader_path` 的 dylib 处理不当，症状是
+      # `Library not loaded: @loader_path/libthosttraderapi_se.dylib`。
+      - name: 确认 CTP 运行时可加载
+        shell: bash
+        run: |
+          python -c "from ttrade import ctp_channel as C; ok, why = C.available('ctp'); print('CTP 可用:', ok, '|', why); raise SystemExit(0 if ok else 1)"
+          python -c "from openctp_ctp import thosttraderapi, thostmduserapi; print('交易/行情模块 import OK:', thosttraderapi.__name__, thostmduserapi.__name__)"
 
       # 融航**不需要**再 pip 装东西了。旧路线 `vnpy_rohon` 只有 cp310 / cp313
       # 的轮子（3.14 装不上），而且它声明依赖 vnpy，一装就把 PySide6 钉回

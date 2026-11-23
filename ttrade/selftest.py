@@ -7952,9 +7952,11 @@ def _run() -> tuple[bool, list[str]]:
     def _ctp():
         """CTP 客户端：装没装都要能跑，装了就得能构造出正确的报单参数。
 
-        `openctp-ctp` 只有 Windows / Linux 的 wheel，macOS 上没有 —— 所以这条
-        自检**不能因为没装就红**，否则 macOS 三平台构建全挂。真正要验的是
-        「没装时优雅降级」和「装了时交易所解析 / 开平映射是对的」。
+        以前 `openctp-ctp` 只有 Windows / Linux 的 wheel，macOS 上装不了，
+        所以这条自检**不能因为没装就红**。2026-11-23 起 macOS 也有了
+        （6.7.0.9 那份发了 macosx 轮子，CI 在 macOS 上钉的就是它）—— 于是
+        「macOS 上加载不了」从「正常」变成了「打包出错」，见下面的分支。
+        Linux 仍然按可选处理。
         """
         from ttrade import ctp_client as C
 
@@ -7987,6 +7989,15 @@ def _run() -> tuple[bool, list[str]]:
         except Exception:  # noqa: BLE001 - 自测里不该因通道冲突中断
             pass
         if not C.HAS_CTP:
+            # macOS 包从 3.8.9 起**承诺**带 CTP（openctp-ctp 6.7.0.9 有 macosx
+            # 轮子，CI 会装）。这里要是也不可用，只有两种可能：构建机没装上，
+            # 或者 PyInstaller 把 `.so` 和 `libthosttraderapi_se.dylib` 拆到了
+            # 不同目录（`@loader_path` 解析不到）。两种都得让构建红 ——
+            # 静默跳过的话，用户拿到的是「macOS 上点 CTP 账户说未安装」的包。
+            if sys.platform == "darwin":
+                raise RuntimeError(
+                    "macOS 发布包必须带 CTP，但它加载不了："
+                    f"{C.CTP_IMPORT_ERROR}")
             return f"openctp-ctp 未安装（CTP 不可用，其余功能不受影响）：{C.CTP_IMPORT_ERROR[:60]}"
 
         # ---- 历史委托 / 成交补查（2026-11-23 融航「今空有仓、委托框空」）

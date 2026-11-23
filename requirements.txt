@@ -66,15 +66,18 @@ threadpoolctl==3.7.0
 
 # ---- 可选依赖，故意不列进来 ----
 #
-# CTP（openctp-ctp）：只有 Windows / Linux x86-64 的 wheel，macOS 上装不了。
-# 写进这里会让 macOS 的 `pip install -r requirements.txt` 直接失败，三平台构建
-# 就废了。要接 CTP 时手动装：
+# CTP（openctp-ctp）：Windows / Linux / macOS 都有 wheel，但**版本不一样**：
+# 最新版 6.7.11.0 只发了 win32 / win_amd64 / manylinux x86_64；macOS 上最后
+# 一份带轮子的是 **6.7.0.9**（`macosx_11_0_arm64` / `macosx_10_15_x86_64`，
+# cp314 也在）。写进这里会让三平台都按同一个版本号装、macOS 直接失败，
+# 所以仍然单独列在 CI 的「安装 CTP 客户端」那一步里，按平台钉版本：
 #
-#     pip install openctp-ctp          # Windows
+#     pip install openctp-ctp                  # Windows / Linux
+#     pip install "openctp-ctp==6.7.0.9"       # macOS
 #
-# 没装也不影响任何其他功能 —— `ttrade/ctp_client.py` 用 try/except 导入，
-# `--selftest` 会照实报「openctp-ctp 未安装」。CI 里也是一步独立的、
-# `continue-on-error` 的 Windows 专属安装。
+# 没装也不影响任何其他功能 —— `ttrade/ctp_client.py` 用 try/except 导入。
+# `--selftest` 在 macOS 上会**红**（3.8.9 起 macOS 包承诺带 CTP），
+# 在 Windows / Linux 上只照实报「openctp-ctp 未安装」。
 #
 # 融航资管中台（旧路线 vnpy_rohon）：**已废弃，不要再装**。
 #

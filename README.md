@@ -2420,10 +2420,13 @@ v2.0.0 把 A 股接成了第三个大类，这一版把「接进来之后要能�
 下单前必须 `ReqSettlementInfoConfirm`，否则拒单理由是「未确认结算」；上期所要
 区分平今平昨，平仓时得先看昨仓够不够。
 
-`openctp-ctp` 只有 Windows / Linux 的 wheel，所以它是**可选依赖**：写进
-`requirements.txt` 会让 macOS 三平台构建直接挂，改成 CI 里一步独立的、
-`continue-on-error` 的 Windows 专属安装。没装时 `HAS_CTP=False`，界面照常，
-自检照实报「未安装」。
+`openctp-ctp` 早先只有 Windows / Linux 的 wheel，所以它是**可选依赖**：写进
+`requirements.txt` 会让 macOS 三平台构建直接挂，改成 CI 里一步独立的安装。
+没装时 `HAS_CTP=False`，界面照常，自检照实报「未安装」。
+
+> 2026-11-23 更新：pypi 上 6.7.0.9 那版发了 macOS 轮子（`macosx_11_0_arm64` /
+> `macosx_10_15_x86_64`，cp314 都有），最新版 6.7.11.0 反而只发 win/linux。
+> 现在 CI 三平台都装（macOS 钉 6.7.0.9），macOS 发布包也带 CTP 了。
 
 ### v2.0.0 —— A 股成为第三个大类
 

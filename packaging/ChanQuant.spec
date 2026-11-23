@@ -33,7 +33,7 @@ APP_NAME = "ChanQuant"
 BUNDLE_ID = "com.chanquant.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "3.8.8"
+VERSION = "3.8.9"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
@@ -94,16 +94,40 @@ EDB_JSON = os.path.join(ROOT, "ttrade", "edb_indicators.json")
 if os.path.isfile(EDB_JSON):
     DATAS.append((EDB_JSON, "ttrade"))
 
-# CTP 客户端是**可选**的：openctp-ctp 只有 Windows / Linux 的 wheel，macOS 上
-# 根本装不了。装了就把它的 .pyd 一起打进去，没装就跳过 —— 不能因为「这个平台
-# 没有这个包」让整个构建失败。运行时 `ttrade.ctp_client` 用 try/except 导入，
-# 缺了只影响 CTP 那一块，自检会照实报「未安装」。
+# CTP 客户端是**可选**的：装了就把运行时一起打进去，没装就跳过 —— 不能因为
+# 「这个平台没有这个包」让整个构建失败。运行时 `ttrade.ctp_client` 用 try/except
+# 导入，缺了只影响 CTP 那一块，自检会照实报「未安装」。
+#
+# 2026-11-23 起 **macOS 也有 CTP 了**：pypi 上 6.7.0.9 那份发了 macosx 轮子
+# （6.7.11.0 没有），CI 在 macOS 上钉的就是它。macOS 的轮子是 SWIG 结构，
+# 和 Windows 的「单个 .pyd」不一样：
+#
+#     openctp_ctp/_thosttraderapi.so              ← 依赖写死
+#     openctp_ctp/libthosttraderapi_se.dylib         @loader_path/libthosttraderapi_se.dylib
+#     openctp_ctp/_thostmduserapi.so
+#     openctp_ctp/libthostmduserapi_se.dylib
+#
+# 两者必须待在**同一个相对目录**里，所以 .so / .dylib 交给
+# `collect_dynamic_libs`（它按包内相对路径落位）。要是图省事只丢进 `_internal/`
+# 根目录，`@loader_path` 就指向错地方了，症状是启动时
+# `Library not loaded: @loader_path/libthosttraderapi_se.dylib` —— 而 import
+# 是被 try/except 包着的，界面上只会安静地显示「CTP 不可用」。
 try:
     import openctp_ctp  # noqa: F401
 
     DATAS += collect_data_files("openctp_ctp")
+    if sys.platform != "win32":
+        # Windows 那边是一个 .pyd（分析器顺着 hiddenimports 就收了），
+        # 不需要也不该走这条 —— 已经验证过的 Windows 打包流程别动。
+        BINARIES += collect_dynamic_libs("openctp_ctp")
     HIDDEN_CTP = ["openctp_ctp", "openctp_ctp.thostmduserapi",
                   "openctp_ctp.thosttraderapi"]
+    if sys.platform != "win32":
+        # SWIG 的 wrapper 里是 `from . import _thosttraderapi`。只列 wrapper
+        # 不够：扩展模块名带下划线前缀，静态分析有时认不出来，漏了就是
+        # 「包里只有 .py、没有 .so」。Windows 的轮子不是这个结构，不列。
+        HIDDEN_CTP += ["openctp_ctp._thostmduserapi",
+                       "openctp_ctp._thosttraderapi"]
 except Exception:  # noqa: BLE001 - 没装 / DLL 加载失败都走这里
     HIDDEN_CTP = []
 
