@@ -501,38 +501,72 @@ def lots_round(x: float) -> int:
     return int(math.floor(float(x) + 0.5))
 
 
-def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float = 0.0,
-              share: float = 1.0) -> float:
-    """这一笔该下多少手。
+def size_plan(cfg: BacktestConfig, price: float, equity: float = 0.0,
+              atr_value: float = 0.0, share: float = 1.0,
+              integer: bool = False) -> tuple[float, dict]:
+    """这一笔该下多少手 —— **全平台唯一实现**。返回 `(手数, 中间量)`。
+
+    🔴 为什么要把「中间量」一起返回：以前实盘那边为了在日志里写清「这个数是
+    怎么来的」，把五个分支的公式**又抄了一遍**（`PortfolioRunner._size`），
+    两份实现靠一条自检钉着。改一处忘另一处就分叉，而且只在某个口径、某个价位
+    上分叉，界面上看不出来。现在数字只有一个来源，日志从 `info` 里取中间量。
 
     `share`：这笔单子要跟几个方向**分**同一份预算（网格的中间震荡带里多空各挂
     一张网时是 2）。只对「按钱定手数」的口径（`budget` / `capital` / `risk`）
     生效 —— `fixed` 是「每格固定 N 手」，本来就是按份数定的，不摊。
 
-    `unit` 口径返回的是**手数**（可以是小数，名义敞口 = 权益），其余口径返回整数手。
-    手数为 0 表示这笔不做 —— 判据是「四舍五入之后是 0」，也就是**不到 0.5 手**，
-    不是「不到 1 手」（`lots_round` 是四舍五入，0.5 就算 1 手）。例外是 `budget`
-    （按分配资金定手数，四舍五入但**最少 1 手**，见下）。
+    `integer`：**只能整手**（期货真实下单）。这是实盘独有的物理约束，不是另一个
+    口径，所以做成参数而不是再写一份：
+      - `capital`：不足半手时保底 1 手（0 手 = 策略静默不动，比超配更糟）
+      - `unit`   ：四舍五入取整 + 保底 1 手（回测里它可以是小数手）
+      - 其余三种本来就是整数手，`integer` 不影响
+
+    回测必须传 `False`（保持「四舍五入到 0 就是这笔不做」）。
+
+    `unit` 口径返回的是**手数**（回测里可以是小数，名义敞口 = 权益），其余口径
+    返回整数手。手数为 0 表示这笔不做 —— 判据是「四舍五入之后是 0」，也就是
+    **不到 0.5 手**，不是「不到 1 手」（`lots_round` 是四舍五入，0.5 就算 1 手）。
+    例外是 `budget`（按分配资金定手数，四舍五入但**最少 1 手**，见下）。
 
     **五种口径都是单利**：手数只看「本金（或分配的那部分）/ 止损金额 / 固定
     手数」，不看账户当前权益。赚了不加大仓位，亏了也不缩 —— 回测出来的是
     「这套规则在固定本金下能赚多少」，而不是「复利滚了二十年之后的奇迹」。
     """
-    if price <= 0:
-        return 0.0
     mode = (cfg.sizing or "unit").lower()
-    mult = float(cfg.multiplier or 1.0)
+    info: dict = {"mode": mode, "price": float(price), "integer": bool(integer),
+                  "share": float(share or 1.0),
+                  "mult": float(cfg.multiplier or 1.0),
+                  "margin_rate": float(cfg.margin_rate or 0.0),
+                  "budget": float(cfg.budget or 0.0),
+                  "principal": float(cfg.initial_cash or 0.0),
+                  "raw": 0.0, "per": 0.0, "floored": False, "note": ""}
+    if price <= 0 and mode != "fixed":
+        info["note"] = "没有价格"
+        if integer:
+            # 实盘拿不到报价：不能静默变成 0 手（0 手会被读成「策略看空」），
+            # 先按 1 手占位；真下单那一步照样过不去（没有可报的价）
+            return 1.0, info
+        return 0.0, info
+    mult = info["mult"]
     if mode == "fixed":
-        return float(max(1, int(cfg.volume or 1)))
+        # 固定手数**不看价格**，所以放在「没有价格就 0 手」那道闸门之前：
+        # 实盘拿不到行情报价时照样该下 `volume` 手（价格是券商那边撮合的），
+        # 而 `capital` / `risk` 那些口径没价格就真的算不出来
+        n = float(max(1, int(cfg.volume or 1)))
+        info["raw"] = n                   # `per` 留 0：固定手数不看每手成本
+        return n, info
     if mode == "risk":
         per = float(cfg.stop_mult or 0) * float(atr_value or 0) * mult
+        info["per"] = per
         if per <= 0:
-            return 1.0                      # ATR 还没暖起来：先 1 手，别裸奔
+            info.update(raw=1.0, note="ATR 还没暖起来")
+            return 1.0, info              # ATR 还没暖起来：先 1 手，别裸奔
         # 四舍五入：向下取整会让「打止损就亏 risk_amount」这一条永远偏保守，
         # 手数小的时候（2.4 手 → 2 手）实际风险比设定少 17%，看起来像策略
         # 比设定更安全 —— 偏差方向和 capital 口径一样，都是「永远偏少」
-        return float(max(1, lots_round(float(cfg.risk_amount or 0)
-                                       / max(share, 1e-9) / per)))
+        raw = float(cfg.risk_amount or 0) / max(share, 1e-9) / per
+        info["raw"] = raw
+        return float(max(1, lots_round(raw))), info
     if mode == "budget":
         # 「按分配资金定手数」：手数 = 分配的钱 ÷ 这一手要花的钱（价格×乘数），
         # **四舍五入**，且**不足一手按 1 手**。
@@ -542,14 +576,19 @@ def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float
         # 代价是低资金账户的实际杠杆会**高于**设定杠杆（43 万预算买 120 万货）。
         # 要按保证金口径（整手、钱不够就不做）请用 `capital`。
         per = price * mult
+        info["per"] = per
         if per <= 0:
-            return 0.0
-        return float(max(1, lots_round(float(cfg.budget or 0.0)
-                                       / max(share, 1e-9) / per)))
+            info["note"] = "没有价格 / 乘数"
+            return 0.0, info
+        raw = float(cfg.budget or 0.0) / max(share, 1e-9) / per
+        info["raw"] = raw
+        return float(max(1, lots_round(raw))), info
     if mode == "capital":
         per = price * mult * float(cfg.margin_rate or 0)
+        info["per"] = per
         if per <= 0:
-            return 1.0
+            info.update(raw=1.0, note="算不出每手保证金")
+            return 1.0, info
         # 分配资金 ÷ 每手保证金，**固定用分配的那笔钱**，不随盈亏变。
         # 按当前权益收口就变成复利了：50 万赚到 80 万会自己加到 80 万的仓，
         # 亏到 30 万又自动减到 30 万 —— 那是另一套策略，不是用户要的「单利」。
@@ -563,13 +602,42 @@ def size_lots(cfg: BacktestConfig, price: float, equity: float, atr_value: float
         # 因为它的语义是「只准用分配的那笔钱」；`budget` 是网格的口径，买不起
         # 也至少 1 手（见上面那段）。
         raw = cfg.budget / max(share, 1e-9) / per
-        return float(lots_round(raw))
+        info["raw"] = raw
+        n = lots_round(raw)
+        if integer and n < 1:
+            # 实盘：0 手 = 策略静默不动，比「超一点预算」糟得多（还会被读成
+            # 「策略看空」）。这一手明显超预算，`_size` 会把它写进日志
+            info["floored"] = True
+            n = 1
+        return float(n), info
     # 名义敞口 = **本金**（固定）。原来是「当前权益」，权益从 10 万涨到 34 万，
     # 手数跟着放大 3.4 倍 —— 那是复利，和其余三种口径不是一套东西：双均线 /
     # 唐奇安 / 海龟 / 通道突破 / MACD 这几条老策略因此会跑出「越赚越猛」的曲线，
     # 和固定手数的结果没法比。改成盯本金之后，四种口径统一是单利。
     # 期货一手是 price × 乘数，不除乘数的话「不加杠杆」会变成 10 倍杠杆
-    return float(max(float(cfg.initial_cash or equity or 0.0), 0.0) / (price * mult))
+    per = price * mult
+    info["per"] = per
+    raw = float(max(float(cfg.initial_cash or equity or 0.0), 0.0)) / per
+    info["raw"] = raw
+    if integer:
+        info["floored"] = raw < 0.5
+        return float(max(1, lots_round(raw))), info
+    return raw, info
+
+
+def size_lots(cfg: BacktestConfig, price: float, equity: float = 0.0,
+              atr_value: float = 0.0, share: float = 1.0,
+              integer: bool = False) -> float:
+    """这一笔该下多少手（`size_plan` 的薄包装，签名和返回保持向后兼容）。
+
+    🔴 **公式只有一份**，就是 `size_plan`。实盘（`PortfolioRunner._size`）
+    传 `integer=True` 调同一个函数，不再自己抄五个分支 —— 两份实现靠自检钉着
+    迟早会分叉，而且只在一个口径、一个价位上分叉，界面上看不出来。
+
+    `integer=True` 时 `capital` / `unit` 会取整并保底 1 手（实盘只能整手）；
+    回测保持 `False`，`unit` 仍然返回小数手、`capital` 仍然「钱不够就是 0 手」。
+    """
+    return size_plan(cfg, price, equity, atr_value, share, integer)[0]
 
 
 def size_lots_intrabar(cfg: BacktestConfig, price: float, equity: float,

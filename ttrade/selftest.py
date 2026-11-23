@@ -3317,15 +3317,44 @@ def _run() -> tuple[bool, list[str]]:
                     raise RuntimeError(
                         f"预算 {raw_n:.2f} 手（{per * raw_n:,.0f} 元）：回测给 "
                         f"{g_bt} 手（应 {exp_bt}）、实盘给 {g_live} 手（应 {exp_live}）")
+
+            # ⑦ **公式只有一份**：`size_lots` 是 `size_plan` 的薄包装，实盘 `_size`
+            #    也调 `size_plan(integer=True)`。上面 ①~⑥ 全是「两份实现、对拍数字」，
+            #    改一处忘另一处只会在某个口径、某个价位上分叉（0.45 手那条线就是），
+            #    连对拍都可能覆盖不到。这里直接钉住实现：源码里不许再出现取整公式。
+            import inspect
+
+            for name in ("_size", "_entry_lots_at", "_ib_arm"):
+                src = inspect.getsource(getattr(SR.PortfolioRunner, name))
+                body = "\n".join(ln for ln in src.splitlines()
+                                 if not ln.lstrip().startswith("#"))
+                if "lots_round(" in body:
+                    raise RuntimeError(
+                        f"实盘 `{name}` 又自己算手数了（源码里出现 lots_round）—— "
+                        "手数公式只许有 `backtest.size_plan` 一份")
+            for m in ("capital", "budget", "risk", "unit", "fixed"):
+                for atr_v in (0.0, 1.7, 12.3):
+                    c = mk(sizing=m, capital=per * 4.77)
+                    b = replay.make_bt("cn", False, c)
+                    n_i = int(BT.size_plan(b, px, 0.0, atr_v, integer=True)[0])
+                    g_i, _w = live_n(c)
+                    if g_i != n_i:
+                        raise RuntimeError(
+                            f"{m} 口径：实盘 {g_i} 手 ≠ size_plan(integer=True) {n_i} 手")
+                    if abs(BT.size_lots(b, px, b.initial_cash, atr_v)
+                           - BT.size_plan(b, px, b.initial_cash, atr_v)[0]) > 1e-9:
+                        raise RuntimeError("`size_lots` 不再是 `size_plan` 的薄包装")
         finally:
             SI.info = real_info
-
-        return ("同一张品种信息表：回测 size_lots 与实盘 _size 同输入同手数"
-                "（capital / budget）；改保证金率两边同步变；表里缺失时兜底一致；"
-                "乘数缺失实盘守 1 手；算手数全程不碰天勤行情；"
+        return ("**手数公式只有一份**（`backtest.size_plan`）：`size_lots` 是它的"
+                "薄包装，实盘 `_size` / `_entry_lots_at` / `_ib_arm` 都调它"
+                "（`integer=True`），源码里不许再出现取整公式；"
+                "同一张品种信息表 ⇒ 同输入同手数（capital / budget）；"
+                "改保证金率两边同步变；表里缺失时兜底一致；乘数缺失实盘守 1 手；"
+                "算手数全程不碰天勤行情；"
                 "取整一律四舍五入（4.77→5、2.5→3，不是截断也不是银行家舍入），"
                 "0.6 手两边都给 1 手（分界点是 0.5，不是 1.0）；"
-                "只有 <0.5 手才分叉：回测 0 手、实盘保底 1 手")
+                "只有 <0.5 手才分叉：回测 0 手、实盘保底 1 手（`integer=True`）")
 
     check("实盘与回测手数同源（品种信息表）", _lots_same_source)
 

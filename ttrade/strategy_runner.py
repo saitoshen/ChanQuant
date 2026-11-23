@@ -57,7 +57,7 @@ from ttrade import (barclock, daylimit, orderbook, positionbook, topup, tqdata,
 from ttrade import strategy_store as SStore
 from ttrade import specs, symbols_info
 from ttrade.market_feed import MarketFeed
-from ttrade.backtest import lots_round, size_lots_intrabar
+from ttrade.backtest import size_lots_intrabar, size_plan
 from ttrade.strategies import STRATEGIES, next_levels, run_strategy
 from ttrade.tqfetch import PERIOD_SEC
 from ttrade.tqlive import (BACKEND_LABELS, AccountSpec, bars_from_serial,
@@ -198,6 +198,25 @@ def default_margin_rate(symbol: str) -> float:
     两边兜底率必须一样，否则表里漏填一个数就又是两套手数。
     """
     return specs.margin_rate(symbol)
+
+
+def bt_cfg(cfg):
+    """实盘策略配置 → **回测那一份** `BacktestConfig`（手数的唯一入口）。
+
+    `replay.make_bt()` 已经把这八件事映射好了：`sizing` / `capital`（←本金×比例）
+    / `risk_amount` / `stop_mult` / `stop_atr_n` / `volume` / 本金 / 合约乘数与
+    保证金率（读「品种信息」表，和 `_terms` 同一张）。实盘再自己写一遍就是第二
+    个口径 —— 2026-11-19 那次「回测 4 手、实盘 1 手」就是这么来的。
+
+    `market` 用 `replay.market_of()` 而不是 `cfg.market`：前者只看 `exchange`
+    （空则看品种池），自检里拿 `SimpleNamespace` 造配置时也能判对；后者是
+    `StrategyConfig` 上的属性，替身对象没有。
+
+    每次现造，不缓存：`make_bt` 只是一串字典取值 + 一次 `symbols_info.info`
+    （覆盖表进程内已缓存），比 `_terms` 原来那次查询不多什么。
+    """
+    return replay.make_bt(replay.market_of(cfg),
+                          replay.resolve_allow_short(cfg), cfg)
 
 
 def atr(df: pd.DataFrame, n: int = 14) -> float:
@@ -2114,7 +2133,9 @@ class PortfolioRunner:
             d = float(lv["stop_dist"])
             m = self._volume_multiple(st)
             if d == d and d > 0 and m > 0:
-                st.lots = max(1, lots_round(float(st.cfg.risk_amount or 0) / (d * m)))
+                # 与回测同一个函数（`size_lots_intrabar`）；原来这里自己写了一遍
+                # `max(1, lots_round(risk_amount/(d×m)))`，是第三份副本
+                st.lots = int(size_lots_intrabar(bt_cfg(st.cfg), 0.0, 0.0, d, m))
         st.ib_fired = False
         st.ib_armed = True
 
@@ -2750,8 +2771,7 @@ class PortfolioRunner:
         if len(df) < 2:
             return None
         try:
-            bt = replay.make_bt(st.cfg.market, replay.resolve_allow_short(st.cfg),
-                                st.cfg)
+            bt = bt_cfg(st.cfg)
         except Exception:                    # noqa: BLE001 - 造不出配置就当没仓
             return None
         cache = getattr(self, "_ibt_cache", None)
@@ -2792,7 +2812,9 @@ class PortfolioRunner:
                 d = float("nan")
             m = self._volume_multiple(st)
             if d == d and d > 0 and m > 0:
-                return max(1, lots_round(float(cfg.risk_amount or 0) / (d * m)))
+                # 和回测 K 线内那一族**同一个函数**（`size_lots_intrabar` 的 risk
+                # 分支就是 `max(1, lots_round(risk_amount / (stop_dist × 乘数)))`）
+                return int(size_lots_intrabar(bt_cfg(cfg), float(px), 0.0, d, m))
         try:
             cut = df.iloc[: j + 1]
             a = atr(cut, cfg.stop_atr_n)
@@ -3314,67 +3336,79 @@ class PortfolioRunner:
         return int(n)
 
     def _size(self, st: SlotState, price: float, atr_value: float) -> tuple[int, str]:
-        """算手数，并返回「这个数是怎么来的」（给 `_lots` 记日志用）。"""
+        """算手数，并返回「这个数是怎么来的」（给 `_lots` 记日志用）。
+
+        🔴 **公式只有一份**：`backtest.size_plan(..., integer=True)`。这里只做
+        三件事 —— ① 把实盘配置映射成回测配置（`bt_cfg`）；② 传 `integer=True`
+        （实盘只能整手，这是物理约束，不是另一个口径）；③ 把返回的中间量讲成
+        人话给日志。
+
+        以前这里和 `size_lots` 各写一份五分支实现，靠一条自检钉着。改一处忘
+        另一处就分叉，而且只在某个口径、某个价位上分叉（比如 0.45 手那条线），
+        界面上看不出来 —— 用户只能看到「回测 4 手、实盘 1 手」。
+        """
         cfg = st.cfg
         mode = (cfg.sizing or "capital").lower()
+        # `_terms` 只为了在日志里点名「乘数没维护 / 保证金率兜底」——数字不吃它。
+        # 但**乘数是 0 这一条必须当闸门**：`replay.make_bt` 对缺失的乘数兜底成
+        # 1.0（回测那边「别崩」够了），照它算就是 105,033 ÷ (110×1×3%) = 31,810 手。
+        # 2026-11-23 自检当场抓到这一条：共用公式之后，安全网不能跟着丢。
+        mult, _rate, src = self._terms(cfg)
+        if mode != "fixed" and mult <= 0:
+            return 1, f"乘数没维护（{src}）：先 1 手，不按兜底乘数放大手数"
+        try:
+            bt = bt_cfg(cfg)
+        except Exception as exc:              # noqa: BLE001 - 造不出配置也要能下单
+            return 1, f"造不出回测配置（{type(exc).__name__}: {exc}）：先 1 手"
+        n, plan = size_plan(bt, float(price), 0.0, atr_value, integer=True)
+        n = int(n)
+        mode = str(plan.get("mode") or mode)
+        mult = float(plan.get("mult") or 0.0)
+        rate = float(plan.get("margin_rate") or 0.0)
+        raw = float(plan.get("raw") or 0.0)
+        per = float(plan.get("per") or 0.0)
+        budget = float(plan.get("budget") or 0.0)
+
         if mode == "fixed":
-            n = max(1, int(cfg.volume or 1))
             return n, f"固定手数 {n}"
-
-        mult, rate, src = self._terms(cfg)
-
         if mode == "risk":
-            stop_px = max(0.0, float(cfg.stop_mult or 0)) * float(atr_value or 0)
-            if stop_px <= 0 or mult <= 0:
-                return 1, "拿不到 ATR / 乘数：先 1 手，别裸奔"
-            per_lot = stop_px * mult
-            n = max(1, lots_round(float(cfg.risk_amount or 0) / per_lot))
-            return n, (f"risk 口径，止损额 {float(cfg.risk_amount or 0):,.0f} ÷ "
-                       f"(止损距离 {stop_px:.4g} × 乘数 {mult:g}，{src})")
-
-        per_margin = price * mult * rate if (price > 0 and mult > 0) else 0.0
-
+            stop_px = float(cfg.stop_mult or 0) * float(atr_value or 0)
+            if not plan.get("note"):
+                return n, (f"risk 口径，止损额 {float(cfg.risk_amount or 0):,.0f} ÷ "
+                           f"(止损距离 {stop_px:.4g} × 乘数 {mult:g}，{src})")
+            return n, f"%s：先 {n} 手" % plan["note"]
         if mode == "budget":
-            # 名义口径：和 `backtest.size_lots` 的 budget 分支逐字对齐
-            per = price * mult
-            if per <= 0:
-                return 1, "拿不到价格 / 乘数：先 1 手"
-            budget = float(cfg.capital or 0) or float(cfg.principal or 0)
-            n = max(1, lots_round(budget / per))
+            if plan.get("note"):
+                return n, f"{plan['note']}：先 {n} 手"
             return n, (f"budget 口径，预算 {budget:,.0f} ÷ 名义 {per:,.0f}"
                        f"（乘数 {mult:g}，价 {price:.3f}）")
         if mode == "unit":
-            per = price * mult
-            if per <= 0:
-                return 1, "拿不到价格 / 乘数：先 1 手"
-            n = max(1, lots_round(float(cfg.principal or 0) / per))
-            return n, (f"unit 口径，本金 {float(cfg.principal or 0):,.0f} ÷ "
-                       f"名义 {per:,.0f}（乘数 {mult:g}，价 {price:.3f}）")
+            if plan.get("note"):
+                return n, f"{plan['note']}：先 {n} 手"
+            why = (f"unit 口径，本金 {float(plan.get('principal') or 0):,.0f} ÷ "
+                   f"名义 {per:,.0f}（乘数 {mult:g}，价 {price:.3f}）")
+            if plan.get("floored"):
+                why += (f"；本金只够 {raw:.2f} 手，实盘按 1 手兜底"
+                        "（回测在这是 0~小数手）")
+            return n, why
 
-        if per_margin <= 0:
-            return 1, f"算不出每手保证金（{src}）：先 1 手"
-        # 取整和回测**同一个函数**（`backtest.lots_round` = 四舍五入）。
-        # 以前这里和 `size_lots` 都是 `int()` 截断，一手不到就少配半手；
-        # 两边各写一份取整，还会在「谁改了谁没改」上再分叉一次。
-        # 🔴 0.5 手就算 1 手，两边口径一致；分界点在 0.5，不是 1.0
-        raw = float(cfg.capital or 0) / per_margin
-        n = max(1, lots_round(raw))
-        why = (f"capital 口径，预算 {float(cfg.capital or 0):,.0f} ÷ "
-               f"每手保证金 {per_margin:,.0f}"
+        # capital（默认）
+        if plan.get("note"):
+            return n, f"{plan['note']}（{src}）：先 {n} 手"
+        why = (f"capital 口径，预算 {budget:,.0f} ÷ 每手保证金 {per:,.0f}"
                f"（{src}：乘数 {mult:g} × 价 {price:.3f} × 保证金率 {rate:.2%}）")
-        if raw < 0.5:
+        if plan.get("floored"):
             # 回测在这是 0 手（四舍五入到 0，钱不够半手），实盘保底 1 手而不是
             # 不动 —— 但这一手会明显超出预算，必须说出来，否则就是「开了但不知道
             # 为什么被拒」。
             # 🔴 分界点是 0.5 不是 1：0.6 手四舍五入就是 1 手，两边一致，不该报警
             why += (f"；预算只够 {raw:.2f} 手（不足半手，回测在这里是 0 手），"
-                    f"实盘按 1 手兜底，可能因保证金不足被拒")
-        elif n > raw:
+                    "实盘按 1 手兜底，可能因保证金不足被拒")
+        elif per > 0 and n > raw:
             # 四舍五入会略微超出预算（4.77 手 → 5 手 = 多占 4.8%）。这是这个
             # 取整口径的必然代价，写清楚才不会让人以为占用算错了
-            over = n * per_margin / max(float(cfg.capital or 0), 1e-9) - 1.0
-            why += (f"；四舍五入进位，占用 {n * per_margin:,.0f}，"
-                    f"超预算 {over:.1%}")
+            over = n * per / max(budget, 1e-9) - 1.0
+            why += (f"；四舍五入进位，占用 {n * per:,.0f}，超预算 {over:.1%}")
         return n, why
 
     # ---- 调仓 ----
