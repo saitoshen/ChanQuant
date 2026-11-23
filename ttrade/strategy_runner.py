@@ -252,7 +252,11 @@ class SlotState:
     running: bool = False
     signal: int = 0
     lots: int = 1              # 一次满仓对应几手（按资金 / 止损金额算出来）
-    target: int = 0            # 策略理论净仓（手）
+    #: **下单目标**（手）。普通策略它就等于「理论净仓」= signal × lots；
+    #: K 线内那一族（`sbbox_ib` 等）只有盘中碰到触发价才会变 —— 它们的理论
+    #: 净仓另算（`_theo_qty`，= signal × lots，与回测同一口径），因为「策略
+    #: 认为该持多少」和「现在该不该按这个价发单」是两件事。
+    target: int = 0
     # **这条策略自己**在各合约上的净仓（手），按自己委托的成交累计，落盘在
     # `positionbook`。不是账户净仓 —— 账户是所有策略 + 手工单 + 别的平台的和，
     # 拿它当自己的仓，同品种两条策略就会互相把对方的仓当成自己的。
@@ -1215,7 +1219,13 @@ class PortfolioRunner:
         # 固定手数模式例外：手数就写在配置里，立刻生效，不用等行情。
         if (cfg.sizing or "capital").lower() == "fixed":
             st.lots = max(1, int(cfg.volume or 1))
-        st.target = st.signal * max(1, st.lots)
+        # 🔴 K 线内那一族**不按 signal 反推目标仓**：它的 target 只能由盘中触发价
+        # 给（`_ib_arm` / `_intrabar_tick`）。`signal` 从 2026-11-23 起保留真值
+        # （给「理论持仓」列用），这里照旧套公式就成了「改一次手数 → 拿一根已经
+        # 收盘的 bar 去追一个过去的价位」，等于凭空发一笔单。手数改了等下一根
+        # `_ib_arm` 自然会重算（它按止损距离定手数）。
+        if not self._ib_on(st):
+            st.target = st.signal * max(1, st.lots)
         # 策略参数（快线 / 慢线）也可能一起改了。不清掉 last_bar 的话，
         # `_refresh_signal` 认为「这根 bar 算过了」直接早退，新参数要等下一根
         # K 线才生效 —— 用户会以为改了没用。
@@ -1726,13 +1736,31 @@ class PortfolioRunner:
             st.signal = min(0, st.signal)     # 禁止做多：+1 砍成空仓，只留空头
         st.lots = self._lots(st, self._mark_price(st, df), atr(df, st.cfg.stop_atr_n))
         if self._ib_on(st):
-            # K 线内那一族不用 `signal` 定目标仓 —— 入场 / 止损由盘中触发价
-            # 决定（见 `_intrabar_tick`）。这根 bar 在这里只做两件事：
-            # ① 重算本根的触发价；② 执行上一根收盘留下的「反向突破离场」
-            st.signal = 0
+            # K 线内那一族**不用 signal 定下单目标** —— 入场 / 止损由盘中触发价
+            # 决定（见 `_intrabar_tick`）。这根 bar 在这里只做三件事：
+            # ① 算「理论持仓」；② 重算本根的触发价；③ 执行上一根收盘留下的
+            #    「反向突破离场」。
+            #
+            # 🔴 ① 是 2026-11-23 补的，之前这里是 `st.signal = 0`。
+            # `signal` 被清 0 之后，「理论」列和两个盈亏列（都按 `signal × lots`
+            # 或 `target` 算）对 K 线内策略**永远是 +0**：用户看到「sbbox 多品种
+            # 波段1h 的 34 个品种理论持仓全是 0」，可回测里明明有 29 个品种持仓。
+            # 那 29 个正好等于 `run_strategy("sbbox_ib")` 最后一根上非零信号的
+            # 品种数 —— 状态机说得清清楚楚，是这一行把它擦了。
+            #
+            # 理论仓和下单目标是**两件事**：理论仓是「策略口径该持多少」（回测
+            # 同一个数，与有没有触发、账户有没有成交无关，见 `_theo_qty`）；
+            # 下单目标只能由触发价给（`_ib_arm`），拿 signal 直接下单就等于
+            # 用「这根已经收盘的 bar」去追一个已经过去的价位。
+            st.signal = self._signal(st, df)
+            if st.cfg.note != "short":
+                st.signal = max(0, st.signal)
+            elif getattr(st.cfg, "short_only", False):
+                st.signal = min(0, st.signal)
             if not open_now:
                 # K 线内那一族的触发价要盘中价格才算得出来，收盘后重算只会
-                # 把最后一根的价位当成「现在」。保留上一轮的目标就行。
+                # 把最后一根的价位当成「现在」。保留上一轮的目标就行
+                # （理论仓已经算好了，界面看得到）。
                 return
             self._ib_arm(st, full)
             return
@@ -2633,6 +2661,25 @@ class PortfolioRunner:
             return
         self._put_theo(st, got, sig, THEO_SIG)
 
+    def _theo_qty(self, st: SlotState) -> int:
+        """策略口径的**理论持仓**（手，带符号）。对应回测里的 position 那一列。
+
+        - 普通策略：直接用 `target`（它本来就是 `signal × lots`，正负即方向）；
+        - **K 线内那一族**（`sbbox_ib` / `strat_im_orb` 这类）：用
+          `signal × lots`。它们的 `target` 是「下单目标」——盘中没碰到触发价
+          就是 0。拿 `target` 当理论仓，界面会一直说「策略空仓」，而回测在
+          同一根 bar 上明明是持仓的：2026-11-23 用户报「sbbox多品种波段1h 的
+          34 个品种理论持仓全是 0，回测里 29 个品种有仓」，这 29 个正好是
+          `run_strategy("sbbox_ib")` 最后一根上非零信号的品种数。
+
+        🔴 与账户、台账、成交一律无关（用户 2026-11-20 两次强调的口径）。
+        也**不**能拿去下单：下单目标必须由触发价给，见 `_refresh_signal` 里
+        K 线内那一支的注释。
+        """
+        if self._ib_on(st):
+            return int(getattr(st, "signal", 0) or 0) * int(st.lots or 0)
+        return int(getattr(st, "target", 0) or 0)
+
     def _slot_pnl(self, st: SlotState) -> tuple[float, float, float, str]:
         """这条策略的「品种价格 / 当日盈亏 / 持仓盈亏」——**全是理论值**。
 
@@ -2640,7 +2687,8 @@ class PortfolioRunner:
         「持仓盈亏和当日盈亏都是策略理论上的，和实际账户交易无关」
         「不需要和实际交易和台账的情况拿来算」
 
-        所以两个数**只读三样东西**：理论仓位 `target`（= signal × lots）、
+        所以两个数**只读三样东西**：理论仓位（`_theo_qty`：普通策略 = `target`
+        = signal × lots，K 线内那一族 = signal × lots）、
         理论建仓价 `theo_px`（**策略自己写下来的**，见 `SlotState.theo_src`）、
         当前行情价。台账 `held` / 均价 `cost` / 已落袋 `real_day` **一律不参与**
         —— 以前拿它们算，于是「实际成交和理论不一致」时这两列会跟着实际仓走，
@@ -2663,7 +2711,7 @@ class PortfolioRunner:
         +55,400，而持仓盈亏只有 +8,080，差 6.9 倍）。
         """
         price = self._last_px(st.underlying)
-        qty = int(getattr(st, "target", 0) or 0)
+        qty = self._theo_qty(st)
         if not qty:
             # 理论空仓：没有仓就没有盈亏。不能写 None —— 用户会以为「算不出来」
             return price, 0.0, 0.0, ""
@@ -4438,6 +4486,10 @@ class PortfolioRunner:
                 "running": st.running,
                 "signal": st.signal,
                 "target": st.target,
+                # 「理论持仓」——界面「理论」列和两个盈亏列按它算。
+                # 大多数策略 `theo == target`；K 线内那一族不一样：`target` 是
+                # 下单目标（没触发就是 0），`theo` 才是策略口径该持多少
+                "theo": self._theo_qty(st),
                 "underlying": st.underlying,
                 # 品种价格 / 当日盈亏 / 持仓盈亏。NaN 一律转 None —— 界面拿
                 # 「不知道」显示成「—」，不能显示成 0（0 会被读成「不赚不亏」）

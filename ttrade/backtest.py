@@ -698,6 +698,13 @@ def run_intrabar_backtest(data: pd.DataFrame, cfg: BacktestConfig,
         # 「只做多」在老路径上靠裁 `signal` 实现，这里没有 signal 可裁 —— 只能
         # 把做空触发价整列抹掉。不抹的话，界面上勾了「只做多」，回测还是会做空
         e_short = np.full(n, np.nan, dtype=float)
+    if cfg.short_only:
+        # 🔴 「禁止做多（只做空）」在这条分支上**曾经完全不起作用**
+        # （2026-11-23 用户：「箱体波幅突破.k线内策略，选择禁止做多，依然还开出
+        # 了多单」）。老路径靠裁 `signal` 实现，K 线内没有 signal —— 只能把做多
+        # 触发价整列抹掉。上面 `long_only` 有对应的一行，`short_only` 漏了，
+        # 于是这个开关对 `sbbox_ib` / `im_orb` 这一族全是摆设：勾了照样开多。
+        e_long = np.full(n, np.nan, dtype=float)
     x_long = _num_col(data, "exit_long", n)
     x_short = _num_col(data, "exit_short", n)
     stop_d = _num_col(data, "stop_dist", n)

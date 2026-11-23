@@ -1202,11 +1202,12 @@ def _run() -> tuple[bool, list[str]]:
     def _intrabar():
         """K 线内进出场（`run_intrabar_backtest`）。
 
-        这条分支容易出的错都是「不报错、只是数字悄悄变好看」那种，所以五件事
-        必须逐条验：入口成交在**触发价**（不是下一根开盘）、止损成交在
+        这条分支容易出的错都是「不报错、只是数字悄悄变好看」那种，所以必须
+        逐条验：入口成交在**触发价**（不是下一根开盘）、止损成交在
         **止损价**、拿掉那几列之后老路径**一个数都不许变**、**进场当根不出场**
         （逐笔 bars>0，且只有诊断开关能造出 bars==0）、显式打开
-        `intrabar_samebar_stop` 才在当根扫。
+        `intrabar_samebar_stop` 才在当根扫、**「只做多 / 禁止做多」两个方向
+        开关都真的起作用**（`short_only` 曾经漏在这条分支里，勾了照样开多）。
         """
         import numpy as np
         import pandas as pd
@@ -1243,6 +1244,38 @@ def _run() -> tuple[bool, list[str]]:
         # 止损 105 − 4 = 101，当根最低 103 没打到 ⇒ 应该还在持仓
         if not t.open_position:
             raise RuntimeError("当根最低 103 没到止损 101，不该平仓")
+
+        # ---- 方向开关：`long_only` 和 `short_only` 两条都必须真起作用 ----
+        #
+        # 用户 2026-11-23：「箱体波幅突破.k线内策略，选择禁止做多，依然还开出了
+        # 多单，说明这个禁止做多选项对这个策略没有起到作用」。`long_only` 一直
+        # 有（抹 `entry_short` 那一行），`short_only` **漏了** —— 老路径靠裁
+        # signal 实现，K 线内没有 signal，于是这个开关对 `sbbox_ib` / `im_orb`
+        # 这一族全是摆设，勾了照样开多。
+        from dataclasses import replace as _replace
+
+        r3 = run_backtest(d, _replace(cfg, short_only=True), label="K线内")
+        if len(r3.trades):
+            raise RuntimeError(
+                f"勾了「禁止做多」还开出 {len(r3.trades)} 笔 "
+                f"（方向 {[t.direction for t in r3.trades]}）—— "
+                "做多触发价没被抹掉")
+        # 对照：同一份数据不勾就该开得出来，否则上面那条断言是假绿
+        if not len(run_backtest(d, cfg, label="K线内").trades):
+            raise RuntimeError("对照组一笔都没开，这条断言测不到东西")
+
+        # 反方向同理：`long_only` 必须把 `entry_short` 抹掉
+        d_s = d.copy()
+        d_s["entry_long"] = np.nan
+        d_s.iloc[6, d_s.columns.get_loc("entry_short")] = 95.0
+        d_s.iloc[6, d_s.columns.get_loc("low")] = 94.0
+        r4 = run_backtest(d_s, _replace(cfg, long_only=True), label="K线内")
+        if len(r4.trades):
+            raise RuntimeError(
+                f"勾了「只做多」还开出 {len(r4.trades)} 笔空单 —— "
+                "做空触发价没被抹掉")
+        if not len(run_backtest(d_s, cfg, label="K线内").trades):
+            raise RuntimeError("只做空那份样本本身不触发，测不到东西")
 
         # ---- 同根止损：**默认关**，进场当根不判止损 ----
         #
@@ -1493,6 +1526,102 @@ def _run() -> tuple[bool, list[str]]:
                 f"按止损金额定仓 {want_lots} 手、无列时走老路径")
 
     check("K 线内进出场（触发价 / 进场当根不出场 / 老路径不变）", _intrabar)
+
+    def _ib_theo():
+        """K 线内策略的「理论持仓」= signal × lots，**不是** target。
+
+        用户 2026-11-23：「波段策略工作区加载的 sbbox 策略，显示理论持仓是 0，
+        但是查看回测里头，交易记录有挺多品种有持仓」。
+
+        真因是 `_refresh_signal` 里 K 线内那一支写了 `st.signal = 0`：signal 一清，
+        「理论」列和两个盈亏列（都按 signal × lots / target 算）对 K 线内策略
+        永远是 +0。实测那条 `sbbox多品种波段1h` 的 34 个品种里，
+        `run_strategy("sbbox_ib")` 最后一根上有 **29 个非零**，正好等于回测里
+        「持仓中 29 笔」—— 状态机从来没说空仓，是引擎把信号擦了。
+
+        反方向的坑也要钉住：**理论仓 ≠ 下单目标**。拿 signal 直接下单等于用一根
+        已经收盘的 bar 去追一个过去的价位，所以改手数那处（`_update_one`）也不许
+        按 signal 反推 K 线内策略的 target。
+        """
+        import inspect
+
+        from ttrade import strategy_runner as SR
+        from ttrade import strategy_store as SStore
+
+        class _Fake:
+            """只借三个方法：`_ib_on` / `_theo_qty` / `_update_one`。"""
+
+            _ib_on = staticmethod(SR.PortfolioRunner._ib_on)
+            _theo_qty = SR.PortfolioRunner._theo_qty
+            _update_one = SR.PortfolioRunner._update_one
+            _slots: dict = {}
+
+        def mk(sid: str, rule_key: str, **kw):
+            return SStore.StrategyConfig(
+                sid=sid, name=sid, symbol="RB", exchange="SHFE", period="1h",
+                family="rule", rule_key=rule_key, **kw)
+
+        f = _Fake()
+
+        # ① K 线内：理论仓 = signal × lots；target 仍是 0（盘中还没碰到触发价）
+        st = SR.SlotState(cfg=mk("t-ib", "sbbox_ib", sizing="fixed", volume=1))
+        st.running, st.signal, st.lots, st.target = True, -1, 32, 0
+        got = f._theo_qty(st)
+        if got != -32:
+            raise RuntimeError(
+                f"K 线内策略的理论仓该是 signal×lots = -32，实际 {got} —— "
+                "「理论持仓」列又会显示成 0（2026-11-23 用户报的 sbbox）")
+
+        # ② 普通策略：理论仓就是 target
+        st2 = SR.SlotState(cfg=mk("t-plain", "ma_cross", sizing="fixed",
+                                  volume=1))
+        st2.running, st2.signal, st2.lots, st2.target = True, -1, 1, -1
+        if f._theo_qty(st2) != -1:
+            raise RuntimeError("普通策略的理论仓该直接读 target")
+
+        # ③ 改手数：K 线内的 target 不许被 signal 反推（那会凭空发一笔单）。
+        # 用 `sizing="fixed"` 才真会走到「手数立刻变」那条分支 —— 默认的
+        # capital 模式手数要等下一根 bar 按价格重算，改 volume 本来就不动。
+        st.target = 0
+        f._slots = {"t-ib": st}
+        f._update_one(mk("t-ib", "sbbox_ib", sizing="fixed", volume=3))
+        if int(st.lots) != 3:
+            raise RuntimeError(
+                f"固定手数模式下改 volume 没立刻生效（lots={st.lots}）—— "
+                "下面的断言就测不到东西了")
+        if int(st.target) != 0:
+            raise RuntimeError(
+                f"改手数把 K 线内策略的 target 设成了 {st.target} —— "
+                "等于拿一根已收盘的 bar 去追过去的价位，会凭空发一笔单")
+        # 普通策略照旧要跟着手数走，别把这条也一起关了
+        st2.target = -1
+        f._slots = {"t-plain": st2}
+        f._update_one(mk("t-plain", "ma_cross", sizing="fixed", volume=3))
+        if int(st2.target) != -3:
+            raise RuntimeError(
+                f"普通策略改手数之后目标仓该变成 -3，实际 {st2.target}")
+
+        # ④ 快照必须推 `theo`，界面「理论」列读它
+        src = inspect.getsource(SR.PortfolioRunner.snapshot)
+        if '"theo": self._theo_qty(st)' not in src:
+            raise RuntimeError(
+                "快照里没推 `theo` —— 界面只能退回 target，K 线内策略又显示成 0")
+        import gui.portfolio_page as PP
+
+        page = inspect.getsource(PP)
+        if 'slot.get("theo"' not in page:
+            raise RuntimeError(
+                "界面「理论」列还在读 target —— K 线内策略会显示 +0，"
+                "而回测里同一根 bar 上是持仓的")
+        if "_theo_qty" not in inspect.getsource(SR.PortfolioRunner._slot_pnl):
+            raise RuntimeError(
+                "盈亏还在按 target 算 —— K 线内策略的当日/持仓盈亏会恒等于 +0")
+
+        return ("K 线内策略的理论仓按 signal×lots 算（不是 target，"
+                "回测同一个数）；改手数不会反推它的下单目标；"
+                "快照推 `theo`、界面与两个盈亏列都读它")
+
+    check("K 线内策略的理论持仓（sbbox 显示 0 那个）", _ib_theo)
 
     def _td_key():
         """交易日归日：sbbox 必须读 `trading_day` 列，不能自己写 `index + 6h`。
@@ -13231,8 +13360,23 @@ def _run() -> tuple[bool, list[str]]:
 
         # ---- ⑩ 基准价的最后一级：本地日线最后一根收盘（行情/成交流都没有时）
         lc = _last_daily_close("SHFE.rb2601")
-        if lc > 0 and abs(lc - 2999.0) > 1e-6:
-            raise RuntimeError(f"本地日线昨收读错了：{lc}（应 2999）")
+        if lc > 0:
+            # 🔴 这里**不许写死价格**。这些 CSV 每天都在长：2026-11-23 收盘后
+            # rb 的最后一根从 2999 变成 3004，写死的断言自己就红了（跟代码改动
+            # 无关，纯粹是「把行情数据钉死在测试里」）。要验的是「从文件尾部
+            # 倒着取到的是**最后一行**的 close」，所以拿整份解析的最后一根来比
+            # —— 两条路径不同（seek 尾部 vs 全量 read_csv），取错行立刻能发现。
+            import pandas as _pd
+
+            from ttrade import symbols_info as _SI
+            from ttrade.tqlive import daily_csv_path as _dcp
+
+            _vari, _ex = _SI.contract_product("SHFE.rb2601")
+            _full = _pd.read_csv(_dcp(_vari.lower(), _ex))
+            _want = float(_full["close"].iloc[-1])
+            if abs(lc - _want) > 1e-6:
+                raise RuntimeError(
+                    f"本地日线昨收读错了：{lc}（库里最后一根是 {_want}）")
         if _last_daily_close("SHFE.zzzz9999") != 0.0:
             raise RuntimeError("没有日线文件的品种该返回 0，不许瞎猜")
 

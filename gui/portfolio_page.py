@@ -3211,12 +3211,24 @@ class PortfolioPage(QWidget):
                 + (f"，再乘仓位比例" if "·" in size else "")
                 + f"\n当前价下 {lots} 手" if lots > 0 else
                 "引擎还没算出实际手数（需要行情）")
-        theo = _int(slot.get("target"))
+        # 🔴 理论持仓读引擎的 `theo`，不是 `target`。K 线内那一族（`sbbox_ib`
+        # 等）的 `target` 是**下单目标**，盘中价格没碰到触发价就是 0；`theo` 才是
+        # 策略口径该持多少（= signal × lots，和回测同一口径）。2026-11-23 用户报
+        # 「sbbox多品种波段1h 的 34 个品种理论持仓全是 +0，回测里 29 个品种有仓」
+        # —— 就是这里读了 target，而那 29 个正好是状态机给出非零信号的品种数。
+        theo = _int(slot.get("theo", slot.get("target")))
         if slot.get("running"):
             self._set_cell(t, i, 5, f"{theo:+d}", C_TEXT)
             it5 = t.item(i, 5)
             if it5 is not None:
-                it5.setToolTip(f"{key} 的目标净仓 {theo:+d} 手")
+                if slot.get("intrabar"):
+                    it5.setToolTip(
+                        f"{key} 的理论净仓 {theo:+d} 手（按已收盘那根 K 线算，"
+                        "与回测同一口径）\n"
+                        "K 线内策略：实际下单要等盘中价格碰到触发价，"
+                        "所以账户里可能还没有这笔仓")
+                else:
+                    it5.setToolTip(f"{key} 的目标净仓 {theo:+d} 手")
         else:
             self._set_cell(t, i, 5, "—", C_MUTED)
         text, color, tip = self._child_status(cfg, slot)
@@ -3436,7 +3448,9 @@ class PortfolioPage(QWidget):
             # 价格 / 当日盈亏 / 持仓盈亏。多账户时各账户的盈亏相加（钱是可加的），
             # 价格取第一个有价的那个（同一条策略盯的还是同一个品种）
             self._render_pnl(t, i, self._merge_pnl(slots) if many else slot)
-            theo = _int(slot.get("target"))
+            # 理论持仓读 `theo`（普通策略它等于 target；K 线内那一族是
+            # signal × lots，见 `_render_child` 上的注释）
+            theo = _int(slot.get("theo", slot.get("target")))
             multi = _int(slot.get("multi"))
             # 仓位列写「口径 → 实际算出来的手数」。手数依赖价格和每手保证金，
             # 存盘时算不出来，只有引擎跑起来才知道 —— 所以两段拼在一起显示。
@@ -3482,10 +3496,17 @@ class PortfolioPage(QWidget):
                         f"{multi} 个品种各自的目标仓在右下监控器里逐合约列出"
                     )
             elif slot.get("running"):
-                self._set_cell(t, i, 5, str(theo), C_TEXT)
+                self._set_cell(t, i, 5, f"{theo:+d}", C_TEXT)
                 it5 = t.item(i, 5)
                 if it5 is not None:
-                    it5.setToolTip(f"策略当前目标净仓 {theo:+d} 手")
+                    if slot.get("intrabar"):
+                        it5.setToolTip(
+                            f"策略的理论净仓 {theo:+d} 手（按已收盘那根 K 线算，"
+                            "与回测同一口径）\n"
+                            "K 线内策略：实际下单要等盘中价格碰到触发价，"
+                            "所以账户里可能还没有这笔仓")
+                    else:
+                        it5.setToolTip(f"策略当前目标净仓 {theo:+d} 手")
             else:
                 self._set_cell(t, i, 5, "—", C_MUTED)
                 it5 = t.item(i, 5)
