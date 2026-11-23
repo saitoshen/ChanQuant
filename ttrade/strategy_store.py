@@ -229,10 +229,14 @@ class StrategyConfig:
     # 落到「每个交易日重排一次」，和原来的行为最接近
     cross_pool_reb: int = 1
     cross_pool_reb_unit: str = "day"
-    # 第一步（排名 + 筛池）用哪个周期的因子。空 = 跟随策略周期。
+    # 第一步（筛池）用哪个周期的因子。空 = 跟随策略周期。
     # 5 分钟策略用日线成交额筛池是常见用法，存盘必须带上 —— 只存因子不存周期，
     # 重开一次就悄悄变回「5 分钟成交额」，同一份配置跑出两个结果
     cross_step1_period: str = ""
+    # 第二步（截面因子排名 / 分强弱）用哪个周期的因子。空 = 跟随策略周期。
+    # 和第一步**互相独立**：筛池用日线、排名用 1 小时是合理组合，存不下就等于
+    # 重开一次换了一条策略
+    cross_step2_period: str = ""
     # 截面 ML 的标签口径：excess / volret / rank / volret_rank
     cross_label_mode: str = "volret"
 

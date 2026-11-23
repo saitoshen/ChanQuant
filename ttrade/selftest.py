@@ -14884,6 +14884,81 @@ def _run() -> tuple[bool, list[str]]:
 
     check("标准化窗口按交易日（老存档按根）+ 预测期数 100 + 资金分配合并", _window_unit)
 
+    def _cross_two_periods():
+        """截面的第一步 / 第二步各有自己的因子周期，互不影响。"""
+        import inspect
+
+        import pandas as pd
+
+        from ttrade import cross as CR
+        from ttrade import strategy_store as SS
+
+        # ---- ① 两个字段都在、都落盘
+        names = {f.name for f in __import__("dataclasses").fields(SS.StrategyConfig)}
+        assert "cross_step1_period" in names and "cross_step2_period" in names, \
+            f"策略库里少了因子周期字段：{sorted(n for n in names if 'cross_step' in n)}"
+        c = SS.StrategyConfig(cross_step1_period="1d", cross_step2_period="1h")
+        d = __import__("dataclasses").asdict(c)
+        assert d["cross_step1_period"] == "1d" and d["cross_step2_period"] == "1h"
+        # 老配置（没有这个键）读回来是空串 = 跟随策略周期，和原来一致
+        assert SS.StrategyConfig().cross_step2_period == ""
+
+        # ---- ② 引擎：排名到底在哪份行情上算
+        #
+        # 用 spy 拦在 `score_panel` 上：它拿到的那份 `frames` 就是「排名用的行情」。
+        # 直接跑完整引擎要几十个真实品种，这里只验「拿的是哪一份」
+        idx_h = pd.date_range("2024-01-01 09:00", periods=5, freq="h")
+        idx_d = pd.date_range("2024-01-01", periods=3, freq="D")
+        frames = {f"S{i}_SHFE": pd.DataFrame({"close": [1.0, 2, 3, 4, 5]}, index=idx_h)
+                  for i in range(3)}
+        daily = {f"S{i}_SHFE": pd.DataFrame({"close": [1.0, 2, 3]}, index=idx_d)
+                 for i in range(3)}
+        bt = __import__("ttrade.backtest", fromlist=["BacktestConfig"]).BacktestConfig(
+            initial_cash=1_000_000.0)
+        seen = []
+        orig = CR.score_panel
+
+        def spy(fr, keys, *a, **kw):
+            seen.append(pd.DatetimeIndex(next(iter(fr.values())).index))
+            raise RuntimeError("STOP-HERE")
+
+        CR.score_panel = spy
+        try:
+            cfg = CR.CrossConfig(mode="hedge", factor_mode="multi",
+                                 factor_keys=["mom_20"], period="1h",
+                                 step2_period="1d")
+            out = CR.run(frames, cfg, bt, step2_frames=daily)
+            assert "STOP-HERE" in str(out.error), out.error
+            assert len(seen) == 1
+            assert seen[0].equals(idx_d), (
+                "配了第二步周期（日线），排名还是拿策略周期（小时）在算")
+
+            # 只配第一步、第二步跟随策略周期 ⇒ 排名用**策略周期**，
+            # 不能像以前那样跟着第一步走
+            seen.clear()
+            cfg1 = CR.CrossConfig(mode="hedge", factor_mode="multi",
+                                  factor_keys=["mom_20"], period="1h",
+                                  step1_period="1d")
+            CR.run(frames, cfg1, bt, step1_frames=daily)
+            assert len(seen) == 1 and seen[0].equals(idx_h), (
+                "第一步换了周期，第二步的排名被带着一起换了（两条腿又共用一个 src）")
+        finally:
+            CR.score_panel = orig
+
+        # ---- ③ 界面：右边那个下拉真的接上了
+        src = inspect.getsource(__import__("gui.app", fromlist=["MainWindow"]).MainWindow._run_cross)
+        assert "step2_frames" in src and "step2_period=p2" in src, \
+            "`_run_cross` 没把第二步周期传给引擎"
+        src2 = inspect.getsource(
+            __import__("gui.app", fromlist=["MainWindow"]).MainWindow._build_cross_panels)
+        assert "cb_step2_period" in src2, "第二步面板里没有「第二步因子周期」下拉"
+
+        return ("第一步（筛池）/ 第二步（排名）各有独立因子周期：配了第二步周期就"
+                "拿那份行情排名，只配第一步时排名仍按策略周期（不再跟着第一步走）；"
+                "`cross_step2_period` 存得进策略库、老配置落到「跟随策略周期」")
+
+    check("截面两步各有独立的因子周期（第一步筛池 / 第二步排名）", _cross_two_periods)
+
     # 跑完就把进度文件收掉：留着会让下一轮的诊断以为"上次崩过"。
     # 崩溃时走不到这里，文件正好留下最后一项的名字。
     if _prog is not None:

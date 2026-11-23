@@ -1054,10 +1054,13 @@ class CrossWorker(QObject):
     def __init__(self, frames: dict, cfg, bt, profile: str, label: str,
                  step1_frames: dict | None = None,
                  timing_extra: dict | None = None,
-                 factor_extra: dict | None = None) -> None:
+                 factor_extra: dict | None = None,
+                 step2_frames: dict | None = None) -> None:
         super().__init__()
         self.frames = frames
         self.step1_frames = step1_frames
+        # 第二步（截面因子排名）自己的行情，和 step1 互不影响
+        self.step2_frames = step2_frames
         # 跨周期因子行情：{品种: {周期: 行情}}，主线程读好再进线程。
         # 两条腿各一份 —— 截面腿和时序腿的因子可以指到不同周期上
         self.timing_extra = dict(timing_extra or {})
@@ -1080,6 +1083,7 @@ class CrossWorker(QObject):
                 step1_frames=self.step1_frames,
                 timing_extra=self.timing_extra,
                 factor_extra=self.factor_extra,
+                step2_frames=self.step2_frames,
             )
         except fstrat.Cancelled:
             return
@@ -2891,13 +2895,14 @@ class MainWindow(QMainWindow):
         for _p in GUI_PERIODS:
             self.cb_step1_period.addItem(PERIOD_LABEL.get(_p, _p), _p)
         self.cb_step1_period.setToolTip(
-            "截面排名和筛池用的因子，按哪个周期的行情算。\n\n"
+            "第一步（筛品种池）用的因子，按哪个周期的行情算。\n\n"
             "跟随策略周期（默认）：5 分钟策略就用 5 分钟因子。\n"
             "选别的周期：比如策略跑 5 分钟、第一步用日线的「成交额 20」筛池 ——\n"
             "流动性是几天的量级，用 5 分钟成交额排名会被当天消息面带偏。\n\n"
             "跨周期时只用**已经收完**的那一根：日线那根要到收盘才知道，所以当天\n"
-            "所有 bar 用的都是前一交易日的值（不会把收盘结果提前灌进上午的 bar）。\n"
-            "第二步的时序腿仍然按策略周期跑。"
+            "所有 bar 用的都是前一交易日的值（不会把收盘结果提前灌进上午的 bar）。\n\n"
+            "和第二步的因子周期**各自独立**（右边那个管排名 / 分强弱）；\n"
+            "选中品种之后的时序腿仍然按策略周期跑。"
         )
         p1.addWidget(self.cb_step1_period)
 
@@ -3028,6 +3033,28 @@ class MainWindow(QMainWindow):
         ht.setSpacing(8)
         gt.addWidget(self.cross_timing_host)
         p2.addWidget(self.grp_timing)
+
+        # ---- 第二步因子周期
+        #
+        # 和第一步那个**各管各的**（用户 2026-11-23：「第一步和第二步都需要有
+        # 自己独立的因子周期」）：第一步拿日线成交额筛流动性，第二步照样可以拿
+        # 1 小时动量排强弱。以前只有一个口子，为了「用日线筛池」不得不把
+        # 「谁强谁弱」也换成日线 —— 等于顺手换了一条策略。
+        p2.addWidget(self._section("第二步因子周期"))
+        self.cb_step2_period = QComboBox()
+        self.cb_step2_period.addItem("跟随策略周期", "")
+        for _p in GUI_PERIODS:
+            self.cb_step2_period.addItem(PERIOD_LABEL.get(_p, _p), _p)
+        self.cb_step2_period.setToolTip(
+            "第二步（截面因子排名 / 分强弱）按哪个周期的行情算。\n\n"
+            "跟随策略周期（默认）：5 分钟策略就用 5 分钟因子排名。\n"
+            "选别的周期：5 分钟策略可以拿 1 小时动量排强弱 —— 日内动量在\n"
+            "5 分钟上太吵，排名一天换好几遍，换手全花在手续费上。\n\n"
+            "和第一步**互不影响**：第一步用日线筛池、第二步用 1 小时排名，可以。\n"
+            "跨周期时只用**已经收完**的那一根，不会把还没收盘的结果提前用上。\n"
+            "「选中哪个品种之后怎么交易」仍然是策略周期 —— 这一项只管排名。"
+        )
+        p2.addWidget(self.cb_step2_period)
 
         # ---- 因子模式 + 截面因子表（从第一步挪过来）
         #
@@ -3230,6 +3257,7 @@ class MainWindow(QMainWindow):
             self.cb_family.currentIndexChanged.connect(self._on_family_changed)
             self.cb_cross_mode.currentIndexChanged.connect(self._on_cross_mode_changed)
             self.cb_step1_period.currentIndexChanged.connect(self._on_cross_param_changed)
+            self.cb_step2_period.currentIndexChanged.connect(self._on_cross_param_changed)
             self.sp_cross_reb.valueChanged.connect(self._on_cross_param_changed)
             self.cb_cross_reb_unit.currentIndexChanged.connect(self._on_cross_param_changed)
             self.sp_cross_pct.valueChanged.connect(self._on_cross_param_changed)
@@ -4381,8 +4409,14 @@ class MainWindow(QMainWindow):
         选了等于没选（`_run_cross` 里 `p1 != period` 才另取数据），灰掉比让用户
         选完发现结果没变要诚实。策略周期改了之后原来那项也可能变成同周期，这时
         顺手退回「跟随策略周期」，免得界面上写着「日线」、实际按 5 分钟在算。
+
+        **第一步和第二步各一份、互不影响**（用户 2026-11-23 要求两者独立）。
         """
-        cb = getattr(self, "cb_step1_period", None)
+        self._sync_period_combo(getattr(self, "cb_step1_period", None))
+        self._sync_period_combo(getattr(self, "cb_step2_period", None))
+
+    def _sync_period_combo(self, cb) -> None:
+        """一个「跟随策略周期 / 具体周期」下拉的灰项 + 同步。"""
         if cb is None:
             return
         cur = self._period()
@@ -4401,10 +4435,16 @@ class MainWindow(QMainWindow):
             cb.blockSignals(False)
 
     def _step1_period(self) -> str:
-        """第一步（截面排名 + 筛池）用哪个周期的因子。空串 = 跟随策略周期。"""
+        """第一步（筛池）用哪个周期的因子。空串 = 跟随策略周期。"""
         if not hasattr(self, "cb_step1_period"):
             return ""
         return self.cb_step1_period.currentData() or ""
+
+    def _step2_period(self) -> str:
+        """第二步（截面因子排名 / 分强弱）用哪个周期的因子。空串 = 跟随策略周期。"""
+        if not hasattr(self, "cb_step2_period"):
+            return ""
+        return self.cb_step2_period.currentData() or ""
 
     def _sync_cross_reb(self, hedge: bool) -> None:
         """调仓间隔那一行的单位和提示。
@@ -4617,9 +4657,12 @@ class MainWindow(QMainWindow):
                          f"（每 {_pn} {'个月' if _pu == 'month' else '个交易日'}重排）")
         # 跨周期是「同一组参数、两套数据」，不写出来就没法解释两次结果为什么不同
         p1 = self._step1_period()
+        p2 = self._step2_period()
+        _pn = PERIOD_LABEL.get(self._period(), self._period())
         if p1:
-            lines.append(f"第一步因子：{PERIOD_LABEL.get(p1, p1)}"
-                         f"（策略 {PERIOD_LABEL.get(self._period(), self._period())}）")
+            lines.append(f"第一步因子：{PERIOD_LABEL.get(p1, p1)}（策略 {_pn}）")
+        if p2:
+            lines.append(f"第二步因子：{PERIOD_LABEL.get(p2, p2)}（策略 {_pn}）")
         # 杠杆：截面原来恒按 1 倍名义额算，和多品种回测（按资金分配 ÷ 保证金）
         # 对不上。现在统一了，摘要里得写出来 —— 不然用户还是不知道为什么
         # 「选 100% 等于没选」时两条曲线不一样
@@ -5285,6 +5328,7 @@ class MainWindow(QMainWindow):
             cross_pool_reb=_cx["pool_reb"],
             cross_pool_reb_unit=_cx["pool_reb_unit"],
             cross_step1_period=self._step1_period(),
+            cross_step2_period=self._step2_period(),
             cross_label_mode=_cx["label"],
             timing_family=self._timing_family(),
             timing_rule_key=self.cb_strategy.currentData() or "",
@@ -5399,6 +5443,12 @@ class MainWindow(QMainWindow):
                 getattr(cfg, "cross_step1_period", "") or "")
             if sp1 >= 0:
                 self.cb_step1_period.setCurrentIndex(sp1)
+            # 第二步因子周期。老配置没有这个字段 ⇒ findData("") 落到「跟随策略
+            # 周期」，正好是原来的行为
+            sp2 = self.cb_step2_period.findData(
+                getattr(cfg, "cross_step2_period", "") or "")
+            if sp2 >= 0:
+                self.cb_step2_period.setCurrentIndex(sp2)
             self.sp_cross_pct.setValue(float(cfg.cross_top_pct or 10.0))
             self.sp_cross_bot.setValue(float(getattr(cfg, "cross_bot_pct", 0) or 10.0))
             # ---- 先筛品种池（含 2026-11-23 新增的筛池频率）
@@ -6700,15 +6750,19 @@ class MainWindow(QMainWindow):
             return
         rev = {k: True for k in self._reversed_factor_keys()}
         fc = self._factor_cfg()
+        # 第二步自己的因子周期（和第一步各管各的，用户 2026-11-23 要求）
+        p2 = self._step2_period()
         # 截面因子腿的跨周期行情：逐品种在主线程里读好，线程里只算。
-        # 用**策略周期**当基准 —— `frames` 就是那一档
+        # 基准是**第二步周期**（没配就是策略周期）—— 「本周期」指的就是那一档，
+        # 拿它当 base 才不会把 `mom_60@本周期` 和 `@1d` 算成同一列
+        _base2 = p2 or period
         factor_extra = {}
         for _k in frames:
-            _ex = self._extra_periods(fc, list(fkeys), period, _k)
+            _ex = self._extra_periods(fc, list(fkeys), _base2, _k)
             if _ex:
                 factor_extra[_k] = _ex
         if self.factor_mode == "single":
-            fkeys = self._pick_usable_single(fkeys[0], frames, factor_extra, period)
+            fkeys = self._pick_usable_single(fkeys[0], frames, factor_extra, _base2)
         _cx = self._cross_new_params()
         # 第一步的行情：配了别的周期就另取一份（典型：5 分钟策略用日线成交额
         # 筛池）。取不到就退回策略周期，并在状态栏说清楚 —— 悄悄降级比报错更糟
@@ -6725,11 +6779,26 @@ class MainWindow(QMainWindow):
                     + "\n换成「跟随策略周期」，或者先去「数据管理 → 天勤」补这个周期"
                 )
                 return
+        # 第二步的行情：配了别的周期就另取一份。取不到就退回策略周期并说清楚
+        # —— 悄悄降级比报错更糟（和第一步同一套处理）
+        step2_frames = None
+        if p2 and p2 != period:
+            step2_frames, miss2 = self._frames_for(keys, p2)
+            if len(step2_frames) < cross_engine.MIN_CROSS:
+                self._show_single_view()
+                self._clear_chart(
+                    f"第二步因子要用 {PERIOD_LABEL.get(p2, p2)} 行情，"
+                    f"但这批品种只有 {len(step2_frames)} 个有该周期数据"
+                    + (f"（缺：{'、'.join(miss2[:6])}）" if miss2 else "")
+                    + "\n换成「跟随策略周期」，或者先去「数据管理 → 天勤」补这个周期"
+                )
+                return
         ccfg = cross_engine.CrossConfig(
             mode=self._cross_mode(),
             rebalance=int(self.sp_cross_reb.value()),
             rebalance_unit=self._cross_reb_unit(),
             step1_period=p1 if step1_frames is not None else "",
+            step2_period=p2 if step2_frames is not None else "",
             top_pct=float(self.sp_cross_pct.value()),
             bot_pct=float(self.sp_cross_bot.value()),
             long_only=self.cfg.long_only,
@@ -6781,6 +6850,8 @@ class MainWindow(QMainWindow):
             # 跨周期是「同一组参数、两套数据」，不写出来就没法解释两次结果为什么
             # 不一样
             label += f" · 第一步因子用{PERIOD_LABEL.get(ccfg.step1_period, ccfg.step1_period)}"
+        if ccfg.step2_period:
+            label += f" · 第二步因子用{PERIOD_LABEL.get(ccfg.step2_period, ccfg.step2_period)}"
         if ccfg.weight == "tier" and ccfg.tiers >= 2:
             label += f" · {ccfg.tiers} 档"
         # 杠杆：截面的名义敞口跟着「仓位」那一组控件走，和多品种回测同一个口径。
@@ -6804,11 +6875,13 @@ class MainWindow(QMainWindow):
         self._start_cross_worker(frames, ccfg, bt, label, period, missing,
                                  step1_frames=step1_frames,
                                  timing_extra=timing_extra,
-                                 factor_extra=factor_extra)
+                                 factor_extra=factor_extra,
+                                 step2_frames=step2_frames)
 
     def _finish_cross(self, out, label: str, ccfg, frames: dict, period: str,
                       bt: BacktestConfig, missing: list[str],
-                      step1_frames: dict | None = None) -> None:
+                      step1_frames: dict | None = None,
+                      step2_frames: dict | None = None) -> None:
         """截面回测收尾：包成 `Result` 挂到组合视图上。同步和线程两条路共用。"""
         if not out.ok:
             self._show_single_view()
@@ -6826,9 +6899,10 @@ class MainWindow(QMainWindow):
             long_only=ccfg.long_only, bars_per_year=bt.bars_per_year,
             overlay=False, selected_keys=[],
             # 「截面因子分析」要拿品种池重算一遍横截面 IC，光有净值画不出来。
-            # 跨周期时用**第一步自己的**那份行情和分数：把日线分数铺到每根 5 分钟
-            # bar 上再算 IC，等于同一个观测重复几十遍，t 值会被吹起来
-            cross=((step1_frames or frames), ccfg,
+            # 跨周期时用**第二步自己的**那份行情和分数（排名就是它算的）：
+            # 把日线分数铺到每根 5 分钟 bar 上再算 IC，等于同一个观测重复几十遍，
+            # t 值会被吹起来
+            cross=((step2_frames or frames), ccfg,
                    (out.score_step1 if getattr(out, "score_step1", None)
                     is not None else out.score)),
         )
@@ -6867,7 +6941,8 @@ class MainWindow(QMainWindow):
                             missing: list[str] | None = None,
                             step1_frames: dict | None = None,
                             timing_extra: dict | None = None,
-                            factor_extra: dict | None = None) -> None:
+                            factor_extra: dict | None = None,
+                            step2_frames: dict | None = None) -> None:
         """截面回测走后台线程。已经在跑的先取消，避免旧结果盖掉新结果。"""
         self._cancel_cross_worker()
         self._c_seq += 1
@@ -6877,13 +6952,15 @@ class MainWindow(QMainWindow):
                              self.cb_cost.currentData() or None, label,
                              step1_frames=step1_frames,
                              timing_extra=timing_extra,
-                             factor_extra=factor_extra)
+                             factor_extra=factor_extra,
+                             step2_frames=step2_frames)
         # 收尾要用的上下文挂在 worker 上，靠 `sender()` 取回来。**不能**用
         # `connect(lambda ...)` 把 seq/上下文带过去：lambda 没有 QObject 接收者，
         # PySide 会当成直连，`done` 于是在**工作线程**里直接跑 `_finish_cross`，
         # 一碰控件就是 "Internal C++ object already deleted" / 随机崩溃
         worker.seq = seq
-        worker.ctx = (ccfg, frames, period, bt, list(missing or []), step1_frames)
+        worker.ctx = (ccfg, frames, period, bt, list(missing or []), step1_frames,
+                      step2_frames)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -6944,13 +7021,15 @@ class MainWindow(QMainWindow):
         ccfg, frames, period, bt = ctx[:4]
         missing = list(ctx[4]) if len(ctx) > 4 else []
         step1_frames = ctx[5] if len(ctx) > 5 else None
+        step2_frames = ctx[6] if len(ctx) > 6 else None
         self._c_worker = None
         self._c_thread = None
         if self._closing or seq != self._c_seq or seq == self._c_applied:
             return
         self._c_applied = seq
         self._finish_cross(out, out.label, ccfg, frames, period, bt, missing,
-                           step1_frames=step1_frames)
+                           step1_frames=step1_frames,
+                           step2_frames=step2_frames)
 
     def _on_cross_failed(self, msg: str) -> None:
         w = self.sender()

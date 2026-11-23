@@ -118,6 +118,17 @@ class CrossConfig:
     # 填充，**绝不让当天还没收完的那根参与排名**。
     step1_period: str = ""
 
+    # 第二步（截面因子 / 排名 / 分强弱）用**哪个周期**的因子算。空 = 跟随策略周期。
+    #
+    # 和 `step1_period` **各自独立**（用户 2026-11-23 明确要求）：第一步拿日线
+    # 成交额筛流动性，第二步完全可以拿 1 小时动量排强弱 —— 这两件事没有理由
+    # 必须同一个周期。以前只有 `step1_period` 一个口子，第二步被迫跟着它走：
+    # 为了「用日线筛池」不得不把「谁强谁弱」也换成日线，等于顺手换了一条策略。
+    #
+    # 因子表里那些带周期的实例（`mom_60@1w`）是**绝对周期**，不随这一项变；
+    # 这一项只改「本周期」指的是哪一档。
+    step2_period: str = ""
+
     # 策略本身的周期（`frames` 是哪一档）。跨周期因子要靠它算「基准时刻」——
     # 周线 bar 的数据要到那周最后一个交易日收盘才齐，日线 bar 要等到当天 15:00。
     # 空 = 不知道，按「时间戳就是决策时刻」处理（分钟级本来就该这样）
@@ -836,15 +847,19 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
         progress=None, cancel=None,
         step1_frames: dict[str, pd.DataFrame] | None = None,
         timing_extra: dict[str, dict] | None = None,
-        factor_extra: dict[str, dict] | None = None) -> CrossResult:
+        factor_extra: dict[str, dict] | None = None,
+        step2_frames: dict[str, pd.DataFrame] | None = None) -> CrossResult:
     """跑一遍截面策略。出错写进 `CrossResult.error`，不抛异常。
 
     `progress` / `cancel` 只给机器学习模式用：walk-forward 要跑几十折，界面
     那边靠它显示进度、也靠它中途叫停。
 
-    `step1_frames` 是**第一步（排名 + 筛池）专用的行情**，周期可以和策略不同
-    （典型：5 分钟策略用日线成交额筛池）。它的分数会按 `align_to_clock()` 搬到
-    策略的时钟上，只用已经收完的那一根。传 None 就是「跟随策略周期」，老行为。
+    `step1_frames` 是**第一步（筛池）专用的行情**，周期可以和策略不同
+    （典型：5 分钟策略用日线成交额筛池）。
+
+    `step2_frames` 是**第二步（截面因子排名）专用的行情**，和第一步各管各的。
+    两者的分数都会按 `align_to_clock()` 搬到策略的时钟上，只用已经收完的那一根。
+    传 None 就是「跟随策略周期」，老行为 —— 两个都为 None 时和以前逐位相同。
 
     `timing_extra` 是时序腿的**跨周期因子行情**：`{品种: {周期: 行情}}`，
     由调用方在主线程里读好（见 `factor_strategy.period_frames`）。
@@ -857,20 +872,16 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
                            error=f"截面策略至少要 {MIN_CROSS} 个品种，现在只有 {len(frames)} 个")
     # 第一步用哪份行情：配了周期且真的拿到了另一份才换，否则还是自己的
     src = step1_frames if (cfg.step1_period and step1_frames) else frames
-    # 因子实例的周期是相对 `frames`（策略周期）说的。第一步换成了另一档行情时，
-    # 「周线因子」到底相对谁算就说不清了 —— 与其猜，不如让它报错
-    if src is not frames and any(factors.split_spec(k)[1]
-                                 for k in (cfg.factor_keys or [])):
-        return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
-                           error="第一步（选品种）换了周期时，截面因子不能再各自"
-                                 "指定周期 —— 把因子周期改回「本周期」，"
-                                 "或者把第一步也改回「跟随策略周期」")
+    # 第二步同理，**和第一步互不影响**。两条腿以前共用一个 `src`，于是「用日线
+    # 筛池」会顺手把「谁强谁弱」也换成日线 —— 那是另一条策略
+    src2 = step2_frames if (cfg.step2_period and step2_frames) else frames
     try:
-        score_src = score_panel(src, list(cfg.factor_keys or []),
+        score_src = score_panel(src2, list(cfg.factor_keys or []),
                                 cfg.factor_reverse, mode=cfg.factor_mode or "multi",
                                 fcfg=_factor_cfg(cfg), progress=progress, cancel=cancel,
                                 label_mode=cfg.label_mode,
-                                factor_extra=factor_extra, base_period=cfg.period)
+                                factor_extra=factor_extra,
+                                base_period=(cfg.step2_period or cfg.period))
     except fstrat.Cancelled:
         raise                     # 用户点的「取消」，不是回测失败
     except Exception as exc:  # noqa: BLE001
@@ -895,6 +906,11 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
         except Exception as exc:  # noqa: BLE001
             return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
                                error=f"第一步选品种失败：{exc}")
+        # 池子分数在**第一步**的时钟上，排名分数在**第二步**的时钟上。不同周期
+        # 时先搬过来（`align_to_clock` 会 shift(1)，只用已经收完的那根）——
+        # 直接 `reindex().ffill()` 会把还没收盘的那根池子判据提前用上
+        if src2 is not src:
+            pool_src = align_to_clock(pool_src, score_src.index)
         score_src = _apply_pool(score_src, pool_src, cfg.pool_top_pct, cfg.pool_min,
                                 reb=getattr(cfg, "pool_reb", 1) or 1,
                                 reb_unit=getattr(cfg, "pool_reb_unit", "day") or "day")
@@ -905,7 +921,7 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     # 分数从第一步的时钟搬到策略的时钟。**同周期不搬** —— `align_to_clock` 会
     # 整体 shift(1)，同一份数据上那样做等于凭空多滞后一根
     close = close_panel(frames)
-    score = score_src if src is frames else align_to_clock(score_src, close.index)
+    score = score_src if src2 is frames else align_to_clock(score_src, close.index)
     score = score.dropna(how="all")
     if score.empty:
         return CrossResult(pd.Series(dtype=float), pd.DataFrame(),
@@ -1016,7 +1032,10 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
                                    eq_prev=ones, mults=mults, scales=scales),
         per_symbol=per_symbol,
         score=score,
-        score_step1=(score_src if src is not frames else None),
+        # 第二步自己的时钟（因子分析页要用它算横截面 IC）。以前这里只有第一步
+        # 的周期可选，所以叫 `score_step1`；现在第二步独立了，它就是「排名那份
+        # 分数在它自己时钟上的样子」
+        score_step1=(score_src if src2 is not frames else None),
     )
 
 
