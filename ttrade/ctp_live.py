@@ -410,6 +410,9 @@ class CtpHub:
     #: 这条通道有没有行情。融航也支持 —— 它的行情前置就是标准 CTP md 服务，
     #: 账户里填了 `md_front` 就会连；留空则整段行情逻辑跳过
     SUPPORTS_MD = True
+    #: 登录失败后的冷却秒数（见 `start()`）。20 秒足够避开「连点启动全部」，
+    #: 又不至于让用户觉得「刷新按钮坏了」。
+    FAIL_COOLDOWN = 20.0
 
     def __init__(self, specs) -> None:
         if specs is None:
@@ -451,6 +454,12 @@ class CtpHub:
         # 一声不响（旧对象还在，只是再也不会被回调）。
         self._start_lock = threading.Lock()
         self._started = False
+        #: 上一次登录失败的时刻 / 原因。见 `start()` 里的冷却 —— 融航登录失败后
+        #: 每点一次「启动全部 / 刷新」就来一轮 `Release()` + `Init()`，实测会直接
+        #: 把进程打崩（2026-11-23 19:28，`vendor\rohon_ctp\openctp_ctp.libs\
+        #: MSVCR100.dll` 访问违例 0xc0000005，连崩三次）
+        self._fail_at = 0.0
+        self._fail_msg = ""
         # 查询额度的闸门锁。`_last_query` 是「先读再写」两个动作，两个线程同时
         # 进来会**都**通过判断 ⇒ 同一毫秒发两笔查询 ⇒ 柜台按每秒一个的规矩丢掉
         # 后一笔，且不回包。这就是「两个页面各抢一份额度」的最后一环。
@@ -500,7 +509,24 @@ class CtpHub:
         with self._start_lock:
             if self._started and self._alive():
                 return
-            self._start_locked()
+            # 🔴 失败冷却：不要「点一下就来一轮 Release + Init」。
+            # `_start_locked()` 一进来就把老客户端 `stop()`（= `api.Release()`），
+            # 再建一条新的 `Init()`；登录又失败时那条新的也在半路被 `Release()`。
+            # 融航这条 dll 在这种反复拆建下会直接段错误 —— 2026-11-23 19:28
+            # 连崩三次（`vendor\rohon_ctp\openctp_ctp.libs\MSVCR100.dll`，
+            # 0xc0000005），而当时融航正是 `[-1] 交易核心未初始化` 一直登不上。
+            # 20 秒内再来问，就原样把上次的错抛出去，一次也不碰底层 API。
+            wait = self.FAIL_COOLDOWN - (time.monotonic() - self._fail_at)
+            if wait > 0 and self._fail_msg:
+                raise CtpError(f"{self._fail_msg}"
+                               f"（{wait:.0f} 秒后可再试；期间不会重复连柜台）")
+            try:
+                self._start_locked()
+            except Exception as exc:
+                self._fail_at = time.monotonic()
+                self._fail_msg = str(exc)
+                raise
+            self._fail_at, self._fail_msg = 0.0, ""
 
     def _alive(self) -> bool:
         """这条会话是不是**还真的连着**。

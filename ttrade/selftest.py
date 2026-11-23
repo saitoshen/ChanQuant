@@ -13890,6 +13890,71 @@ def _run() -> tuple[bool, list[str]]:
 
     check("一个账户一条会话（交易页与组合页共用同一条连接）", _one_session)
 
+    def _hub_fail_cooldown() -> str:
+        """登录失败后不许反复 `Release()` + `Init()`（2026-11-23 融航连崩三次）。
+
+        现场：融航 `[-1] 交易核心未初始化` 一直登不上，用户每次点「启动全部 /
+        刷新」，`_start_locked()` 就把老客户端 `Release()` 掉、再建一条新的
+        `Init()`，失败时那条新的也在半路被 `Release()`。事件日志：
+        `vendor\\rohon_ctp\\openctp_ctp.libs\\MSVCR100.dll` 0xc0000005 ——
+        19:28:01 / 19:28:31 / 19:29:12 连崩三次，都是**原生的访问违例**，
+        Python 层一条 traceback 都留不下来。
+
+        判据只有一条：失败之后再来问，**一次也不许碰底层 API**。
+        """
+        import inspect
+        import threading
+
+        from ttrade import ctp_live as CL
+        from ttrade import ctp_client as CC
+
+        h = CL.CtpHub.__new__(CL.CtpHub)
+        h._start_lock = threading.Lock()
+        h._started = False
+        h._fail_at = 0.0
+        h._fail_msg = ""
+        h._alive = lambda: False
+        calls = {"n": 0}
+
+        def _boom():
+            calls["n"] += 1
+            raise CL.CtpError("[-1] 交易核心未初始化")
+
+        h._start_locked = _boom
+        msgs = []
+        for _ in range(3):
+            try:
+                h.start()
+            except Exception as exc:     # noqa: BLE001
+                msgs.append(str(exc))
+        if calls["n"] != 1:
+            raise RuntimeError(
+                f"登录失败后还在反复连柜台（{calls['n']} 次）—— 每次都会走一遍 "
+                "Release+Init，融航那条 dll 会在这种拆建下段错误")
+        if "秒后可再试" not in msgs[-1]:
+            raise RuntimeError(f"冷却期内的报错没说清楚什么时候能再试：{msgs[-1]!r}")
+        # 冷却过了要能重试（别把按钮永久焊死）
+        h._fail_at = 0.0
+        try:
+            h.start()
+        except Exception:                # noqa: BLE001
+            pass
+        if calls["n"] != 2:
+            raise RuntimeError("冷却期过去之后没再试 —— 「刷新」按钮会变成摆设")
+
+        # Release 之前必须先摘 SPI，否则正在执行的回调会踩到已回收的对象
+        src = inspect.getsource(CC._release_api)
+        if src.index("api.RegisterSpi(None)") > src.index("api.Release()"):
+            raise RuntimeError("`_release_api` 又变成先 Release 再摘 SPI 了")
+        if "_release_api(api)" not in inspect.getsource(CC.TraderClient.stop):
+            raise RuntimeError("`TraderClient.stop()` 绕过了 `_release_api`")
+        return (f"失败 {calls['n'] - 1} 次只碰了一次底层 API（冷却 "
+                f"{CL.CtpHub.FAIL_COOLDOWN:.0f} 秒，过后能重试）；"
+                "Release 之前一定先 RegisterSpi(None)")
+
+    check("登录失败后不反复 Release+Init（融航段错误）", _hub_fail_cooldown)
+
+
     def _acct_pump() -> str:
         """组合页每轮必须**同时**推行情和账户（2026-11-23 融航「监控器不动」）。
 

@@ -366,10 +366,7 @@ class MdClient(_ChannelApi):
         api, self.api = self.api, None
         self.ready.clear()
         if api is not None:
-            try:
-                api.Release()
-            except Exception:  # noqa: BLE001
-                pass
+            _release_api(api)
 
     def wait_ready(self, timeout: float = 10.0) -> bool:
         return self.ready.wait(timeout)
@@ -493,6 +490,30 @@ DIR_BUY = "0"
 DIR_SELL = "1"
 
 
+def _release_api(api) -> None:
+    """安全地收掉一条 CTP 会话：**先摘 SPI，再 `Release()`**。
+
+    🔴 不摘 SPI 就直接 `Release()` 是访问违例的高发点。CTP 的 `Release()` 会停掉
+    它自己那条回调线程，但「停」和「已经进到 Python 层」不是同一件事 —— 正在
+    执行的回调仍然持有 spi 对象和它的 C++ 包装层，Release 之后那块内存被回收，
+    下一个回调就踩空。2026-11-23 19:28 融航在「启动全部」时连崩三次，事件日志
+    写的是 `vendor\\rohon_ctp\\openctp_ctp.libs\\MSVCR100.dll` 的 0xc0000005 ——
+    当时融航正是 `[-1] 交易核心未初始化` 反复登录失败，每次失败都走一遍
+    `Release()` + `Init()`。
+
+    `RegisterSpi(None)` 让后续回调在 C++ 侧就被丢掉，再 Release 才安全。有些
+    包装层不接受 None，抛了就退回老行为 —— 这里只为**降低**风险，不改变语义。
+    """
+    try:
+        api.RegisterSpi(None)
+    except Exception:                    # noqa: BLE001 - 不接受 None 就算了
+        pass
+    try:
+        api.Release()
+    except Exception:                    # noqa: BLE001
+        pass
+
+
 def _req_why(n) -> str:
     """`Req*` 系列返回值翻成人话。用于报单 / 撤单 / 查询三条路径。
 
@@ -611,10 +632,7 @@ class TraderClient(_ChannelApi):
         for ev in (self.connected, self.logged_in, self.settled):
             ev.clear()
         if api is not None:
-            try:
-                api.Release()
-            except Exception:  # noqa: BLE001
-                pass
+            _release_api(api)
 
     def wait_ready(self, timeout: float = 15.0) -> bool:
         """等到「能下单」为止：登录 + 结算确认都完成。"""
