@@ -573,7 +573,10 @@ def _warmup_note(score: pd.Series | None, n_bars: int, cfg: FactorConfig) -> str
     need = int(min(nb, max(60, nb // 4)))
     return (f"分数全空：这段行情只有 {int(n_bars)} 根（约 {days} 个交易日），"
             f"而标准化窗口 {int(cfg.window)} 根至少要 {need} 根"
-            " —— 把回测区间拉长，或者把窗口调小")
+            " —— 把回测区间拉长，或者把窗口调小"
+            # 窗口在配置里是**交易日**：5 分钟图上 252 天 ≈ 1.2 万根，看到
+            # 「窗口 12096 根」不要以为是配错了，是这个周期一年就这么多根
+            "（窗口按交易日折算成根数，分钟周期上会是很长的回看）")
 
 
 def _orient_note(ori: pd.DataFrame | None, cfg: FactorConfig) -> str:
