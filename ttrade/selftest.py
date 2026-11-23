@@ -2259,6 +2259,112 @@ def _run() -> tuple[bool, list[str]]:
 
     check("截面逐笔金额口径", _cross_trade_money)
 
+    def _cross_lots() -> str:
+        """截面交易记录必须有手数（2026-11-23 用户：「截面对冲策略的交易记录没有手数」）。
+
+        以前 `trades_from_weights` 把 `lots` 写死 0.0，理由是「截面是权重不是
+        手数」。权重**能**折成手数，只是得给它一个本金：
+
+            名义额 = 本金 × |权重|          ← 截面引擎里 `gross` 就是按这个口径累的
+            手数   = 名义额 ÷ (开仓价 × 合约乘数)
+
+        两个坑必须一起钉：
+
+        ① **手数是「每 1 元本金」的比例**（和 `gross` / `cost` 同一套），由
+           `to_result` 乘回本金。不乘的话界面上是 0.0000029 手，看着和「没有手数」
+           一样；乘两遍则是天文数字。
+        ② **乘数必须查 `symbols_info`**，不能用 `BacktestConfig().multiplier`
+           （默认 1）—— 沥青乘数 10，拿 1 去算就是 10 倍手数。前复权价还要按
+           `price_scale` 换回真实盘面价（`P_adj = P_raw × scale`），否则历史那
+           段的手数会偏。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import cross as CX
+        from ttrade.backtest import BacktestConfig
+
+        rng = np.random.default_rng(11)
+        idx = pd.date_range("2023-01-02", periods=260, freq="B")
+        frames = {}
+        scales = {}
+        for k in range(6):
+            r = rng.normal(0.0002, 0.012, len(idx))
+            px = 100 * np.exp(np.cumsum(r))
+            # 前复权因子：最后一根 = 1（和 `futures.load(adjust="qfq")` 同口径）
+            sc = np.linspace(0.9, 1.0, len(idx))
+            frames[f"S{k}_SHFE"] = pd.DataFrame(
+                {"open": px * (1 + rng.normal(0, 0.001, len(idx))),
+                 "high": px * 1.01, "low": px * 0.99, "close": px,
+                 "price_scale": sc,
+                 "volume": rng.integers(1e4, 1e5, len(idx)).astype(float),
+                 "open_interest": rng.integers(1e4, 1e5, len(idx)).astype(float)},
+                index=idx)
+            scales[f"S{k}_SHFE"] = sc
+
+        cfg = CX.CrossConfig(mode="hedge", factor_mode="single",
+                             factor_keys=["mom_20"], top_pct=30.0, bot_pct=30.0,
+                             weight="equal", rebalance=5)
+        cash = 1_000_000.0
+        bt = BacktestConfig(initial_cash=cash, fee_rate=0.0003, slippage=0.0)
+        out = CX.run(frames, cfg, bt)
+        if not out.ok:
+            raise RuntimeError(f"截面回测没跑通：{out.error}")
+        res = CX.to_result(out, label="截面", step=out.step, bpy=252.0,
+                           initial_cash=cash)
+        if not res.trades:
+            raise RuntimeError("截面回测没产生交易")
+        if any(float(t.lots) <= 0 for t in res.trades):
+            n = sum(1 for t in res.trades if float(t.lots) <= 0)
+            raise RuntimeError(f"{n}/{len(res.trades)} 笔的手数是 0 —— 界面上会显示「—」")
+
+        # 恒等式：手数 × 乘数 × 真实盘面价 == 本金 × |开仓那根的权重|
+        mults = CX.mult_vector(frames)
+        w = out.weights
+        for t in res.trades:
+            wv = float(w.at[t.entry_date, t.symbol])
+            if abs(wv) <= 0:
+                continue
+            sc = float(frames[t.symbol]["price_scale"].loc[t.entry_date])
+            notional = float(t.lots) * float(mults[t.symbol]) * (t.entry_price / sc)
+            want = cash * abs(wv)
+            if abs(notional - want) > 1e-6 * max(want, 1.0):
+                raise RuntimeError(
+                    f"{t.symbol} {t.entry_date:%Y-%m-%d} 名义额 {notional:.2f} "
+                    f"≠ 本金×权重 {want:.2f}")
+
+        # 乘数必须是真乘数：拿 1 去算的话沥青会差 10 倍
+        real = {"BU_SHFE": 10.0, "RB_SHFE": 10.0, "AG_SHFE": 15.0,
+                "AL_SHFE": 5.0, "AU_SHFE": 1000.0}
+        got = CX.mult_vector({k: frames["S0_SHFE"] for k in real})
+        for k, v in real.items():
+            if abs(float(got.get(k, 0.0)) - v) > 1e-9:
+                raise RuntimeError(f"{k} 的合约乘数拿到 {got.get(k)}，应该是 {v}")
+
+        # 复权因子方向：前复权价被缩小过，换回真实盘面价要**除** scale。
+        # 直接调一次构造函数，把 scale 减半 ⇒ 手数应该也减半（价格按比例变大）
+        one = {k: frames[k] for k in ("S0_SHFE",)}
+        w1 = pd.DataFrame({"S0_SHFE": [0.1, 0.1, 0.0]},
+                          index=idx[:3])
+        c1 = pd.DataFrame({"S0_SHFE": [100.0, 100.0, 100.0]}, index=idx[:3])
+        base_kw = dict(rets=None, cvec=None, eq_prev=None)
+        t_no = CX.trades_from_weights(w1, c1, mults=pd.Series({"S0_SHFE": 10.0}),
+                                      **base_kw)[0]
+        half = pd.DataFrame({"S0_SHFE": [0.5, 0.5, 0.5]}, index=idx[:3])
+        t_half = CX.trades_from_weights(
+            w1, c1, mults=pd.Series({"S0_SHFE": 10.0}), scales=half, **base_kw)[0]
+        if abs(float(t_no.lots) - 0.1 / (100.0 * 10.0)) > 1e-12:
+            raise RuntimeError(f"不复权口径的手数算错：{t_no.lots}")
+        if abs(float(t_half.lots) - float(t_no.lots) * 0.5) > 1e-15:
+            raise RuntimeError(
+                f"复权因子方向错了：scale=0.5 时手数 {t_half.lots}，"
+                f"应该是 {float(t_no.lots) * 0.5}")
+        return (f"{len(res.trades)} 笔全部有手数；手数×乘数×真实价 = 本金×权重"
+                "（逐笔验过）；乘数取真值（BU 10 / AG 15 / AU 1000）；"
+                "前复权因子按 P_adj=P_raw×scale 换回真实盘面价")
+
+    check("截面交易记录的手数（权重折手数）", _cross_lots)
+
     def _pool_reb_cycle():
         """筛品种频率：每 N 个交易日 / 每 N 个月重排一次池，间隔内沿用上一份。
 

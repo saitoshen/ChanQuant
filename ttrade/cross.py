@@ -586,6 +586,20 @@ def leverage_vector(frames: dict[str, pd.DataFrame], bt: BacktestConfig) -> pd.S
     return pd.Series(out, dtype=float)
 
 
+def mult_vector(frames: dict[str, pd.DataFrame]) -> pd.Series:
+    """每个品种的**合约乘数**（一手 = 乘数 × 价格 元）。
+
+    🔴 必须查品种信息，不能用 `BacktestConfig().multiplier`：那个默认值是 1，
+    拿来折算「元/手」手续费会把螺纹（10）算小 10 倍，折算手数会把沥青（10）
+    算成 10 倍手数。`symbols_info` 里没有的品种退回 1。
+    """
+    out = {}
+    for sym in frames:
+        sym_code, _, ex = sym.rpartition("_")
+        out[sym] = float(symbols_info.info(sym_code, ex).get("mult") or 1.0)
+    return pd.Series(out, dtype=float)
+
+
 def cost_vector(frames: dict[str, pd.DataFrame], bt: BacktestConfig,
                 profile: str | None = None) -> pd.Series:
     """每个品种「单边成本占名义额的比例」，用来乘换手。
@@ -598,6 +612,7 @@ def cost_vector(frames: dict[str, pd.DataFrame], bt: BacktestConfig,
     比例给整段用，所以取中位数 —— 权重矩阵是逐根的，成本向量是一个数，用中位数
     和「按价格中位数折手续费」是同一个口径。
     """
+    mults = mult_vector(frames)
     out = {}
     for sym, df in frames.items():
         if df is None or not len(df):
@@ -612,7 +627,7 @@ def cost_vector(frames: dict[str, pd.DataFrame], bt: BacktestConfig,
             scale = float(s) if s == s and s > 0 else 1.0
         # 乘数要查品种信息：`BacktestConfig()` 的默认值是 1，拿它去折算「元/手」
         # 会把螺纹（乘数 10）的手续费算小 10 倍
-        mult = float(symbols_info.info(sym_code, ex).get("mult") or 1.0)
+        mult = float(mults.get(sym, 1.0) or 1.0)
         if price <= 0:
             continue
         if c.fee_per_lot > 0:
@@ -657,7 +672,9 @@ def trades_from_weights(weights: pd.DataFrame,
                         close: pd.DataFrame,
                         rets: pd.DataFrame | None = None,
                         cvec: pd.Series | None = None,
-                        eq_prev: pd.Series | None = None) -> list[Trade]:
+                        eq_prev: pd.Series | None = None,
+                        mults: pd.Series | None = None,
+                        scales: pd.DataFrame | None = None) -> list[Trade]:
     """把权重矩阵翻成逐笔交易：每个品种「同向连续持仓」算一笔。
 
     截面策略没有「一次开一手、一次平一手」的成交，仓位是按权重挂着的。要给出
@@ -683,6 +700,28 @@ def trades_from_weights(weights: pd.DataFrame,
     一半归上一段，开新仓那一半归这一段。所以这里记的是 `|w[i]|`（开仓）和
     `|w[j]|`（平仓），不是 `0.5 × |Δw|` —— 空仓开仓、平回空仓时对面没有段，
     取一半的话逐笔成本合计会只有总成本的一半。
+
+    ## 手数（2026-11-23 补）
+
+    原来这里写死 `lots=0.0`（「截面是权重不是手数，界面上显示 —」）。用户报
+    「截面对冲策略的交易记录没有手数」—— 权重**能**折成手数，只是要给它一个
+    本金：
+
+        名义额 = 本金 × |权重|            （权重本身就是本金的比例，见 run()）
+        手数   = 名义额 ÷ (开仓价 × 合约乘数)
+
+    这里算出来的是「**每 1 元本金**对应几手」，和 `gross` / `cost` 完全同一套
+    口径（那两个也是占本金的比例），由 `to_result` 乘回本金。所以真实手数
+    = `Trade.lots × initial_cash`。
+
+    开仓价用**复权价**（`close` 是前复权序列），乘数查 `symbols_info`。前复权
+    价被整体缩放过，一比「真实盘面价」就要换回来：`P_adj = P_raw × scale`，
+    而一手的名义额是 `乘数 × P_raw` ⇒ 手数要**乘** scale。`scales` 不给就按 1
+    （不复权口径，股票指数那条路就是 1）。
+
+    取「开仓那一根」的权重和价格，不是段内平均值 —— 用户要的是「这笔开了多少
+    手」，段内调仓会让名义额变，那属于加仓，不是这一笔的开仓量（同一个判据
+    见 MEMORY #203）。
     """
     out: list[Trade] = []
     if weights is None or weights.empty:
@@ -695,6 +734,13 @@ def trades_from_weights(weights: pd.DataFrame,
             continue
         w = weights[sym].to_numpy(dtype=float)
         px = close[sym].to_numpy(dtype=float)
+        # 这个品种的合约乘数 / 逐根复权因子（手数用，见上面「手数」那段）
+        mt = float((mults.get(sym, 1.0) if mults is not None else 1.0) or 1.0)
+        if mt <= 0:
+            mt = 1.0
+        sc = None
+        if scales is not None and sym in getattr(scales, "columns", ()):
+            sc = pd.to_numeric(scales[sym], errors="coerce").to_numpy(dtype=float)
         if money:
             r = (rets[sym].to_numpy(dtype=float) if sym in rets
                  else np.zeros(n, dtype=float))
@@ -741,6 +787,16 @@ def trades_from_weights(weights: pd.DataFrame,
             # 备注列：进场看权重多大，出场看权重是归零还是反向。截面策略没有
             # ATR 出场规则，这两种就是全部的离场方式
             w0 = float(w[i]) if np.isfinite(w[i]) else 0.0
+            # 手数（每 1 元本金几手）：开仓那一根的名义额 ÷ 一手的名义额。
+            # `p0` 是前复权价，乘数按真实盘面价算 ⇒ 要乘回复权因子
+            f0 = 1.0
+            if sc is not None:
+                try:
+                    v = float(sc[i])
+                    f0 = v if np.isfinite(v) and v > 0 else 1.0
+                except (IndexError, TypeError, ValueError):
+                    f0 = 1.0
+            lots = abs(w0) * f0 / (p0 * mt) if (p0 > 0 and abs(w0) > 0) else 0.0
             if opened:
                 why = "样本结束，仍持仓"
             elif end < n and np.isfinite(w[end]) and np.sign(w[end]) == -s:
@@ -751,7 +807,7 @@ def trades_from_weights(weights: pd.DataFrame,
                 entry_date=idx[i], exit_date=idx[k],
                 entry_price=p0, exit_price=p1, ret=float(ret),
                 bars=int(k - i), direction=int(s), open_position=bool(opened),
-                lots=0.0,          # 截面是权重不是手数，界面上显示「—」
+                lots=float(lots),   # 占本金的比例，`to_result` 乘回本金（同 gross/cost）
                 gross=float(gross), cost=float(cost),
                 symbol=str(sym),
                 entry_note=f"截面权重 {w0:+.2f} 进场",
@@ -880,6 +936,16 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
     lev = leverage_vector(frames, bt).reindex(weights.columns).fillna(1.0)
     if float(lev.min()) != 1.0 or float(lev.max()) != 1.0:
         weights = weights * lev
+    # 手数要用「乘数」和「逐根复权因子」。放在这里一次算好，逐品种和组合两条
+    # 拆账路径共用同一份（两处各算一遍必然会在某个品种上分叉）
+    mults = mult_vector(frames)
+    scols = {}
+    for sym, df in frames.items():
+        if df is None or not len(df) or "price_scale" not in df.columns:
+            continue
+        s = pd.to_numeric(df["price_scale"], errors="coerce")
+        scols[sym] = s.reindex(weights.index)
+    scales = pd.DataFrame(scols) if scols else None
     port_ret = (weights.shift(1) * rets).sum(axis=1)
     fee = (weights.diff().abs() * cvec).sum(axis=1).fillna(0.0)
     net = port_ret - fee
@@ -923,7 +989,8 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
             "notional_pct": float(wv.diff().abs().fillna(0.0).sum()),
             "trades": trades_from_weights(
                 weights[[sym]], close[[sym]], rets=rets[[sym]],
-                cvec=pd.Series({sym: cv}, dtype=float), eq_prev=ones),
+                cvec=pd.Series({sym: cv}, dtype=float), eq_prev=ones,
+                mults=mults, scales=scales),
         }
     return CrossResult(
         equity=equity, weights=weights, metrics=m,
@@ -933,7 +1000,7 @@ def run(frames: dict[str, pd.DataFrame], cfg: CrossConfig, bt: BacktestConfig,
         # `eq_prev` 给常数 1.0（= 本金）：单利下每根的盈亏都按本金算，
         # 不是按当时权益算
         trades=trades_from_weights(weights, close, rets=rets, cvec=cvec,
-                                   eq_prev=ones),
+                                   eq_prev=ones, mults=mults, scales=scales),
         per_symbol=per_symbol,
         score=score,
         score_step1=(score_src if src is not frames else None),
@@ -1011,8 +1078,12 @@ def to_result(out: "CrossResult", label: str = "", step: int = 0,
     # 逐笔金额：`trades_from_weights` 算出来的是「占初始本金的比例」，这里乘回
     # 本金。用 `replace` 生成新对象，别原地改 `out.trades` —— 同一个 `CrossResult`
     # 被包两次（主窗口 + 组合页）时，原地改会乘两遍本金
+    #
+    # 手数同理：那边算的是「每 1 元本金对应几手」，乘回本金才是真手数。不乘的话
+    # 界面上会显示 0.0000029 手（用户 2026-11-23 报「交易记录没有手数」的后半段）
     cash = float(initial_cash or 0.0)
-    trades = [replace(t, gross=float(t.gross) * cash, cost=float(t.cost) * cash)
+    trades = [replace(t, gross=float(t.gross) * cash, cost=float(t.cost) * cash,
+                      lots=float(t.lots) * cash)
               for t in out.trades]
 
     # ---- 逐品种：每条腿单独成一份 Result，绩效页的「品种」下拉框直接换过去
@@ -1025,7 +1096,8 @@ def to_result(out: "CrossResult", label: str = "", step: int = 0,
         leq = leg["equity"]
         lpos = pd.Series(np.sign(out.weights[sym].reindex(leq.index).fillna(0.0)),
                          index=leq.index, name="position")
-        ltrades = [replace(t, gross=float(t.gross) * cash, cost=float(t.cost) * cash)
+        ltrades = [replace(t, gross=float(t.gross) * cash, cost=float(t.cost) * cash,
+                           lots=float(t.lots) * cash)
                    for t in leg["trades"]]
         lm = dict(_metrics(leq, lpos, ltrades, bpy, base=1.0))
         lm["initial_cash"] = cash
