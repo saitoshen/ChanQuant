@@ -946,8 +946,13 @@ class ResultView(QObject):
         # 表头不写「(元)」：视图对象建一次就复用，市场从美股切到期货时表头
         # 不会重建，带单位的表头会让「按名字找列」直接抛 ValueError。单位改由
         # 上面那行提示说明，切市场时它会跟着刷新
+        #
+        # 🔴 倒数第二列原来叫「持仓」，装的是 `Trade.bars` —— **这笔持有了多少根
+        # K 线**，不是手数。名字撞上组合页的「理论持仓」之后，用户 2026-11-23 直接
+        # 拿它对账：「交易记录里头的持仓手数 rb/a/c 都和理论手数对不上」。
+        # 改成「持仓K线」，谁也不会再把它读成手数。
         cols = ["#", "策略", "方向", "开仓", "开仓价", "平仓", "平仓价", "手数",
-                "收益", "成本", "累计盈亏", "持仓", "备注"]
+                "收益", "成本", "累计盈亏", "持仓K线", "备注"]
         if self.kind == "portfolio":
             cols[1] = "策略"
         else:
@@ -2345,6 +2350,8 @@ class ResultView(QObject):
         c_cost = head.index("成本")
         c_cum = head.index("累计盈亏")
         c_note = head.index("备注")
+        c_lots = head.index("手数")
+        c_bars = head.index("持仓K线")
 
         shown = rows
         tbl.setRowCount(len(shown))
@@ -2392,6 +2399,19 @@ class ResultView(QObject):
                         f" ｜ 净 {t.pnl:+,.0f} {unit}\n收益率（按成交价）{t.ret*100:+.2f}%")
                 elif j == c_cost:
                     it.setForeground(QColor("#b45309"))
+                elif j == c_lots:
+                    # 手数为什么和工作区的「理论」列不一样：那是两根不同的 K 线
+                    it.setToolTip(
+                        "这一笔**开仓那一根**算出来的手数：\n"
+                        "　　手数 = 每笔止损金额 ÷ (当根止损距离 × 合约乘数)\n"
+                        "止损距离是当根的 ATR × 倍数，所以同一策略在不同时点、\n"
+                        "不同波动下手数本来就不一样。工作区「理论」列给的是\n"
+                        "**当前那根**的手数 —— 拿两边比通常对不上，那不是算错，\n"
+                        "是两根不同的 K 线。要比就比同一天的回测与实盘。")
+                elif j == c_bars:
+                    it.setToolTip(
+                        f"这一笔持有了 {t.bars} 根 K 线（周期 {self.period}）"
+                        " —— **不是手数**，手数看左边「手数」那一列。")
                 elif j == c_cum:
                     it.setForeground(QColor(C_UP if cums[i] >= 0 else C_DOWN))
                     it.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))
