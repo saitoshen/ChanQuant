@@ -1552,6 +1552,7 @@ def _run() -> tuple[bool, list[str]]:
             """只借三个方法：`_ib_on` / `_theo_qty` / `_update_one`。"""
 
             _ib_on = staticmethod(SR.PortfolioRunner._ib_on)
+            _theo_lots_qty = SR.PortfolioRunner._theo_lots_qty
             _theo_qty = SR.PortfolioRunner._theo_qty
             _update_one = SR.PortfolioRunner._update_one
             _slots: dict = {}
@@ -1617,11 +1618,220 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(
                 "盈亏还在按 target 算 —— K 线内策略的当日/持仓盈亏会恒等于 +0")
 
-        return ("K 线内策略的理论仓按 signal×lots 算（不是 target，"
+        return ("K 线内策略的理论仓按「方向 × 开仓手数」算（不是 target，"
                 "回测同一个数）；改手数不会反推它的下单目标；"
                 "快照推 `theo`、界面与两个盈亏列都读它")
 
     check("K 线内策略的理论持仓（sbbox 显示 0 那个）", _ib_theo)
+
+    def _theo_entry_lots():
+        """理论手数取「**开仓那一根**算出来的那个数」，绝不按当前 K 线重算。
+
+        用户 2026-11-23：「交易区理论列，需要按照开仓的手数来算，不能根据当前
+        k 线来算，实际上应该就从开仓那边获取，而不是自己擅自计算，这样是很严重
+        的 bug」。
+
+        真 bug：`_theo_qty` 以前用 `st.lots`，而 `st.lots` **每根 bar 都按当根
+        ATR 重算**。risk 口径下 `手数 = 止损额 ÷ (ATR × 倍数 × 乘数)`，ATR 从
+        12 掉到 4.7，同一笔仓的理论手数就从 39 手漂到 106 手 —— 界面和回测交易
+        记录里那一笔永远对不上。回测是「开仓那一根算一次、固定到平仓」，实盘
+        必须同一个口径。
+
+        这里用真数据（RB 日线）跑一遍：`_note_theo_entry` 倒推到信号波段起点，
+        算出来的手数要**逐位等于回测同一笔的 `Trade.lots`**；再往后接 6 根波幅
+        翻倍的 K 线，手数必须一动不动。
+        """
+        import inspect
+
+        import pandas as pd
+
+        from ttrade import backtest as BT
+        from ttrade import strategy_runner as SR
+        from ttrade import strategy_store as SStore
+        from ttrade import tqdata
+        from ttrade.strategies import run_strategy
+
+        class _Fake:
+            # 只借「算手数 / 记理论值」这几个方法，不碰行情、不碰柜台
+            _terms = staticmethod(SR.PortfolioRunner._terms)
+            _size = SR.PortfolioRunner._size
+            _volume_multiple = SR.PortfolioRunner._volume_multiple
+            _entry_lots_at = SR.PortfolioRunner._entry_lots_at
+            _note_theo_entry = SR.PortfolioRunner._note_theo_entry
+            _theo_qty = SR.PortfolioRunner._theo_qty
+            _theo_lots_qty = SR.PortfolioRunner._theo_lots_qty
+            _ib_on = staticmethod(SR.PortfolioRunner._ib_on)
+            _ib_entry_bar = SR.PortfolioRunner._ib_entry_bar
+            _latch_theo_lots = SR.PortfolioRunner._latch_theo_lots
+            _latch_to_order = SR.PortfolioRunner._latch_to_order
+            _theo_rank = staticmethod(SR.PortfolioRunner._theo_rank)
+            _side_cost_px = SR.PortfolioRunner._side_cost_px
+            _put_theo = SR.PortfolioRunner._put_theo
+
+            def _log(self, *a, **k):
+                pass
+
+        try:
+            df = tqdata.load_main("RB", "SHFE", "1d")
+        except Exception as exc:              # noqa: BLE001
+            return f"跳过：读不到 RB 日线（{type(exc).__name__}: {exc}）"
+        df = df[[c for c in ("open", "high", "low", "close") if c in df.columns]]
+        df = df.dropna().tail(1200)
+        if len(df) < 200:
+            return f"跳过：RB 日线只有 {len(df)} 根"
+
+        sig = run_strategy(df, "ma_cross", {})["signal"]
+        arr = sig.to_numpy()
+        sig0 = int(arr[-1])
+        if not sig0:
+            return "跳过：RB 日线最后那根信号是 0，测不到「持仓中的那笔」"
+        need = 6
+
+        f = _Fake()
+        st = SR.SlotState(cfg=SStore.StrategyConfig(
+            sid="t-lots", name="t-lots", symbol="RB", exchange="SHFE",
+            period="1d", family="rule", rule_key="ma_cross", sizing="risk",
+            principal=1_000_000.0, risk_pct=2.0, stop_atr_n=14, stop_mult=2.0))
+        f._note_theo_entry(st, df, sig)
+        if st.theo_lots <= 0:
+            raise RuntimeError(
+                "「开仓手数」没算出来（theo_lots=0）—— 理论列会退回按当前 K 线"
+                "重算，就是用户 11-23 报的那个 bug")
+        if st.theo_lots_src != SR.THEO_SIG:
+            raise RuntimeError(f"来源该是 sig，实际 {st.theo_lots_src!r}")
+        st.signal = sig0
+        if f._theo_lots_qty(st) != sig0 * st.theo_lots:
+            raise RuntimeError("理论仓 ≠ 方向 × 开仓手数")
+        st.target = sig0 * st.theo_lots
+        if f._theo_qty(st) != st.target:
+            raise RuntimeError("普通策略的理论仓该等于 target（两者同源）")
+
+        # ① 与回测最后一笔逐位相等（用户就是拿这两个数对账的）
+        bcfg = BT.BacktestConfig(
+            initial_cash=1_000_000.0, sizing="risk", risk_amount=20_000.0,
+            stop_atr_n=14, stop_mult=2.0, multiplier=10.0, margin_rate=0.10,
+            fee_rate=0.0, fee_per_lot=0.0, tick_size=0.0, slippage_ticks=0.0,
+            slippage=0.0, bars_per_year=244.0)
+        trades = BT.run_backtest(df.assign(signal=sig), bcfg, label="t").trades
+        if not trades:
+            return "跳过：这段数据没跑出交易，对不上账"
+        last = trades[-1]
+        if int(last.lots) != st.theo_lots:
+            raise RuntimeError(
+                f"实盘口径 {st.theo_lots} 手 ≠ 回测这一笔 {int(last.lots)} 手 ——"
+                "两边手数的输入（价 / ATR / 乘数 / 止损额）又分叉了")
+        entry_lots = int(st.theo_lots)     # ← 就是与回测对得上的那个数
+
+        # ② 后面接 6 根波幅翻倍的 K 线：手数必须一动不动
+        rows, idx6 = [], []
+        base = df.iloc[-1]
+        for m in range(need):
+            row = base.copy()
+            row["open"] = base["close"]
+            row["high"] = base["close"] * 1.25
+            row["low"] = base["close"] * 0.75
+            row["close"] = base["close"]
+            rows.append(row)
+            idx6.append(df.index[-1] + pd.Timedelta(days=m + 1))
+        d2 = pd.concat([df, pd.DataFrame(rows, index=idx6)])
+        s2 = pd.concat([sig, pd.Series([sig0] * need, index=d2.index[-need:])])
+        if len(s2) != len(d2):
+            raise RuntimeError(f"造数据失败 {len(s2)} ≠ {len(d2)}")
+        st.signal = sig0
+        f._note_theo_entry(st, d2, s2)
+        if st.theo_lots != int(last.lots):
+            raise RuntimeError(
+                f"波动一变理论手数就跟着变（{int(last.lots)} → {st.theo_lots}）"
+                " —— 又回到「按当前 K 线算」了")
+        # 对照：按当前这根重算会是另一个数，否则这条测试证明不了什么
+        drifted = f._size(st, float(d2["close"].iloc[-1]), SR.atr(d2, 14))[0]
+        if abs(int(drifted) - st.theo_lots) < 1:
+            raise RuntimeError(
+                f"对照组造不出差异（{drifted} 手 vs {st.theo_lots} 手）—— "
+                "这条断言测不到漂移，得把波幅放大")
+
+        # ③ 翻方向必须重算
+        flip = pd.concat([sig, pd.Series([-sig0] * need, index=d2.index[-need:])])
+        st.signal = -sig0
+        f._note_theo_entry(st, d2, flip)
+        if st.theo_lots_sig != -sig0:
+            raise RuntimeError("翻方向之后手数没有重算 —— 会拿着上一波的手数开新仓")
+
+        # ④ K 线内真触发：手数用那一刻**实际下单**的那份，且此后推断不许盖掉它
+        st.lots = 7
+        f._latch_to_order(st, -sig0)
+        if st.theo_lots_src != SR.THEO_IB:
+            raise RuntimeError("K 线内触发之后来源没升到 ib 档")
+        if st.theo_lots != 7:
+            raise RuntimeError(f"触发时实际下单 7 手，记成了 {st.theo_lots} 手")
+        st.lots = 12                      # 收盘那根重算出来是 12 手（波动变了）
+        f._note_theo_entry(st, d2, flip)  # 同一波，推断不许覆盖
+        if st.theo_lots != 7:
+            raise RuntimeError(
+                f"实际下单是 7 手，推断却把它改成了 {st.theo_lots} 手 ——"
+                "「从开仓那边获取」这一条没守住")
+
+        # ⑤ 源码级：目标仓必须走 `_theo_lots_qty`，不许再是 `signal × lots`
+        body = inspect.getsource(SR.PortfolioRunner._refresh_signal)
+        if "st.target = st.signal * st.lots" in body:
+            raise RuntimeError(
+                "`_refresh_signal` 又按当前 K 线的 lots 算目标仓了 —— "
+                "同一笔持仓会被 ATR 的漂移一路加仓 / 减仓")
+        if "st.target = self._theo_lots_qty(st)" not in body:
+            raise RuntimeError("`_refresh_signal` 没用 `_theo_lots_qty()` 定目标仓")
+
+        # ⑥ K 线内那一族（用户最早报的 sbbox）：开仓那根要按**价格路径**找出来，
+        #    手数要和回测未平那笔逐位相等。起点写成 k+1 会漏掉真正的开仓那根
+        #    （实测 62 vs 77）；`stop_dist` 拿整数下标索引 Series 会静默退回 ATR
+        #    那条路（实测 61 vs 77）。
+        note6 = ""
+        try:
+            d1h = tqdata.load_main("RB", "SHFE", "1h").tail(1500)
+            r6 = run_strategy(d1h, "sbbox_ib", {})
+        except Exception as exc:              # noqa: BLE001
+            d1h, r6 = None, None
+            note6 = f"；K 线内那半段跳过（读不到 1h：{type(exc).__name__}）"
+        if r6 is not None and "stop_dist" in r6.columns:
+            s6 = r6["signal"]
+            sg6 = int(s6.iloc[-1])
+            st6 = SR.SlotState(cfg=SStore.StrategyConfig(
+                sid="t-ib-lots", name="t-ib-lots", symbol="RB",
+                exchange="SHFE", period="1h", family="rule",
+                rule_key="sbbox_ib", sizing="risk", principal=1_000_000.0,
+                risk_pct=1.0, stop_atr_n=14, stop_mult=2.0))
+            if sg6:
+                f._note_theo_entry(st6, d1h, s6, r6["stop_dist"],
+                                   r6["entry_long"], r6["entry_short"])
+                res6 = BT.run_backtest(d1h.assign(
+                    signal=s6, stop_dist=r6["stop_dist"],
+                    entry_long=r6["entry_long"], entry_short=r6["entry_short"],
+                    exit_long=r6["exit_long"], exit_short=r6["exit_short"]),
+                    BT.BacktestConfig(
+                        initial_cash=1_000_000.0, sizing="risk",
+                        risk_amount=10_000.0, stop_atr_n=14, stop_mult=2.0,
+                        multiplier=10.0, margin_rate=0.10, fee_rate=0.0,
+                        fee_per_lot=0.0, tick_size=0.0, slippage_ticks=0.0,
+                        slippage=0.0, bars_per_year=244.0 * 6))
+                t6 = res6.trades[-1] if res6.trades else None
+                if t6 is not None and t6.open_position and t6.direction == sg6:
+                    if int(t6.lots) != st6.theo_lots:
+                        raise RuntimeError(
+                            f"K 线内：理论 {st6.theo_lots} 手 ≠ 回测这笔 "
+                            f"{int(t6.lots)} 手 —— 开仓那根没找对"
+                            "（起点该是信号第一根 k，不是 k+1）")
+                    note6 = f"；K 线内实测 {st6.theo_lots} 手也等于回测 Trade.lots"
+                else:
+                    note6 = "；K 线内那笔已平仓，对拍跳过"
+            else:
+                note6 = "；K 线内末根信号是 0，对拍跳过"
+
+        return (f"手数在「开仓那一根」定死：RB 日线实测 {entry_lots} 手，"
+                f"与回测同一笔的 Trade.lots 逐位相等；"
+                f"波幅翻倍后仍是 {entry_lots} 手不漂"
+                f"（按当前 K 线重算会变成 {drifted} 手）；翻方向才重算；"
+                "K 线内触发后用实际下单手数，推断不覆盖" + note6)
+
+    check("理论手数取开仓那一根（不按当前 K 线重算）", _theo_entry_lots)
 
     def _td_key():
         """交易日归日：sbbox 必须读 `trading_day` 列，不能自己写 `index + 6h`。
