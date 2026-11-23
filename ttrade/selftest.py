@@ -8423,8 +8423,43 @@ def _run() -> tuple[bool, list[str]]:
         if type(c3._td.CThostFtdcInputOrderField()) is not type(r1):
             raise RuntimeError("又建了一个 CTP 客户端之后，先前那个的结构体变了")
 
+        # ③ 🔴 SPI 回调里造请求，**不能**用 SPI 自己的 `self`
+        # 用户 2026-11-23 报的「融航认证请求失败：'_Spi' object has no attribute
+        # '_td'」就是这个：批量改 `tdapi.` → `self._td.` 时，内层 `class _Spi`
+        # 里的 `self` 是 SPI 对象。SPI 的回调自己 try/except 掉了异常（只写
+        # `last_error`），所以这里必须**两件事都查**：没记错误 + 请求真发出去了
+        class _FakeApi:
+            def __init__(self):
+                self.calls = []
+
+            def __getattr__(self, name):
+                if name.startswith("Req"):
+                    def _rec(*a, **k):
+                        self.calls.append(name)
+                        return 0
+
+                    return _rec
+                raise AttributeError(name)
+
+        for who, c in (("标准", c1), ("融航", c2)):
+            api = _FakeApi()
+            c.api = api
+            c._spi = c._make_spi()      # 必须被持有：CTP 侧拿的是裸指针
+            c._spi.OnFrontConnected()   # 认证请求就在这一步造
+            if c.last_error:
+                raise RuntimeError(
+                    f"[{who}] 前置连上就报错（SPI 回调里造不出请求）：{c.last_error}")
+            if "ReqAuthenticate" not in api.calls:
+                raise RuntimeError(f"[{who}] 认证请求没发出去：{api.calls}")
+            c._spi.OnRspAuthenticate(None, None, 1, True)   # 认证过 → 发登录
+            if c.last_error or "ReqUserLogin" not in api.calls:
+                raise RuntimeError(
+                    f"[{who}] 认证之后没发登录请求：{c.last_error!r} {api.calls}")
+            c.api = None
+
         return ("两套 dll 同进程共存（load 两家都成、互不挤掉）；"
-                f"请求结构体各取各的（{type(r1).__module__} / {type(r2).__module__}），"
+                f"请求结构体各取各的（{type(r1).__module__} / {type(r2).__module__}）；"
+                "SPI 回调里用 `outer._td` 造请求（不会把 SPI 对象当成客户端）；"
                 "后建的客户端不影响先建的 —— 所以 CTP 户和融航户可以同时登录，"
                 "不需要独立进程")
 

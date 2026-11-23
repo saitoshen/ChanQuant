@@ -389,7 +389,7 @@ class MdClient(_ChannelApi):
         class _Spi(self._md.CThostFtdcMdSpi):
             def OnFrontConnected(self):  # noqa: N802 - CTP 规定的方法名
                 try:
-                    req = self._md.CThostFtdcReqUserLoginField()
+                    req = outer._md.CThostFtdcReqUserLoginField()
                     req.BrokerID = outer.cfg.broker_id
                     req.UserID = outer.cfg.user_id
                     req.Password = outer.cfg.password
@@ -1004,7 +1004,7 @@ class TraderClient(_ChannelApi):
             def OnFrontConnected(self):  # noqa: N802
                 outer.connected.set()
                 try:
-                    req = self._td.CThostFtdcReqAuthenticateField()
+                    req = outer._td.CThostFtdcReqAuthenticateField()
                     req.BrokerID = outer.cfg.broker_id
                     req.UserID = outer.cfg.user_id
                     req.AppID = outer.cfg.app_id
@@ -1025,7 +1025,7 @@ class TraderClient(_ChannelApi):
                     outer.last_error = f"认证失败：{err}"
                     return
                 try:
-                    req = self._td.CThostFtdcReqUserLoginField()
+                    req = outer._td.CThostFtdcReqUserLoginField()
                     req.BrokerID = outer.cfg.broker_id
                     req.UserID = outer.cfg.user_id
                     req.Password = outer.cfg.password
