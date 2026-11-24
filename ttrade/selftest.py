@@ -26,6 +26,25 @@ def _run() -> tuple[bool, list[str]]:
     # 就只落了 "selftest.py line 7841 in run" 两帧，等于没说是哪一项死的。
     # 这里每进一项就把名字刷到文件里（不缓冲），崩了至少知道死在谁身上。
     _prog = None
+    # 日志**边跑边落盘**，理由同上但更狠：原来 `run()` 只在最后把整个 `lines`
+    # 写一次文件，段错误一来进程直接死 ⇒ `selftest.log` **不存在**。CI 那几轮
+    # 只能拿到「日志文件不存在（自检没跑完就没机会落盘）」，一条线索都没有
+    # （v3.9.6 与 v3.9.15 的 macOS arm64 都是这么白跑的）。
+    _log_fh = None
+
+    def _emit(text: str) -> None:
+        """记一行，并立刻刷进 `selftest.log`。
+
+        `flush()` 就够：进程被信号打死时数据已经在**内核**缓冲里，只有断电才
+        需要 `fsync`，而 135 项每项 fsync 一次在 Windows 上要多花好几秒。
+        """
+        lines.append(text)
+        if _log_fh is not None:
+            try:
+                _log_fh.write(text + "\n")
+                _log_fh.flush()
+            except Exception:  # noqa: BLE001 - 写不进就少一层线索，不影响自检
+                pass
 
     # 全程离屏，自检不应该在用户屏幕上闪一个窗口
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -40,11 +59,11 @@ def _run() -> tuple[bool, list[str]]:
                 pass
         try:
             detail = fn()
-            lines.append(f"[ OK ] {name}" + (f"  {detail}" if detail else ""))
+            _emit(f"[ OK ] {name}" + (f"  {detail}" if detail else ""))
         except Exception as exc:  # noqa: BLE001 - 自检要吞掉异常继续跑完
             ok = False
-            lines.append(f"[FAIL] {name}  {type(exc).__name__}: {exc}")
-            lines.append(traceback.format_exc())
+            _emit(f"[FAIL] {name}  {type(exc).__name__}: {exc}")
+            _emit(traceback.format_exc())
 
     from ttrade.paths import bundle_root, cache_dir, data_dir, is_frozen, log_dir, user_dir
 
@@ -53,14 +72,22 @@ def _run() -> tuple[bool, list[str]]:
                      encoding="utf-8")
     except Exception:  # noqa: BLE001
         _prog = None
+    try:
+        # buffering=1 = 行缓冲，配合 `_emit` 里的显式 flush；段错误时文件已经有
+        # 到死点为止的全文，CI 那边 `cat` 出来就能看到是**哪一项**挂的
+        _log_fh = open(os.path.join(log_dir(), "selftest.log"), "w",
+                       encoding="utf-8", buffering=1)
+    except Exception:  # noqa: BLE001
+        _log_fh = None
 
-    lines.append(f"frozen={is_frozen()}  python={sys.version.split()[0]}  platform={sys.platform}")
-    lines.append(f"bundle_root = {bundle_root()}")
-    lines.append(f"data(us)    = {data_dir('us')}")
-    lines.append(f"data(cn)    = {data_dir('cn')}")
-    lines.append(f"user_dir    = {user_dir()}")
-    lines.append(f"log_dir     = {log_dir()}")
-    lines.append("")
+    _emit(
+        f"frozen={is_frozen()}  python={sys.version.split()[0]}  platform={sys.platform}")
+    _emit(f"bundle_root = {bundle_root()}")
+    _emit(f"data(us)    = {data_dir('us')}")
+    _emit(f"data(cn)    = {data_dir('cn')}")
+    _emit(f"user_dir    = {user_dir()}")
+    _emit(f"log_dir     = {log_dir()}")
+    _emit("")
 
     def _store_isolated():
         """自检绝不能读写用户的组合 / 策略库。
@@ -15470,6 +15497,13 @@ def _run() -> tuple[bool, list[str]]:
         try:
             _prog.close()
             os.remove(os.path.join(log_dir(), "selftest_progress.txt"))
+        except Exception:  # noqa: BLE001
+            pass
+    # 关掉增量日志：`run()` 之后还会把 `lines` 整份重写一遍（内容相同），
+    # 同一个文件不能同时开着两个写句柄
+    if _log_fh is not None:
+        try:
+            _log_fh.close()
         except Exception:  # noqa: BLE001
             pass
 

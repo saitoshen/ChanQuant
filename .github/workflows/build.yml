@@ -14,12 +14,14 @@ jobs:
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    # macOS arm64 允许失败：它从 v3.7.4 起自检就稳定死在「构建主窗口（端到端）」，
-    # 退出码 139，且与 PySide6 版本无关（6.12.0 / 6.11.3 都一样），x64 与 Windows
-    # 用同一份代码同一个包都不崩 —— 说明是 arm64 单独的问题，还没定位。
-    # 不设这个开关的话，一个平台的未知问题会把三个平台的包全扣住（Release 被
-    # skip），已经因此连续 5 轮发不出包。**这是妥协，不是修复**：arm64 的 zip
-    # 会缺，别再默默往上加 ignore。
+    # 2026-11-24 起 macOS arm64 **不再允许失败**（用户要求）。
+    # 它从 v3.7.4 起自检稳定死在「构建主窗口（端到端）」、退出码 139，与 PySide6
+    # 版本无关（6.12.0 / 6.11.3 都一样），x64 与 Windows 用同一份代码同一个包都不崩。
+    # 之前用 `allow_fail: true` 兜着，代价是「红了两轮没人管」—— v3.9.6 和 v3.9.15
+    # 的 arm64 都挂着，因为整个 run 还是绿的，看着像没事。
+    # 现在改成必须绿：它一红整个 run 就红。**不会扣住 Release** —— 下面 `release`
+    # 的 `if` 用的是 `!cancelled()`，不是「所有矩阵都成功」，能出几个平台的包就发几个
+    # （当初就是为了这个才这么写的，见 release job 上的注释）。
     continue-on-error: ${{ matrix.allow_fail == true }}
     # 英文版 Windows runner 的控制台是 cp1252，脚本里的中文 print 会抛
     # UnicodeEncodeError（表现为「生成图标」步骤莫名失败）。强制 UTF-8 模式。
@@ -35,16 +37,22 @@ jobs:
             artifact: ChanQuant-win64
             archive: dist/ChanQuant-win64.zip
             allow_fail: false
+            faulthandler: "0"
           - os: macos-latest     # Apple Silicon（macos-14 起默认 arm64）
             label: macOS arm64
             artifact: ChanQuant-macos-arm64
             archive: dist/ChanQuant-macos-arm64.zip
-            allow_fail: true     # 见上面的注释：自检段错误未定位
+            allow_fail: false    # 2026-11-24 起必须绿（见 build job 上的注释）
+            # 只有这一档开 faulthandler：它在 macOS x64 上会把「先探地址再恢复」的
+            # 段错误变成致命错误（实测自检从 exit 0 变 139），但 arm64 现在**本来就
+            # 是 100% 崩**，拿不到 C 层栈反而没法查。绿了以后记得关回 "0"。
+            faulthandler: "1"
           - os: macos-15-intel   # Intel；macos-13 已于 2025-12-04 退役
             label: macOS x64
             artifact: ChanQuant-macos-x64
             archive: dist/ChanQuant-macos-x64.zip
             allow_fail: false
+            faulthandler: "0"
 
     steps:
       - uses: actions/checkout@v4
@@ -165,6 +173,11 @@ jobs:
 
       - name: 自检（验证包内资源与 Qt 插件）
         shell: bash
+        env:
+          # 崩溃栈（C 层）。默认关 —— 见 `selftest.run()` 里的说明：它在 macOS
+          # 上会把非致命的段错误变成致命错误。现在只在 arm64 开，因为那一档
+          # 本来就在死，我们要的正是那份栈。
+          CHANQUANT_SELFTEST_FAULTHANDLER: ${{ matrix.faulthandler }}
         run: |
           # 失败时把 [FAIL] 那几行**发成 annotation**：job 日志要 API token 才能
           # 读，annotation 匿名就能读，排查打包环境独有的失败时这是唯一线索。
@@ -221,10 +234,18 @@ jobs:
               cat "$log"
               emit_fail "$log"
             elif [ -f "$log" ]; then
-              echo "::error title=selftest::日志里没有 [FAIL] 行 —— 进程崩在中途或被信号打死，下面是日志尾部"
+              echo "::error title=selftest::日志里没有 [FAIL] 行 —— 进程崩在中途或被信号打死"
+              # 🔴 自 2026-11-24 起 `selftest.log` 是**边跑边落盘**的，崩在中途
+              # 也会有到死点为止的全文。整份打到 job 日志里（annotation 每 step
+              # 只有 10 条配额，装不下），最后再补一条「停在哪一项」。
+              cat "$log"
+              echo "----- 日志尾部 3 行 -----"
               emit_tail "$log" 3
             else
-              echo "::error title=selftest::日志文件不存在（自检没跑完就没机会落盘）"
+              # v3.9.6 / v3.9.15 的 arm64 都卡在这一句上：日志只在自检跑完才落盘，
+              # 段错误一来文件就不存在。现在改成增量落盘，这句**不该再出现**了；
+              # 真出现了说明进程连第一项都没跑进去（动态库加载阶段就死了）。
+              echo "::error title=selftest::日志文件不存在 —— 进程在写出第一项之前就死了（多半是 dylib 加载失败）"
             fi
             return 1
           }
