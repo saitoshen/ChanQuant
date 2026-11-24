@@ -8,6 +8,16 @@
 调用都会新建订阅对象，天勤会按符号去重但语义上仍然是浪费）。所以这里的做法是
 `start()` 里一次性建好引用，`wait()` 推进，`snapshot()` 拷出普通 dict 给界面。
 
+🔴 **2026-11-24 起，推进 `wait_update` 的那条线程在 `LiveHub` 自己身上**
+（`_pump`），不再是调用方。因为一个账户的会话现在由交易页和组合页**共用**
+（`ttrade/hubreg.py`）：两个调用方各推一次 = 两条线程驱动同一个 `TqApi`，
+tqsdk 明确不支持，会把内部订阅状态写坏。所以：
+
+- `wait()` 只等「泵推来下一拍」，不再自己调 `wait_update()`；
+- 所有碰 `TqApi` 的方法都进 `_lock`（`@_serial` 装饰器 / `_api_call()`）；
+- 组合页要的 `TqApi` 同名方法（`get_position` / `get_order` / `insert_order` /
+  `cancel_order`）在文件末尾原样转出去，所以 `PortfolioRunner` 一行都不用改。
+
 **时间戳**：K 线 `datetime` 是 **UTC 纳秒**，而 `DataDownloader` 写出的 CSV 是
 北京时间，两者差 8 小时且不报错。统一走 `tqfetch.local_time()` 转北京时间，
 与 DuckDB 里已落盘的历史对齐。
@@ -20,14 +30,17 @@ bar」，实时段全部落在当前主力合约的时间区间内，而后复�
 
 from __future__ import annotations
 
+import functools
 import json
+import math
 import os
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 
 import pandas as pd
 
-from . import daylimit, symbols_info
+from . import daylimit, hubreg, symbols_info
 from .paths import user_dir
 from .tqdata import PERIODS, daily_csv_path, resample, trading_days
 from .tqfetch import PERIOD_SEC, local_time
@@ -431,6 +444,36 @@ def _last_daily_close(symbol: str, exchange: str = "") -> float:
         px = 0.0
     _LAST_CLOSE[path] = (mtime, px)
     return px if px > 0 else 0.0
+
+
+#: 泵线程一次 `wait_update` 的上限（秒）。
+#:
+#: 它同时是「别的线程调 `TqApi` 最多被挡多久」：`wait_update` 期间会话锁是
+#: 被占着的（`TqApi` 不是线程安全的），所以这个数不能大。0.1 秒的代价是空闲
+#: 时每秒醒 10 次 —— 有消息时 `wait_update` 会立刻返回，不受这个数影响。
+PUMP_SEC = 0.1
+
+
+def _serial(fn):
+    """把这个方法的**整段**包进会话锁（`LiveHub._lock`）。
+
+    🔴 为什么需要（2026-11-24 用户要求「天勤账户也共享一条会话」）：一条
+    `TqApi` 被泵线程 `wait_update` 驱动着，其它线程再去碰 `get_position()` /
+    `insert_order()` / `get_kline_serial()` 就是**跨线程用同一个 TqApi**，
+    tqsdk 明确不支持（会写坏内部订阅状态，表现为「单子偶尔丢、偶尔重复」）。
+    所以读写一律串行化，泵也只在这个锁里推 `wait_update`。
+
+    用装饰器而不是在每个函数体里缩进一层：这几个方法里全是长注释和 early
+    return，缩进一改 diff 就没法看了。
+    """
+
+    @functools.wraps(fn)
+    def inner(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+
+    return inner
+
 
 
 def _qnum(q, name: str, default: float = 0.0) -> float:
@@ -837,10 +880,15 @@ class LiveHub:
     生命周期：`start()` → 反复 `wait()` → `close()`。`wait()` 之外的调用都只是
     读活引用，不会阻塞。所有异常都写进 `last_error`，不让界面线程炸掉。
 
+    🔴 **这个对象是进程内共享的**（2026-11-24 起）：交易页和组合页按账户名
+    从 `ttrade/hubreg.py` 领到**同一个 `LiveHub`**，`start()` 幂等、`close()`
+    带引用计数。唯一能碰 `TqApi` 的那条线程是 `_pump`，别的线程全程走 `_lock`
+    —— 详见 `_serial` 和 `_api_call` 的注释。
+
     **多账户**：`specs` 给多个账户时走天勤的 `TqMultiAccount` —— 一条连接、
-    一次登录，`insert_order(..., account=obj)` 指定落到哪个账户。多个 TqApi
-    各连各的也能跑，但要重复登录、重复订阅行情，而且撤单/持仓的实时性会互相
-    拖累，没有理由那么做。
+    一次登录，`insert_order(..., account=obj)` 指定落到哪个账户。但**共享那条路
+    只发单账户**：`hubreg` 的键是「一个账户」，两个账户共享一条 TqApi 会让
+    「登出其中一个」变成「两个一起断」。
     """
 
     def __init__(self, specs):
@@ -878,56 +926,150 @@ class LiveHub:
         # 落盘计数（同一个账户、同一个进程只能有一份）。多账户各自计数。
         self.limit = daylimit.DayLimit(self.spec.label() if self.spec else "账户")
 
+        # ---- 会话共享（2026-11-24）----
+        # 🔴 一个天勤账户在整个系统只能有一条 `TqApi`。以前交易页一条、组合页
+        # 一条，同一账户被登了两次：天勤按会话推持仓/委托/成交回报，两条会话
+        # 互不相通 ⇒ 「一键对齐发出去的单在交易页看得到、监控器上不动」。
+        #
+        # `TqApi` 是单线程语义（`wait_update()` 只能在一条线程里调），所以共享
+        # 的做法和 `MarketFeed` 一样：**一条泵线程独占 `wait_update`**，其它
+        # 线程的每次调用都走 `self._lock`，`wait()` 退化成「等泵推来下一拍」。
+        self._lock = threading.RLock()
+        #: 和 `_lock` 同一把（`Condition` 会在等待期间释放它，泵才拿得到）
+        self._cv = threading.Condition(self._lock)
+        #: `wait_update` 拿到新数据的次数。`wait()` 靠它判断「这一拍有没有来」
+        self._tick = 0
+        self._start_lock = threading.RLock()
+        self._thread: threading.Thread | None = None
+        self._stopped = False
+
     # ---- 生命周期 ----
 
     def start(self) -> None:
-        """建立连接并取好所有活引用。失败抛异常，由调用方决定怎么提示。"""
+        """建立连接并取好所有活引用。失败抛异常，由调用方决定怎么提示。
+
+        **幂等**：别人（交易页 / 组合页）已经登过这条会话时立刻返回，不会二次
+        登录。`hubreg.acquire()` 会把同一个账户的同一条连接发给两个使用者，
+        后到的那一方必须能安全地再调一次 `start()` —— 不幂等的话它会把已经
+        登录好的 `api` 换掉，先到那方手里的活引用当场变野指针。
+        """
         from tqsdk import TqApi, TqAuth
 
-        if not self.specs:
-            # 纯行情会话。天勤允许不带账户建连接（只要 TqAuth），这样研究页的
-            # 实时不依赖「账户透视和交易」页有没有登录，也不会多占一个资金账号
-            # 的连接名额。
-            from ttrade.tqsdk_symbols import read_account
+        with self._start_lock:
+            if self.api is not None:
+                self._start_pump()
+                return
+            if not self.specs:
+                # 纯行情会话。天勤允许不带账户建连接（只要 TqAuth），这样研究页的
+                # 实时不依赖「账户透视和交易」页有没有登录，也不会多占一个资金账号
+                # 的连接名额。
+                from ttrade.tqsdk_symbols import read_account
 
-            user, pwd = read_account()
-            if not user or not pwd:
-                raise ValueError("没有配置天勤账户，无法连接实时行情")
-            self.api = TqApi(auth=TqAuth(user, pwd), web_gui=False)
+                user, pwd = read_account()
+                if not user or not pwd:
+                    raise ValueError("没有配置天勤账户，无法连接实时行情")
+                self.api = TqApi(auth=TqAuth(user, pwd), web_gui=False)
+                self._start_pump()
+                return
+            alien = [s.name for s in self.specs if s.backend != "tq"]
+            if alien:
+                # 柜台账户（CTP / 融航）在这里必须被挡住。掉到下面去的话，报的是
+                # 「缺少天勤账户或密码」，用户会以为自己账号密码填错了
+                raise ValueError(
+                    f"账户「{'、'.join(alien)}」是柜台账户，不走天勤，"
+                    "不能放进天勤连接（应各自单开一条柜台连接）"
+                )
+            for s in self.specs:
+                if not s.user or not s.password:
+                    raise ValueError(f"账户「{s.name}」缺少天勤账户或密码")
+            objs = [s.build() for s in self.specs]
+            # 同一个资金账号选两次会被天勤拒绝（account_key 重复）。提前说清楚，
+            # 别让用户对着一句英文异常猜。
+            keys = [getattr(o, "_account_key", id(o)) for o in objs]
+            if len(set(keys)) != len(keys):
+                raise ValueError("同一天勤资金账号不能重复连接，请取消其中一个的勾选")
+            if len(objs) == 1:
+                self.api = TqApi(
+                    objs[0],
+                    auth=TqAuth(self.specs[0].user, self.specs[0].password),
+                    web_gui=False)
+            else:
+                from tqsdk import TqMultiAccount
+
+                self.api = TqApi(TqMultiAccount(objs),
+                                 auth=TqAuth(self.specs[0].user, self.specs[0].password),
+                                 web_gui=False)
+            self._accs = list(zip(self.specs, objs))
+            self._start_pump()
+
+    # ---- 泵线程：唯一驱动 wait_update 的那条线程 ----
+
+    def _start_pump(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
             return
-        alien = [s.name for s in self.specs if s.backend != "tq"]
-        if alien:
-            # 柜台账户（CTP / 融航）在这里必须被挡住。掉到下面去的话，报的是
-            # 「缺少天勤账户或密码」，用户会以为自己账号密码填错了
-            raise ValueError(
-                f"账户「{'、'.join(alien)}」是柜台账户，不走天勤，"
-                "不能放进天勤连接（应各自单开一条柜台连接）"
-            )
-        for s in self.specs:
-            if not s.user or not s.password:
-                raise ValueError(f"账户「{s.name}」缺少天勤账户或密码")
-        objs = [s.build() for s in self.specs]
-        # 同一个资金账号选两次会被天勤拒绝（account_key 重复）。提前说清楚，
-        # 别让用户对着一句英文异常猜。
-        keys = [getattr(o, "_account_key", id(o)) for o in objs]
-        if len(set(keys)) != len(keys):
-            raise ValueError("同一天勤资金账号不能重复连接，请取消其中一个的勾选")
-        if len(objs) == 1:
-            self.api = TqApi(objs[0], auth=TqAuth(self.specs[0].user, self.specs[0].password),
-                             web_gui=False)
-        else:
-            from tqsdk import TqMultiAccount
+        self._stopped = False
+        self._thread = threading.Thread(
+            target=self._pump, name="tq-pump", daemon=True)
+        self._thread.start()
 
-            self.api = TqApi(TqMultiAccount(objs),
-                             auth=TqAuth(self.specs[0].user, self.specs[0].password),
-                             web_gui=False)
-        self._accs = list(zip(self.specs, objs))
+    def _pump(self) -> None:
+        """不停地 `wait_update`。**`TqApi` 只在这一条线程里被推进。**
+
+        别的方法只读活引用、或者把调用塞进 `_lock` 串行执行 —— tqsdk 明确说
+        `wait_update()` 只能在一条线程里调，两条线程一起驱动会把内部订阅状态
+        写坏（表现是「单子偶尔丢、偶尔重复」，而且不报错）。
+
+        出异常就停：再转下去只会每 0.1 秒刷一次同样的错。`last_error` 留着，
+        界面据此显示「行情中断」，`wait()` 会因为没新拍而超时返回 False。
+        """
+        while not self._stopped:
+            api = self.api
+            if api is None:
+                break
+            try:
+                with self._lock:
+                    got = bool(api.wait_update(deadline=time.time() + PUMP_SEC))
+            except Exception as exc:  # noqa: BLE001 - 泵线程不能抛出去
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                got = False
+                with self._cv:
+                    # 叫醒还在等的人，否则他们的 `wait()` 会一直等到超时
+                    self._tick += 1
+                    self._cv.notify_all()
+                break
+            if got:
+                with self._cv:
+                    self._tick += 1
+                    self._cv.notify_all()
+
+    def _api_call(self, name: str, *args, **kwargs):
+        """在会话锁里调一次 `TqApi` 的方法（泵线程用的是同一个 `TqApi`）。"""
+        api = self.api
+        if api is None:
+            raise RuntimeError("还没连接")
+        with self._lock:
+            return getattr(api, name)(*args, **kwargs)
 
     def close(self) -> None:
+        """收掉这条会话。**只有最后一个使用者才真的关**（见 `ttrade/hubreg.py`）。
+
+        交易页和组合页共用同一条天勤连接：一边登出就把 `TqApi` 关掉，另一边
+        的持仓 / 委托当场全冻住，而界面上只是「数据不更新了」。
+        """
+        if not hubreg.release(self):
+            return                   # 还有别人在用，谁都不许关
+        hubreg.forget(self)          # 直接 close 的路径（断线收尾）也要摘干净
+        with self._start_lock:
+            self._stopped = True
+            t, self._thread = self._thread, None
         api, self.api = self.api, None
         self._klines = self._quote = None
         self._accs = []
         self._targets.clear()
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=2.0)      # 泵最多卡在 `PUMP_SEC` 的 wait_update 里
+        with self._cv:
+            self._cv.notify_all()    # 叫醒还在 wait() 里的人
         if api is not None:
             try:
                 api.close()
@@ -940,6 +1082,7 @@ class LiveHub:
 
     # ---- 订阅 ----
 
+    @_serial
     def subscribe(self, symbol: str, exchange: str, period: str) -> None:
         """订阅一个品种的主连 K 线与实时行情。
 
@@ -972,6 +1115,7 @@ class LiveHub:
         # 股票没有「主连 → 真实合约」这一步，订的就是能下单的那个代码
         self.underlying = tq_sym if is_stock(symbol, exchange) else ""
 
+    @_serial
     def watch(self, symbols) -> None:
         """盯一列合约的盘口，给交易页的「报价」框用。
 
@@ -1006,18 +1150,44 @@ class LiveHub:
     # ---- 推进 ----
 
     def wait(self, timeout: float = 0.8) -> bool:
-        """推进一次。返回 False 表示这段时间没有新数据（不是出错）。
+        """等泵推来下一拍。返回 False 表示这段时间没有新数据（不是出错）。
 
-        超时设成 0.8 秒：太短会变成忙轮询白烧 CPU，太长会让界面的「停止」按钮
-        反应迟钝。
+        🔴 **这里不再自己调 `wait_update`**（2026-11-24 会话共享）：`TqApi` 只能
+        被一条线程推进，现在那条线程是 `_pump`。调用方（交易页 worker /
+        组合页 runner）只负责「按自己的节奏转一圈」，数据由泵送进来 ——
+        两边共用一条会话时这是唯一安全的写法。
+
+        没有泵（单测里的假 api、或者还没 `start()`）时退回老行为，直接推一次：
+        自检和注入的假柜台不需要线程。
+
+        泵**因为异常退出**时把 `last_error` 抛出去 —— 不抛的话界面只会看到
+        「每 0.8 秒都超时」，账户表和 K 线就那么冻着，日志里一句错的都没有
+        （以前 `wait_update` 抛异常是从这里冒出去的，调用方靠它报「连接中断」）。
         """
         if self.api is None:
             return False
-        try:
-            return bool(self.api.wait_update(deadline=time.time() + timeout))
-        except Exception as exc:
-            self.last_error = f"{type(exc).__name__}: {exc}"
-            raise
+        t = self._thread
+        if t is None:
+            try:
+                with self._lock:
+                    return bool(self.api.wait_update(deadline=time.time() + timeout))
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                raise
+        if not t.is_alive():
+            if self.last_error and not self._stopped:
+                raise RuntimeError(self.last_error)
+            return False
+        n = self._tick
+        end = time.time() + max(0.0, float(timeout))
+        with self._cv:
+            while self._tick == n:
+                left = end - time.time()
+                if left <= 0 or self._stopped:
+                    return False
+                # `Condition(self._lock)` 在等待期间把会话锁放掉 —— 泵才拿得到
+                self._cv.wait(left)
+            return True
 
     # ---- 读 ----
 
@@ -1028,7 +1198,8 @@ class LiveHub:
         合约现取。下单面板的合约和图上看的品种经常不是一个（图上 rb、手上要下
         m2601），所以必须有这条路径。
 
-        **必须在 worker 线程里调**（内部会 `wait_update`）。新订阅第一次通常拿不到
+        **必须在 worker 线程里调** —— `get_quote` 会动订阅状态，所以要进会话锁
+        （泵线程也在用同一个 `TqApi`）。新订阅第一次通常拿不到
         数据，`last_price` 是 NaN —— 要等一两轮推送。所以这里带墙钟上限轮询，
         拿不到就返回空 dict，让界面说「还没拿到这个合约的行情」，而不是把 NaN
         当成 0 填进价格框（0 价的限价单会被柜台按「价格不合法」拒掉）。
@@ -1041,14 +1212,16 @@ class LiveHub:
         sym = str(symbol or "").strip()
         if not sym or "." not in sym:
             raise ValueError(f"要天勤写法的合约（如 SHFE.rb2601），收到 {symbol!r}")
-        q = self.api.get_quote(sym)
+        with self._lock:
+            q = self.api.get_quote(sym)
 
         end = time.time() + max(0.5, float(timeout))
         while time.time() < end:
             if _qnum(q, "last_price"):
                 break
             try:
-                self.api.wait_update(deadline=time.time() + 0.5)
+                # 等泵推下一拍就够了，别在这里自己驱动 `wait_update`
+                self.wait(0.5)
             except Exception:  # noqa: BLE001 - 抢不到推送就再转一圈，超时由墙钟兜
                 break
         last = _qnum(q, "last_price")
@@ -1056,6 +1229,7 @@ class LiveHub:
             return {}
         return _quote_row(q, sym)
 
+    @_serial
     def bars(self) -> pd.DataFrame:
         """实时 K 线。
 
@@ -1073,6 +1247,7 @@ class LiveHub:
             j -= 1
         return df.iloc[: j + 1]
 
+    @_serial
     def state(self) -> LiveState:
         """拷一份普通数据出来。界面线程只碰这个，不碰天勤对象。"""
         # 快照要先取：`underlying` 是在 `_quote_snapshot()` 里跟着主连 quote 更新的，
@@ -1423,6 +1598,7 @@ class LiveHub:
                 return obj
         raise ValueError(f"没有名为「{name}」的账户")
 
+    @_serial
     def place(self, symbol: str, direction: str, offset: str, volume: int,
               limit_price: float | None = None, account: str = "") -> str:
         """下单。返回客户端订单号。`account` 是多账户时的目标账户名。
@@ -1476,6 +1652,7 @@ class LiveHub:
             return "BUY", "OPEN"
         return "SELL", "CLOSE"
 
+    @_serial
     def cancel(self, order_id: str, account: str = "") -> None:
         """撤单。同样是入队，下一次 `wait_update()` 才发。
 
@@ -1494,6 +1671,7 @@ class LiveHub:
         else:
             self.api.cancel_order(order_id)
 
+    @_serial
     def set_target(self, symbol: str, volume: int, account: str = "") -> None:
         """把某个合约的目标净仓设成 `volume`（正多负空，0 平掉）。
 
@@ -1515,3 +1693,68 @@ class LiveHub:
                 else TargetPosTask(self.api, symbol)
             self._targets[key] = task
         task.set_target_volume(int(volume))
+
+    # ---- 交易：`PortfolioRunner` 要的那套 tqsdk 同名接口 ----
+    #
+    # 组合页（`ttrade/strategy_runner.py`）以前自己 `TqApi(TqAccount(...))` 登一条，
+    # 于是同一个天勤账户在系统里挂了两条会话：交易页一条、组合页一条，持仓和
+    # 委托回报各推各的 —— 用户看到的就是「一键对齐发出去的单，监控器上不动」。
+    # 现在两边认领**同一个 `LiveHub`**（`ttrade/hubreg.py`），
+    # 所以这里必须把 runner 用到的那几个 `TqApi` 方法原样转出去：
+    # `get_position` / `get_order` / `insert_order` / `cancel_order`。
+    #
+    # 全部走 `_api_call()`（持会话锁）—— 泵线程正在同一个 `TqApi` 上跑
+    # `wait_update`，跨线程裸调会把内部订阅状态写坏。
+
+    def get_position(self, *args, **kwargs):
+        """`TqApi.get_position()` 的同一份活引用（账户 → `Position` 的 dict）。"""
+        return self._api_call("get_position", *args, **kwargs)
+
+    def get_order(self, *args, **kwargs):
+        return self._api_call("get_order", *args, **kwargs)
+
+    def get_trade(self, *args, **kwargs):
+        return self._api_call("get_trade", *args, **kwargs)
+
+    def get_account(self, *args, **kwargs):
+        return self._api_call("get_account", *args, **kwargs)
+
+    def insert_order(self, **kwargs):
+        """下单。参数与 `TqApi.insert_order(...)` 完全一致。
+
+        🔴 时间戳字段仍由泵线程的 `wait_update` 发出去 —— 这条会话任何时候都有
+        泵在推（交易页关掉也一样，泵属于 hub 不属于调用方），所以不用担心
+        「下完单没人推」。
+        """
+        return self._api_call("insert_order", **kwargs)
+
+    def cancel_order(self, order=None, **kwargs):
+        return self._api_call("cancel_order", order, **kwargs)
+
+    def positions_ready(self) -> bool:
+        """持仓**真从柜台读回来过**没有（`PortfolioRunner._pos_live()` 的判据）。
+
+        🔴 空字典有两种含义：「账户真的没仓」和「第一帧还没到」。天勤在收到
+        账户数据之前 `Account.balance` 是 `nan`，正好拿来区分：
+        `_num()` 会把 nan 洗成 0，那就分不清了，所以这里直接读原属性判 nan。
+
+        少了这道判据，「一键对齐」会在登录后头几秒拿「账户是空的」去算差额，
+        把整个理论仓位重新开一遍（2026-11-23 融航那次就是这么来的，只是那边
+        走的是柜台侧的 `positions_loaded`）。
+        """
+        if self.api is None or not self._accs:
+            return False
+        for _spec, obj in self._accs:
+            try:
+                a = obj.get_account()
+            except Exception:  # noqa: BLE001
+                return False
+            if a is None:
+                return False
+            v = getattr(a, "balance", None)
+            try:
+                if not math.isfinite(float(v)):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True

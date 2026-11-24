@@ -904,6 +904,10 @@ CATEGORIES: list[str] = [
     "趋势", "反转", "波动", "量能", "形态",
     "日内", "时段",
     "MACD 风洞",
+    # HL-Point（1h / 36 因子）那一套独立成类：它的「偏离度 / 影线 / 趋势结构 /
+    # 关键位」和上面通用的「趋势 / 形态」不是同一套口径（全部 ATR 归一 + 滚动 z），
+    # 混在一起用户根本分不清 `dev_z_60` 和 `ma_gap_60` 差在哪。
+    "偏离度", "影线", "趋势结构", "关键位",
     "展期", "展期 OI3", "展期 OI6", "期权",
     "季节性", "品种季节",
     "基本面", "板块行业", "宏观",
@@ -1187,6 +1191,10 @@ from ttrade import factors_fx5 as _FFX       # noqa: E402
 # HL point 截面对冲（future_quant/cross_section）的 42 个因子：MACD 风洞族、
 # 动量二阶导、缩量族、持仓比、以及 EDB 现货/库存同比那几条
 from ttrade import factors_hl as _FHL        # noqa: E402
+# HL-Point（future_quant/strategy/hl_point）的 36 个 1h 因子。**和上面那个
+# `factors_hl` 不是同一套**：上面是 cross_section/ 的日频 59 因子，这个是
+# 1h / 36 因子（价格 27 + 持仓量 5 + 展期 4）那一套。
+from ttrade import factors_hlpoint as _FHP  # noqa: E402
 
 _INTRA_FACTORS = _FI.register_into(FACTORS, FactorSpec)
 _SEASON_FACTORS = _FS.register_into(FACTORS, FactorSpec)
@@ -1200,6 +1208,9 @@ _STOCK_FACTORS = _FK.register_into(FACTORS, FactorSpec)
 _FX5_FACTORS = _FFX.register_into(FACTORS, FactorSpec)
 # HL point 截面对冲的 42 个因子（MACD 风洞 / 缩量 / 持仓比 / 现货库存）
 _HL_FACTORS = _FHL.register_into(FACTORS, FactorSpec)
+# HL-Point（1h / 36 因子）里库里没有的那 33 个；另 3 个展期因子映射到
+# `roll_main_oi` / `roll_main_annual` / `roll_main_curv`，不重复注册
+_HP_FACTORS = _FHP.register_into(FACTORS, FactorSpec)
 
 # 用户因子可能带来新类别（默认叫「自定义」）。`CATEGORIES` 是界面上分组用的
 # 静态列表，不补进去的话新因子在「策略研究」页的因子下拉里根本不出现 ——

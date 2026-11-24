@@ -52,8 +52,8 @@ import pandas as pd
 from ttrade import factor_strategy as fstrat
 from ttrade import ml_artifact
 from ttrade import replay
-from ttrade import (barclock, daylimit, orderbook, positionbook, topup, tqdata,
-                    tqstore)
+from ttrade import (barclock, daylimit, hubreg, orderbook, positionbook, topup,
+                    tqdata, tqstore)
 from ttrade import strategy_store as SStore
 from ttrade import specs, symbols_info
 from ttrade.market_feed import MarketFeed
@@ -1135,19 +1135,37 @@ class PortfolioRunner:
         backend = getattr(self.spec, "backend", "tq")
 
         if backend == "tq":
-            from tqsdk import TqApi, TqAuth
+            from ttrade.tqlive import LiveHub
 
-            self.api = TqApi(
-                self.spec.build(),
-                auth=TqAuth(self.spec.user, self.spec.password),
-                web_gui=False,
-            )
+            # 🔴 **借交易页已经连上的那条天勤会话**（`ttrade/hubreg.py`，
+            # 2026-11-24 用户要求）。以前这里自己 `TqApi(TqAccount(...))` 登一条：
+            # 同一个天勤账户在系统里挂了两条会话，而天勤是**按会话推送**持仓 /
+            # 委托 / 成交的 ⇒ 交易页下的单在组合页那条会话里根本不出现，
+            # 用户看到的就是「一键对齐发了一堆委托，监控器上的差额一次都没变」。
+            #
+            # `LiveHub` 现在自带一条泵线程（独占 `wait_update`），并且实现
+            # `get_position` / `get_order` / `insert_order` / `cancel_order`
+            # 这几个 `TqApi` 同名方法，所以下面的代码一行都不用改。
+            # `start()` 是幂等的：借到别人已经登好的会话时立刻返回，不会二次登录。
+            hub = hubreg.acquire("tq", [self.spec], lambda: LiveHub([self.spec]))
+            try:
+                hub.start()
+            except Exception:
+                # 借到手却没连上：把引用还回去，否则注册表里留一条 refs 卡住的
+                # 僵尸，交易页那条会话再也关不掉
+                if hubreg.release(hub):
+                    hub.close()
+                raise
+            self.api = hub
+            self._shared_tq = hubreg.refs(hub) > 1
         else:
             self.api = self._broker_api(backend)
         self._pos = self.api.get_position()
         self._orders = self.api.get_order()
         if backend == "tq":
-            self._log(f"账户已连接：{self.spec.label()}")
+            self._log(f"账户已连接：{self.spec.label()}"
+                      + ("（复用交易页已连的天勤会话，持仓/委托是同一份）"
+                         if getattr(self, "_shared_tq", False) else ""))
         else:
             self._log(f"账户已连接：{self.spec.label()}"
                       f"（行情走 {self._feed_label()}，历史行情读本地天勤数据）")
@@ -4455,7 +4473,31 @@ class PortfolioRunner:
     # ---- 监控器 ----
 
     def theoretical(self) -> dict[str, int]:
-        """按合约汇总策略的理论净仓。同一个品种被多个策略持有时取和。"""
+        """按合约汇总策略的**理论净仓**。同一个品种被多个策略持有时取和。
+
+        🔴 这里用的是 `_theo_qty()`（策略口径持仓 = 回测里 position 那一列），
+        **不是** `st.target`（实盘下单目标）。两者只在「K 线内」那一族
+        （`sbbox_ib` / `strat_im_orb` 等 `intrabar` 策略）上分叉：
+
+          - `target` 只有在**盘中价格碰到触发价**之后才有值（`_ib_arm`），
+            冷启动时 state machine 说「该持 -8 手」而这一轮从没触发过 ⇒
+            `target` 恒 0；
+          - `_theo_qty()` = signal × `theo_lots`（开仓那一根锁死的），
+            与回测同一个数。
+
+        拿 `target` 当理论仓的后果（2026-11-24 用户报「一键对齐没有读出来这个
+        多品种模型的持仓」）：策略表「理论」列写 -8/-10/-44（走 `_theo_qty`），
+        而监控器和一键对齐按 `target` 算 ⇒ 那几条腿**连一行都不出现**，
+        用户点了对齐看不到它们，账户里也就一直是空的。
+        证据：融航 `sbbox多品种波段1h 基本面空` 7 条腿里只有 AL 在 09:18 开过仓
+        （台账 `1a797dc69879#AL_SHFE = -6`），其余 6 条 `[LOTS] 开仓手数 0 → 8/10/44`
+        都只有理论值、`target` 全是 0。
+
+        ⚠️ 下单路径**不能**跟着改：`_rebalance` / `_send` 仍按 `target` 走 ——
+        K 线内那族的入场必须等触发价，拿信号直接下单等于用「这根已收盘的 bar」
+        去追一个已经过去的价位（见 `_refresh_signal` 里那一支的注释）。
+        对齐是**用户显式点、并且看过确认框**的动作，口径跟「理论」列一致。
+        """
         out: dict[str, int] = {}
         for st in self._slots.values():
             if not st.running:
@@ -4465,7 +4507,21 @@ class PortfolioRunner:
             for sym in st.retired:
                 out.setdefault(sym, 0)
             if st.underlying:
-                out[st.underlying] = out.get(st.underlying, 0) + st.target
+                out[st.underlying] = out.get(st.underlying, 0) + self._theo_qty(st)
+        return out
+
+    def _theo_pending(self) -> set[str]:
+        """「理论有仓、但实盘还没触发过」的合约。
+
+        确认框和监控器靠它把话说明白：这些行对齐下去是**按市价补开**，
+        不是把已有的仓调一调。少了这句话，用户会以为对齐只动手里那些仓。
+        """
+        out: set[str] = set()
+        for st in self._slots.values():
+            if not st.running or not st.underlying:
+                continue
+            if self._theo_qty(st) and not int(getattr(st, "target", 0) or 0):
+                out.add(st.underlying)
         return out
 
     def _pos_live(self) -> bool:
@@ -4590,6 +4646,9 @@ class PortfolioRunner:
             # 给副本。界面拿到的 list 会被到处传，别让它改到缓存里的 dict。
             return [dict(r) for r in self._mm_cache]
         theo = self.theoretical()
+        # 「理论有仓、实盘还没触发过」的合约：只用来给界面补一句话，
+        # 不参与差额（差额一律是 target − actual）
+        pending = self._theo_pending()
         keys = set(theo)
         if self._pos is not None:
             for sym in list(self._pos):
@@ -4612,6 +4671,8 @@ class PortfolioRunner:
                 # 多空双开。界面据此把「账户实际」写成 `0（多4 空4）`，
                 # 否则一行 `0 / 0 / +0` 摆在那里，谁都不知道要动什么
                 "locked": bool(a_long and a_short),
+                # 「理论仓来自回测口径、实盘从没触发过」⇒ 对齐会市价补开
+                "theo_only": sym in pending,
             })
         self._mm_cache = out
         self._mm_ts = now
@@ -4720,7 +4781,7 @@ class PortfolioRunner:
                                             int(r.get("a_short") or 0))
                       for r in rows}
         n = 0
-        skipped, stale = [], []
+        skipped, stale, busy = [], [], []
         self._align_touched = set()
         for row in self.mismatch(fresh=True):
             sym = row["symbol"]
@@ -4735,6 +4796,18 @@ class PortfolioRunner:
                                  f"现在 {pair[0]}多/{pair[1]}空）")
                     continue
             if not row["managed"] and not close_orphans:
+                continue
+            # 这个合约上还有策略自己的委托在途。账户下一秒就会变，这时候按
+            # 「账户现在没有」去补差额，就是把同一笔仓开两遍 —— 而且策略那笔
+            # 成交后账本才算数，两边各开一半，谁都对不上。等它落地，几秒后
+            # 再点一次就行。
+            #
+            # 🔴 这条是「理论仓改走 `_theo_qty`」带来的新敞口：以前只有真触发过
+            # 的腿才有 `target`，那种腿本来就有单在飞；现在从没触发过的腿也算
+            # 理论仓，而它的单可能是刚刚才报出去的。
+            if any(st.pending and sym == st.underlying
+                   for st in self._slots.values()):
+                busy.append(sym)
                 continue
             self._align_log(
                 f"对齐 {sym}：目标 {int(row['target']):+d} 手"
@@ -4772,6 +4845,10 @@ class PortfolioRunner:
             self._align_log("对齐跳过（持仓在点确认之后变了，换个基数会把平仓算成开仓）："
                             + "、".join(stale[:6]) + ("…" if len(stale) > 6 else "")
                             + "　—— 看清楚了再点一次")
+        if busy:
+            self._align_log("对齐跳过（这几个合约上还有策略自己的委托在途，"
+                            "等成交或撤掉再点）："
+                            + "、".join(busy[:8]) + ("…" if len(busy) > 8 else ""))
         if n:
             self._align_log(f"对齐已下发 {n} 笔，剩下的交给追单")
         else:
@@ -4844,16 +4921,42 @@ class PortfolioRunner:
     def _sync_after_align(self, sym: str) -> None:
         """对齐发出去之后，把各策略的账本摆成「对齐完成时的样子」。
 
-        运行中且就是这个合约的策略，账本取它自己的 `target`；其余情况（策略停着、
-        或者这是换月留下的老合约）归 0 —— 对齐会把这些当未托管平掉。
+        运行中且就是这个合约的策略，账本取它自己的**理论仓**（`_theo_qty`，
+        与 `theoretical()` 同一个函数）；其余情况（策略停着、或者这是换月留下
+        的老合约）归 0 —— 对齐会把这些当未托管平掉。
+
+        🔴 口径必须和 `theoretical()` 一字不差，否则对齐开的仓在账本里没人认领：
+        下一轮 `mismatch()` 把它当「未托管」，再点一次对齐就平掉（开了又平）。
+        🔴 因此这里**不能**再用 `if sym not in st.held: continue` 当闸门 ——
+        K 线内那族的仓 `held` 里本来就没有这一条（实盘从没触发过），
+        对齐补上之后必须给它**建**账本条目（2026-11-24 用户报「一键对齐没有
+        读出来这个多品种模型的持仓」，补的就是这一步）。
+
+        🔴 `held` 和 `target` 必须**一起**写。`_rebalance` 只看 `target − held`，
+        只写 `held` 会让「刚补开的仓」立刻被自己平掉（见下面那段注释）。
         """
         for st in self._slots.values():
-            if sym not in st.held:
-                continue
-            if st.running and sym == st.underlying and st.target:
-                st.held[sym] = int(st.target)
-            else:
+            qty = int(self._theo_qty(st) or 0)
+            if st.running and sym == st.underlying:
+                if qty:
+                    st.held[sym] = qty
+                    # 🔴 `target` 必须**跟着一起**摆（K 线内那族尤其）。它才是
+                    # `_rebalance` 的输入：只写 `held` 的话，对齐之后是
+                    # `target=0 / held=-8`，正好命中 `_rebalance` 里
+                    # 「目标没变 + 减仓」那条放行分支（`abs(target) < abs(held)`）
+                    # ⇒ 下一轮 `delta = 0 − (−8) = +8`，把刚补开的 8 手空
+                    # 按市价买平 —— 用户看到的还是「对齐了但仓没留住」，
+                    # 而且这次是策略自己动手，账本上查不出是谁干的。
+                    # 两者相等 ⇒ delta=0，一手不发；下一根 `_ib_arm` 走「② 有仓」
+                    # 分支把 `target` 写回 `held`，并补挂止损，一切照常。
+                    st.target = qty
+                else:
+                    st.held.pop(sym, None)
+                    st.target = 0            # 理论仓是 0，`target` 也得归 0
+            elif sym in st.held:
                 st.held.pop(sym, None)
+            else:
+                continue            # 与这个合约无关，也没什么可清的
             if sym in st.retired and sym not in st.held:
                 st.retired.remove(sym)
             # 对齐之后「当前目标」就是新基准：否则加载时记的旧基准还在，

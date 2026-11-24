@@ -7,17 +7,23 @@
 - `LiveController` 活在主线程，负责起停线程、把界面操作**排队**丢给 worker，
   再把 worker 的信号转出来。
 
-**一条会话一个账户**（2026-11-17 改）。早先是「一条会话装所有勾选的账户」：
-天勤走 `TqMultiAccount` 一次登录，多个账户共用一条 TqApi。那样省连接，但账户
-列表里**没法单独登录 / 登出某一个账户** —— 而用户要的就是每行一个按钮。所以
-改成按账户分会话：一个账户一个线程、一条连接。代价是 N 个天勤账户就是 N 条
-TqApi（N 次登录、各订一份行情）；账户是「两三个」这个量级时无所谓。
+**一条会话一个账户，而且这条会话是进程内共享的**（`ttrade/hubreg.py`）。
+早先是「一条会话装所有勾选的账户」：天勤走 `TqMultiAccount` 一次登录，多个
+账户共用一条 TqApi。那样省连接，但账户列表里**没法单独登录 / 登出某一个账户**
+—— 而用户要的就是每行一个按钮。所以改成按账户分会话：一个账户一条连接。
 
-为什么下单要排队而不是直接调：天勤的 `insert_order()` 只是入队，真正的报文在
-下一次 `wait_update()` 发出；而 `wait_update()` 正在 worker 线程里阻塞着。跨线程
-直接调会写坏 TqApi 内部的订阅状态，表现为「单子偶尔丢、偶尔重复」。CTP / 融航的
-`ReqOrderInsert` 倒是线程安全，但三家走同一条队列才能保证**成交回报的顺序和
-下单顺序一致**，所以柜台也排队。
+会话本身由 `hubreg` 按账户发：组合页（`BrokerApi` / `PortfolioRunner`）和
+交易页（`LiveWorker`）拿到的可能是**同一个 hub 对象**。天勤 2026-11-24 起也
+一样（此前被排除，因为 `TqApi` 单线程语义；现在 `LiveHub` 自带泵线程，见
+`ttrade/tqlive.py`）。一条会话的意义是：委托回报、持仓、成交只有一份 ——
+否则「交易页下的单，组合页的监控器上永远看不见」。
+
+为什么下单要排队而不是直接调：一，`insert_order()` 只是入队，报文由
+`wait_update()` 在**下一次**发出（天勤那边是 hub 的泵线程在推），排队才能保证
+「下单顺序 = 报文顺序 = 回报顺序」；二，`TqApi` 不是线程安全的，跨线程直接调
+会写坏内部订阅状态（表现是「单子偶尔丢、偶尔重复」，还不报错）—— `LiveHub`
+里靠会话锁串行化，`LiveWorker` 靠这条队列，两层都在。CTP / 融航的
+`ReqOrderInsert` 倒是线程安全，但三家走同一条队列才好统一观察和重放。
 
 **行情源**：多个柜台同时登录时，K 线和盘口只能来自一个柜台（两家的 tick 拼在
 一条 K 线上会来回跳）。选哪一个由 `feed` 参数决定，界面上是「行情源」下拉框；
@@ -60,11 +66,15 @@ def make_hub(backend: str, specs: list):
     """按柜台造一个 hub。三家的对外接口完全一致（start/subscribe/wait/bars/
     state/place/cancel/set_target），worker 循环不需要知道底下是谁。
 
-    🔴 **CTP / 融航走进程内注册表**（`ttrade/hubreg.py`，2026-11-23）：同一个
-    账户如果组合页已经在用，这里拿到的就是**同一条连接**，`hub.start()` 会
-    直接短路返回。一个账户在柜台那边只能有一条会话 —— 两条会话的委托回报互不
-    相通、查询额度各抢一份，界面表现就是「交易页有仓、监控器说不一致」。
-    天勤不进注册表：`TqApi` 是单线程语义，两个页面共用一个对象会写坏订阅状态。
+    🔴 **三家都走进程内注册表**（`ttrade/hubreg.py`）：同一个账户如果组合页已经
+    在用，这里拿到的就是**同一条连接**，`hub.start()` 会直接短路返回。一个账户
+    在柜台那边只能有一条会话 —— 两条会话的委托回报互不相通、查询额度各抢一份，
+    界面表现就是「交易页有仓、监控器说不一致」。
+
+    天勤（2026-11-24 起）也一样。它原本被排除在外，理由是 `TqApi` 单线程语义；
+    现在 `LiveHub` 自带一条泵线程独占 `wait_update`（见 `ttrade/tqlive.py`），
+    共用一条会话是安全的，而且天勤本来也是**按会话推送**持仓 / 委托 / 成交的，
+    不共用就永远是「一边下单一动不动」。
     """
     if backend == "ctp":
         from ttrade.ctp_live import CtpHub
@@ -74,7 +84,7 @@ def make_hub(backend: str, specs: list):
         from ttrade.ctp_live import RohonHub
 
         return hubreg.acquire("rohon", specs, lambda: RohonHub(specs))
-    return LiveHub(specs)
+    return hubreg.acquire("tq", specs, lambda: LiveHub(specs))
 
 
 class HubSet:

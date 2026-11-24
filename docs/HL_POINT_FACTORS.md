@@ -1,8 +1,23 @@
-# HL point 截面对冲策略 · 因子盘点与复现说明
+# HL-Point 策略 · 因子盘点与复现说明（1h / 36 因子）
 
-> 源项目：`D:/CozeTask/future_quant/cross_section/`（HL point，日频商品截面对冲）
-> 复现落点：ChanQuant 3.9.14，`ttrade/factors_hl.py`（42 个新因子）+
-> `_tools/hl_point_register.py`（策略库条目「HL point · 商品截面对冲（日线）」）
+> 源项目：`D:/CozeTask/future_quant/strategy/hl_point/`
+> 复现落点：ChanQuant 3.9.14，`ttrade/factors_hlpoint.py`（33 个新因子）+
+> `_tools/hl_point_register.py`（策略库条目「HL-Point · 商品十分位多空（1h）」）
+
+---
+
+## 〇、先分清是哪一套「HL point」
+
+`future_quant` 下面**有两套**都自称 HL point 的策略，周期、因子、建模范式全不同。
+本文只讲**左边那套**。
+
+| | `strategy/hl_point/` ← **本文** | `cross_section/` |
+|---|---|---|
+| 周期 | **1h**（`HL_ML_TF=1h`） | 日线 |
+| 因子数 | **36**（价格 27 + 持仓量 5 + 展期 4） | 59（Rust 77 列去财务后）+ 基本面 |
+| 标签 | 未来 5 交易日收益，**回归** | 未来 5 日涨跌 >1%，二分类 |
+| 组合 | **十分位**：预测最高 10% 多、最低 10% 空，等权 | 前一半多、后一半空，波动率倒数 |
+| ChanQuant 移植件 | `ttrade/factors_hlpoint.py`（33 新 + 3 映射） | `ttrade/factors_hl.py`（42 个） |
 
 ---
 
@@ -10,207 +25,298 @@
 
 | 环节 | 原实现 | 出处 |
 |---|---|---|
-| 周期 | 日线 | `strategy_cross.py` |
-| 品种池 | 全部商品品种，排除 IF/IH/IC/IM/T/TF/TS/TL | `data_prep.get_variety_list` |
-| 第一步筛池 | 每月选**成交额前 70%** | `backtest_cross.AMOUNT_TOP_PCT = 0.70` |
-| 特征 | 77 列 Rust 输出（实含信息 59 列）+ 价差结构 3 + 持仓量 5 + 持仓排名 5 + EDB 基本面 15 | `factor_panel.py` |
-| 标准化 | 每日**截面 z-score** | Rust `compute_features_cs_rank` |
-| 模型 | LightGBM，滚动 12 个月训练 / 1 个月预测 / 步长 1 个月 | `train_cross.TRAIN_MONTHS…` |
-| 标签 | 未来 5 个交易日收益 > 1% 的二分类 | `LABEL_DAYS=5, THRESHOLD=0.01` |
-| 组合 | 分数**前一半做多、后一半做空** | `backtest_cross` |
-| 加权 | 波动率倒数，**多空各半仓**（日收益 `Σ(w·r)/2`） | `backtest_cross` |
-| 调仓 | 每 5 个交易日，14:55 前 | `strategy_cross.REBALANCE_DAYS=5` |
-| 本金 | 500 万，保证金占用 80% | `strategy_cross.initial_capital` |
+| 周期 | 1h（`HL_ML_TF=1h`；`BPD=6` 是「每天约几根」的近似） | `tools_ml.py` |
+| 品种池 | DuckDB 内全部 888 商品（约 87 个），不筛池 | `tools_ml.py` |
+| 特征 | **36 个已归一化特征**（价格 27 + 持仓量 5 + 展期 4） | `tools_ml.py::FEATS/OI_FEATS/ROLL_FEATS` |
+| 模型 | LightGBM 回归，lr 0.03 / leaves 31 / `min_data_in_leaf=200` / 300 轮 | `tools_ml.py` |
+| 标签 | 未来 `H = H_DAYS × BPD = 5 × 6 = 30` 根收益 | `tools_ml.py` |
+| 训练 | **逐年 walk-forward**，扩张窗口（2021 起），`PURGE_DAYS ≥ 20` 日历日 | `tools_ml.py` |
+| 组合 | `k = len(pr)//10`，`top = 预测最高 k`、`bot = 最低 k` | `decile_ls()` |
+| 期收益 | `top.mean() − bot.mean() − 2×cost`（**等权、非重叠每 H bar**） | `decile_ls()` |
+| 成本 | 单边 5bp | `COST = 0.0005` |
+
+**为什么必须 ATR 归一**：跨品种做截面，价格水平、波动幅度差几个数量级。全部
+27 个价格特征都除以 Wilder ATR 或做滚动 z，剩下的才是「形态」而不是「谁贵」。
 
 ---
 
-## 二、因子盘点（原策略 77 列 → ChanQuant）
+## 二、36 因子逐条盘点
 
-Rust 的 77 列分成 7 组。**Group B（第 20~37 列，18 个 Fama-French 财务因子）
-在期货上恒为 0**（财务列全填 0，`has_financial` 为假，标准化时 std=0 被跳过），
-对模型零贡献 —— 直接不移植。剩下 59 列逐条对照：
+**结论：ChanQuant 原有 215 个因子里，36 个名字一个都不存在。**
+新建 33 个（`ttrade/factors_hlpoint.py`），另 3 个映射到库里的主力口径展期因子。
 
-### Group A · 基础量价（20 列）
+### 价格 · 多均线偏离度（5）
 
-| # | HL point | 定义 | ChanQuant | 判定 |
-|---|---|---|---|---|
-| 0 | `mom_5d` | 5 日涨跌 | **`mom_5`（新增）** | 缺 → 已注册 |
-| 1 | `mom_10d` | 10 日涨跌 | `mom_10` | ✅ 有 |
-| 2 | `mom_20d` | 20 日涨跌 | `mom_20` | ✅ 有 |
-| 3 | `mom_60d` | 60 日涨跌 | `mom_60` | ✅ 有 |
-| 4 | `vol_5d` | 5 日收益标准差 | **`vol_5`（新增）** | 缺 → 已注册 |
-| 5 | `vol_20d` | 20 日收益标准差 | `vol_20` | ✅ 有 |
-| 6 | `vol_ratio_5d` | 当日量/5 日均量 | `vol_surge` | ✅ 等价 |
-| 7 | `macd` | DIF | **`macd_dif`（新增）** | 缺 → 已注册 |
-| 8 | `macd_signal` | DEA | **`macd_dea`（新增）** | 缺 → 已注册 |
-| 9 | `macd_hist` | 柱值 | `macd_hist` | ✅ 有（库里已除收盘价） |
-| 10 | `rsi` | RSI(14) | `rsi_14` | ✅ 有 |
-| 11 | `bb_upper` | 布林上轨（绝对价） | `bb_pos_20` 代 | ⚠️ 绝对价位跨品种不可比 |
-| 12 | `bb_middle` | SMA20（绝对价） | `ma_gap_20` | ✅ 等价（close/MA20−1） |
-| 13 | `bb_lower` | 布林下轨（绝对价） | `bb_pos_20` 代 | ⚠️ 同上 |
-| 14 | `atr` | ATR(14) 绝对值 | `atr_pct` | ✅ 有（占比版更可比） |
-| 15 | `tg_macd_hist` | T−1 的柱值 | **`macd_hist_lag1`（新增）** | 缺 → 已注册 |
-| 16 | `tg_bb_upper` | T−1 上轨 | — | ⚠️ 绝对价位，不参与 |
-| 17 | `tg_bb_lower` | T−1 下轨 | — | ⚠️ 绝对价位，不参与 |
-| 18 | `log_price` | log(收盘) | — | ⚠️ 纯价位，横截面比「谁贵」 |
-| 19 | `mom_20d_alt` | 与 #2 完全重复 | `mom_20` | ✅ 重复列 |
-
-### Group C · MACD 风洞共振（10 列）→ 全部**缺**，已整组注册
-
-| # | HL point | ChanQuant | 说明 |
+| 因子 | 定义 | 窗口 | ChanQuant |
 |---|---|---|---|
-| 38 | `funnel_daily` | **`macd_funnel_d`** | 柱值在最近 5 根的相对位置，−1~+1 |
-| 39 | `hist_chg` | **`macd_hist_chg`** | 柱值一阶差分 |
-| 40 | `hist_acc` | **`macd_hist_acc`** | 柱值二阶差分 |
-| 41 | `funnel_weekly` | **`macd_funnel_w`** | 21/55/9 参数，回看 8 根 |
-| 42 | `funnel_monthly` | **`macd_funnel_m`** | 55/144/9 参数，回看 13 根 |
-| 43 | `resonance` | **`macd_resonance`** | 0.4·日 + 0.4·周 + 0.2·月 |
-| 44 | `cross_up_d` | **`macd_cross_up`** | 柱值上穿 0 |
-| 45 | `cross_dn_d` | **`macd_cross_dn`** | 柱值下穿 0 |
-| 46 | `at_trough` | **`macd_at_trough`** | 柱值是 10 根内最低 |
-| 47 | `at_peak` | **`macd_at_peak`** | 柱值是 10 根内最高 |
+| `dev_z_20` | `rolling_z((C−MA20)/ATR)` | MA20 / z250 | **新增** |
+| `dev_z_60` | 同上 | MA60 / z250 | **新增** |
+| `dev_z_120` | 同上 | MA120 / z250 | **新增** |
+| `dev_z_agg` | 三条 z 的等权均值 | — | **新增**（HL 重要性 **30.5%，第 1**） |
+| `dev_spread` | `dev_20 − dev_120`（原始偏离度） | — | **新增**（HL 单因子 IC 最强 +0.0253） |
 
-> 「风洞」= `2·(h−min)/(max−min) − 1`，把柱值换成「在最近 n 根里的相对位置」。
-> 它和 `macd_hist` 不是一回事：后者看柱子多长，前者看柱子在区间里的位置。
+### 价格 · 影线（8）
 
-### Group D · 几何结构（10 列）
-
-| # | HL point | ChanQuant | 判定 |
-|---|---|---|---|
-| 48 | `slope_20_norm` | **`slope_20`（新增）** | 缺 → 已注册 |
-| 49 | `slope_60_norm` | **`slope_60`（新增）** | 缺 → 已注册 |
-| 50 | `dev_20` = (C−MA20)/σ20 | `bb_pos_20` | ✅ 等价（差常数 2） |
-| 51 | `dev_60` | **`dev_60`（新增）** | 缺 → 已注册 |
-| 52 | `bb_width_20` | **`bb_width_20`（新增）** | 缺 → 已注册 |
-| 53 | `bb_width_60` | **`bb_width_60`（新增）** | 缺 → 已注册 |
-| 54 | `ma_align` | **`ma_align`（新增）** | 缺 → 已注册 |
-| 55 | `pos_20` | `pos_20` | ✅ 有（定义完全一致） |
-| 56 | `pos_60` | **`pos_60`（新增）** | 缺 → 已注册 |
-| 57 | `new_high_10` | **`new_high_10`（新增）** | 缺 → 已注册 |
-
-### Group E · 缩量短线（7 列）
-
-| # | HL point | ChanQuant | 判定 |
-|---|---|---|---|
-| 58 | `vol_ratio_20` | `vol_surge` | ✅ 等价（量/20 日均量） |
-| 59 | `vol_shrink` | **`vol_shrink`（新增）** | 缺 → 已注册 |
-| 60 | `atr_ratio` | **`atr_ratio`（新增）** | 缺 → 已注册 |
-| 61 | `range_ratio` | **`range_ratio`（新增）** | 缺 → 已注册 |
-| 62 | `vol_price_diverge` | **`vol_price_diverge`（新增）** | 缺 → 已注册 |
-| 63 | `vol_surge_5` | **`vol_surge_5`（新增）** | 缺 → 已注册 |
-| 64 | `contraction_score` | **`contraction_score`（新增）** | 缺 → 已注册 |
-
-### Group F · 动量/反转/成交额（7 列）
-
-| # | HL point | ChanQuant | 判定 |
-|---|---|---|---|
-| 65 | `momentum_accel` | **`mom_accel`（新增）** | 缺 → 已注册 |
-| 66 | `momentum_divergence` | 与 #65 **数学恒等** | ⚠️ 原项目重复列，不单独注册 |
-| 67 | `price_vs_sma20` | `ma_gap_20` | ✅ 等价 |
-| 68 | `price_vs_sma60` | `ma_gap_60` | ✅ 等价 |
-| 69 | `high_vs_sma20` | **`high_ma_gap_20`（新增）** | 缺 → 已注册 |
-| 70 | `reversal_1d` | `mom_1` | ✅ 只差符号（方向由滚动 IC 定） |
-| 71 | `turnover_est_ma5` | `log_amount_20` | ✅ 等价（成交额对数） |
-
-### Group H · 日线级日内（5 列）
-
-| # | HL point | ChanQuant | 判定 |
-|---|---|---|---|
-| 72 | `intraday_strength` | **`intraday_strength`（新增）** | 缺 → 已注册 |
-| 73 | `close_vs_open_ratio` | `mom_1` | ✅ 日线上恒等 |
-| 74 | `close_position` | `close_pos` | ✅ 有（库里是 10 日均值） |
-| 75 | `gap_continuation` | `gap` | ✅ 有（库里是 10 日均值） |
-| 76 | `gap_fill_ratio` | **`gap_fill_ratio`（新增）** | 缺 → 已注册 |
-
-### 非 Rust 部分
-
-| 来源 | HL point | ChanQuant | 判定 |
-|---|---|---|---|
-| 价差结构 | `term_spread_near_far` | `term_near_far` | ✅ 有 |
-| 价差结构 | `term_spread_main_far` | `roll_main_oi` | ✅ 有（同族） |
-| 价差结构 | `roll_yield` | `roll_yield` | ✅ 有 |
-| 持仓量 | `oi_chg_1d` / `5d` / `10d` | `oi_change_1` / `oi_change_5` / **`oi_change_10`（新增）** | 10 日缺 → 已注册 |
-| 持仓量 | `oi_vol_ratio` | **`oi_vol_ratio`（新增）** | 缺 → 已注册 |
-| 持仓量 | `oi_price_corr_5d` | **`oi_price_corr_5`（新增）** | 缺 → 已注册 |
-| 持仓排名 | `net_pos_ratio` / `long_oi_share` / `short_oi_share` / `long_chg_ratio` / `short_chg_ratio` | — | ❌ **数据源不存在**（要天勤龙虎榜） |
-| EDB | `basis_rate` | `spot_basis` | ✅ 有 |
-| EDB | `spot_mom_5` / `spot_mom_20` | **`spot_mom_5` / `spot_mom_20`（新增）** | 缺 → 已注册 |
-| EDB | `warehouse_rank` / `warehouse_chg_5` / `warehouse_chg_20` | `war_pct` / `war_chg_5` / **`warehouse_chg_20`（新增）** | 20 日缺 → 已注册 |
-| EDB | `inventory_rank` / `inventory_chg_1w` / `inventory_chg_10w` / `inventory_yoy` / `inventory_seasonal` | `inv_pct` / `inv_chg_5` / — / **`inventory_yoy`（新增）** / — | `10w` 覆盖太少、`seasonal` 与同比恒等，不注册 |
-| EDB | `delivery_rank` / `delivery_chg_mom` | **`deliv_pct`（新增）** / `deliv_chg_30` | 分位缺 → 已注册 |
-| EDB | `profit_rank` / `profit_chg_4w` | **`profit_pct`（新增）** / `profit_chg_5` | 分位缺 → 已注册 |
-
-### 汇总
-
-| 结论 | 数量 |
-|---|---|
-| 原策略**有信息**的列（77 − 18 财务恒 0） | 59 + 3 价差 + 5 持仓 + 5 排名 + 15 EDB = **87** |
-| ChanQuant **本来就有**（含等价替代） | 33 |
-| **本来缺、本次新注册** | **42** |
-| **数据源不存在、不参与** | 持仓排名 5 + `log_price` 1 + 绝对价位 4 = 10 |
-
----
-
-## 三、复现的配置映射
-
-| 原策略参数 | ChanQuant 字段 | 值 |
+| 因子 | 定义 | ChanQuant |
 |---|---|---|
-| 日线 | `period` | `"1d"` |
-| 排除金融期货 | `multi_symbols` | 本机 86 个商品品种键 |
-| 每月成交额前 70% | `cross_pool_mode="single"` + `cross_pool_keys=["log_amount_20"]` + `cross_pool_pct=70` + `cross_pool_reb=1` + `cross_pool_reb_unit="month"` | |
-| 前一半做多 / 后一半做空 | `cross_top_pct=50` / `cross_bot_pct=50` | |
-| 波动率倒数加权 | `cross_weight="risk"` | |
-| **多空各半仓** | **`cross_weight_scope="legs"`** | 见下文 |
-| 每 5 个交易日调仓 | `cross_rebalance=5` + `cross_rebalance_unit="day"` | |
-| LightGBM 12 个月滚动 | `factor_mode="ml"` + `model="lightgbm"` + `train_window=252` + `step=21` | |
-| 5 日预测 | `factor_cfg.horizon=5` | |
-| 回看 90 天 | `factor_cfg.window=90` + `window_unit="day"` | |
-| 500 万本金 / 80% 保证金 | `principal=5_000_000` + `capital_pct=80` + `sizing="capital"` | |
+| `up_sh` | `(H − max(O,C)) / (H−L)` | **新增** |
+| `dn_sh` | `(min(O,C) − L) / (H−L)` | **新增** |
+| `up_sh_atr` | `(H − max(O,C)) / ATR` | **新增** |
+| `dn_sh_atr` | `(min(O,C) − L) / ATR` | **新增** |
+| `up_sh_int` | `up_sh` 的 20 根均值 | **新增** |
+| `dn_sh_int` | `dn_sh` 的 20 根均值 | **新增** |
+| `shadow_high_z` | `rolling_z(up_sh_int, 250)` | **新增** |
+| `shadow_low_z` | `rolling_z(dn_sh_int, 250)` | **新增** |
 
-### 🔴 `cross_weight_scope` 这一项是复现的关键
+### 价格 · 趋势结构（7）+ 通道（1）
 
-原策略的组合日收益写的是 `Σ(w·r)/2`：多头腿内归一、空头腿内归一，**两边各占半仓**，
-净敞口恒为 0 —— 这是「对冲」的定义式。
+| 因子 | 定义 | 窗口 | ChanQuant |
+|---|---|---|---|
+| `slope_atr` | `OLS斜率 × 60 / ATR` | 60 根 | **新增**（HL 重要性 9.7%） |
+| `r2` | 60 根回归 R² | 60 根 | **新增**（库里没有同名键） |
+| `slope_chg_atr` | `(slope − slope.shift(30)) × 30 / ATR` | 60/30 | **新增**（重要性 **15.8%**） |
+| `dist_hi` | `(C − HH250) / ATR` | 250 根 | **新增** |
+| `dist_lo` | `(C − LL250) / ATR` | 250 根 | **新增** |
+| `ext_hi` | `HH250`（**绝对价格**） | 250 根 | **新增**，默认**不参与**，见 §五 |
+| `ext_lo` | `LL250`（**绝对价格**） | 250 根 | **新增**，默认**不参与** |
+| `ch_slope_atr` | 30 根回归通道斜率 / ATR | 30 根 | **新增** |
 
-ChanQuant 从 2026-11-23 起默认是**合并分配**（`pooled`）：多 + 空放在一张表里归一化，
-Σ|w| = 1 但两边不必等值、净敞口不钉 0。用 `pooled` 跑 HL point，两边波动水平不同时
-组合会自己偏多头，就不是同一条策略了。实测（3 只低波动多头 + 3 只高波动空头）：
+> ⚠️ `ext_lookback` 取的是 `max(level_lookback, trend_lookback) = max(250, 60) = 250`，
+> 不是任何单参数。
 
-| 口径 | Σ\|w\| | 净敞口 |
+### 价格 · 关键位（6）—— 全部依赖 PIT 分形
+
+| 因子 | 定义 | ChanQuant |
 |---|---|---|
-| `pooled` | 1.0000 | **+0.8182** |
-| `legs` | 1.0000 | **0.0000** |
+| `hit_high` | `min\|PH − high\| / ATR`（最近 6 个 pivot high） | **新增** |
+| `hit_low` | `min\|PL − low\| / ATR` | **新增** |
+| `clus_high` | 近 6 个 PH 中与最近一条同带（±0.75×ATR）的个数 | **新增** |
+| `clus_low` | 同上（低点） | **新增** |
+| `level_high` | `clip(0.60×贴线分 + 0.40×聚集分, 0, 1)` | **新增** |
+| `level_low` | 同上 | **新增** |
 
-所以这条注册里显式写了 `cross_weight_scope="legs"`。默认值仍是 `pooled`，
-别人的策略不受影响。
+🔴 **PIT 的关键**：`pivot_events` 用 `rolling(center=True)` 找分形（分形定义本身
+就需要右侧），但**只在 `confirm_pos = bar_pos + right`（right=3）之后才准可见**。
+拿 `bar_pos` 当可见时点，就是让今天的因子含未来 3 根 K 线的最高价。
+
+### 持仓量（5）
+
+| 因子 | 定义 | ChanQuant |
+|---|---|---|
+| `oi_chg_5` | `OI / OI.shift(5) − 1`（**bar 口径**，非交易日） | **新增** |
+| `oi_chg_20` | 同上 20 根 | **新增** |
+| `oi_z_60` | 单根变化率的 60 根 z，**ddof=1** | **新增** |
+| `oi_ratio_60` | `OI / rolling_mean(OI,60) − 1` | **新增**（重要性 **26.4%，第 2**） |
+| `oi_px_sync_5` | `sign(ΔC₅) × sign(ΔOI₅)` | **新增** |
+
+### 展期（4）
+
+| 因子 | ChanQuant | 说明 |
+|---|---|---|
+| `roll` | **`roll_main_oi`** | 映射，未新建 |
+| `roll_ann` | **`roll_main_annual`** | 映射，未新建 |
+| `curv` | **`roll_main_curv`** | 映射，未新建 |
+| `roll_chg_20` | **新增** | 库里 `roll_main_change` 差分的是**年化值**，这里差分**价差率** |
+
+为什么前三个只映射不新建：库里那三个的选腿口径（近端 = 持仓最大的腿、远端 =
+它之后持仓最大的腿）与 HL 的展期面板（`roll_yield_panel_all87.csv` 的
+`near = OI 最大`、`far = 下一主力`）**是同一套**。差异只有两点：
+①库里多做了一道 5 日均值（原项目用未平滑日快照）；
+②`roll×12/dmonth` vs `roll×365/gap_days`，只差 1.39% 常数，z-score 后完全等价。
+
+`roll_chg_20` 不能映射：`roll` 差分与 `roll_ann` 差分差一个 `365/间隔天数` 的
+**时变**系数（间隔随换腿变），不是常倍数，z-score 消不掉。
 
 ---
 
-## 四、与原策略的已知差异（解释曲线差异时用）
+## 三、移植时踩到的两个真坑
 
-1. **标签口径**：原策略是「收益 > 1% 的二分类概率」，ChanQuant 截面 ML 是
-   「预测收益（回归/排序）」。二分类概率不是期望收益的单调变换（同样的 μ，
-   高波动品种 `P(r>1%)` 更高），严格说选出的品种不完全一样。这里取
-   `label_mode="excess"`（预测收益减截面均值），是「谁涨得多」的线性对应，
-   比 `volret` 更接近原意。
-2. **标准化**：原策略做**截面 z-score**（今天相对别人），ChanQuant 做**时序
-   滚动 z**（相对自己历史）再横比。两套不同，第二条对「这只品种自己是不是
-   异常」更敏感。
-3. **`inventory_chg_10w` / `inventory_seasonal`**：前者十周变化覆盖品种太少，
-   后者在原项目里与 `inventory_yoy` 是同一行代码（`iloc[-53]`），不重复注册。
-4. **持仓排名 5 个因子不参与**：需要天勤龙虎榜 `symbol_rank_daily`，ChanQuant
-   没有这个数据源。
+### 坑 1：`_ols` 的窗口下标错位（**最严重**，净值虚增 239%）
 
----
+原项目 `rolling_ols` 是
 
-## 五、怎么复核
-
-```bash
-# 只打印配置，不落库
-python _tools/hl_point_register.py --dry-run
-
-# 重新注册 / 覆盖策略库里的那一条
-python _tools/hl_point_register.py
+```python
+Y = sliding_window_view(y, L)      # Y[j] = y[j : j+L]
+slope[L-1:] = ...                  # 落到「窗口结束处」
 ```
 
-自检里对应项：**「HL point 复现：新因子 + 资金分配范围（多空各半仓 / 合并）」**。
+分块移植时如果写成
+
+```python
+sw = sliding_window_view(seg, L)   # sw[j] = v[a+j : a+j+L]
+slope[a:b] = ...                   # ❌ 落到「窗口开始处」
+```
+
+就变成**每一行的斜率都用了未来 L−1 根收盘价**。实测后果：
+
+| | 修前 | 修后 |
+|---|---|---|
+| `slope_atr` 横截面 IC | **+0.6408**（t 105） | +0.0023（t 0.21） |
+| `ch_slope_atr` IC | **+0.7465**（t 137） | +0.0237（t 2.32） |
+| 模型分数 IC | +0.6178 | **+0.0011** |
+| 全品种全历史期均 | +1.42%/期（t 9.3） | **−0.020%/期**（t −0.22） |
+
+修法：`sl = slice(a + L - 1, b + L - 1)`。
+
+### 坑 2：「尾部截断」测不出这类错位
+
+第一版 PIT 测试是「砍掉最后 1 根，比对末 200 根的值」—— 这对 `_ols` 的下标错位
+**完全无感**：两份数据用的是同一套错位下标，值当然一致。必须改成
+**逐点扩历史**：第 t 行的值只能由 `df[:t+1]` 算出来。见
+`_tools/hlpoint_verify.py` 的「PIT 校验（二）」。
+
+顺带记一个测试数据的陷阱：`_day_diff` 用 `groupby(day).last()`，只有在入参
+**同一交易日内恒定**（= `aux` 的日频快照）时才 PIT 安全。合成数据如果把展期腿
+做成逐根随机游走，这条测试会**误报**。
+
+---
+
+## 四、复现配置（`_tools/hl_point_register.py`）
+
+| 环节 | 原实现 | ChanQuant 字段 |
+|---|---|---|
+| 周期 | `HL_ML_TF=1h` | `period="1h"` |
+| 品种池 | 全部 888 商品，排除金融 | `cross_symbols` + `cross_pool_mode="off"` |
+| 持有期 | `H = 5 × BPD` | `horizon = 46`（= 5 天 × 实测 9.28 根/天） |
+| 调仓 | 非重叠每 H bar | `cross_rebalance=46`, `unit="bar"` |
+| 分档 | `k = len//10` | `cross_top_pct=10`, `cross_bot_pct=10` |
+| 加权 | `top.mean() − bot.mean()`（等权） | `cross_weight="equal"` |
+| 资金范围 | `Σ(w·r)/2`，净敞口恒 0 | 🔴`cross_weight_scope="legs"` |
+| 杠杆 | 裸 100% 名义额 | 🔴`sizing="unit"` |
+| 标准化 | 因子内部已 z | `window=250`, `window_unit="bar"`, `method="z"` |
+| 模型 | LightGBM 回归 | `model="lightgbm"` |
+| 训练 | 逐年、扩张窗口 | `train_window=1260` 天 + `step=252` 天 |
+| 标签 | 未来 H bar 收益 | `cross_label_mode="excess"` |
+| 方向 | 回归天然「预测高→做多」 | `orient="long_high"`（ML 模式下**不生效**，见 §五-7） |
+
+**两处必须显式改的默认值**（不改就是另一条策略）：
+
+1. `cross_weight_scope` 默认 `pooled`（多空合并归一、净敞口不钉 0）。HL 的组合
+   收益是 `Σ(w·r)/2`，必须切 `legs`。实测切之前净敞口中位 −0.034、最大 3.66。
+2. `sizing` 必须是 `unit`。`capital` 会走 `cross.leverage_vector` 把权重再乘
+   `资金分配比例 ÷ 保证金率`（80% ÷ 10% = **8 倍**），实测 Σ|w| 从 1.0 变成中位
+   **6.81**、单腿权重 −5.72、净值两年 19 倍。
+
+### 模型确认：确实在用 LightGBM
+
+| 检查项 | 结果 |
+|---|---|
+| `import lightgbm` | **4.7.0 已装**（base 环境） |
+| `ML.build("lightgbm")` | 返回 `ttrade.mlmodels.LGBMModel` |
+| 内部估计器 | `lightgbm.sklearn.LGBMRegressor`，**200 棵树** |
+| 未知模型名 | `build()` 直接抛 `KeyError`，**不会静默回退成线性模型** |
+
+超参与原项目**不同**（ChanQuant 这套是为小样本折做的通用化，不是照抄）：
+
+| 超参 | 原项目 | ChanQuant `LGBMModel` |
+|---|---|---|
+| 轮数 | 300 | **200** |
+| 学习率 | 0.03 | **0.05** |
+| 叶子数 | 31 | **15** |
+| 最大深度 | 不限（−1） | **4** |
+| 叶子最小样本 | **200** | 40 |
+| 列采样 / 行采样 | 0.8 / 0.8 | 0.8 / 0.8 |
+| 正则 L2 / L1 | 默认 | `2×lam_scale` / `0.01×标签std`（按标签量纲缩放） |
+
+> 这些差异（尤其 `max_depth=4` 与 `min_child_samples=40`）会让模型比原项目
+> **更浅、更不容易分裂**，是「复现不出 HL 的 IC」的头号嫌疑之一。
+
+---
+
+## 五、已知差异（对照曲线时要用到）
+
+1. **`ext_hi` / `ext_lo` 默认不勾选**。它们是 250 根内的绝对最高/最低价，与
+   `tools_ml.py` 里「只用已归一化特征，避免跨品种价格水平泄漏」的注释自相矛盾。
+   截面 z-score 后会退化成「本品种在池中的价格排名」，等于塞一个品种哑变量。
+   要 36 个全开的忠实版本加 `--with-price-level`。
+2. **绝对收益只有原策略的一半**。ChanQuant 的 `legs` 让多空**各占 50%**
+   （gross 100%），原策略是 `1.0×top_ret − 1.0×bot_ret`（gross 200%）。收益与
+   成本同步减半，**夏普 / IR 不变**。跨平台比绩效请锚夏普。
+3. **持有期 46 根不是 30 根**。原项目 `BPD=6` 是「每天约 6 根」的拍脑袋近似，
+   本机 1h 面板实测 **9.28 根/天**（AU/AG/SC 夜盘到 02:30、CU/AL/ZN 到 01:00）。
+   `H_DAYS=5` 是设计意图、`BPD=6` 只是实现近似，默认按实测密度换算。
+   `--bpd 6` 可逐字复现源码常量。
+4. **标签 `excess` 不是 `ret`**。`excess` = 收益 − 当期截面均值；同一时间戳内
+   减常数不改变排序 ⇒ 十分位选谁完全一样，只是模型拟合去均值后的收益
+   （等价于加日期固定效应）。
+5. **展期 3 个是映射**，库里多一道 5 日均值（见 §二 展期一节）。
+6. **成本口径不同**：原项目统一 5bp/边；ChanQuant 按品种跳数建模（手续费按元/手
+   折成比例 + 1 跳滑点），实测单边约 2~3.5bp。
+7. **`orient` 在截面机器学习路径上不生效**。`ttrade/cross.py` **全文没有**
+   `orient` 这个词：`ml_score_panel` 只用 `label_mode` 定标签，因子方向和交互
+   全交给 LightGBM 自己学。实测 `orient="auto"` 与 `orient="long_high"` 在同样
+   数据上给出**逐位相同**的结果（−20.7% / 534 期 / −0.020%）。
+   真正读 `orient` 的是 `factor_strategy` 的单因子 / 多因子加权求和那两条路
+   —— 那才是「因子有正有反、需要人工定方向」的场合。配置里仍显式写
+   `long_high`，只是把意图固化下来。
+
+---
+
+## 六、复现结果（全部品种 × 全历史）
+
+口径：68 个商品（1h 库里有数据的全部非金融品种）/ 2017-04 ~ 2026-11 /
+34 个因子 / 每 46 根调仓 / 多空各 10%（每期 4 多 4 空）/ LightGBM 回归 /
+`orient="long_high"`。
+
+| 变体 | 总收益 | 期数 | 期均 | t 值 | 期胜率 | 最大回撤 |
+|---|---|---|---|---|---|---|
+| 原始 | −20.7% | 534 | −0.020% | −0.22 | 50.4% | −42.9% |
+| 截面分数打乱 | −63.4% | 534 | −0.150% | −1.27 | 44.9% | −82.8% |
+| 分数取负 | −36.2% | 534 | −0.064% | −0.75 | 46.1% | −51.7% |
+
+- **OOS 横截面 rank IC = +0.0034（t 0.76，1991 个截面）** —— 基本为零。
+- Σ|w| 中位 1.0000、净敞口 |Σw| 最大 0.0000 ✓（legs 口径正确）
+- 每期持仓 8 个（4 多 4 空）✓（十分位正确）
+
+**读法**：原始版比打乱版好 43 个百分点，说明分数里确实**有一点**信息；但
+534 期累计成本约 30%，把毛收益吃干净还剩 −20.7%。
+
+对照 HL-Point 原文（87 品种 / 2021-2026 / 400 期）：期均 **+0.899%**、t **4.84**、
+最强单因子 IC `dev_spread` +0.0253 / `curv` −0.0283。
+
+> ⚠️ 即：**因子移植与组合构造是对的（单因子 IC 量级、净敞口、十分位腿数、PIT、
+> 模型类型都对得上），但绩效没有复现出来。** 差异来源尚未定论，见下节。
+
+---
+
+## 七、下一步该查什么
+
+按优先级：
+
+1. **`orient`（方向）**：ChanQuant 的 `orient="auto"` 按滚动 IC 定「分高做多还是
+   做空」。HL 的 LightGBM 回归天然就是「预测高 → 做多」，不需要二次定向；若
+   auto 在小样本上翻来覆去，会把 alpha 抵消掉。**先固定 `long_high` 再比。**
+2. **持有期口径**：`H=46`（实测密度）vs `H=30`（源码常量）对 IC 与换手的影响。
+3. **标签口径**：`excess` vs `volret`。
+4. **训练窗口**：HL 是「2021 起扩张窗口」，ChanQuant 的 `train_window` 是固定
+   长度滚动窗（1260 天 ≈ 4.8 年）。要真扩张得把 `train_window` 设得比样本还长。
+5. **标准化叠加**：因子内部已经滚动 z，`method="z"` 又做一次（理论上近似恒等，
+   但 `min_periods` 更松，可能让早期因子值失真）。
+6. **品种池**：HL 用的是「888 主连、约 87 个」；本机 1h 库里 68 个商品，其中
+   2023 年后上市的新品种历史很短。
+
+`_tools/hlpoint_sweep.py` 就是按这个顺序做的变体扫描。
+
+## 八、逐因子 IC 对照的结论（2026-11-24 补）
+
+详见 **`docs/HL_POINT_FACTOR_IC_CMP.md`**，这里只留三条决定性数字：
+
+1. **因子实现等价**：把**原项目的因子函数**直接跑在本机同一份数据上，
+   32 个价格/持仓量因子与库里的实现逐条差 **≤ 0.001**，秩相关 **+0.86**，同号 **35/36**。
+   `ttrade/factors_hlpoint.py` 的移植可以放心用。
+2. **逐因子 IC 不能当验收锚**：原报表 vs 本机，36 个因子的 IC 秩相关只有 **+0.02**、同号 20/32，
+   但两边的 `|IC|` 均值一样（0.0114 vs 0.0117）。而且「同函数只换数据」秩相关就掉到 0.17~0.38 ——
+   **IC 的抽样波动比平台差异还大**。要看合成分数 IC / 组合绩效。
+3. **数据侧唯一硬差异：复权口径 —— 但它改的是 `y`，不是展期因子值**。
+   展期因子来自真实合约（`o6_*` 各腿），qfq / 不复权两次加载 **max|Δ| = 0.000e+00**（逐位相同）；
+   被动的是标签：同一份 `roll_main_oi`，`IC(y_qfq) = +0.041`、`IC(y_raw) = −0.019`、
+   `IC(y_gap 换月跳空那一截) = −0.133 (t −11.4)`。换月窗口占 11.6%，`|y_gap|` 均值 0.283%。
+   🔴 **原项目 1h 到底复没复权**：入口都写 `adj='v2'`，但 `apply_adjust` 只在**日线**路径被调用，
+   1h/30m/15m 分支从不调用（`adj` 只进了缓存 key）⇒ 实测 `adj='v2'` 与 `adj=None`
+   的 1h 收盘比值恒 **1.000**、跳空截恒 **0**、无 `adj_factor` 列。
+   **结论：原项目 1h 全链路实际是不复权的**（声称 v2、漏实现，只有 1d 真复权）。
+   ⇒ 它 `roll` 的 IC −0.026 主要就是换月跳空的机械效应（详见 `docs/HL_POINT_FACTOR_IC_CMP.md` §1b）。
+
+另有一条真实现差异：库里 `curv` 的公式是 `(远端斜率 − 近端斜率)`，**与原项目差一个负号**
+（同数据下 原函数 −0.0197 vs 库 +0.0276），而且 `library_docs.py` 里「曲率为负＝近端更陡」的说明也是反的。
+

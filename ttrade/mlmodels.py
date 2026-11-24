@@ -282,7 +282,31 @@ class BaseModel:
 
 # ================================================================== 树模型
 class LGBMModel(BaseModel):
-    """LightGBM。小样本上刻意压低复杂度：叶子少、叶子样本数高、强正则。
+    """LightGBM。**两套参数**：大折照抄原项目，小折走保护分支。
+
+    ## 一、大折（≥ 5000 行）：逐字照抄原项目
+
+    原项目 `future_quant/strategy/hl_point/tools_ml.py` 的写法是
+
+    ```python
+    params = dict(objective='regression', learning_rate=0.03, num_leaves=31,
+                  min_data_in_leaf=200, feature_fraction=0.8, bagging_fraction=0.8,
+                  bagging_freq=1, verbose=-1, num_threads=4)
+    m = lgb.train(params, ds, num_boost_round=300)
+    ```
+
+    注意它**没设** `max_depth` / `reg_alpha` / `reg_lambda` —— 那就都是
+    LightGBM 默认值：深度不限、正则 0。以前本库写的是 `max_depth=4` +
+    `num_leaves=15` + `min_child_samples=40` + 200 轮 + 缩放正则，
+    比原项目**浅得多、也松得多**，同一份因子跑出来的分数自然对不上。
+
+    ## 二、小折（< 5000 行）：保留原来的保护分支
+
+    阈值 5000 不是拍的：原项目自己就是 `if len(tr) < 5000: continue`，
+    它**从来不在**这个规模以下训练，所以保护分支跟「参数一致」不冲突。
+    截面 ml 那条路单折上限是 20000 行（`cross.ML_MAX_TRAIN_ROWS`），稳在大折。
+
+    保护分支的两个理由见下（小样本那套是踩过真实故障才加的，不能跟着删）。
 
     ## 为什么要按标签量纲缩放正则
 
@@ -304,8 +328,7 @@ class LGBMModel(BaseModel):
     而且从产物文件上看不出任何异常（特征重要度还在，因为树确实存在）。
 
     所以这里的正则按**标签标准差**缩放：量纲小的时候把正则按比例压下去，
-    让「劈开值不值」回到一个和标签同量级的比较里。样本多的时候仍用原来的
-    保守配置（标签量纲一样时缩放系数接近 1）。
+    让「劈开值不值」回到一个和标签同量级的比较里。
 
     `min_child_samples` 也按样本量收缩：几十个样本的折用 40 的下限，
     父节点要 80 个才够劈成两半，必然劈不开。
@@ -313,18 +336,45 @@ class LGBMModel(BaseModel):
 
     name = "lightgbm"
 
-    def __init__(self, seed: int = 42, n_estimators: int = 200):
+    #: 原项目（`strategy/hl_point/tools_ml.py:463`）那套超参，名字换成 sklearn
+    #: 侧的叫法。`max_depth=-1` / `reg_alpha=0` / `reg_lambda=0` 都是「原项目
+    #: 没写 ⇒ LightGBM 默认」，不是我们额外加的。
+    ORIG = {
+        "learning_rate": 0.03,
+        "num_leaves": 31,
+        "min_child_samples": 200,   # 原 min_data_in_leaf=200
+        "colsample_bytree": 0.8,    # 原 feature_fraction=0.8
+        "subsample": 0.8,           # 原 bagging_fraction=0.8
+        "subsample_freq": 1,        # 原 bagging_freq=1
+        "max_depth": -1,
+        "reg_alpha": 0.0,
+        "reg_lambda": 0.0,
+        "n_estimators": 300,        # 原 num_boost_round=300
+    }
+
+    #: 换成 `ORIG` 的最小行数。挑 5000 是为了跟原项目的门槛对齐：它
+    #: `if len(tr) < 5000: continue`，也就是说这套参数只在「单折上万行」的
+    #: 面板上被验证过。低于 5000 还硬套 `min_data_in_leaf=200` 会直接退成
+    #: 一根树桩（不足 401 行连一次都劈不开），所以那一段留给保护分支。
+    BIG_SAMPLE = 5000
+
+    def __init__(self, seed: int = 42, n_estimators: int = 300):
         self.seed = seed
         self.n_estimators = n_estimators
         self._m = None
         self._imp = None
 
     def _params(self, n_samples: int, y: np.ndarray | None = None) -> dict:
-        """按样本量和标签量纲给一组能真的分裂的参数。"""
+        """大折返回原项目参数；小折返回一组「能真的分裂」的保守参数。"""
+        if n_samples >= self.BIG_SAMPLE:
+            # 🔴 这里**不许**再加任何「改良」：要和原项目一致，就一个数都别动。
+            # 想加 `min_child` 收缩、想加 L1 兜底，请放到下面的小折分支。
+            return {k: v for k, v in self.ORIG.items() if k != "n_estimators"}
+        # ---- 以下是小折保护分支（原项目不会跑到这里）----
         # 叶子最小样本数：样本少就往下压，但至少留 5 —— 再少就全是噪声叶子
-        min_child = 40 if n_samples >= 400 else max(5, int(n_samples * 0.05))
+        min_child = max(5, int(n_samples * 0.05))
         # 叶子数：要能装下 min_child 的约束，`n_samples / min_child` 的一半左右
-        leaves = 15 if n_samples >= 400 else max(2, min(15, n_samples // max(min_child, 1)))
+        leaves = max(2, min(15, n_samples // max(min_child, 1)))
         # ---- 正则按标签量纲缩放 ----
         # L2（reg_lambda）是二次惩罚，权重量级小的时候它跟着变小，永远不会
         # 把分裂掐死 —— 实测 lam 从 0 到 10 都能正常分裂。
@@ -343,13 +393,16 @@ class LGBMModel(BaseModel):
                 # sd=1e-2 → 1e-4（远小于 0.1，放行）；sd=5e-3 → 5e-5。
                 lam_scale = float(np.clip(sd / 1e-2, 0.02, 1.0))
                 alpha = min(0.1, sd * 0.01)
-        # 小样本不开 bagging：每棵树扔 20% 的样本，几十行的折就再也劈不开了
-        bag = 0.8 if n_samples >= 400 else 1.0
         return {
+            "learning_rate": self.ORIG["learning_rate"],
+            "colsample_bytree": self.ORIG["colsample_bytree"],
+            # 小折不开 bagging：每棵树扔 20% 的样本，几十行的折就再也劈不开了
+            "subsample": 1.0,
+            "subsample_freq": 0,
+            # 小折也限深：叶子数已经压到 15 以内，再放开深度只增加过拟合
+            "max_depth": 4,
             "min_child_samples": int(min_child),
             "num_leaves": int(leaves),
-            "subsample": float(bag),
-            "subsample_freq": 1 if bag < 1.0 else 0,
             "reg_lambda": float(2.0 * lam_scale),
             "reg_alpha": float(alpha),
         }
@@ -363,9 +416,6 @@ class LGBMModel(BaseModel):
         prm = self._params(n, y)
         self._m = lgb.LGBMRegressor(
             n_estimators=self.n_estimators,
-            learning_rate=0.05,
-            max_depth=4,
-            colsample_bytree=0.8,
             random_state=self.seed,
             n_jobs=1,
             verbose=-1,

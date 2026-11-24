@@ -3612,6 +3612,8 @@ class PortfolioPage(QWidget):
         sig = tuple((k, r["symbol"], r["target"], r["actual"], r["delta"],
                      bool(r.get("managed")), int(r.get("a_long") or 0),
                      int(r.get("a_short") or 0),
+                     # 「回测口径 / 实盘没触发过」进签名：说明列的文字靠它区分
+                     bool(r.get("theo_only")),
                      bool(self._snaps.get(k, {}).get("account_ready", True)),
                      # 持仓有没有真读回来也要进签名：它是「账户实际」这一格的
                      # 画法之一（读不到要画「—」），不进签名就不会重绘
@@ -3637,6 +3639,10 @@ class PortfolioPage(QWidget):
                     have = (f"{r['actual']}（多{r['a_long']} 空{r['a_short']}）")
                 delta_txt = _delta_text(r)
                 note = "策略持仓" if managed else "未托管（策略已停或手工开仓）"
+                if r.get("theo_only"):
+                    # 理论仓来自回测口径、实盘这一轮从没触发过入场 ——
+                    # 不说清楚的话，用户会以为账户里已经有这笔仓、对齐只是「调一调」
+                    note += " · 回测口径（实盘还没触发过入场，对齐会市价补开）"
                 if locked:
                     note += " · 锁仓，两条腿都要平"
                 if not logged_in:
@@ -4395,6 +4401,20 @@ class PortfolioPage(QWidget):
                 # 剩下的**一样会被调整**，只是框里不逐条列了 —— 所以要把这句话
                 # 写出来，不能让人以为「还有 N 个」是不动
                 lines.append(f"　…… 还有 {len(managed) - 20} 个，同样按理论持仓调整")
+        # 「理论有仓、实盘还没触发过」的那批单独说：这是**开仓**，不是调仓。
+        # 不说清楚，用户会把「市价补 8 手空」当成「把手里那 8 手挪一挪」
+        pend = [r for r in managed if r.get("theo_only")]
+        if pend:
+            lines.append("")
+            lines.append(f"其中 {len(pend)} 个是**回测口径的仓、实盘这一轮从没进场过**"
+                         "（K 线内策略要等盘中价格碰到触发价）：")
+            for r in pend[:10]:
+                lines.append(f"　{r['symbol']}　现在 {_pos_text(r['actual'], r)} → "
+                             f"{r['target']}（按市价**新开**，不是调仓）")
+            if len(pend) > 10:
+                lines.append(f"　…… 还有 {len(pend) - 10} 个，同样按市价新开")
+            lines.append("补上之后账本就按这个数接着走；建仓价是此刻的市价，"
+                         "不是策略当初那个触发价 —— 这几笔的盈亏从今天算起。")
         if orphans:
             lines.append("")
             lines.append(f"平掉 {len(orphans)} 个没有策略在管的合约：")

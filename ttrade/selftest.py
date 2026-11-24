@@ -976,12 +976,21 @@ def _run() -> tuple[bool, list[str]]:
         libs = [k for k in T.keys() if k.startswith("tpl_lib_")]
         if len(libs) < 50:
             raise RuntimeError(f"收编进去的模板只有 {len(libs)} 条")
+        # 「只做空」默认是**不该勾**的（勾错了等于半个策略不干活），但它也可以是
+        # 策略定义本身：`sbbox多品种波段1h 基本面空` 就是照着「只做空头」调的，
+        # 收编时把它掰回双向，载入后跑出来的曲线和用户库里那条对不上。
+        # 所以白名单放行，条件是说**说明里必须写明「只做空」** —— 否则以后照着
+        # 这条改品种的人不会知道自己在改一条单边策略。
+        only_short_ok = {"tpl_lib_rule_26"}
         for k in libs:
             c = T.to_config(k)
             if c is None:
                 raise RuntimeError(f"{k} 还原不出来")
             if getattr(c, "short_only", False):
-                raise RuntimeError(f"{k} 默认勾了「禁止做多」，应该默认不勾")
+                if k not in only_short_ok:
+                    raise RuntimeError(f"{k} 默认勾了「禁止做多」，应该默认不勾")
+                if "只做空" not in T.teach(k):
+                    raise RuntimeError(f"{k} 是只做空策略，说明里却没写「只做空」")
             if c.market != "cn_stock" and c.note != "short":
                 raise RuntimeError(f"{k} 默认没勾「允许做空」")
         names = T.names()
@@ -6128,6 +6137,171 @@ def _run() -> tuple[bool, list[str]]:
 
     check("一键对齐看得见锁仓（多空双开）", _align_lock)
 
+    def _align_intrabar_theo():
+        """K 线内那族的**理论仓**必须进监控器，也必须能被一键对齐真的建出来。
+
+        2026-11-24 用户报「一键对齐没有读出来这个多品种模型的持仓」。融航账户上
+        `sbbox多品种波段1h 基本面空` 7 条腿，策略表「理论」列写着 -6 / -8 / -10 /
+        -44，点一键对齐却只下发了 `CFFEX.IM2612 / CFFEX.TL2612` 两笔 —— 这 7 条腿
+        一条都不在名单里（`live.log` 里只有 09:18 那笔 `SHFE.al2701 卖 OPEN 6 手`，
+        其余 6 条只有 `[LOTS] 开仓手数 0 → 8/10/44`）。
+
+        根因：`theoretical()` 原来用 `st.target`，而 K 线内那族（`sbbox_ib`）的
+        `target` 是**下单目标** —— 只有盘中价格真碰到触发价（`_ib_arm`）才有值，
+        冷启动时恒 0。`target=0` 且账户无仓 ⇒ `mismatch()` 里
+        `(0,0) == (0,0)` 直接 `continue`，一行都不产出。
+
+        第二处同源错误在 `_sync_after_align()`：它也用 `target` 算，而且拿
+        `if sym not in st.held: continue` 当闸门 —— 即使对齐把仓开出来了也不记账本，
+        下一轮 `mismatch()` 把它当「未托管」，再点一次对齐就平掉（开了又平）。
+
+        两处都必须用 `_theo_qty()`（= 方向 × 锁存的开仓手数，与回测 `position`
+        同一列），**下单路径不动**（仍按 `target` 等触发价）。
+        """
+        from ttrade import strategy_store as SStore
+        from ttrade.strategy_runner import (STRATEGIES, PortfolioRunner,
+                                            SlotState)
+
+        spec = STRATEGIES.get("sbbox_ib")
+        if not getattr(spec, "intrabar", False):
+            raise RuntimeError("前提不成立：sbbox_ib 不在策略表里 / 不是 intrabar")
+
+        class P:
+            def __init__(self, lo, sh):
+                self.pos_long, self.pos_short = lo, sh
+                for s, v in (("long", lo), ("short", sh)):
+                    setattr(self, f"pos_{s}_his", v)
+                    setattr(self, f"pos_{s}_today", 0)
+                    setattr(self, f"volume_{s}_his", v)
+                    setattr(self, f"volume_{s}_today", 0)
+
+        r = PortfolioRunner.__new__(PortfolioRunner)
+        r._log_fn = None
+        r._diag = None
+        r._mm_cache, r._mm_ts = [], 0.0
+        r._align_ts = 0.0
+        r.api = object()                      # 没有 positions_ready ⇒ 按「已读回」
+        r._save_book = lambda s: None          # 不落盘，自检不留垃圾
+        # 台账「加载首轮不交易」那一套（`_fresh_book` / `_adopted`）不在本用例
+        # 的验算范围里，单独桩掉；要验的是 `_rebalance` 会不会反手平仓
+        r._adopt_if_needed = lambda s: None
+        st = SlotState(cfg=SStore.StrategyConfig(
+            sid="t", name="sbbox多品种波段1h 基本面空", period="1h",
+            family="rule", rule_key="sbbox_ib", note="short", short_only=True))
+        st.running, st.underlying = True, "SHFE.cu2701"
+        # 策略口径：做空、开仓 8 手（`[LOTS] 开仓手数 0 → 8`）；
+        # 但这一轮从没触发入场 ⇒ 下单目标 `target` 还是 0
+        st.signal, st.theo_lots, st.lots = -1, 8, 8
+        st.target = 0
+        r._slots = {"t": st}
+        r._align_slot = SlotState(cfg=SStore.StrategyConfig(
+            sid="__align__", name="一键对齐", period="1d"))
+        r._pos = {}                            # 账户里确实没有这个仓
+
+        if not r._ib_on(st):
+            raise RuntimeError("前提不成立：这条策略没走 K 线内口径")
+        if r._theo_qty(st) != -8:
+            raise RuntimeError(f"理论仓该是 -8（信号×锁存手数），实际 {r._theo_qty(st)}")
+
+        # ① 理论仓要读得出来
+        theo = r.theoretical()
+        if theo.get("SHFE.cu2701") != -8:
+            raise RuntimeError(f"theoretical() 漏了 K 线内那族：{theo}")
+
+        # ② 监控器/对齐要看得见这条腿，并且标注「回测口径、实盘没触发过」
+        rows = r.mismatch(fresh=True)
+        hit = [x for x in rows if x["symbol"] == "SHFE.cu2701"]
+        if len(hit) != 1:
+            raise RuntimeError(f"监控器里没有这条腿：{[x['symbol'] for x in rows]}")
+        row = hit[0]
+        if (row["target"], row["actual"], row["delta"]) != (-8, 0, -8):
+            raise RuntimeError(f"差额算错了：{row}")
+        if not row["theo_only"]:
+            raise RuntimeError("没标出「回测口径 / 实盘没触发过」—— 用户会以为是调仓")
+
+        # ③ 对齐要真发一笔（8 手空）
+        sent = []
+        r._send = lambda s, sym, delta, closeable=None: (
+            sent.append((sym, delta)) or s.pending.append("x") or 1)
+        n = r.align(close_orphans=True)
+        if sent != [("SHFE.cu2701", -8)] or n != 1:
+            raise RuntimeError(f"对齐该补开 8 手空，实发 {sent}")
+        # ④ 对齐之后账本里必须有这条 —— 否则下一轮被当「未托管」再平掉
+        if int(st.held.get("SHFE.cu2701") or 0) != -8:
+            raise RuntimeError(f"对齐开了仓但账本没建条目：{st.held}")
+        # ④b `target` 必须跟着一起摆。只写 `held` 的话，对齐之后是
+        #     `target=0 / held=-8` —— 正好命中 `_rebalance` 里「目标没变 + 减仓」
+        #     那条放行分支 ⇒ 下一轮 `delta=+8` 把刚补开的 8 手按市价买平。
+        #     账户先摆成「已成交」，否则 `_rebalance` 里的「账户持仓还没跟上」
+        #     那道闸会把它挡掉，这条断言就抓不到东西（下面的反证证明它不是恒真）。
+        r._pos = {"SHFE.cu2701": P(0, 8)}
+        if int(st.target or 0) != -8:
+            raise RuntimeError(f"对齐后 target 没跟着摆（{st.target}）—— 会被自己平掉")
+        r._align_slot.pending.clear()
+        sent.clear()
+        r._rebalance(st)
+        if sent:
+            raise RuntimeError(f"对齐补开的仓被策略自己平掉了：{sent}")
+
+        # ④c 反证：把 target 掰回 0（= 只写 held 的旧写法），上面那条必须能变红
+        keep = (st.target, st.based_target)
+        st.target, st.based_target = 0, 0
+        sent.clear()
+        r._rebalance(st)
+        st.target, st.based_target = keep
+        if sent != [("SHFE.cu2701", 8)]:
+            raise RuntimeError(
+                f"反证不成立（旧写法竟然不发单，说明 ④b 抓不到东西）：{sent}")
+
+        # ⑤ 账户跟上之后必须判一致（不能反复报差）
+        r._mm_ts = 0.0
+        r._align_slot.pending.clear()
+        left = [x["symbol"] for x in r.mismatch(fresh=True)]
+        if left:
+            raise RuntimeError(f"账户补上之后还在报不一致：{left}")
+
+        # ⑤b 策略自己的委托还在飞时，对齐不许动这个合约 —— 账户一秒后就变，
+        #     按「现在没有」补差额就是把同一笔仓开两遍。这是「理论仓改走
+        #     `_theo_qty`」带来的新敞口：从没触发过的腿也可能是刚报出去的单。
+        st.pending.append("order-1")
+        r._pos = {}
+        r._mm_ts = 0.0
+        r._align_ts = 0.0
+        r._align_slot.pending.clear()
+        sent.clear()
+        if r.align(close_orphans=True) != 0 or sent:
+            raise RuntimeError(f"策略还有在途单时对齐照发了：{sent}")
+        st.pending.clear()
+
+        # ⑥ 反证一：真触发过（`target` 有值）就不该再标「回测口径」
+        st.target = -8
+        r._mm_ts = 0.0
+        r._pos = {}
+        if r._theo_pending():
+            raise RuntimeError("target 有值时不该进「回测口径」那一批")
+        if r.mismatch(fresh=True)[0]["theo_only"]:
+            raise RuntimeError("target 有值时 theo_only 该是假 —— 上面那几条可能是恒真")
+
+        # ⑦ 反证二：普通策略（非 K 线内）空仓时理论仓就是 0，不许被这次改动带进来
+        st2 = SlotState(cfg=SStore.StrategyConfig(
+            sid="n", name="普通空仓策略", period="1h", family="rule",
+            rule_key="ma_cross"))
+        st2.running, st2.underlying = True, "DCE.jd2701"
+        st2.signal, st2.theo_lots, st2.lots, st2.target = -1, 9, 9, 0
+        r._slots = {"n": st2}
+        if r.theoretical().get("DCE.jd2701"):
+            raise RuntimeError("普通策略空仓也被算成有理论仓了 —— `_theo_qty` 分叉错了")
+        r._mm_ts = 0.0
+        if [x["symbol"] for x in r.mismatch(fresh=True)]:
+            raise RuntimeError("普通策略空仓不该出现在监控器里")
+
+        return ("K 线内那族的理论仓能读出来（-8）、标注「回测口径」、对齐补开 8 手、"
+                "账本与 target 一起摆好（下一轮不会被自己平掉，反证能变红）、"
+                "在途单时不重复开仓；账户跟上后判一致；真触发过/普通空仓两条反证"
+                "都不误报")
+
+    check("一键对齐读得出 K 线内多品种策略的理论仓", _align_intrabar_theo)
+
     def _align_no_flip():
         """一键对齐**不许**把「平仓」变成「反方向开仓」，也不许动没确认过的合约。
 
@@ -10332,7 +10506,11 @@ def _run() -> tuple[bool, list[str]]:
             _i_aux = _src.find("self._aux_bg")
             if _auxsrc.find("self._ensure_aux()") < 0:
                 _i_aux = -1
-            _i_api = _conn.find("self.api = TqApi(")
+            # 🔴 2026-11-24：天勤那一支不再自己 `TqApi(...)`，改成到 `hubreg`
+            # 借会话（一个天勤账户在整个系统只能有一条会话）。文案跟着换 ——
+            # 这里盯的是「体检在前、连账户在后、天勤分支在柜台分支之前」，
+            # 不是某个具体的构造调用
+            _i_api = _conn.find('hubreg.acquire("tq"')
             _i_broker = _conn.find("self._broker_api(backend)")
             # 2026-11-20 起账户只是**最后一步**：行情先起，衍生数据次之，账户最后。
             # 顺序错了就退回「账户连不上 ⇒ 策略不跑」的老样子
@@ -14137,7 +14315,9 @@ def _run() -> tuple[bool, list[str]]:
         assert hubreg.release(a) is True, "最后一个使用者放手却没资格关"
         assert hubreg.size() == 0, f"注册表没清干净：{hubreg.describe()}"
 
-        # 不在表里的连接（天勤 / 单测注入的假柜台）照旧由调用方关
+        # 不在表里的连接（纯行情会话 / 单测注入的假柜台）照旧由调用方关。
+        # 🔴 天勤的**账户**会话 2026-11-24 起进表了（见下面 `_tq_one_session`），
+        # 这里说的「不在表里」只剩纯行情那种（`LiveHub(specs=[])` 不建键）
         assert hubreg.release(_H()) is True, "不在注册表里的连接被当成了共享会话"
 
         # ---- `start()` 幂等，但**断线之后必须重登**
@@ -14284,6 +14464,199 @@ def _run() -> tuple[bool, list[str]]:
                 "make_hub / BrokerApi / HubSet 三处接线都走 hubreg")
 
     check("一个账户一条会话（交易页与组合页共用同一条连接）", _one_session)
+
+    def _tq_one_session() -> str:
+        """天勤也要一条会话（2026-11-24 用户要求）。
+
+        用户原话：「天勤的账户也要和 CTP 和融航账户一样，同一个账户在整个系统
+        共享同一个会话，这样一键对齐和账户持仓和委托成交的会话才能实时响应。」
+
+        天勤原来被 `hubreg` 明确排除，理由是「`TqApi` 单线程语义，两个页面共用
+        一个对象会写坏订阅状态」。结论没错，但办法应该是**让它有一条自己的
+        线程**，而不是让它登两次 —— 天勤按会话推持仓 / 委托 / 成交，两条会话
+        互不相通，用户看到的就永远是「下单了，监控器不动」。
+
+        这个块钉五件事：
+        1. `hubreg` 认天勤，同一账户两次 `acquire()` 是同一个对象；
+        2. 键里带账户类型 —— 同一个天勤账号的 `kq`（模拟）和 `account`（实盘）
+           必须是两条会话；
+        3. `wait_update()` **只**在泵线程里被调（以前是调用方自己推，共用就会
+           两条线程一起推）；
+        4. `close()` 带引用计数（交易页先收尾不能把组合页的持仓掐断）；
+        5. 组合页要的 `TqApi` 同名方法（`get_position` / `get_order` /
+           `insert_order` / `cancel_order`）都转出去了，`positions_ready()` 用
+           `Account.balance` 的 nan 区分「还没读到」和「真的是 0」。
+        """
+        import inspect
+        import threading as _th
+
+        from ttrade import hubreg
+        from ttrade import strategy_runner as SR
+        from ttrade import strategy_store as SStore
+        from ttrade.tqlive import AccountSpec, LiveHub
+
+        hubreg.clear()
+
+        class _Pos:
+            def __init__(self):
+                self.instrument_id = "SHFE.cu2701"
+                self.pos_long, self.pos_short = 0, 8
+                self.pos = -8
+                self.pos_long_today = self.pos_short_today = 0
+                self.open_price_long = self.open_price_short = 0.0
+                self.float_profit = self.margin = 0.0
+
+        class _Ord:
+            def __init__(self, oid):
+                self.order_id = oid
+                self.status = "ALIVE"
+
+        class _Api:
+            """假 `TqApi`：只实现 `LiveHub` 用到的几个方法，并记下谁在调。"""
+
+            def __init__(self):
+                self.threads = set()
+                self.calls = []
+                self.updates = 0
+                self.orders = []
+
+            def wait_update(self, deadline=None):
+                self.threads.add(_th.current_thread().name)
+                self.updates += 1
+                return True
+
+            def get_position(self, *a, **k):
+                self.threads.add(_th.current_thread().name)
+                return {"SHFE.cu2701": _Pos()}
+
+            def get_order(self, *a, **k):
+                self.threads.add(_th.current_thread().name)
+                return {o.order_id: o for o in self.orders}
+
+            def insert_order(self, **kw):
+                self.threads.add(_th.current_thread().name)
+                self.calls.append(("insert_order", dict(kw)))
+                o = _Ord(f"o{len(self.orders) + 1}")
+                self.orders.append(o)
+                return o
+
+            def cancel_order(self, order=None, **kw):
+                self.threads.add(_th.current_thread().name)
+                self.calls.append(("cancel_order", order))
+                return True
+
+            def close(self):
+                self.calls.append(("close", None))
+
+        class _Acc:
+            def __init__(self, balance):
+                self.balance = balance
+
+            def get_account(self):
+                return self
+
+        spec = AccountSpec(name="快期A", kind="kq", user="u1", password="p1")
+        made = []
+        h1 = hubreg.acquire("tq", [spec],
+                            lambda: made.append(1) or LiveHub([spec]))
+        h2 = hubreg.acquire("tq", [spec],
+                            lambda: made.append(1) or LiveHub([spec]))
+        assert "tq" in hubreg.SHARED, "天勤还是没进注册表 —— 会登两条会话"
+        assert h1 is h2, "同一个天勤账户拿到了两条会话（持仓/委托互不相通）"
+        assert len(made) == 1, f"同一个账户被构造了 {len(made)} 次"
+        assert hubreg.refs(h1) == 2, f"引用数不对：{hubreg.refs(h1)}"
+
+        # 键里带账户类型：同一个天勤账号既能挂模拟也能挂实盘
+        real = AccountSpec(name="快期A", kind="account", user="u1", password="p1")
+        h3 = hubreg.acquire("tq", [real], lambda: LiveHub([real]))
+        assert h3 is not h1, ("同一个天勤账号的模拟户和实盘户串成了一条会话 —— "
+                              "下的单会全落在模拟盘里")
+        assert hubreg.hub_key("tq", real)[-1] == "account", "键里没带账户类型"
+
+        # ---- 泵线程独占 wait_update ----
+        hub = h1
+        api = _Api()
+        hub.api = api
+        hub._start_pump()
+        assert hub.wait(1.0) is True, "泵没把数据推过来，wait() 一直超时"
+        time.sleep(0.15)
+        assert api.threads == {"tq-pump"}, (
+            f"wait_update 被别的线程也调了：{api.threads} —— 两条线程驱动同一个 "
+            "TqApi 会写坏内部订阅状态")
+
+        # ---- 组合页要的 tqsdk 同名接口 ----
+        assert sorted(hub.get_position()) == ["SHFE.cu2701"], "get_position 没转出去"
+        assert hub.get_order() == {}, "get_order 没转出去"
+        o = hub.insert_order(symbol="SHFE.cu2701", direction="BUY",
+                             offset="CLOSE", volume=8, limit_price=70000.0)
+        assert getattr(o, "order_id", ""), "insert_order 没转出去"
+        assert api.calls[0][1]["volume"] == 8, "下单参数没原样传下去"
+        assert hub.cancel_order(o) is True, "cancel_order 没转出去"
+
+        # ---- positions_ready：空字典 ≠ 没仓 ----
+        hub._accs = [(spec, _Acc(float("nan")))]
+        assert hub.positions_ready() is False, \
+            "第一帧还没到就说「读到了」—— 一键对齐会拿「账户是空的」重开一遍"
+        hub._accs = [(spec, _Acc(1_000_000.0))]
+        assert hub.positions_ready() is True, "账户数据到了还说没读到"
+
+        # ---- 组合页的引擎直接吃这条会话（不用改一行）----
+        hub._accs = [(spec, _Acc(1_000_000.0))]
+        run = SR.PortfolioRunner.__new__(SR.PortfolioRunner)
+        run._log_fn = run._diag = None
+        run._mm_cache, run._mm_ts = [], 0.0
+        run._align_ts = 0.0
+        run.api = hub
+        run._save_book = lambda s: None
+        run._adopt_if_needed = lambda s: None
+        run._pos = hub.get_position()          # tqsdk 形状的活引用
+        run._orders = hub.get_order()
+        run._slots = {}
+        st0 = SR.SlotState(cfg=SStore.StrategyConfig(
+            sid="t", name="cu", period="1h"))
+        st0.running, st0.underlying, st0.target = True, "SHFE.cu2701", -8
+        run._slots["t"] = st0
+        run._align_slot = SR.SlotState(cfg=SStore.StrategyConfig(
+            sid="__align__", name="一键对齐", period="1d"))
+        assert run._side_pair("SHFE.cu2701") == (0, 8), \
+            "组合页的引擎读不懂 LiveHub 转出来的持仓（tqsdk 字段对不上）"
+        assert run._net_pos("SHFE.cu2701") == -8, "净仓算错了"
+        assert run._pos_live() is True, "positions_ready 没接上 —— 对齐会被永久挡住"
+        assert [x["symbol"] for x in run.mismatch(fresh=True)] == [], \
+            "理论与账户明明一致却报不一致"
+
+        # ---- close() 按引用计数 ----
+        hub.close()                        # 交易页先收尾
+        assert hub.api is not None, "组合页还在用这条会话，被交易页关掉了"
+        assert hubreg.refs(hub) == 1, f"放手一次之后 refs={hubreg.refs(hub)}"
+        hub.close()                        # 组合页收尾
+        assert hub.api is None, "最后一个使用者放手却没关连接"
+        assert ("close", None) in api.calls, "api.close() 没被调"
+        assert hubreg.refs(hub) == 0, f"注册表留下僵尸：{hubreg.describe()}"
+
+        # ---- 接线：组合页那条路必须借会话，不能自己登 ----
+        src = "\n".join(ln for ln in inspect.getsource(
+            SR.PortfolioRunner._connect_account).splitlines()
+            if not ln.strip().startswith("#"))
+        assert 'hubreg.acquire("tq"' in src, (
+            "`PortfolioRunner._connect_account()` 还在自己 `TqApi(...)` —— "
+            "同一个天勤账户会登两条会话")
+
+        from gui import live as GL
+
+        gsrc = "\n".join(ln for ln in inspect.getsource(GL.make_hub).splitlines()
+                         if not ln.strip().startswith("#"))
+        assert 'hubreg.acquire("tq"' in gsrc, \
+            "交易页建天勤连接没走注册表 —— 反过来也不会复用组合页那条"
+
+        h3.close()
+        hubreg.clear()
+        return ("天勤进注册表（同账户一条会话、键带 kq/实盘类型）；wait_update 只在 "
+                "tq-pump 里被调；close 按引用计数；get_position/insert_order/"
+                "cancel_order/positions_ready 都转出去了；组合页与交易页两处接线"
+                "都走 hubreg")
+
+    check("天勤也一个账户一条会话（交易页与组合页共用 TqApi）", _tq_one_session)
 
     def _hub_fail_cooldown() -> str:
         """登录失败后不许反复 `Release()` + `Init()`（2026-11-23 融航连崩三次）。
