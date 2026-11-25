@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 import pandas as pd
 
+from ttrade import cross as cross_engine
 from ttrade import symbols_info
 
 PANEL_WIDTH = 340
@@ -89,7 +90,7 @@ class _Panel(QWidget):
         self.scroll.setWidget(self._body)
 
         tip = QLabel("勾选多个品种：同一套策略在每个品种上各跑一遍再等权平均；"
-                     "截面策略至少 3 个")
+                     f"截面策略至少 {cross_engine.MIN_CROSS} 个")
         tip.setObjectName("PickHead")
         tip.setWordWrap(True)
         root.addWidget(tip)
@@ -294,7 +295,7 @@ class SymbolPicker(QToolButton):
         self.setToolTip(
             ("已选：" + "、".join(sel)) if sel else
             "勾选多个品种后，研究页按**等权组合**回测：每个品种单独跑同一套策略，\n"
-            "再把净值曲线等权平均。截面策略要求至少 3 个品种。"
+            f"再把净值曲线等权平均。截面策略要求至少 {cross_engine.MIN_CROSS} 个品种。"
         )
 
 

@@ -48,6 +48,17 @@ from gui.app import _log_fatal, main
 
 
 def run() -> int:
+    # 崩溃取证要在**任何重活之前**装好（见 ttrade/crashlog.py）：
+    # 每 10 秒把所有 Python 线程的栈顶写进 logs/heartbeat.log，崩了打开它就知道
+    # 出事那一刻每个线程停在哪一行。2026-11-23/24 那串 `0xc0000005` 光靠事件日志
+    # 只能拿到「哪个 dll 的哪个偏移」，完全看不出是查持仓、报单回调还是 Release。
+    #
+    # 🔴 放在 `run()` 里而不是模块顶层：`--selftest` 那条路在上面 `os._exit` 掉了，
+    # 不会走到这里。自检如果也装，`os._exit` 跳过 atexit ⇒ `run.marker` 留在盘上
+    # ⇒ 下次开界面会误报「上次是异常退出」。
+    from ttrade import crashlog
+
+    crashlog.install("gui")
     try:
         return main()
     except SystemExit:

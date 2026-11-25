@@ -112,11 +112,21 @@ def _macd(c: pd.Series, fast: int, slow: int, sig: int):
 
 
 def _slope(s: pd.Series, n: int) -> pd.Series:
-    """滚动线性回归斜率（x = 0..n−1）。
+    """滚动线性回归斜率（x = 0..n−1），**对齐到窗口结束的那一根**。
 
     为什么不用 `rolling.apply`：日线上无所谓，但分钟线上 30 万根逐个调 Python
     函数是分钟级的。这里用 `sliding_window_view` 一次算一片，再按 6.5 万根分块，
-    避免一次性materialize 出 30 万 × 60 的矩阵把内存顶掉。
+    避免一次性 materialize 出 30 万 × 60 的矩阵把内存顶掉。
+
+    🔴 下标必须 +n−1：`sw[j]` 是「从 a+j **开始**、长 n」的窗口，它描述的是第
+    a+j+n−1 根（窗口**结束**处）的状态。原来写的是 `out[a:b]`，等于每个斜率都
+    **往后借了 n−1 根未来数据**：
+
+        slope_20 t=300: 因子 −0.001191 vs 真值（结束于 300 的窗口）+0.001731
+        ── 连符号都反了。NaN 也全落在尾部（应为头部 n−1 个）。
+
+    同一个坑 `factors_hlpoint._ols` 早就踩过并修好了（那里 `sl` 带 `+L-1`），
+    这支是漏网的。截断不变性探针见 `_tools/_probe_slope_leak.py`。
     """
     v = np.asarray(s, dtype=float)
     m = len(v)
@@ -131,7 +141,8 @@ def _slope(s: pd.Series, n: int) -> pd.Series:
         b = min(a + step, m - n + 1)
         seg = v[a:b + n - 1]
         sw = np.lib.stride_tricks.sliding_window_view(seg, n)
-        out[a:b] = ((sw - sw.mean(axis=1, keepdims=True)) * (x - xm)).sum(axis=1) / den
+        vals = ((sw - sw.mean(axis=1, keepdims=True)) * (x - xm)).sum(axis=1) / den
+        out[a + n - 1:b + n - 1] = vals
     return pd.Series(out, index=s.index)
 
 
@@ -287,16 +298,20 @@ def f_mom_diverge(df):
 
 
 def f_slope_20(df):
-    """20 日收盘线性回归斜率 / 收盘价。
+    """**最近** 20 根收盘的线性回归斜率 / 收盘价。
 
     和 `ma_slope_20` 的区别：那条是「MA20 相对 10 日前」，本质是均线的差；
     这条是对 20 个收盘点做最小二乘，对两端的极值不敏感。
+
+    🔴 窗口是「结束于当前这根」的 20 根（前 19 根为 NaN）。2026-11-24 之前
+    写成「开始于当前这根」（`_slope` 下标少了个 `+n−1`）⇒ 每个值都偷了 19 根
+    未来，横截面 IC 从 +0.0032 虚报到 +0.0516（t 7.08）。见 `_slope` 的注释。
     """
     return _safe_div(_slope(df["close"], 20), df["close"])
 
 
 def f_slope_60(df):
-    """60 日收盘线性回归斜率 / 收盘价。"""
+    """**最近** 60 根收盘的线性回归斜率 / 收盘价（前 59 根为 NaN，同 `f_slope_20`）。"""
     return _safe_div(_slope(df["close"], 60), df["close"])
 
 

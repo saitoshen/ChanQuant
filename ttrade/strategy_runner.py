@@ -49,6 +49,8 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from ttrade import cross_live
+from ttrade import cross_ml
 from ttrade import factor_strategy as fstrat
 from ttrade import ml_artifact
 from ttrade import replay
@@ -540,6 +542,10 @@ class SlotState:
     # 这次提交走的是快路径（有训练产物、只预测）还是慢路径（后台重训）。
     # 慢路径没出结果时说「重训中」，快路径说「计算中」—— 两者等待时间差 10 倍
     ml_fast: bool = False
+    # 截面腿这一轮分到的权重（占**整份本金**的比例，带符号；Σ|w| = 杠杆）。
+    # 父级 `CrossLive` 算完一篮子才写进来，腿自己不算 —— 界面展开逐品种持仓时
+    # 要显示「这条腿为什么是这几手」，光给手数说不清（2026-11-24）。
+    cross_w: float = 0.0
 
     # ---- K 线内进出场（`StrategySpec.intrabar` 的规则策略用） ----
     # 这根 bar 的触发价算好没有。**每根 bar 只算一次**：算一次要把整个
@@ -854,6 +860,14 @@ class PortfolioRunner:
         self._groups: dict[str, list[str]] = {}
         self._child_of: dict[str, str] = {}
         self._parents: dict[str, SStore.StrategyConfig] = {}
+        # 截面策略的实盘状态机：父 sid -> CrossLive。它一篮子算一次权重，再把
+        # 目标手数分给各条腿槽位；腿自己只管订阅、下单、追单（见 `_cross_refresh`）
+        self._cross: dict[str, cross_live.CrossLive] = {}
+        # 截面第一步 / 第二步的专用周期行情，按「自然日」缓存 —— 日线级的行情
+        # 一天只变一次，没必要每根 bar 都把几十个品种的文件重读一遍
+        self._xperiod: dict[tuple[str, str], tuple[object, dict]] = {}
+        # 跨周期因子实例的行情（{品种: {周期: df}}），同样按自然日缓存
+        self._xextra: dict[str, tuple[object, dict]] = {}
         # 机器学习实盘的信号缓存（后台线程，见 `MlSignals`）
         self._diag = LiveLog()
         self._ml = MlSignals(log=self._log, diag=self._diag)
@@ -987,7 +1001,10 @@ class PortfolioRunner:
     def _uses_aux(self) -> bool:
         for st in self._slots.values():
             # 「规则 + 因子过滤」的因子同样要衍生列，不能只看 factor 族
-            uses = st.cfg.family == "factor" or (
+            # 截面策略的排名因子同样可能是 roll_* / iv_* / pcr（库里那几条
+            # 「有色 / 化工截面对冲」就是），漏掉它会在衍生快照落后时照样
+            # 开仓，而回测吃的是补到最新的那份
+            uses = st.cfg.family in ("factor", "cross") or (
                 st.cfg.family == "rule" and bool(st.cfg.factor_mode or ""))
             if uses:
                 for k in (st.cfg.factor_keys or []):
@@ -1322,12 +1339,19 @@ class PortfolioRunner:
     def children_of(self, cfg: SStore.StrategyConfig) -> list:
         """把一条多品种配置拆成「一个品种一份」。
 
-        单品种 / 截面族返回空表（前者本来就不用拆，后者是真的不支持 —— 截面要
-        一篮子同时按权重调仓，不是 N 个独立信号）。
+        两种拆法，**目标从哪来完全不同**：
+
+        - 规则 / 因子族：每条腿自己算自己的信号，本金按品种数均分。
+        - 截面族：腿**不算信号**，目标手数由父级 `CrossLive` 按一篮子权重统一下发
+          （`_cross_refresh`）。所以本金**不折** —— 权重本身就是「占这份本金的
+          比例」（Σ|w| = 资金比例 ÷ 保证金率 = 杠杆），折成 1/N 再乘就是
+          把杠杆又除回来。拆成腿只是为了复用那套已经验过的单合约下单 / 追单 /
+          账本 / 换月状态机，不是为了各算各的。
         """
         keys = [k for k in (getattr(cfg, "symbols", None) or []) if k]
-        if getattr(cfg, "family", "") == "cross" or len(keys) < 2:
+        if len(keys) < 2:
             return []
+        is_cross = getattr(cfg, "family", "") == "cross"
         n = len(keys)
         out = []
         for k in keys:
@@ -1335,6 +1359,11 @@ class PortfolioRunner:
             one = cfg.clone(symbol=sym, exchange=ex,
                             multi_symbols=[], cross_symbols=[])
             one.sid = f"{cfg.sid}{GROUP_SEP}{k}"
+            if is_cross:
+                # 截面：权重已经按整份本金归一过了，腿上必须拿到完整本金
+                one.principal = float(cfg.principal or 0)
+                out.append(one)
+                continue
             # 资金按品种数均分。组合回测里每个品种各占一份账户、再把净值等权
             # 平均，换算到一个真实账户上就是「每个品种只分到 1/N 的钱」。
             # 不拆的话 19 个品种各按 30% 满仓，实际敞口是配置的 19 倍
@@ -1373,6 +1402,8 @@ class PortfolioRunner:
             return self._add_one(cfg)
         self._groups[cfg.sid] = [k.sid for k in kids]
         self._parents[cfg.sid] = cfg
+        if getattr(cfg, "family", "") == "cross":
+            self._cross[cfg.sid] = cross_live.CrossLive(cfg, bt_cfg(cfg))
         first = None
         for k in kids:
             self._child_of[k.sid] = cfg.sid
@@ -1414,6 +1445,7 @@ class PortfolioRunner:
             self._child_of.pop(k, None)
             self._remove_one(k)
         self._parents.pop(sid, None)
+        self._cross.pop(sid, None)
         self._remove_one(sid)
 
     def _save_book(self, st: SlotState) -> None:
@@ -1486,6 +1518,10 @@ class PortfolioRunner:
         界面改了手数 / 名称之后必须走这里：`SlotState.cfg` 是启动时那一份的引用，
         组合文件里改完不会自动同步过来，否则「改完手数没反应」得等重启才生效。
         """
+        if getattr(cfg, "family", "") == "cross" and cfg.sid in self._groups:
+            # 截面参数（因子 / 调仓间隔 / 权重口径 / 本金）全在这台状态机里，换配置
+            # 必须连它一起换 —— 只改腿上的 cfg 会拿新因子 + 旧杠杆继续下单
+            self._cross[cfg.sid] = cross_live.CrossLive(cfg, bt_cfg(cfg))
         kids = self._groups.get(cfg.sid)
         if not kids:
             self._update_one(cfg)
@@ -1520,14 +1556,27 @@ class PortfolioRunner:
         if st is None:
             return
         if on and st.cfg.family == "cross":
-            # 截面策略要**同时**持有一篮子品种、按权重整体调仓，而实盘引擎一个
-            # 槽位只挂一个合约（多品种策略是拆成多个独立槽位、各自按固定
-            # 比例下单，没有「按权重整体调仓」这回事）。硬跑会变成「只按第一个
-            # 品种下单」，那是最危险的一种错误 —— 看着在跑，实际仓位完全不是
-            # 回测里那条曲线
-            st.error = ("截面策略暂不支持实盘：实盘引擎每个槽位只挂一个合约，"
-                        "截面要一篮子同时按权重调仓。可以先用组合页看回测")
-            return
+            # 截面也跑实盘，但走的是**另一条路**：父级一台 CrossLive 一篮子算权重，
+            # 各腿槽位只负责自己的下单 / 追单（见 `_cross_refresh`）。这里只做
+            # 「能不能一比一复现」的体检 —— 跑不了的口径宁可拦住说清楚，也不能
+            # 看着在跑、实际是另一条策略
+            pid = self._child_of.get(sid, "")
+            x = self._cross.get(pid)
+            if x is None:
+                # 品种不够时 `children_of()` 根本没拆腿，这时 st.cfg 就是父配置
+                try:
+                    cross_live.check_support(st.cfg)
+                except cross_live.CrossRefused as exc:
+                    st.error = str(exc)
+                else:
+                    st.error = "截面策略没有建好一篮子状态机，请停止后重新启动"
+                return
+            try:
+                cross_live.check_support(x.cfg)
+            except cross_live.CrossRefused as exc:
+                st.error = str(exc)
+                self._log(f"{st.title()}：{st.error}")
+                return
         if on and not st.cfg.rule_key and st.cfg.family == "rule":
             st.error = "这条策略没有选规则"
             return
@@ -1641,6 +1690,11 @@ class PortfolioRunner:
         """每轮 wait_update 之后调一次：刷信号、调仓、追单。"""
         if self.feed is None:
             return
+        # 截面先算：一篮子同时出权重、把目标手数分给各腿，然后下面的逐槽位循环
+        # 只做它本来就擅长的那件事（下单 / 追单 / 记账）。顺序不能反 —— 腿先跑
+        # 的话这一轮用的还是上一根 bar 的目标，永远慢一拍
+        if self._cross:
+            self._cross_refresh()
         # 没接账户：信号、理论仓位、台账全照常算，只是**一笔不发**。以前这里
         # 直接 return，策略跟着账户一起停 —— 实盘日终登出就等于策略断线
         can_trade = self.api is not None
@@ -1897,8 +1951,259 @@ class PortfolioRunner:
             self._log(f"{st.title()}：本地历史补到最新 +{r['added']} 根"
                       f"（{src}，到 {r['last']:%Y-%m-%d %H:%M}）")
 
+    def _sync_underlying(self, st: SlotState, key: str) -> None:
+        """把主连映射到真实合约。普通策略和截面腿共用这一处。
+
+        换月留下的老合约必须记进 `retired`：`_rebalance` 靠它先平老仓、再开新仓，
+        两条路径各写一份的话总有一条会漏。
+        """
+        q = self._quotes.get(key)
+        und = getattr(q, "underlying_symbol", "") if q is not None else ""
+        if und and und != st.underlying:
+            if st.underlying and st.underlying not in st.retired:
+                st.retired.append(st.underlying)
+                self._log(f"{st.title()}：换月 {st.underlying} → {und}，老合约待清仓")
+            st.underlying = und
+            # 换月带来新的换月跳空，前复权基准要按新数据重算
+            self._qfq_base.pop(key, None)
+
+    # ------------------------------------------------------------ 截面实盘
+    #
+    # 一条截面策略 = 一个`父状态机` + N 个`腿槽位`：
+    #   父：整篮子算一次权重（cross_live.CrossLive）
+    #   腿：拿父下发的手数，走引擎原来那套单合约下单 / 追单 / 账本 / 换月
+    # 拆腿只为了复用那套状态机，**不是**让每个品种各算各的信号 —— 那会把横
+    # 截面排序整个丢掉，是「看着在跑、实际另一条策略」的典型。
+
+    def _cross_leg_state(self, st: SlotState, df: pd.DataFrame) -> None:
+        """截面腿的显示 / 理论口径。目标手数已经由父写好，这里不碰它。
+
+        普通策略走 `_theo_lots_qty()` 是为了把「开仓那一根的手数」锁住；截面没有
+        「开仓那一根」，权重每 N 天才变一次，所以 `theo_lots` 留 0，让
+        `_theo_lots_qty()` 退回 `st.lots` —— 我们正是按 |target| 写的它。
+        """
+        tgt = int(st.target or 0)
+        sig = 1 if tgt > 0 else (-1 if tgt < 0 else 0)
+        st.signal = sig
+        st.lots = abs(tgt)
+        st.theo_lots, st.theo_lots_sig, st.theo_lots_src = 0, 0, ""
+        # 方向变了才记建仓价；同向不加价（`_put_theo` 的同级不覆盖规则）。
+        # 父那一轮算失败时 df 可能是 None —— 此时仍能拿合约最新价记一笔
+        px = (self._mark_price(st, df) if df is not None and len(df)
+              else self._last_px(st.underlying))
+        self._sync_theo_entry(st, px)
+
+    def _cross_refresh(self) -> None:
+        """每轮 tick 开头调一次：给每条在跑的截面策略算权重、下目标。"""
+        for pid, x in list(self._cross.items()):
+            kids = self._groups.get(pid) or []
+            sts = [self._slots[s] for s in kids if s in self._slots]
+            if not sts or not any(s.running for s in sts):
+                continue
+            try:
+                self._cross_step(pid, x, sts)
+            except Exception as exc:                  # noqa: BLE001
+                why = f"截面计算失败：{type(exc).__name__}: {exc}"
+                for s in sts:
+                    if s.running and not s.error:
+                        s.error = why
+                self._diagw("XSEC", f"{x.cfg.title()}：{why}")
+
+    def _cross_frames(self, x, sts: list) -> tuple[dict, str]:
+        """整篮子的行情，**按 (腿, bar_id) 缓存**。
+
+        截面排序用的是同一时刻的一行横截面 —— 一条腿已经换到新 bar、另一条还停在
+        上一根时算出来的强弱是假的，所以这里在算之前先把所有腿的帧对齐到各自最新
+        的那根，再交给 `CrossLive`。
+        """
+        out: dict = {}
+        for st in sts:
+            self._subscribe(st)
+            key = self._skey(st.cfg)
+            kl = self._klines.get(key)
+            if kl is None or not len(kl):
+                return {}, (f"{st.cfg.symbol} 行情未就绪（{self._feed_label()}）："
+                            "截面要等齐一篮子才算")
+            last = int(kl["datetime"].iloc[-1])
+            k = st.cfg.key()
+            got = x.frames.get(k)
+            if got is None or got[0] != last:
+                self._sync_underlying(st, key)
+                df = self._signal_frame(st, kl)
+                if df is None or df.empty or not st.frame_ok:
+                    return {}, (f"{st.cfg.symbol}：{st.frame_note or '行情帧不可用'}，"
+                                "截面本轮不算（保持上一组权重）")
+                if len(df) > 1 and barclock.tail_is_live(
+                        df.index[-1], st.cfg.symbol, st.cfg.exchange, st.cfg.period):
+                    # 和 `_refresh_signal` 同一条规矩：最后一根还在走，不算它
+                    df = df.iloc[:-1]
+                df = self._with_aux(st, df)
+                x.put(k, last, df)
+                st.last_bar = last
+            out[k] = x.get(k)
+        return out, ""
+
+    def _cross_load_period(self, cfg, period: str) -> dict:
+        """截面第一步 / 第二步专用周期的**全品种**行情（前复权 + 衍生列 + 同区间）。
+
+        和研究页 `_frames_for()` / 组合页 `loader` 同一套口径：前复权、按
+        `range_years` 裁同一刀。少一步，5 分钟策略用日线筛池就会拿到另一条曲线。
+        """
+        mk = replay.market_of(cfg)
+        rng = getattr(cfg, "range_years", 0) or 0
+        out: dict = {}
+        for key in (getattr(cfg, "symbols", None) or []):
+            sym, ex = replay.split_key(key, mk)
+            try:
+                df = self._aux_frame(
+                    tqdata.load_main(sym, ex, period, adjust="qfq"), sym, ex, period)
+            except Exception:                         # noqa: BLE001 - 缺一个品种不拦整组
+                continue
+            if df is None or df.empty:
+                continue
+            df = replay.window(df, rng)
+            if df is not None and not df.empty:
+                out[key] = df
+        return out
+
+    def _cross_other_frames(self, cfg, idx):
+        """第一步 / 第二步专用周期 + 跨周期因子实例的行情。按**自然日**缓存。
+
+        这些帧是日线级的，一天只变一次；每根 bar 重读几十个 CSV 是纯浪费。缓存
+        的键带上 bar 那一天，跨日自动失效 —— 不引入「永远不更新」的陈旧数据。
+        """
+        base = str(getattr(cfg, "period", "") or "1d")
+        day = pd.Timestamp(idx[-1]).normalize()
+        out: list[dict | None] = []
+        for name in ("cross_step1_period", "cross_step2_period"):
+            p = str(getattr(cfg, name, "") or "")
+            if not p or p == base:
+                out.append(None)
+                continue
+            ck = (str(getattr(cfg, "sid", "") or ""), p)
+            got = self._xperiod.get(ck)
+            if got is None or got[0] != day:
+                got = (day, self._cross_load_period(cfg, p))
+                self._xperiod[ck] = got
+            frames2 = got[1]
+            # 和 `cross.run()` 同一条判据：配了周期却没取够行情 ⇒ 退回策略周期
+            out.append(frames2 if len(frames2) >= cross_live.CX.MIN_CROSS else None)
+
+        fc = replay.factor_config(getattr(cfg, "factor_cfg", {}) or {})
+        keys = (list(getattr(cfg, "factor_keys", []) or [])
+                + list(getattr(cfg, "timing_factor_keys", []) or []))
+        sid = str(getattr(cfg, "sid", "") or "")
+        got = self._xextra.get(sid)
+        if got is None or got[0] != day:
+            mk = replay.market_of(cfg)
+            ex: dict = {}
+            for key in (getattr(cfg, "symbols", None) or []):
+                sym, exn = replay.split_key(key, mk)
+                per = fstrat.period_frames(
+                    fc, keys, base,
+                    lambda p, _s=sym, _e=exn: self._aux_frame(
+                        tqdata.load_main(_s, _e, p, adjust="qfq"), _s, _e, p),
+                    extra_keys=list(getattr(fc, "trigger_keys", None) or []))
+                if per:
+                    ex[key] = per
+            got = (day, ex)
+            self._xextra[sid] = got
+        return out[0], out[1], got[1]
+
+    def _cross_step(self, pid: str, x, sts: list) -> None:
+        """一条截面策略的一次推进：齐帧 → 判调仓 → 权重折手数 → 写各腿 target。"""
+        # 截面 ML：离线产物只挂一次。没产物 / 配置对不上时**不许动仓** ——
+        # `ml_ready=False` 会让 tick 里的调仓整段跳过，界面显示真实原因；
+        # 「先拿空信号把仓平了再说」在实盘上就是白交手续费。
+        if str(getattr(x.cfg, "factor_mode", "") or "") == "ml" and x.ml is None:
+            pred, why_ml = cross_ml.load_for_live(x.cfg)
+            if pred is None:
+                for s in sts:
+                    s.ml_ready = False
+                    s.ml_age = 0.0
+                    s.ml_why = why_ml
+                self._diagw("XML", f"{x.cfg.title()}：{why_ml}")
+                return
+            x.ml = pred
+            for s in sts:
+                s.ml_ready = True
+                s.ml_why = ""
+            if why_ml:
+                self._diagw("XML", f"{x.cfg.title()}：{why_ml}")
+        if x.ml is not None:
+            age = float(getattr(x.ml, "age_days", 0.0) or 0.0)
+            for s in sts:
+                s.ml_age = age
+        frames, why = self._cross_frames(x, sts)
+        if not frames:
+            for s in sts:
+                if s.running:
+                    self._note_once(s, why)
+            return
+        sig = x.frame_sig()
+        if sig == x.sig:
+            return                              # 一篮子一根 bar 只算一次
+        x.sig = sig
+        due, why = x.due(frames)
+        if not due:
+            if x.n_calc:
+                self._diagw("XSEC", f"{x.cfg.title()}：{why}")
+            return
+
+        s1, s2, extra = self._cross_other_frames(x.cfg, cross_live.union_index(frames))
+        w, note = x.decide(frames, step1_frames=s1, step2_frames=s2,
+                           factor_extra=extra, timing_extra=extra)
+        if w is None:
+            self._diagw("XSEC", f"{x.cfg.title()}：{note}")
+            return
+
+        # 权重 → 手数：特征是「占本金的百分比」（Σ|w| 已经是杠杆倍数），所以
+        # 名义额 = 本金 × w，手数 = 名义额 ÷ (真实价 × 合约乘数)
+        by_key = {s.cfg.key(): s for s in sts}
+        principal = float(getattr(x.cfg, "principal", 0) or 0)
+        mults = cross_live.CX.mult_vector(frames)
+        legs = [(s.cfg.key(), int(s.target or 0)) for s in sts]
+
+        def _price(key):
+            s = by_key.get(key)
+            return self._mark_price(s, frames[key]) if s is not None else 0.0
+
+        def _mult(key):
+            s = by_key.get(key)
+            v = float(mults.get(key, 0) or 0)
+            if v <= 0 and s is not None:
+                v = self._volume_multiple(s)
+            return v
+
+        target = cross_live.targets_from_weights(w, legs, principal, _price, _mult)
+        changed = 0
+        for s in sts:
+            key = s.cfg.key()
+            # 权重先写，界面展开子行时才有「这条腿为什么是这几手」的根据。
+            # 只在权重真的算出来时写；`w` 里没这个键（数据缺）保持上一次值。
+            if key in w.index:
+                s.cross_w = float(w.get(key, 0.0) or 0.0)
+            prev = int(s.target or 0)
+            new = int(target.get(key, prev))
+            if new != prev:
+                s.target = new
+                changed += 1
+                prog = getattr(x.cfg, "note", "") or ""
+                self._diagw("XTG", f"{x.cfg.title()}{prog}：{key} "
+                                   f"{prev:+d} → {new:+d} 手（w={float(w.get(key, 0)):+.3f}）")
+        self._diagw("XSEC", f"{x.cfg.title()}：{note}；"
+                            f"{changed} 条腿目标变化；算权重 {x.cost:.2f} 秒")
+
     def _refresh_signal(self, st: SlotState) -> None:
         self._subscribe(st)
+        pid = self._child_of.get(st.cfg.sid, "")
+        if pid in self._cross:
+            # 截面腿**不算自己的信号**：它的 target 是父级按一篮子权重算好后直接
+            # 写进来的。在这里走普通 _signal() 会用「这条腿自己的规则 / 因子」
+            # 算出一个毫无关系的数，把父级的目标盖掉 —— 那就是「看着在跑、
+            # 实际是另一条策略」。这里只补齐显示 / 理论列要用的几个字段
+            self._cross_leg_state(st, self._cross[pid].get(st.cfg.key()))
+            return
         # 🔴 非交易时段**照常算信号，只是不下单**。老写法在这里直接 return，
         # 结果面板上的理论仓位一直是 0，用户以为「策略没仓 / 台账没了」
         # （2026-11-17 两次误判都是它）。收盘后模拟账户还在长的那根 bar 会被
@@ -1915,17 +2220,7 @@ class PortfolioRunner:
                 st, f"行情未就绪（{src}）：算不出信号，理论仓位保持上次值"
                     f"{'，原因：' + self.feed.error if self.feed is not None and self.feed.error else ''}")
             return
-        q = self._quotes.get(key)
-        und = getattr(q, "underlying_symbol", "") if q is not None else ""
-        if und and und != st.underlying:
-            if st.underlying and st.underlying not in st.retired:
-                # 主连换月了。老合约上的仓位不会自己消失 —— 不记下来，它就变成
-                # 一笔没人管的持仓，只能靠人肉发现。
-                st.retired.append(st.underlying)
-                self._log(f"{st.title()}：换月 {st.underlying} → {und}，老合约待清仓")
-            st.underlying = und
-            # 换月带来新的换月跳空，前复权基准要按新数据重算
-            self._qfq_base.pop(key, None)
+        self._sync_underlying(st, key)
         # 必须 `.iloc[-1]`：天勤的 kline 是 DataFrame，`kl["datetime"]` 是带
         # RangeIndex 的 Series，`series[-1]` 走的是**按标签**取值，直接抛
         # `KeyError: -1`。这一行曾经让每条策略在第一个 tick 就停机。
@@ -5164,6 +5459,7 @@ class PortfolioRunner:
                 "ml_wait": bool(not st.ml_ready and st.running),
                 "ml_age": float(st.ml_age or 0.0),
                 "ml_why": str(st.ml_why or ""),
+                "cross_w": float(getattr(st, "cross_w", 0.0) or 0.0),
                 # K 线内那一族：界面要能看到「这一根的触发价 / 止损挂在哪」，
                 # 否则用户只知道「有仓」，不知道离被打掉还有多远
                 "intrabar": bool(self._ib_on(st)),

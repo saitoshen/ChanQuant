@@ -619,6 +619,13 @@ class CtpHub:
         # 对象时，谁先收尾都不该在表里留一条「refs>0 但 trader 已空」的僵尸。
         hubreg.forget(self)
         self._started = False
+        try:
+            from ttrade import crashlog
+
+            _nm = ",".join(str(getattr(s, "name", "")) for s in (self.specs or []))
+            crashlog.breadcrumb(f"hub.close({_nm})")
+        except Exception:      # noqa: BLE001 - 取证不能拦着收尾
+            pass
         md, self.md = self.md, None
         trader, self.trader = self.trader, None
         for cli in (md, trader):

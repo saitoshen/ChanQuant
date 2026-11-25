@@ -217,6 +217,10 @@ ACC_DEFAULTS = {
     "enabled": False,
     "night": ["20:55", "02:35"],     # [登录, 登出]
     "day": ["08:55", "15:20"],
+    # 2026-11-24 用户要求：定时登出时连策略一起停，登录时再把策略开起来。
+    # 默认关，老配置补 False，不改变既有行为。
+    "start_all_on_login": False,
+    "stop_all_on_logout": False,
 }
 
 
@@ -235,6 +239,8 @@ def load_acc_timer() -> dict:
             d = json.load(f)
         if isinstance(d, dict):
             cfg["enabled"] = bool(d.get("enabled", cfg["enabled"]))
+            for k in ("start_all_on_login", "stop_all_on_logout"):
+                cfg[k] = bool(d.get(k, cfg[k]))
             for k in ("night", "day"):
                 v = d.get(k)
                 if isinstance(v, (list, tuple)) and len(v) == 2:
@@ -504,6 +510,24 @@ class AccountTimerDialog(QDialog):
         )
         form.addRow(self.chk)
 
+        # 策略联动（2026-11-24）。放在「启用」正下方：这两条一旦勾上，
+        # 到点就不只是连/断账户，还会把组合页那一批策略整批起停。
+        self.chk_start = QCheckBox("自动登录后，启动全部策略")
+        self.chk_start.setChecked(bool(cfg.get("start_all_on_login")))
+        self.chk_start.setToolTip(
+            "账户定时登录成功之后，自动点组合页的「启动全部」。\n"
+            "等的是**连接成功信号**，不是发出登录请求的那一刻 —— "
+            "登录要几秒，早一步启策略会让它对着没连上的柜台下单。")
+        form.addRow(self.chk_start)
+
+        self.chk_stop = QCheckBox("自动登出前，停止全部策略")
+        self.chk_stop.setChecked(bool(cfg.get("stop_all_on_logout")))
+        self.chk_stop.setToolTip(
+            "账户定时登出之前，先自动点组合页的「停止全部」。\n"
+            "顺序是**先停策略、再断账户**：反过来会让策略对着已经断开的\n"
+            "柜台继续跑几秒，最容易留下挂单和错位账本。")
+        form.addRow(self.chk_stop)
+
         self.ed: dict[str, tuple[QTimeEdit, QTimeEdit]] = {}
         for key, label in (("night", "夜盘"), ("day", "日盘")):
             pair = cfg.get(key) or ACC_DEFAULTS[key]
@@ -529,7 +553,7 @@ class AccountTimerDialog(QDialog):
             "默认：夜盘 20:55 登 → 02:35 出，日盘 08:55 登 → 15:20 出。\n"
             "登录留 5 分钟余量是给柜台握手、订阅行情、拉持仓；登出留 5 分钟是等\n"
             "收盘那几笔成交和结算回推完。\n\n"
-            "**只管登录 / 登出，不管下单**：策略是不是自动交易，仍由策略页的开关决定。\n"
+            "只管登录 / 登出；勾了上面的「策略联动」才会顺带整批启停策略。\n"
             "夜盘登出跨零点（02:35），按时刻判，不用管它是哪天。"
         )
         hint.setObjectName("Hint")
@@ -553,7 +577,9 @@ class AccountTimerDialog(QDialog):
         self.accept()
 
     def result_cfg(self) -> dict:
-        cfg = {"enabled": self.chk.isChecked()}
+        cfg = {"enabled": self.chk.isChecked(),
+               "start_all_on_login": self.chk_start.isChecked(),
+               "stop_all_on_logout": self.chk_stop.isChecked()}
         for key in ("night", "day"):
             a, b = self.ed[key]
             cfg[key] = [a.time().toString("HH:mm"), b.time().toString("HH:mm")]
@@ -569,6 +595,10 @@ class TradePage(QWidget):
     disconnect_requested = Signal()
     # 只断开一个账户（账户表每行的「登出」）。参数是账户名。
     disconnect_one = Signal(str)
+    # 账户定时 → 组合页整批启停（2026-11-24）。主窗口把这两个信号接到
+    # `PortfolioPage._start_all` / `_stop_all`，交易页自己不碰策略状态。
+    start_all_requested = Signal()
+    stop_all_requested = Signal()
 
     def __init__(self, live, parent=None) -> None:
         super().__init__(parent)
@@ -586,6 +616,9 @@ class TradePage(QWidget):
         # 就什么都不做）。
         self._acc_cfg = load_acc_timer()
         self._acc_last = ""
+        # 定时登录是异步的：发出 connect_requested 时账户还没连上。等 `started`
+        # 真的到了再启策略，这个标志就是「这一场登录之后要补一次启动全部」。
+        self._acc_start_all_pending = False
         self._build()
         # 默认全勾：以前是「下拉框选中谁就连谁」，现在多个账户并存，全勾等于
         # 保持原来的行为；用户想只连一个，取消其余勾选即可
@@ -1607,7 +1640,9 @@ class TradePage(QWidget):
         self.on_log(
             "账户定时：" + ("已开启" if self._acc_cfg["enabled"] else "已关闭")
             + "　夜盘 {} 登 / {} 出，日盘 {} 登 / {} 出".format(
-                *self._acc_cfg["night"], *self._acc_cfg["day"]))
+                *self._acc_cfg["night"], *self._acc_cfg["day"])
+            + ("；登录启动全部" if self._acc_cfg["start_all_on_login"] else "")
+            + ("；登出停止全部" if self._acc_cfg["stop_all_on_logout"] else ""))
 
     def _sync_acc_btn(self) -> None:
         """按钮上直接标出开没开，不用点开才知道。"""
@@ -1619,7 +1654,9 @@ class TradePage(QWidget):
             f"夜盘：{cfg['night'][0]} 登录 → {cfg['night'][1]} 登出\n"
             f"日盘：{cfg['day'][0]} 登录 → {cfg['day'][1]} 登出\n"
             "登录用的是账户列表里勾选的账户；登出就是断开。\n"
-            "已连着 / 已断着时不重复动作。"
+            "已连着 / 已断着时不重复动作。\n"
+            + (f"登录 → 启动全部策略：{'开' if cfg.get('start_all_on_login') else '关'}\n"
+               f"登出 → 停止全部策略：{'开' if cfg.get('stop_all_on_logout') else '关'}")
             + ("" if on else "\n\n当前：**未启用**（点开勾上「启用」）"))
 
     def _acc_tick(self) -> None:
@@ -1641,20 +1678,40 @@ class TradePage(QWidget):
                 self.on_log(f"账户定时：{label} {hhmm} 到点，勾选的账户都连着，不重复登录")
                 return
             self.connect_requested.emit((todo, self.cb_feed.currentData() or ""))
-            self.on_log(f"账户定时：{label} {hhmm} 自动登录（{len(todo)} 个账户）")
+            start_all = bool(self._acc_cfg.get("start_all_on_login"))
+            self._acc_start_all_pending = start_all
+            self.on_log(f"账户定时：{label} {hhmm} 自动登录（{len(todo)} 个账户）"
+                        + ("，连接成功后启动全部策略" if start_all else ""))
         else:
             if not self.live.running:
                 return
+            # 先停策略、再断账户：反过来那几秒策略仍会对着死会话发单。
+            # `_stop_all()` 内部自己判「本来就没在跑」，这里重复发也无害。
+            if self._acc_cfg.get("stop_all_on_logout"):
+                self._acc_start_all_pending = False
+                self.stop_all_requested.emit()
+                self.on_log(f"账户定时：{label} {hhmm} 先停止全部策略")
             self.disconnect_requested.emit()
             self.on_log(f"账户定时：{label} {hhmm} 自动断开")
 
     def _on_started(self, key: str) -> None:
         self._sync_conn_buttons()
         self._sync_conn_label()
+        # 定时登录是异步的，只有在 `started` 到了之后才算「真的连上」。
+        # 第一个连上的账户到了就启动全部 —— 多账户是一批一起连的，等最后一户
+        # 没有可靠的「全部完成」信号，早一点比晚一点安全（策略启动本身会
+        # 检查账户会话）。
+        if self._acc_start_all_pending:
+            self._acc_start_all_pending = False
+            self.start_all_requested.emit()
+            self.on_log(f"账户定时：{key} 连接成功，启动全部策略")
 
     def _on_stopped(self) -> None:
         self._sync_conn_buttons()
         self._sync_conn_label()
+        # 这次登录没连成就别把「启动全部」留到下一次手动连接时才补 ——
+        # 那是几小时后完全另外一个场景，突然把策略开起来最危险
+        self._acc_start_all_pending = False
         # 断开后把数字清掉：留着上一次的权益和持仓，看着像还连着
         self._sig.clear()
         self._reload_accounts()

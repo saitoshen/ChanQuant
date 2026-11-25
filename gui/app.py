@@ -32,6 +32,20 @@ from ttrade.paths import bundle_root, cache_dir, data_dir as resolve_data_dir, l
 # 打包成 macOS .app 后 ROOT 所在的卷是只读的，写入会静默失败。
 ASSET_ROOT = bundle_root()
 
+#: 自检进程。`ttrade/selftest.py` 会建主窗口、跑几十项检查之后再 `win.close()`，
+#: 而 `closeEvent` 在正常运行时是**硬退出**（见那里的注释）—— 自检里必须放行，
+#: 否则检查被拦腰砍断，还会留下一个 exit=0 的假绿。
+def _in_selftest() -> bool:
+    """当前进程是不是自检。三条路都认：`--selftest`、`python -m ttrade.selftest`、
+    环境变量（打包后的 exe 也是 `--selftest`，但脚本调起时要能显式指定）。"""
+    return ("--selftest" in sys.argv
+            or "ttrade.selftest" in " ".join(sys.argv[:3])
+            or str(os.environ.get("CHANQUANT_SELFTEST", "")).strip()
+            not in ("", "0"))
+
+
+_SELFTEST_MODE = _in_selftest()
+
 
 def app_icon():
     """窗口图标。找不到就返回空 QIcon，绝不让它把启动搞挂。
@@ -527,6 +541,24 @@ QPushButton {
 }
 QPushButton:hover { background: #1d4ed8; }
     QPushButton:pressed { background: #1e40af; }
+/* 禁用态。此前整个 QSS 里一条 `:disabled` 都没有 ⇒ `setEnabled(False)` 之后
+   按钮还是蓝的、下拉框还是白的，看着跟能点一样（截面参数里「筛池＝关闭」时
+   整片左栏都该灰下去，界面上却一点变化都没有）。统一给一套灰。 */
+QPushButton:disabled { background: #e2e8f0; color: #94a3b8; }
+QPushButton#Ghost:disabled {
+    background: #f8fafc; color: #cbd5e1; border: 1px solid #e2e8f0;
+}
+QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
+QLineEdit:disabled {
+    background: #f8fafc; color: #94a3b8; border: 1px solid #e2e8f0;
+}
+QCheckBox:disabled, QRadioButton:disabled, QLabel:disabled { color: #94a3b8; }
+/* 上面那条 `QPushButton:disabled` 会给**所有**按钮刷灰底，页签和实时按钮
+   原本是透明的，被刷上一层灰就成了一块砖。按同一个选择器优先级盖回来 */
+QPushButton#PageTab:disabled { background: transparent; color: #cbd5e1; }
+QPushButton#LiveBtn:disabled {
+    background: #f8fafc; color: #cbd5e1; border: 1px solid #e2e8f0;
+}
 QPushButton#Ghost { background: #ffffff; color: #334155; border: 1px solid #cbd5e1; }
 QPushButton#Ghost:hover { background: #f8fafc; border-color: #94a3b8; }
 /* 研究页的「启动实时」：默认是普通描边按钮，跑起来变绿 —— 和顶部那个
@@ -1548,6 +1580,10 @@ class MainWindow(QMainWindow):
         self.trade_page.disconnect_requested.connect(self._on_live_stop)
         # 账户表每行的「登出」：只断开这一个账户，别的会话照跑
         self.trade_page.disconnect_one.connect(self._on_live_stop_one)
+        # 账户定时 → 整批启停策略（2026-11-24）。从交易页直接发信号给组合页，
+        # 不经过账户线程：启停必须在 GUI 主线程里做，否则会撞 Qt 控件。
+        self.trade_page.start_all_requested.connect(self.portfolio_page._start_all)
+        self.trade_page.stop_all_requested.connect(self.portfolio_page._stop_all)
         self._wire_live()
         self._wire_study_live()
         # 行情源：**程序打开就连上默认源**（天勤），不等用户点。
@@ -1972,7 +2008,7 @@ class MainWindow(QMainWindow):
         self.sym_pick = SymbolPicker("多品种回测")
         self.sym_pick.setToolTip(
             "勾选多个品种：同一套策略在每个品种上各跑一遍，净值等权平均。\n"
-            "截面策略要求至少 3 个品种。"
+            f"截面策略要求至少 {cross_engine.MIN_CROSS} 个品种。"
         )
         cl.addWidget(self.sym_pick)
         # A 股 5577 只，勾选框面板装不下（几千个 QCheckBox 会直接卡死），
@@ -7638,8 +7674,36 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------- 生命周期
     def closeEvent(self, event) -> None:
-        """关窗前先让更新线程收尾，避免线程还在写 CSV 就被强杀。"""
+        """关窗前先让更新线程收尾，避免线程还在写 CSV 就被强杀。
+
+        🔴 这条路以前**每次关窗都崩一次**：`0xc0000005`，模块恒为
+        `thosttraderapi_se-….dll`、偏移恒为 `0x25d9e0`（11/23 19:57 / 20:33 /
+        21:09 / 21:39，11/24 9:29 / 16:27 共 6 次，没有一次在盘中）。真凶是
+        `hub.close() → TraderClient.stop() → Release()`：`Release()` 停掉 CTP 的
+        C++ 工作线程时，那条线程可能正踩在 Python 帧里。见 `ctp_client.APP_EXITING`。
+
+        处置分两步：
+        ① 从这里开始不再 `Release()`（只摘句柄）；
+        ② 该收的都收完以后**硬退出**，跳过解释器 finalize —— 否则 C++ 工作线程
+           会在 Python 正在销毁时回调进来，照样是访问违例。
+        """
         self._closing = True
+        try:
+            from ttrade import crashlog
+
+            crashlog.breadcrumb("closeEvent 开始")
+        except Exception:      # noqa: BLE001 - 取证失败不能拦着关窗
+            pass
+        # 自检里**不许**改这两处全局状态：自检 `win.close()` 之后还要接着跑几十
+        # 项检查，`APP_EXITING` 留成真会让后面的 CTP 检查全变成「不 Release」，
+        # `logging.shutdown()` 会把自检自己的日志句柄一起关掉。
+        if not _SELFTEST_MODE:
+            try:
+                from ttrade import ctp_client
+
+                ctp_client.APP_EXITING = True
+            except Exception:      # noqa: BLE001
+                pass
         self.data_page.shutdown()
         self._cancel_factor_worker()
         self._cancel_cross_worker()
@@ -7652,6 +7716,27 @@ class MainWindow(QMainWindow):
         # 研究页那条行情连接同理：线程还卡在 wait_update 里，解释器退出会崩在 TqApi
         self.study_live.stop(wait=True)
         super().closeEvent(event)
+
+        # 到这里该收的都收完了。剩下的是解释器自己的收尾，而那正是第二个
+        # 崩溃点（C++ 线程在 Python 销毁期间回调）。直接 `os._exit`：不跑
+        # atexit、不 GC、不析构任何 SWIG director。
+        # 自检进程里**不许**硬退：`ttrade/selftest.py` 会 `win.close()` 之后
+        # 接着跑几十项检查，硬退等于把自检拦腰砍断、还留下一个 exit=0 的假绿。
+        if _SELFTEST_MODE:
+            return
+        try:
+            import logging
+
+            logging.shutdown()          # 日志落盘；os._exit 之后不会再有机会
+        except Exception:      # noqa: BLE001
+            pass
+        try:
+            from ttrade import crashlog
+
+            crashlog.mark_clean_exit("关窗正常退出")
+        except Exception:      # noqa: BLE001
+            pass
+        os._exit(0)
 
 
 _INSTANCE_NAME = "ChanQuant-single-instance-7f3a"
@@ -7718,6 +7803,18 @@ def main() -> int:
     win = MainWindow()
     app._main_window = win
     win.show()
+
+    # 上一轮是不是崩的（见 ttrade/crashlog.py）。以前这件事**只有用户自己知道**：
+    # 界面被 0xc0000005 带走之后重开，一切看着正常，于是「昨晚跑了一夜」和
+    # 「昨晚十点就死了」在界面上长得一模一样。这里把结论直接写进交易页日志，
+    # 并指向 logs/heartbeat.log —— 里面有出事那一刻每个线程的栈。
+    try:
+        from ttrade import crashlog
+
+        if crashlog.LAST_EXIT:
+            win._on_live_log("⚠ " + crashlog.LAST_EXIT)
+    except Exception:  # noqa: BLE001 - 取证提示失败不能拦着开窗
+        pass
 
     if not win.store.symbols:
         if getattr(sys, "frozen", False):

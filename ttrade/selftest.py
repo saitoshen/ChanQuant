@@ -5767,6 +5767,11 @@ def _run() -> tuple[bool, list[str]]:
                 self._qfq_base, self.api, self.fast = {}, None, True
                 self._ml = _Ml()
                 self.frame = frame
+                # `_refresh_signal()` 现在开头会查 `_child_of` / `_cross`（截面腿
+                # 要靠它认父级、跳过自己的 _signal）。真构造函数里一定初始化过，
+                # 这里绕过了 super().__init__()，得自己补，否则 AttributeError。
+                self._child_of = {}
+                self._cross = {}
                 # ML 快/慢路径会往诊断日志里写 `[TGT]`。真构造函数里 `_diag`
                 # 一定有（`LiveLog()`），这里绕过了 `super().__init__()`，得自己补
                 self._diag = None
@@ -12944,12 +12949,16 @@ def _run() -> tuple[bool, list[str]]:
 
         from gui.trade_page import (
             ACC_DEFAULTS,
+            AccountTimerDialog,
             TradePage,
             acc_due,
             acc_transitions,
             load_acc_timer,
         )
 
+        if ACC_DEFAULTS.get("start_all_on_login") is not False \
+                or ACC_DEFAULTS.get("stop_all_on_logout") is not False:
+            raise RuntimeError("策略联动默认必须关，老配置不能突然多一批动作")
         if (ACC_DEFAULTS["night"] != ["20:55", "02:35"]
                 or ACC_DEFAULTS["day"] != ["08:55", "15:20"]):
             raise RuntimeError(
@@ -12989,13 +12998,23 @@ def _run() -> tuple[bool, list[str]]:
 
         src = inspect.getsource(TradePage._acc_tick)
         for must in ("connect_requested.emit", "disconnect_requested.emit",
-                     "self.live.running"):
+                     "stop_all_requested.emit", "self.live.running"):
             if must not in src:
                 raise RuntimeError(f"`_acc_tick` 少了 {must}（不会真连/真断）")
+        if "start_all_requested.emit" not in inspect.getsource(TradePage._on_started):
+            raise RuntimeError("登录成功后不会启动全部策略（提前发请求会打空）")
+        if "start_all_on_login" not in inspect.getsource(AccountTimerDialog.result_cfg):
+            raise RuntimeError("策略联动开关没存进账户定时配置")
+        # 账户定时 → 整批启停的接线在 `_build_ui()`（页面搭好之后才有
+        # portfolio_page 可接），不在 `__init__()` 里 —— 别找错方法。
+        _mw = __import__("gui.app", fromlist=["MainWindow"]).MainWindow
+        if ("start_all_requested.connect" not in inspect.getsource(_mw._build_ui)
+                or "stop_all_requested.connect" not in inspect.getsource(_mw._build_ui)):
+            raise RuntimeError("主窗口没把账户定时的启动全部接到组合页")
         if "QTimer" not in inspect.getsource(TradePage.__init__):
             raise RuntimeError("TradePage 没起定时器")
         return ("四个时刻判对（含夜盘 02:35 跨零点与 10 分钟宽限），同一时刻只动一次，"
-                "未启用不动作，登录走 connect_requested、登出走 disconnect_requested")
+                "未启用不动作；登录/登出照旧，策略联动接到组合页的启动全部/停止全部")
 
     def _per_account_sessions():
         """逐账户登录 / 登出：一个账户一条会话。
@@ -14737,15 +14756,20 @@ def _run() -> tuple[bool, list[str]]:
         if calls["n"] != 2:
             raise RuntimeError("冷却期过去之后没再试 —— 「刷新」按钮会变成摆设")
 
-        # Release 之前必须先摘 SPI，否则正在执行的回调会踩到已回收的对象
+        # 🔴 反过来钉：**绝对不许** `RegisterSpi(None)`。
+        # 2026-11-24 实验定案（`_tools/_probe_ctp_fail_stop_dual.py`）：两套 dll
+        # 同进程并行失败收尾时，只要碰了 RegisterSpi(None) 就 0xC0000005，
+        # 只调 Release() 反而活着。上一版这条断言是反着写的，把崩因当成了修法。
         src = inspect.getsource(CC._release_api)
-        if src.index("api.RegisterSpi(None)") > src.index("api.Release()"):
-            raise RuntimeError("`_release_api` 又变成先 Release 再摘 SPI 了")
+        if "api.RegisterSpi(None)" in src:
+            raise RuntimeError(
+                "`_release_api` 又在调 `RegisterSpi(None)` —— 这是 0xc0000005 的"
+                "崩因（见 ctp_client._release_api 的注释）")
         if "_release_api(api)" not in inspect.getsource(CC.TraderClient.stop):
             raise RuntimeError("`TraderClient.stop()` 绕过了 `_release_api`")
         return (f"失败 {calls['n'] - 1} 次只碰了一次底层 API（冷却 "
                 f"{CL.CtpHub.FAIL_COOLDOWN:.0f} 秒，过后能重试）；"
-                "Release 之前一定先 RegisterSpi(None)")
+                "收尾只调 Release()，绝不 RegisterSpi(None)")
 
     check("登录失败后不反复 Release+Init（融航段错误）", _hub_fail_cooldown)
 
@@ -15359,6 +15383,577 @@ def _run() -> tuple[bool, list[str]]:
 
     check("截面两步各有独立的因子周期（第一步筛池 / 第二步排名）", _cross_two_periods)
 
+    def _cross_cfg_passthrough():
+        """`StrategyConfig` → `CrossConfig` **一个字段都不许漏**（2026-11-24）。
+
+        用户报的现象：「同一份配置，策略研究页和策略交易和组合页跑出两个结果」。
+        真根因不是引擎，是 `replay.run_cross()` 那段构造函数漏了几个字段 ——
+        漏了不报错、不崩，只是跑出另一条曲线，谁都说不清丢的是哪一个。
+
+        实测「全品种截面对冲」漏掉 `cross_pool_reb`（库里存 200 个交易日重排，
+        默认落到 1 = 每天重排）：
+
+            年化 128.98% → 71.90%｜最大回撤 -209% → -514%｜夏普 0.85 → 0.45
+            交易次数 245 → 245（一模一样，所以只看次数永远发现不了）
+
+        钉三件事：
+
+        ① 策略库里**每一个** `cross_*` 字段都在 `replay.CROSS_FIELDS` 里
+           （以后新增字段忘了映射，这条直接红）；
+        ② 逐字段往返：给一份所有字段都是非默认值的配置，比 `CrossConfig`；
+        ③ 组合页的两步周期行情真的传下去了。
+        """
+        import dataclasses
+        import inspect
+        import re
+
+        from ttrade import replay as RP
+        from ttrade import strategy_store as SS
+        from ttrade.backtest import BacktestConfig
+
+        # ---- ① 覆盖面：cross_* 字段一个都不能没映射
+        names = [f.name for f in dataclasses.fields(SS.StrategyConfig)]
+        crossed = {n for n in names if n.startswith("cross_")}
+        # 品种池（cross_symbols）走 `cfg.symbols`，两步周期单独处理，不在表里
+        skip = {"cross_symbols", "cross_step1_period", "cross_step2_period"}
+        mapped = {src for _dst, src in RP.CROSS_FIELDS}
+        lost = sorted(crossed - skip - mapped)
+        if lost:
+            raise RuntimeError(
+                f"这些截面字段没被映射进 CrossConfig：{lost}。"
+                "漏一个就是「同一份配置两条曲线」—— 补 `replay.CROSS_FIELDS`")
+        # 反向也要查：表里的字段名写错了同样静默失效
+        bad = sorted(src for _d, src in RP.CROSS_FIELDS if src not in names)
+        if bad:
+            raise RuntimeError(f"CROSS_FIELDS 里这些名字策略库没有：{bad}")
+
+        # ---- ② 逐字段往返（全部用非默认值，默认值相等说明不了什么）
+        cfg = SS.StrategyConfig(
+            family="cross",
+            cross_mode="select", cross_rebalance=7, cross_rebalance_unit="month",
+            cross_top_pct=12.0, cross_bot_pct=8.0,
+            cross_weight="tier", cross_weight_scope="legs",
+            cross_tiers=3, cross_tier_units=[4.0, 2.0, 1.0],
+            cross_pool_mode="single", cross_pool_keys=["log_amount_20"],
+            cross_pool_reverse={"log_amount_20": True}, cross_pool_pct=55.0,
+            cross_pool_reb=37, cross_pool_reb_unit="month",
+            cross_label_mode="rank",
+            cross_step1_period="1d_tq", cross_step2_period="1h",
+            factor_mode="multi", factor_keys=["mom_20", "vol_20"],
+            factor_reverse={"mom_20": True}, factor_cfg={"window": 100},
+            timing_family="factor", timing_rule_key="",
+            timing_rule_params={"entry_n": 20},
+            timing_factor_mode="single", timing_factor_keys=["mom_60"],
+            timing_factor_reverse={"mom_60": True},
+            timing_factor_cfg={"window": 50},
+        )
+        bt = BacktestConfig(initial_cash=1_000_000.0, long_only=False)
+        # 两步周期只有在**真拿到那份行情**时才算数，所以先给一个非空占位
+        ccfg = RP.cross_config(cfg, bt, period="5m",
+                               step1_frames={"A": None}, step2_frames={"A": None})
+        diff = []
+        for dst, src in RP.CROSS_FIELDS:
+            got = getattr(ccfg, dst)
+            want = getattr(cfg, src)
+            if isinstance(want, list):
+                got, want = list(got or []), list(want or [])
+            elif isinstance(want, dict):
+                got, want = dict(got or {}), dict(want or {})
+            elif isinstance(want, (int, float)) and not isinstance(want, bool):
+                got, want = float(got or 0), float(want or 0)
+            elif isinstance(want, str):
+                got, want = str(got or ""), str(want or "")
+            if got != want:
+                diff.append(f"{dst}: CrossConfig={got!r} ≠ 策略库={want!r}")
+        if diff:
+            raise RuntimeError("截面字段透传丢东西了：" + "；".join(diff))
+        if (ccfg.step1_period, ccfg.step2_period) != ("1d_tq", "1h"):
+            raise RuntimeError(
+                f"两步周期没透传：{ccfg.step1_period!r}/{ccfg.step2_period!r}")
+        # 没给那份行情时必须退回「跟随策略周期」—— 否则引擎以为换了周期却
+        # 还在用同一份数据
+        bare = RP.cross_config(cfg, bt, period="5m")
+        if bare.step1_period or bare.step2_period:
+            raise RuntimeError(
+                f"没取到跨周期行情，却仍标着 step1/step2 = "
+                f"{bare.step1_period!r}/{bare.step2_period!r}")
+
+        # ---- ③ 组合页真的把两步行情递下去了
+        import gui.portfolio_page as PP
+        src = inspect.getsource(PP.run_replay_job)
+        if "step1_frames" not in src or "step2_frames" not in src:
+            raise RuntimeError("`run_replay_job` 没把两步周期的行情传给 `run_cross`")
+        src2 = inspect.getsource(PP.PortfolioPage._prepare)
+        if "_step_period_frames" not in src2:
+            raise RuntimeError("`_prepare` 没去取第一步 / 第二步周期的行情")
+        src3 = inspect.getsource(PP.EditDialog)
+        for need in ("cross_pool_reb", "cross_step1_period", "cross_step2_period",
+                     "cross_weight_scope"):
+            if need not in src3:
+                raise RuntimeError(f"组合页「设置参数」里没有 {need} 这一项")
+        if not re.search(r"def _apply_cross", src3):
+            raise RuntimeError("组合页「设置参数」没把截面参数写回配置")
+
+        # ---- ④ 两步**并排**、两栏等宽（2026-11-24）
+        # 竖排时这一块二十多行、右边一根长滚动条，一屏看不完。并排之后还有个
+        # 副作用要钉住：右栏字段多、最小宽度天生比左栏大（实测 326 vs 302，
+        # 更早一版因为按钮上铺了 23 个因子名，是 580 vs 285），不显式抹平的话
+        # 左栏会被挤成一条窄带、标签全成省略号。
+        if src3.count("_cross_column(") < 3:          # 1 次 def + 2 次调用
+            raise RuntimeError("组合页的截面参数没分成「第一步 / 第二步」两栏")
+        for need in ("cols.addWidget(left, 1)", "cols.addWidget(right, 1)",
+                     "form.addRow(wrap)",
+                     "_l.setMinimumWidth(_w)", "_r.setMinimumWidth(_w)"):
+            if need not in src3:
+                raise RuntimeError(f"截面两栏没并排 / 没等宽：缺 {need!r}")
+        # 因子清单只能进 tooltip：铺在按钮上（原来最多 6 个名字 + 「等 23 个」）
+        # 会把按钮的最小宽度撑到 470px，并排之后左栏就没有立足之地了
+        if "_factor_list_text" not in src3:
+            raise RuntimeError("截面因子清单没放进 tooltip（会撑宽右栏）")
+
+        return ("策略库的每个 cross_* 字段都在 replay.CROSS_FIELDS 里，逐字段往返"
+                "一致（含筛池重排 37 个月、两步周期 1d_tq/1h、多空各半仓、分档 4/2/1）；"
+                "没取到跨周期行情时退回「跟随策略周期」；组合页「设置参数」能改也能存，"
+                "第一步 / 第二步并排且两栏等宽")
+
+    check("截面策略参数逐字段透传（组合页 = 研究页）", _cross_cfg_passthrough)
+
+    def _cross_live_weights():
+        """截面实盘决策必须和回测**逐位一致**，不是「差不多」。
+
+        实盘只走 `cross.run()` 里决定权重的三步（分数面板 → 筛池 → 分钱），
+        不跑净值 / 逐笔 / 绩效。这里在合成日线上拿两边最后一根调仓日的权重
+        直接相减 —— 差一个 1e-9 都是口径分叉，放到真实账户上就是另一条曲线。
+
+        顺带钉住两个曾经把整套改动废掉的坑：
+          * `score.where(mask_series)` 按**行**对齐 ⇒ 整张表 NaN ⇒ 空仓；
+          * 池子蒙版要从**最后一个采样行**取，不能拿「今天」当采样点
+            （`pool_reb=200` 时差 200 个交易日）。
+        """
+        import inspect
+
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import cross as CX
+        from ttrade import cross_live as XL
+        from ttrade import replay as _RP
+        from ttrade import strategy_runner as _SR
+        from ttrade import strategy_store as _SS
+
+        keys = [f"S{i}_SHFE" for i in range(6)]
+        idx = pd.date_range("2025-01-01", periods=420, freq="B")
+        rng = np.random.default_rng(24)
+        frames = {}
+        for j, key in enumerate(keys):
+            px = 3000.0 * np.exp(np.cumsum(rng.normal(0, 0.01, len(idx))))
+            frames[key] = pd.DataFrame({
+                "open": px, "high": px * 1.005, "low": px * 0.995,
+                "close": px, "volume": np.full(len(idx), 1000.0),
+            }, index=idx)
+        cfg = _SS.StrategyConfig(
+            sid="xselftest", name="截面实盘自检", family="cross", period="1d",
+            multi_symbols=list(keys), cross_mode="hedge", cross_rebalance=5,
+            cross_rebalance_unit="bar", cross_top_pct=30, cross_bot_pct=30,
+            cross_weight="equal", cross_weight_scope="pooled",
+            factor_mode="multi", factor_keys=["mom_20"],
+            principal=1_000_000, sizing="capital", capital_pct=30)
+        bt = _RP.make_bt(_RP.market_of(cfg), _RP.resolve_allow_short(cfg), cfg)
+        out = CX.run(frames, _RP.cross_config(cfg, bt, period="1d"), bt)
+        assert out.ok, out.error
+        step = out.step
+        last = ((len(out.weights) - 1) // step) * step
+        want = out.weights.iloc[last]
+        bar = out.weights.index[last]
+        cut = {k: v.loc[:bar] for k, v in frames.items()}
+        x = XL.CrossLive(cfg, bt)
+        got, note = x.decide(cut)
+        assert got is not None, f"实盘没出权重：{note}"
+        d = float((want.reindex(got.index).fillna(0).to_numpy()
+                   - got.to_numpy()).__abs__().max())
+        assert d < 1e-9, f"回测 / 实盘权重不一致，maxΔ={d}"
+
+        # 2026-11-24 用户放宽：2 个品种也要能跑。两个品种正好一强一弱，
+        # `_rank` 会把 top_pct/bot_pct 折成各 1 条腿；少到 1 个才不是截面。
+        assert CX.MIN_CROSS == 2
+        keys2 = keys[:2]
+        cfg2 = _SS.StrategyConfig(
+            sid="xselftest2", name="截面实盘自检-2品种", family="cross", period="1d",
+            multi_symbols=list(keys2), cross_mode="hedge", cross_rebalance=5,
+            cross_rebalance_unit="bar", cross_top_pct=30, cross_bot_pct=30,
+            cross_weight="equal", cross_weight_scope="pooled",
+            factor_mode="multi", factor_keys=["mom_20"],
+            principal=1_000_000, sizing="capital", capital_pct=30)
+        XL.check_support(cfg2)  # 2 个品种不应该再被拒绝
+        bt2 = _RP.make_bt(_RP.market_of(cfg2), _RP.resolve_allow_short(cfg2), cfg2)
+        frames2 = {k: frames[k] for k in keys2}
+        out2 = CX.run(frames2, _RP.cross_config(cfg2, bt2, period="1d"), bt2)
+        assert out2.ok, f"2 品种回测失败：{out2.error}"
+        step2 = out2.step
+        last2 = ((len(out2.weights) - 1) // step2) * step2
+        want2 = out2.weights.iloc[last2]
+        bar2 = out2.weights.index[last2]
+        cut2 = {k: v.loc[:bar2] for k, v in frames2.items()}
+        x2 = XL.CrossLive(cfg2, bt2)
+        got2, note2 = x2.decide(cut2)
+        assert got2 is not None, f"2 品种实盘没出权重：{note2}"
+        d2 = float((want2.reindex(got2.index).fillna(0).to_numpy()
+                    - got2.to_numpy()).__abs__().max())
+        assert d2 < 1e-9, f"2 品种回测 / 实盘权重不一致，maxΔ={d2}"
+        assert int((want2.abs() > 0).sum()) == 2, "2 品种对冲应该一多一空两条腿"
+
+        # 筛池蒙版必须按列广播，不能按行对齐
+        pool = pd.DataFrame(rng.normal(size=(len(idx), len(keys))),
+                            index=idx, columns=keys)
+        score = pool.copy()
+        pcfg = CX.CrossConfig(pool_mode="multi", pool_keys=[],
+                              pool_top_pct=60, pool_reb=3, pool_reb_unit="day")
+        staged = XL.CrossLive(cfg, bt)
+        w2 = CX._apply_pool(score, pool, 60, 0, reb=3, reb_unit="day")
+        g2 = pd.DataFrame([staged._pool_apply(score.iloc[:i + 1],
+                                              pool.iloc[:i + 1], pcfg).iloc[-1]
+                           for i in range(len(idx))], index=idx, columns=keys)
+        dd = (w2 - g2).abs()
+        one_na = w2.isna() ^ g2.isna()
+        if bool(one_na.to_numpy().any()) or \
+                bool((dd > 1e-9).fillna(False).to_numpy().any()):
+            raise AssertionError("带状态的筛池蒙版和回测 ffill 对不上")
+
+        # 手数：四舍五入（不是 Python 的银行家 round）、没价保持、符号跟权重
+        assert XL.round_lots(0.49, 0) == 0
+        assert XL.round_lots(0.5, 0) == 1
+        assert XL.round_lots(1.5, 0) == 2
+        assert XL.round_lots(2.5, 0) == 3       # round(2.5) 会错给 2
+        assert XL.round_lots(-1.5, 0) == -2
+        assert XL.round_lots(0.45, 2) == 0      # 旧滞回会给 1，纯四舍五入是 0
+        assert XL.round_lots(float("nan"), 2) == 2
+        ww = pd.Series({"A": 0.2, "B": -0.1, "C": 0.1})
+        tg = XL.targets_from_weights(
+            ww, [("A", 0), ("B", 0), ("C", 5)], 1_000_000,
+            lambda k: 3000 if k == "A" else (4000 if k == "B" else 0),
+            lambda k: 10.0)
+        assert tg["A"] > 0 and tg["B"] < 0 and tg["C"] == 5
+
+        # 跑不了的口径要明说，不能静默按别的策略下单。1 个品种不是截面；
+        # 2 个已经放开（上面单独验过），这里只拦真正不够的那一个。
+        try:
+            XL.check_support(_SS.StrategyConfig(family="cross", factor_keys=["mom_20"],
+                                                multi_symbols=keys[:1]))
+            raise AssertionError("品种不足没被拦住")
+        except XL.CrossRefused:
+            pass
+        try:
+            XL.check_support(_SS.StrategyConfig(family="cross", factor_keys=["mom_20"],
+                                                factor_mode="ml", multi_symbols=keys))
+            raise AssertionError("截面 ML 没被拦住")
+        except XL.CrossRefused:
+            pass
+
+        # 引擎接线：不再拒绝截面，也不再在「启动全部」里剔掉它
+        src = inspect.getsource(_SR.PortfolioRunner.enable)
+        assert "截面策略暂不支持实盘" not in src
+        assert "cross_live.check_support" in src
+        src2 = inspect.getsource(_SR.PortfolioRunner.tick)
+        assert "self._cross_refresh()" in src2
+        src3 = inspect.getsource(
+            __import__("gui.portfolio_page", fromlist=["PortfolioPage"]).PortfolioPage._live_plan)
+        assert "n_cross" not in src3
+        return (f"合成 6 品种 / 420 根，回测第 {last} 行权重与实盘逐位相同（maxΔ={d:g}）；"
+                f"2 品种（maxΔ={d2:g}）也能跑；"
+                "筛池暂存、手数四舍五入、不支持口径拦截、引擎接线四项均通过")
+
+    check("截面实盘：权重逐位对齐回测 + 手数 / 筛池 / 接线", _cross_live_weights)
+
+    def _cross_expand_rows():
+        """截面也要能在策略列表里展开成「一个品种一行」。
+
+        以前 `_is_multi_cfg()` 把 family=cross 直接挡掉，理由是「它只有权重没有
+        手数」。现在实盘腿上既有 `target` 也有 `cross_w`，没理由不显示 —— 这里
+        钉住识别、文案、引擎快照三处，少一处界面上就还是平铺一条。
+        """
+        import inspect
+
+        from gui import portfolio_page as _PP
+        from ttrade import strategy_runner as _SR
+        from ttrade import strategy_store as _SS
+
+        cfg = _SS.StrategyConfig(
+            sid="xexpand", name="截面展开自检", family="cross", period="1d",
+            multi_symbols=["RB_SHFE", "HC_SHFE"], cross_weight="equal",
+            factor_mode="multi", factor_keys=["mom_20"],
+            principal=1_000_000)
+        assert _PP._is_multi_cfg(cfg), "截面配置没被识别成可展开"
+        txt = _PP._cross_child_size_text(cfg, {"cross_w": 0.35})
+        assert "多 +0.350" in txt and "35.0 万" in txt
+        txt2 = _PP._cross_child_size_text(cfg, {"cross_w": -0.25})
+        assert "空 -0.250" in txt2 and "25.0 万" in txt2
+        assert '"cross_w"' in inspect.getsource(_SR.PortfolioRunner.snapshot)
+        # `_cross_step` 里是给腿槽位写属性 `s.cross_w = ...`（不是字典字面量），
+        # 所以这里钉属性赋值，别再找带引号的 '"cross_w"'。
+        assert ".cross_w" in inspect.getsource(_SR.PortfolioRunner._cross_step)
+        return "截面识别为可展开，子行按权重/名义额显示，快照带 cross_w"
+
+    check("截面策略可展开逐品种持仓", _cross_expand_rows)
+
+    def _cross_ml_live():
+        """截面 ML：离线产物训一次，实盘只预测，权重必须贴住回测。
+
+        以前 `check_support()` 直接拒绝 ML。现在按因子 ML 的成熟套路放开：
+        产物里存最后一折模型 + 特征列 + 绑定后的配置；实盘 predict 出一行
+        横截面分数，再走原有权重链路。缺产物 / 配置错配仍必须拦住。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import cross as CX
+        from ttrade import cross_live as XL
+        from ttrade import cross_ml as XM
+        from ttrade import replay as _RP
+        from ttrade import strategy_store as _SS
+
+        sid = "xselftest_cross_ml"
+        keys = [f"M{i}_SHFE" for i in range(6)]
+        idx = pd.date_range("2025-01-01", periods=460, freq="B")
+        rng = np.random.default_rng(31)
+        frames = {}
+        for key in keys:
+            px = 3000.0 * np.exp(np.cumsum(rng.normal(0.0002, 0.009, len(idx))))
+            frames[key] = pd.DataFrame({
+                "open": px * 0.999, "high": px * 1.006, "low": px * 0.994,
+                "close": px, "volume": np.full(len(idx), 1000.0),
+            }, index=idx)
+        cfg = _SS.StrategyConfig(
+            sid=sid, name="截面 ML 自检", family="cross", period="1d",
+            multi_symbols=list(keys), cross_mode="hedge", cross_rebalance=5,
+            cross_rebalance_unit="bar", cross_top_pct=30, cross_bot_pct=30,
+            cross_weight="equal", cross_weight_scope="pooled",
+            factor_mode="ml", factor_keys=["mom_20", "mom_60", "ma_gap_20"],
+            cross_label_mode="volret",
+            factor_cfg=dict(model="linear", window=20, window_unit="bar",
+                            horizon=1, train_window=180, step=40, min_train=120),
+            principal=1_000_000, sizing="capital", capital_pct=30)
+        try:
+            XM.remove_artifact(sid)
+            if not XM.check_artifact(cfg):
+                raise AssertionError("没产物却放行了")
+            art = XM.train_from_strategy(cfg, frames)
+            if XM.check_artifact(cfg):
+                raise AssertionError("产物配置校验不过")
+            pred, _why = XM.load_for_live(cfg)
+            if pred is None:
+                raise AssertionError("产物装载失败")
+            XL.check_support(cfg)              # 有产物后不再拒绝
+
+            bt = _RP.make_bt(_RP.market_of(cfg), _RP.resolve_allow_short(cfg), cfg)
+            out = CX.run(frames, _RP.cross_config(cfg, bt, period="1d"), bt)
+            if not out.ok:
+                raise AssertionError(out.error)
+            step = out.step
+            last = ((len(out.weights) - 1) // step) * step
+            want = out.weights.iloc[last]
+            bar = out.weights.index[last]
+            cut = {k: v.loc[:bar] for k, v in frames.items()}
+            x = XL.CrossLive(cfg, bt)
+            x.ml = pred
+            got, note = x.decide(cut)
+            if got is None:
+                raise AssertionError(f"截面 ML 实盘没出权重：{note}")
+            d = float(np.abs(want.reindex(got.index).fillna(0).to_numpy()
+                             - got.to_numpy()).max())
+            if d >= 1e-9:
+                raise AssertionError(f"截面 ML 回测 / 实盘权重不一致：{d}")
+        finally:
+            XM.remove_artifact(sid)
+        return (f"{art.n_folds} 折产物，实盘只预测，"
+                f"回测 / 实盘权重 maxΔ={d:g}")
+
+    check("截面 ML 实盘：离线产物 + 只预测 + 权重对齐回测", _cross_ml_live)
+
+    def _factor_no_lookahead():
+        """因子不许吃未来数据 —— **截断不变性**。
+
+        判据只有一条：`f(df)[t]` 必须等于 `f(df.iloc[:t+1])[t]`。t 之后的数据
+        只要参与了 t 处的取值，两边的值就不一样。
+
+        `slope_20` / `slope_60` 原来是反的：`sliding_window_view` 给出的是「从
+        a+j **开始**、长 n」的窗口，代码直接写 `out[a:b]` ⇒ 每个斜率都借了 n−1
+        根未来。同一份写法在 `factors_hlpoint._ols` 里早就修过（那里 `sl` 带
+        `+L-1`，注释里还记着实测 IC 从 0.01 飙到 0.64），`factors_hl._slope`
+        是漏网的那一支。
+
+        真实日线（54 品种 / 13.9 万根）上的代价：
+
+            slope_20   修复前 IC +0.0516 (t 7.08) → 修复后 +0.0032 (t 0.41)
+            slope_60   修复前 −0.0024 (t −0.34) → 修复后 −0.0025 (t −0.31)
+
+        也就是说 slope_20 那条「t=7 的强因子」**整条都是偷来的**。60 那支两边
+        都是噪声：60 根窗口里只有 1 根是标签 bar，污染被摊薄了。
+
+        另一条便宜判据：NaN 必须落在**头部** n−1 个（窗口还没凑满），落在尾部
+        就说明下标是错的。两条一起钉，改错方向也能立刻红。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import factors as F
+        from ttrade import factors_hl as FH        # noqa: F401  注册 slope_20/60
+
+        rng = np.random.RandomState(11)
+        n = 360
+        c = 3000 * np.exp(np.cumsum(rng.normal(0, 0.01, n)))
+        o = c * (1 + rng.normal(0, 0.002, n))
+        df = pd.DataFrame(
+            {"open": o,
+             "high": np.maximum(o, c) * 1.004,
+             "low": np.minimum(o, c) * 0.996,
+             "close": c,
+             "volume": np.abs(rng.normal(1e5, 2e4, n)),
+             "open_interest": np.abs(rng.normal(5e5, 5e4, n))},
+            index=pd.date_range("2021-01-04", periods=n, freq="B"))
+        df.attrs["symbol"] = "RB"
+
+        cases = [("slope_20", 20), ("slope_60", 60),
+                 ("ma_slope_20", 0), ("obv_slope", 0), ("mom_20", 0)]
+        bad = []
+        for key, win in cases:
+            full = F.raw(df, key)
+            if full is None:
+                raise RuntimeError(f"{key} 算不出值（因子没注册？）")
+            for t in (120, 200, 299, n - 1):
+                a = full.iloc[t]
+                b = F.raw(df.iloc[:t + 1], key).iloc[t]
+                # 一边有值一边 NaN 也算前视：修复前 `full[t]` 有值而截断版是 NaN
+                if pd.isna(a) != pd.isna(b):
+                    bad.append(f"{key} t={t}: 全样本={a!r} 截断={b!r}")
+                    break
+                if pd.isna(a):
+                    continue
+                if abs(float(a) - float(b)) > 1e-12:
+                    bad.append(f"{key} t={t}: {float(a):.6g} ≠ {float(b):.6g}")
+                    break
+            # NaN 只能落在头部
+            if win:
+                nn = full.isna()
+                head = int(nn.iloc[:win].sum())
+                tail = int(nn.iloc[-win:].sum())
+                if head != win - 1 or tail:
+                    bad.append(f"{key}: NaN 头部 {head} / 尾部 {tail}"
+                               f"（应为 {win - 1} / 0，尾部分布 = 下标错位）")
+        if bad:
+            raise RuntimeError("这些因子吃了未来数据：" + "；".join(bad))
+
+        # 源码级：`_slope` 的下标必须带 +n−1（回归测试，防有人把 shift 改回去）
+        import inspect
+
+        src = inspect.getsource(FH._slope)
+        if "out[a + n - 1:b + n - 1]" not in src:
+            raise RuntimeError("`_slope` 的下标又丢了 `+n−1` ⇒ slope_20/60 重新变成前视")
+
+        return ("slope_20 / slope_60 / ma_slope_20 / obv_slope / mom_20 逐点满足截断"
+                "不变性（t 处只用 ≤t 的数据）；slope_20/60 的 NaN 落在头部 n−1 个；"
+                "`_slope` 下标带 `+n−1`")
+
+    check("因子不吃未来数据（截断不变性 · slope_20/60 曾整条前视）", _factor_no_lookahead)
+
+    def _ctp_exit_no_release():
+        """关窗那条路**不许** `Release()` —— 那是 6 次 0xc0000005 的现场。
+
+        事件日志（`pythonw.exe` + `thosttraderapi_se-….dll` + 偏移 `0x25d9e0`）：
+
+            11/23 19:57:30 / 20:32:57 / 21:09:26 / 21:38:55、11/24 09:29:49 / 16:27:02
+
+        六个时刻**没有一次在盘中**，全是「关掉界面」那一下（16:27:02 那次关窗
+        之后 11 秒新进程就起来了）。所以「同时登录融航 + CTP 必崩」这个说法是
+        反的：崩的是收尾。`Release()` 要停 CTP 自己的 C++ 工作线程，而那条线程
+        此刻可能正踩在 Python 帧里（`OnRtnOrder` / `OnRspQryInvestorPosition`）。
+
+        钉四件事：
+
+        ① `APP_EXITING` 时 `_release_api` **一个字节都不碰** api；
+        ② 那一刻 api 要留强引用（不留 ⇒ SWIG 包装层析构照样删 C++ 对象）；
+        ③ 正常运行（`APP_EXITING=False`）仍然是 `RegisterSpi(None)` → `Release()`；
+        ④ `closeEvent` 里有硬退出，且被 `_in_selftest()` 挡在自检外面。
+        """
+        import inspect
+
+        from ttrade import crashlog as CL
+        from ttrade import ctp_client as CC
+
+        class _FakeApi:
+            def __init__(self):
+                self.calls = []
+
+            def RegisterSpi(self, spi):        # noqa: N802 - 照抄 CTP 的名字
+                self.calls.append("RegisterSpi")
+
+            def Release(self):                 # noqa: N802
+                self.calls.append("Release")
+
+        old = CC.APP_EXITING
+        try:
+            api = _FakeApi()
+            CC.APP_EXITING = True
+            CC._RETIRED_API.clear()
+            CC._release_api(api)
+            if api.calls:
+                raise RuntimeError(
+                    f"退出时还在碰 CTP（{api.calls}）—— 这正是 0x25d9e0 那 6 次崩溃")
+            if api not in CC._RETIRED_API:
+                raise RuntimeError("退出时没留住 api 引用 ⇒ SWIG 析构会把 C++ 对象删掉")
+
+            api2 = _FakeApi()
+            CC.APP_EXITING = False
+            CC._release_api(api2)
+            # 正常断开：**只 Release**，不许 RegisterSpi(None)（那是崩因）
+            if api2.calls != ["Release"]:
+                raise RuntimeError(
+                    f"正常断开该「只 Release、不摘 SPI」，实际 {api2.calls}")
+        finally:
+            CC.APP_EXITING = old
+            CC._RETIRED_API.clear()
+
+        from gui import app as GA
+        src = inspect.getsource(GA.MainWindow.closeEvent)
+        for need in ("APP_EXITING = True", "os._exit(0)", "_SELFTEST_MODE"):
+            if need not in src:
+                raise RuntimeError(f"`closeEvent` 缺 {need!r}")
+        # 硬退出跳过了 atexit ⇒ marker 必须由 `mark_clean_exit` 手删，否则下一轮
+        # 开界面又会误报「上次异常退出」（用户 2026-11-24 就撞到过这条误报）
+        src_c = inspect.getsource(CL.mark_clean_exit)
+        if "os.remove" not in src_c:
+            raise RuntimeError("`mark_clean_exit` 没删 run.marker ⇒ 会误报异常退出")
+        src_g = inspect.getsource(GA._in_selftest)
+        if "--selftest" not in src_g:
+            raise RuntimeError("`_in_selftest()` 不认 `--selftest`，自检会被硬退出砍断")
+
+        # marker 真删一次。`_log` 指到临时目录 —— **千万别动真界面那份**
+        # （用户正开着界面在跑实盘，删了它的 marker 下次开窗就不报警了）
+        if CL._FH is None:
+            import os
+            import shutil
+            import tempfile
+
+            tmp = tempfile.mkdtemp(prefix="cq_marker_")
+            old_log = CL._log
+            try:
+                CL._log = lambda name: os.path.join(tmp, name)
+                p = CL._log("run.marker")
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.write("x\n")
+                CL.mark_clean_exit("测试")
+                if os.path.isfile(p):
+                    raise RuntimeError("`mark_clean_exit` 没删掉 marker ⇒ 会误报异常退出")
+            finally:
+                CL._log = old_log
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        return ("关窗不再碰 CTP（6 次 0xc0000005 @ thosttraderapi 0x25d9e0 的现场）；"
+                "退出时留引用防 SWIG 析构；正常断开只 Release、绝不 RegisterSpi(None)；"
+                "收尾后 os._exit(0) 跳过解释器 finalize，自检进程放行；"
+                "mark_clean_exit 手删 marker，不再误报「上次异常退出」")
+
+    check("关窗不 Release CTP（0xc0000005 的真凶）", _ctp_exit_no_release)
+
     def _hl_point():
         """HL point 复现：新因子注册齐全、两种资金分配范围、策略库往返。"""
         import dataclasses
@@ -15478,11 +16073,16 @@ def _run() -> tuple[bool, list[str]]:
             "legs 口径没进策略摘要"
         assert "多空各半仓" not in SS.StrategyConfig(family="cross").params_text(), \
             "默认口径不该在摘要里多一行噪音"
-        # replay 必须把口径透传下去（漏了就悄悄按 pooled 回测）
+        # replay 必须把口径透传下去（漏了就悄悄按 pooled 回测）。
+        # 2026-11-24 起映射搬进了 `replay.cross_config()`（`CROSS_FIELDS` 那张表），
+        # 所以这里查的是它 —— 查 `run_cross` 的话现在一句都找不到（它只调一次
+        # `cross_config(...)`），改成查 run_cross 会把「搬走」误判成「丢了」
         from ttrade import replay as _RP
 
-        assert "weight_scope=getattr(cfg" in inspect.getsource(_RP.run_cross), \
-            "replay.run_cross 没把 cross_weight_scope 透传给 CrossConfig"
+        assert "weight_scope" in (d for d, _s in _RP.CROSS_FIELDS), \
+            "replay.CROSS_FIELDS 里没有 cross_weight_scope"
+        assert "weight_scope=_txt(" in inspect.getsource(_RP.cross_config), \
+            "replay.cross_config 没把 cross_weight_scope 透传给 CrossConfig"
 
         return ("HL point 的 42 个因子全部注册且非空（MACD 风洞 13 个自成一类）；"
                 "mom_accel ≡ mom_diverge 只注册一列；"

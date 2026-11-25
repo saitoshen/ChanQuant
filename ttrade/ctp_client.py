@@ -32,6 +32,7 @@ manylinux x86_64；macOS 最后一份带轮子的是 **6.7.0.9**（cp314 的
 
 from __future__ import annotations
 
+import collections
 import itertools
 import json
 import os
@@ -418,6 +419,7 @@ class MdClient(_ChannelApi):
             raise CtpError(f"用不了 CTP 行情（{CTP_IMPORT_ERROR}）")
         if self.api is not None:            # 同上：重复 start 先把老的 Release 掉
             self.stop()
+        _retire_spi(getattr(self, "_spi", None))   # 同 `TraderClient.start()`
         spi = self._make_spi()
         self._spi = spi
         flow = _new_flow_dir("md")
@@ -432,11 +434,13 @@ class MdClient(_ChannelApi):
 
     def stop(self) -> None:
         # 锁内摘句柄、锁外 Release，理由见 `_ChannelApi._send`
+        _crumb("md.stop")
         with self._guard():
             api, self.api = self.api, None
             self.ready.clear()
         if api is not None:
             _release_api(api)
+            _retire_spi(getattr(self, "_spi", None))   # 同交易侧
 
     def wait_ready(self, timeout: float = 10.0) -> bool:
         return self.ready.wait(timeout)
@@ -590,27 +594,96 @@ DIR_BUY = "0"
 DIR_SELL = "1"
 
 
+#: 已经 `Release()` 过、但**不能马上让 Python 回收**的 SPI 对象。
+#: 🔴 为什么需要：`_Spi` 继承的是 SWIG **director** 类（`CThostFtdcTraderSpi`）。
+#: director 的 C++ 那一半是跟着 Python 对象一起走的 —— Python 对象一进 GC，
+#: `__del__` 就把 C++ 包装层删掉。而 CTP 的 `Release()` 只是「请工作线程退出」，
+#: 它返回的那一刻，回调线程可能**还在 Python 帧里**（实测栈顶就是 `_Spi.OnRtnOrder`
+#: / `OnRspQryInvestorPosition`）。这时把 spi 回收掉，那条线程回来就是踩着已释放的
+#: 内存继续跑 ⇒ `0xc0000005`，而报的模块是 `thosttraderapi_se-….dll`（崩在 CTP
+#: 自己 `m_pSpi->OnXxx` 那一句上），看着像是 CTP 的锅。
+#:
+#: 之前 `stop()` 不清 `self._spi`，所以「停掉」不会触发；真正触发的是**下一次
+#: `start()`** —— 它把 `self._spi` 换成新对象，老的那个当场没了引用。「启动全部」
+#: 把几个账户并行连、或断线重连时，正好是「老会话刚 Release、新会话马上建」的
+#: 节奏，撞上的概率不低。
+#:
+#: 留 8 个够覆盖任何在飞的回调（每条会话同时最多一个回调线程），代价可以忽略。
+_RETIRED_SPI: collections.deque = collections.deque(maxlen=8)
+
+#: 进程正在退出（`gui.app.MainWindow.closeEvent` 第一件事就把它置真）。
+#:
+#: 🔴 关窗时**绝对不能** `Release()`。事件日志里 `pythonw.exe` 连着 6 次崩在
+#: `thosttraderapi_se-….dll` 的**同一个偏移** `0x25d9e0`：
+#:
+#:     11/23 19:57:30 / 20:32:57 / 21:09:26 / 21:38:55、11/24 09:29:49 / 16:27:02
+#:
+#: 六个时刻没有一个发生在盘中，全都正好是「关掉界面」那一下（16:27:02 那次
+#: 关窗前后 11 秒新进程就起来了）。所以它不是「同时登录必崩」，而是
+#: **收尾收不干净**：`Release()` 要停掉 CTP 自己的 C++ 工作线程，而那条线程
+#: 此刻可能正踩在 Python 帧里（`OnRtnOrder` / `OnRspQryInvestorPosition`）
+#: ⇒ 线程一停，它回来就是访问违例，报的还是 CTP 的 dll。
+#:
+#: 进程马上就不存在了，`Release()` 一点好处都没有（内存由 OS 回收），
+#: 于是关窗这条路直接跳过它，详见 `_release_api`。
+APP_EXITING = False
+
+#: 退出时**没有** Release 掉的 api。**必须留着强引用**：SWIG 包装层析构时会
+#: 去删 C++ 对象，那比「不 Release」危险得多（director 析构走的是 C++ 那一半）。
+_RETIRED_API: list = []
+
+
+def _retire_spi(spi) -> None:
+    """把 SPI 从「即将被 GC」改成「再留一会儿」。见 `_RETIRED_SPI`。"""
+    if spi is not None:
+        _RETIRED_SPI.append(spi)
+
+
 def _release_api(api) -> None:
-    """安全地收掉一条 CTP 会话：**先摘 SPI，再 `Release()`**。
+    """收掉一条 CTP 会话：**只 `Release()`，绝不 `RegisterSpi(None)`**。
 
-    🔴 不摘 SPI 就直接 `Release()` 是访问违例的高发点。CTP 的 `Release()` 会停掉
-    它自己那条回调线程，但「停」和「已经进到 Python 层」不是同一件事 —— 正在
-    执行的回调仍然持有 spi 对象和它的 C++ 包装层，Release 之后那块内存被回收，
-    下一个回调就踩空。2026-11-23 19:28 融航在「启动全部」时连崩三次，事件日志
-    写的是 `vendor\\rohon_ctp\\openctp_ctp.libs\\MSVCR100.dll` 的 0xc0000005 ——
-    当时融航正是 `[-1] 交易核心未初始化` 反复登录失败，每次失败都走一遍
-    `Release()` + `Init()`。
+    🔴🔴 **`RegisterSpi(None)` 是崩因，不是解药**（2026-11-24 实验定案）。以前这段
+    写着「先把 SPI 摘掉，Release 时就不会再回调进 Python」—— 听着很对，实测是
+    灾难：把 SPI 置成 NULL 之后，CTP 自己的 C++ 工作线程**照样会去调
+    `m_pSpi->OnXxx`**，没有任何空指针检查 ⇒ 访问违例，而且**偏移是固定的**
+    （`thosttraderapi_se-….dll` + `0x25d9e0`），看着像 CTP 的 bug。
 
-    `RegisterSpi(None)` 让后续回调在 C++ 侧就被丢掉，再 Release 才安全。有些
-    包装层不接受 None，抛了就退回老行为 —— 这里只为**降低**风险，不改变语义。
+    证据（`_tools/_probe_ctp_fail_stop_dual.py`：标准 CTP + 融航两套 dll 同进程
+    并行登录失败 —— 正是「启动全部」的形态；三种收尾各跑一次独立子进程）：
+
+        cur     RegisterSpi(None) → Release()      💥 0xC0000005
+        nosets  ──────────────────→ Release()      ✅ 存活、Release 正常返回
+        norel   RegisterSpi(None) →（不 Release）   💥 0xC0000005
+
+    只要碰了 `RegisterSpi(None)` 就崩，跟 Release 无关。单通道单账户跑四种收尾
+    全活 —— 所以以前「一次登不上」根本查不出来，必须两条通道同时在场。
+
+    现在只做一件事：`Release()`。**SPI 保持注册、保持存活**（`_RETIRED_SPI` 攥着
+    它），Release 之后万一还有在飞的回调进来，落到的仍是活对象 ——
+    「SPI 活着 + 已 Release」才是安全组合。
+
+    🔴 进程正在退出时（`APP_EXITING`）一个字节都别碰 CTP，只把 api 挂起来防止
+    SWIG 析构，理由见常量处的注释。
     """
-    try:
-        api.RegisterSpi(None)
-    except Exception:                    # noqa: BLE001 - 不接受 None 就算了
-        pass
+    if api is None:
+        return
+    if APP_EXITING:
+        _RETIRED_API.append(api)
+        return
     try:
         api.Release()
     except Exception:                    # noqa: BLE001
+        pass
+
+
+def _crumb(text: str) -> None:
+    """往心跳日志里插一行面包屑。关窗崩了之后能看出停在 `trader.stop` 还是
+    `Release()` 之后 —— 心跳每 10 秒一拍，几百毫秒的收尾根本拍不到。"""
+    try:
+        from ttrade import crashlog
+
+        crashlog.breadcrumb(text)
+    except Exception:                    # noqa: BLE001 - 取证不能影响收尾
         pass
 
 
@@ -726,6 +799,10 @@ class TraderClient(_ChannelApi):
         # 老客户端被丢弃不 Release 的话，C++ 那边的回调线程还活着，越积越多。
         if self.api is not None:
             self.stop()
+        # 老 spi 换成新的之前先挂到回收站：见 `_RETIRED_SPI`。
+        # `self._spi` 一赋值，老的就没引用、当场可被 GC —— 而 `stop()` 里
+        # `Release()` 返回不代表回调线程已经离开 Python 帧。
+        _retire_spi(getattr(self, "_spi", None))
         spi = self._make_spi()
         self._spi = spi
         flow = _new_flow_dir("td")
@@ -750,12 +827,16 @@ class TraderClient(_ChannelApi):
         # 正阻塞在这把锁上（它也要发 `Req*`）⇒ 持锁 Release 就是死锁。
         # 这个顺序同时也保证了「不会有新的 `Req*` 在 Release 之后进 C++」：
         # 句柄一置空，`_send()` 就再也拿不到它了。
+        _crumb("trader.stop")
         with self._guard():
             api, self.api = self.api, None
             for ev in (self.connected, self.logged_in, self.settled):
                 ev.clear()
         if api is not None:
             _release_api(api)
+            # `Release()` 回来之后回调线程可能还没离开 Python 帧，别急着让
+            # GC 回收这个 director（见 `_RETIRED_SPI`）
+            _retire_spi(getattr(self, "_spi", None))
 
     def wait_ready(self, timeout: float = 15.0) -> bool:
         """等到「能下单」为止：登录 + 结算确认都完成。"""

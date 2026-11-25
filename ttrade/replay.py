@@ -648,18 +648,150 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
                   bars_per_year=bpy, keys=keys)
 
 
+#: `StrategyConfig` 的截面字段 → `CrossConfig` 的字段。**唯一一份映射表**。
+#:
+#: 🔴 为什么单独立一张表（2026-11-24）：这个映射以前散在 `run_cross()` 的一段
+#: 二十多行构造函数里，漏一个不会报错、不会崩，只会跑出另一条曲线 —— 而界面
+#: 上「同一份配置，组合页和研究页两个结果」是用户唯一能看到的症状，谁也说不清
+#: 丢了哪一个。实测漏掉 `cross_pool_reb`（存 200 个交易日重排）时，池子变成
+#: 每天重排，年化 128.98% → 71.90%、最大回撤 -209% → -514%，而交易次数一模一样。
+#:
+#: 自检 `_cross_cfg_passthrough` 就是照这张表逐字段比的，所以「又漏一个」会红。
+CROSS_FIELDS: list[tuple[str, str]] = [
+    ("mode", "cross_mode"),
+    ("rebalance", "cross_rebalance"),
+    ("rebalance_unit", "cross_rebalance_unit"),
+    ("top_pct", "cross_top_pct"),
+    ("bot_pct", "cross_bot_pct"),
+    ("weight", "cross_weight"),
+    ("weight_scope", "cross_weight_scope"),
+    ("tiers", "cross_tiers"),
+    ("tier_units", "cross_tier_units"),
+    ("pool_mode", "cross_pool_mode"),
+    ("pool_keys", "cross_pool_keys"),
+    ("pool_reverse", "cross_pool_reverse"),
+    ("pool_top_pct", "cross_pool_pct"),
+    # 🔴 筛池重排频率：`CrossConfig.pool_reb` 的默认值是 1（每个交易日重排），
+    # 而策略库里存的是 127 / 200。漏这两行就是「每天重排 vs 半年重排」
+    ("pool_reb", "cross_pool_reb"),
+    ("pool_reb_unit", "cross_pool_reb_unit"),
+    ("label_mode", "cross_label_mode"),
+    ("factor_mode", "factor_mode"),
+    ("factor_keys", "factor_keys"),
+    ("factor_reverse", "factor_reverse"),
+    ("factor_cfg", "factor_cfg"),
+    ("timing_family", "timing_family"),
+    ("timing_rule_key", "timing_rule_key"),
+    ("timing_rule_params", "timing_rule_params"),
+    ("timing_factor_mode", "timing_factor_mode"),
+    ("timing_factor_keys", "timing_factor_keys"),
+    ("timing_factor_reverse", "timing_factor_reverse"),
+    ("timing_factor_cfg", "timing_factor_cfg"),
+]
+
+
+def cross_config(cfg, bt: BacktestConfig, period: str = "",
+                 step1_frames=None, step2_frames=None):
+    """`StrategyConfig` → `cross.CrossConfig`。**组合页和研究页共用这一处。**
+
+    `long_only` / `short_only` 从 `bt` 取：它们已经过
+    `resolve_allow_short()` 和「市场是否允许做空」两道判断，是唯一真源。
+
+    `step1_period` / `step2_period` **只在这一份行情真拿到时才算数**，和
+    `cross.run()` 里 `src = step1_frames if (cfg.step1_period and step1_frames)
+    else frames` 是同一个判据。配了周期却没取到行情，就老老实实退回策略周期
+    —— 留一个 `step1_period` 而不给行情，等于让引擎以为「第一步换周期了」却
+    仍然用同一份数据。
+    """
+    from ttrade import cross as cross_engine
+
+    vals = {}
+    for dst, src in CROSS_FIELDS:
+        vals[dst] = getattr(cfg, src, None)
+    # 逐类清洗：跨版本存下来的 json 里可能有 None / 字符串化的列表
+    def _lst(k, default):
+        v = vals.get(k)
+        return list(v) if isinstance(v, (list, tuple)) else list(default)
+
+    def _dct(k):
+        v = vals.get(k)
+        return dict(v) if isinstance(v, dict) else {}
+
+    def _num(k, default, cast=float):
+        try:
+            v = vals.get(k)
+            return cast(v) if v not in (None, "") else cast(default)
+        except (TypeError, ValueError):
+            return cast(default)
+
+    def _txt(k, default):
+        v = vals.get(k)
+        return (str(v) if v not in (None, "") else default) or default
+
+    return cross_engine.CrossConfig(
+        mode=_txt("mode", "hedge"),
+        rebalance=max(1, _num("rebalance", 5, int) or 5),
+        rebalance_unit=_txt("rebalance_unit", "bar"),
+        step1_period=str(getattr(cfg, "cross_step1_period", "") or "")
+        if step1_frames else "",
+        step2_period=str(getattr(cfg, "cross_step2_period", "") or "")
+        if step2_frames else "",
+        top_pct=_num("top_pct", 10.0),
+        bot_pct=_num("bot_pct", 10.0),
+        long_only=bool(bt.long_only),
+        short_only=bool(bt.short_only),
+        weight=_txt("weight", "risk"),
+        weight_scope=_txt("weight_scope", "pooled"),
+        tiers=max(0, _num("tiers", 0, int)),
+        tier_units=[float(x) for x in _lst("tier_units", [])],
+        pool_mode=_txt("pool_mode", "off"),
+        pool_keys=_lst("pool_keys", []),
+        pool_reverse=_dct("pool_reverse"),
+        pool_top_pct=_num("pool_top_pct", 60.0),
+        pool_reb=max(1, _num("pool_reb", 1, int) or 1),
+        pool_reb_unit=_txt("pool_reb_unit", "day"),
+        label_mode=_txt("label_mode", "volret"),
+        period=period,
+        factor_mode=_txt("factor_mode", "multi"),
+        factor_keys=_lst("factor_keys", []),
+        factor_reverse=_dct("factor_reverse"),
+        factor_cfg=_dct("factor_cfg"),
+        timing_family=_txt("timing_family", "rule"),
+        timing_rule_key=str(vals.get("timing_rule_key") or ""),
+        timing_rule_params=_dct("timing_rule_params"),
+        timing_factor_mode=_txt("timing_factor_mode", "single"),
+        timing_factor_keys=_lst("timing_factor_keys", []),
+        timing_factor_reverse=_dct("timing_factor_reverse"),
+        timing_factor_cfg=_dct("timing_factor_cfg"),
+    )
+
+
 def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "",
               timing_extra: dict[str, dict] | None = None,
-              factor_extra: dict[str, dict] | None = None) -> Replay:
+              factor_extra: dict[str, dict] | None = None,
+              step1_frames: dict[str, pd.DataFrame] | None = None,
+              step2_frames: dict[str, pd.DataFrame] | None = None) -> Replay:
     """截面策略的离线回放。组合页双击一条截面策略走这里。
 
     截面要的是**一批**品种的行情，调用方按 `cfg.cross_symbols` 各自取好再递进来
     —— 回放这一层不碰数据源，和研究页 / 批量脚本各用各的取数方式。
 
+    🔴 **这里必须把 `cross_*` 字段一个不漏地搬进 `CrossConfig`**（2026-11-24）：
+    漏一个不会报错，只会跑出另一条曲线，而用户看到的是「同一份配置，组合页
+    和研究页两个结果」。实测「全品种截面对冲」：漏了 `cross_pool_reb`（存的是
+    每 200 个交易日重排一次），默认落到 `pool_reb=1`（每天重排），于是
+    年化 128.98% → 71.90%、最大回撤 -209% → -514%、夏普 0.85 → 0.45，
+    交易次数却一模一样（245）—— 只看次数根本发现不了。
+
+    `step1_frames` / `step2_frames` 是第一步（筛池）/ 第二步（排名）**专用周期**
+    的行情，由调用方按 `cfg.cross_step1_period` / `cross_step2_period` 另外取好。
+    传了才启用跨周期：没取到就别假装配上了，那会让两步都按策略周期算。
+
     返回的 `Replay` 里 `df` / `raw` 都是空的：截面策略没有「某一条策略的 K 线」，
     仓位是一篮子权重，画 K 线会误导。视图那边要用组合视图（绩效 / 阶段）。
     """
     from ttrade import cross as cross_engine
+    from ttrade import tqdata
 
     mk = market or market_of(cfg)
     period = getattr(cfg, "period", "") or "1d"
@@ -676,45 +808,38 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "",
     bt = make_bt(mk, resolve_allow_short(cfg), cfg)
     bt.bars_per_year = bars_per_year(panel.index)
 
-    ccfg = cross_engine.CrossConfig(
-        mode=getattr(cfg, "cross_mode", "hedge") or "hedge",
-        rebalance=max(1, int(getattr(cfg, "cross_rebalance", 5) or 5)),
-        rebalance_unit=getattr(cfg, "cross_rebalance_unit", "bar") or "bar",
-        top_pct=float(getattr(cfg, "cross_top_pct", 10.0) or 10.0),
-        bot_pct=float(getattr(cfg, "cross_bot_pct", 10.0) or 10.0),
-        long_only=bt.long_only,
-        short_only=bt.short_only,
-        weight=getattr(cfg, "cross_weight", "risk") or "risk",
-        weight_scope=getattr(cfg, "cross_weight_scope", "pooled") or "pooled",
-        tiers=int(getattr(cfg, "cross_tiers", 0) or 0),
-        tier_units=list(getattr(cfg, "cross_tier_units", []) or []),
-        pool_mode=getattr(cfg, "cross_pool_mode", "off") or "off",
-        pool_keys=list(getattr(cfg, "cross_pool_keys", []) or []),
-        pool_reverse=dict(getattr(cfg, "cross_pool_reverse", {}) or {}),
-        pool_top_pct=float(getattr(cfg, "cross_pool_pct", 60.0) or 60.0),
-        label_mode=getattr(cfg, "cross_label_mode", "volret") or "volret",
-        period=period,
-        factor_mode=getattr(cfg, "factor_mode", "multi") or "multi",
-        factor_keys=list(getattr(cfg, "factor_keys", []) or []),
-        factor_reverse=dict(getattr(cfg, "factor_reverse", {}) or {}),
-        factor_cfg=dict(getattr(cfg, "factor_cfg", {}) or {}),
-        timing_family=getattr(cfg, "timing_family", "rule") or "rule",
-        timing_rule_key=getattr(cfg, "timing_rule_key", "") or "",
-        timing_rule_params=dict(getattr(cfg, "timing_rule_params", {}) or {}),
-        timing_factor_mode=getattr(cfg, "timing_factor_mode", "single") or "single",
-        timing_factor_keys=list(getattr(cfg, "timing_factor_keys", []) or []),
-        timing_factor_reverse=dict(getattr(cfg, "timing_factor_reverse", {}) or {}),
-        timing_factor_cfg=dict(getattr(cfg, "timing_factor_cfg", {}) or {}),
-    )
+    ccfg = cross_config(cfg, bt, period=period,
+                        step1_frames=step1_frames,
+                        step2_frames=step2_frames)
     mode_cn = "截面对冲" if ccfg.mode == "hedge" else "截面选品种"
     fcn = {"single": "单因子", "multi": "多因子", "ml": "机器学习"}.get(
         ccfg.factor_mode, ccfg.factor_mode)
     label = (f"{mode_cn} · {fcn} · {len(frames)} 品种 · "
              f"{ccfg.step_text(fstrat.bars_per_day(panel.index))}调仓")
+    # 下面这几段和研究页一个字不差地拼一遍。**不写出来就没法解释同一个策略
+    # 为什么两条曲线差一倍**：以前这里只写到「每 10 天调仓」，先筛池 / 跨周期 /
+    # 杠杆三件事全看不见，用户只能怀疑程序算错
+    if ccfg.pool_keys:
+        _pu = "月" if str(ccfg.pool_reb_unit) == "month" else "交易日"
+        label += (f" · 先筛池 {ccfg.pool_top_pct:g}%"
+                  f"/每{int(ccfg.pool_reb)}{_pu}")
+    if ccfg.step1_period:
+        label += f" · 第一步因子用{tqdata.PERIOD_LABEL.get(ccfg.step1_period, ccfg.step1_period)}"
+    if ccfg.step2_period:
+        label += f" · 第二步因子用{tqdata.PERIOD_LABEL.get(ccfg.step2_period, ccfg.step2_period)}"
+    if ccfg.weight == "tier" and ccfg.tiers >= 2:
+        label += f" · {ccfg.tiers} 档"
+    try:
+        _lev = float(cross_engine.leverage_vector(frames, bt).mean() or 1.0)
+    except Exception:                        # noqa: BLE001 - 标签不能因它报错
+        _lev = 1.0
+    if abs(_lev - 1.0) > 1e-9:
+        label += f" · ×{_lev:.1f} 杠杆"
     out = cross_engine.run(frames, ccfg, bt,
                            profile=getattr(cfg, "cost_profile", "") or None,
                            label=label, timing_extra=timing_extra,
-                           factor_extra=factor_extra)
+                           factor_extra=factor_extra,
+                           step1_frames=step1_frames, step2_frames=step2_frames)
     if not out.ok:
         return Replay(error=out.error or "截面回测没有算出净值")
     res = cross_engine.to_result(out, label=label, step=out.step,

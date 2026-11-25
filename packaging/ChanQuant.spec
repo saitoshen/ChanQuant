@@ -33,7 +33,7 @@ APP_NAME = "ChanQuant"
 BUNDLE_ID = "com.chanquant.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "3.9.16"
+VERSION = "3.9.17"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
@@ -171,6 +171,10 @@ HIDDEN = [
     "matplotlib.backends.backend_agg",
     "ttrade.paths",
     "ttrade.selftest",
+    # 崩溃取证：`launcher.run()` 里是**函数内**的 `from ttrade import crashlog`。
+    # 静态分析其实扫得到（PyInstaller 读的是字节码，不分作用域），但这份名单
+    # 的用途就是「别指望分析器猜」，缺了它的后果是打包版静静地没有取证。
+    "ttrade.crashlog",
     # 因子策略的机器学习部分：模型按字符串动态 build()，PyInstaller 扫不到。
     # sklearn 的这几处是 GPR 的实际入口，缺了会在运行时报 ImportError。
     # 注意：别照抄网上抄来的 scipy.special._cdflib —— scipy 1.18 里已经没这个模块，
@@ -230,6 +234,11 @@ HIDDEN = [
     "gui.skills_dialog",
     "ttrade.skillpacks",
     "ttrade.replay",
+    # 截面实盘决策（父级一篮子算权重、腿槽位下单）。虽然是 strategy_runner
+    # 顶层 import、静态分析收得到，这里仍然显式列一份：打包后自检会直接
+    # `from ttrade import cross_live`，漏了就是一条没有明细的 ImportError
+    "ttrade.cross_live",
+    "ttrade.cross_ml",
     # 能力包注册表：`ttrade.skills` 里的每个模块靠 `__init__` 显式 import 完成
     # 注册。PyInstaller 静态扫描看不到「import 了但没被引用」，漏一个包就是
     # 界面上那几个动作静默消失（模型给了动作块，平台回「没有这个动作」）

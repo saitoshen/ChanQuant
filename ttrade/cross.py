@@ -42,7 +42,11 @@ from ttrade import factor_strategy as fstrat
 from ttrade.backtest import BacktestConfig, Trade
 from ttrade.strategies import STRATEGIES, run_strategy
 
-MIN_CROSS = 3          # 横截面上至少几个品种有值，才算得出一组强弱
+# 横截面上至少几个品种有值，才算得出一组强弱。
+# 2026-11-24 用户要求 3 → 2：两个品种已经能分出「一强一弱」，对冲模式正好
+# 一边持一个；再少（1 个）就只是单边，不是横截面。所有截面入口（回测、研究
+# 页、实盘 check_support、筛池）都读这一处，别再写死 3。
+MIN_CROSS = 2
 
 # 风险平价用的波动率窗口（根）。60 根日线约三个月，5 分钟 48 根一天的话是
 # 一天多一点 —— 都不至于慢到追不上波动率的变化，也不至于快到被一两根异常
@@ -358,7 +362,8 @@ def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
                 fcfg=None, progress=None, cancel=None,
                 label_mode: str = "volret",
                 factor_extra: dict[str, dict] | None = None,
-                base_period: str = "") -> pd.DataFrame:
+                base_period: str = "",
+                ml_collect: dict | None = None) -> pd.DataFrame:
     """截面合成分数。三种模式和时序那边对齐：单因子 / 多因子 / 机器学习。
 
     - `single`：取第一个因子，横截面 Z-score
@@ -371,9 +376,12 @@ def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
     `label_mode` 只对 ml 生效，口径见 `ml_score_panel`。
 
     `keys` 可以是因子实例（`mom_60@1w`）：同一个因子在几个周期上各算一份、
-    各占一列。`factor_extra` 是这些实例要用的别的周期行情
+    各占一列。    `factor_extra` 是这些实例要用的别的周期行情
     `{品种: {周期: 行情}}`，`base_period` 是 `frames` 是哪一档 —— 两者都不给
     时按「时间戳就是决策时刻」处理，和以前一样。
+
+    `ml_collect` 只给离线训练截面 ML 产物用：把每一折的模型 / 特征列 / 折边界
+    收进这个 dict。实盘不传，行为逐位不变。
     """
     keys = [k for k in (keys or []) if factors.is_factor(k)]
     if not keys:
@@ -392,7 +400,7 @@ def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
                 + "）：把周期改回「本周期」，或者用单因子 / 多因子"
             )
         return ml_score_panel(frames, keys, fcfg, progress=progress, cancel=cancel,
-                              label_mode=label_mode)
+                              label_mode=label_mode, collect=ml_collect)
 
     parts = []
     # 跨周期实例要用的行情没给全时**报缺行情**，不要退化成「这些因子都没有
@@ -455,7 +463,8 @@ def score_panel(frames: dict[str, pd.DataFrame], keys: list[str],
 
 
 def ml_score_panel(frames: dict[str, pd.DataFrame], keys: list[str], fcfg,
-                   progress=None, cancel=None, label_mode: str = "volret") -> pd.DataFrame:
+                   progress=None, cancel=None, label_mode: str = "volret",
+                   collect: dict | None = None) -> pd.DataFrame:
     """横截面机器学习打分：把所有品种的样本堆成一张长表，滚动训练。
 
     和时序 ML 的区别在**标签**。这里预测的是「同期比别的品种强多少」：每根 bar
@@ -474,6 +483,9 @@ def ml_score_panel(frames: dict[str, pd.DataFrame], keys: list[str], fcfg,
 
     训练样本按时间正序切折，训练集只取到 `b - horizon`：第 i 行的标签要等到
     i+h 才成立，混进训练集就是未来函数。
+
+    `collect` 只给离线训练截面 ML 产物用（见 `cross_ml`）：把每折模型、特征列、
+    折边界收出来。不传时和以前逐位一样。
     """
     from ttrade import factor_strategy as fstrat
     from ttrade import mlmodels as ML
@@ -561,6 +573,20 @@ def ml_score_panel(frames: dict[str, pd.DataFrame], keys: list[str], fcfg,
         bounds.append((max(0, t - train_bars), t, min(n, t + step_bars)))
         t += step_bars
 
+    if collect is not None:
+        # 截面 ML 离线产物要用的三件事：模型实际用的特征列、折边界、训练配置。
+        # 放在这里而不是产物模块里再抄一遍，是为了让「训练」和回测打分走同一段
+        # 代码 —— 抄一遍迟早会分叉，界面上却看不出来。
+        collect.clear()
+        collect.update({
+            "keys": list(use),
+            "label_mode": lm,
+            "fcfg": fcfg,
+            "bounds": list(bounds),
+            "ts": ts,
+            "models": [],
+        })
+
     pred = np.full(len(long), np.nan)
     done = 0
     for a, b, c in bounds:
@@ -577,6 +603,8 @@ def ml_score_panel(frames: dict[str, pd.DataFrame], keys: list[str], fcfg,
             model.fit(X[rows], Y[rows])
         except Exception:  # noqa: BLE001
             continue
+        if collect is not None:
+            collect["models"].append((model, a, b, c, int(len(rows))))
         want = (pos >= b) & (pos < c)
         try:
             pred[want] = model.predict(X[want])

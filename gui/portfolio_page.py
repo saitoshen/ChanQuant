@@ -299,14 +299,23 @@ def run_replay_job(cfg, kind: str, payload, with_bh: bool = True):
     DuckDB 连接不安全（研究页那条多品种也是先取数再进线程的）。
     """
     # payload 可能是 `(行情, 跨周期行情)` 这种两元组：别的周期的行情在主线程
-    # 里已经读好了（`_prepare`），后台线程只算。没配跨周期因子时就是单份行情
+    # 里已经读好了（`_prepare`），后台线程只算。没配跨周期因子时就是单份行情。
+    # 截面还可能是**三元组**（多一份第一步 / 第二步专用周期的行情），见下面。
     extra = None
+    step1_frames = step2_frames = None
     if isinstance(payload, tuple):
-        payload, extra = payload
+        if len(payload) == 3:
+            payload, extra, steps = payload
+            step1_frames, step2_frames = steps
+        else:
+            payload, extra = payload
     if kind == "cross":
         # 两份都是 `{品种: {周期: 行情}}`，同一份就够 —— 截面腿和时序腿可以指到
         # 不同周期上，但读的都是这几个品种的那几档行情
-        return replay.run_cross(cfg, payload, timing_extra=extra, factor_extra=extra)
+        return replay.run_cross(cfg, payload, timing_extra=extra,
+                                factor_extra=extra,
+                                step1_frames=step1_frames,
+                                step2_frames=step2_frames)
     if kind == "multi":
         return replay.run_multi(cfg, payload, extras=extra)
     return replay.run(cfg, payload, with_bh=with_bh, extra=extra)
@@ -491,6 +500,49 @@ class TrainWorker(QObject):
         keys = list(cfg.factor_keys or [])
         if len(keys) < 2:
             self.done.emit(False, "机器学习至少要 2 个因子")
+            return
+
+        # 截面 ML：整篮子一个模型，产物按**父 sid** 存一份。
+        # 和因子 ML 的「合并训练」不是一回事 —— 这里学的是相对强弱，
+        # 标签在横截面上减过均值，见 `cross.ml_score_panel`。
+        if str(getattr(cfg, "family", "") or "") == "cross" \
+                and str(getattr(cfg, "factor_mode", "") or "") == "ml":
+            from ttrade import cross_ml
+
+            self.log.emit(f"截面机器学习：{len(cfg.symbols)} 个品种一起训一个模型…")
+            try:
+                def _frames(p):
+                    out = {}
+                    for key in (cfg.symbols or []):
+                        sym, exn = replay.split_key(key, cfg.market)
+                        df = tqdata.load_main(sym, exn, p, adjust="qfq")
+                        if df is None or df.empty:
+                            continue
+                        df = replay.window(df, getattr(cfg, "range_years", 0) or 0)
+                        out[key] = df
+                    return out
+
+                base = _frames(cfg.period)
+                bt = replay.make_bt(replay.market_of(cfg),
+                                    replay.resolve_allow_short(cfg), cfg)
+                ccfg = replay.cross_config(cfg, bt, period=cfg.period)
+                step2 = None
+                if getattr(ccfg, "step2_period", "") \
+                        and ccfg.step2_period != cfg.period:
+                    step2 = _frames(ccfg.step2_period)
+                if len(step2 if step2 is not None else base) < 2:
+                    self.done.emit(False, "截面 ML 至少要 2 个品种有数据")
+                    return
+                art = cross_ml.train_from_strategy(
+                    cfg, base, step2_frames=step2,
+                    progress=lambda d, t, m: self.log.emit(f"    [{d}/{t}] {m}"),
+                    cancel=lambda: self._cancel)
+                self.done.emit(
+                    True, f"截面 ML 训练完成：{art.n_folds} 折  "
+                          f"{art.train_seconds:.1f}s  "
+                          f"（{len(art.symbols)} 个品种一个模型）")
+            except Exception as exc:  # noqa: BLE001
+                self.done.emit(False, f"截面 ML 训练失败：{type(exc).__name__}: {exc}")
             return
 
         # 合并训练：所有品种的样本一起训一个模型，产物按父 sid 存一份
@@ -1026,11 +1078,12 @@ def _split_key(key: str, market: str = "") -> tuple[str, str]:
 def _is_multi_cfg(cfg) -> bool:
     """这条策略能不能「展开成一个品种一行」。
 
-    只有多品种等权可以：截面策略的品种是一篮子同时按权重调仓，拆成一行行说
-    「这个品种的目标仓是多少手」本身就没有意义（它只有权重）。
+    多品种等权和截面都算（2026-11-24 用户要求）：两条路在实盘里都拆成
+    「一个品种一个子槽位」（`PortfolioRunner.children_of`），快照里本来就
+    有逐品种的目标 / 理论 / 盈亏。区别只在钱的口径 —— 多品种按 1/N 折本金，
+    截面按父级一篮子给的权重（`cross_w`）折手数。以前把截面挡在外面，是
+    因为误以为「它只有权重没有手数」；现在腿上确实有手数了，没理由不显示。
     """
-    if str(getattr(cfg, "family", "") or "") == "cross":
-        return False
     try:
         return len(list(getattr(cfg, "symbols", None) or [])) >= 2
     except Exception:  # noqa: BLE001 - 坏配置不该把整页带崩
@@ -1061,6 +1114,30 @@ def _child_size_text(cfg) -> str:
     return f"资金 {pct:g}% · {per * pct / 100 / 10000:,.1f} 万"
 
 
+def _cross_child_size_text(cfg, slot: dict | None = None) -> str:
+    """截面子行的「仓位」：这一腿分到的**权重**和对应名义额。
+
+    截面不能套 `_child_size_text()` 的「本金 ÷ 品种数」—— 权重是按一篮子归一
+    过的（Σ|w| = 杠杆），再除 N 就把杠杆除没了。这里直接显示引擎写进槽位的
+    `cross_w`：正数多头、负数空头，名义额 = 整份本金 × |权重|。
+    """
+    mode = str(getattr(cfg, "cross_weight", "") or "equal")
+    label = {"risk": "风险平价", "equal": "等权", "score": "按分数",
+             "tier": "分档"}.get(mode, mode)
+    w = 0.0
+    if slot:
+        try:
+            w = float(slot.get("cross_w", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            w = 0.0
+    if not w:
+        return f"{label}权重（待算）"
+    principal = float(getattr(cfg, "principal", 0) or 0)
+    side = "多" if w > 0 else "空"
+    return (f"{label} {side} {w:+.3f} · "
+            f"{principal * abs(w) / 10000:,.1f} 万")
+
+
 def _sym_text(cfg) -> str:
     """策略表「标的」列。
 
@@ -1082,6 +1159,144 @@ def _sym_tip(cfg) -> str:
     kind = ("截面品种池" if cfg.family == "cross"
             else "多品种等权：每个品种各跑一遍再平均")
     return f"{kind}，共 {len(syms)} 个\n{head}"
+
+
+class FactorPickDialog(QDialog):
+    """因子多选：`用` / `因子` / `反向` 三列 + 一个过滤框。
+
+    为什么不复用「策略研究」页那张大表：那张表挂在 `MainWindow` 的侧边栏上，
+    是**同一条策略的编辑现场**（切换策略、保存配置都认它）。组合页里的
+    「设置参数」是另一份配置（`portfolio.json` 里那一条），两边共用一张表的话，
+    在这个框里勾一下就把研究页正在调的因子改了 —— 正是本项目一直在防的
+    「同一个东西两个出处」。
+
+    这里只要能改**用哪几个、哪个要反向**，所以按市场过滤 + 搜索就够了。
+    """
+
+    def __init__(self, market: str, keys, reverse, single: bool = False,
+                 title: str = "选择因子", parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(460, 560)
+        self._single = bool(single)
+
+        from ttrade import factors as F
+
+        self._F = F
+        want = set(keys or [])
+        rev = dict(reverse or {})
+        # 按市场过滤，再按类别分组排。**顺序取自注册表**（`CATEGORIES` 的次序），
+        # 不按字母排 —— 用户找「动量」时是成组找的，不是按拼音找
+        allowed = set(F.filter_by_market(market))
+        rows: list[tuple[str, str, str]] = []
+        for cat in F.categories_for_market(market):
+            for k, spec in F.FACTORS.items():
+                if k in allowed and spec.category == cat:
+                    rows.append((k, spec.label, cat))
+        # 选中但不在注册表里的（自定义因子被删了、或跨市场配置）也要列出来，
+        # 否则一保存就被静默丢掉
+        known = {r[0] for r in rows}
+        for k in (keys or []):
+            if k not in known:
+                rows.insert(0, (k, F.FACTORS[k].label if k in F.FACTORS else k, "其它"))
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+        self.ed_find = QLineEdit()
+        self.ed_find.setPlaceholderText("输入关键字过滤（因子名 / 类别）")
+        self.ed_find.textChanged.connect(self._filter)
+        lay.addWidget(self.ed_find)
+
+        self.lbl_n = _hint("")
+        lay.addWidget(self.lbl_n)
+
+        self.tbl = QTableWidget(0, 3)
+        self.tbl.setHorizontalHeaderLabels(["用", "因子", "反向"])
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        hh = self.tbl.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Fixed)
+        hh.resizeSection(0, 34)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.Fixed)
+        hh.resizeSection(2, 46)
+        self.tbl.setRowCount(len(rows))
+        flags = Qt.ItemIsUserCheckable | Qt.ItemIsEnabled
+        for i, (k, label, cat) in enumerate(rows):
+            c0 = QTableWidgetItem("")
+            c0.setFlags(flags)
+            c0.setCheckState(Qt.Checked if k in want else Qt.Unchecked)
+            c0.setData(Qt.UserRole, k)
+            self.tbl.setItem(i, 0, c0)
+            c1 = QTableWidgetItem(f"{label}　·　{cat}")
+            c1.setData(Qt.UserRole, label)
+            self.tbl.setItem(i, 1, c1)
+            c2 = QTableWidgetItem("")
+            c2.setFlags(flags)
+            c2.setCheckState(Qt.Checked if rev.get(k) else Qt.Unchecked)
+            self.tbl.setItem(i, 2, c2)
+            if k in want:
+                self.tbl.selectRow(i)
+        self.tbl.itemChanged.connect(self._on_item)
+        lay.addWidget(self.tbl, 1)
+
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        lay.addWidget(box)
+        self._refresh()
+
+    def _filter(self, text: str) -> None:
+        flt = str(text or "").strip().lower()
+        for i in range(self.tbl.rowCount()):
+            it = self.tbl.item(i, 1)
+            hit = (not flt) or flt in (it.text() if it is not None else "").lower()
+            self.tbl.setRowHidden(i, not hit)
+
+    def _on_item(self, item: QTableWidgetItem) -> None:
+        """单选模式：勾一个就把别的取消掉。
+
+        `itemChanged` 里改别的行会**递归**触发一遍，所以先 `blockSignals`。
+        """
+        if not self._single or item.column() != 0:
+            return
+        if item.checkState() != Qt.Checked:
+            return
+        self.tbl.blockSignals(True)
+        for i in range(self.tbl.rowCount()):
+            other = self.tbl.item(i, 0)
+            if other is not None and other is not item:
+                other.setCheckState(Qt.Unchecked)
+        self.tbl.blockSignals(False)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        n = len(self.value()[0])
+        self.lbl_n.setText(f"已选 {n} 个" + ("（单选）" if self._single else ""))
+
+    def value(self) -> tuple[list[str], dict]:
+        """(选中的因子 key 列表, {key: 反向})。顺序 = 表里的顺序。"""
+        keys, rev = [], {}
+        for i in range(self.tbl.rowCount()):
+            c0, c2 = self.tbl.item(i, 0), self.tbl.item(i, 2)
+            if c0 is None or c0.checkState() != Qt.Checked:
+                continue
+            k = c0.data(Qt.UserRole)
+            if not k:
+                continue
+            keys.append(k)
+            if c2 is not None and c2.checkState() == Qt.Checked:
+                rev[k] = True
+        return keys, rev
+
+    def accept(self) -> None:
+        if not self.value()[0]:
+            QMessageBox.information(self, "还没选因子",
+                                    "至少要勾一个因子（一个都不勾就退出）")
+            return
+        super().accept()
 
 
 class EditDialog(QDialog):
@@ -1139,7 +1354,15 @@ class EditDialog(QDialog):
         self.cb_size = QComboBox()
         for text, val in (("按资金分配", "capital"),
                           ("按止损金额", "risk"),
-                          ("固定手数", "fixed")):
+                          ("固定手数", "fixed"),
+                          # 🔴 `unit` 以前**没列在这儿**，而它是 `BacktestConfig`
+                          # 的默认口径（「名义敞口 = 权益，不加杠杆、不看乘数」）。
+                          # 库里存着 `sizing=unit` 的策略，只要在这一页点开一次
+                          # 「设置参数」再确定，`findData` 回 -1、`max(i,0)` 落到
+                          # 第一项 ⇒ 静默变成 `capital`，手数从「本金全额」变成
+                          # 「本金 ÷ 每手保证金」，同一条策略凭空多出十倍杠杆
+                          # （2026-11-24 和「截面参数没读出来」一起发现的）
+                          ("本金全额（不加杠杆）", "unit")):
             self.cb_size.addItem(text, val)
         i = self.cb_size.findData(cfg.sizing or "capital")
         self.cb_size.setCurrentIndex(max(i, 0))
@@ -1147,7 +1370,8 @@ class EditDialog(QDialog):
             "按资金：手数 = 本金 × 资金比例 ÷ 每手保证金。\n"
             "杠杆由品种自己的保证金比例决定（商品、股指约 10 倍，国债 30~50 倍）。\n"
             "按止损金额：手数 = 本金 × 止损比例 ÷（止损倍数 × ATR × 合约乘数）。\n"
-            "固定手数：老的「几手」口径。"
+            "固定手数：老的「几手」口径。\n"
+            "本金全额：名义敞口就等于权益，不加杠杆也不看合约乘数（美股 / 批量脚本）。"
         )
         form.addRow("仓位分配", self.cb_size)
 
@@ -1262,6 +1486,10 @@ class EditDialog(QDialog):
                 it.setForeground(QColor(C_MUTED))
                 bad_acct.append(a)
             self.lst_acct.addItem(it)
+        # 高度按行数给：这条对话框本来就长，一个空列表也占满 104px 纯属浪费。
+        # 上限还是 104（账户多的时候照旧能滚），空的时候只留一行的高度。
+        self.lst_acct.setMaximumHeight(
+            min(104, 26 * max(1, self.lst_acct.count()) + 8))
         form.addRow("交易账户", self.lst_acct)
         if not accounts:
             form.addRow("", _hint("还没有交易账户，先到「账户透视和交易」页添加"))
@@ -1302,6 +1530,17 @@ class EditDialog(QDialog):
                 "再存入策略库、重新加入组合"
             ))
 
+        # ---- 截面策略参数（两步）----
+        # 2026-11-24 用户报「同一份配置，组合页和研究页两个结果」之后补的。
+        # 当时这一页对截面策略**一个专科参数都没有**（既没有 rule_params 也没有
+        # 因子块），于是「先筛池多久重排一次」「第一步 / 第二步各自用哪个周期的
+        # 因子」「多空是合并分钱还是各半仓」这些只有研究页能改 —— 而研究页改完
+        # 存进策略库、再加进组合，这里又看不见，用户自然会怀疑"没读出来"。
+        if cfg.family == "cross":
+            self._build_cross(cfg, form)
+        else:
+            self.cb_pool = None
+
         # ---- 回测区间 ----
         self.cb_range = QComboBox()
         for text, years in RANGE_CHOICES:
@@ -1326,6 +1565,419 @@ class EditDialog(QDialog):
         box.accepted.connect(self.accept)
         box.rejected.connect(self.reject)
         form.addRow(box)
+
+    # ---- 截面策略参数（两步）------------------------------------------
+
+    def _build_cross(self, cfg, form: QFormLayout) -> None:
+        """截面策略的专科参数。**字段名和研究页一一对应**，两边读同一份存盘。
+
+        分两段是照抄研究页的理由：第一步只决定「谁有资格进场」，第二步才决定
+        「谁强谁弱、怎么分钱」。混成一片的话，改「筛池保留比例」会让人以为
+        连排名也动了。
+        """
+        from gui.app import CROSS_SCOPES, CROSS_WEIGHTS
+        from ttrade import factors as F
+        from ttrade import tqdata
+
+        self._cross_market = cfg.market
+        self._f_keys = list(cfg.factor_keys or [])
+        self._f_rev = dict(cfg.factor_reverse or {})
+        self._pool_keys = list(cfg.cross_pool_keys or [])
+        self._pool_rev = dict(cfg.cross_pool_reverse or {})
+
+        def _per_combo(cur: str) -> QComboBox:
+            """「跟随策略周期 + 各档周期」。当前值不在清单里就补进去。"""
+            cb = QComboBox()
+            cb.addItem("跟随策略周期", "")
+            order = list(tqdata.PERIOD_ORDER)
+            if cur and cur not in order:
+                order.insert(0, cur)
+            for p in order:
+                cb.addItem(PERIOD_LABEL.get(p, p), p)
+            i = cb.findData(cur or "")
+            cb.setCurrentIndex(max(0, i))
+            return cb
+
+        # ---------------- 两栏并排 ----------------
+        # 用户 2026-11-24：这个框竖着排了二十多行，右边还有一根滚动条，一屏看
+        # 不完。而第一步 / 第二步本来就是一左一右两件事 —— 研究页那个
+        # `CrossSetupDialog` 也是左右并排（参照期权 T 型报价：左边一列、右边
+        # 一列、中间一道分隔）。这里照做，同时把能合的行合掉：
+        # 间隔+单位、多头+空头、档数+份数 各占一行，右栏从 10 行压到 7 行。
+        def _row(a, b, sa: int = 0, sb: int = 1) -> QWidget:
+            """两个控件挤一行。`sa` / `sb` 是拉伸比例。"""
+            w = QWidget()
+            h = QHBoxLayout(w)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(6)
+            h.addWidget(a, sa)
+            h.addWidget(b, sb)
+            return w
+
+        wrap = QWidget()
+        cols = QHBoxLayout(wrap)
+        cols.setContentsMargins(0, 0, 0, 0)
+        cols.setSpacing(16)
+
+        left, col1 = self._cross_column("1", "第一步 · 筛品种池",
+                                        "谁有资格进场，不改方向")
+        right, col2 = self._cross_column("2", "第二步 · 截面选多空",
+                                         "谁强谁弱、怎么分钱")
+        cols.addWidget(left, 1)
+        cols.addWidget(right, 1)
+        form.addRow(wrap)
+        self._cross_cols = (left, right)
+
+        # ---------------- 第一步 · 左栏 ----------------
+        self.cb_pool = QComboBox()
+        self.cb_pool.addItem("关闭（全部品种都参与排名）", "off")
+        self.cb_pool.addItem("单因子筛池", "single")
+        _pm = str(cfg.cross_pool_mode or "off")
+        if _pm not in ("off", "single"):
+            # multi / ml 的筛池只能在研究页配（要多因子表或训练），这里只保证
+            # **显示成它本来的样子**，不许静默改成 single
+            self.cb_pool.addItem(f"{_pm}（在研究页配）", _pm)
+        self.cb_pool.setCurrentIndex(max(0, self.cb_pool.findData(_pm)))
+        self.cb_pool.setToolTip(
+            "用「能不能交易」这类慢变量筛一遍池子，再在池内排强弱。\n"
+            "典型：成交额 20 日（对数）留前 60% —— 流动性差的品种不进排名，\n"
+            "否则等权之后小品种的权重被放大，换手和滑点全上去了。"
+        )
+        col1.addRow("筛池方式", self.cb_pool)
+
+        self.btn_pool_factor = QPushButton("")
+        self.btn_pool_factor.clicked.connect(self._pick_pool_factor)
+        col1.addRow("筛池因子", self.btn_pool_factor)
+
+        self.sp_pool_pct = QDoubleSpinBox()
+        self.sp_pool_pct.setRange(1.0, 100.0)
+        self.sp_pool_pct.setDecimals(0)
+        self.sp_pool_pct.setSingleStep(5.0)
+        self.sp_pool_pct.setSuffix(" %")
+        self.sp_pool_pct.setValue(float(cfg.cross_pool_pct or 60.0))
+        self.sp_pool_pct.setToolTip("池里保留分数最高的百分之几。")
+        col1.addRow("筛池保留", self.sp_pool_pct)
+
+        self.sp_pool_reb = QSpinBox()
+        self.sp_pool_reb.setRange(1, 240)
+        self.sp_pool_reb.setValue(max(1, _int(cfg.cross_pool_reb) or 1))
+        self.sp_pool_reb.setToolTip(
+            "多久重排一次池子。两次重排之间**沿用上一次的池**。\n\n"
+            "筛池因子是慢变量（成交额 20 日、持仓），每根 bar 重排一次不但是白算，\n"
+            "盘中的抖动还会让边界品种进进出出、换手凭空变高。\n\n"
+            "🔴 这一项以前没被读出来：库里存 200 天，组合页按默认 1 天跑，\n"
+            "同一条策略年化 128.98% 变成 71.90%（2026-11-24）。"
+        )
+        self.cb_pool_unit = QComboBox()
+        self.cb_pool_unit.addItem("交易日", "day")
+        self.cb_pool_unit.addItem("个月", "month")
+        i = self.cb_pool_unit.findData(str(cfg.cross_pool_reb_unit or "day"))
+        self.cb_pool_unit.setCurrentIndex(max(0, i))
+        # 「127 交易日」是一个数，不该拆成两行；拆开之后右栏就多一行要滚
+        col1.addRow("筛池重排",
+                    _row(self.sp_pool_reb, self.cb_pool_unit, sa=0, sb=1))
+
+        self.cb_step1p = _per_combo(str(cfg.cross_step1_period or ""))
+        self.cb_step1p.setToolTip(
+            "第一步的筛池因子按哪个周期算。\n"
+            "典型：策略跑 5 分钟、第一步用**日线**成交额筛池 —— 流动性是几天、\n"
+            "几周的量级，拿 5 分钟成交额排名只会被当天消息面带着走。\n\n"
+            "跨周期只用**已经收完**的那一根，不会把收盘结果提前灌进上午的 bar。"
+        )
+        col1.addRow("第一步因子周期", self.cb_step1p)
+
+        # ---------------- 第二步 · 右栏 ----------------
+        self.cb_fmode = QComboBox()
+        for key, label in (("single", "单因子"), ("multi", "多因子"),
+                           ("ml", "机器学习（组合页跑会现场训练）")):
+            self.cb_fmode.addItem(label, key)
+        i = self.cb_fmode.findData(str(cfg.factor_mode or "multi"))
+        self.cb_fmode.setCurrentIndex(max(0, i))
+        col2.addRow("因子模式", self.cb_fmode)
+
+        self.btn_factors = QPushButton("")
+        self.btn_factors.clicked.connect(self._pick_factors)
+        col2.addRow("截面因子", self.btn_factors)
+
+        self.cb_step2p = _per_combo(str(cfg.cross_step2_period or ""))
+        self.cb_step2p.setToolTip(
+            "第二步（排名 / 分强弱）按哪个周期的因子算，**和第一步互不影响**。\n"
+            "典型：第一步日线筛池、第二步用 1 小时动量排名。"
+        )
+        col2.addRow("第二步因子周期", self.cb_step2p)
+
+        self.sp_reb = QSpinBox()
+        self.sp_reb.setRange(1, 250)
+        self.sp_reb.setValue(max(1, _int(cfg.cross_rebalance) or 5))
+        self.sp_reb.setToolTip(
+            "多久换一次仓。按「根」时是 K 线根数（对冲模式默认），\n"
+            "按「交易日 / 个月」时回测会自动按数据的实际密度折成根数。"
+        )
+        self.cb_reb_unit = QComboBox()
+        for text, key in (("根", "bar"), ("交易日", "day"), ("个月", "month")):
+            self.cb_reb_unit.addItem(text, key)
+        i = self.cb_reb_unit.findData(str(cfg.cross_rebalance_unit or "bar"))
+        self.cb_reb_unit.setCurrentIndex(max(0, i))
+        col2.addRow("调仓间隔",
+                    _row(self.sp_reb, self.cb_reb_unit, sa=0, sb=1))
+
+        self.sp_top = QDoubleSpinBox()
+        self.sp_top.setRange(1.0, 50.0)
+        self.sp_top.setDecimals(0)
+        self.sp_top.setSingleStep(1.0)
+        self.sp_top.setSuffix(" %")
+        self.sp_top.setValue(float(cfg.cross_top_pct or 10.0))
+        self.sp_top.setToolTip("多头：选截面分数最强的 top X%。")
+        self.sp_bot = QDoubleSpinBox()
+        self.sp_bot.setRange(1.0, 50.0)
+        self.sp_bot.setDecimals(0)
+        self.sp_bot.setSingleStep(1.0)
+        self.sp_bot.setSuffix(" %")
+        self.sp_bot.setValue(float(cfg.cross_bot_pct or 10.0))
+        self.sp_bot.setToolTip("空头：选截面分数最弱的 bottom X%（可以和多头不同）。")
+        # 多 / 空是一对，并成一行：「多 30% 空 30%」比上下两行好读
+        _legs = QWidget()
+        _lh = QHBoxLayout(_legs)
+        _lh.setContentsMargins(0, 0, 0, 0)
+        _lh.setSpacing(4)
+        _lh.addWidget(QLabel("多"))
+        _lh.addWidget(self.sp_top, 1)
+        _lh.addWidget(QLabel("空"))
+        _lh.addWidget(self.sp_bot, 1)
+        col2.addRow("多空比例", _legs)
+
+        self.cb_weight = QComboBox()
+        for key, label, tip in CROSS_WEIGHTS:
+            self.cb_weight.addItem(label, key)
+            self.cb_weight.setItemData(self.cb_weight.count() - 1, tip,
+                                       Qt.ToolTipRole)
+        i = self.cb_weight.findData(str(cfg.cross_weight or "risk"))
+        self.cb_weight.setCurrentIndex(max(0, i))
+        col2.addRow("资金分配", self.cb_weight)
+
+        self.cb_scope = QComboBox()
+        for key, label, tip in CROSS_SCOPES:
+            self.cb_scope.addItem(label, key)
+            self.cb_scope.setItemData(self.cb_scope.count() - 1, tip,
+                                      Qt.ToolTipRole)
+        i = self.cb_scope.findData(str(cfg.cross_weight_scope or "pooled"))
+        self.cb_scope.setCurrentIndex(max(0, i))
+        self.cb_scope.setToolTip(
+            "分母取「多 + 空合起来」还是「各腿自己」——\n"
+            "这一项决定**净敞口是否钉 0**，同一条策略两种口径能差一倍。\n"
+            "复现 HL point 那类严格中性策略必须用「多空各半仓」。"
+        )
+        col2.addRow("分配范围", self.cb_scope)
+
+        self.sp_tiers = QSpinBox()
+        self.sp_tiers.setRange(2, 6)
+        self.sp_tiers.setValue(max(2, _int(cfg.cross_tiers) or 3))
+        self.sp_tiers.setPrefix("分 ")
+        self.sp_tiers.setSuffix(" 档")
+        self.ed_units = QLineEdit()
+        # placeholder 只放一个例子：写长句会被挤成「份数 4,2,1（留空＝按 2…」，
+        # 说法放 tooltip 里（两栏并排后这一格只有一百多像素宽）
+        self.ed_units.setPlaceholderText("4,2,1")
+        self.ed_units.setToolTip(
+            "每档分配几份，从第 1 档（分数最高）往后依次给。\n"
+            "留空 = 按 2 的幂递减：4,2,1（分 3 档时）。\n\n"
+            "只有「资金分配」选「分档（排名越靠前给越多）」时这一项才有用。")
+        self.ed_units.setText(
+            "、".join(f"{u:g}" for u in (cfg.cross_tier_units or [])))
+        col2.addRow("分档 / 份数",
+                    _row(self.sp_tiers, self.ed_units, sa=0, sb=1))
+
+        if str(cfg.cross_mode or "hedge") != "hedge":
+            form.addRow(_hint(
+                "「截面选品种 + 时序交易」的时序腿（用哪条规则 / 因子、怎么进怎么出）"
+                "还在「策略研究」页调 —— 这里只调截面那两步"))
+
+        self.cb_pool.currentIndexChanged.connect(self._sync_cross)
+        self.cb_weight.currentIndexChanged.connect(self._sync_cross)
+        self.cb_fmode.currentIndexChanged.connect(self._sync_cross)
+        self._sync_cross()
+        # 两栏等宽：右栏字段多（还有一条带 placeholder 的输入框），最小宽度天生
+        # 比左栏大（实测 285 vs 580），不抹平的话左栏被挤成一条窄带、标签全成
+        # 省略号。**必须在所有行都 addRow 完之后算** —— 早算时两栏都还是空的。
+        _l, _r = self._cross_cols
+        _w = max(_l.minimumSizeHint().width(), _r.minimumSizeHint().width())
+        _l.setMinimumWidth(_w)
+        _r.setMinimumWidth(_w)
+        # 两栏并排之后比原来宽一倍：窄了会把「机器学习（组合页跑会现场训练）」
+        # 这种长标签挤成省略号，反而更难看
+        self.setMinimumWidth(max(760, 2 * _w + 80))
+
+    def _cross_column(self, step: str, title: str,
+                      sub: str) -> tuple[QWidget, QFormLayout]:
+        """截面参数的一栏：徽标 + 标题 + 一句说明 + 自己的 `QFormLayout`。
+
+        用 `QFrame#SubCard` 包起来（和研究页 `CrossSetupDialog._pane` 同一个观感）：
+        两栏并排却没有任何边界时，右边那栏的「因子模式」看着像是左边「第一步因子
+        周期」的下一行 —— 那正是这一块要避免的误读。
+
+        样式直接借 `gui.cross_dialog` 的 `_TITLE` / `_HINT` / `_BADGE`：两个页面
+        说的是同一件事，长得不一样反而让人以为是两套参数。
+        """
+        from PySide6.QtWidgets import QFrame
+        from gui.cross_dialog import _BADGE, _HINT, _TITLE
+
+        box = QFrame()
+        box.setObjectName("SubCard")
+        v = QVBoxLayout(box)
+        v.setContentsMargins(12, 10, 12, 10)
+        v.setSpacing(4)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        badge = QLabel(step)
+        badge.setStyleSheet(_BADGE)
+        badge.setAlignment(Qt.AlignCenter)
+        head.addWidget(badge, 0, Qt.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        t = QLabel(title)
+        t.setStyleSheet(_TITLE)
+        s = QLabel(sub)
+        s.setStyleSheet(_HINT)
+        s.setWordWrap(True)
+        col.addWidget(t)
+        col.addWidget(s)
+        head.addLayout(col, 1)
+        v.addLayout(head)
+        inner = QFormLayout()
+        inner.setContentsMargins(0, 6, 0, 0)
+        inner.setSpacing(6)
+        inner.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        inner.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        v.addLayout(inner)
+        v.addStretch(1)
+        return box, inner
+
+    def _factor_text(self, keys, rev: dict, empty: str = "（未选）",
+                     limit: int = 6) -> str:
+        """按钮上那行字：因子标签 + 反向标记 + 条数。"""
+        from ttrade import factors as F
+
+        ks = list(keys or [])
+        if not ks:
+            return empty
+        names = []
+        for k in ks[:limit]:
+            base = str(k).split("@")[0]
+            lab = F.FACTORS[base].label if base in F.FACTORS else base
+            suffix = str(k)[len(base):]
+            names.append(f"{lab}{suffix}" + ("↺" if rev.get(k) else ""))
+        more = f" 等 {len(ks)} 个" if len(ks) > limit else ""
+        return "、".join(names) + more
+
+    def _factor_list_text(self, keys, rev: dict, per_line: int = 4) -> str:
+        """完整因子清单，给 tooltip 用（按钮上只写条数）。
+
+        右栏的「截面因子」原来把最多 6 个因子名铺在按钮上、后面跟「等 23 个」，
+        最小宽度被撑到 470px —— 两栏并排之后左栏只剩 285px，长标签全成了省略号
+        （2026-11-24 实测）。条数写在按钮上、清单放进 tooltip，两栏才能等宽。
+        """
+        from ttrade import factors as F
+
+        ks = list(keys or [])
+        if not ks:
+            return ""
+        names = []
+        for k in ks:
+            base = str(k).split("@")[0]
+            lab = F.FACTORS[base].label if base in F.FACTORS else base
+            suffix = str(k)[len(base):]
+            names.append(f"{lab}{suffix}" + ("↺" if rev.get(k) else ""))
+        lines = ["、".join(names[i:i + per_line])
+                 for i in range(0, len(names), per_line)]
+        return "\n".join(lines) + "\n\n（↺ = 反向）"
+
+    def _pick_pool_factor(self) -> None:
+        dlg = FactorPickDialog(self._cross_market, self._pool_keys,
+                              self._pool_rev, single=True,
+                              title="筛池因子（单因子）", parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            self._pool_keys, self._pool_rev = dlg.value()
+
+    def _pick_factors(self) -> None:
+        dlg = FactorPickDialog(self._cross_market, self._f_keys, self._f_rev,
+                              single=self.cb_fmode.currentData() == "single",
+                              title="截面因子", parent=self)
+        if dlg.exec() == QDialog.Accepted:
+            self._f_keys, self._f_rev = dlg.value()
+
+    def _sync_cross(self) -> None:
+        """按「筛池开关 / 资金分配」把用不上的行灰掉，按钮文字跟着刷新。
+
+        灰掉而不是隐藏：`QFormLayout.setRowVisible` 在老 Qt 上没有，而且这些
+        参数一旦藏起来，用户会以为「没这一项」。
+        """
+        if getattr(self, "cb_pool", None) is None:
+            return
+        pool_on = self.cb_pool.currentData() != "off"
+        # 第一步因子周期也算「筛池」的一部分：池子关掉之后它读都不读，
+        # 留着可点只会让人以为筛池还在起作用
+        for w in (self.btn_pool_factor, self.sp_pool_pct, self.sp_pool_reb,
+                  self.cb_pool_unit, self.cb_step1p):
+            w.setEnabled(pool_on)
+        self.btn_pool_factor.setText(
+            self._factor_text(self._pool_keys, self._pool_rev,
+                              empty="点这里选一个筛池因子"))
+        multi = self.cb_fmode.currentData() != "single"
+        # 按钮上只写「几个因子」，完整清单进 tooltip —— 见 `_factor_list_text`
+        _n = len(self._f_keys)
+        self.btn_factors.setText(
+            (f"{_n} 个因子 · 点这里改" if _n else "点这里选截面因子")
+            + ("" if multi else "（只取第一个）"))
+        _tip = self._factor_list_text(self._f_keys, self._f_rev)
+        self.btn_factors.setToolTip(_tip + "\n\n点这里改因子和方向" if _tip
+                                    else "点这里选截面因子")
+        tier_on = self.cb_weight.currentData() == "tier"
+        for w in (self.sp_tiers, self.ed_units):
+            w.setEnabled(tier_on)
+
+    def _apply_cross(self, cfg) -> None:
+        """把这一块写回配置。字段名和研究页**逐个对应**，漏一个就是又一条曲线。"""
+        if getattr(self, "cb_pool", None) is None:
+            return
+        cfg.cross_pool_mode = self.cb_pool.currentData() or "off"
+        cfg.cross_pool_keys = list(self._pool_keys)
+        cfg.cross_pool_reverse = dict(self._pool_rev)
+        cfg.cross_pool_pct = float(self.sp_pool_pct.value())
+        cfg.cross_pool_reb = int(self.sp_pool_reb.value())
+        cfg.cross_pool_reb_unit = self.cb_pool_unit.currentData() or "day"
+        cfg.cross_step1_period = self.cb_step1p.currentData() or ""
+
+        cfg.factor_mode = self.cb_fmode.currentData() or "multi"
+        keys = list(self._f_keys)
+        # 单因子模式只认第一个：`score_panel` 在 single 下本来也只取 keys[0]，
+        # 留着 16 个会让「因子」那一列显示 16 个而实际只用了 1 个
+        if cfg.factor_mode == "single" and len(keys) > 1:
+            keys = keys[:1]
+        cfg.factor_keys = keys
+        cfg.factor_reverse = dict(self._f_rev)
+        cfg.cross_step2_period = self.cb_step2p.currentData() or ""
+
+        cfg.cross_rebalance = int(self.sp_reb.value())
+        cfg.cross_rebalance_unit = self.cb_reb_unit.currentData() or "bar"
+        cfg.cross_top_pct = float(self.sp_top.value())
+        cfg.cross_bot_pct = float(self.sp_bot.value())
+        cfg.cross_weight = self.cb_weight.currentData() or "risk"
+        cfg.cross_weight_scope = self.cb_scope.currentData() or "pooled"
+        cfg.cross_tiers = (int(self.sp_tiers.value())
+                           if cfg.cross_weight == "tier" else 0)
+        units: list[float] = []
+        for tok in str(self.ed_units.text() or "").replace("，", ",").split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                v = float(tok)
+            except ValueError:
+                continue
+            if v > 0:
+                units.append(v)
+        cfg.cross_tier_units = units
 
     def _sync_dir(self, _checked: bool = False) -> None:
         """方向两个开关联动，和研究页同一套规则（见 `MainWindow._sync_dir_flags`）。"""
@@ -1397,6 +2049,9 @@ class EditDialog(QDialog):
         if self.chk_reverse is not None:
             cfg.rule_reverse = self.chk_reverse.isChecked()
         cfg.range_years = float(self.cb_range.currentData() or 0.0)
+        # 截面两步的专科参数（筛池 / 跨周期 / 腿数 / 分配范围）。不在这一页的
+        # 策略没有这些控件，`_apply_cross` 自己会跳过
+        self._apply_cross(cfg)
 
         if self.pick is not None:
             picked = [k for k in self.pick.selected() if k]
@@ -1732,7 +2387,7 @@ class PortfolioPage(QWidget):
             "训完实盘就直接用这些模型算信号（只预测，不重训）—— "
             "实测 65 因子 × 26 万根 5m 的策略，重训要 34 秒/品种，"
             "用产物只要 3 秒。\n"
-            "多品种策略每个品种训一份。")
+            "多品种策略每个品种训一份；截面机器学习整篮子训一份相对强弱模型。")
         self.btn_train.clicked.connect(self._train_selected)
         head.addWidget(self.btn_train)
 
@@ -1775,7 +2430,7 @@ class PortfolioPage(QWidget):
         # 而「看一眼这条策略的历史表现」没有别的入口 —— 双击给后者更值。
         self.tbl_strat.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tbl_strat.doubleClicked.connect(self._on_row_double)
-        # 多品种策略：点一下名称展开成「一个品种一行」，再点收起。
+        # 多品种 / 截面策略：点一下名称展开成「一个品种一行」，再点收起。
         # 注意 `cellClicked` 是 (row, col) 两个 int，**不是** QModelIndex ——
         # 早先按 QModelIndex 写，单击时 `index.column()` 抛 AttributeError，
         # 被 PySide 吞掉，表现成「点一下没反应」（2026-11-19 用户反馈）
@@ -1795,9 +2450,10 @@ class PortfolioPage(QWidget):
             "所以当天开的仓（没有隔夜仓）两个数必然相等。\n"
             "最后一行「合计」= 上面所有策略的这两个数相加（展开出来的品种行不重复计）；"
             "有策略暂时算不出来时，合计只加算得出来的部分，并在数字后面标 `*`。\n"
-            "多品种策略的名称前有 ▸：点一下名称（或者双击名称）展开成「一个品种一行」，"
-            "再点名称收起 —— 支行的价格和盈亏是那个品种自己的，"
-            "父行显示各品种的合计（价格没有合计，写「—」）。\n"
+            "多品种 / 截面策略的名称前有 ▸：点一下名称（或者双击名称）展开成"
+            "「一个品种一行」，再点名称收起 —— 支行的价格和盈亏是那个品种自己的，"
+            "父行显示各品种的合计（价格没有合计，写「—」）。"
+            "截面子行的「仓位」写这一腿的权重和名义额（不是本金 ÷ 品种数）。\n"
             "双击名称不再打开回测，双击别的列才是打开回测。\n"
             "「启动 / 停止」只作用于选中的那一条：账户还没连上时会把它的账户单独连上。"
         )
@@ -1815,12 +2471,14 @@ class PortfolioPage(QWidget):
         self.btn_view.setEnabled(n >= 1)
         # 「训练模型」只对机器学习策略有意义。规则策略没有模型可训，
         # 按钮亮着只会让人以为点一下有用
-        is_ml = bool(cfgs) and (cfgs[0].family or "") == "factor" \
-            and (cfgs[0].factor_mode or "") == "ml"
+        is_ml = bool(cfgs) and (cfgs[0].factor_mode or "") == "ml" \
+            and ((cfgs[0].family or "") == "factor"
+                 or (cfgs[0].family or "") == "cross")
         self.btn_train.setEnabled(is_ml and n >= 1)
         self.btn_train.setVisible(is_ml or n == 0)
         if is_ml:
-            n_sym = len(cfgs[0].multi_symbols or [])
+            n_sym = len(cfgs[0].symbols or []) if cfgs[0].family == "cross" \
+                else len(cfgs[0].multi_symbols or [])
             # 已经训过的品种数标在按钮上 —— 用户一眼能看出「还差几个没训」，
             # 不用点进去才发现
             done = self._trained_count(cfgs[0])
@@ -1833,10 +2491,14 @@ class PortfolioPage(QWidget):
 
     @staticmethod
     def _trained_count(cfg) -> int:
-        """这条策略里已经有训练产物的品种数。"""
+        """这条策略里已经有训练产物的品种数。截面 ML 只有一份（父 sid）。"""
         try:
             from ttrade import ml_artifact as MLA
 
+            if str(getattr(cfg, "family", "") or "") == "cross":
+                from ttrade import cross_ml
+
+                return 1 if os.path.exists(cross_ml.artifact_path(cfg.sid)) else 0
             syms = list(cfg.multi_symbols or [])
             if len(syms) < 2:
                 syms = [cfg.key()]
@@ -2444,7 +3106,9 @@ class PortfolioPage(QWidget):
                     name = f"　　└ {row['key']}"
                     sym_txt = row["key"]
                     strat_txt = "同一策略"
-                    size_txt = _child_size_text(cfg)
+                    is_cross = str(getattr(cfg, "family", "") or "") == "cross"
+                    size_txt = (_cross_child_size_text(cfg) if is_cross
+                                else _child_size_text(cfg))
                 else:
                     mark = ("▾ " if str(cfg.sid) in self._expanded else "▸ ") \
                         if row["multi"] else ""
@@ -2466,10 +3130,17 @@ class PortfolioPage(QWidget):
                 if child:
                     it0 = t.item(i, 0)
                     if it0 is not None:
-                        it0.setToolTip(
-                            f"这条多品种策略里的 {row['key']}\n"
-                            f"预算 {size_txt}（总本金 ÷ 品种数）\n"
-                            "右侧的「理论 / 状态」是它自己的，不是整条策略的合计")
+                        if str(getattr(cfg, "family", "") or "") == "cross":
+                            tip = (f"这条截面策略里的 {row['key']}\n"
+                                   f"权重 / 名义额：{size_txt}\n"
+                                   "截面按一篮子权重折手数，不按品种数折本金；"
+                                   "右侧的「理论 / 状态」是这一腿自己的")
+                        else:
+                            tip = (f"这条多品种策略里的 {row['key']}\n"
+                                   f"预算 {size_txt}（总本金 ÷ 品种数）\n"
+                                   "右侧的「理论 / 状态」是它自己的，"
+                                   "不是整条策略的合计")
+                        it0.setToolTip(tip)
                     for j in (5, 6, 7, 8, 9, 10, 11, 12):
                         t.setItem(i, j, QTableWidgetItem("—"))
                     continue
@@ -2479,10 +3150,12 @@ class PortfolioPage(QWidget):
                 if row["multi"]:
                     it0 = t.item(i, 0)
                     if it0 is not None:
+                        kind = ("截面策略" if str(getattr(cfg, "family", "") or "")
+                                == "cross" else "多品种策略")
                         it0.setToolTip(
-                            f"多品种策略，共 {len(cfg.symbols or [])} 个品种。\n"
+                            f"{kind}，共 {len(cfg.symbols or [])} 个品种。\n"
                             "点一下名称展开成「一个品种一行」，再点收起 —— "
-                            "逐个品种看理论手数和运行状态")
+                            "逐个品种看权重 / 理论手数和运行状态")
                 if len(accs) > 1:
                     it4 = t.item(i, 4)
                     if it4 is not None:
@@ -2699,7 +3372,13 @@ class PortfolioPage(QWidget):
             frames, why = self._load_frames(cfg)
             if not frames:
                 return ("cross", None, why)
-            return ("cross", (frames, self._extra_periods_multi(cfg, frames)), why)
+            # 三元组：行情、跨周期因子行情、第一步/第二步专用周期的行情。
+            # 第三项以前**根本没取**，于是「第一步用日线成交额筛池」的 5 分钟
+            # 策略在组合页里悄悄按 5 分钟算 —— 和研究页两条曲线（#216）
+            return ("cross",
+                    (frames, self._extra_periods_multi(cfg, frames),
+                     self._step_period_frames(cfg)),
+                    why)
         if len(keys) >= 2:
             frames, why = self._load_frames(cfg, need=2)
             if not frames:
@@ -2709,6 +3388,43 @@ class PortfolioPage(QWidget):
         if df is None:
             return ("single", None, why)
         return ("single", (df, self._extra_periods(cfg)), why)
+
+    def _step_period_frames(self, cfg) -> tuple[dict | None, dict | None]:
+        """截面两步各自的**专用周期**行情：`(step1_frames, step2_frames)`。
+
+        规则和研究页 `_run_cross()` 一个字不差：
+        - 配了周期**且**和策略周期不同 → 另取一份；
+        - 取不到（品种数不够）→ 返回 None，让引擎退回策略周期。
+          这里**不抛也不报错**：组合页是批量跑的，一条策略缺一档分钟线不该
+          把整个「组合报告」拦下来 —— 研究页会在状态栏说清楚，组合页只在
+          行情缺失里记一笔（见 `_load_frames` 的 missing）。
+
+        🔴 以前这个方法是**不存在**的：`replay.run_cross` 从来没收到过
+        `step1_frames` / `step2_frames`，`CrossConfig.step1_period` 也就一直是
+        空 ⇒ 库里 `cross_step1_period='1d_tq'` 的「HL-point截面对冲」在组合页
+        跑的是「5 分钟/策略周期筛池」，和研究页的结果对不上（#216 的另一半）。
+        """
+        from ttrade import cross as cross_engine
+
+        out: list[dict | None] = []
+        base = getattr(cfg, "period", "") or "1d"
+        keys = list(getattr(cfg, "symbols", None) or [])
+        for name in ("cross_step1_period", "cross_step2_period"):
+            p = str(getattr(cfg, name, "") or "")
+            if not p or p == base or self._loader is None:
+                out.append(None)
+                continue
+            mk = replay.market_of(cfg)
+            got: dict = {}
+            for key in keys:
+                try:
+                    df = self._loader(mk, key, p)
+                except Exception:                 # noqa: BLE001
+                    continue
+                if df is not None and not df.empty:
+                    got[key] = df
+            out.append(got if len(got) >= cross_engine.MIN_CROSS else None)
+        return out[0], out[1]
 
     def _extra_periods(self, cfg) -> dict:
         """跨周期因子要用的别的周期行情（主线程取数）。
@@ -3179,7 +3895,7 @@ class PortfolioPage(QWidget):
         if not slot:
             if getattr(cfg, "enabled", True):
                 return ("接入中", C_MUTED,
-                        "这条多品种策略的子槽位快照还没到（刚启动时等几秒）")
+                        "这条组合策略的子槽位快照还没到（刚启动时等几秒）")
             return "未启用", C_IDLE, "点「启动 / 停止」把它打开"
         if slot.get("error"):
             return "错误", C_BAD, str(slot["error"])
@@ -3203,20 +3919,38 @@ class PortfolioPage(QWidget):
             by = self._slot_multi.get(sid) or {}
             slot = next(iter(by.values()), {}) if by else {}
         lots = _int(slot.get("lots"))
-        size = _child_size_text(cfg) + (f" → {lots} 手" if lots > 0 else "")
+        is_cross = str(getattr(cfg, "family", "") or "") == "cross"
+        size = (_cross_child_size_text(cfg, slot) if is_cross
+                else _child_size_text(cfg)) + (f" → {lots} 手" if lots > 0 else "")
         self._set_cell(t, i, 3, size, C_TEXT)
         it3 = t.item(i, 3)
         if it3 is not None:
-            # 「仓位」列括号里的手数是**现在这根 K 线**下「如果开新仓会下几手」；
-            # 「理论」列是**这一笔开仓时定下的手数**。波动变了这两个数就会不一样
-            # （用户 2026-11-23 就是拿这两列对的账，得说清楚）。
-            it3.setToolTip(
-                f"这个品种分到的钱 = 总本金 ÷ 品种数"
-                + ("，再乘仓位比例" if "·" in size else "")
-                + (f"\n按现在这根 K 线的波动，**现在开新仓**会是 {lots} 手\n"
-                   "（「理论」列给的是这一笔开仓时定下的手数 —— 波动一变，"
-                   "这两个数就会不同，属正常）" if lots > 0 else
-                   "\n引擎还没算出实际手数（需要行情）"))
+            if is_cross:
+                # 截面腿的「仓位」是父级一篮子给的权重，不是「本金 ÷ 品种数」。
+                # 两者放一起对账会差 N 倍，必须说清楚。
+                w = 0.0
+                try:
+                    w = float(slot.get("cross_w", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    pass
+                it3.setToolTip(
+                    f"截面权重 {w:+.3f}（占整份本金，正多负空）\n"
+                    f"名义额 = 本金 × |权重| = "
+                    f"{float(getattr(cfg, 'principal', 0) or 0) * abs(w) / 10000:,.1f} 万\n"
+                    "手数 = 名义额 ÷ (真实价 × 合约乘数)，按调仓日四舍五入\n"
+                    + (f"这一腿现在是 {lots} 手\n" if lots else
+                       "\n引擎还没算出实际手数（需要行情）"))
+            else:
+                # 「仓位」列括号里的手数是**现在这根 K 线**下「如果开新仓会下几手」；
+                # 「理论」列是**这一笔开仓时定下的手数**。波动变了这两个数就会不一样
+                # （用户 2026-11-23 就是拿这两列对的账，得说清楚）。
+                it3.setToolTip(
+                    f"这个品种分到的钱 = 总本金 ÷ 品种数"
+                    + ("，再乘仓位比例" if "·" in size else "")
+                    + (f"\n按现在这根 K 线的波动，**现在开新仓**会是 {lots} 手\n"
+                       "（「理论」列给的是这一笔开仓时定下的手数 —— 波动一变，"
+                       "这两个数就会不同，属正常）" if lots > 0 else
+                       "\n引擎还没算出实际手数（需要行情）"))
         # 🔴 理论持仓读引擎的 `theo`，不是 `target`。K 线内那一族（`sbbox_ib`
         # 等）的 `target` 是**下单目标**，盘中价格没碰到触发价就是 0；`theo` 才是
         # 策略口径该持多少（= 方向 × 开仓手数，和回测同一口径）。2026-11-23 用户报
@@ -3233,7 +3967,18 @@ class PortfolioPage(QWidget):
             self._set_cell(t, i, 5, f"{theo:+d}", C_TEXT)
             it5 = t.item(i, 5)
             if it5 is not None:
-                if slot.get("intrabar"):
+                if is_cross:
+                    w = 0.0
+                    try:
+                        w = float(slot.get("cross_w", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        pass
+                    it5.setToolTip(
+                        f"{key} 的理论净仓 {theo:+d} 手\n\n"
+                        f"父级截面策略按调仓日一篮子权重 {w:+.3f} 算出名义额，"
+                        "再按真实价 × 合约乘数折手数（四舍五入）。\n"
+                        "和回测最后一根调仓日的权重逐位一致；这一腿自己不算信号")
+                elif slot.get("intrabar"):
                     it5.setToolTip(
                         f"{key} 的理论净仓 {theo:+d} 手\n\n"
                         "手数**是开仓那一根定下来的**，之后整笔持有期间不再变\n"
@@ -3316,7 +4061,7 @@ class PortfolioPage(QWidget):
             self._set_cell(t, i, 7, "—", C_MUTED)
             tip7 = "还没有行情（策略没启动，或者这个合约没订上盘口）"
             if slot.get("multi"):
-                tip7 = ("多品种策略没有「一个」价格 —— 27 个品种各是各的价，"
+                tip7 = ("组合策略没有「一个」价格 —— N 个品种各是各的价，"
                         "点名称展开，逐品种看")
             it = t.item(i, 7)
             if it is not None and it.toolTip() != tip7:
@@ -3801,6 +4546,10 @@ class PortfolioPage(QWidget):
         seen: dict[tuple[str, str], float] = {}
         warn: list[str] = []
         default = self.cb_acct.currentData() or ""
+        # 截面策略也进计划：引擎里一台 `CrossLive` 一篮子算权重，各腿只负责自己
+        # 的下单（见 `PortfolioRunner._cross_refresh`）。以前在这里剔掉是为了躲开
+        # `enable()` 的硬拒绝，但那是「连了账户才拒绝」—— 白连一轮柜台，还会
+        # 在登录失败的收尾里踩到 CTP 的 0xc0000005。真正该做的是让截面能跑。
         for w in self._wss:
             cfgs, _missing = WS.resolve(w, self._pool)
             for c in cfgs:
@@ -3849,13 +4598,14 @@ class PortfolioPage(QWidget):
         for msg in warn:
             self._on_log(f"注意：{msg}")
         if not groups:
-            # 分两种「空」：真的没有启用策略，和「启用着的都挂在跑不了的账户上」
-            # （柜台 + 股票）—— 后者是配置选错了账户，说成「没有启用的策略」
-            # 会让人去翻策略列表
-            self._on_failed(
-                "没有可以启动的账户：启用的策略都挂在只做期货的柜台账户上，"
-                "股票策略请把交易账户改成天勤账户"
-                if warn else "所有工作区里都没有启用的策略")
+            # 两种「空」，得分开说，否则用户会去翻策略列表找不存在的问题：
+            # ① 真的没有启用策略；② 启用着的都挂在跑不了的账户上（柜台 + 股票）
+            if warn:
+                self._on_failed(
+                    "没有可以启动的账户：启用的策略都挂在只做期货的柜台账户上，"
+                    "股票策略请把交易账户改成天勤账户")
+            else:
+                self._on_failed("所有工作区里都没有启用的策略")
             return
         for name in list(groups):
             if not name:
@@ -4567,13 +5317,22 @@ class PortfolioPage(QWidget):
             self._on_log("先在下面选中一条策略")
             return
         cfg = cfgs[0]
-        if (cfg.family or "") != "factor" or (cfg.factor_mode or "") != "ml":
+        is_ml = (cfg.factor_mode or "") == "ml" and (
+            (cfg.family or "") in ("factor", "cross"))
+        if not is_ml:
             self._on_log("只有机器学习策略需要训练模型（当前这条不是）")
             return
 
-        # 品种清单：多品种策略训全部，单品种策略就训它自己
+        # 品种清单：多品种策略训全部，单品种策略就训它自己。
+        # 截面 ML 不用这份清单（TrainWorker 自己按 cfg.symbols 读整篮子），
+        # 但确认框仍要显示品种数。
+        is_cross = (cfg.family or "") == "cross"
         syms = []
-        if len(cfg.multi_symbols or []) >= 2:
+        if is_cross:
+            for k in (cfg.symbols or []):
+                sym, ex = _split_key(k, cfg.market)
+                syms.append((sym, ex))
+        elif len(cfg.multi_symbols or []) >= 2:
             for k in cfg.multi_symbols:
                 sym, ex = _split_key(k, cfg.market)
                 syms.append((sym, ex))
@@ -4582,11 +5341,14 @@ class PortfolioPage(QWidget):
 
         n = len(syms)
         est = n * 40
+        how = ("整篮子一起训一个相对强弱模型，训完存一份 .pkl"
+               if is_cross else
+               f"每个品种大约 30~40 秒，全部大概 {est // 60} 分 {est % 60} 秒")
         if QMessageBox.question(
                 self, "训练模型",
                 f"训练「{cfg.name or cfg.sid}」的机器学习模型。\n\n"
                 f"品种 {n} 个，{len(cfg.factor_keys or [])} 个因子。\n"
-                f"每个品种大约 30~40 秒，全部大概 {est // 60} 分 {est % 60} 秒。\n"
+                f"{how}。\n"
                 f"训完存成 .pkl，实盘启动时直接用（只预测，不重训）。\n\n继续？",
         ) != QMessageBox.Yes:
             return
