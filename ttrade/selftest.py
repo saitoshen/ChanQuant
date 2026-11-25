@@ -11455,7 +11455,10 @@ def _run() -> tuple[bool, list[str]]:
             combo_ok = (
                 tabs is not None
                 and pv is not None
-                and tabs.count() == 4
+                # 组合视图 5 页：K线与信号 / 绩效 / 截面因子分析 / 交易记录 / 阶段分析
+                # （2026-11-25 新增 K线与信号，setTabVisible 只隐藏不改 count）
+                and tabs.count() == 5
+                and any(tabs.tabText(i) == "K线与信号" for i in range(tabs.count()))
                 and pv.table.columnCount() == 2
                 and pv.res is not None
                 and "组合（2 条策略）" in text
