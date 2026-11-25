@@ -386,6 +386,10 @@ class Replay:
     # 截面策略的 (品种行情, CrossConfig, 分数面板)。「截面因子分析」要拿品种池
     # 重算横截面 IC，光有净值曲线画不出来
     cross: object | None = None
+    # 多品种逐条的「含 signal 的行情」。组合页「K线与信号」页要按品种单独看，
+    # 只给 `res.legs`（净值）画不出 K 线；重跑一遍回测又太贵，`run_multi` 手里
+    # 本来就有每条的 df，顺手留一份（2026-11-25）
+    leg_frames: dict[str, pd.DataFrame] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -556,6 +560,7 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
         and len(fkeys) >= 2
     )
     results, named, failed = [], [], []
+    leg_frames: dict[str, pd.DataFrame] = {}
     # 每个品种分到的本金 = 总本金 ÷ 品种数，和实盘 `children_of` 同一个口径。
     # 分母取**配置里勾的品种数**，不是「这次成功读到行情的品种数」—— 有品种
     # 读不到数据时整批会报错返回，不该因为少一个就悄悄把别人的钱分多。
@@ -591,6 +596,7 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
             try:
                 results.append(run_backtest(out.df, bt, label=out.label))
                 named.append((key, results[-1]))
+                leg_frames[key] = out.df
             except Exception as exc:  # noqa: BLE001
                 failed.append(f"{key}：{exc}")
     else:
@@ -608,6 +614,7 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
                 continue
             results.append(rp.res)
             named.append((key, rp.res))
+            leg_frames[key] = rp.df
     if not results:
         return Replay(error="多品种一个都没跑出来：" + "；".join(failed[:4]))
     # 🔴 掉了腿就必须报错，不能「有几个算几个」（2026-11-16 补）。
@@ -645,7 +652,7 @@ def run_multi(cfg, frames: dict[str, pd.DataFrame], market: str = "",
                   family=getattr(cfg, "family", "rule"),
                   period=period,
                   long_only=_bt.long_only, short_only=_bt.short_only,
-                  bars_per_year=bpy, keys=keys)
+                  bars_per_year=bpy, keys=keys, leg_frames=leg_frames)
 
 
 #: `StrategyConfig` 的截面字段 → `CrossConfig` 的字段。**唯一一份映射表**。
@@ -848,4 +855,6 @@ def run_cross(cfg, frames: dict[str, pd.DataFrame], market: str = "",
     return Replay(res=res, bh=None, label=label, family="cross", period=period,
                   long_only=bt.long_only, short_only=bt.short_only,
                   bars_per_year=bt.bars_per_year,
+                  leg_frames={k: v for k, v in (frames or {}).items()
+                              if v is not None and len(v)},
                   cross=(frames, ccfg, out.score))

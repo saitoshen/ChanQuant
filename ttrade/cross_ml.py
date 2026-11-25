@@ -88,6 +88,10 @@ class CrossMlArtifact:
     model_key: str = ""
     # 模型实际吃进去的特征列（交集，`ml_score_panel` 里算出来的）
     keys: list[str] = field(default_factory=list)
+    # 配置里原本选的全部因子（训练时可能有个别品种算不出被交集剔掉）。
+    # 校验「配置改没改」要比这个，不能比 keys —— 后者天然是它的子集。
+    # 老产物没有这个字段，mismatch_reason 里按「keys 是配置的子集」兼容。
+    requested_keys: list[str] = field(default_factory=list)
     label_mode: str = "volret"
     # 训练时 bind_window 后的配置：实盘重算因子必须用它，不能拿未绑定的配置
     fcfg: object = None
@@ -127,8 +131,23 @@ class CrossMlArtifact:
         return max(0.0, (time.time() - float(self.trained_at or 0.0)) / 86400.0)
 
     def mismatch_reason(self, fcfg, keys, label_mode, symbols) -> str:
-        """配置 / 品种池对不上就拒绝加载，别拿错模型下单。"""
-        want = _digest(fcfg, keys, label_mode, symbols)
+        """配置 / 品种池对不上就拒绝加载，别拿错模型下单。
+
+        🔴 `keys` 要比的是「配置原本选了哪些因子」，不是「模型实际吃到几列」：
+        训练时 `ml_score_panel` 按各品种的可用列取交集，某个因子（如
+        roll_main_oi）在个别品种算不出就被剔掉 —— 产物 `keys` 天然是配置的子集
+        （用户 2026-11-25：产物 5 列 / 配置 6 列，训练完立刻被拒绝启动）。
+
+        新产物存了 `requested_keys`（配置全集），指纹也用它算，严格相等即放行。
+        老产物（3.9.18 之前）没这个字段、指纹里存的是裁剪后的交集 —— 无法区分
+        「训练时正常剔除」和「用户后来改了配置」，所以明确要求重训一次，不能靠
+        「子集就放行」蒙混（那会让配置新增因子也通过，等于拿错模型下单）。
+        """
+        got_keys = set(dict(self.cfg_digest or {}).get("keys") or [])
+        if not getattr(self, "requested_keys", None):
+            return ("截面 ML 产物是旧格式（没记录配置原始因子），"
+                    "请在组合页点「训练模型」重新训练一次即可启动")
+        want = _digest(fcfg, keys, label_mode, symbols)   # keys = 当前配置
         got = dict(self.cfg_digest or {})
         if want == got:
             return ""
@@ -168,6 +187,11 @@ def train_artifact(frames: dict, sid: str, name: str, fcfg, keys: list[str],
                          "换 LightGBM / XGBoost / GPR / 线性回归")
 
     keys_used = list(collect.get("keys") or [])
+    # 配置原本选的全部因子（训练时按各品种可用列取交集，`keys_used` 是交集）。
+    # 指纹必须用全集：校验时拿的是配置全集，拿交集去存就会出现「训练完立刻
+    # 配置和产物对不上」的假红（用户 2026-11-25 油脂截面：roll_main_oi 被交集
+    # 剔掉，产物 5 列 / 配置 6 列，启动时被拒）。
+    keys_requested = list(keys or [])
     got_fcfg = collect.get("fcfg")
     fcfg_bound = got_fcfg if got_fcfg is not None else fstrat.bind_window(
         fcfg, next(iter(frames.values())).index)
@@ -175,11 +199,12 @@ def train_artifact(frames: dict, sid: str, name: str, fcfg, keys: list[str],
     ts = list(got_ts) if got_ts is not None else []
     b = int(models[-1][2])
     first = next((v for v in frames.values() if v is not None and len(v)), None)
-    dig = _digest(fcfg, keys_used, label_mode, list(frames))
+    dig = _digest(fcfg, keys_requested, label_mode, list(frames))
     art = CrossMlArtifact(
         sid=str(sid or ""), name=str(name or ""),
         model=model, model_key=str(getattr(fcfg, "model", "") or ""),
-        keys=keys_used, label_mode=str(label_mode or "volret"),
+        keys=keys_used, requested_keys=keys_requested,
+        label_mode=str(label_mode or "volret"),
         fcfg=fcfg_bound, symbols=list(frames),
         cfg_digest=dig, cfg_hash=MLA._hash_obj(dig),
         trained_at=time.time(),

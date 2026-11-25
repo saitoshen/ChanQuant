@@ -54,8 +54,8 @@ from ttrade import cross_ml
 from ttrade import factor_strategy as fstrat
 from ttrade import ml_artifact
 from ttrade import replay
-from ttrade import (barclock, daylimit, hubreg, orderbook, positionbook, topup,
-                    tqdata, tqstore)
+from ttrade import (barclock, daylimit, hubreg, live_data, orderbook,
+                    positionbook, topup, tqdata, tqstore)
 from ttrade import strategy_store as SStore
 from ttrade import specs, symbols_info
 from ttrade.market_feed import MarketFeed
@@ -564,6 +564,12 @@ class SlotState:
     # 看到 `st.held` 还是老仓时**不能**把它重新捡回来：那等于把刚下的平仓
     # 单撤掉，止损白打了。成交回报到、`held` 归零之后自动清掉
     ib_exit_pending: bool = False
+    # 盘中真触发过之后，**理论仓就跟这一笔实际仓位走**（用户 2026-11-25 选的
+    # 口径：「盘中触发开仓后理论仓立刻变成对应方向/手数，止损平仓后归 0」）。
+    # None = 还没触发过，此时仍按回测口径 `signal × theo_lots` 显示（冷启动
+    # 一键对齐要靠它看见从没触发过的腿，见 `theoretical()`）。
+    # 一旦盘中入场/止损写过一次，就锁在那笔仓上，信号再闪也不跟着变回去。
+    theo_live_qty: int | None = None
 
     def title(self) -> str:
         return self.cfg.title()
@@ -943,6 +949,11 @@ class PortfolioRunner:
         self._fresh_book = not positionbook.exists()
         self._adopted: set[str] = set()
         self._aux_warned: set[str] = set()
+        # 实盘数据就绪检查：每个品种用到的衍生源、上次检查结果、日内现算器。
+        # 检查每小时一次就够（联网补数是分钟级），不跟着 0.4 秒的 tick 跑。
+        self._data_need: dict[str, dict[str, bool]] = {}
+        self._data_checked: dict[str, float] = {}
+        self._live_aux: dict[str, live_data.LiveAux] = {}
         # 因子被剔除只提示一次（按 sid 去重），理由见 `_note_dropped`
         self._factor_warned: set[str] = set()
         # 已经落过盘的槽位错误：(sid, 错误原文)。见 `snapshot`
@@ -1050,29 +1061,20 @@ class PortfolioRunner:
             return
         if self._aux_recent():
             return                      # 已经是最新的，别每天白跑两分钟
-        try:
-            from ttrade import updater
-
-            self._log("检查期货日线与展期 / 期权数据…")
-            # **先补主力连续日线**：`update_aux` 拿 data_futures 的日期当交易日历，
-            # 日线停在几天前的话它会认为「衍生数据已是最新」，缺的其实是源头。
-            # 窗口给足一年：两个更新函数都只补本地没有的部分，多给的日期不会
-            # 重复请求，只是让「很久没开程序」的缺口一次补完。
-            f = updater.update_futures(
-                None, "1y",
-                progress=lambda d, t, m: self._log(f"  日线 [{d}/{t}] {m}"),
-            )
-            self._log(f"日线：{f.summary()}")
-            res = updater.update_aux(
-                None, range_key="1y", want_contracts=True, want_options=True,
-                progress=lambda d, t, m: self._log(f"  补衍生数据 [{d}/{t}] {m}"),
-            )
-            n = int(getattr(res, "days", 0) or 0)
-            self._log(f"衍生数据已补 {n} 个交易日" if n else "衍生数据已是最新")
-            if getattr(res, "failed", 0):
-                self._log(f"  {res.failed} 天失败，下次启动会再试")
-        except Exception as exc:  # noqa: BLE001
-            self._log(f"衍生数据补充失败（{type(exc).__name__}: {exc}），先用本地快照")
+        # 补数本身要几分钟（日线 94 个品种 + 展期 / 期权逐日横截面），在后台
+        # 线程做。`live_data.SupplementThread` 按品种去重、10 分钟内不重复跑，
+        # 所以这里的启动检查和 `_ensure_live_data` 的运行时检查不会打起来。
+        worker = live_data.SupplementThread.get()
+        for st in self._slots.values():
+            uses = st.cfg.family in ("factor", "cross") or (
+                st.cfg.family == "rule" and bool(st.cfg.factor_mode or ""))
+            if not uses:
+                continue
+            need = live_data.needed_aux(st.cfg.period, st.cfg.factor_keys or [])
+            need["price"] = True
+            worker.submit(st.cfg.symbol, st.cfg.exchange, need, log=self._log)
+        self._log("日线 / 展期 / 期权数据落后，已转后台补齐"
+                  "（补好自动生效，不用重启）")
 
     # ---- 监控设置（一键对齐的刷新周期） ----
 
@@ -1892,6 +1894,67 @@ class PortfolioRunner:
         if q is not None:
             self._quotes[key] = q
         self._top_up(st)
+        self._ensure_live_data(st)
+
+    def _ensure_live_data(self, st: SlotState) -> None:
+        """启动时检查这条策略用到的行情 / 因子数据够不够新。
+
+        - 日线主连 + 日频展期 / IV：缺到昨日就丢后台补（真实合约 → 重算展期、
+          期权库 → 重算 IV）。补数很慢，绝不堵主循环；
+        - 比日线更细的展期 / IV：订阅真实合约 / 期权报价，盘中现算（`LiveAux`）。
+
+        一小时查一次就够。检查只读本地文件，联网补数失败也只写一行日志 ——
+        数据旧了该降的是「可交易」的判断，不是把策略直接停掉。
+        """
+        cfg = st.cfg
+        key = self._skey(cfg)
+        checked = getattr(self, "_data_checked", None)
+        if checked is None:
+            checked = self._data_checked = {}
+        now = time.monotonic()
+        if now - checked.get(key, 0.0) < 3600:
+            return
+        checked[key] = now
+        fc = replay.factor_config(cfg.factor_cfg or {})
+        keys = list(cfg.factor_keys or []) + list(
+            getattr(fc, "trigger_keys", None) or [])
+        need = live_data.needed_aux(cfg.period, keys)
+        need["price"] = True
+        if not hasattr(self, "_data_need"):
+            self._data_need = {}
+        self._data_need[key] = need
+        if any(need.values()):
+            fr = live_data.freshness(cfg.symbol, cfg.exchange, need)
+            if fr["stale"]:
+                want = "/".join(fr["stale"])
+                self._log(
+                    f"{st.title()}：数据只到 行情{fr['price_1d']} / "
+                    f"展期{fr['curve']} / 期权{fr['opt']}（要 {fr['want']}），"
+                    f"缺 {want} —— 后台补数中，补好前因子按旧值算")
+                todo = {
+                    "price": "price_1d" in fr["stale"],
+                    "curve": "curve" in fr["stale"],
+                    "opt": "opt" in fr["stale"],
+                }
+                live_data.SupplementThread.get().submit(
+                    cfg.symbol, cfg.exchange, todo, log=self._log)
+        if (live_data.is_intraday(cfg.period)
+                and (need.get("curve") or need.get("opt"))
+                and self.feed is not None):
+            watch = live_data.watch_symbols(cfg.symbol, cfg.exchange, need,
+                                            cfg.period)
+            syms = watch["curve"] + watch["opt"]
+            if not hasattr(self, "_live_aux"):
+                self._live_aux = {}
+            aux = self._live_aux.setdefault(
+                f"{cfg.symbol}_{cfg.exchange}", live_data.LiveAux())
+            # 展期取价只认真实合约那两位，别让期权合约混进(curve_syms 的用途)
+            aux.set_watch(syms, watch["curve"])
+            for s in syms:
+                try:
+                    self.feed.request_quote(s)
+                except Exception:                       # noqa: BLE001
+                    pass
 
     def _top_up(self, st: SlotState) -> None:
         """把引擎手上这份实时 K 线写回本地库，库里就不再停在几天前。
@@ -2534,6 +2597,9 @@ class PortfolioRunner:
                 hit = price <= sp if held > 0 else price >= sp
                 if hit:
                     st.target = 0
+                    # 🔴 理论仓跟着这一笔走：止损一打就归 0。signal 下一根
+                    # 可能还是 -1，但不能让它把已经平掉的仓又「显示」回来
+                    st.theo_live_qty = 0
                     st.ib_armed = False      # 这根 bar 不再入场
                     st.ib_exit_pending = True
                     st.ib_stop = float("nan")
@@ -2550,6 +2616,7 @@ class PortfolioRunner:
         if el == el and price >= el and not getattr(st.cfg, "short_only", False):
             # 禁止做多时多头触发价作废：价格冲上去了也不开多
             st.target = st.lots
+            st.theo_live_qty = int(st.target)
             st.ib_fired = True
             st.ib_exit_pending = False     # 重新持仓了，上一笔的平仓账已清
             # 理论手数跟着「这一笔实际下的手数」走，见 `_latch_to_order`
@@ -2569,6 +2636,7 @@ class PortfolioRunner:
             # 不要看 `note`：`note` 只是备注（曾被当批次标签写），照它判会让
             # 回测能双向、实盘只做多（#145）
             st.target = -st.lots
+            st.theo_live_qty = int(st.target)
             st.ib_fired = True
             st.ib_exit_pending = False
             self._latch_to_order(st, -1)
@@ -2971,7 +3039,35 @@ class PortfolioRunner:
                 st, "衍生列没挂上任何一列（没有该品种的期限结构 / 期权文件，"
                     "或文件与行情没有重叠日期）—— 展期、期权类因子本轮无值")
         self._check_aux_fresh(st, out)
+        self._overlay_live_aux(st, out)
         return out
+
+    def _overlay_live_aux(self, st: SlotState, df: pd.DataFrame) -> pd.DataFrame:
+        """日内因子：用订阅到的真实合约 / 期权报价现算，只覆盖最后那根活 bar。
+
+        历史那一段仍是 `attach_for_period` 给的上一交易日快照，不许回写 —— 那会
+        把「盘中才知道的价差」写进过去，回测和实盘立刻分叉。
+        """
+        cfg = st.cfg
+        if not live_data.is_intraday(cfg.period) or self.feed is None:
+            return df
+        aux = getattr(self, "_live_aux", {}).get(f"{cfg.symbol}_{cfg.exchange}")
+        if aux is None or not aux.quote_syms:
+            return df
+        need = getattr(self, "_data_need", {}).get(self._skey(cfg)) \
+            or live_data.needed_aux(cfg.period, cfg.factor_keys or [])
+        quotes: dict = {}
+        for s in aux.quote_syms:
+            try:
+                q = self.feed.peek_quote(s)
+            except Exception:                           # noqa: BLE001
+                q = None
+            if q is not None:
+                quotes[s] = q
+        if not quotes:
+            return df
+        aux.snapshot(quotes, cfg.symbol, cfg.exchange, need)
+        return aux.overlay(df, cfg.period, need)
 
     def _check_aux_fresh(self, st: SlotState, df: pd.DataFrame) -> None:
         """衍生快照落后太多就提示一次。
@@ -3514,12 +3610,18 @@ class PortfolioRunner:
 
         - 普通策略：就是 `target`（而 `target` 现在由 `_theo_lots_qty` 定，也就是
           「方向 × 开仓手数」，不再随当前 K 线的 ATR 漂）；
-        - **K 线内那一族**（`sbbox_ib` / `strat_im_orb` 这类）：`target` 是「下单
-          目标」——盘中没碰到触发价就是 0，所以理论仓必须单独按信号算。拿
-          `target` 当理论仓，界面会一直说「策略空仓」，而回测在同一根 bar 上明明
-          是持仓的：2026-11-23 用户报「sbbox多品种波段1h 的 34 个品种理论持仓全是
-          0，回测里 29 个品种有仓」，这 29 个正好是 `run_strategy("sbbox_ib")`
-          最后一根上非零信号的品种数。
+        - **K 线内那一族**（`sbbox_ib` / `strat_im_orb` 这类），分两段：
+
+          1. **还没盘中触发过**（`theo_live_qty is None`）：按回测口径
+             `signal × theo_lots`。冷启动时 `target` 恒 0，拿它当理论仓会让
+             界面一直说「策略空仓」，2026-11-23 用户报的「34 个品种理论持仓
+             全是 0、回测里 29 个品种有仓」就是这个；一键对齐也看不见这些腿。
+          2. **盘中真触发过之后**：直接读 `theo_live_qty`（入场写 ±手数、止损
+             写 0，见 `_intrabar_tick`）。用户 2026-11-25 明确选的口径：
+             「跟着实际持仓走（盘中触发开仓后理论仓立刻变成对应方向/手数，
+             止损平仓后归 0）—— 界面理论仓 = 策略当前真实该持的仓」。
+             以前一直按 signal 算，于是「信号莫名奇妙变一下触发交易、一会儿
+             又变回来」时，理论仓也跟着变回去，实际却还持着那笔仓 —— 对不上。
 
         🔴 手数取的是**开仓那一根定的那个数**（`theo_lots`），不是当前这根 K 线
         按现在的 ATR 算出来的（用户 2026-11-23：「理论列需要按照开仓的手数来算，
@@ -3535,6 +3637,9 @@ class PortfolioRunner:
         `_refresh_signal` 里那一支的注释）。
         """
         if self._ib_on(st):
+            live = getattr(st, "theo_live_qty", None)
+            if live is not None:
+                return int(live)
             return self._theo_lots_qty(st)
         return int(getattr(st, "target", 0) or 0)
 

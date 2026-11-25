@@ -511,6 +511,9 @@ class TrainWorker(QObject):
 
             self.log.emit(f"截面机器学习：{len(cfg.symbols)} 个品种一起训一个模型…")
             try:
+                from ttrade import auxdata
+                from ttrade.auxdata import bar_period
+
                 def _frames(p):
                     out = {}
                     for key in (cfg.symbols or []):
@@ -519,6 +522,15 @@ class TrainWorker(QObject):
                         if df is None or df.empty:
                             continue
                         df = replay.window(df, getattr(cfg, "range_years", 0) or 0)
+                        # 🔴 必须挂衍生列，否则展期 / 期权 / 基本面因子整列 NaN，
+                        # 被 factor available 静默剔掉 —— 用户 2026-11-25 油脂截面
+                        # 的 roll_main_oi 就是这样丢的（研究页有值、训练侧没有）。
+                        # 口径和研究页 / 实盘跨周期帧一致：attach_for_period
+                        # （日线同日、分钟隔一日），别在这里另写一份。
+                        try:
+                            df = auxdata.attach_for_period(df, sym, exn, p or bar_period(df))
+                        except Exception:      # 衍生数据缺了不该让整场训练停摆
+                            pass
                         out[key] = df
                     return out
 
@@ -2138,6 +2150,12 @@ class PortfolioPage(QWidget):
         self._live_sid = ""
         self._live_busy = False
         self._live_req = 0.0
+        # 多品种 / 截面：逐品种那份历史底 + 「品种 → 正在跑的子策略 sid」。
+        # 单品种那套字段（`_live_sid` / `_live_base`）继续原样用，别把两条路
+        # 搅在一个变量里 —— 一处当 DataFrame、一处当 dict，出错时很难查。
+        self._live_kind = "single"      # single / multi / cross
+        self._live_syms: dict[str, str] = {}
+        self._live_sid_sym: dict[str, str] = {}
         # 图上缺交易日时的提示键（(首日, 末日)），同一条只提示一次
         self._live_seam = None
         self._live_timer = QTimer(self)
@@ -3609,11 +3627,13 @@ class PortfolioPage(QWidget):
         is_multi = (not is_cross) and len(keys) >= 2
         period = PERIOD_LABEL.get(cfg.period, cfg.period)
         if is_cross or is_multi:
-            # 多品种 / 截面都没有「某一条策略的 K 线」：仓位是一篮子，画 K 线会
-            # 误导。走组合视图那几页（绩效 / 交易记录 / 阶段）
-            self._stop_live()
+            # 组合净值是一篮子，不能画成「某一条策略的 K 线」；但用户 2026-11-25
+            # 要按品种单独看 K 线与信号，于是组合视图里加那一页，每条腿各有
+            # 一份含 signal 的行情（`Replay.leg_frames`）。
             tabs, view = self._ensure_view("portfolio")
+            frames = dict(getattr(rp, "leg_frames", None) or {})
             set_tab_visible(tabs, "截面因子分析", is_cross)
+            set_tab_visible(tabs, "K线与信号", bool(frames))
             ctx = ViewCtx(
                 symbol="", name=f"{len(keys)} 个品种",
                 exchange="", period=cfg.period, market=replay.market_of(cfg),
@@ -3622,11 +3642,15 @@ class PortfolioPage(QWidget):
                 long_only=rp.long_only, bars_per_year=rp.bars_per_year,
                 overlay=False, selected_keys=[],
                 cross=getattr(rp, "cross", None) if is_cross else None,
+                leg_frames=frames,
             )
             view.show_result(
                 None, None, rp.res, None, ctx,
                 trades=[(t.symbol or rp.label, t) for t in rp.res.trades],
             )
+            # 默认就接实时：历史底 + 逐品种实时 K 线（用户 2026-11-25）
+            self._start_live(cfg, "cross" if is_cross else "multi",
+                             None, payload=frames)
             self._show_view("portfolio", f"{cfg.title()}｜{period}"
                                          + (f"｜{note}" if note else ""))
             if is_multi:
@@ -3643,11 +3667,8 @@ class PortfolioPage(QWidget):
         # 两元组）。直接把它当 DataFrame 存下去，`merge_live` 里 `local.empty`
         # 就会抛 `AttributeError: 'tuple' object has no attribute 'empty'` ——
         # 界面顶部那行「实时 K 线刷新失败」红字，5 秒刷一次，图永远不动。
-        # 拆包只有 `run_replay_job` 做了，这里和 `show_config` 都漏了。
-        self._live_cfg, self._live_base, self._live_sid = (
-            cfg, raw[0] if isinstance(raw, tuple) else raw, cfg.sid)
-        self._live_busy = False
-        self._live_timer.start()
+        # 拆包交给 `_start_live`，和 `run_replay_job` 同一处处理。
+        self._start_live(cfg, "single", raw)
         # cfg.title() 已经含「品种 · 策略」，别再拼一遍 key 和策略名
         self._show_view("single", f"{cfg.title()}｜{period}"
                                  + (f"｜{note}" if note else ""))
@@ -3727,6 +3748,7 @@ class PortfolioPage(QWidget):
         self._stop_live()
         tabs, view = self._ensure_view("portfolio")
         set_tab_visible(tabs, "截面因子分析", False)
+        set_tab_visible(tabs, "K线与信号", False)
         view.show_result(None, None, res, None, ctx, trades=trades)
         names = "、".join(c.title() for c, _r in reps)
         self._show_view("portfolio", f"组合报告｜{len(reps)} 条策略等权｜{names}")
@@ -3766,6 +3788,44 @@ class PortfolioPage(QWidget):
         self._live_cfg = self._live_base = None
         self._live_sid = ""
         self._live_busy = False
+        self._live_kind = "single"
+        self._live_syms = {}
+        self._live_sid_sym = {}
+
+    def _start_live(self, cfg, kind: str, base, payload=None) -> None:
+        """给「查看回测」的结果页挂上实时数据。
+
+        单品种：`base` 是一份 DataFrame，沿用 `_live_sid` 那条老路。
+        多品种 / 截面：`base` 是 `{品种: 行情}`（`payload[0]`），逐品种找正在
+        跑的子策略 sid 要 K 线；没启动时也不报错，图就停在库里最后一根。
+        """
+        self._live_timer.stop()
+        self._live_cfg = cfg
+        self._live_kind = kind
+        self._live_busy, self._live_req = False, 0.0
+        self._live_syms, self._live_sid_sym = {}, {}
+        if kind == "single":
+            self._live_base = base[0] if isinstance(base, tuple) else base
+            self._live_sid = str(getattr(cfg, "sid", "") or "")
+        else:
+            frames = payload[0] if isinstance(payload, tuple) else payload
+            self._live_base = dict(frames or {})
+            self._live_sid = ""
+            # 子策略 sid 用父 sid + 品种拼成（和 `children_of` 一致）
+            parent = str(getattr(cfg, "sid", "") or "")
+            for key in self._live_base:
+                sid = f"{parent}#{key}" if parent else ""
+                self._live_syms[key] = sid
+                self._live_sid_sym[sid] = key
+            self._live_sid = parent
+        self._live_timer.start()
+
+    def _leg_cfg(self, cfg, key: str):
+        """多品种里单独一条腿的配置，口径与 `replay.run_multi` 一致。"""
+        sym, ex = replay.split_key(key, replay.market_of(cfg))
+        one = cfg.clone(symbol=sym, exchange=ex, multi_symbols=[],
+                        cross_symbols=[])
+        return one
 
     def _poll_live(self) -> None:
         """5 秒一趟：问引擎要一次当前这条策略的实时 K 线。
@@ -3782,6 +3842,22 @@ class PortfolioPage(QWidget):
         # 请求发出去了却一直没回来（账户线程在重连之类），别把自己锁死
         if self._live_busy and time.monotonic() - self._live_req < 10:
             return
+        if self._live_kind != "single":
+            # 多品种 / 截面：一次把这一组正在跑的子策略 sid 都要过来。
+            # 子 sid 是 `父sid#品种`（`children_of` 的 GROUP_SEP），没启动时
+            # `_live_syms` 仍然是空的 —— 图停在库里最后一根，不报错。
+            want = [s for s in (self._live_syms or {}).values() if s]
+            if not want:
+                return
+            for key, snap in self._snaps.items():
+                live = {str(s.get("sid") or "") for s in (snap.get("slots") or [])}
+                hit = [s for s in want if s in live]
+                if hit:
+                    self._live_busy = True
+                    self._live_req = time.monotonic()
+                    self.ctl.req_bars(key, hit)
+                    return
+            return
         sid = self._live_sid
         for key, snap in self._snaps.items():
             if any(s.get("sid") == sid for s in (snap.get("slots") or [])):
@@ -3793,6 +3869,9 @@ class PortfolioPage(QWidget):
     def _apply_live(self, bars: dict) -> None:
         """把实时段拼到本地历史后面，重跑一遍再画。"""
         self._live_busy = False
+        if self._live_kind != "single":
+            self._apply_live_multi(bars)
+            return
         cfg = self._live_cfg
         live = bars.get(self._live_sid)
         if cfg is None or live is None or live.empty:
@@ -3825,6 +3904,41 @@ class PortfolioPage(QWidget):
         # 三万点的净值曲线一次几百毫秒；用户切到「交易记录」页签看一眼，也在
         # 每 5 秒被拖住一次，Windows 直接标成「未响应」
         view.update_kline(rp.df)
+
+    def _apply_live_multi(self, bars: dict) -> None:
+        """多品种 / 截面的实时刷新：逐品种拼 K 线，只重画那一块。
+
+        不整份重跑 `run_multi` / `run_cross`：那是 N 条腿各一遍回测（还有几十折
+        机器学习），5 秒一趟主线程直接废掉。这里只给**当前选中那条腿**重跑一遍
+        单品种回放，其余腿把拼好的底存着，切过去时再用。组合净值/绩效停在打开
+        那一刻 —— 要最新的重开一次「查看回测」即可。
+        """
+        cfg = self._live_cfg
+        base = self._live_base
+        if cfg is None or not isinstance(base, dict) or not bars:
+            return
+        rev = self._live_sid_sym or {}
+        _tabs, view = self._ensure_view("portfolio")
+        for sid, live in bars.items():
+            key = rev.get(str(sid))
+            if not key or key not in base or live is None or live.empty:
+                continue
+            try:
+                merged = merge_live(base[key], live)
+                if merged is None or merged.empty:
+                    continue
+                base[key] = merged          # 下一轮在最新这份上继续拼
+                if self._live_kind == "cross":
+                    # 截面腿不自己算信号，净值由父级一篮子权重给；这里只更新
+                    # 价格，避免拿腿自己的规则算出另一个信号画上去
+                    df_show = merged
+                else:
+                    one = self._leg_cfg(cfg, key)
+                    rp = replay.run(one, merged, with_bh=False)
+                    df_show = rp.df if rp.ok else merged
+                view.update_leg_kline(key, df_show)
+            except Exception as exc:  # noqa: BLE001
+                self._on_log(f"{key} 实时 K 线刷新失败：{type(exc).__name__}: {exc}")
 
     def _render_diag(self, t, i: int, cfg) -> None:
         """三列资金占用：平均开仓占用 / 峰值保证金占用 / 利用率。

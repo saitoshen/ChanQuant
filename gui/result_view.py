@@ -388,6 +388,8 @@ class ViewCtx:
     # 截面策略的上下文：(frames, CrossConfig, 分数面板)。「截面因子分析」要按
     # 品种池重算一遍因子的横截面 IC，光有结果曲线画不出来
     cross: object | None = None
+    # 多品种逐条的含 signal 行情，给组合视图的「K线与信号」页按品种切着看
+    leg_frames: dict = field(default_factory=dict)
 
 
 # 交易所中文名。放在这里而不是从 app 引，避免环依赖
@@ -408,8 +410,10 @@ class ResultView(QObject):
     """回测结果视图。宿主只负责「给数据」和「放页面」。
 
     `kind="single"` 给五页（含因子分析、含基准对比）；`kind="portfolio"` 给
-    三页（绩效 / 交易记录 / 阶段分析），没有基准也没有因子 —— 组合是跨品种
-    加权的，没有单一对照物。
+    绩效 / K线与信号 / 交易记录 / 阶段分析 —— 没有基准也没有因子分析（组合
+    是跨品种加权的，没有单一对照物），但**逐品种的 K 线与信号要有**：
+    2026-11-25 用户「多品种回测结果页面除了绩效和交易记录，也需要一个
+    K线与信号页面，显示单独各个品种的 k 线和信号情况」。
     """
 
     status = Signal(str)      # 一行状态，宿主决定放哪（研究页放在输入框上方）
@@ -434,6 +438,8 @@ class ResultView(QObject):
         self.filter_active = False
         self.selected_keys: list = []
         self.outcome = None
+        # 组合视图逐品种的含 signal 行情（`ViewCtx.leg_frames` 递进来）
+        self._leg_frames: dict = {}
         # 只画 K 线（具体合约 / 期权合约）。标题里不能再写「当前状态：空仓」——
         # 那是策略的仓位，这里根本没有策略，写上去像「策略空仓了」
         self.bars_only = False
@@ -493,8 +499,7 @@ class ResultView(QObject):
 
     def _build_pages(self) -> list[tuple[str, QWidget]]:
         out = []
-        if self.kind == "single":
-            out.append(("K线与信号", self._build_chart_page()))
+        out.append(("K线与信号", self._build_chart_page()))
         out.append(("绩效对比" if self.kind == "single" else "绩效", self._build_perf_page()))
         if self.kind == "single":
             out.append(("因子分析", self._build_factor_page()))
@@ -535,6 +540,18 @@ class ResultView(QObject):
         self.chart_actions = QHBoxLayout()
         self.chart_actions.setContentsMargins(0, 0, 0, 0)
         self.chart_actions.setSpacing(6)
+        if self.kind != "single":
+            # 组合没有「某一条策略的 K 线」，但可以按品种一张张看：每个品种
+            # 各自跑一遍回测、各自有 signal，逐品种看才知道是普涨还是一条腿
+            # 在扛（2026-11-25 需求）
+            lab = QLabel("品种")
+            lab.setStyleSheet("font-size: 11px; color: #6b7280;")
+            self.chart_actions.addWidget(lab)
+            self.cb_chart_sym = QComboBox()
+            self.cb_chart_sym.setMinimumWidth(180)
+            self.cb_chart_sym.currentIndexChanged.connect(
+                self._on_chart_sym_changed)
+            self.chart_actions.addWidget(self.cb_chart_sym)
         head.addLayout(self.chart_actions)
         lay.addLayout(head)
 
@@ -700,6 +717,74 @@ class ResultView(QObject):
             cb.setToolTip(
                 f"切到某一个{self._leg_noun}，只看它自己的交易 / 阶段收益；"
                 "和绩效页那个下拉框是同一个选择")
+
+    def _sync_chart_sym(self, res) -> None:
+        """组合视图的「K线与信号」页按品种填下拉框。
+
+        优先用 `ViewCtx.leg_frames` 里真有 K 线的品种 —— 只有净值没有行情时
+        下拉框填了也画不出东西，宿主会把整个页签藏起来。
+        """
+        cb = getattr(self, "cb_chart_sym", None)
+        if cb is None:
+            return
+        keys = sorted(self._leg_frames or {}) or sorted(
+            (getattr(res, "legs", None) or {}).keys())
+        cb.blockSignals(True)
+        cb.clear()
+        for k in keys:
+            cb.addItem(str(k), str(k))
+        cb.setEnabled(bool(keys))
+        cb.blockSignals(False)
+
+    def _hide_chart_if_no_frames(self) -> None:
+        """组合视图没拿到逐品种行情时把「K线与信号」页收起来。
+
+        研究页 / 多策略组合报告也会建 portfolio 视图，它们只有合成净值、没有
+        逐品种 K 线；留一页空白图会让人以为数据坏了。宿主若自己调过
+        `set_tab_visible`，这里只是再按数据判一次，两边口径一致。
+        """
+        page = next((w for name, w in getattr(self, "_pages", [])
+                     if name == "K线与信号"), None)
+        tabs = page.parentWidget() if page is not None else None
+        while tabs is not None and not hasattr(tabs, "setTabVisible"):
+            tabs = tabs.parentWidget()
+        if tabs is not None:
+            set_tab_visible(tabs, "K线与信号", bool(self._leg_frames))
+
+    def _on_chart_sym_changed(self, _i: int = 0) -> None:
+        """换品种：只重画 K 线，并让绩效 / 交易 / 阶段三页切到同一个品种。"""
+        cb = getattr(self, "cb_chart_sym", None)
+        key = str(cb.currentData() or "") if cb is not None else ""
+        df = (self._leg_frames or {}).get(key)
+        if df is None or not len(df):
+            return
+        self.df = df
+        self._draw_kline()
+        for other in (getattr(self, "_leg_combos", None) or []):
+            if other is cb:
+                continue
+            j = other.findData(key)
+            if j >= 0 and str(other.currentData() or "") != key:
+                other.blockSignals(True)
+                other.setCurrentIndex(j)
+                other.blockSignals(False)
+
+    def update_leg_kline(self, sym: str, df) -> None:
+        """实时刷新**某一个品种**的 K 线（组合视图 5 秒一趟，只重画那一块）。"""
+        if df is None or not len(df):
+            return
+        sym = str(sym or "")
+        self._leg_frames[sym] = df
+        cb = getattr(self, "cb_chart_sym", None)
+        if cb is None:
+            return self.update_kline(df)
+        if cb.findData(sym) < 0:
+            cb.blockSignals(True)
+            cb.addItem(sym, sym)
+            cb.blockSignals(False)
+        if str(cb.currentData() or "") == sym:
+            self.df = df
+            self._draw_kline(keep_window=True)
 
     def _leg_key(self) -> str:
         """三页共用的「选中的那条腿」。空字符串 = 全部合计。"""
@@ -1042,6 +1127,7 @@ class ResultView(QObject):
         self.filter_active = ctx.filter_active
         self.selected_keys = list(ctx.selected_keys or [])
         self.outcome = ctx.outcome
+        self._leg_frames = dict(getattr(ctx, "leg_frames", None) or {})
         self.trades = list(trades) if trades is not None else [
             (ctx.label, t) for t in (res.trades if res is not None else [])
         ]
@@ -1053,6 +1139,14 @@ class ResultView(QObject):
         if self.kind == "single":
             self.lbl_legend.setText(ctx.legend)
             self._draw_kline(keep_window)
+        else:
+            self._sync_chart_sym(res)
+            self._hide_chart_if_no_frames()
+            first = str(self.cb_chart_sym.currentData() or "") \
+                if getattr(self, "cb_chart_sym", None) is not None else ""
+            if first in self._leg_frames:
+                self.df = self._leg_frames[first]
+                self._draw_kline()
         self._draw_perf()
         self._update_metrics()
         self._update_table()
@@ -1087,8 +1181,16 @@ class ResultView(QObject):
         策略算出来了但结论为空 —— 比直接空白更误导。
         """
         self.df = self.raw = self.res = self.bh = None
+        self._leg_frames = {}
         self.trades = []
         self._sync_leg_combo(None)
+        cb = getattr(self, "cb_chart_sym", None)
+        if cb is not None:
+            cb.blockSignals(True)
+            cb.clear()
+            cb.blockSignals(False)
+        if self.kind != "single":
+            self._hide_chart_if_no_frames()
         # 画布已经被换成「一句话」了，不能留着旧窗口等 `eventFilter` 补画时
         # 把上一张图又摆回来
         self._k_view = None

@@ -471,6 +471,7 @@ def update_futures(
     progress=None,
     cancel=None,
     include_new: bool = True,
+    symbols: list[str] | None = None,
 ) -> UpdateResult:
     """更新期货 CSV。
 
@@ -479,6 +480,9 @@ def update_futures(
 
     缺少 Tushare token 时 `read_token()` 会抛 RuntimeError，
     错误信息里已写明三种配置方式，这里直接向上抛，由界面显示。
+
+    `symbols` 是 `["RB_SHFE", ...]` 形式的可选过滤，只更新这些品种。实盘引擎
+    发现行情落后时用它补自己用到的那一两个，不必把全市场几十个品种都重下一遍。
     """
     data_dir = data_dir or resolve_data_dir("cn")
     days = _days_of(range_key)
@@ -494,6 +498,10 @@ def update_futures(
     index = {x.get("ts_code"): x for x in manifest}
 
     targets = _fut_targets(data_dir, days, include_new, manifest)
+    if symbols:
+        want = {str(s).upper() for s in symbols}
+        targets = [t for t in targets
+                   if f"{t['symbol']}_{t['exchange']}".upper() in want]
     if not targets:
         raise FileNotFoundError(f"{data_dir} 下没有 CSV，请先运行 python download_futures.py")
 

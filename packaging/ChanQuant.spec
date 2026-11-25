@@ -33,7 +33,7 @@ APP_NAME = "ChanQuant"
 BUNDLE_ID = "com.chanquant.app"
 # 版本号必须和要打的 tag 对齐：v1.0.1 的包里这里还写着 1.0.0，
 # 装完在「关于」里看到的版本是错的。发版前记得同步改这里。
-VERSION = "3.9.18"
+VERSION = "3.9.20"
 
 ICON = os.path.join(PACK, "icon.ico" if sys.platform == "win32" else "icon.icns")
 if not os.path.exists(ICON):
@@ -239,6 +239,16 @@ HIDDEN = [
     # `from ttrade import cross_live`，漏了就是一条没有明细的 ImportError
     "ttrade.cross_live",
     "ttrade.cross_ml",
+    # 实盘数据就绪检查：日线 / 展期 / IV 的补数链路全是函数内 import
+    # （没网 / 没 token 时也照样能启动），静态分析扫不到。漏了的表现是
+    # 实盘发现数据旧了想补时抛 ImportError，策略静默用旧快照
+    "ttrade.live_data",
+    "ttrade.updater",
+    "ttrade.tqcurve",
+    "ttrade.optfetch",
+    "ttrade.optstore",
+    "ttrade.options",
+    "ttrade.auxdata",
     # 能力包注册表：`ttrade.skills` 里的每个模块靠 `__init__` 显式 import 完成
     # 注册。PyInstaller 静态扫描看不到「import 了但没被引用」，漏一个包就是
     # 界面上那几个动作静默消失（模型给了动作块，平台回「没有这个动作」）

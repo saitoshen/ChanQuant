@@ -1660,6 +1660,74 @@ def _run() -> tuple[bool, list[str]]:
 
     check("K 线内策略的理论持仓（sbbox 显示 0 那个）", _ib_theo)
 
+    def _ib_theo_follows_live():
+        """盘中真触发之后，理论仓跟**这一笔实际仓**走，不再跟 signal 闪。
+
+        用户 2026-11-25：「信号值有时候会莫名奇妙变动触发交易，但是一会儿又
+        变回来了」；选的口径是「跟着实际持仓走（盘中触发开仓后理论仓立刻变成
+        对应方向/手数，止损平仓后归 0）」。
+
+        冷启动那一段仍按回测口径（signal × 锁存手数）—— 一键对齐要靠它看见
+        「从没触发过」的腿，不能一并改掉（2026-11-24 的修复）。
+        """
+        from ttrade import strategy_runner as SR
+        from ttrade import strategy_store as SStore
+
+        class _Quote:
+            def __init__(self, px):
+                self.last_price = px
+
+        class _Fake:
+            _ib_on = staticmethod(SR.PortfolioRunner._ib_on)
+            _theo_lots_qty = SR.PortfolioRunner._theo_lots_qty
+            _theo_qty = SR.PortfolioRunner._theo_qty
+            _intrabar_tick = SR.PortfolioRunner._intrabar_tick
+            _latch_to_order = SR.PortfolioRunner._latch_to_order
+
+            def __init__(self, px):
+                self.px = px
+
+            def _contract_quote(self, symbol):
+                return _Quote(self.px)
+
+            def _note_ib_entry(self, st, px, sig):
+                pass
+
+            def _log(self, *a, **k):
+                pass
+
+        st = SR.SlotState(cfg=SStore.StrategyConfig(
+            sid="t-ib-live", name="t-ib-live", symbol="RB", exchange="SHFE",
+            period="1h", family="rule", rule_key="sbbox_ib", note="short",
+            sizing="fixed", volume=8))
+        st.running, st.underlying = True, "SHFE.rb2701"
+        st.signal, st.lots, st.theo_lots = -1, 8, 8
+        st.ib_armed, st.ib_entry_short, st.ib_stop_dist = True, 3300.0, 20.0
+
+        f = _Fake(px=3290.0)               # 跌破空头触发价
+        if f._theo_qty(st) != -8:
+            raise RuntimeError("冷启动还没触发过，理论仓该按回测口径 -8")
+        f._intrabar_tick(st)
+        if int(st.target) != -8 or st.theo_live_qty != -8:
+            raise RuntimeError(
+                f"盘中触发后没记下这一笔实际仓位：{st.target} / {st.theo_live_qty}")
+        # signal 闪一下变 0，理论仓不许跟着回去（用户报的那个现象）
+        st.signal = 0
+        if f._theo_qty(st) != -8:
+            raise RuntimeError(f"信号闪变把理论仓改掉了：{f._theo_qty(st)}")
+        # 止损打掉：理论仓立刻归 0，哪怕 signal 还是空
+        st.signal, st.held[st.underlying] = -1, -8
+        f.px = 3330.0                      # 止损 3300+20=3320，已越过
+        f._intrabar_tick(st)
+        if int(st.target) != 0 or st.theo_live_qty != 0:
+            raise RuntimeError(f"止损后理论仓没归 0：{st.target} / {st.theo_live_qty}")
+        if f._theo_qty(st) != 0:
+            raise RuntimeError(f"止损后理论仓还是 {f._theo_qty(st)}")
+        return ("冷启动按回测口径 -8；盘中触发后按实际仓 -8，signal 闪变不改；"
+                "止损后立刻归 0")
+
+    check("K 线内策略盘中触发后理论仓跟实际仓走", _ib_theo_follows_live)
+
     def _theo_entry_lots():
         """理论手数取「**开仓那一根**算出来的那个数」，绝不按当前 K 线重算。
 
@@ -5441,6 +5509,193 @@ def _run() -> tuple[bool, list[str]]:
                 f"与手工口径偏差 {dev:.1e}")
 
     check("多品种回放认「合并训练」", _multi_pooled)
+
+    def _multi_leg_frames_for_chart():
+        """多品种回测留逐品种 signal 行情；结果页能按品种看 K 线且默认接实时。
+
+        2026-11-25 用户：「多品种的回测结果页面除了绩效，和交易记录等，也需要
+        一个 K线与信号 页面，显示单独各个品种的 k 线和信号情况」；又要求
+        「查看回测默认要实时状态……实时接到实时更新的数据」。
+        """
+        import inspect
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import replay as RP
+        from ttrade import strategy_store as SStore
+
+        def _mk(seed: int):
+            n = 320
+            idx = pd.date_range("2022-01-03", periods=n, freq="B")
+            r = np.random.default_rng(seed).normal(0.0005, 0.013, n)
+            close = pd.Series(100 * np.exp(np.cumsum(r)), index=idx)
+            op = close.shift(1).fillna(close.iloc[0])
+            return pd.DataFrame({
+                "open": op, "high": np.maximum(op, close) * 1.004,
+                "low": np.minimum(op, close) * 0.996,
+                "close": close, "volume": 1e5,
+            })
+
+        frames = {"A_SHFE": _mk(1), "B_SHFE": _mk(2)}
+        cfg = SStore.StrategyConfig(
+            symbol="A", exchange="SHFE", period="1d", family="rule",
+            rule_key="ma_cross", principal=100_000.0,
+            multi_symbols=list(frames))
+        rp = RP.run_multi(cfg, frames)
+        if not rp.ok:
+            raise RuntimeError(f"多品种回放失败：{rp.error}")
+        if set(rp.leg_frames) != set(frames):
+            raise RuntimeError(f"逐品种行情没留给 K 线页：{list(rp.leg_frames)}")
+        for key, df in rp.leg_frames.items():
+            if df is None or "signal" not in df.columns or len(df) < 100:
+                raise RuntimeError(f"{key} 的逐品种行情没有可用 signal 列")
+            if df.index[-1] != frames[key].index[-1]:
+                raise RuntimeError(f"{key} 的逐品种行情末根对不上")
+
+        import gui.portfolio_page as PP
+        import gui.result_view as RV
+
+        pages = inspect.getsource(RV.ResultView._build_pages)
+        if '"K线与信号"' not in pages:
+            raise RuntimeError("组合视图没有「K线与信号」页签")
+        if "def update_leg_kline" not in inspect.getsource(RV.ResultView):
+            raise RuntimeError("没有逐品种 K 线的实时更新入口")
+        present = inspect.getsource(PP.PortfolioPage._present_single)
+        if "_start_live" not in present or "leg_frames=frames" not in present:
+            raise RuntimeError("查看回测没默认接实时 / 没把逐品种行情递给视图")
+        poll = inspect.getsource(PP.PortfolioPage._poll_live)
+        if "_live_syms" not in poll:
+            raise RuntimeError("实时轮询没按子策略逐品种要 K 线")
+        return f"{len(rp.leg_frames)} 条逐品种 signal 行情；组合视图可看 K 线并默认接实时"
+
+    check("多品种回测逐品种 K 线与默认实时", _multi_leg_frames_for_chart)
+
+    def _live_data_ready():
+        """实盘数据就绪：辨识所需衍生源、查末日、订阅清单、日内现算。"""
+        import inspect
+        import numpy as np
+        import pandas as pd
+
+        from ttrade import auxdata, live_data as LD, strategy_runner as SR
+        from ttrade import tqstore, updater as UP
+
+        need = LD.needed_aux("1d", ["roll_main_oi", "iv_atm", "mom_20"])
+        if need != {"curve": True, "opt": True}:
+            raise RuntimeError(f"因子需要的衍生源判错了：{need}")
+        if not LD.needed_aux("5m", ["roll_intraday@5m"])["curve"]:
+            raise RuntimeError("日内展期因子没认出来要订阅真实合约")
+        if LD.needed_aux("5m", ["mom_20"])["opt"]:
+            raise RuntimeError("纯价格因子不该触发期权订阅")
+
+        # 末日检查：缺哪样报哪样，不靠真实联网
+        want = LD.prev_trading_day()
+        day = pd.Timestamp(want)
+        old_last, old_curve, old_opt = (tqstore.last_dt, auxdata.load_curve,
+                                        auxdata.load_opt)
+        try:
+            tqstore.last_dt = lambda *a, **k: day
+            auxdata.load_curve = lambda *a, **k: pd.DataFrame(
+                index=pd.DatetimeIndex([day]))
+            auxdata.load_opt = lambda *a, **k: pd.DataFrame()
+            fr = LD.freshness("X", "E", need)
+            if "opt" not in fr["stale"] or "price_1d" in fr["stale"]:
+                raise RuntimeError(f"末日检查分叉错了：{fr}")
+        finally:
+            tqstore.last_dt, auxdata.load_curve, auxdata.load_opt = (
+                old_last, old_curve, old_opt)
+
+        # 订阅清单：展期取 c1/c2，转成天勤合约代码
+        old_curve = auxdata.load_curve
+        try:
+            auxdata.load_curve = lambda *a, **k: pd.DataFrame(
+                {"c1_code": ["RB2601.SHF"], "c2_code": ["RB2605.SHF"]},
+                index=pd.DatetimeIndex([day]))
+            w = LD.watch_symbols("RB", "SHFE", {"curve": True, "opt": False})
+            if w["curve"] != ["SHFE.rb2601", "SHFE.rb2605"]:
+                raise RuntimeError(f"日内展期订阅清单错了：{w}")
+        finally:
+            auxdata.load_curve = old_curve
+
+        # 日内现算：roll_intra 用近/次近那一刻的价差减开盘价差，只写最后一根
+        q = {
+            "SHFE.rb2601": type("Q", (), {"last_price": 100.0,
+                                          "open_interest": 10.0})(),
+            "SHFE.rb2605": type("Q", (), {"last_price": 98.0,
+                                          "open_interest": 20.0})(),
+        }
+        from datetime import date as _date
+
+        aux = LD.LiveAux()
+        aux.set_watch(list(q))
+        # 首 tick 没有「开盘价」，现算器不编；先喂一份开盘价模拟盘中第二跳
+        aux.open_px = {s: (_date.today(), 100.0) for s in q}
+        snap = aux.snapshot(q, "RB", "SHFE", {"curve": True, "opt": False})
+        if not ("roll_intra" in snap and abs(snap["roll_intra"]
+                                             - (100 / 98 - 1)) < 1e-9):
+            raise RuntimeError(f"日内展期算错了：{snap}")
+        df = pd.DataFrame({"close": np.arange(3.0)})
+        got = aux.overlay(df.copy(), "5m", {"curve": True, "opt": False})
+        if got["roll_intra"].iloc[:2].notna().any():
+            raise RuntimeError("日内现算写进了历史 bar —— 这是前视数据")
+        if pd.isna(got["roll_intra"].iloc[-1]):
+            raise RuntimeError("最后那根活 bar 没写上现算值")
+
+        # 展期+期权同开时，期权合约排在真实合约前面也不能把期权价当远近月价
+        q2 = dict(q)
+        q2["OPT_fake"] = type("Q", (), {"last_price": 9.0,
+                                        "open_interest": 1.0})()
+        aux2 = LD.LiveAux()
+        aux2.set_watch(["OPT_fake"] + list(q), list(q))  # 期权在前，真实合约在后
+        aux2.open_px = {s: (_date.today(), 100.0) for s in q}
+        snap2 = aux2.snapshot(q2, "RB", "SHFE", {"curve": True, "opt": False})
+        if abs(snap2["roll_intra"] - snap["roll_intra"]) > 1e-9:
+            raise RuntimeError(f"期权合约混进展期取价了：{snap2} vs {snap}")
+
+        # 补数链路：日线 → 真实合约 → 重算展期，顺序和开关都要对（全程打桩）
+        from ttrade import tqcurve, tqfetch
+
+        class _R:
+            added, failed, days = 3, 0, 1
+
+        class _Sess:
+            def get(self):
+                return object()
+
+            def close(self):
+                pass
+
+        calls: dict = {}
+        olds = (UP.update_futures, UP.update_aux, tqfetch.Session,
+                tqfetch.write_contracts, tqcurve.build_all)
+        try:
+            UP.update_futures = lambda *a, **k: calls.setdefault("price", k) or _R()
+            UP.update_aux = lambda *a, **k: calls.setdefault("aux", k) or _R()
+            tqfetch.Session = _Sess
+            tqfetch.write_contracts = lambda *a, **k: calls.setdefault("contracts", a)
+            tqcurve.build_all = lambda *a, **k: calls.setdefault("curve", a)
+            LD.supplement("X", "E", {"price": False, "curve": True, "opt": False})
+        finally:
+            (UP.update_futures, UP.update_aux, tqfetch.Session,
+             tqfetch.write_contracts, tqcurve.build_all) = olds
+        if not (calls["aux"]["want_contracts"]
+                and not calls["aux"]["want_options"]):
+            raise RuntimeError(f"补展期时开关错了：{calls['aux']}")
+        if "contracts" not in calls or "curve" not in calls:
+            raise RuntimeError(f"没有补真实合约并重算展期：{list(calls)}")
+
+        # 引擎接线：检查 / 订阅 / 现算三处都接上，且单品种过滤参数存在
+        if "_ensure_live_data" not in inspect.getsource(SR.PortfolioRunner._subscribe):
+            raise RuntimeError("订阅主连时没检查数据是否最新")
+        if "_overlay_live_aux" not in inspect.getsource(SR.PortfolioRunner._with_aux):
+            raise RuntimeError("实盘因子帧没叠日内现算的衍生列")
+        if "symbols: list[str] | None = None" not in inspect.getsource(
+                UP.update_futures):
+            raise RuntimeError("补数入口没有按品种过滤 —— 会重下全市场")
+        return (f"因子源判定 OK；末日 {want} 缺期权能报出；"
+                f"展期订阅 {len(w['curve'])} 个真实合约；"
+                f"日内 roll_intra {snap['roll_intra']:.4f} 只写活 bar")
+
+    check("实盘行情与因子数据就绪检查", _live_data_ready)
 
     def _ml_artifact():
         """训练产物：每一折落一个 .pkl，实盘只预测的结果和回测**一致**。
@@ -15802,10 +16057,24 @@ def _run() -> tuple[bool, list[str]]:
                              - got.to_numpy()).max())
             if d >= 1e-9:
                 raise AssertionError(f"截面 ML 回测 / 实盘权重不一致：{d}")
+
+            # 🔴 训练侧必须挂衍生列（用户 2026-11-25：油脂截面 roll_main_oi 在
+            # 训练时被剔除，根因是 TrainWorker 用 load_main 裸读、没 attach aux）。
+            # 展期 / OI 因子需要 o6_/o3_ 列，裸日线只有 10 列 ⇒ 整列 NaN 被静默剔除。
+            import inspect as _ins
+            from gui import portfolio_page as _PP
+            tw = _ins.getsource(_PP.TrainWorker.run)
+            assert "attach_for_period" in tw, "截面 ML 训练没挂衍生列，展期/OI 因子会丢"
+            # 产物存配置原始 keys、校验拿它比，不能拿交集（交集天然是子集）
+            src_art = _ins.getsource(XM.train_artifact)
+            assert "keys_requested" in src_art, "产物没存配置原始因子列表"
+            src_dig = _ins.getsource(XM.CrossMlArtifact.mismatch_reason)
+            assert "requested_keys" in src_dig, "校验没用配置原始因子列表"
         finally:
             XM.remove_artifact(sid)
         return (f"{art.n_folds} 折产物，实盘只预测，"
-                f"回测 / 实盘权重 maxΔ={d:g}")
+                f"回测 / 实盘权重 maxΔ={d:g}；"
+                "训练侧挂衍生列 + 产物存配置原始因子均已钉住")
 
     check("截面 ML 实盘：离线产物 + 只预测 + 权重对齐回测", _cross_ml_live)
 
