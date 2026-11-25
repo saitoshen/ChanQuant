@@ -201,8 +201,13 @@ def build(symbol: str, exchange: str, period: str = "1d") -> tuple[pd.DataFrame,
 
 
 def build_all(pairs: list[tuple[str, str]], period: str = "1d", on_row=None,
-              cancel=None) -> dict:
-    """批量构建并写盘。返回 {品种_交易所: 行数}。"""
+              cancel=None, replace: bool = False) -> dict:
+    """批量构建并写盘。返回 {品种_交易所: 行数}。
+
+    `replace=True` 用于「底料重做」后的全量重建：旧文件里那些新算不再存在的
+    日期必须删掉，不能靠 merge_write 留着（修合约代码时踩过：旧日期仍带
+    错位选腿）。日常增量仍用默认 False 保住实时叠进来的活 bar。
+    """
     os.makedirs(curve_dir(), exist_ok=True)
     out: dict[str, int] = {}
     for sym, ex in pairs:
@@ -218,7 +223,11 @@ def build_all(pairs: list[tuple[str, str]], period: str = "1d", on_row=None,
             continue
         n = 0
         if not df.empty:
-            n = C.merge_write(curve_path(sym, ex), df, ["date"])
+            if replace:
+                C.write_atomic(curve_path(sym, ex), df)
+                n = len(df)
+            else:
+                n = C.merge_write(curve_path(sym, ex), df, ["date"])
         out[key] = n
         if on_row is not None:
             on_row(key, n, note)

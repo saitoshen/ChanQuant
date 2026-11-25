@@ -5819,6 +5819,7 @@ def _run() -> tuple[bool, list[str]]:
         """展期源严格跟随合成底料，两套不混列（2026-11-25 用户口径）。"""
         import inspect
 
+        import numpy as np
         import pandas as pd
 
         from ttrade import auxdata as AD, tqdata as TQ, strategy_runner as SR
@@ -5850,6 +5851,51 @@ def _run() -> tuple[bool, list[str]]:
         if not d.empty and not t.empty and len(d.columns) != len(t.columns):
             raise RuntimeError("默认展期源和显式 tushare 不一致")
 
+        # 天勤日线补成交额：amount = 量 × 未复权价 × 乘数 / 1e4（万元）。
+        # 少了这一列，log_amount_20 会回退到「手×价」，逐品种常数不一样，
+        # 横截面排序和 Tushare 对不上（同一因子的 IC 因此差很多）。
+        from ttrade import specs
+        qraw = TQ.load_main("RB", "SHFE", "1d_tq", adjust="none")
+        if "amount" not in qraw.columns:
+            raise RuntimeError("天勤日线没有 amount，成交额因子会回退到手×价")
+        mult = specs.multiplier("RB", "SHFE")
+        ratio = (qraw["amount"] / (qraw["volume"] * qraw["close"])).replace(
+            [np.inf, -np.inf], np.nan).dropna()
+        if ratio.empty or abs(float(ratio.median()) - mult / 1e4) > 1e-8:
+            raise RuntimeError(f"天勤成交额口径错了：{ratio.median()} ≠ {mult / 1e4}")
+
+        # 郑商所 3 位月份必须按每根 bar 自己的交易日消歧。统一用 to_ts(c, end)
+        # 会把 2016 年的 MA701 写成 MA2701，展期选腿整段错位（2026-11-25 现场）。
+        from ttrade import tqfetch as TF, tqstore as TS
+        from ttrade.tqsdk_symbols import to_ts_candidates
+
+        wsrc = inspect.getsource(TF.write_contracts)
+        if ("_ts_codes_for_bars" not in wsrc
+                or "to_ts(c, end)" in wsrc
+                or "_pick_ts_code(c, end, have)" not in wsrc):
+            raise RuntimeError("郑商所合约没按 bar 日期消歧（仍按今天写死十年代码）")
+        cs = set(to_ts_candidates("CZCE.MA701"))
+        if "MA1701.ZCE" not in cs or "MA2701.ZCE" not in cs:
+            raise RuntimeError(f"3 位月份的候选年份不全：{sorted(cs)}")
+        # 全量重建必须能整份替换：merge_write 会把新算不再存在的旧日期留着，
+        # 修完合约代码后那些旧行仍是错位选腿。
+        from ttrade import tqcurve as TQC
+        if "replace: bool = False" not in inspect.getsource(TQC.build_all):
+            raise RuntimeError("展期全量重建没有 replace 选项，旧日期删不掉")
+        if TS.exists():
+            with TS.connect(read_only=True) as con:
+                tables = {r[0] for r in con.execute(
+                    "SELECT table_name FROM information_schema.tables"
+                    " WHERE table_schema='main'").fetchall()}
+                if "contract_bars" in tables:
+                    bad = con.execute(
+                        "SELECT count(*) FROM contract_bars WHERE symbol='MA'"
+                        " AND exchange='CZCE' AND period='1d'"
+                        " AND year(trading_day)=2016 AND contract LIKE 'MA27%'"
+                    ).fetchone()[0]
+                    if bad:
+                        raise RuntimeError(f"库里仍有 2016 年的 MA27xx 错位合约：{bad} 行")
+
         # 期权同源分流：tushare 只读 opt_*.csv、tq 只读本地库，不混不回退。
         # Tushare 只有日频 —— 非 1d 档必须返回空，不能拿日频冒充。
         oh = AD.load_opt(AD._default_dir(), "RB", "SHFE", "1h",
@@ -5865,6 +5911,22 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError("期权两源没走各自的文件 / 库")
         AD.load_opt(AD._default_dir(), "IO", "CFFEX", "1d", source="tushare")
         AD.load_opt(AD._default_dir(), "IO", "CFFEX", "1d", source="tq")
+        # 期权没有展期那条「按今天补十年」的坑：天勤期权代码 / 标的 / 到期都
+        # 从报价对象读，不经过 to_ts；CZCE 3 位码即使十年后复用，join 也带 dt。
+        # 反证：库里不该有一个郑商所期权合约的 bar 跨三个日历年。
+        from ttrade import optstore as OS
+        if OS.exists():
+            with OS.connect(read_only=True) as ocon:
+                otabs = {r[0] for r in ocon.execute(
+                    "SELECT table_name FROM information_schema.tables"
+                    " WHERE table_schema='main'").fetchall()}
+                if "option_bars" in otabs:
+                    span = ocon.execute(
+                        "SELECT count(*) FROM (SELECT contract FROM option_bars"
+                        " WHERE contract LIKE 'CZCE.%' GROUP BY contract"
+                        " HAVING count(DISTINCT year(dt)) > 2)").fetchone()[0]
+                    if span:
+                        raise RuntimeError(f"郑商所期权合约跨十年复用：{span} 个")
         # 档位选择也跟随源：tushare 锁 1d，tq 可走多档
         if AD._use_iv_period(AD._default_dir(), "IO", "CFFEX", pd.DataFrame(),
                              "tushare") != "1d":

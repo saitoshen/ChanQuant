@@ -25,7 +25,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from . import tqstore
+from . import specs, tqstore
 from .paths import data_dir
 
 # 周期名 → (源周期, 合并根数)。源周期就是实际落盘的那个。
@@ -214,7 +214,13 @@ def load_main(
     数据从 DuckDB 读（`tqstore`）。早期版本按品种存 CSV，这里保留 CSV 兜底，
     方便还没迁移的老数据继续能用；两条路径返回的列完全一致。
 
-    列：open/high/low/close/volume/open_oi/close_oi/adj_factor/trading_day。
+    列：open/high/low/close/volume/amount/open_oi/close_oi/adj_factor/trading_day。
+
+    `amount` 是**未复权成交额（万元）**，`volume × 未复权 close × 合约乘数 / 1e4`。
+    天勤原始 bar 没有这一列，但 `f_log_amount_20` 优先读 `amount`；不补的话它会
+    回退到 `volume × close`（手×价），少掉逐品种不同的合约乘数，横截面排序会被
+    一个品种一个常数打乱 —— 这就是同一条「成交金额对数」因子在两套日线上 IC
+    差很多的主因。复权只改 OHLC，不改 amount（和 Tushare 一样）。
     """
     if is_multiday(period):
         return _load_multiday(symbol, exchange, period, adjust, start, end)
@@ -234,6 +240,16 @@ def load_main(
             df["adj_factor"] = 1.0
         if "trading_day" not in df.columns:
             df["trading_day"] = trading_days(df.index).to_numpy()
+
+    # 🔴 补成交额（万元）：一定用**未复权** close，和 Tushare fut_daily 同口径。
+    # 乘数走 specs（从 Tushare 日线的 amount/(volume*close) 反推，查不到退 1）。
+    # 已有 amount（例如以后写库时落了这一列）就不覆盖。
+    if "amount" not in df.columns:
+        mult = specs.multiplier(symbol, exchange)
+        if "volume" in df.columns and "close" in df.columns:
+            df["amount"] = (pd.to_numeric(df["volume"], errors="coerce")
+                            * pd.to_numeric(df["close"], errors="coerce")
+                            * float(mult) / 1e4)
 
     mode = (adjust or "none").lower()
     f = pd.to_numeric(df["adj_factor"], errors="coerce").fillna(1.0).to_numpy(float)
@@ -277,6 +293,7 @@ def merge_bars(df: pd.DataFrame, n: int) -> pd.DataFrame:
         "low": "min",
         "close": "last",
         "volume": "sum",
+        "amount": "sum",
         "open_oi": "last",
         "close_oi": "last",
         "adj_factor": "last",

@@ -178,6 +178,34 @@ def to_ts(tq_code: str, ref_date) -> str:
     return f"{variety.upper()}{digits}.{suffix}"
 
 
+def to_ts_candidates(tq_code: str) -> list[str]:
+    """列出这个天勤合约可能对应的全部 Tushare 代码，新的在前。
+
+    郑商所 3 位月份只有一个年份个位，`to_ts()` 必须靠参考日期消歧。下载整个
+    十年历史时，一个 `MA701` 在 2016 年指 2017-01、在 2026 年指 2027-01，
+    所以不能拿「今天」一个参考日期把整段历史都写死。这个函数给出所有候选，
+    让调用方按 bar 自己的日期挑；4 位月份的交易所只有一个候选。
+    """
+    s = str(tq_code).strip()
+    if "." not in s:
+        raise ValueError(f"不是合法的天勤合约：{tq_code}")
+    exchange, code = s.rsplit(".", 1)
+    m = _CODE_RE.match(code)
+    if not m:
+        raise ValueError(f"无法解析天勤合约代码：{tq_code}")
+    variety, digits = m.group(1), m.group(2)
+    suffix = _TS_SUFFIX.get(exchange, exchange)
+    if len(digits) == 4:
+        return [f"{variety.upper()}{digits}.{suffix}"]
+    if len(digits) != 3:
+        raise ValueError(f"合约月份位数不对：{tq_code}")
+    years = range(2000 + int(digits[0]), 2100, 10)
+    return [
+        f"{variety.upper()}{y % 100:02d}{int(digits[1:]):02d}.{suffix}"
+        for y in sorted(years, reverse=True)
+    ]
+
+
 def _resolve_short_year(year_digit: int, ref_date) -> int:
     """把「年份个位」还原成完整年份，取离参考日期最近的那个。
 

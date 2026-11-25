@@ -22,7 +22,7 @@ import pandas as pd
 from . import tqstore as S
 from .paths import data_dir
 from .tqdata import source_period, trading_days
-from .tqsdk_symbols import main_symbol, read_account, to_ts
+from .tqsdk_symbols import main_symbol, read_account, to_ts, to_ts_candidates
 
 
 PERIOD_SEC = {"5m": 300, "1h": 3600, "1d": 86400}
@@ -791,6 +791,47 @@ def _query_contracts(api, sym: str, ex: str) -> list[str]:
         raise err
     return sorted(out)
 
+def _pick_ts_code(c: str, end: date, have: dict) -> str:
+    """增量对账用的「代表代码」。
+
+    真正写库的合约代码按每根 bar 的日期定（见 `_ts_codes_for_bars`），这里只
+    决定「库里有没有下过这个合约」——取 `have` 里实际存在的那个候选；都没有
+    就取不晚于明年的最新候选（新合约），免得把老合约当成新合约的已下记录。
+    """
+    cands = to_ts_candidates(c)
+    for code in cands:
+        if code in have:
+            return code
+    for code in cands:
+        digits = code.rsplit(".", 1)[0][-4:]
+        if 2000 + int(digits[:2]) <= end.year + 1:
+            return code
+    return cands[-1]
+
+
+def _ts_codes_for_bars(c: str, df: pd.DataFrame, end: date, ex: str):
+    """每根 bar 按自己的交易日消歧合约代码。
+
+    🔴 郑商所 3 位月份不能统一按 `end` 解析：2016 年的 `MA701` 是 2017-01，
+    2026 年的 `MA701` 是 2027-01，按今天解析会把 2016 年那段写成 2027 年，
+    展期选腿整段错位。4 位月份的交易所不受影响，走原来的 `to_ts()` 即可。
+    """
+    if ex != "CZCE" or len(to_ts_candidates(c)) == 1:
+        return to_ts(c, end)
+    days = pd.to_datetime(df["dt"])
+    from .tqdata import trading_days
+
+    days = trading_days(days)
+    cache: dict[pd.Timestamp, str] = {}
+    out: list[str] = []
+    for d in days:
+        key = pd.Timestamp(d)
+        if key not in cache:
+            cache[key] = to_ts(c, key)
+        out.append(cache[key])
+    return pd.Series(out, index=df.index).to_numpy()
+
+
 def write_contracts(api, sym: str, ex: str, period: str, years: int,
                     days: int = 0, cancel=None) -> dict:
     """下载一个品种的全部真实合约（不复权，单个合约本身没有换月跳空）。
@@ -828,7 +869,7 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int,
     skipped = old = blank = 0
     for c in conts:
         try:
-            ts_code = to_ts(c, end)
+            ts_code = _pick_ts_code(c, end, have)
         except Exception:
             ts_code = c  # 解析不了就保留天勤原名，至少不丢数据
         ym = _contract_ym(ts_code)
@@ -877,7 +918,11 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int,
                 for c, ts_code, cstart in batch:
                     df = frames.get(c)
                     if df is not None and not df.empty:
-                        df["contract"] = ts_code
+                        df = df.copy()
+                        try:
+                            df["contract"] = _ts_codes_for_bars(c, df, end, ex)
+                        except Exception:
+                            df["contract"] = ts_code
                         added += S.upsert_contracts(con, sym, ex, period, df)
                         n_con += 1
                         failed.pop(c, None)
