@@ -3066,7 +3066,14 @@ class PortfolioRunner:
                 quotes[s] = q
         if not quotes:
             return df
-        aux.snapshot(quotes, cfg.symbol, cfg.exchange, need)
+        # 标的现价 = 主连最后一根收盘价（IV 反解的 F，不能用期权权利金）
+        spot = 0.0
+        try:
+            if len(df) and "close" in df.columns:
+                spot = float(pd.to_numeric(df["close"], errors="coerce").iloc[-1])
+        except Exception:                                # noqa: BLE001
+            spot = 0.0
+        aux.snapshot(quotes, cfg.symbol, cfg.exchange, need, spot=spot)
         return aux.overlay(df, cfg.period, need)
 
     def _check_aux_fresh(self, st: SlotState, df: pd.DataFrame) -> None:

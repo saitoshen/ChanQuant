@@ -5683,6 +5683,48 @@ def _run() -> tuple[bool, list[str]]:
         if "contracts" not in calls or "curve" not in calls:
             raise RuntimeError(f"没有补真实合约并重算展期：{list(calls)}")
 
+        # 期权按品种过滤：商品期权小写、中金所大写，两种都要圈中
+        from ttrade import optfetch as OF
+        src = inspect.getsource(LD.supplement)
+        if "sym.lower()" not in src or "sym.upper()" not in src:
+            raise RuntimeError("期权补数没同时传大小写品种，股指期权会被过滤掉")
+        for c, v in (("SHFE.rb2612C3500", "rb"), ("CFFEX.IO2412-C-3800", "IO")):
+            if OF.variety_of(c) not in {v.lower(), v.upper()}:
+                raise RuntimeError(f"品种口径对不上：{c} → {OF.variety_of(c)}")
+
+        # 期权 IV 现算：F 必须是标的价，不能用期权权利金当 spot。
+        # 用 optstore 里真实存在的未到期合约 + 合理标的价，验证能反解出 iv_near。
+        import numpy as np
+
+        from ttrade import optstore as OS, options as OP
+        from datetime import date as _date2
+        meta = OS.load_meta(varieties=["IO"])
+        if meta is not None and not meta.empty:
+            futm = meta[pd.to_datetime(meta["expiry"]) > pd.Timestamp(_date2.today())]
+            if not futm.empty:
+                exp = futm["expiry"].min()
+                chain = futm[futm["expiry"] == exp]
+                spot_v = float(pd.to_numeric(chain["strike"], errors="coerce").median())
+                dte = int((pd.Timestamp(exp) - pd.Timestamp(_date2.today())).days)
+                qs = {}
+                for _, r in chain.iterrows():
+                    c = str(r["contract"])
+                    k = float(r["strike"])
+                    iscall = "-C-" in c
+                    px = float(OP.black76(spot_v, k, dte / 365.0, 0.19, 0.0,
+                                          np.array([iscall]))[0]) + 0.5
+                    qs[c] = type("Q", (), {"last_price": px,
+                                           "open_interest": 100.0})()
+                aux3 = LD.LiveAux()
+                aux3.set_watch(list(qs), [])
+                snap3 = aux3.snapshot(qs, "IO", "CFFEX", {"opt": True},
+                                      spot=spot_v)
+                if not (0 < snap3.get("iv_near", 0) < 1):
+                    raise RuntimeError(f"IV 现算用错标的价（权利金当 F）：{snap3}")
+        # 引擎把主连收盘价当 spot 传进来
+        if "spot=spot" not in inspect.getsource(SR.PortfolioRunner._overlay_live_aux):
+            raise RuntimeError("引擎没把标的价传给 IV 现算")
+
         # 引擎接线：检查 / 订阅 / 现算三处都接上，且单品种过滤参数存在
         if "_ensure_live_data" not in inspect.getsource(SR.PortfolioRunner._subscribe):
             raise RuntimeError("订阅主连时没检查数据是否最新")

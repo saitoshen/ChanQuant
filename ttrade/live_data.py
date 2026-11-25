@@ -184,8 +184,13 @@ def supplement(sym: str, ex: str, need: dict[str, bool], progress=None) -> dict:
         if need.get("opt"):
             from ttrade import optfetch, tqfetch
 
+            # 🔴 必须按品种过滤：不传 varieties 会对全市场 2974 条期权链逐条检查
+            # （实测品种过滤能砍掉 98.3%），实盘后台补数会被它拖死。
+            # 🔴 大小写两种都要传：variety_of() 对商品期权返回小写（rb/au/m），
+            # 对中金所返回大写（IO/MO/HO）—— 只传小写会把股指期权全过滤掉。
             sess = sess or tqfetch.Session()
-            optfetch.update(sess, periods=("1d", "1h"))
+            varieties = list({sym.lower(), sym.upper()})
+            optfetch.update(sess, periods=("1d", "1h"), varieties=varieties)
             out["opt"] = "已重算"
     except Exception as exc:                            # noqa: BLE001
         out["opt"] = f"失败：{type(exc).__name__}: {str(exc)[:100]}"
@@ -340,8 +345,13 @@ class LiveAux:
             oi = 0.0
         return px, oi
 
-    def snapshot(self, quotes: dict, sym: str, ex: str, need: dict[str, bool]) -> dict:
-        """算一份当前 tick 的衍生值。`quotes` 是 `{天勤合约: quote}`。"""
+    def snapshot(self, quotes: dict, sym: str, ex: str, need: dict[str, bool],
+                 spot: float = 0.0) -> dict:
+        """算一份当前 tick 的衍生值。`quotes` 是 `{天勤合约: quote}`。
+
+        `spot` 是标的现价（主连最新价）—— 期权 IV 反解必须用标的价当 F，
+        绝不能用某个期权合约的报价（那是权利金，不是标的）。
+        """
         today = date.today()
         out: dict = {}
         if need.get("curve"):
@@ -364,11 +374,12 @@ class LiveAux:
                 if min(opens) > 0:
                     out["roll_intra"] = now - (opens[0] / opens[1] - 1.0)
         if need.get("opt"):
-            out.update(self._iv_snapshot(quotes, sym, ex))
+            out.update(self._iv_snapshot(quotes, sym, ex, spot))
         self.last = out
         return out
 
-    def _iv_snapshot(self, quotes: dict, sym: str, ex: str) -> dict:
+    def _iv_snapshot(self, quotes: dict, sym: str, ex: str,
+                     spot: float = 0.0) -> dict:
         """用期权实时报价反解近 / 次近两个到期月的 IV 摘要。"""
         try:
             from ttrade import optstore as OS, options as OP
@@ -393,11 +404,9 @@ class LiveAux:
                 dte = int((pd.Timestamp(exp) - today).days)
                 if not (OP.MIN_DTE <= dte <= OP.MAX_DTE):
                     continue
-                spot = 0.0
-                for q in quotes.values():
-                    spot = self._px(q)[0]
-                    if spot > 0:
-                        break
+                # 🔴 F 必须是标的价（引擎传主连最新价）。原来这里从 quotes 里
+                # 抓第一个报价当 spot —— 那是期权权利金（几十块），不是标的
+                # （几千点），money=ln(K/F) 全部超出区间 ⇒ IV 恒算不出来。
                 if not (spot > 0):
                     continue
                 recs = []
