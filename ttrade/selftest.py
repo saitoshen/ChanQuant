@@ -5856,12 +5856,15 @@ def _run() -> tuple[bool, list[str]]:
                          source="tushare")
         if len(oh):
             raise RuntimeError("Tushare 期权非日频档不该有值（只有日频）")
-        oi_ts = AD.load_opt(AD._default_dir(), "IO", "CFFEX", "1d",
-                            source="tushare")
-        oi_tq = AD.load_opt(AD._default_dir(), "IO", "CFFEX", "1d",
-                            source="tq")
-        if len(oi_ts) or oi_tq.empty:
-            raise RuntimeError("股指期权应只有天勤源有值（Tushare 无 IF/IO 文件）")
+        # 不能假设某份期权文件「一定不存在」：源码版和随包版带的文件不同
+        # （打包版里 opt_IO_CFFEX.csv 可能存在）。验的是两条读取路径分开，
+        # 而不是「这个品种恰好在哪一边有数据」。
+        opt_src = inspect.getsource(AD.load_opt)
+        if ('source == "tq"' not in opt_src or "_opt_local" not in opt_src
+                or "opt_path(aux_dir, symbol, exchange)" not in opt_src):
+            raise RuntimeError("期权两源没走各自的文件 / 库")
+        AD.load_opt(AD._default_dir(), "IO", "CFFEX", "1d", source="tushare")
+        AD.load_opt(AD._default_dir(), "IO", "CFFEX", "1d", source="tq")
         # 档位选择也跟随源：tushare 锁 1d，tq 可走多档
         if AD._use_iv_period(AD._default_dir(), "IO", "CFFEX", pd.DataFrame(),
                              "tushare") != "1d":

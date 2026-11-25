@@ -189,11 +189,29 @@ def _seed_full_from_lite(full: str) -> None:
         }
         for ddl in DDL:
             con.execute(ddl)
+        # 🔴 不能一条 INSERT 把 bars（打包版 1079 万行）整表搬过去：DuckDB 会把
+        # 整张表一次性物化，打包版首次写库直接 `Failed to commit: Allocation
+        # failure`。按 rowid 分段拷贝，内存占用 bounded，失败也不会留下半份库。
+        step = 200_000
         for t in ("bars", "contract_bars", "switch", "meta"):
-            if t in have:
-                con.execute(f"INSERT INTO {t} SELECT * FROM lite.{t}")
+            if t not in have:
+                continue
+            n = int(con.execute(f"SELECT count(*) FROM lite.{t}").fetchone()[0])
+            for lo in range(0, n, step):
+                con.execute(
+                    f"INSERT INTO {t} SELECT * FROM lite.{t}"
+                    " WHERE rowid >= ? AND rowid < ?", [lo, lo + step])
         con.execute("DETACH lite")
-    finally:
+    except Exception:
+        con.close()
+        for p in (tmp, tmp + ".wal"):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        raise
+    else:
         con.close()
     os.replace(tmp, full)
 
