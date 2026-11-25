@@ -1924,7 +1924,9 @@ class PortfolioRunner:
             self._data_need = {}
         self._data_need[key] = need
         if any(need.values()):
-            fr = live_data.freshness(cfg.symbol, cfg.exchange, need)
+            # 实盘历史一律天勤库 ⇒ 检查天勤源的末日，不能拿 Tushare 的冒充
+            fr = live_data.freshness(cfg.symbol, cfg.exchange, need,
+                                     source="tq")
             if fr["stale"]:
                 want = "/".join(fr["stale"])
                 self._log(
@@ -2961,7 +2963,10 @@ class PortfolioRunner:
             # 有四种说法，漂掉是必然的。没传周期时退回按帧形态判。
             from ttrade.auxdata import attach_for_period, bar_period
 
-            return attach_for_period(df, sym, ex, period or bar_period(df))
+            # 🔴 实盘历史一律来自天勤库（load_main），展期也必须纯天勤 —— 不能
+            # 因为策略配了 1d/2d/1w 就误挂 Tushare 展期，两套源不能混（2026-11-25）。
+            return attach_for_period(df, sym, ex, period or bar_period(df),
+                                     curve_source="tq")
         except Exception:      # noqa: BLE001 - 衍生数据缺了不该让策略停摆
             return df
 
@@ -3026,7 +3031,7 @@ class PortfolioRunner:
             from ttrade.auxdata import attach_for_period
 
             out = attach_for_period(df, st.cfg.symbol, st.cfg.exchange,
-                                    st.cfg.period)
+                                    st.cfg.period, curve_source="tq")
         except Exception as exc:  # noqa: BLE001 - 挂不上也要能算信号（只是因子少几票）
             self._note_once(
                 st, f"衍生列挂不上（{type(exc).__name__}: {exc}）⇒ 展期 / 期权那几个"
@@ -3098,8 +3103,9 @@ class PortfolioRunner:
 
             aux_dir = _default_dir()
             last = None
-            for part in (load_curve(aux_dir, st.cfg.symbol, st.cfg.exchange),
-                         load_opt(aux_dir, st.cfg.symbol, st.cfg.exchange)):
+            for part in (load_curve(aux_dir, st.cfg.symbol, st.cfg.exchange, "tq"),
+                         load_opt(aux_dir, st.cfg.symbol, st.cfg.exchange,
+                                  source="tq")):
                 if not part.empty:
                     d = pd.Timestamp(part.index[-1])
                     last = d if last is None or d < last else last

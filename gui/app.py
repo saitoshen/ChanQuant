@@ -114,7 +114,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ttrade import costs, factors, mlmodels, symbols_info, tqdata, tqlive
+from ttrade import costs, factors, live_data, mlmodels, symbols_info, tqdata, tqlive
 from ttrade import cross as cross_engine
 from ttrade import factor_strategy as fstrat
 from ttrade import replay
@@ -157,9 +157,9 @@ C_DOWN = "#0f9d58"    # 绿跌
 # 就悄悄换源（历史长度和价格都会变），所以天勤日线用 `1d_tq`。
 PERIOD_1D = "1d"            # Tushare 日线，显示为「日线Tushare」
 PERIOD_1D_TQ = "1d_tq"      # 天勤日线，显示为「日线」
-# 2 日 / 周线由**日线合成**，不下载。底料是「日线Tushare」那一份（期货是
-# data_futures 的 CSV、美股是 data 的 CSV、A 股是 stock.duckdb 的 Tushare 表）——
-# 它比天勤日线覆盖全、历史长，周线才够一个 252 根的因子窗口用。
+# 2 日 / 周线由**日线合成**，不下载，两套并存（2026-11-25）：
+# `2d`/`1w` 底料是 Tushare 日线、`2d_tq`/`1w_tq` 底料是天勤日线；展期源各跟各的
+# 底料（Tushare 合成配 Tushare 展期、天勤合成配天勤展期），两套不混。
 GUI_PERIODS = (
     [PERIOD_1D_TQ, PERIOD_1D]
     + [p for p in tqdata.PERIOD_ORDER if p != PERIOD_1D_TQ]
@@ -879,15 +879,16 @@ class DataStore:
             return self._cache[ck]
         try:
             if tqdata.is_multiday(period):
-                # 2 日 / 周线不落盘，现由日线合成。底料走日线那条分支，
-                # 这样「日线Tushare 一根什么价」和「周线由哪几根拼的」是同一份
-                # 数据；衍生列（期限结构 / 期权 IV）在日线分支里已经挂好了，
-                # 合成时按组内最后一根取值，不会把后面才公布的数提前用上
-                base = self.get(key, PERIOD_1D)
+                # 2 日 / 周线不落盘，由日线合成。**底料按周期分**（2026-11-25）：
+                # `2d`/`1w` ← Tushare 日线；`2d_tq`/`1w_tq` ← 天勤日线。衍生列
+                # （期限结构 / 期权 IV）在日线分支里按各自的源挂好了，合成时按组内
+                # 最后一根取值，不会把后面才公布的数提前用上。
+                base_period = tqdata.MULTIDAY_BASE[period]
+                base = self.get(key, base_period)
                 if base is None or base.empty:
                     raise RuntimeError(
-                        f"{key} 的日线还没有，{tqdata.PERIOD_LABEL.get(period, period)}"
-                        " 合成不出来")
+                        f"{key} 的{tqdata.PERIOD_LABEL.get(base_period, base_period)}还没有，"
+                        f"{tqdata.PERIOD_LABEL.get(period, period)} 合成不出来")
                 df = tqdata.merge_days(base, period)
             elif self.market == "cn_stock":
                 df = self._load_stock(key, period)
@@ -936,8 +937,8 @@ class DataStore:
     def has_period(self, key: str, period: str) -> bool:
         """这个标的有没有该周期的数据。按品种缓存，切换品种时只查一次库。"""
         if tqdata.is_multiday(period):
-            # 合成周期：日线在就有（三个市场都一定有日线，否则标的根本列不出来）
-            return self.has_period(key, PERIOD_1D)
+            # 合成周期：底料日线在就有（Tushare 合成看 1d，天勤合成看 1d_tq）
+            return self.has_period(key, tqdata.MULTIDAY_BASE[period])
         if self.market == "cn_stock":
             # 日线一定有（只要元数据存在）；分钟级查天勤表
             if period in (None, "", PERIOD_1D, PERIOD_1D_TQ):
@@ -1491,6 +1492,7 @@ class MainWindow(QMainWindow):
         # 「启动实时」）/ 空（只画本地历史）。两条同时跑时只让其中一条画
         self._live_src = ""
         self._live_last = None                         # 上一根 bar 的时间，用来判断「新 bar」
+        self._live_aux_snap: dict = {}                 # 实时现算的展期 / IV 摘要
         self._live_seq = 0                             # 每次起停自增，丢掉过期的推送
         self._live_patch_ts = 0.0                      # 上次刷未走完那根 bar 的时刻
 
@@ -7315,6 +7317,7 @@ class MainWindow(QMainWindow):
         self.live.started.connect(self._on_live_started)
         self.live.stopped.connect(self._on_live_stopped)
         self.live.bars.connect(self._on_live_bars)
+        self.live.aux_snapshot.connect(self._on_live_aux)
         self.live.state.connect(self._on_live_state)
         self.live.failed.connect(self._on_live_failed)
         self.live.log.connect(self._on_live_log)
@@ -7324,6 +7327,7 @@ class MainWindow(QMainWindow):
         self.study_live.started.connect(self._on_study_live_started)
         self.study_live.stopped.connect(self._on_study_live_stopped)
         self.study_live.bars.connect(self._on_study_live_bars)
+        self.study_live.aux_snapshot.connect(self._on_live_aux)
         self.study_live.state.connect(self._on_study_live_state)
         self.study_live.failed.connect(self._on_study_live_failed)
         self.study_live.log.connect(self._on_study_live_log)
@@ -7442,7 +7446,20 @@ class MainWindow(QMainWindow):
         )
         # 补历史放在 worker 线程里（十年 5m 要几十秒），界面不冻；`ready` 之后
         # 才开始收 bar，所以这里不用等
-        self.study_live.start(None, pair[0], pair[1], period, need_history=True)
+        # 把当前选中的因子一起交给 worker：只有选了展期 / 期权族因子时才需要
+        # 订真实合约和期权报价、盘中现算并覆盖活 bar（跨周期因子也算进来）。
+        keys = list(self._selected_factor_keys()) + list(self._trigger_keys())
+        try:
+            fc = self._factor_cfg()
+            keys += list(getattr(fc, "trigger_keys", None) or [])
+            keys += list((getattr(fc, "factor_periods", None) or {}).keys())
+        except Exception:                               # noqa: BLE001
+            pass
+        tf = getattr(self, "cb_tfactor", None)
+        if tf is not None and tf.currentData():
+            keys.append(str(tf.currentData()))
+        self.study_live.start(None, pair[0], pair[1], period, need_history=True,
+                              aux_keys=keys)
         return ""
 
     def _sync_live_btn(self, on: bool) -> None:
@@ -7487,6 +7504,7 @@ class MainWindow(QMainWindow):
         self._live_period = ctl.period or self._period()
         self._live_seq += 1
         self._live_last = None
+        self._live_aux_snap = {}   # 上一品种的现算值不能带进这一轮
         # 工作线程刚把缺口补进库，缓存里的旧数据要作废，否则实时段会接在旧尾巴上
         self.store.invalidate(key, self._live_period)
         self._live_base = self.store.get(key, self._live_period)
@@ -7565,6 +7583,10 @@ class MainWindow(QMainWindow):
         self.lbl_live_msg.setText(msg)
         self._sync_live_btn(False)
 
+    def _on_live_aux(self, snap) -> None:
+        """worker 现算出展期 / IV 摘要：缓存起来，下一帧拼 K 线时只用一份。"""
+        self._live_aux_snap = dict(snap or {})
+
     def _on_live_bars(self, live_df) -> None:
         self._apply_live_bars(live_df, "trade")
 
@@ -7604,6 +7626,11 @@ class MainWindow(QMainWindow):
         merged = tqlive.merge_live(self._live_base, live_df)
         if merged.empty:
             return
+        # 日内因子：把 worker 刚算出来的 roll_intra / IV 摘要写到最后那根活 bar。
+        # 历史那段仍是 attach_for_period 挂的上一交易日快照，绝不回写（前视）。
+        if self._live_aux_snap:
+            merged = live_data.overlay_snapshot(
+                merged, self._live_aux_snap, self._live_period or self._period())
         # 拿**实时段**的最后一根判断「是不是新 bar」。合并后的最后一根可能是库里
         # 更晚的那根（下载写进了半根活 bar），拿它比会一直判成「同一根」，
         # 实时 bar 永远进不了图

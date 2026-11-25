@@ -1132,7 +1132,7 @@ DAY_CLOSE = pd.Timedelta(hours=15)
 # 日线级周期的名字。**不从 tqdata 导**：这个模块被 selftest / 实盘 / 打包后的
 # 环境反复导入，多一个 import 就多一处能断的地方；而周期名是这里唯一的依赖，
 # 写死一张表反而更稳（`tqdata.is_daily` 判的也是这几个）
-_DAY_PERIODS = {"1d", "1d_tq", "2d", "1w"}
+_DAY_PERIODS = {"1d", "1d_tq", "2d", "1w", "2d_tq", "1w_tq"}
 
 
 def _close_lag(period: str) -> int:
@@ -1237,7 +1237,7 @@ def align_to_base(
     # 「这周到今天为止」当周线因子，数值每天变一次，还和以后重算的结果不一样。
     # 所以整根丢掉：宁可让大周期因子晚一根，也不要用一根会变形的 bar。
     # 日线级里只有这两档会这样，1d / 1d_tq 每天收盘就是完整的一天。
-    if str(src_period or "") in ("2d", "1w") and len(vals) > 1:
+    if str(src_period or "") in ("2d", "1w", "2d_tq", "1w_tq") and len(vals) > 1:
         vals = vals.iloc[:-1]
     # 基准用**它自己的时间戳**（分钟级不偏移；日线级换成当天 15:00）
     tgt = _decision_time(base_index, base_period, source=False)

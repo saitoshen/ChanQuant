@@ -1885,9 +1885,11 @@ class ResultView(QObject):
         elif self.market == "us":
             source = "东方财富后复权"
         elif tqdata.is_multiday(period):
-            # 2 日 / 周线的底料是 Tushare 日线 CSV，不是天勤 —— 写「天勤」会
-            # 让用户拿它和「日线」（天勤）逐根对，对不上还以为复权算错了
-            source = "Tushare 换月前复权（由日线合成）"
+            # 合成周期按底料标注：2d/1w ← Tushare 日线、2d_tq/1w_tq ← 天勤日线。
+            # 写错会让用户拿它和「日线」逐根对，对不上还以为复权算错了
+            base = tqdata.MULTIDAY_BASE[period]
+            source = ("天勤前复权（由天勤日线合成）" if base == "1d_tq"
+                      else "Tushare 换月前复权（由日线合成）")
         elif period == PERIOD_1D:
             source = "Tushare 换月前复权"
         else:

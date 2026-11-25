@@ -207,7 +207,7 @@ register(Tool(
 # 干等；「先跑再存」写在 `sector-factor-scan` 技能包里，由模型按顺序调用。
 
 PERIODS_OK = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "1d_tq",
-              "2d", "1w")
+              "2d", "1w", "2d_tq", "1w_tq")
 
 
 def prepare_strategy_save(p: dict) -> tuple[dict, str]:

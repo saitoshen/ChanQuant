@@ -54,8 +54,12 @@ def needed_aux(period: str, factor_keys, trigger_keys=()) -> dict[str, bool]:
 
 
 def is_intraday(period: str) -> bool:
-    """比日线更细就要日内更新（含 `1h` / `5m` / `15m`…）。"""
-    return str(period or "1d").split("@")[0] not in ("1d", "2d", "1w", "1mo")
+    """比日线更细就要日内更新（含 `1h` / `5m` / `15m`…）。
+
+    日线级（含两套合成周期 2d/1w、2d_tq/1w_tq）都不做日内订阅。
+    """
+    return str(period or "1d").split("@")[0] not in (
+        "1d", "1d_tq", "2d", "1w", "2d_tq", "1w_tq", "1mo")
 
 
 def prev_trading_day(today=None) -> date:
@@ -104,8 +108,14 @@ def _daily_csv_last(sym: str, ex: str) -> date | None:
         return None
 
 
-def freshness(sym: str, ex: str, need: dict[str, bool]) -> dict:
-    """行情 / 展期 / IV 三末日 + 缺哪几样。只读，不发网络请求。"""
+def freshness(sym: str, ex: str, need: dict[str, bool],
+              source: str | None = None) -> dict:
+    """行情 / 展期 / IV 三末日 + 缺哪几样。只读，不发网络请求。
+
+    `source` 决定检查哪一份衍生数据：Tushare 周期查 `data_futures_aux/`，
+    天勤周期（含实盘）查 `data_tq/curve/` + 期权库。不传 = 旧行为（Tushare），
+    兼容老调用。两个源严格分开，不能拿一家的末日判断另一家新不新。
+    """
     want = prev_trading_day()
     out: dict = {"want": want, "price_1d": None, "curve": None, "opt": None,
                  "stale": []}
@@ -124,9 +134,10 @@ def freshness(sym: str, ex: str, need: dict[str, bool]) -> dict:
 
         aux = auxdata._default_dir()
         if need.get("curve"):
-            out["curve"] = _last_date(auxdata.load_curve(aux, sym, ex))
+            out["curve"] = _last_date(auxdata.load_curve(aux, sym, ex, source))
         if need.get("opt"):
-            out["opt"] = _last_date(auxdata.load_opt(aux, sym, ex, "1d"))
+            out["opt"] = _last_date(auxdata.load_opt(aux, sym, ex, "1d",
+                                                    source=source))
     except Exception:                                   # noqa: BLE001
         pass
     for k in ("price_1d", "curve", "opt"):
@@ -146,7 +157,12 @@ def supplement(sym: str, ex: str, need: dict[str, bool], progress=None) -> dict:
     真实合约重算展期、用期权库重算 IV。某一步失败不阻断后面的步骤，结果里逐项
     写明原因，由调用方打日志。
     """
-    out: dict = {"symbol": f"{sym}_{ex}", "price": "", "curve": "", "opt": ""}
+    # 🔴 按数据源分流（2026-11-25）：tushare 那条链写 data_futures_aux/，天勤那条
+    # 写 data_tq/（curve + 期权库）。两套严格分开，不传 source 时两套都补（兼容
+    # 老调用）。绝对不能用一家的补数结果去填另一家的缺。
+    src = need.get("source") or "both"
+    out: dict = {"symbol": f"{sym}_{ex}", "source": src,
+                 "price": "", "curve": "", "opt": ""}
     if need.get("price") is not False:                  # 默认补日线
         try:
             from ttrade import updater
@@ -156,8 +172,9 @@ def supplement(sym: str, ex: str, need: dict[str, bool], progress=None) -> dict:
             out["price"] = f"+{r.added} 根，错误 {r.failed}"
         except Exception as exc:                        # noqa: BLE001
             out["price"] = f"失败：{type(exc).__name__}: {str(exc)[:100]}"
+    # Tushare 那条链：update_aux 写 data_futures_aux 的展期 CSV + opt_*.csv
     try:
-        if need.get("curve") or need.get("opt"):
+        if src in ("tushare", "both") and (need.get("curve") or need.get("opt")):
             from ttrade import updater
 
             res = updater.update_aux(
@@ -169,8 +186,9 @@ def supplement(sym: str, ex: str, need: dict[str, bool], progress=None) -> dict:
     except Exception as exc:                            # noqa: BLE001
         out["aux"] = f"失败：{type(exc).__name__}: {str(exc)[:100]}"
     sess = None
+    # 天勤那条链：真实合约 → 展期 CSV（data_tq/curve），不碰 Tushare CSV
     try:
-        if need.get("curve"):
+        if src in ("tq", "both") and need.get("curve"):
             from ttrade import tqcurve, tqfetch
 
             sess = sess or tqfetch.Session()
@@ -180,8 +198,9 @@ def supplement(sym: str, ex: str, need: dict[str, bool], progress=None) -> dict:
             out["curve"] = "已重算"
     except Exception as exc:                            # noqa: BLE001
         out["curve"] = f"失败：{type(exc).__name__}: {str(exc)[:100]}"
+    # 天勤期权库（data_tq/option.duckdb），不碰 Tushare opt_*.csv
     try:
-        if need.get("opt"):
+        if src in ("tq", "both") and need.get("opt"):
             from ttrade import optfetch, tqfetch
 
             # 🔴 必须按品种过滤：不传 varieties 会对全市场 2974 条期权链逐条检查
@@ -229,7 +248,9 @@ class SupplementThread:
         self._log = None
 
     def submit(self, sym: str, ex: str, need: dict[str, bool], log=None) -> bool:
-        key = f"{sym}_{ex}"
+        # key 带上 source：同一品种 Tushare / 天勤是两条独立链路，各自节流，
+        # 否则第二个源会被第一个源的 10 分钟窗口吞掉，永远补不了。
+        key = f"{sym}_{ex}#{need.get('source') or 'both'}"
         now = time.monotonic()
         if now - self._last.get(key, 0.0) < 600:
             return False
@@ -261,7 +282,8 @@ class SupplementThread:
 
 
 def watch_symbols(sym: str, ex: str, need: dict[str, bool],
-                  period: str = "1d", max_options: int = 12) -> dict[str, list[str]]:
+                  period: str = "1d", max_options: int = 12,
+                  source: str | None = None) -> dict[str, list[str]]:
     """日内因子要额外订阅哪些天勤合约。
 
     - 展期：期限结构表最后一天的 `c1_code` / `c2_code`（Tushare 格式）转成
@@ -270,12 +292,16 @@ def watch_symbols(sym: str, ex: str, need: dict[str, bool],
       白烧服务端订阅名额）。
 
     返回 `{"curve": [...], "opt": [...]}`。读库失败返回空表，不抛。
+
+    `source` 决定从哪份展期表取远近月代码：实盘 / 日内现算一律天勤（`tq`），
+    不能拿 Tushare 那份表的合约名去订阅天勤行情（两套合约代码和到期安排不同）。
     """
     out: dict[str, list[str]] = {"curve": [], "opt": []}
     try:
         from ttrade import auxdata, tqsdk_symbols as TS
 
-        curve = auxdata.load_curve(auxdata._default_dir(), sym, ex)
+        curve = auxdata.load_curve(auxdata._default_dir(), sym, ex,
+                                   source or "tq")
         if need.get("curve") and not curve.empty and "c1_code" in curve.columns:
             row = curve.iloc[-1]
             for col in ("c1_code", "c2_code"):
@@ -312,6 +338,25 @@ def watch_symbols(sym: str, ex: str, need: dict[str, bool],
     return out
 
 
+def overlay_snapshot(df: pd.DataFrame, snapshot: dict, period: str) -> pd.DataFrame:
+    """把一份现算快照写到**最后那根活 bar**，历史一律不碰。
+
+    抽成独立函数是为了让研究页（不在 `PortfolioRunner` 里）能复用同一套 PIT
+    约束：只写 `iloc[-1]`，不回写历史，日线级周期整段跳过。
+    """
+    if df is None or df.empty or not snapshot or not is_intraday(period):
+        return df
+    out = df
+    for col, val in snapshot.items():
+        if col not in out.columns:
+            out[col] = np.nan
+        try:
+            out.iloc[-1, out.columns.get_loc(col)] = val
+        except Exception:                               # noqa: BLE001
+            pass
+    return out
+
+
 class LiveAux:
     """用订阅到的实时报价现算日内衍生列，覆盖到 df 的最后一根。
 
@@ -335,15 +380,19 @@ class LiveAux:
                            if curve_syms is not None else [])
 
     def _px(self, q) -> tuple[float, float]:
-        try:
-            px = float(getattr(q, "last_price", 0) or 0)
-        except Exception:                               # noqa: BLE001
-            px = 0.0
-        try:
-            oi = float(getattr(q, "open_interest", 0) or 0)
-        except Exception:                               # noqa: BLE001
-            oi = 0.0
-        return px, oi
+        # CTP 的 watch 给的是普通 dict（键名和天勤对象不同），天勤给的是活引用。
+        # 两种都要能吃，不然选 CTP 当行情源时日内现算会永远拿到 0。
+        def val(name: str, alt: str) -> float:
+            if isinstance(q, dict):
+                v = q.get(name, q.get(alt, 0))
+            else:
+                v = getattr(q, name, getattr(q, alt, 0))
+            try:
+                return float(v or 0)
+            except (TypeError, ValueError):             # noqa: BLE001
+                return 0.0
+
+        return val("last_price", "last"), val("open_interest", "oi")
 
     def snapshot(self, quotes: dict, sym: str, ex: str, need: dict[str, bool],
                  spot: float = 0.0) -> dict:
@@ -465,14 +514,4 @@ class LiveAux:
     def overlay(self, df: pd.DataFrame, period: str,
                 need: dict[str, bool]) -> pd.DataFrame:
         """把当前 tick 的值写到最后一根（只写活 bar，历史一律不碰）。"""
-        if df is None or df.empty or not self.last or not is_intraday(period):
-            return df
-        out = df
-        for col, val in self.last.items():
-            if col not in out.columns:
-                out[col] = np.nan
-            try:
-                out.iloc[-1, out.columns.get_loc(col)] = val
-            except Exception:                           # noqa: BLE001
-                pass
-        return out
+        return overlay_snapshot(df, self.last, period)

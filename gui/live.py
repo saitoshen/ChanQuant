@@ -200,6 +200,16 @@ class HubSet:
         """按账户路由到它那条连接去取最新盘口（下单面板「填最新价」）。"""
         return self._owner(account).quote_of(symbol, timeout=timeout)
 
+    def watched_quotes(self) -> dict:
+        """行情源那一路订阅到的报价，给日内衍生因子现算用。"""
+        hub = self.hubs.get(self.feed)
+        if hub is None:
+            return {}
+        try:
+            return dict(hub.watched_quotes())
+        except Exception:                               # noqa: BLE001
+            return {}
+
     def watch(self, symbols) -> None:
         """每个柜台各订一遍「报价」框要盯的合约。
 
@@ -224,13 +234,15 @@ class LiveWorker(QObject):
 
     ready = Signal(str)          # 订阅就绪，参数是「品种_交易所」
     bars = Signal(object)        # 实时 K 线 DataFrame（含未走完的最后一根）
+    aux_snapshot = Signal(object)  # 日内现算的展期 / IV 摘要（dict）
     state = Signal(object)       # LiveState
     failed = Signal(str)
     log = Signal(str)
     order_sent = Signal(str)     # 下单成功，参数是 order_id
 
     def __init__(self, spec, symbol: str, exchange: str, period: str,
-                 need_history: bool = True, feed: str = "") -> None:
+                 need_history: bool = True, feed: str = "",
+                 aux_keys=None) -> None:
         super().__init__()
         # `spec` 可以是一个 AccountSpec，也可以是列表（多账户 / 多柜台）
         self.spec = spec
@@ -239,6 +251,9 @@ class LiveWorker(QObject):
         self.period = period
         self.need_history = need_history
         self.feed = feed
+        # 研究页当前选的因子键：判定要不要订真实合约 / 期权、盘中现算哪些列。
+        # 由主线程在 start() 时传进来；worker 线程只读。
+        self.aux_keys = list(aux_keys or [])
         self._stop = False
         self._queue: queue.Queue = queue.Queue()
 
@@ -272,6 +287,30 @@ class LiveWorker(QObject):
                 self.log.emit(f"本地历史已补齐（本次写入 {n:,} 行）")
             except Exception as exc:  # noqa: BLE001
                 self.log.emit(f"补历史失败（{type(exc).__name__}: {exc}），继续连接")
+
+            # 研究页「启动实时」还要补衍生数据：展期 / 期权 IV 落后时，挂到
+            # 因子帧上的就是旧快照（看着有值、其实是几天前的期限结构）。和实盘
+            # 引擎走同一条 SupplementThread（后台、去重、失败不阻断连接）。
+            # 🔴 按当前周期的数据源分流：Tushare 周期（1d/2d/1w）只补 Tushare
+            # 那份，天勤周期（1d_tq/2d_tq/1w_tq/分钟）只补天勤那份，两套不混。
+            try:
+                from ttrade import auxdata as AD, live_data as LD
+
+                src = AD.curve_source_of(self.period)
+                need = {"curve": True, "opt": True}
+                fr = LD.freshness(self.symbol, self.exchange, need, source=src)
+                stale_aux = [k for k in ("curve", "opt") if k in fr["stale"]]
+                if stale_aux:
+                    LD.SupplementThread.get().submit(
+                        self.symbol, self.exchange,
+                        {"price": False, "curve": "curve" in stale_aux,
+                         "opt": "opt" in stale_aux, "source": src},
+                        log=lambda s: self.log.emit(s))
+                    self.log.emit(
+                        f"{src} 展期/期权数据落后（缺 {'/'.join(stale_aux)}，"
+                        f"要 {fr['want']}），已转后台补齐，补好自动生效")
+            except Exception as exc:  # noqa: BLE001
+                self.log.emit(f"衍生数据补数启动失败（{type(exc).__name__}: {exc}）")
 
         # ---- 连各柜台。一个失败不影响其它：这就是「同时登录」的意义 ----
         hubs: dict = {}
@@ -325,8 +364,34 @@ class LiveWorker(QObject):
             + f"；行情源 {BACKEND_LABELS.get(hs.feed, hs.feed)}")
         self.ready.emit(f"{self.symbol}_{self.exchange}")
 
+        # ---- 日内衍生因子：订真实合约 / 期权报价，盘中现算后推给界面 ----
+        # 只有「比日线更细 + 选中了展期/期权族因子」才订；日线和合成周期用的是
+        # 上一交易日快照，不看 tick，订阅了只会白烧额度。实盘 / 研究页行情都
+        # 来自天勤库，所以订阅清单也只读天勤那份展期表。
+        aux_state = None
+        try:
+            from ttrade import auxdata as AD, live_data as LD
+
+            need = LD.needed_aux(self.period, self.aux_keys)
+            if (LD.is_intraday(self.period) and AD.curve_source_of(self.period) == "tq"
+                    and (need.get("curve") or need.get("opt"))):
+                watch = LD.watch_symbols(self.symbol, self.exchange, need,
+                                         self.period, source="tq")
+                syms = watch["curve"] + watch["opt"]
+                if syms:
+                    hs.watch(syms)
+                    live_aux = LD.LiveAux()
+                    live_aux.set_watch(syms, watch["curve"])
+                    aux_state = (live_aux, need)
+                    self.log.emit(
+                        f"已订阅 {len(watch['curve'])} 个真实合约 / "
+                        f"{len(watch['opt'])} 个期权合约，用于日内展期 / IV 现算")
+        except Exception as exc:                        # noqa: BLE001
+            self.log.emit(f"日内衍生行情订阅失败（{type(exc).__name__}: {exc}）")
+
         last_bar = None
         last_state = 0.0
+        last_snap = None
         try:
             while not self._stop:
                 for name in list(hs.hubs):
@@ -370,6 +435,23 @@ class LiveWorker(QObject):
                 if sig != last_bar:
                     last_bar = sig
                     self.bars.emit(df)
+
+                if aux_state is not None:
+                    la, la_need = aux_state
+                    quotes = hs.watched_quotes()
+                    if quotes:
+                        spot = 0.0
+                        try:
+                            if df is not None and not df.empty and "close" in df:
+                                spot = float(df["close"].iloc[-1])
+                        except Exception:                 # noqa: BLE001
+                            spot = 0.0
+                        snap = la.snapshot(quotes, self.symbol, self.exchange,
+                                           la_need, spot=spot)
+                        # 只在值真的变了时推：0.8 秒一轮，tick 不动就别刷界面
+                        if snap and snap != last_snap:
+                            last_snap = snap
+                            self.aux_snapshot.emit(dict(snap))
 
                 now = time.monotonic()
                 if now - last_state > 0.4:
@@ -429,6 +511,7 @@ class LiveController(QObject):
     """
 
     bars = Signal(object)
+    aux_snapshot = Signal(object)   # 日内现算的展期 / IV 摘要
     state = Signal(object)
     log = Signal(str)
     failed = Signal(str)
@@ -500,7 +583,8 @@ class LiveController(QObject):
     # ---- 起停 ----
 
     def start(self, spec, symbol: str, exchange: str, period: str,
-              need_history: bool = True, feed: str = "") -> None:
+              need_history: bool = True, feed: str = "",
+              aux_keys=None) -> None:
         """登录账户。`spec` 可以是一个、也可以是一批；**已经在跑的账户不动**。
 
         `feed` 是行情源（`tq` / `ctp` / `rohon`），多柜台同时登录时才需要传；
@@ -511,6 +595,7 @@ class LiveController(QObject):
             self.feed = feed
         self.spec = spec
         self.period = period
+        self.aux_keys = list(aux_keys or [])
         for s in _as_list(spec):
             name = _session_key(s)
             old = self._sessions.get(name)
@@ -527,12 +612,13 @@ class LiveController(QObject):
         sess = _Session(name, spec, (getattr(spec, "backend", "tq") or "tq"))
         sess.symbol, sess.period = symbol, period
         worker = LiveWorker(spec, symbol, exchange, period, need_history,
-                            self.feed)
+                            self.feed, aux_keys=getattr(self, "aux_keys", []))
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.ready.connect(lambda key, n=name: self._on_ready(n, key))
         worker.bars.connect(lambda df, n=name: self._on_bars(n, df))
+        worker.aux_snapshot.connect(lambda snap, n=name: self._on_aux(n, snap))
         worker.state.connect(lambda st, n=name: self._on_state(n, st))
         worker.log.connect(self.log)
         worker.failed.connect(lambda msg, n=name: self._on_failed(n, msg))
@@ -594,6 +680,13 @@ class LiveController(QObject):
         if sess is None or sess.name != name:
             return
         self.bars.emit(df)
+
+    def _on_aux(self, name: str, snap) -> None:
+        """日内现算值也只认行情源那一路，避免多会话互相覆盖。"""
+        sess = self._primary()
+        if sess is None or sess.name != name:
+            return
+        self.aux_snapshot.emit(dict(snap or {}))
 
     def _on_state(self, name: str, st) -> None:
         sess = self._sessions.get(name)

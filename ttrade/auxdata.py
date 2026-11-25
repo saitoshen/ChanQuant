@@ -82,24 +82,26 @@ def _read(path: str, cols: list[str]) -> pd.DataFrame:
     return df
 
 
-def load_curve(aux_dir: str, symbol: str, exchange: str) -> pd.DataFrame:
-    """期限结构。aux 文件缺失时回退到天勤合约算出来的那份。
+def load_curve(aux_dir: str, symbol: str, exchange: str,
+               source: str | None = None) -> pd.DataFrame:
+    """期限结构。两个源**严格分开**，绝不混列（2026-11-25 用户口径）。
 
-    两套文件互不覆盖：`data_futures_aux/` 是 Tushare 的 20 年口径，
-    `data_tq/curve/` 是天勤合约（十年出头）。同一个日期混着用两个源会让展期值
-    随机跳，所以价格类列只做「有就用、没有才退」，不做合并。
+    - `source="tushare"`：`data_futures_aux/`（Tushare 20 年日线口径，31 列）。
+      只有研究回测用 Tushare 日线（`1d`/`2d`/`1w`）时才用。
+    - `source="tq"`：`data_tq/curve/`（天勤真实合约，32 列，含 `roll_intra`）。
+      实盘 + 天勤日线 `1d_tq` + 所有分钟周期用它。
+    - `source=None`（默认）：按调用方场景推断 —— 见 `attach_for_period()`。
 
-    **唯一例外是 `roll_intra`**：日内价差漂移只有分钟级真实合约算得出来，
-    Tushare 那份（日线合约）根本没有这一列。它不是「另一个源的同名数据」，
-    而是天勤独有的补充列，所以单独并进来，缺日期就是空。
+    🔴 原来这里把 Tushare 主表 join 上天勤的 `roll_intra` 一列，等于两个源混着用：
+    价格类列是 Tushare 的、日内价差是天勤的，同一条展期序列来自两家。用户明确
+    「不能把 Tushare 展期和天勤展期混在一起，应该分开来」，且「实盘不使用日线
+    Tushare 数据源，所以也不用 Tushare 展期」⇒ 每个场景只读一份完整的源。
     """
-    df = _read(curve_path(aux_dir, symbol, exchange), CURVE_COLS)
-    alt = _read(_tq_curve_path(symbol, exchange), ["roll_intra"])
-    if df.empty:
-        return alt
-    if not alt.empty and "roll_intra" in alt.columns and "roll_intra" not in df.columns:
-        df = df.join(alt[["roll_intra"]], how="left")
-    return df
+    if source is None:
+        source = "tushare"
+    if source == "tq":
+        return _read(_tq_curve_path(symbol, exchange), CURVE_COLS + ["roll_intra"])
+    return _read(curve_path(aux_dir, symbol, exchange), CURVE_COLS)
 
 
 def _tq_curve_path(symbol: str, exchange: str) -> str:
@@ -114,23 +116,29 @@ def _tq_curve_path(symbol: str, exchange: str) -> str:
 
 
 def load_opt(aux_dir: str, symbol: str, exchange: str,
-             period: str = "1d") -> pd.DataFrame:
+             period: str = "1d", source: str | None = None) -> pd.DataFrame:
     """期权 IV 摘要（`period` 档：`1d` / `1h` / `5m`）。
 
-    **为什么会有本地回退**：Tushare 那条链路（`opt_daily` + `settle_map`）要靠
-    「标的期货当天结算价」当 Black-76 里的 F，而**股指期权的标的是指数**
-    （沪深300 / 上证50 / 中证1000），不是期货合约 —— 于是
-    `data_futures_aux/opt_IF_*.csv` 从来就没生成过，IF / IH / IM 的 5 个 IV 因子
-    一直是空的。本地天勤库有这三家的 IV 摘要（IO / HO / MO），只是品种名和期货
-    不一样（见 `optstore.INDEX_FUT_OPT`），映射过来就能用。
+    两套数据口径不同（Tushare 用结算价、天勤用收盘价），**严格分开不混**
+    （2026-11-25 用户口径），和展期同源同规则：
 
-    两套数据口径不同（Tushare 用结算价、天勤用收盘价），所以**不做合并**：
-    aux 有就用 aux，没有才回退，同一个品种永远只吃一个源。
+    - `source="tushare"`：只读 `data_futures_aux/opt_*.csv`（只有日频）；
+    - `source="tq"`：只读天勤本地库 `optstore`（`1d`/`1h`/`5m` 多档都有，
+      股指 IO/HO/MO 的 IV 就是它算的，见 `optfetch.update`）；
+    - `source=None`（默认）：旧行为 —— Tushare 有就用、没有才回退天勤，
+      兼容还没传源的老调用（自检 / 工具脚本）。
 
-    🔴 **Tushare 那份只有日频**（`opt_*.csv` 是日线汇总）。所以 `period`
-    不是 `1d` 时直接走本地库 —— 拿日频冒充小时频，挂上去的值会是一天一个台阶，
-    `iv_atm` 看着有数其实是常数。
+    🔴 Tushare 那份只有日频（`opt_*.csv` 是日线汇总），拿它冒充小时频会让
+    `iv_atm` 一天一个台阶。所以 `source="tushare"` 且 `period != "1d"` 时返回空，
+    不回退天勤 —— 要天勤的请显式传 `source="tq"`。
     """
+    if source == "tq":
+        return _opt_local(symbol, period)
+    if source == "tushare":
+        if period == "1d":
+            return _read(opt_path(aux_dir, symbol, exchange), OPT_COLS)
+        return pd.DataFrame()
+    # source=None：兼容旧调用，Tushare 优先回退
     if period == "1d":
         df = _read(opt_path(aux_dir, symbol, exchange), OPT_COLS)
         if not df.empty:
@@ -256,6 +264,7 @@ def attach(
     symbol: str,
     exchange: str,
     aux_dir: str | None = None,
+    curve_source: str | None = None,
 ) -> pd.DataFrame:
     """把衍生列按日期并到行情表上。缺文件时原样返回（不报错）。
 
@@ -270,7 +279,8 @@ def attach(
     if df.empty or not isinstance(df.index, pd.DatetimeIndex):
         return df
 
-    parts = [load_curve(aux_dir, symbol, exchange), load_opt(aux_dir, symbol, exchange)]
+    parts = [load_curve(aux_dir, symbol, exchange, curve_source),
+             load_opt(aux_dir, symbol, exchange, source=curve_source)]
     out = df
     for part in parts:
         if part.empty:
@@ -322,6 +332,7 @@ def attach_intraday(
     symbol: str,
     exchange: str,
     aux_dir: str | None = None,
+    curve_source: str | None = None,
 ) -> pd.DataFrame:
     """把衍生列挂到**分钟级**行情上：每根 bar 用「上一个交易日」的快照。
 
@@ -354,14 +365,14 @@ def attach_intraday(
         if raw.isna().any():
             df = df.copy()
             df["trading_day"] = day
-    parts = [load_curve(aux_dir, symbol, exchange)]
+    parts = [load_curve(aux_dir, symbol, exchange, curve_source)]
     out = df
     # 期限结构只有日频（Tushare 合约表 / 天勤 curve 都是按天算的）
     for part in parts:
         out = _join_day_snapshot(out, part, day)
 
-    ivp = _use_iv_period(aux_dir, symbol, exchange, df)
-    opt = load_opt(aux_dir, symbol, exchange, period=ivp)
+    ivp = _use_iv_period(aux_dir, symbol, exchange, df, curve_source)
+    opt = load_opt(aux_dir, symbol, exchange, period=ivp, source=curve_source)
     if ivp == "1d" or opt.empty:
         out = _join_day_snapshot(out, opt, day)
     else:
@@ -374,7 +385,8 @@ def attach_intraday(
         miss = [c for c in opt.columns if c in out.columns
                 and pd.api.types.is_numeric_dtype(opt[c]) and out[c].isna().any()]
         if miss:
-            daily = load_opt(aux_dir, symbol, exchange, period="1d")
+            daily = load_opt(aux_dir, symbol, exchange, period="1d",
+                             source=curve_source)
             fill = _daily_snapshot(daily, day, miss, out.index)
             for c in fill.columns:
                 out[c] = out[c].where(out[c].notna(), fill[c])
@@ -383,12 +395,29 @@ def attach_intraday(
     return out
 
 
+def curve_source_of(period: str) -> str:
+    """展期数据源按「合成周期的底料」分流（2026-11-25 用户口径）。
+
+    - Tushare 日线合成的：`1d` / `2d` / `1w` → Tushare 展期；
+    - 天勤日线合成的：`1d_tq` / `2d_tq` / `1w_tq`，以及所有分钟周期 → 天勤展期。
+
+    实盘即便配置 `1d`/`2d`/`1w`，历史行情也从天勤库读（`tqdata.load_main`），
+    由引擎显式传 `curve_source="tq"` 覆盖，不走这里的推断。
+    """
+    from .tqdata import MULTIDAY_BASE
+
+    p = str(period or "")
+    base = MULTIDAY_BASE.get(p, p)
+    return "tushare" if base == "1d" else "tq"
+
+
 def attach_for_period(
     df: pd.DataFrame,
     symbol: str,
     exchange: str,
     period: str,
     aux_dir: str | None = None,
+    curve_source: str | None = None,
 ) -> pd.DataFrame:
     """按**周期**选对齐口径：日线同日、分钟隔一个交易日。全平台唯一入口。
 
@@ -415,12 +444,14 @@ def attach_for_period(
     """
     from .tqdata import is_daily          # 局部导入，auxdata 不背 tqdata 的依赖
 
+    if curve_source is None:
+        curve_source = curve_source_of(period)
     fn = attach if is_daily(period) else attach_intraday
-    return fn(df, symbol, exchange, aux_dir)
+    return fn(df, symbol, exchange, aux_dir, curve_source)
 
 
 def _use_iv_period(aux_dir: str, symbol: str, exchange: str,
-                   df: pd.DataFrame) -> str:
+                   df: pd.DataFrame, source: str | None = None) -> str:
     """这段 BAR 的期权 IV 该取哪一档。
 
     **只有走本地库的品种**（股指那三家，没有 Tushare 文件）才用日内档；有 aux
@@ -431,10 +462,15 @@ def _use_iv_period(aux_dir: str, symbol: str, exchange: str,
     拿它当主档的话 2020 那八个月是 5m 精度、剩下六年全靠日频兜底，精度来回
     跳。这种情况退到更粗的 `1h`，全天候一个精度。
     """
-    try:
-        if os.path.exists(opt_path(aux_dir, symbol, exchange)):
+    # Tushare 源只有日频，档位只能是 1d；天勤源才有多档可选。
+    # source=None 的旧调用保留「有 Tushare 文件就锁 1d」的行为。
+    if source != "tq":
+        try:
+            if os.path.exists(opt_path(aux_dir, symbol, exchange)):
+                return "1d"
+        except OSError:
             return "1d"
-    except OSError:
+    if source == "tushare":
         return "1d"
     return _iv_period_for(df, symbol)
 

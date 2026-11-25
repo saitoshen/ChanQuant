@@ -1147,6 +1147,15 @@ class LiveHub:
         for sym in [s for s in self._watch if s not in want]:
             self._watch.pop(sym, None)
 
+    def watched_quotes(self) -> dict:
+        """给日内现算用的订阅报价表（`{天勤合约: 行情对象}`）。
+
+        和 `state()["quotes"]` 的区别：那份是给界面显示用的普通 dict，没有
+        `open_interest`；这里给的是天勤活引用，现算器直接读它需要的值。
+        """
+        with self._lock:
+            return dict(self._watch)
+
     # ---- 推进 ----
 
     def wait(self, timeout: float = 0.8) -> bool:

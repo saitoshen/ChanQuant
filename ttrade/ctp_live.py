@@ -897,6 +897,8 @@ class CtpHub:
                 "low": float(t.get("low") or 0.0),
                 "pre_close": float(t.get("pre_close") or 0.0),
                 "volume": float(t.get("volume") or 0.0),
+                # 日内现算要算持仓占比 / PCR，报价框不显示这一列但必须带出去
+                "open_interest": float(t.get("open_interest") or 0.0),
                 "tick": float(info.get("tick") or 0.0),
                 "datetime": str(t.get("datetime") or ""),
                 "source": "live",
@@ -917,6 +919,14 @@ class CtpHub:
                     row = dict(cached)
                     row["source"] = "closed"
             out.append(row)
+        return out
+
+    def watched_quotes(self) -> dict:
+        """给日内现算用的订阅报价表，键统一成天勤写法（和 `watch` 的入参一致）。"""
+        out: dict = {}
+        for sym, row in zip(self._watch_syms, self._watch_rows()):
+            if str(row.get("source") or "") == "live":
+                out[str(sym)] = row
         return out
 
     def state(self) -> LiveState:

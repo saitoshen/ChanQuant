@@ -72,6 +72,7 @@ MAX_FACTORS = 6
 
 # 每日根数兜底表（实际值优先从数据里数，见 `_bpd`）
 BARS_PER_DAY = {"1d": 1.0, "1d_tq": 1.0, "2d": 0.5, "1w": 0.2,
+                "2d_tq": 0.5, "1w_tq": 0.2,
                 "4h": 2.0, "2h": 3.9, "1h": 7.0, "30m": 11.2,
                 "15m": 22.0, "10m": 33.0, "5m": 60.0, "3m": 100.0, "1m": 300.0}
 
@@ -608,7 +609,8 @@ def _daily_returns(ctx, keys, period: str, bars: int, cache: dict) -> dict[str, 
 
 
 def _is_daily(period: str) -> bool:
-    return str(period).startswith("1d") or str(period) in ("2d", "1w")
+    return (str(period).startswith("1d")
+            or str(period) in ("2d", "1w", "2d_tq", "1w_tq"))
 
 
 def _avg_pair_corr(rets: dict[str, pd.Series], min_common: int = 60) -> dict:

@@ -53,16 +53,27 @@ PERIODS: dict[str, tuple[str, int]] = {
 # 门禁认不出来就自动挡住。
 #
 # 值 = 几根日线合成一根；0 表示「按自然周分组」而不是固定根数。
-MULTIDAY: dict[str, int] = {"2d": 2, "1w": 0}
+#
+# 两套并存的合成周期（2026-11-25 用户口径）：`2d`/`1w` 由 **Tushare 日线**合成，
+# `2d_tq`/`1w_tq` 由 **天勤日线**(1d_tq) 合成。分开的理由是展期数据源：前者配
+# Tushare 展期、后者配天勤展期，混在一起会让同一条展期序列来自两家（#220）。
+MULTIDAY: dict[str, int] = {"2d": 2, "1w": 0, "2d_tq": 2, "1w_tq": 0}
+
+# 合成周期 → 底料日线周期。Tushare 合成的那两条底料是 `1d`，天勤合成的底料是
+# `1d_tq`。_load_multiday / DataStore.has_period 都按这张表追溯底料，不用散落 if。
+MULTIDAY_BASE: dict[str, str] = {"2d": "1d", "1w": "1d",
+                                 "2d_tq": "1d_tq", "1w_tq": "1d_tq"}
 
 # 展示顺序（GUI 的周期下拉框按这个排）。2 日 / 周线紧挨着日线，因为它们是
 # 从日线合成出来的 —— 排在一起，用户一眼看得出这一组是「由日线粗化」。
-PERIOD_ORDER = ["2d", "1w", "1d_tq", "5m", "15m", "30m", "1h", "2h", "4h"]
+PERIOD_ORDER = ["2d", "2d_tq", "1w", "1w_tq", "1d_tq", "5m", "15m", "30m", "1h", "2h", "4h"]
 
 PERIOD_LABEL = {
     "2d": "2 日",
     "1w": "周线",
     "1d_tq": "日线",
+    "2d_tq": "2 日(天勤)",
+    "1w_tq": "周线(天勤)",
     "5m": "5 分钟",
     "15m": "15 分钟",
     "30m": "30 分钟",
@@ -125,7 +136,12 @@ def daily_csv_path(symbol: str, exchange: str) -> str:
 def has_period(symbol: str, exchange: str, period: str) -> bool:
     """仓库里有没有这个品种的这个周期。查 DuckDB，不再看 CSV。"""
     if is_multiday(period):
-        # 合成周期不单独落盘：日线在就有
+        # 合成周期不单独落盘：按底料日线判（Tushare 合成看 CSV/1d，天勤合成看 1d_tq）
+        base = MULTIDAY_BASE[period]
+        if base == "1d_tq":
+            if tqstore.exists() and tqstore.bar_count(symbol, exchange, "1d"):
+                return True
+            return os.path.exists(main_path(symbol, exchange, "1d_tq"))
         if tqstore.exists() and tqstore.bar_count(symbol, exchange, "1d"):
             return True
         return os.path.exists(daily_csv_path(symbol, exchange))
@@ -148,11 +164,12 @@ def available_periods(symbol: str, exchange: str) -> list[str]:
         need = PERIODS.get(p, (p, 1))[0]
         if need in src or os.path.exists(main_path(symbol, exchange, p)):
             out.append(p)
-    # 2 日 / 周线只要日线在就能合成。底料优先用 Tushare 日线 CSV —— 它比天勤
-    # 日线覆盖全（94 vs 78 个品种）、历史长（17 年 vs 10 年），周线合成下来
-    # 才够一个 252 根的因子窗口用
-    if has_period(symbol, exchange, "2d"):
-        out = [p for p in PERIOD_ORDER if is_multiday(p)] + out
+    # 合成周期按各自的底料分别判：Tushare 合成的（2d/1w）看 Tushare 日线，
+    # 天勤合成的（2d_tq/1w_tq）看天勤日线。两套可能一个有一个没有。
+    multi = [p for p in PERIOD_ORDER
+             if is_multiday(p) and has_period(symbol, exchange, p)]
+    if multi:
+        out = multi + out
     return out
 
 
@@ -346,18 +363,27 @@ def _load_multiday(
     start=None,
     end=None,
 ) -> pd.DataFrame:
-    """2 日 / 周线：读日线，再合成。
+    """2 日 / 周线：读底料日线，再合成。
 
-    底料是 **Tushare 日线 CSV**（`futures.load_local`），不是天勤日线。天勤日线
-    只覆盖 78 个品种、十年出头，周线合成下来五百多根，跑一个 252 根窗口的因子
-    就没剩几年可看了；Tushare 日线有 17 年、覆盖全部品种。
+    底料按周期分（2026-11-25 用户口径）：
+    - `2d`/`1w` → Tushare 日线 CSV（`futures.load_local`），17 年、覆盖全品种；
+    - `2d_tq`/`1w_tq` → 天勤日线（`load_main(..., "1d_tq")`），十年出头。
+
+    两套分开是为了展期数据源能对上底料：Tushare 底料配 Tushare 展期、天勤底料
+    配天勤展期，混用会让同一条展期序列一半来自 Tushare 一半来自天勤（#220）。
 
     注意**先合成再按 start/end 切**：2 日线是「行序两两成对」，先切再合会让
     不同的起始日期切出不同的配对，同一根历史 K 线在两张图上长得不一样。
     """
-    from .futures import load_local as _load_daily
+    base = MULTIDAY_BASE[period]
+    if base == "1d_tq":
+        # 不传 start/end：必须先把全部日线合成完，再在下面统一切 —— 先切再合
+        # 会让 2 日线的两两配对随起始日期变化，同一历史 bar 在两张图上不一样。
+        daily = load_main(symbol, exchange, "1d_tq", adjust=adjust)
+    else:
+        from .futures import load_local as _load_daily
 
-    daily = _load_daily(symbol, exchange, data_dir("cn"), adjust=adjust)
+        daily = _load_daily(symbol, exchange, data_dir("cn"), adjust=adjust)
     out = merge_days(daily, period)
     if start is not None:
         out = out[out.index >= pd.Timestamp(start)]

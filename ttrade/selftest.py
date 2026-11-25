@@ -570,7 +570,9 @@ def _run() -> tuple[bool, list[str]]:
         if not len(daily):
             return "日线为空（可选）"
         out = []
-        for p in T.MULTIDAY:
+        # 这里只验 Tushare 日线合成的那两条（底料是上面的 CSV，CI 无天勤库）。
+        # 天勤合成周期（2d_tq/1w_tq）由 _curve_source_split 覆盖。
+        for p in [p for p in T.MULTIDAY if T.MULTIDAY_BASE[p] == "1d"]:
             m = T.load_main(sym, ex, p)
             if not len(m):
                 raise RuntimeError(f"{p} 合成出来是空的")
@@ -5683,6 +5685,29 @@ def _run() -> tuple[bool, list[str]]:
         if "contracts" not in calls or "curve" not in calls:
             raise RuntimeError(f"没有补真实合约并重算展期：{list(calls)}")
 
+        # 数据源分流：tushare 只写 Tushare 那份，tq 只写天勤那份，互不越界
+        def _probe_src(which: str) -> set:
+            seen: set = set()
+            try:
+                UP.update_futures = lambda *a, **k: seen.add("price") or _R()
+                UP.update_aux = lambda *a, **k: seen.add("aux") or _R()
+                tqfetch.Session = _Sess
+                tqfetch.write_contracts = lambda *a, **k: seen.add("contracts")
+                tqcurve.build_all = lambda *a, **k: seen.add("curve")
+                LD.supplement("X", "E", {"price": False, "curve": True,
+                                         "opt": False, "source": which})
+            finally:
+                (UP.update_futures, UP.update_aux, tqfetch.Session,
+                 tqfetch.write_contracts, tqcurve.build_all) = olds
+            return seen
+
+        seen_ts = _probe_src("tushare")
+        seen_tq = _probe_src("tq")
+        if seen_ts != {"aux"}:
+            raise RuntimeError(f"Tushare 源补数越界到天勤链：{seen_ts}")
+        if seen_tq != {"contracts", "curve"}:
+            raise RuntimeError(f"天勤源补数越界到 Tushare 链：{seen_tq}")
+
         # 期权按品种过滤：商品期权小写、中金所大写，两种都要圈中
         from ttrade import optfetch as OF
         src = inspect.getsource(LD.supplement)
@@ -5725,9 +5750,60 @@ def _run() -> tuple[bool, list[str]]:
         if "spot=spot" not in inspect.getsource(SR.PortfolioRunner._overlay_live_aux):
             raise RuntimeError("引擎没把标的价传给 IV 现算")
 
+        # CTP 订阅给的是 dict（不是天勤对象），现算器两种都得吃
+        px, oi = aux._px({"last": 7.0, "open_interest": 9.0})
+        if (px, oi) != (7.0, 9.0):
+            raise RuntimeError(f"dict 行情读不出来：{px}/{oi}")
+
+        # 抽出来的覆盖函数：日内只写最后一根，日线整段跳过
+        d = pd.DataFrame({"close": [1.0, 2.0, 3.0], "iv_near": [np.nan] * 3})
+        got = LD.overlay_snapshot(d.copy(), {"iv_near": 0.21, "dte_near": 3}, "1h")
+        if (not got["iv_near"].iloc[:2].isna().all()
+                or abs(got["iv_near"].iloc[-1] - 0.21) > 1e-9
+                or abs(got["dte_near"].iloc[-1] - 3) > 1e-9):
+            raise RuntimeError(f"现算快照覆盖错了：{got}")
+        day = LD.overlay_snapshot(d.copy(), {"iv_near": 0.21}, "1d_tq")
+        if day["iv_near"].notna().any():
+            raise RuntimeError("日线级不该写日内现算值")
+
+        # 订阅清单按源取表：实盘 / 日内现算只认天勤那份展期
+        if 'source or "tq"' not in inspect.getsource(LD.watch_symbols):
+            raise RuntimeError("日内订阅清单没锁天勤展期源")
+
+        # 研究页实时：订报价 → 现算 → 只覆盖活 bar（不重放历史）
+        import gui.live as GL
+        import gui.app as GA
+        lr = inspect.getsource(GL.LiveWorker.run)
+        for token in ("LD.watch_symbols", "hs.watch(syms)", "hs.watched_quotes()",
+                      "aux_snapshot.emit", "spot=spot"):
+            if token not in lr:
+                raise RuntimeError(f"研究页实时现算缺环节 {token}")
+        if "aux_snapshot" not in inspect.getsource(GL.LiveController._start_one) \
+                or "aux_snapshot" not in inspect.getsource(GL.LiveController._on_aux):
+            raise RuntimeError("现算快照没从 worker 转到主线程")
+        ga = inspect.getsource(GA.MainWindow._apply_live_bars)
+        if "live_data.overlay_snapshot" not in ga:
+            raise RuntimeError("研究页没把现算值注入实时帧")
+        if "aux_keys=keys" not in inspect.getsource(GA.MainWindow._start_study_live):
+            raise RuntimeError("研究页启动实时没把因子清单交给订阅层")
+
+        # HubSet 从行情源那一路取回订阅报价（多会话不串）
+        class _Hub:
+            def watched_quotes(self):
+                return {"SHFE.rb2601": {"last": 10.0, "open_interest": 1.0}}
+
+        hs = GL.HubSet({"tq": _Hub()}, "tq")
+        if hs.watched_quotes().get("SHFE.rb2601", {}).get("last") != 10.0:
+            raise RuntimeError("实时订阅报价取不回来，现算恒空")
+
         # 引擎接线：检查 / 订阅 / 现算三处都接上，且单品种过滤参数存在
         if "_ensure_live_data" not in inspect.getsource(SR.PortfolioRunner._subscribe):
             raise RuntimeError("订阅主连时没检查数据是否最新")
+        # 研究页「启动实时」也要补衍生数据（和实盘引擎同一条 SupplementThread）
+        import gui.live as GL
+        live_run = inspect.getsource(GL.LiveWorker.run)
+        if "SupplementThread" not in live_run or "freshness" not in live_run:
+            raise RuntimeError("研究页启动实时没补展期 / 期权数据")
         if "_overlay_live_aux" not in inspect.getsource(SR.PortfolioRunner._with_aux):
             raise RuntimeError("实盘因子帧没叠日内现算的衍生列")
         if "symbols: list[str] | None = None" not in inspect.getsource(
@@ -5738,6 +5814,83 @@ def _run() -> tuple[bool, list[str]]:
                 f"日内 roll_intra {snap['roll_intra']:.4f} 只写活 bar")
 
     check("实盘行情与因子数据就绪检查", _live_data_ready)
+
+    def _curve_source_split():
+        """展期源严格跟随合成底料，两套不混列（2026-11-25 用户口径）。"""
+        import inspect
+
+        import pandas as pd
+
+        from ttrade import auxdata as AD, tqdata as TQ, strategy_runner as SR
+
+        # 只有 Tushare 日线合成的周期用 Tushare 展期，其余一律天勤
+        want_src = {"1d": "tushare", "2d": "tushare", "1w": "tushare",
+                    "1d_tq": "tq", "2d_tq": "tq", "1w_tq": "tq",
+                    "5m": "tq", "1h": "tq"}
+        for p, want in want_src.items():
+            if AD.curve_source_of(p) != want:
+                raise RuntimeError(f"周期 {p} 展期源判错：{AD.curve_source_of(p)}≠{want}")
+        # 合成周期底料映射
+        for p, base in {"2d": "1d", "1w": "1d", "2d_tq": "1d_tq",
+                        "1w_tq": "1d_tq"}.items():
+            if not TQ.is_multiday(p) or TQ.MULTIDAY_BASE.get(p) != base:
+                raise RuntimeError(f"合成周期 {p} 底料映射错")
+        if not TQ.is_daily("2d_tq") or not TQ.is_daily("1w_tq"):
+            raise RuntimeError("天勤合成周期没被认成日线级")
+
+        # 两个源严格分开读，绝不 join 混列
+        t = AD.load_curve(AD._default_dir(), "RB", "SHFE", "tushare")
+        q = AD.load_curve(AD._default_dir(), "RB", "SHFE", "tq")
+        if not t.empty and "roll_intra" in t.columns:
+            raise RuntimeError("Tushare 展期混进了天勤的 roll_intra")
+        if not q.empty and "roll_intra" not in q.columns:
+            raise RuntimeError("天勤展期缺了 roll_intra（应是完整那一份）")
+        # 默认（不传 source）仍是 Tushare，老调用不受影响
+        d = AD.load_curve(AD._default_dir(), "RB", "SHFE")
+        if not d.empty and not t.empty and len(d.columns) != len(t.columns):
+            raise RuntimeError("默认展期源和显式 tushare 不一致")
+
+        # 期权同源分流：tushare 只读 opt_*.csv、tq 只读本地库，不混不回退。
+        # Tushare 只有日频 —— 非 1d 档必须返回空，不能拿日频冒充。
+        oh = AD.load_opt(AD._default_dir(), "RB", "SHFE", "1h",
+                         source="tushare")
+        if len(oh):
+            raise RuntimeError("Tushare 期权非日频档不该有值（只有日频）")
+        oi_ts = AD.load_opt(AD._default_dir(), "IO", "CFFEX", "1d",
+                            source="tushare")
+        oi_tq = AD.load_opt(AD._default_dir(), "IO", "CFFEX", "1d",
+                            source="tq")
+        if len(oi_ts) or oi_tq.empty:
+            raise RuntimeError("股指期权应只有天勤源有值（Tushare 无 IF/IO 文件）")
+        # 档位选择也跟随源：tushare 锁 1d，tq 可走多档
+        if AD._use_iv_period(AD._default_dir(), "IO", "CFFEX", pd.DataFrame(),
+                             "tushare") != "1d":
+            raise RuntimeError("Tushare 期权档位没锁 1d")
+
+        # 实盘任何路径都强制天勤：历史一律 load_main（天勤库），不能因配了
+        # 1d/2d/1w 就挂 Tushare 展期。源码级断言两处入口都传了 tq。
+        for fn in ("_aux_frame", "_with_aux"):
+            src = inspect.getsource(getattr(SR.PortfolioRunner, fn))
+            if 'curve_source="tq"' not in src:
+                raise RuntimeError(f"实盘 {fn} 没强制天勤展期")
+        # 新鲜度检查也走天勤源（不能拿 Tushare 的末日冒充实盘数据新鲜）
+        fresh_src = inspect.getsource(SR.PortfolioRunner._check_aux_fresh)
+        if 'load_opt(aux_dir, st.cfg.symbol, st.cfg.exchange' not in fresh_src \
+                or 'source="tq"' not in fresh_src:
+            raise RuntimeError("实盘新鲜度检查没走天勤期权源")
+
+        # 新增合成周期能真的从天勤日线读出数据（不是只有周期名）
+        try:
+            tq2 = TQ.load_main("RB", "SHFE", "2d_tq", adjust="qfq")
+            tq1 = TQ.load_main("RB", "SHFE", "2d", adjust="qfq")
+        except Exception as exc:                        # noqa: BLE001
+            raise RuntimeError(f"合成周期读不出数据：{exc}")
+        if tq2.empty or tq1.empty or len(tq2) == len(tq1):
+            raise RuntimeError("2d_tq/2d 没从各自底料合成出不同的序列")
+        return (f"展期源分流正确（仅 1d/2d/1w→Tushare）；两源分列不混；"
+                f"实盘强制 tq；2d_tq {len(tq2)} 根 / 2d {len(tq1)} 根")
+
+    check("展期源随合成底料分流（两套严格分开）", _curve_source_split)
 
     def _ml_artifact():
         """训练产物：每一折落一个 .pkl，实盘只预测的结果和回测**一致**。
@@ -6272,14 +6425,14 @@ def _run() -> tuple[bool, list[str]]:
         seen = []
         orig = (auxdata.attach, auxdata.attach_intraday)
 
-        def _fake_daily(df, sym, ex, aux_dir=None):
-            seen.append("daily")
+        def _fake_daily(df, sym, ex, aux_dir=None, curve_source=None):
+            seen.append(f"daily:{curve_source}")
             out = df.copy()
             out["c1_oi"] = 1.0
             return out
 
-        def _fake_intra(df, sym, ex, aux_dir=None):
-            seen.append("intra")
+        def _fake_intra(df, sym, ex, aux_dir=None, curve_source=None):
+            seen.append(f"intra:{curve_source}")
             out = df.copy()
             out["c1_oi"] = 2.0
             return out
@@ -6299,8 +6452,8 @@ def _run() -> tuple[bool, list[str]]:
         finally:
             auxdata.attach, auxdata.attach_intraday = orig
 
-        if seen != ["daily", "intra"]:
-            raise RuntimeError(f"挂列的次序/选择不对：{seen}（应 daily → intra）")
+        if seen != ["daily:tq", "intra:tq"]:
+            raise RuntimeError(f"挂列次序/源不对：{seen}（应 daily:tq → intra:tq）")
         if "c1_oi" not in a.columns or "c1_oi" not in b.columns:
             raise RuntimeError("衍生列没挂上")
         if c is not None or len(e) != 0:
@@ -9008,31 +9161,34 @@ def _run() -> tuple[bool, list[str]]:
         minute = TD.load_main("P", "DCE", "1h", adjust="qfq")
         minute = minute.iloc[-200:] if minute is not None and len(minute) else minute
 
-        same = AD.attach(daily, "P", "DCE")
-        lag = AD.attach_intraday(daily, "P", "DCE")
+        # 基准的源要和 attach_for_period 按周期推断出的源一致，否则比的是
+        # Tushare vs 天勤两份展期的数值差，不是「同日 vs 隔一日」的口径差。
+        same_tq = AD.attach(daily, "P", "DCE", curve_source="tq")
+        same_ts = AD.attach(daily, "P", "DCE", curve_source="tushare")
+        lag_tq = AD.attach_intraday(daily, "P", "DCE", curve_source="tq")
         col = next((c for c in ("c1_close", "c2_close", "iv_near")
-                    if c in same.columns and c in lag.columns), "")
+                    if c in same_tq.columns and c in lag_tq.columns), "")
         if not col:
             return "没有衍生数据（展期/期权快照），跳过口径比对"
-        got_d = AD.attach_for_period(daily, "P", "DCE", "1d_tq")
-        got_w = AD.attach_for_period(daily, "P", "DCE", "2d")
-        for tag, got, want in (("1d_tq", got_d, same), ("2d", got_w, same)):
+        got_d = AD.attach_for_period(daily, "P", "DCE", "1d_tq")   # → tq
+        got_w = AD.attach_for_period(daily, "P", "DCE", "2d")      # → tushare
+        for tag, got, want in (("1d_tq", got_d, same_tq), ("2d", got_w, same_ts)):
             a = pd.to_numeric(got[col], errors="coerce").to_numpy(float)
             b = pd.to_numeric(want[col], errors="coerce").to_numpy(float)
             if not np.array_equal(np.isnan(a), np.isnan(b)) or not np.allclose(
                     a[~np.isnan(a)], b[~np.isnan(b)], atol=1e-9):
                 bad.append(f"{tag} 没走日线口径（同日）")
         if minute is not None and len(minute):
-            got_m = AD.attach_for_period(minute, "P", "DCE", "1h")
-            want_m = AD.attach_intraday(minute, "P", "DCE")
+            got_m = AD.attach_for_period(minute, "P", "DCE", "1h")   # → tq
+            want_m = AD.attach_intraday(minute, "P", "DCE", curve_source="tq")
             a = pd.to_numeric(got_m[col], errors="coerce").to_numpy(float)
             b = pd.to_numeric(want_m[col], errors="coerce").to_numpy(float)
             if not np.allclose(np.nan_to_num(a), np.nan_to_num(b), atol=1e-9):
                 bad.append("1h 没走分钟口径（隔一个交易日）")
 
         # ② 反证：两种口径在尾部必须真的有差，否则上面两条谁都能过
-        a = pd.to_numeric(same[col], errors="coerce")
-        b = pd.to_numeric(lag[col], errors="coerce")
+        a = pd.to_numeric(same_tq[col], errors="coerce")
+        b = pd.to_numeric(lag_tq[col], errors="coerce")
         tail = (a.tail(5).to_numpy(float), b.tail(5).to_numpy(float))
         if np.allclose(np.nan_to_num(tail[0]), np.nan_to_num(tail[1]), atol=1e-9):
             bad.append("同日与隔日在尾部完全相同，口径比对是空转（衍生数据可能停更）")
