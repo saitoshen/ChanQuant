@@ -34,6 +34,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
+import math
+
 import numpy as np
 import pandas as pd
 
@@ -47,6 +49,29 @@ from ttrade.strategies import STRATEGIES, run_strategy
 # 一边持一个；再少（1 个）就只是单边，不是横截面。所有截面入口（回测、研究
 # 页、实盘 check_support、筛池）都读这一处，别再写死 3。
 MIN_CROSS = 2
+
+
+def round_lots(raw: float, prev: int = 0) -> int:
+    """名义额折出来的手数 → **四舍五入取整**（用户 2026-11-24 明确口径）。
+
+    🔴 不能用 Python 内建 `round()`：它是银行家舍入（round(2.5)=2），和
+    「四舍五入」不是一回事。按绝对值 `floor(|x| + 0.5)` 再带回符号：
+    1.5→2、2.5→3、−1.5→−2。
+
+    回测（`to_result` 折手数）和实盘（`cross_live.targets_from_weights`）必须用
+    同一份实现 —— 所以函数放在这里（无依赖），`cross_live` 直接引用，别各写一份
+    迟早分叉。`prev` 只在 `raw` 是 NaN（没价 / 没乘数）时用来保持原仓。
+    """
+    try:
+        raw = float(raw)
+    except (TypeError, ValueError):
+        return int(prev or 0)
+    if not math.isfinite(raw):
+        return int(prev or 0)
+    if raw == 0:
+        return 0
+    sign = 1 if raw > 0 else -1
+    return sign * int(math.floor(abs(raw) + 0.5))
 
 # 风险平价用的波动率窗口（根）。60 根日线约三个月，5 分钟 48 根一天的话是
 # 一天多一点 —— 都不至于慢到追不上波动率的变化，也不至于快到被一两根异常
@@ -1158,8 +1183,13 @@ def to_result(out: "CrossResult", label: str = "", step: int = 0,
     # 手数同理：那边算的是「每 1 元本金对应几手」，乘回本金才是真手数。不乘的话
     # 界面上会显示 0.0000029 手（用户 2026-11-23 报「交易记录没有手数」的后半段）
     cash = float(initial_cash or 0.0)
+    # 手数按**四舍五入取整**（用户 2026-11-25：「回测手数也需要取整」）：
+    # 实盘 targets_from_weights 用同一个 round_lots，回测不取整就会出现
+    # 「实盘下 458 手、回测交易记录写 458.46 手」的对不上。取整后多空名义额
+    # 不再精确等于本金×权重（用户 2026-11-25：「多空不必精确一致，运行存在
+    # 误差」），gross/cost 仍按连续权重算（净值口径不变）。
     trades = [replace(t, gross=float(t.gross) * cash, cost=float(t.cost) * cash,
-                      lots=float(t.lots) * cash)
+                      lots=float(round_lots(float(t.lots) * cash)))
               for t in out.trades]
 
     # ---- 逐品种：每条腿单独成一份 Result，绩效页的「品种」下拉框直接换过去
@@ -1173,7 +1203,7 @@ def to_result(out: "CrossResult", label: str = "", step: int = 0,
         lpos = pd.Series(np.sign(out.weights[sym].reindex(leq.index).fillna(0.0)),
                          index=leq.index, name="position")
         ltrades = [replace(t, gross=float(t.gross) * cash, cost=float(t.cost) * cash,
-                           lots=float(t.lots) * cash)
+                           lots=float(round_lots(float(t.lots) * cash)))
                    for t in leg["trades"]]
         lm = dict(_metrics(leq, lpos, ltrades, bpy, base=1.0))
         lm["initial_cash"] = cash

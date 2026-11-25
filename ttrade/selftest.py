@@ -2354,20 +2354,31 @@ def _run() -> tuple[bool, list[str]]:
             n = sum(1 for t in res.trades if float(t.lots) <= 0)
             raise RuntimeError(f"{n}/{len(res.trades)} 笔的手数是 0 —— 界面上会显示「—」")
 
-        # 恒等式：手数 × 乘数 × 真实盘面价 == 本金 × |开仓那根的权重|
+        # 手数 × 乘数 × 真实盘面价 ≈ 本金 × |开仓那根的权重|
+        # 2026-11-25 改：手数四舍五入取整后不再精确相等（用户「多空不必精确一致，
+        # 运行存在误差」），允许每腿半个hand对应的名义额误差；但取整必须是真整数。
         mults = CX.mult_vector(frames)
         w = out.weights
+        saw_fraction = False
         for t in res.trades:
+            lots = float(t.lots)
+            if abs(lots - round(lots)) > 1e-9:
+                saw_fraction = True
             wv = float(w.at[t.entry_date, t.symbol])
             if abs(wv) <= 0:
                 continue
             sc = float(frames[t.symbol]["price_scale"].loc[t.entry_date])
-            notional = float(t.lots) * float(mults[t.symbol]) * (t.entry_price / sc)
+            real_px = t.entry_price / sc
+            notional = lots * float(mults[t.symbol]) * real_px
             want = cash * abs(wv)
-            if abs(notional - want) > 1e-6 * max(want, 1.0):
+            # 半个hand的名义额 = 0.5 × 乘数 × 真实价，取整误差不应超过它
+            tol = 0.5 * float(mults[t.symbol]) * real_px + 1e-6 * max(want, 1.0)
+            if abs(notional - want) > tol + 1e-6:
                 raise RuntimeError(
-                    f"{t.symbol} {t.entry_date:%Y-%m-%d} 名义额 {notional:.2f} "
-                    f"≠ 本金×权重 {want:.2f}")
+                    f"{t.symbol} {t.entry_date:%Y-%m-%d} 取整后名义额 {notional:.2f} "
+                    f"偏离本金×权重 {want:.2f} 超过半个hand {tol:.2f}")
+        if saw_fraction:
+            raise RuntimeError("回测交易记录的手数还有小数，没取整")
 
         # 乘数必须是真乘数：拿 1 去算的话沥青会差 10 倍
         real = {"BU_SHFE": 10.0, "RB_SHFE": 10.0, "AG_SHFE": 15.0,
@@ -2395,8 +2406,9 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(
                 f"复权因子方向错了：scale=0.5 时手数 {t_half.lots}，"
                 f"应该是 {float(t_no.lots) * 0.5}")
-        return (f"{len(res.trades)} 笔全部有手数；手数×乘数×真实价 = 本金×权重"
-                "（逐笔验过）；乘数取真值（BU 10 / AG 15 / AU 1000）；"
+        return (f"{len(res.trades)} 笔全部有整数手数（四舍五入）；"
+                "手数×乘数×真实价 ≈ 本金×权重（误差 ≤ 半个hand）；"
+                "乘数取真值（BU 10 / AG 15 / AU 1000）；"
                 "前复权因子按 P_adj=P_raw×scale 换回真实盘面价")
 
     check("截面交易记录的手数（权重折手数）", _cross_lots)
@@ -15634,6 +15646,22 @@ def _run() -> tuple[bool, list[str]]:
             lambda k: 10.0)
         assert tg["A"] > 0 and tg["B"] < 0 and tg["C"] == 5
 
+        # 🔴 理论仓 = 当前持仓，与「今天是不是调仓日」无关（用户 2026-11-25 明确）。
+        # 回测 `_place` 把调仓行的权重 ffill 铺满全轴，所以就算最后一根不是调仓日，
+        # 持仓也非空 —— 实盘必须照这个口径给，不能因为 (L-1)%step≠0 就返回 0 手。
+        # 之前黑色/化工截面冷启动后理论全 0 就是栽在这里（2443%10=3 永不整除）。
+        x_full = XL.CrossLive(cfg, bt)
+        w_full, note_full = x_full.decide(frames)     # 全量 420 根，419%5=4 非调仓日
+        assert w_full is not None, f"非调仓日不该没仓位：{note_full}"
+        # 回测最后一根 = 最近调仓行 ffill 过来的权重，maxΔ 必须为 0
+        d_full = float((out.weights.iloc[-1].reindex(w_full.index).fillna(0)
+                        - w_full).abs().max())
+        assert d_full < 1e-9, f"非调仓日实盘仓位≠回测最后一根，maxΔ={d_full}"
+        # 同一批 bar 再算一次：调仓行没变，不该重算（省性能），但权重仍在
+        w_again, note_again = x_full.decide(frames)
+        assert "调仓行没变" in note_again or (w_again is not None), \
+            "跨调仓行才该重算，同一调仓行重复算会拖垮 tick"
+
         # 跑不了的口径要明说，不能静默按别的策略下单。1 个品种不是截面；
         # 2 个已经放开（上面单独验过），这里只拦真正不够的那一个。
         try:
@@ -15658,8 +15686,20 @@ def _run() -> tuple[bool, list[str]]:
         src3 = inspect.getsource(
             __import__("gui.portfolio_page", fromlist=["PortfolioPage"]).PortfolioPage._live_plan)
         assert "n_cross" not in src3
+
+        # 🔴 回测手数也要取整（用户 2026-11-25），且回测 / 实盘共用同一个
+        # round_lots（定义在 cross.py，cross_live 只是别名导出）—— 两处各写
+        # 一份迟早分叉。源码级钉住，别只靠数据探针。
+        assert "round_lots" in inspect.getsource(CX.to_result)
+        assert "round_lots = CX.round_lots" in inspect.getsource(XL)
+        # ML 缺产物不该显示成红色「错误」（用户 2026-11-25「ML 截面加载显示
+        # 错误」）—— 组合页状态列要把它归到「待训练」
+        _pp = __import__("gui.portfolio_page", fromlist=["PortfolioPage"]).PortfolioPage
+        _status_src = inspect.getsource(_pp._render)
+        assert "待训练" in _status_src and "训练产物" in _status_src
         return (f"合成 6 品种 / 420 根，回测第 {last} 行权重与实盘逐位相同（maxΔ={d:g}）；"
-                f"2 品种（maxΔ={d2:g}）也能跑；"
+                f"2 品种（maxΔ={d2:g}）也能跑；非调仓日仍持仓且贴住回测最后一根"
+                f"（maxΔ={d_full:g}）；"
                 "筛池暂存、手数四舍五入、不支持口径拦截、引擎接线四项均通过")
 
     check("截面实盘：权重逐位对齐回测 + 手数 / 筛池 / 接线", _cross_live_weights)

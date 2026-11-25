@@ -4302,6 +4302,16 @@ class PortfolioPage(QWidget):
                 # 截面这一类「引擎结构上跑不了」的，不该显示成红字「错误」——
                 # 那不是故障，是这一条本来就只能回测。原因留在 tooltip 里
                 text, color, tip = "仅回测", C_MUTED, slot["error"]
+            elif slot.get("error") and (
+                    "还没有训练产物" in str(slot["error"])
+                    or "训练产物" in str(slot["error"])):
+                # 截面 ML / 因子 ML 缺产物：**不是故障**，是还没训练。显示成红色
+                # 「错误」会让人以为程序坏了（用户 2026-11-25 报「ML 截面加载
+                # 显示错误」）。改成「待训练」并说清楚去哪训，tooltip 留在原消息
+                _why = str(slot["error"])
+                text, color = "待训练", C_MUTED
+                tip = _why + ("\n在组合页选中这条策略点「训练模型」，训完重新启动。"
+                              if "训练" in _why else "")
             elif slot.get("error"):
                 text, color, tip = "错误", C_BAD, slot["error"]
             elif slot.get("ml_wait"):

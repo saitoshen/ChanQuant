@@ -105,30 +105,11 @@ def union_index(frames: dict) -> pd.DatetimeIndex:
     return pd.DatetimeIndex(cat).sort_values()
 
 
-def round_lots(raw: float, prev: int = 0) -> int:
-    """名义额折出来的手数 → **四舍五入取整**（用户 2026-11-24 明确口径）。
-
-    🔴 不能用 Python 内建 `round()`：它是银行家舍入（round(1.5)=2、round(2.5)=2），
-    和「四舍五入」不是一回事。这里按绝对值 `floor(|x| + 0.5)` 再带回符号：
-    1.5→2、2.5→3、−1.5→−2。
-
-    原来这里加过 0.6/0.4 的滞回（无仓时够 0.6 才开、有仓时剩不到 0.4 才平），
-    目的是防 0.5 手附近来回打。用户要求**纯四舍五入**，就把滞回去掉 —— 权重
-    本身按调仓日才变，一天之内的价格抖动不会每 tick 重算手数，本来也打不起来。
-
-    `prev` 只在 `raw` 是 NaN（某个品种没价 / 没乘数）时用来**保持原仓**：丢一个
-    价格不该把那一腿平掉。有有效数字时它不参与取整。
-    """
-    try:
-        raw = float(raw)
-    except (TypeError, ValueError):
-        return int(prev or 0)
-    if not math.isfinite(raw):
-        return int(prev or 0)
-    if raw == 0:
-        return 0
-    sign = 1 if raw > 0 else -1
-    return sign * int(math.floor(abs(raw) + 0.5))
+# 四舍五入折手数：回测（cross.to_result）和实盘（下面 targets_from_weights）
+# 必须用同一份实现，函数定义在 cross.py（无依赖），这里只是别名导出。
+# 用户 2026-11-24 明确「四舍五入」（不是银行家舍入、不是 0.6/0.4 滞回）；
+# 2026-11-25 补充「回测也要取整、多空不必精确一致，运行存在误差」。
+round_lots = CX.round_lots
 
 
 @dataclass
@@ -156,6 +137,10 @@ class CrossLive:
 
     weights: pd.Series | None = None
     at: object = None            # 上一次真正算出权重的 bar 时间
+    #: 上一次算权重用的是 score 的哪一**调仓行号**（arange(0, N, step) 里的一个）。
+    #: 用它判「要不要重算」而不是拿当前 bar 去凑 `(L-1)%step` —— 后者在日线这种
+    #: 数据源行数固定的场合，L 恒不整除 step 就永远不算，冷启动直接卡在 0 手
+    at_row: int | None = None
     step: int = 1
     bpd: float = 1.0
     n_calc: int = 0
@@ -197,10 +182,17 @@ class CrossLive:
         self.bpd = fstrat.bars_per_day(idx)
         self.step = max(1, int(ccfg.step(self.bpd)))
         L = len(idx) + int(self.drop or 0)
-        if self.drop is not None and self.at is not None \
-                and (L - 1) % self.step \
-                and int((idx > self.at).sum()) < 2 * self.step:
-            return False, f"未到调仓日（第 {L} 根，每 {self.step} 根一次）"
+        # 当前应该持有的是「最近一个已过的调仓行」那组仓位（回测里 `_place` 把
+        # 调仓行 ffill 铺满，最后一根的权重就是它）。所以判据是**最近调仓行有没有
+        # 变**，而不是拿当前 bar 去凑 `(L-1)%step`。
+        #
+        # 老写法 `(L-1)%step` 在日线这种「一天之内数据源行数固定」的场合是死结：
+        # L 恒等于某个值，若它不整除 step（实测黑色 2444%10=4、化工 2446%10=6），
+        # 就永远不算权重，冷启动后 target 一直是 0 —— 界面上理论持仓全 0，
+        # 而回测最后一根明明有仓。有色恰好 2445%5==0 才没暴露。
+        row = max(0, (L - 1) // self.step) * self.step
+        if self.at_row is not None and row == self.at_row:
+            return False, f"调仓行没变（第 {row} 根，每 {self.step} 根一次）"
         return True, ""
 
     def decide(self, frames: dict, step1_frames: dict | None = None,
@@ -300,10 +292,15 @@ class CrossLive:
         # 预热，数量在一段行情里恒定
         self.drop = int(len(score) - len(idx))
         L = int(len(score))
-        if (L - 1) % step:
-            return None, f"未到调仓日（第 {L} 根，每 {step} 根一次）"
+        # 用「最近一个已过的调仓行」算权重 —— 回测 `_place` 就是把 arange(0,N,step)
+        # 那些行的权重 ffill 铺满全轴，所以当前应有仓位 = 最近调仓行的那组，
+        # 而不是「当前 bar 必须恰好是调仓行」。老写法在这里硬卡 (L-1)%step，
+        # 日线数据源行数固定时若 L 不整除 step 就永远返回 None，冷启动全 0 手。
+        row = max(0, (L - 1) // step) * step
+        if self.at_row is not None and row == self.at_row:
+            return None, f"调仓行没变（第 {row} 根，每 {step} 根一次）"
 
-        last = score.iloc[[-1]]
+        last = score.iloc[[row]]
         n_ok = int(last.notna().sum(axis=1).iloc[0])
         if n_ok < CX.MIN_CROSS:
             return None, (f"这一根只有 {n_ok} 个品种算得出分数（要 {CX.MIN_CROSS} 个），"
@@ -327,11 +324,12 @@ class CrossLive:
         w = w.reindex(list(frames)).fillna(0.0)
 
         self.weights = w
-        self.at = score.index[-1]
+        self.at = score.index[row]
+        self.at_row = row
         n_leg = int((w.abs() > 0).sum())
         return w, (f"调仓：{n_leg} 条腿，Σ|w|={float(w.abs().sum()):.2f}"
                    f"（杠杆 {float(w.abs().sum()) / max(1e-9, 1.0):.2f}×），"
-                   f"第 {L} 根 / 每 {step} 根一次" + self.ml_note)
+                   f"第 {row} 根 / 每 {step} 根一次" + self.ml_note)
 
     # ------------------------------------------------------------ 筛池
 
