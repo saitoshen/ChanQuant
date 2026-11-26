@@ -1216,7 +1216,15 @@ def to_result(out: "CrossResult", label: str = "", step: int = 0,
         legs[str(sym)] = Result(equity=leq * cash, position=lpos, trades=ltrades,
                                 metrics=lm, label=str(sym))
 
-    return Result(equity=eq, position=pos, trades=trades,
+    # 🔴 **主结果的 equity 必须乘回本金**（2026-11-25）：上面 `m` 是按归一化
+    # 净值（base=1.0）算的，指标本身是比例不受量纲影响；但 `Result.equity`
+    # 是对外接口 —— 阶段分析 `stage_table(eq, base=initial_cash)`、回撤
+    # `drawdown_series(eq, initial_cash)`、组合 `combine()` 的 `base=eq.iloc[0]`
+    # 全拿它当**真金**。以前这里返回归一化的 eq（首值 1.0），分母却是真金
+    # 100000 ⇒ 阶段分析首年 (1−100000)/100000 = −100%、其余年份 ±0.0，
+    # 组合报告里 `cost_pct=total_cost/eq.iloc[0]` 也把成本放大 10 万倍。
+    # 各腿上面已经 `equity=leq * cash`，这里统一量纲，主与腿才对得上。
+    return Result(equity=eq * cash, position=pos, trades=trades,
                   metrics=m, label=label, legs=legs)
 
 

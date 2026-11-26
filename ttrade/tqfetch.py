@@ -833,7 +833,7 @@ def _ts_codes_for_bars(c: str, df: pd.DataFrame, end: date, ex: str):
 
 
 def write_contracts(api, sym: str, ex: str, period: str, years: int,
-                    days: int = 0, cancel=None) -> dict:
+                    days: int = 0, cancel=None, force: bool = False) -> dict:
     """下载一个品种的全部真实合约（不复权，单个合约本身没有换月跳空）。
 
     十年全品种是几千个合约、上亿行的量级，所以三件事必须做对：
@@ -850,6 +850,10 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int,
     日线 243 根）。差别只在单次请求上限 `RECENT_BARS`（2026-11-10 实测 10000）——
     日线一个合约一辈子才 240 根，等于**完整**；5m 只拿得到最后一万根（约 7 个月），
     更早的那段取不到，展期因子在那种合约上会退回日线口径。
+
+    `force=True` 用于**补历史缺口**：默认那套增量对「已到期但只下了一部分」的
+    合约会整段跳过，2018–2020 的缺口正好属于这种。force 会让每个合约都从
+    `start` 重新下，落库仍是 `INSERT OR REPLACE`，不会丢掉已有 key。
     """
     key = f"{sym}_{ex}"
     # 15m/30m 归到 5m、2h/4h 归到 1h：合约明细只有 5m/1h 两种，其余周期在读取时
@@ -877,16 +881,19 @@ def write_contracts(api, sym: str, ex: str, period: str, years: int,
             old += 1                      # 到期月份早于回溯区间，整段都不需要
             continue
         last = have.get(ts_code)
-        if last is not None and (_expired(ts_code, end) or last.date() >= end - timedelta(days=5)):
-            skipped += 1
-            continue
-        if last is None and ts_code in empty and _expired(ts_code, end):
-            blank += 1                    # 摘牌时就没数据，不会再有
-            continue
+        if not force:
+            if last is not None and (_expired(ts_code, end)
+                                     or last.date() >= end - timedelta(days=5)):
+                skipped += 1
+                continue
+            if last is None and ts_code in empty and _expired(ts_code, end):
+                blank += 1                # 摘牌时就没数据，不会再有
+                continue
         # 同理**不能**用 `max(start, ...)` 夹：定时任务 days=1 时 start 是昨天，
         # 合约要是停在更早（主连在补、真实合约没跟上），夹完就从昨天开始，
         # 中间那截永远缺，展期因子照样算得出来，只是算错。
-        cstart = start if last is None else (last - timedelta(days=3)).date()
+        # force 时对每个合约都从 start 重下，覆盖已有的那部分。
+        cstart = start if (force or last is None) else (last - timedelta(days=3)).date()
         todo.append((c, ts_code, cstart))
 
     added = n_con = 0

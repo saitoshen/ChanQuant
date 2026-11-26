@@ -2403,12 +2403,21 @@ class ResultView(QObject):
         with_name = self.kind == "portfolio"
         leg = self._leg_key()
         if leg:
-            # 切到某一条腿就只看它自己的交易。`Trade.symbol` 是回测端盖上去的
-            # （`backtest._stamp_symbol`）；老的保存结果没有这个字段，退回按
-            # 名字匹配 —— 不匹配宁可留空，也不能把别的品种混进来
-            rows = [nt for nt in rows
-                    if str(getattr(nt[1], "symbol", "") or "") == leg
-                    or (not getattr(nt[1], "symbol", "") and str(nt[0]) == leg)]
+            # 切到某一条腿就只看它自己的交易。🔴 **两条腿的口径不一样**：
+            # - 多策略组合报告：下拉的 leg 是**策略名**（`_combo_legs` 用
+            #   cfg.title() 做键），`self.trades` 是 combine_trades 产出的
+            #   [(策略名, Trade)]，`nt[0]` 才是策略名。而 `Trade.symbol` 是
+            #   回测端盖的**品种名**（截面每笔归属于某个品种），拿它去比策略名
+            #   永远不相等 ⇒ 组合报告切单条策略时交易记录整表为空（2026-11-25）。
+            # - 多品种 / 截面按品种切：leg 是品种名，才比 `Trade.symbol`。
+            # 以前只按 symbol 过滤，所以「策略」腿全军覆没；按 leg_noun 分流，
+            # 两种下拉框各自对上自己的键，不匹配仍然宁可留空不混进别人的交易。
+            if self._leg_noun == "策略":
+                rows = [nt for nt in rows if str(nt[0]) == leg]
+            else:
+                rows = [nt for nt in rows
+                        if str(getattr(nt[1], "symbol", "") or "") == leg
+                        or (not getattr(nt[1], "symbol", "") and str(nt[0]) == leg)]
         if with_name:
             # 第二列：截面策略 / 多品种是「哪个品种」，多策略组合是「哪条策略」。
             # 以前多品种也写「策略」，27 个品种的行全长得一样，还找不到品种名

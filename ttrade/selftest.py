@@ -2322,6 +2322,19 @@ def _run() -> tuple[bool, list[str]]:
                            initial_cash=bt.initial_cash)
         if not res.trades:
             raise RuntimeError("截面回测没产生交易")
+        # 🔴 主结果与逐品种腿的 equity 量纲必须一致（2026-11-25 阶段分析全 ±0）：
+        # 阶段分析 `stage_table(eq, base=initial_cash)` 把首值 1.0 的归一化净值
+        # 当真金除 ⇒ 首年 −100%、其余 ±0.0；`combine()` 里成本率也放大本金倍。
+        if abs(float(res.equity.iloc[0]) - bt.initial_cash) > 1e-6:
+            raise RuntimeError(
+                f"截面主 equity 首值 {float(res.equity.iloc[0]):.2f} ≠ 本金 "
+                f"{bt.initial_cash:.2f}（阶段分析会显示 -100%）")
+        from ttrade.backtest import stage_table as _stage
+        _yrs = _stage(res.equity, "YE", base=bt.initial_cash)
+        if _yrs.empty or any(abs(r) > 2.0 for r in _yrs["ret"]):
+            raise RuntimeError(f"截面年度收益出现 -100% 量纲错：{_yrs['ret'].tolist()}")
+        if abs(float(_yrs["ret"].sum()) - res.metrics["total_return"]) > 1e-6:
+            raise RuntimeError("截面各年收益相加 ≠ 累计收益")
         cost_gap = abs(sum(t.cost for t in res.trades) - res.metrics["total_cost"])
         pnl_gap = abs(sum(t.pnl for t in res.trades)
                       - (res.metrics["final_equity"] - bt.initial_cash))
@@ -5571,6 +5584,31 @@ def _run() -> tuple[bool, list[str]]:
         return f"{len(rp.leg_frames)} 条逐品种 signal 行情；组合视图可看 K 线并默认接实时"
 
     check("多品种回测逐品种 K 线与默认实时", _multi_leg_frames_for_chart)
+
+    def _combo_leg_trades_filter():
+        """组合报告切「策略」腿时，交易记录按策略名过滤而不是 Trade.symbol。
+
+        2026-11-25 用户报「组合报告里单独策略的交易记录显示空的」：下拉 leg
+        来自 `_combo_legs` 的 cfg.title()（策略名），而 `self.trades` 是
+        `combine_trades([(策略名, Result)])`，每笔的 `Trade.symbol` 是品种名。
+        旧代码只按 symbol==leg 过滤，策略名永不匹配 ⇒ 空表。按 leg_noun 分流：
+        「策略」腿用 nt[0]（策略名），「品种」腿才用 Trade.symbol。
+        """
+        import inspect
+
+        import gui.result_view as RV
+
+        src = inspect.getsource(RV.ResultView._refresh_trades)
+        if 'self._leg_noun == "策略"' not in src:
+            raise RuntimeError("交易记录没有按「策略」腿分流过滤")
+        if "str(nt[0]) == leg" not in src:
+            raise RuntimeError("「策略」腿没按 nt[0]（策略名）过滤交易")
+        leg_src = inspect.getsource(RV.ResultView._leg_key)
+        if "cb.currentData()" not in leg_src:
+            raise RuntimeError("腿选择不再读下拉 currentData")
+        return "「策略」腿按策略名过滤交易，「品种」腿按 Trade.symbol"
+
+    check("组合报告单策略交易记录", _combo_leg_trades_filter)
 
     def _live_data_ready():
         """实盘数据就绪：辨识所需衍生源、查末日、订阅清单、日内现算。"""
