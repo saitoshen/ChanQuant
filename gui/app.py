@@ -114,7 +114,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ttrade import costs, factors, live_data, mlmodels, symbols_info, tqdata, tqlive
+from ttrade import (barclock, costs, factors, live_data, mlmodels, symbols_info,
+                    tqdata, tqlive)
 from ttrade import cross as cross_engine
 from ttrade import factor_strategy as fstrat
 from ttrade import replay
@@ -165,6 +166,29 @@ GUI_PERIODS = (
     + [p for p in tqdata.PERIOD_ORDER if p != PERIOD_1D_TQ]
 )
 PERIOD_LABEL = dict(tqdata.PERIOD_LABEL, **{PERIOD_1D: "日线Tushare"})
+
+
+def live_bar_key(ts, period: str):
+    """实时帧的「这一根 bar」稳定标识，用来判断是不是真换了 bar。
+
+    🔴 不能直接拿 `df.index[-1]` 比。天勤原生周期的时间戳是 bar 起点，一根之内
+    不变；但 15m/30m/2h/4h 是 `tqdata.resample()` 用 5m/1h 现合的，`merge_bars`
+    把**最后一根源 bar 的时间**当合成 bar 的索引 —— 15m 在 09:10、09:15、
+    09:20 会给出三个不同的时间戳，而它们其实是同一根 09:00 的 bar。老代码
+    `ts_new != _live_last` 因此一根 bar 重算三遍（1h 十二遍），每遍都跑完整
+    回测 + `show_result()` 重建五页，研究页一开实时就被拖住。
+
+    这里把时间戳折到**目标周期的桶起点**：5m 按 5 分钟、15m 按 15 分钟……
+    日线按自然日。有了它，同一根 bar 内无论来多少帧都只算价格刷新。
+    """
+    if ts is None:
+        return None
+    t = pd.Timestamp(ts)
+    sec = int(barclock.rt_sec(period) or 0)
+    if sec <= 0 or sec >= 86400:
+        return t.normalize()
+    return t.floor(pd.Timedelta(seconds=sec))
+
 
 # ------------------------------------------------------------------ 策略族
 # 两个大类：规则策略（原有 5 个）、因子策略（单/多/机器学习）。
@@ -1492,6 +1516,7 @@ class MainWindow(QMainWindow):
         # 「启动实时」）/ 空（只画本地历史）。两条同时跑时只让其中一条画
         self._live_src = ""
         self._live_last = None                         # 上一根 bar 的时间，用来判断「新 bar」
+        self._live_bar_key = None                      # 稳定 bar 桶（`live_bar_key`）
         self._live_aux_snap: dict = {}                 # 实时现算的展期 / IV 摘要
         self._live_seq = 0                             # 每次起停自增，丢掉过期的推送
         self._live_patch_ts = 0.0                      # 上次刷未走完那根 bar 的时刻
@@ -7482,6 +7507,7 @@ class MainWindow(QMainWindow):
         if self._live_src == "study":
             self._live_src = ""
             self._live_last = None
+            self._live_bar_key = None
             self.lbl_live.setText("本地历史")
             self.lbl_live.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
         self._sync_live_btn(False)
@@ -7504,6 +7530,8 @@ class MainWindow(QMainWindow):
         self._live_period = ctl.period or self._period()
         self._live_seq += 1
         self._live_last = None
+        self._live_bar_key = None
+        self._live_patch_ts = 0.0
         self._live_aux_snap = {}   # 上一品种的现算值不能带进这一轮
         # 工作线程刚把缺口补进库，缓存里的旧数据要作废，否则实时段会接在旧尾巴上
         self.store.invalidate(key, self._live_period)
@@ -7540,6 +7568,7 @@ class MainWindow(QMainWindow):
             return
         self._live_src = ""
         self._live_last = None
+        self._live_bar_key = None
         self.lbl_live.setText("本地历史")
         self.lbl_live.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
         self.lbl_live_msg.setText("实时已停止（只显示本地历史）")
@@ -7615,8 +7644,12 @@ class MainWindow(QMainWindow):
         # 每笔都 `merge_live` + 重画整张 K 线，主线程直接被占满 —— 界面看着
         # 就是「一打开就卡住」。同一根内限到 2.5 次/秒，肉眼看不出差别。
         ts_new = live_df.index[-1]
+        # 🔴 判「新 bar」用**周期桶**，不能用裸时间戳（见 live_bar_key 的说明）。
+        # 15m 由 5m 现合，同一根 09:00 的 bar 在 09:10/09:15/09:20 会给出三个
+        # 不同的 index[-1]；老代码因此一根 bar 重算三遍，1h 十二遍。
+        key = live_bar_key(ts_new, self._live_period or self._period())
         now = time.monotonic()
-        if (self._live_last is not None and ts_new == self._live_last
+        if (self._live_bar_key is not None and key == self._live_bar_key
                 and now - self._live_patch_ts < 0.4):
             return
         self._live_patch_ts = now
@@ -7631,17 +7664,115 @@ class MainWindow(QMainWindow):
         if self._live_aux_snap:
             merged = live_data.overlay_snapshot(
                 merged, self._live_aux_snap, self._live_period or self._period())
-        # 拿**实时段**的最后一根判断「是不是新 bar」。合并后的最后一根可能是库里
-        # 更晚的那根（下载写进了半根活 bar），拿它比会一直判成「同一根」，
-        # 实时 bar 永远进不了图
-        new_bar = self._live_last is not None and ts_new != self._live_last
-        first = self._live_last is None
+        prev = self._live_bar_key
+        if prev is not None and key < prev:
+            return          # 晚到的旧帧：拿它重算会把新 bar 顶回去
+        new_bar = prev is not None and key != prev
+        first = prev is None
         self._live_last = ts_new
-        if first or new_bar:
-            # 新 bar 走完整重算：信号只认走完的 bar，避免一根没走完的 K 线反复开平
-            self.run_analysis(df_override=merged)
-        else:
+        self._live_bar_key = key
+        if not (first or new_bar):
             self._patch_live_bar(merged)
+            return
+        # 多品种 / 截面没有「这一根主连 K 线」的单一视图：研究页的实时只订了当前
+        # 主连那一条会话，拿它去重跑 N 条腿的组合回测（每次几条到几十条，还要
+        # 重建整页 K 线）纯属把界面拖死。这类策略要看实时请去组合页。
+        if self.family == FAMILY_CROSS or self._multi_symbols():
+            return
+        self._live_refresh(merged)
+
+    # 实时只算最后一根的信号：走实盘引擎 `_refresh_signal` 那套思路 ——
+    # 不回放、不回测、不重建结果页；历史 signal 一根都不重算。
+    _LIVE_SIGNAL_TAIL = 600        # 因子只在这点尾窗上算，够暖 252 根窗口
+
+    def _live_refresh(self, merged: pd.DataFrame) -> None:
+        """把实时价接到**已有那份带信号行情**上，只重算末根信号后刷画布。"""
+        base = getattr(self.view, "df", None)
+        if base is None or not len(base):
+            base = self.df_sig
+        if base is None or not len(base):
+            # 还没跑过一次完整回测：没有信号可增量，只把 K 线画出来
+            self.view.update_kline(merged)
+            return
+        show = tqlive.merge_live(base, merged)
+        if show is None or show.empty:
+            return
+        show = self._live_signal_only(show)
+        self.view.update_kline(show)
+
+    def _live_signal_only(self, df: pd.DataFrame) -> pd.DataFrame:
+        """只给最后一根写 signal；不跑 `run_backtest`、不碰 res/trades。
+
+        绩效、交易记录、因子分析停在「上次完整回测」那一刻 —— 实时帧只回答
+        「最新这根是做多/做空/空仓」，这正是实盘引擎每个 bar 做的事。
+        """
+        out = df.copy()
+        try:
+            period = self._live_period or self._period()
+            if not (self.family == FAMILY_FACTOR or self._filter_active()):
+                rk = self.cb_strategy.currentData()
+                if not rk:
+                    return out
+                tail = out.tail(self._LIVE_SIGNAL_TAIL)
+                sig = run_strategy(tail, rk, self._current_params(),
+                                   reverse=self._rule_reverse())
+                last = out.index[-1]
+                for c in ("signal", "entry_long", "entry_short", "exit_long",
+                          "exit_short", "stop_dist"):
+                    if c in sig.columns:
+                        if c not in out.columns:
+                            out[c] = False if c != "stop_dist" else float("nan")
+                        out.loc[last, c] = sig[c].iloc[-1]
+                return out
+
+            cfg = self._factor_cfg()
+            keys = list(self._selected_factor_keys())
+            # 机器学习整段 walk-forward 是分钟级，实时帧绝不能碰：复用上次算好
+            # 的分数（新 bar 用前值），只把分数过一遍阈值状态机。
+            if self.factor_mode == "ml" and "factor_score" in out.columns:
+                last = out.index[-1]
+                if "signal" not in out.columns:
+                    out["signal"] = 0
+                if cfg.trigger_keys:
+                    # 触发态没法从分数重建；新 bar 沿用上一次决策，绝不重训
+                    new_sig = out["signal"].ffill().iloc[-1]
+                else:
+                    score = out["factor_score"].ffill()
+                    sig = fstrat.hysteresis(
+                        score.to_numpy(dtype=float), cfg.entry_z, cfg.exit_z)
+                    new_sig = sig[-1]
+                out.loc[last, "signal"] = 0 if pd.isna(new_sig) else new_sig
+                return out
+            tail = out.tail(self._LIVE_SIGNAL_TAIL)
+            extra = self._extra_periods(cfg, keys, period, self._live_key)
+            extra = {p: d.tail(self._LIVE_SIGNAL_TAIL)
+                     for p, d in (extra or {}).items()}
+            if self._filter_active():
+                rk = self.cb_strategy.currentData()
+                rule = run_strategy(tail, rk, self._current_params(),
+                                    reverse=self._rule_reverse())
+                res = fstrat.run_rule_with_filter(
+                    tail, rule["signal"].to_numpy(int),
+                    self.factor_mode or "single", keys, cfg,
+                    extra=extra, base_period=period)
+            else:
+                res = fstrat.run_factor_strategy(
+                    tail, self.factor_mode or "single", keys, cfg,
+                    extra=extra, base_period=period)
+            last = out.index[-1]
+            if res.df is None or res.df.empty:
+                return out
+            for c in ("signal", "factor_score", "entry_note", "exit_note"):
+                if c not in res.df.columns:
+                    continue
+                if c not in out.columns:
+                    out[c] = float("nan")
+                out.loc[last, c] = res.df[c].iloc[-1]
+            return out
+        except Exception as exc:                         # noqa: BLE001
+            self.lbl_status.setText(
+                f"实时信号刷新失败：{type(exc).__name__}: {exc}")
+            return out
 
     def _patch_live_bar(self, merged: pd.DataFrame) -> None:
         """把还没走完的那根 bar 的最新价刷到图上，不重算策略。

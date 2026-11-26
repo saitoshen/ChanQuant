@@ -2529,6 +2529,12 @@ class PortfolioRunner:
         # ① 反向突破离场：上一根**收盘**决定，这一根**开盘**执行
         if held and ((held > 0 and lv["exit_long"]) or (held < 0 and lv["exit_short"])):
             st.target = 0
+            # 🔴 理论仓跟着这一笔走：和 `_intrabar_tick` 的止损路径同一口径 ——
+            # 离场已经决定，signal 下一根可能还是 ±1，但不能让它把这笔已经平掉
+            # 的仓又「显示」回来。以前这里只写 target、漏了 theo_live_qty，
+            # 于是界面出现「已平仓、理论仍 -8」（2026-11-26 a2701 现场；那次
+            # 真正的错是 1h 库被 5m 污染，但口径不同步本身也是确定的 bug）。
+            st.theo_live_qty = 0
             st.ib_armed = False          # 这根不再看入场，等下一根重来
             st.ib_exit_pending = True
             st.ib_stop = float("nan")

@@ -1672,6 +1672,7 @@ def _run() -> tuple[bool, list[str]]:
         冷启动那一段仍按回测口径（signal × 锁存手数）—— 一键对齐要靠它看见
         「从没触发过」的腿，不能一并改掉（2026-11-24 的修复）。
         """
+        import pandas as pd
         from ttrade import strategy_runner as SR
         from ttrade import strategy_store as SStore
 
@@ -1725,8 +1726,43 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"止损后理论仓没归 0：{st.target} / {st.theo_live_qty}")
         if f._theo_qty(st) != 0:
             raise RuntimeError(f"止损后理论仓还是 {f._theo_qty(st)}")
+
+        # 反向突破离场（_ib_arm ①）：理论仓也要跟着归 0，和止损同一口径。
+        # 2026-11-26 a2701 那次虽是 1h 库被 5m 污染引起的误触发，但
+        # 「只写 target、漏写 theo_live_qty」本身是确定的口径 bug：
+        # 界面会显示「已平仓、理论仍 -8」。
+        f2 = _Fake(px=3400.0)
+        # 实例方法要绑到 f2，不能把未绑定函数直接挂实例（self 会被当成 st）
+        f2._ib_arm = SR.PortfolioRunner._ib_arm.__get__(f2, type(f2))
+        f2._mark_price = lambda st, df: 3400.0
+        f2._volume_multiple = lambda st: 10.0
+        st2 = SR.SlotState(cfg=SStore.StrategyConfig(
+            sid="t-ib-exit", name="t-ib-exit", symbol="A", exchange="DCE",
+            period="1h", family="rule", rule_key="sbbox_ib", note="short",
+            sizing="fixed", volume=8))
+        st2.running, st2.underlying = True, "DCE.a2701"
+        st2.signal, st2.lots, st2.theo_lots = -1, 8, 8
+        st2.theo_live_qty = -8                 # 盘中触发过，理论 = -8
+        st2.held[st2.underlying] = -8
+        orig_nl = SR.next_levels
+        try:
+            SR.next_levels = (lambda *a, **k: {
+                "entry_long": float("nan"), "entry_short": float("nan"),
+                "stop_dist": 20.0, "exit_long": False, "exit_short": True})
+            f2._ib_arm(st2, pd.DataFrame({
+                "open": [3400.0], "high": [3400.0], "low": [3400.0],
+                "close": [3400.0], "volume": [1], "open_oi": [0], "close_oi": [0],
+            }, index=pd.DatetimeIndex(["2026-11-26 10:00:00"])))
+        finally:
+            SR.next_levels = orig_nl
+        if int(st2.target) != 0 or st2.theo_live_qty != 0:
+            raise RuntimeError(
+                f"反向突破离场后理论仓没归 0：target={st2.target} "
+                f"theo_live_qty={st2.theo_live_qty}")
+        if f2._theo_qty(st2) != 0:
+            raise RuntimeError(f"反向突破离场后 _theo_qty 还是 {f2._theo_qty(st2)}")
         return ("冷启动按回测口径 -8；盘中触发后按实际仓 -8，signal 闪变不改；"
-                "止损后立刻归 0")
+                "止损后立刻归 0；反向突破离场后也立刻归 0")
 
     check("K 线内策略盘中触发后理论仓跟实际仓走", _ib_theo_follows_live)
 
@@ -5584,6 +5620,102 @@ def _run() -> tuple[bool, list[str]]:
         return f"{len(rp.leg_frames)} 条逐品种 signal 行情；组合视图可看 K 线并默认接实时"
 
     check("多品种回测逐品种 K 线与默认实时", _multi_leg_frames_for_chart)
+
+    def _study_live_signal_only():
+        """研究页实时只算末根信号：不回测、不重建结果页（2026-11-26）。
+
+        用户报「启动实时会不断触发 K线与信号全量构建，系统卡住」。两个根因：
+        ① 15m/1h 的合成 bar 时间戳会随源 bar 前移，旧代码拿裸时间戳判新 bar，
+           一根 15m 重算三遍（1h 十二遍），每遍 `show_result()` 重建五页；
+        ② 实时帧直接进 `run_analysis`，ML 还会 cancel 上一轮因子线程并等 4 秒。
+        现在实时帧只走 `_live_refresh` → `_live_signal_only`，末根信号按尾窗算，
+        历史一根都不动；`run_backtest` / `show_result` 都不在链路上。
+        """
+        import inspect
+
+        import numpy as np
+        import pandas as pd
+
+        import gui.app as GA
+
+        src = inspect.getsource(GA.MainWindow._apply_live_bars)
+        if "run_analysis" in src:
+            raise RuntimeError("实时帧还在走整段回测 run_analysis")
+        if "self._live_refresh(" not in src:
+            raise RuntimeError("实时帧没接到增量信号入口")
+        sig_src = inspect.getsource(GA.MainWindow._live_signal_only)
+        for bad in ("run_backtest(", "show_result(", "run_analysis("):
+            if bad in sig_src:
+                raise RuntimeError(f"末根信号链路仍然调用 {bad}")
+        refresh_src = inspect.getsource(GA.MainWindow._live_refresh)
+        if "self.view.update_kline(" not in refresh_src:
+            raise RuntimeError("增量刷新没有落到只画 K 线的入口")
+
+        # 合成周期的 bar 桶必须稳定：同一根 15m 的三个时间戳只算一根
+        p = pd.Timestamp
+        checks = [
+            ("15m", ["09:05", "09:10", "09:15"], ["09:00", "09:00", "09:15"]),
+            ("1h", ["09:55", "10:05", "10:55"], ["09:00", "10:00", "10:00"]),
+        ]
+        for period, stamps, want in checks:
+            got = [GA.live_bar_key(p(f"2026-11-26 {s}"), period) for s in stamps]
+            exp = [p(f"2026-11-26 {s}") for s in want]
+            if got != exp:
+                raise RuntimeError(f"{period} 的 bar 桶不稳定：{[str(x) for x in got]}")
+
+        # 借普通对象调未绑定方法（不构造 QMainWindow），验证历史 signal 不被改写
+        from ttrade.strategies import STRATEGIES, run_strategy
+
+        class Dummy:
+            pass
+
+        win = Dummy()
+        win._live_signal_only = GA.MainWindow._live_signal_only.__get__(
+            win, Dummy)
+        win.family = "rule"
+        win._live_period = "1d_tq"
+        # _live_signal_only 规则分支要查 _filter_active / _LIVE_SIGNAL_TAIL，
+        # 异常兜底还要 lbl_status；少一个都会静默返回原 out，让断言假红
+        win._filter_active = lambda: False
+        win._LIVE_SIGNAL_TAIL = GA.MainWindow._LIVE_SIGNAL_TAIL
+        win.lbl_status = type("_Lbl", (), {"setText": lambda self, s: None})()
+        win._current_params = lambda: {}
+        win._rule_reverse = lambda: False
+
+        class _Cb:
+            def currentData(self):
+                return next(iter(STRATEGIES))
+
+        win.cb_strategy = _Cb()
+        n = 320
+        idx = pd.date_range("2025-01-01", periods=n, freq="B")
+        rng = np.random.default_rng(7)
+        close = 100 * np.exp(np.cumsum(rng.normal(0.0004, 0.012, n)))
+        df = pd.DataFrame({
+            "open": close * 0.999, "high": close * 1.005,
+            "low": close * 0.995, "close": close, "volume": 1e5,
+            "signal": np.zeros(n, dtype=int),
+        }, index=idx)
+        old_bt = GA.run_backtest
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("实时帧调用了 run_backtest")
+
+        GA.run_backtest = _boom
+        try:
+            out = win._live_signal_only(df)
+        finally:
+            GA.run_backtest = old_bt
+        if not bool((out["signal"].iloc[:-1].to_numpy()
+                     == df["signal"].iloc[:-1].to_numpy()).all()):
+            raise RuntimeError("实时刷新改写了历史 signal")
+        want = run_strategy(df.tail(GA.MainWindow._LIVE_SIGNAL_TAIL),
+                            win.cb_strategy.currentData(), {})["signal"].iloc[-1]
+        if int(out["signal"].iloc[-1]) != int(want):
+            raise RuntimeError(f"末根信号对不上：{out['signal'].iloc[-1]} != {want}")
+        return "实时帧只算末根信号；15m 一根只算一次；run_backtest 未被调用"
+
+    check("研究页实时只算末根信号", _study_live_signal_only)
 
     def _combo_leg_trades_filter():
         """组合报告切「策略」腿时，交易记录按策略名过滤而不是 Trade.symbol。
@@ -11545,8 +11677,10 @@ def _run() -> tuple[bool, list[str]]:
                        and win.tbl_fmulti.item(r, COL_NAME) is not None
                        and str(win.tbl_fmulti.item(r, COL_NAME).data(_Qt.UserRole))
                        != _k0}
-            gauge_ok = (_got == {_k0: "rank"} and _after == "rank"
-                        and _others <= {""})
+            # 只验目标因子这一格的「存→读」往返。别的因子可能在前面那段
+            # method_info 检查里已经设过口径（如 mom_250），这里不该假设它们
+            # 为空 —— 往返也不该把它们清掉，所以只断言 _k0 收得到、读得回。
+            gauge_ok = (_got.get(_k0) == "rank" and _after == "rank")
             gauge_info = (f"{_k0} 收集 {_got} / 读回 {_after!r} / "
                           f"其余格 {sorted(str(o) for o in _others)}")
             # 还原：口径回原值，勾选按备份恢复（`_apply_factor_keys` 会把
