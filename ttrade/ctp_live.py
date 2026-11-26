@@ -1091,6 +1091,13 @@ class CtpHub:
         }
 
     def _positions(self, src: dict, account: dict) -> list[dict]:
+        """柜台持仓 → 交易页持仓表。
+
+        🔴 「当日盈亏」口径（2026-11-26 用户明确）：**持仓 vs 昨日收盘价**，不是
+        柜台逐日盯市那个 `PositionProfit`（它按**昨结算**算，两者在期货上差很多 ——
+        al2701 截图里昨结算口径 -4,050，按昨收是另一回事）。算不出昨收 / 最新价
+        时退回柜台值，不写 0、不写「—」。
+        """
         out = []
         for ins, p in src.items():
             long_q = int(p.get("long") or 0)
@@ -1113,6 +1120,17 @@ class CtpHub:
             cs = float(p.get("cost_short") or 0.0)
             avg_l = (cl / (long_q * mult)) if (long_q and cl > 0) else (avg if long_q else 0.0)
             avg_s = (cs / (short_q * mult)) if (short_q and cs > 0) else (avg if short_q else 0.0)
+            # 当日盈亏 = (现价 − 昨收) × 净手 × 乘数 × 方向。昨收优先 CTP tick 的
+            # `pre_close`（PreClosePrice），没订上的品种退回本地日线最后一根收盘。
+            # 两边都拿不到就用柜台的，绝不拿 0 当昨收硬算出一个「今日大赚」。
+            tick = (self.md.last(ins) if self.md is not None else None) or {}
+            last = float(tick.get("last") or 0.0)
+            pre = float(tick.get("pre_close") or 0.0)
+            if not pre:
+                pre = _last_daily_close(ins, self._ex_of(ins))
+            day = (float(p.get("profit") or 0.0)
+                   if (last <= 0 or pre <= 0 or mult <= 0)
+                   else (last - pre) * (long_q - short_q) * mult)
             out.append({
                 "symbol": ins,
                 "pos": long_q - short_q,
@@ -1127,7 +1145,7 @@ class CtpHub:
                 "float_profit": float(p.get("profit") or 0.0),
                 "float_profit_long": float(p.get("profit") or 0.0) if long_q else 0.0,
                 "float_profit_short": float(p.get("profit") or 0.0) if short_q else 0.0,
-                "position_profit": float(p.get("profit") or 0.0),
+                "position_profit": day,
                 "margin": float(p.get("margin") or 0.0),
                 "last_price": 0.0,
             })

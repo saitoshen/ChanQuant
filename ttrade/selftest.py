@@ -14257,6 +14257,35 @@ def _run() -> tuple[bool, list[str]]:
                 raise RuntimeError(f"报价框合约没去重 / 没归一：{got}")
         finally:
             page.deleteLater()
+        # ---- 5. CTP / 融航持仓：当日盈亏按昨收算（2026-11-26 用户）
+        from ttrade.ctp_live import CtpHub
+
+        hub = CtpHub.__new__(CtpHub)  # 不连柜台，只测纯计算
+        hub._mult = lambda ins: 10.0
+        hub._ex_of = lambda ins: "SHFE"
+        hub.md = type("_Md", (), {
+            "last": lambda self, ins: {"last": 3550.0, "pre_close": 3500.0},
+        })()
+        rows = CtpHub._positions(hub, {
+            "rb2701": {"long": 2, "short": 0, "long_yd": 2, "short_yd": 0,
+                       "cost_long": 70000.0, "cost_short": 0.0,
+                       "profit": -80.0, "margin": 7000.0},
+        }, {})
+        # (3550 − 3500) × 2 手 × 10 = +1000，不是柜台给的 -80
+        if not rows or abs(rows[0]["position_profit"] - 1000.0) > 1e-6:
+            raise RuntimeError(
+                f"持仓当日盈亏要按昨收：(3550−3500)×2×10=1000，"
+                f"得到 {rows[0]['position_profit'] if rows else None}")
+        # 拿不到行情时退回柜台值，不拿 0 硬算
+        hub.md = None
+        rows2 = CtpHub._positions(hub, {
+            "rb2701": {"long": 2, "short": 0, "long_yd": 2, "short_yd": 0,
+                       "cost_long": 70000.0, "cost_short": 0.0,
+                       "profit": -80.0, "margin": 7000.0},
+        }, {})
+        if not rows2 or abs(rows2[0]["position_profit"] + 80.0) > 1e-6:
+            raise RuntimeError("没昨收/现价时要退回柜台的 position_profit")
+
         return ("持仓当日盈亏走 position_profit（-80.00）、成交平仓盈亏按多空各侧均价"
                 "（+250.00 / 拿不到均价画「—」）、CTP 委托时间=11-18 14:35:02 而不是"
                 "委托说明、三表资金账户列不再吃 Stretch、报价框双击带入 "
@@ -14346,30 +14375,42 @@ def _run() -> tuple[bool, list[str]]:
         pos_want = (1200.0 - 1180.0) * 3 * mult
         if abs(pos - pos_want) > 1e-6:
             raise RuntimeError(f"持仓盈亏要按理论建仓价算：{pos} ≠ {pos_want}")
-        if abs(day - pos_want) > 1e-6:
+        # 2026-11-26 用户改口径：当日盈亏 = 持仓浮动 + 本策略当日已落袋。
+        # 上面 feed 平了 2 手，real 已经落袋 ⇒ 当日盈亏必须含这一块
+        if abs(day - (pos_want + real)) > 1e-6:
             raise RuntimeError(
-                f"当天开的理论上仓，当日盈亏必须等于持仓盈亏：{day} ≠ {pos_want}")
-        # 🔴 台账那三个数随便怎么歪，两列都不许动一格
+                f"当日平仓的盈亏要计入当日盈亏：{day} ≠ 持仓 {pos_want} + 平仓 {real}")
+        # 🔴 台账均价 / 手数随便歪，两列都不许动一格（已落袋除外，那是新口径）
         st.cost["SHFE.rb2701"] = 500.0
-        st.real_day = 98765.0
+        st.held["SHFE.rb2701"] = 99
         _px2, day2, pos2, _n2 = run._slot_pnl(st)
         if (abs(day2 - day) > 1e-9) or (abs(pos2 - pos) > 1e-9):
             raise RuntimeError(
-                f"改了台账（均价 500、已落袋 98765）两列就变了 —— "
+                f"改了台账（均价 500、手数 99）两列就变了 —— "
                 f"又去读台账了：day {day2} pos {pos2}")
+        st.cost["SHFE.rb2701"] = 1060.0
+        st.held["SHFE.rb2701"] = 3
+        # 已落袋变一格，当日盈亏跟着变一格；持仓盈亏不许动
+        st.real_day += 100.0
+        _px2b, day2b, pos2b, _n2b = run._slot_pnl(st)
+        if (abs(day2b - (day2 + 100.0)) > 1e-9) or (abs(pos2b - pos) > 1e-9):
+            raise RuntimeError(
+                f"已落袋盈亏没进当日盈亏：{day2b} ≠ {day2}+100；持仓 {pos2b}")
+        st.real_day -= 100.0
         # 隔夜仓：当日基准换成昨结算（1000），持仓仍按建仓价 1180
         st.theo_day = "2000-01-03"
         _px3, day3, pos3, _n3 = run._slot_pnl(st)
         if abs(pos3 - pos_want) > 1e-6:
             raise RuntimeError(f"隔夜仓的持仓盈亏仍按建仓价：{pos3} ≠ {pos_want}")
-        day3_want = (1200.0 - 1000.0) * 3 * mult
+        day3_want = (1200.0 - 1000.0) * 3 * mult + real
         if abs(day3 - day3_want) > 1e-6:
-            raise RuntimeError(f"隔夜仓的当日盈亏要按昨结算：{day3} ≠ {day3_want}")
-        # 理论空仓：两列写 0（不是「—」，也不是拿台账顶上）
+            raise RuntimeError(f"隔夜仓的当日盈亏要按昨结算 + 已落袋：{day3} ≠ {day3_want}")
+        # 理论空仓：持仓盈亏写 0，**当日盈亏仍保留当天已平仓那一半**
+        # （用户 11-26：原油策略当天平掉全部仓位，这道格不能变回 0）
         st.target = 0
         _px4, day4, pos4, _n4 = run._slot_pnl(st)
-        if pos4 != 0.0 or day4 != 0.0:
-            raise RuntimeError(f"理论空仓时两列要写 0：day {day4} pos {pos4}")
+        if pos4 != 0.0 or abs(day4 - real) > 1e-6:
+            raise RuntimeError(f"空仓时持仓写 0、当日盈亏留平仓：day {day4} pos {pos4}")
         # 反手：均价必须重设成新方向的价（这是下单用的账本，仍在维护）
         st.target = 3
         feed("SELL", "OPEN", 4, 900.0)
@@ -14548,8 +14589,8 @@ def _run() -> tuple[bool, list[str]]:
                 raise RuntimeError(f"算不出来的格子要写「—」：{got}")
         finally:
             page.deleteLater()
-        return ("理论口径：台账改成 500/98765 两列一格不动、当天开的仓当日≡持仓、"
-                "隔夜仓按昨结算、空仓写 0；建仓价由策略自己写（下单价 > 触发价 >"
+        return ("理论口径：台账改均价/手数两列一格不动、当日盈亏含已平仓（空仓也留）、"
+                "隔夜仓按昨结算+已落袋；建仓价由策略自己写（下单价 > 触发价 >"
                 "推断，加仓/平仓/推断都不许盖下单价）；方向对不上写「—」；"
                 "均价加权 1060/减仓不动/反手重设 900；"
                 "三列在「状态」右侧且不知道时写「—」")
