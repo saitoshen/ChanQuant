@@ -441,10 +441,18 @@ class SlotState:
     #: 不会变成多下一手。落盘在 `positionbook` 的 `_costs` 段。
     cost: dict = field(default_factory=dict)
     #: 本交易日**已经落袋**的平仓盈亏（元）。当日盈亏 = 这个 + 持仓盈亏。
-    #: 不落盘：重启后从 0 起算，那时界面上就只剩持仓那一半 —— 宁可少算，
-    #: 也不能把上一天的落袋盈亏算进今天。换交易日自动清零（`daylimit.trading_day`）。
+    #: 🔴 口径和回测一致：只按**理论仓的变化 + 策略自己的建仓价 `theo_px`**
+    #: 记账，不读柜台成交 / 账本均价（2026-11-26 用户定调）。原来从账本
+    #: `_book_cost()` 记：对齐补仓没有均价 ⇒ 平仓按成交价当成本 ⇒ 盈亏恒 0，
+    #: 三条策略当天平过仓却全显示 +0，就是这个坑。
+    #: 落盘在 `positionbook` 的 `_realized` 段（带交易日），重启后仍是当天的数；
+    #: 换交易日自动清零（`daylimit.trading_day`）。
     real_day: float = 0.0
     real_day_of: str = ""
+    #: 上次记账用的理论仓 / 那一仓的理论建仓价。只在 `_slot_pnl` 里随理论仓
+    #: 变化推进，不落盘 —— 落盘的是算出来的 `real_day`，不是这个中间状态。
+    theo_book_qty: int = 0
+    theo_book_px: float = 0.0
     #: 理论建仓价 —— 「持仓盈亏 / 当日盈亏」两列**只读这三个数 + 行情**，
     #: 既不读台账（`held`/`cost`/`real_day`），也不读账户成交。
     #: 用户 2026-11-20 明确：这两列是「策略理论上」的数，跟实际下单无关。
@@ -1391,6 +1399,13 @@ class PortfolioRunner:
         book = positionbook.load(self._book_key)
         st.held = dict(book.get(cfg.sid, {}))
         st.cost = dict(positionbook.load_costs(self._book_key).get(cfg.sid, {}))
+        # 当天已落袋的平仓盈亏也跟着账本恢复：策略平完仓后 held 是空的，
+        # 内存里的 real_day 一重启就没了，界面又变回 +0（11-26 用户反馈）。
+        # 只认**同一交易日**的记录，隔夜的不带过来。
+        rv = positionbook.load_realized(self._book_key).get(cfg.sid) or {}
+        if str(rv.get("day") or "") == daylimit.trading_day():
+            st.real_day = float(rv.get("pnl") or 0.0)
+            st.real_day_of = str(rv.get("day"))
         # 仓位还在、均价丢了（老版本升级上来）时，按当前价补一个 —— 不补的话
         # 那一列会一直是 0 盈亏，看着像「刚开仓」。宁可写一个近似值并在日志里
         # 说清楚，也不要让用户对着一个不动的 0 猜
@@ -1452,7 +1467,12 @@ class PortfolioRunner:
 
     def _save_book(self, st: SlotState) -> None:
         st.book_ts = time.time()
-        positionbook.save(self._book_key, st.cfg.sid, st.held, cost=st.cost)
+        # `real_day_of` 为空 = 这条策略还没记过当日盈亏，传 None 表示别动盘上
+        # 已有的记录（比如加载时的 `_seed_cost()` 顺手存一次，不能把它清掉）。
+        realized = ({"day": st.real_day_of, "pnl": st.real_day}
+                    if getattr(st, "real_day_of", "") else None)
+        positionbook.save(self._book_key, st.cfg.sid, st.held,
+                          cost=st.cost, realized=realized)
 
     def get(self, sid: str) -> SlotState | None:
         return self._slots.get(sid)
@@ -3701,6 +3721,9 @@ class PortfolioRunner:
         """
         price = self._last_px(st.underlying)
         qty = self._theo_qty(st)
+        # 理论仓一变就记一笔「已落袋」：和回测的逐笔口径同源（理论价 + 手数），
+        # 不经柜台成交、不读账本均价。必须先于下面的 real 取值。
+        self._note_theo_close(st, qty, price)
         real = self._realized_today(st)
         if not qty:
             # 理论空仓：持仓盈亏是 0；**当日盈亏仍要留着当天已平仓那一半**
@@ -3731,6 +3754,45 @@ class PortfolioRunner:
         if not theo_day:
             note = "理论建仓日未知，当日盈亏按建仓价算"
         return price, day, pos, note
+
+    def _note_theo_close(self, st: SlotState, qty: int, price: float) -> None:
+        """按「理论仓减少」记一笔已落袋盈亏 —— 回测口径，不碰账本。
+
+        触发点是**理论仓变化**，不是成交回报：界面上这几列本来就是策略理论值，
+        柜台成没成、成交价多少都不该改它。用户 2026-11-26 明确「从回测中更容易
+        获得，不从账本获得」，把原来 `_book_cost()` 里那套搬到这里。
+
+        - 同方向减仓：`(现价 − 那一仓建仓价) × 减掉的手数 × 乘数 × 方向`
+        - 反手 / 归零：先把旧仓全平掉，新仓另起一个基准价
+        - 加仓：只换基准（按加仓价加权），不算已落袋
+
+        `theo_book_*` 不落盘，所以重启后「重启前已记的那笔」靠落盘的 `real_day`
+        保住，重启后新平的那笔从当前理论仓重新起基准，不会重复记。
+        """
+        qty = int(qty or 0)
+        prev = int(getattr(st, "theo_book_qty", 0) or 0)
+        if prev == qty:
+            return
+        mult = self._volume_multiple(st)
+        entry = float(getattr(st, "theo_book_px", 0) or 0)
+        px = float(price or 0)
+        if prev and entry > 0 and mult > 0 and px == px and px > 0:
+            if qty and (prev > 0) == (qty > 0):
+                closed = abs(prev) - abs(qty)   # 同方向减仓
+            else:
+                closed = abs(prev)              # 反手 / 全平
+            if closed > 0:
+                pnl = (px - entry) * closed * mult * (1 if prev > 0 else -1)
+                st.real_day = self._realized_today(st) + pnl
+
+        if qty:
+            if not prev or (prev > 0) != (qty > 0):
+                st.theo_book_px = float(getattr(st, "theo_px", 0) or px)
+            st.theo_book_qty = qty
+        else:
+            st.theo_book_qty = 0
+            st.theo_book_px = 0.0
+        self._save_book(st)
 
     def _realized_today(self, st: SlotState) -> float:
         """本交易日已落袋的平仓盈亏。跨交易日自动清零（夜盘 20 点后算次日）。"""
@@ -4687,19 +4749,20 @@ class PortfolioRunner:
 
     def _book_cost(self, st: SlotState, o: PendingOrder, prev: int,
                    delta: int) -> None:
-        """按成交更新「持仓均价」，顺手把平掉那部分的盈亏记进当日已实现。
+        """按成交更新「持仓均价」——只供台账显示用，不参与任何盈亏列。
 
         三种情况：
 
         - 新开 / 反手（`prev` 为 0，或成交后方向翻过来）：均价 = 这笔成交价。
-          反手时**先结算旧仓**（已实现盈亏），再把新方向的成本设成成交价 ——
-          拿旧仓的均价给新仓当成本，持仓盈亏会直接从几十个点的错数开始。
+          反手时把新方向的成本设成成交价 —— 拿旧仓的均价给新仓当成本，台账
+          会从几十个点的错数开始。
         - 同向加仓：按手数加权平均。
         - 减仓：均价不变（卖剩下的还是原来那批）。
 
-        减仓（以及反手时平掉的那部分）按 `(成交价 − 均价) × 手数 × 乘数 × 方向`
-        计入 `real_day`。这一项是「当日盈亏」里已经落袋的那一半，`_slot_pnl`
-        会把持仓那一半再加上去。
+        🔴 这里**不再记 `real_day`**（2026-11-26 用户定调「从回测获得，不从
+        账本获得」）。账本均价在对齐补仓 / 老版本升级时会缺，缺了就拿成交价
+        当成本，平仓盈亏恒 0 —— 当天平过仓的策略三格全是 +0 就是这么来的。
+        已落袋改由 `_note_theo_close()` 按理论仓变化记，和回测同一口径。
         """
         sym = o.symbol
         price = float(o.price or 0)
@@ -4707,14 +4770,6 @@ class PortfolioRunner:
             return
         old = float(st.cost.get(sym) or 0)
         new = prev + delta
-        if prev and (prev > 0) != (delta > 0):
-            # 平掉 min(|prev|, |delta|) 手
-            qty = min(abs(prev), abs(delta))
-            cost = old if old > 0 else price
-            mult = self._volume_multiple(st)
-            if mult > 0:
-                pnl = (price - cost) * qty * mult * (1 if prev > 0 else -1)
-                st.real_day = self._realized_today(st) + pnl
         if not new:
             st.cost.pop(sym, None)
         elif not prev or (prev > 0) != (new > 0):

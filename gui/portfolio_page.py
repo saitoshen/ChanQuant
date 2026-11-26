@@ -138,6 +138,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
@@ -2431,6 +2432,8 @@ class PortfolioPage(QWidget):
         self.ws_bar.create.connect(self._ws_create)
         self.ws_bar.rename.connect(self._ws_rename)
         self.ws_bar.remove.connect(self._ws_remove)
+        self.ws_bar.export_workspace.connect(self._ws_export)
+        self.ws_bar.import_workspace.connect(self._ws_import)
         self.ws_bar.measure.connect(self._measure_usages)
         self.ws_bar.preview.connect(self._alloc_preview)
         self.ws_bar.total_changed.connect(self._ws_total)
@@ -2789,6 +2792,57 @@ class PortfolioPage(QWidget):
         self._save_ws()
         self.reload()
         self._on_log(f"已删除工作区「{dead.name}」")
+
+    def _ws_export(self) -> None:
+        """把全部工作区连同依赖存成 .cqw。
+
+        只导当前分页没用：运行是跨工作区按账户合并的，导出去少了别的分页，
+        在另一台机器上就不是原来那个组合了。
+        """
+        from ttrade import portable as PORT
+        from ttrade.paths import user_dir
+
+        if not self._wss:
+            self._on_failed("没有工作区可导出")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出工作区", os.path.join(user_dir(), "组合工作区.cqw"),
+            "工作区包 (*.cqw)")
+        if not path:
+            return
+        if not path.lower().endswith(".cqw"):
+            path += ".cqw"
+        try:
+            n, missing = PORT.export_workspaces(self._wss, path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        msg = f"已导出 {n} 个工作区（连同策略配置与自定义因子）到 {path}"
+        if missing:
+            msg += (f"\n\n注意：有 {len(missing)} 条成员的 sid 在策略池里找不到配置，"
+                    "导出的包里也补不上，导入后需要重新绑定。")
+        QMessageBox.information(self, "导出工作区", msg)
+        self._on_log(msg)
+
+    def _ws_import(self) -> None:
+        """导入 .cqw：依赖先落地，再合工作区；sid 原样保留。"""
+        from ttrade import portable as PORT
+        from ttrade.paths import user_dir
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入工作区", user_dir(), "工作区包 (*.cqw)")
+        if not path:
+            return
+        try:
+            rep = PORT.import_workspaces(path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        self.reload()
+        msg = ("导入工作区：" + rep.summary()
+               + "\n\n已经启动的策略仍在跑旧配置，要让导入的参数生效请停止后重新启动。")
+        QMessageBox.information(self, "导入工作区", msg)
+        self._on_log(msg)
 
     def _ws_total(self, v: float) -> None:
         if self._ws is None:

@@ -128,6 +128,8 @@ class WorkspaceBar(QWidget):
     create = Signal()
     rename = Signal()
     remove = Signal()
+    export_workspace = Signal()       # 导出全部工作区（.cqw）
+    import_workspace = Signal()       # 从 .cqw 导入
     measure = Signal()              # 「量一下占用」
     preview = Signal()              # 「分配预览」
     total_changed = Signal(float)
@@ -285,6 +287,22 @@ class WorkspaceBar(QWidget):
         self.btn_preview.setToolTip("按当前分配方式算出每条策略该拿多少钱，看一眼再决定要不要应用")
         self.btn_preview.clicked.connect(self.preview.emit)
         lay2.addWidget(self.btn_preview)
+
+        # .cqw 放在第二行末尾而不是页签旁：第一行再加按钮会把页签挤出滚动箭头
+        # （2026-11 已踩过一次）。这两个按钮压到最小宽度，让「分配预览」优先。
+        btn_imp = QPushButton("导入")
+        btn_imp.setObjectName("Ghost")
+        btn_imp.setToolTip("从 .cqw 导入工作区，连同它引用的策略 / 自定义因子一起带进来")
+        btn_imp.setMinimumWidth(46)
+        btn_imp.clicked.connect(self.import_workspace.emit)
+        lay2.addWidget(btn_imp)
+
+        btn_exp = QPushButton("导出")
+        btn_exp.setObjectName("Ghost")
+        btn_exp.setToolTip("把全部工作区存成 .cqw（含策略配置与自定义因子依赖）")
+        btn_exp.setMinimumWidth(46)
+        btn_exp.clicked.connect(self.export_workspace.emit)
+        lay2.addWidget(btn_exp)
 
         lay2.addStretch(1)
 

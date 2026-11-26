@@ -3953,6 +3953,293 @@ def _run() -> tuple[bool, list[str]]:
 
     check("组合工作区解析（本金/sid/多账户）", _workspace_resolve)
 
+    def _portable_bundles():
+        """.cqs / .cqf / .cqw 三种可携带包的导出 → 清空 → 导入往返。
+
+        三个坑必须一起验：
+          ① 工作区包里的策略配置要**保留 sid**，用 `add_to_portfolio()` 会
+             clone 出新号，工作区成员全部指空（界面上就是「策略已不在池里」）
+          ② 工作区包要带上依赖（自定义因子 / 规则策略），否则换机器打开就是
+             一堆算不出来的配置
+          ③ 内置 key 不许覆盖 —— 包是从别处来的，同名不代表是同一个东西
+        """
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        from ttrade import factors as F
+        from ttrade import portable as P
+        from ttrade import strategies as S
+        from ttrade import strategy_store as SStore
+        from ttrade import userfactors as UF
+        from ttrade import userstrategies as US
+        from ttrade import workspace_store as WS
+
+        td = tempfile.mkdtemp(prefix="cq_portable_")
+        old_uf, old_us = UF.path, US.path
+        old_f, old_s = dict(F.FACTORS), dict(S.STRATEGIES)
+        old_cats = list(F.CATEGORIES)
+        fcode = ('def f_cq_probe(df):\n'
+                 '    return df["close"] / df["close"].shift(1)\n')
+        scode = ('def sig_cq_probe(df, n=5):\n'
+                 '    m = df["close"].rolling(int(n)).mean()\n'
+                 '    out = pd.Series(0, index=df.index)\n'
+                 '    out[df["close"] > m] = 1\n'
+                 '    return pd.DataFrame({"signal": out})\n')
+        try:
+            UF.path = lambda: os.path.join(td, "user_factors.json")
+            US.path = lambda: os.path.join(td, "user_strategies.json")
+
+            ok, msg = UF.register(UF.UserFactor(
+                key="cq_probe_f", label="携带测试因子", func="f_cq_probe",
+                code=fcode, category="自定义"))
+            if not ok:
+                raise RuntimeError(f"测试因子没注册上：{msg}")
+            ok, msg = US.register(US.UserStrategy(
+                key="cq_probe_s", label="携带测试策略", func="sig_cq_probe",
+                code=scode, params={"n": 5}))
+            if not ok:
+                raise RuntimeError(f"测试策略没注册上：{msg}")
+
+            lib_cfg = SStore.StrategyConfig(
+                sid="cqprobelib01", name="携带测试库配置", symbol="RB",
+                exchange="SHFE", period="1d", rule_key="cq_probe_s",
+                factor_keys=["cq_probe_f"], principal=100_000.0)
+            # 自检存储目录 seed 了一份真实策略库（近 800 条），这条用例只关心
+            # 「自己导出的那一条能不能回来」，先把快照清到只剩测试项。
+            SStore.save_library([lib_cfg])
+            pool_cfg = SStore.StrategyConfig(
+                sid="cqprobeinst01", name="携带测试实例", symbol="RB",
+                exchange="SHFE", period="1d", rule_key="cq_probe_s",
+                factor_keys=["cq_probe_f"], principal=50_000.0, account="sim")
+            SStore.save_portfolio(SStore.load_portfolio() + [pool_cfg])
+            w = WS.new_workspace("携带测试工作区", total=100_000.0)
+            w.add("cqprobeinst01", 50_000.0)
+            WS.save_workspaces([w], w.id)
+
+            # ---- .cqs：全量 + 子集 ----
+            p_s = os.path.join(td, "bundle.cqs")
+            n = P.export_strategies(P.strategy_items(), p_s)
+            if n != 2:
+                raise RuntimeError(f".cqs 应当有 2 条（规则 + 库配置），实际 {n}")
+            with open(p_s, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if raw.get("format") != P.FMT_STRATEGY or len(raw.get("rules") or []) != 1:
+                raise RuntimeError(".cqs 包结构不对")
+            p_one = os.path.join(td, "one.cqs")
+            P.export_strategies([x for x in P.strategy_items() if x[0] == "rule"], p_one)
+            with open(p_one, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if raw.get("library"):
+                raise RuntimeError("只勾了规则策略，包里却混进了策略库配置")
+
+            US.remove("cq_probe_s")
+            UF.remove("cq_probe_f")     # 连依赖一起删，验证 .cqs 能把它带回来
+            SStore.remove_from_library("cqprobelib01")
+            rep = P.import_strategies(p_s)
+            if rep.ok != 3 or rep.errors:
+                raise RuntimeError(
+                    f".cqs 往返失败（应有 1 因子 + 1 规则 + 1 配置）：{rep.summary()}")
+            if "cq_probe_f" not in F.FACTORS:
+                raise RuntimeError(".cqs 没把配置引用的自定义因子一起带回来")
+            if "cq_probe_s" not in S.STRATEGIES:
+                raise RuntimeError("导入后规则策略没进 STRATEGIES")
+            if not any(c.sid == "cqprobelib01" for c in SStore.load_library()):
+                raise RuntimeError("导入后策略库配置丢了")
+
+            # ---- .cqf ----
+            p_f = os.path.join(td, "bundle.cqf")
+            P.export_factors([f for f in P.factor_items()
+                              if f.key == "cq_probe_f"], p_f)
+            UF.remove("cq_probe_f")
+            rep = P.import_factors(p_f)
+            if rep.ok != 1 or rep.errors or "cq_probe_f" not in F.FACTORS:
+                raise RuntimeError(f".cqf 往返失败：{rep.summary()}")
+
+            # ---- .cqw：闭包 + sid 保留 ----
+            p_w = os.path.join(td, "bundle.cqw")
+            n_w, missing = P.export_workspaces([w], p_w)
+            if n_w != 1 or missing:
+                raise RuntimeError(f".cqw 导出不对：{n_w} 个，missing={missing}")
+            with open(p_w, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if not raw.get("rules") or not raw.get("factors") or not raw.get("portfolio"):
+                raise RuntimeError(".cqw 没把依赖一起打包")
+            if raw["portfolio"][0]["sid"] != "cqprobeinst01":
+                raise RuntimeError("导出就把策略池的 sid 改了")
+
+            US.remove("cq_probe_s")
+            UF.remove("cq_probe_f")
+            SStore.save_portfolio([])
+            SStore._save(WS.FILE, {"items": [], "active": ""})  # noqa: SLF001
+            rep = P.import_workspaces(p_w)
+            if rep.errors:
+                raise RuntimeError(f".cqw 导入出错：{rep.summary()}")
+            if "cq_probe_s" not in S.STRATEGIES or "cq_probe_f" not in F.FACTORS:
+                raise RuntimeError(".cqw 导入后依赖没落地")
+            pool = SStore.load_portfolio()
+            if [c.sid for c in pool] != ["cqprobeinst01"]:
+                raise RuntimeError(f"导入没保留 sid，工作区会指空：{[c.sid for c in pool]}")
+            got = [x for x in WS.load_workspaces(pool) if x.id == w.id]
+            if len(got) != 1 or got[0].name != w.name:
+                raise RuntimeError(f"工作区没导回来：{[x.name for x in WS.load_workspaces(pool)]}")
+            if abs(got[0].principal_of("cqprobeinst01") - 50_000.0) > 1e-9:
+                raise RuntimeError("工作区里这条策略的本金没带过去")
+
+            # ---- 内置 key 不许被覆盖 ----
+            builtin_f = next(k for k in old_f if k != "cq_probe_f")
+            p_bad = os.path.join(td, "bad.cqf")
+            with open(p_bad, "w", encoding="utf-8") as fh:
+                json.dump({"format": P.FMT_FACTOR, "version": 1,
+                           "factors": [{"key": builtin_f, "label": "冒名",
+                                        "func": "f_cq_probe", "code": fcode}]}, fh)
+            rep = P.import_factors(p_bad)
+            if not rep.skipped or rep.ok:
+                raise RuntimeError(f"内置因子被包里的同代号条目覆盖了：{rep.summary()}")
+
+            # 不是本平台的包要直接报错，不能当成空包静默成功
+            p_other = os.path.join(td, "other.json")
+            with open(p_other, "w", encoding="utf-8") as fh:
+                json.dump({"format": "something-else", "version": 1}, fh)
+            try:
+                P.import_factors(p_other)
+            except P.BadPackage:
+                pass
+            else:
+                raise RuntimeError("别的文件格式被当成因子包静默接收了")
+
+            # 界面入口：三个功能都得有按钮回调，避免只写数据层没接线
+            from gui import agent_page as AP
+            from gui.workspace_bar import WorkspaceBar
+
+            for name in ("_export_strategies", "_import_strategies",
+                         "_export_factors", "_import_factors"):
+                if not callable(getattr(AP.AgentPage, name, None)):
+                    raise RuntimeError(f"Agent 页少了入口：{name}")
+            for name in ("export_workspace", "import_workspace"):
+                if not hasattr(WorkspaceBar, name):
+                    raise RuntimeError(f"工作区工具条少了信号：{name}")
+        finally:
+            UF.path, US.path = old_uf, old_us
+            F.FACTORS.clear()
+            F.FACTORS.update(old_f)
+            S.STRATEGIES.clear()
+            S.STRATEGIES.update(old_s)
+            F.CATEGORIES[:] = old_cats
+            shutil.rmtree(td, ignore_errors=True)
+
+    check("可携带文件 .cqs / .cqf / .cqw 往返", _portable_bundles)
+
+    def _theory_realized_persist():
+        """当日已落袋走**理论口径**并落盘，不再依赖账本成本。
+
+        用户 11-26 反馈：碳酸锂两条 + 原油一条，当天都平过仓，三格仍全是 +0。
+        两个确定性根因一起钉：
+          ① 原来 `real_day` 由账本 `_book_cost()` 记，账本均价缺（对齐补仓、
+             老版本升级）时 `cost = 成交价` ⇒ 平仓盈亏恒 0；
+          ② 原来 `real_day` 不落盘，进程一重启当天的落袋就清零。
+        现在改成理论仓减少时按 `theo_px` 记，并写进 positionbook 的 `_realized`。
+        """
+        from ttrade import daylimit
+        from ttrade import strategy_runner as R
+        from ttrade import strategy_store as SStore
+        from ttrade.tqlive import AccountSpec
+
+        old_pb = R.positionbook
+
+        class _PB:
+            """内存账本：自检绝不能读写用户真实的 live_positions.json。"""
+
+            data = {}
+
+            def exists(self):
+                return True
+
+            def load(self, account):
+                return {}
+
+            def load_costs(self, account):
+                return {}
+
+            def load_realized(self, account):
+                return dict(self.data.get(account) or {})
+
+            def save(self, account, sid, held, cost=None, realized=None):
+                if realized is None:
+                    return
+                row = self.data.setdefault(account, {})
+                if realized:
+                    row[sid] = dict(realized)
+                else:
+                    row.pop(sid, None)
+
+            def forget(self, account, sid):
+                self.data.get(account, {}).pop(sid, None)
+
+        try:
+            R.positionbook = _PB()
+            R.positionbook.data.clear()
+            spec = AccountSpec(name="__selftest_theory_real__", kind="sim")
+            cfg = SStore.StrategyConfig(
+                sid="__theory_a", name="自检理论已落袋", symbol="RB",
+                exchange="SHFE", period="5m", family="rule",
+                rule_key="ma_cross", account=spec.name)
+
+            class _Q:
+                last_price = 1200.0
+                pre_close = 1000.0
+
+            def make():
+                run = R.PortfolioRunner(spec)
+                run._contract_quote = lambda sym: _Q()      # noqa: ARG005
+                run._last_px = lambda sym: 1200.0           # noqa: ARG005
+                run.add(cfg)
+                return run, run._slots["__theory_a"]
+
+            run, st = make()
+            mult = run._volume_multiple(st)
+            if mult <= 0:
+                raise RuntimeError("RB 乘数读不到")
+
+            # 今天开 2 手多 @1100，再一把全平 @1200 —— 账本均价故意是空的
+            st.cost.clear()
+            st.held.clear()
+            st.target = 2
+            st.theo_px, st.theo_sig = 1100.0, 1
+            st.theo_day = daylimit.trading_day()
+            run._slot_pnl(st)               # 只起基准，不该记已落袋
+            if abs(st.real_day) > 1e-9:
+                raise RuntimeError(f"开仓就记了已落袋：{st.real_day}")
+
+            st.target = 0
+            run._slot_pnl(st)               # 全平 ⇒ 按理论价记一笔
+            want = (1200.0 - 1100.0) * 2 * mult
+            if abs(st.real_day - want) > 1e-6:
+                raise RuntimeError(
+                    f"理论平仓盈亏没记上（账本均价是空的）：{st.real_day} ≠ {want}")
+            if st.cost:
+                raise RuntimeError("读账本均价了 —— 已落袋必须是理论口径")
+
+            # 落盘 + 重启：平完仓 held 是空的，重启后这一格不能变回 0
+            rv = R.positionbook.load_realized(run._book_key).get("__theory_a") or {}
+            if abs(float(rv.get("pnl") or 0) - want) > 1e-6:
+                raise RuntimeError(f"已落袋没落盘：{rv}")
+            run2, st2 = make()
+            if abs(st2.real_day - want) > 1e-6:
+                raise RuntimeError(f"重启后当日已落袋丢了：{st2.real_day} ≠ {want}")
+            if st2.real_day_of != daylimit.trading_day():
+                raise RuntimeError(f"恢复的交易日不对：{st2.real_day_of}")
+
+            # 跨交易日自动清零，不能把昨天的落袋算进今天
+            st2.real_day_of = "2000-01-01"
+            if abs(run2._realized_today(st2)) > 1e-9:
+                raise RuntimeError("跨交易日没清零")
+        finally:
+            R.positionbook = old_pb
+
+    check("当日已落袋：理论口径 + 落盘恢复", _theory_realized_persist)
+
     def _macro_pit():
         """宏观因子的「只用 T-1 及更早」这条（5m / 1h 不前视）。
 
@@ -14358,9 +14645,11 @@ def _run() -> tuple[bool, list[str]]:
         feed("SELL", "CLOSE", 2, 1200.0)
         if abs(st.cost["SHFE.rb2701"] - 1060.0) > 1e-6:
             raise RuntimeError("减仓不该改均价（卖剩下的还是原来那批）")
-        real = (1200.0 - 1060.0) * 2 * mult
-        if abs(st.real_day - real) > 1e-6:
-            raise RuntimeError(f"当日已实现盈亏算错：{st.real_day} ≠ {real}")
+        # 🔴 2026-11-26 用户定调：已落袋从回测口径（理论仓变化）拿，**不从账本拿**。
+        # 账本均价在对齐补仓时会缺，缺了就拿成交价当成本 ⇒ 平仓盈亏恒 0
+        if abs(st.real_day) > 1e-9:
+            raise RuntimeError(f"账本成交不该再写 real_day：{st.real_day}")
+        real = 0.0      # 还没平过理论仓
 
         # ---- 理论口径：只认 target / theo_px / 最新价 ----
         from ttrade import daylimit as _dl
@@ -14407,8 +14696,11 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"隔夜仓的当日盈亏要按昨结算 + 已落袋：{day3} ≠ {day3_want}")
         # 理论空仓：持仓盈亏写 0，**当日盈亏仍保留当天已平仓那一半**
         # （用户 11-26：原油策略当天平掉全部仓位，这道格不能变回 0）
+        # 平仓盈亏按**理论建仓价 1180**算，不是账本均价 1060 —— 这正是用户
+        # 说的「从回测获得，不从账本获得」
         st.target = 0
         _px4, day4, pos4, _n4 = run._slot_pnl(st)
+        real = pos_want          # = (1200 − 1180) × 3 × 乘数
         if pos4 != 0.0 or abs(day4 - real) > 1e-6:
             raise RuntimeError(f"空仓时持仓写 0、当日盈亏留平仓：day {day4} pos {pos4}")
         # 反手：均价必须重设成新方向的价（这是下单用的账本，仍在维护）

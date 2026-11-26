@@ -54,6 +54,7 @@ from PySide6.QtGui import (
     QTextCursor,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -88,6 +89,7 @@ from ttrade import agent_memory as Mem
 from ttrade import attachments as ATT
 from ttrade import factors as F
 from ttrade import library_docs as L
+from ttrade import portable as PORT
 from ttrade import session_files as SF
 from ttrade import skills as S
 from ttrade import strategy_store as SStore
@@ -978,6 +980,57 @@ class SessAtt:
         return f"{len(self.item.text)} 字符"
 
 
+# ------------------------------------------------------------------ 导出选择框
+
+
+class _PickExportDialog(QDialog):
+    """导出前的勾选框。默认全选，另给「全选 / 清空」两个显式按钮。
+
+    不让用户在主列表上直接多选就导出，是因为那个列表混着内置条目和分组标题，
+    多选时很容易把「规则策略」这组标题一起选进去 —— 导出包里就会出现一条空条目。
+    """
+
+    def __init__(self, title: str, entries: list[tuple[str, object]], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(560, 460)
+        lay = QVBoxLayout(self)
+
+        tip = QLabel("勾选要导出的条目，Ctrl / Shift 可多选。默认全选。")
+        tip.setStyleSheet(f"font-size:{FS_SMALL}px; color:{C_MUTED};")
+        lay.addWidget(tip)
+
+        self.lst = QListWidget()
+        self.lst.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        for label, obj in entries:
+            it = QListWidgetItem(label)
+            it.setData(Qt.UserRole, obj)
+            it.setToolTip(label)
+            self.lst.addItem(it)
+        self.lst.selectAll()
+        lay.addWidget(self.lst, 1)
+
+        row = QHBoxLayout()
+        btn_all = QPushButton("全选")
+        btn_all.setObjectName("Ghost")
+        btn_all.clicked.connect(self.lst.selectAll)
+        row.addWidget(btn_all)
+        btn_none = QPushButton("清空")
+        btn_none.setObjectName("Ghost")
+        btn_none.clicked.connect(self.lst.clearSelection)
+        row.addWidget(btn_none)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        lay.addWidget(box)
+
+    def chosen(self) -> list:
+        return [it.data(Qt.UserRole) for it in self.lst.selectedItems()]
+
+
 # ------------------------------------------------------------------ 页面
 
 
@@ -1157,6 +1210,20 @@ class AgentPage(QWidget):
         self.btn_del_factor.setToolTip("只能删自定义因子；内置因子改代码才会消失。")
         self.btn_del_factor.clicked.connect(self._delete_factor)
         lay.addWidget(self.btn_del_factor)
+
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        btn_exp = QPushButton("导出自定义因子")
+        btn_exp.setObjectName("Ghost")
+        btn_exp.setToolTip("勾选后存成 .cqf，可以整库带走，也可以只带几个")
+        btn_exp.clicked.connect(self._export_factors)
+        row.addWidget(btn_exp)
+        btn_imp = QPushButton("导入因子")
+        btn_imp.setObjectName("Ghost")
+        btn_imp.setToolTip("从 .cqf 导入；同代号覆盖，内置因子不会被覆盖")
+        btn_imp.clicked.connect(self._import_factors)
+        row.addWidget(btn_imp)
+        lay.addLayout(row)
         return w
 
     def _build_strategy_tab(self) -> QWidget:
@@ -1192,6 +1259,20 @@ class AgentPage(QWidget):
         self.btn_del_strat.setToolTip("删自定义策略或策略库模板；内置策略改代码才会消失。")
         self.btn_del_strat.clicked.connect(self._delete_strategy)
         lay.addWidget(self.btn_del_strat)
+
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        btn_exp = QPushButton("导出自定义策略")
+        btn_exp.setObjectName("Ghost")
+        btn_exp.setToolTip("弹框勾选自定义规则策略 / 我的策略库，存成 .cqs")
+        btn_exp.clicked.connect(self._export_strategies)
+        row.addWidget(btn_exp)
+        btn_imp = QPushButton("导入策略")
+        btn_imp.setObjectName("Ghost")
+        btn_imp.setToolTip("从 .cqs 导入；同代号 / 同 sid 覆盖，内置策略不会被覆盖")
+        btn_imp.clicked.connect(self._import_strategies)
+        row.addWidget(btn_imp)
+        lay.addLayout(row)
         return w
 
     def _build_report_tab(self) -> QWidget:
@@ -2705,6 +2786,108 @@ class AgentPage(QWidget):
         self._set_state(f"已注册策略 {s.key}", C_OK)
         self.reload()
         self.strategy_added.emit(s.key)
+
+    # ---------------------------------------------------------- 导入 / 导出
+
+    def _export_factors(self) -> None:
+        items = PORT.factor_items()
+        if not items:
+            QMessageBox.information(self, "导出因子", "本地还没有自定义因子。")
+            return
+        entries = [(f"{i.label}（{i.key}）", i) for i in items]
+        dlg = _PickExportDialog("导出自定义因子", entries, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        chosen = dlg.chosen()
+        if not chosen:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出自定义因子",
+            os.path.join(user_dir(), "自定义因子.cqf"), "因子包 (*.cqf)")
+        if not path:
+            return
+        if not path.lower().endswith(".cqf"):
+            path += ".cqf"
+        try:
+            n = PORT.export_factors(chosen, path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        self._append(
+            f"<p style='color:{C_OK}'>已导出 {n} 个自定义因子到 "
+            f"<code>{_esc(path)}</code>。</p>")
+        self._set_state(f"已导出 {n} 个因子", C_OK)
+
+    def _import_factors(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入自定义因子", user_dir(), "因子包 (*.cqf)")
+        if not path:
+            return
+        before = {f.key for f in PORT.factor_items()}
+        try:
+            rep = PORT.import_factors(path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        added = sorted({f.key for f in PORT.factor_items()} - before)
+        self.reload()
+        for k in added:
+            self.factor_added.emit(k)
+        QMessageBox.information(self, "导入因子", rep.summary())
+        self._append(
+            f"<p style='color:{C_OK}'>从 <code>{_esc(path)}</code> 导入因子："
+            f"{_esc(rep.summary())}</p>")
+        self._set_state("已导入因子", C_OK)
+
+    def _export_strategies(self) -> None:
+        pairs = PORT.strategy_items()
+        if not pairs:
+            QMessageBox.information(self, "导出策略", "本地还没有自定义策略。")
+            return
+        entries = [(PORT.item_label(k, i), (k, i)) for k, i in pairs]
+        dlg = _PickExportDialog("导出自定义策略", entries, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        chosen = dlg.chosen()
+        if not chosen:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出自定义策略",
+            os.path.join(user_dir(), "自定义策略.cqs"), "策略包 (*.cqs)")
+        if not path:
+            return
+        if not path.lower().endswith(".cqs"):
+            path += ".cqs"
+        try:
+            n = PORT.export_strategies(chosen, path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        self._append(
+            f"<p style='color:{C_OK}'>已导出 {n} 条自定义策略到 "
+            f"<code>{_esc(path)}</code>。</p>")
+        self._set_state(f"已导出 {n} 条策略", C_OK)
+
+    def _import_strategies(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入自定义策略", user_dir(), "策略包 (*.cqs)")
+        if not path:
+            return
+        before = {getattr(i, "key", "") for k, i in PORT.strategy_items() if k == "rule"}
+        try:
+            rep = PORT.import_strategies(path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        added = sorted({getattr(i, "key", "") for k, i in PORT.strategy_items() if k == "rule"} - before)
+        self.reload()
+        for key in added:
+            self.strategy_added.emit(key)
+        QMessageBox.information(self, "导入策略", rep.summary())
+        self._append(
+            f"<p style='color:{C_OK}'>从 <code>{_esc(path)}</code> 导入策略："
+            f"{_esc(rep.summary())}</p>")
+        self._set_state("已导入策略", C_OK)
 
     # ---------------------------------------------------------- 删除自定义
 

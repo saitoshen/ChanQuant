@@ -97,12 +97,17 @@ _COSTS = "_costs"
 
 
 def save(account: str, sid: str, held: dict[str, int],
-         cost: dict[str, float] | None = None) -> None:
+         cost: dict[str, float] | None = None,
+         realized: dict | None = None) -> None:
     """整条策略的账本覆盖写。仓位归 0 的合约不写。
 
     `cost` 传了就连同**持仓均价**一起写；传 `None` 表示「这次不动均价」。
     均价必须和仓位一起落盘：重启后账本还在、均价没了的话，持仓盈亏会从 0
     重新算起，界面上刚启动那一刻永远是「0 盈亏」，看着像策略刚开仓。
+
+    `realized` 是**本交易日已落袋的平仓盈亏**（`{"day":…, "pnl":…}`）。
+    传 `None` 表示这次不动它；传空 dict 表示清掉。它必须落盘：策略当天平完仓
+    之后 `held` 是空的，内存里的 `real_day` 一重启就没了，界面又变回 +0。
     """
     clean = {str(s): int(n) for s, n in (held or {}).items() if int(n or 0)}
     with _LOCK:
@@ -120,6 +125,8 @@ def save(account: str, sid: str, held: dict[str, int],
             data.pop(account, None)
         if cost is not None:
             _put_costs(data, account, sid, cost, bool(clean))
+        if realized is not None:
+            _put_realized(data, account, sid, realized)
         _write(data)
 
 
@@ -153,6 +160,65 @@ def _put_costs(data: dict, account: str, sid: str, cost: dict,
         data.pop(_COSTS, None)
 
 
+#: 当日已落袋平仓盈亏的存放位置，形如
+#: `{"_realized": {账户: {策略 id: {"day": "2026-11-26", "pnl": 1234.5}}}}`。
+#: 和仓位分开放：仓位归零时会整条删掉，而**当天平掉的那一笔盈亏必须留住**，
+#: 否则策略列表「当日盈亏」在程序重启后从 1234.5 变回 0（2026-11-26 用户反馈：
+#: 碳酸锂两条 + 原油一条，当天都平过仓，三格全是 +0）。
+_REALIZED = "_realized"
+
+
+def _put_realized(data: dict, account: str, sid: str, realized: dict) -> None:
+    box = data.get(_REALIZED)
+    if not isinstance(box, dict):
+        box = {}
+    row = box.get(account)
+    if not isinstance(row, dict):
+        row = {}
+    raw = realized or {}
+    day = str(raw.get("day") or "")
+    try:
+        pnl = float(raw.get("pnl") or 0.0)
+    except (TypeError, ValueError):
+        pnl = 0.0
+    if day and pnl == pnl and abs(pnl) < 1e15:
+        row[sid] = {"day": day, "pnl": pnl}
+    else:
+        row.pop(sid, None)
+    if row:
+        box[account] = row
+    else:
+        box.pop(account, None)
+    if box:
+        data[_REALIZED] = box
+    else:
+        data.pop(_REALIZED, None)
+
+
+def load_realized(account: str) -> dict[str, dict]:
+    """{策略 id: {"day": 交易日, "pnl": 当日已落袋}}。没有记录就返回空。
+
+    只读同一交易日的记录是调用方的责任（`_realized_today()` 会按
+    `daylimit.trading_day()` 清零）—— 这里不猜「今天是几号」，账本层保持纯存储。
+    """
+    with _LOCK:
+        box = _read().get(_REALIZED)
+    row = box.get(account) if isinstance(box, dict) else None
+    if not isinstance(row, dict):
+        return {}
+    out = {}
+    for sid, one in row.items():
+        if not isinstance(one, dict):
+            continue
+        try:
+            pnl = float(one.get("pnl") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if pnl == pnl:
+            out[str(sid)] = {"day": str(one.get("day") or ""), "pnl": pnl}
+    return out
+
+
 def load_costs(account: str) -> dict[str, dict[str, float]]:
     """{策略 id: {合约: 持仓均价}}。没有记录就返回空 —— 均价只是显示用的参考，
     读不出来不该阻断启动。"""
@@ -182,6 +248,7 @@ def forget(account: str, sid: str) -> None:
     """删掉一条策略的账本。策略被删除时调 —— 留着只会在同 id 新建时误导。
 
     均价一起清：不清的话，同 id 新建一条会把上一轮的成本当成自己的开仓价，
-    持仓盈亏从一开始就是错的数。
+    持仓盈亏从一开始就是错的数。当日已落袋也一起清 —— 同 id 新建的策略不该
+    继承上一条策略那天赚的钱。
     """
-    save(account, sid, {}, cost={})
+    save(account, sid, {}, cost={}, realized={})
