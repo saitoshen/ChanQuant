@@ -413,6 +413,30 @@ class CtpHub:
     #: 登录失败后的冷却秒数（见 `start()`）。20 秒足够避开「连点启动全部」，
     #: 又不至于让用户觉得「刷新按钮坏了」。
     FAIL_COOLDOWN = 20.0
+    #: 🔴 进程级「建连闸门」：所有 CTP / 融航会话共享（类属性，RohonHub 继承）。
+    #: 2026-11-27「登录全部」4 账户并发时，2 CTP + 1 融航几乎同时 Init() 连前置，
+    #: CTP 前置瞬时并发受限 ⇒ 全报「前置=✗ 登录=✗ 结算=✗」。每个实例自己的
+    #: `_start_lock` 只锁自己，管不住跨账户并发；这里用全局闸门把「Init → 登录 →
+    #: 结算确认」串行，连上一户再放下一户，天勤（LiveHub/tqsdk）不走这段，仍并行。
+    _CONNECT_GATE = threading.Lock()
+    #: 等「登录 + 结算确认」的最长秒数。历史：15 → 45 →（2026-11-27 用户定）
+    #: 20 秒。原来 15 秒在结算窗口「[26] 结果未就绪」反复重发时不够；后来
+    #: 放宽到 45，但多账户并发建连的**真根因**是同时 Init 撞前置（已由
+    #: `_CONNECT_GATE` 串行解决），等待再长也没用、只是瞎等 —— 用户明确要求
+    #: 回到 20 秒。单户串行建连 20 秒足够，环境变量
+    #: `CHANQUANT_CTP_LOGIN_WAIT` 可按机器网络再调，钳在 5~180 秒。
+    LOGIN_WAIT_SEC = 20.0
+
+    @classmethod
+    def login_wait_sec(cls) -> float:
+        """实际等待秒数：环境变量优先，坏值退回默认。"""
+        try:
+            v = float(os.environ.get("CHANQUANT_CTP_LOGIN_WAIT", "") or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if 5.0 <= v <= 180.0:
+            return v
+        return float(cls.LOGIN_WAIT_SEC)
 
     def __init__(self, specs) -> None:
         if specs is None:
@@ -491,6 +515,30 @@ class CtpHub:
     def make_md(self, cfg):
         return MdClient(cfg)
 
+    @staticmethod
+    def _login_stage(trader) -> str:
+        """超时报错里附一段「卡在哪一步」的诊断（2026-11-27）。
+
+        CTP 登录是四步串行：前置连接 → 认证 → 登录 → 结算确认。任何一步
+        卡住，表现都是「settled 没置位 = 超时」，但从三个 Event 能立刻分清：
+
+        - 前置未连 → 地址 / 网络 / 服务时段问题（TCP 都没握手）；
+        - 前置连了、没登录 → 认证或登录回包没来（AppID/AuthCode/密码错，
+          或者柜台压根没回包 —— 注意 last_error 为空说明是后者）；
+        - 登录了没结算 → `[26] 结算结果未就绪`，重发即可。
+
+        这三个状态自检里会断言都在报错串里，免得又退化成「只说超时」。
+        """
+        def flag(ev) -> str:
+            return "✓" if (ev is not None and ev.is_set()) else "✗"
+
+        try:
+            return (f"【登录阶段 前置={flag(getattr(trader, 'connected', None))}"
+                    f" 登录={flag(getattr(trader, 'logged_in', None))}"
+                    f" 结算={flag(getattr(trader, 'settled', None))}】")
+        except Exception:                                 # noqa: BLE001
+            return ""
+
     def login_hint(self, cfg) -> str:
         """登录超时时补一句「为什么」。CTP 的 SimNow 有个服务时段问题。"""
         if "182.254.243.31" in str(getattr(cfg, "td_front", "")):
@@ -520,12 +568,19 @@ class CtpHub:
             if wait > 0 and self._fail_msg:
                 raise CtpError(f"{self._fail_msg}"
                                f"（{wait:.0f} 秒后可再试；期间不会重复连柜台）")
-            try:
-                self._start_locked()
-            except Exception as exc:
-                self._fail_at = time.monotonic()
-                self._fail_msg = str(exc)
-                raise
+            # 🔴 进程级建连闸门（2026-11-27「登录全部」并发建连失败）：
+            # 实例锁 `_start_lock` 只锁自己，2 CTP + 1 融航的线程会用各自的锁
+            # 同时冲进 `Init()`，CTP 前置瞬时并发受限 ⇒ 全报「前置=✗」。这里
+            # 用类级闸门把整个建连串行：连完一户（成功或超时抛错）再放下一户。
+            # 失败冷却检查在闸门**之前**，所以排队不会把 20 秒冷却算进去。
+            # 天勤走 LiveHub/tqsdk，不经过这里，仍与柜台并行登录。
+            with self._CONNECT_GATE:
+                try:
+                    self._start_locked()
+                except Exception as exc:
+                    self._fail_at = time.monotonic()
+                    self._fail_msg = str(exc)
+                    raise
             self._fail_at, self._fail_msg = 0.0, ""
 
     def _alive(self) -> bool:
@@ -584,15 +639,21 @@ class CtpHub:
         trader.start()
         # 🔴 等的是「登录 + 结算确认」，不是「登录」。结算确认在收盘后的结算窗口里
         # 常回「[26] 结算结果未就绪」，等几秒再发就好 —— 所以这里**边等边重发**，
-        # 而不是干等 15 秒然后把整条会话判死（那样界面只说「登录超时」，用户
-        # 完全看不出是结算没确认）。
-        end = time.monotonic() + 15.0
+        # 而不是干等然后把整条会话判死。
+        # 🔴 2026-11-27：等待走 LOGIN_WAIT_SEC（默认 20，环境变量可调，用户
+        # 定 —— 并发撞前置已由 `_CONNECT_GATE` 解决，等待不必再放宽）；报错必须**说清卡在
+        # 哪一步** —— 原来只说「登录超时」、last_error 又是空的，用户完全没法
+        # 判断是前置没连上、认证没回还是结算没确认（当天快期能登、ChanQuant
+        # 不能，就是这种「无错误回包」的超时）。
+        wait_sec = self.login_wait_sec()
+        end = time.monotonic() + wait_sec
         while not trader.wait_ready(1.0):
             trader.confirm_settlement()
             if time.monotonic() >= end:
-                err = trader.last_error or "登录超时（15 秒）"
+                err = trader.last_error or f"登录超时（{wait_sec:.0f} 秒）"
+                err += self._login_stage(trader) + self.login_hint(cfg)
                 trader.stop()
-                raise CtpError(err + self.login_hint(cfg))
+                raise CtpError(err)
         # 🔴 登录后的**第一拍只能发一个查询**（2026-11-23 融航 SA701）：
         # CTP 同一会话每秒最多一个查询请求，这里原来连着 `query_account()` +
         # `query_positions()`，柜台只受理第一个，第二个直接被流控丢掉 ——

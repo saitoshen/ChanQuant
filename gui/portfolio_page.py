@@ -2281,8 +2281,25 @@ class PortfolioPage(QWidget):
         lay.addWidget(self.cb_acct)
 
         self.btn_start = QPushButton("启动全部")
+        self.btn_start.setToolTip("启动**所有工作区**里启用的策略（按账户合并连接）")
         self.btn_start.clicked.connect(self._start_all)
         lay.addWidget(self.btn_start)
+
+        self.btn_start_ws = QPushButton("启动工作区")
+        self.btn_start_ws.setToolTip(
+            "只启动当前分页这个工作区：其他工作区正在跑的策略停掉"
+            "（撤在途单、保留理论仓），账户连接不动")
+        self.btn_start_ws.clicked.connect(self._start_workspace)
+        lay.addWidget(self.btn_start_ws)
+
+        self.btn_stop_ws = QPushButton("停止工作区")
+        self.btn_stop_ws.setObjectName("Ghost")
+        self.btn_stop_ws.setEnabled(False)
+        self.btn_stop_ws.setToolTip(
+            "只停止当前分页这个工作区的策略：其他工作区继续跑"
+            "（撤在途单、保留理论仓），账户连接不动")
+        self.btn_stop_ws.clicked.connect(self._stop_workspace)
+        lay.addWidget(self.btn_stop_ws)
 
         self.btn_stop = QPushButton("停止全部")
         self.btn_stop.setObjectName("Ghost")
@@ -4711,8 +4728,9 @@ class PortfolioPage(QWidget):
         one = self._slot_view.get(str(getattr(cfg, "sid", "") or ""))
         return {"": one} if one else {}
 
-    def _live_plan(self) -> tuple[dict, list]:
-        """**所有工作区**里启用的成员 → `{账户: [配置]}`。
+    def _live_plan(self, only_current: bool = False) -> tuple[dict, list]:
+        """启用的成员 → `{账户: [配置]}`。默认**所有工作区**，`only_current=True`
+        时只要当前分页（「启动工作区」按钮）。
 
         运行不按工作区分，按**账户**合并：一个账户一条天勤连接，跑该账户下所有
         工作区里启用的策略。两个工作区用同一个账户时不会开两条连接去抢同一个仓。
@@ -4728,7 +4746,9 @@ class PortfolioPage(QWidget):
         # 的下单（见 `PortfolioRunner._cross_refresh`）。以前在这里剔掉是为了躲开
         # `enable()` 的硬拒绝，但那是「连了账户才拒绝」—— 白连一轮柜台，还会
         # 在登录失败的收尾里踩到 CTP 的 0xc0000005。真正该做的是让截面能跑。
-        for w in self._wss:
+        wss = ([self._ws] if only_current and self._ws is not None
+               else self._wss)
+        for w in wss:
             cfgs, _missing = WS.resolve(w, self._pool)
             for c in cfgs:
                 m = w.find(str(getattr(c, "sid", "") or ""))
@@ -4767,12 +4787,8 @@ class PortfolioPage(QWidget):
                 plan.pop(acct)
         return plan, warn
 
-    def _start_all(self) -> None:
-        if not self._pool:
-            self._on_failed("还没有策略，先在某个工作区里「从策略库添加」")
-            return
-
-        groups, warn = self._live_plan()
+    def _check_plan(self, groups: dict, warn: list, empty_note: str) -> bool:
+        """两种启动入口共用的体检。返回 False 就别往下走。"""
         for msg in warn:
             self._on_log(f"注意：{msg}")
         if not groups:
@@ -4783,16 +4799,115 @@ class PortfolioPage(QWidget):
                     "没有可以启动的账户：启用的策略都挂在只做期货的柜台账户上，"
                     "股票策略请把交易账户改成天勤账户")
             else:
-                self._on_failed("所有工作区里都没有启用的策略")
-            return
+                self._on_failed(empty_note)
+            return False
         for name in list(groups):
             if not name:
                 self._on_failed("有策略没有可用账户（既没绑账户，也没有默认账户）")
-                return
+                return False
             if name != NO_ACCOUNT_KEY and self._spec(name) is None:
                 self._on_failed(f"账户「{name}」已不存在，请重新绑定")
-                return
+                return False
+        return True
 
+    def _start_all(self) -> None:
+        if not self._pool:
+            self._on_failed("还没有策略，先在某个工作区里「从策略库添加」")
+            return
+        groups, warn = self._live_plan()
+        if not self._check_plan(groups, warn, "所有工作区里都没有启用的策略"):
+            return
+        self._apply_plan(groups)
+
+    def _start_workspace(self) -> None:
+        """只启动当前工作区：其他工作区正在跑的策略**停信号与下单**。
+
+        和「启动全部」的区别就在计划范围（当前分页 vs 所有分页）。用户 2026-11-27
+        报「启动全部要十几二十分钟」—— 114 条策略里往往只想先看当前这一个工作区，
+        全量排队首屏要等很久。这里把不在本工作区的槽位 `enable(False)`（引擎会
+        撤掉它的在途单、保留理论仓与账本），不关账户连接，切回来点「启动全部」
+        就能原样补齐。停的是**策略**不是账户，别用 `ctl.stop()`。
+        """
+        if not self._pool:
+            self._on_failed("还没有策略，先在某个工作区里「从策略库添加」")
+            return
+        if self._ws is None:
+            self._on_failed("还没有工作区")
+            return
+        groups, warn = self._live_plan(only_current=True)
+        title = self._ws.name or "未命名"
+        if not self._check_plan(groups, warn, f"工作区「{title}」里没有启用的策略"):
+            return
+
+        # 保留集按「账户 + 策略 sid」记。子槽位的 `group` 是父 sid，所以一条
+        # 多品种 / 截面策略只要停一次父 sid，全部腿一起停（引擎 enable 会展开）
+        keep = {(name, str(c.sid)) for name, cfgs in groups.items() for c in cfgs}
+        drop: set[tuple[str, str]] = set()
+        # 先按配置算：刚启动、第一份快照还没推过来时 `_slot_multi` 是空的，
+        # 光看快照会把别的工作区的策略漏掉（按钮看着点了其实没切换）
+        all_groups, _ = self._live_plan()
+        for name, cfgs in all_groups.items():
+            for c in cfgs:
+                if (name, str(c.sid)) not in keep:
+                    drop.add((name, str(c.sid)))
+        # 再按快照补：用户单独启动过、但已不在任何工作区里的策略也要停
+        for sid, by in list(self._slot_multi.items()):
+            for acct, slot in list(by.items()):
+                parent = str(slot.get("group") or "")
+                if (acct, parent or sid) not in keep:
+                    drop.add((acct, parent or sid))
+        dropped = 0
+        for acct, sid in sorted(drop):
+            if self.ctl.enable(acct, sid, False):
+                dropped += 1
+        if dropped:
+            self._on_log(f"工作区「{title}」：已停止 {dropped} 条其他工作区的策略"
+                         "（撤在途单，理论仓与账本保留）")
+
+        self._apply_plan(groups)
+        n = sum(len(v) for v in groups.values())
+        self._on_log(f"工作区「{title}」：只启动本工作区的 {n} 条策略"
+                     "（其他分页点「启动全部」可补齐）")
+
+    def _stop_workspace(self) -> None:
+        """只停当前工作区：其他工作区继续跑、账户连接也不动。
+
+        和「停止全部」的分界：`ctl.stop()` 是停 worker（账户连接一起断），这里
+        只按策略 sid 调 `enable(False)`（引擎撤在途单、保留理论仓与账本）。用户
+        2026-11-27 要的「工作区级开关」—— 多开几个分页各跑一组时，切到某一页
+        只想停这一页，不能把别页的策略也一起停掉。
+        """
+        if self._ws is None:
+            self._on_failed("还没有工作区")
+            return
+        title = self._ws.name or "未命名"
+        # 当前工作区成员的 sid（含已禁用的成员 —— 「停止工作区」就该把它们
+        # 也停掉；`_live_plan` 只给启用的，不够用）
+        cfgs, _missing = WS.resolve(self._ws, self._pool or [])
+        owned = {str(c.sid) for c in cfgs}
+        default = self.cb_acct.currentData() or ""
+        stop: set[tuple[str, str]] = set()
+        for c in cfgs:
+            for acct in (c.account_list(default) or [NO_ACCOUNT_KEY]):
+                stop.add((acct, str(c.sid)))
+        # 快照补：已经拆腿的多品种 / 截面，子槽位用 `group`（父 sid）判断归属。
+        # 按父 sid 调一次 enable 就会把所有腿一起停，不能逐腿发。
+        for sid, by in list(self._slot_multi.items()):
+            for acct, slot in list(by.items()):
+                parent = str(slot.get("group") or "")
+                root = parent or sid
+                if root in owned:
+                    stop.add((acct, root))
+
+        stopped = 0
+        for acct, sid in sorted(stop):
+            if self.ctl.enable(acct, sid, False):
+                stopped += 1
+        self._on_log(f"工作区「{title}」：已停止 {stopped} 条策略"
+                     "（撤在途单、保留理论仓；其他分页与账户连接不受影响）")
+        self._refresh_conn_label()
+
+    def _apply_plan(self, groups: dict) -> None:
         # 允许在「已经单独启动过某一条」的情况下再点：把其余补齐，不逼用户先停止全部
         newly = 0
         for name, cfgs in groups.items():
@@ -4847,6 +4962,8 @@ class PortfolioPage(QWidget):
         # 这里不重画：线程还没真退，`ctl.running` 仍是 True，重画会走到
         # 「仓位一致」那个分支，看着像是刚对齐过。等 `_on_stopped` 再刷。
         self.btn_start.setEnabled(False)
+        self.btn_start_ws.setEnabled(False)
+        self.btn_stop_ws.setEnabled(False)
         self.btn_stop.setEnabled(False)
         self.lbl_conn.setText("正在停止…")
         self.lbl_conn.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
@@ -4855,6 +4972,8 @@ class PortfolioPage(QWidget):
 
     def _on_stopped(self) -> None:
         self.btn_start.setEnabled(True)
+        self.btn_start_ws.setEnabled(True)
+        self.btn_stop_ws.setEnabled(False)
         self.btn_stop.setEnabled(False)
         self.btn_acct.setEnabled(False)
         self.lbl_dot.setStyleSheet(f"color: {C_IDLE}; font-size: 15px;")
@@ -4989,6 +5108,8 @@ class PortfolioPage(QWidget):
             self.lbl_conn.setText("已停止")
             self.lbl_conn.setStyleSheet(f"color: {C_MUTED}; font-size: 11px;")
             self.btn_start.setEnabled(True)
+            self.btn_start_ws.setEnabled(True)
+            self.btn_stop_ws.setEnabled(False)
             self.btn_stop.setEnabled(False)
             self.btn_acct.setEnabled(False)
             return
@@ -5008,6 +5129,8 @@ class PortfolioPage(QWidget):
         self.lbl_conn.setStyleSheet(f"color: {C_OK}; font-size: 11px;")
         # 只单独启动过一条时，「启动全部」还要能用 —— 它会把剩下的补齐
         self.btn_start.setEnabled(True)
+        self.btn_start_ws.setEnabled(True)
+        self.btn_stop_ws.setEnabled(True)
         self.btn_stop.setEnabled(True)
 
     # ---------------------------------------------------------- 增删改

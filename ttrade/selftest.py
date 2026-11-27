@@ -15920,6 +15920,126 @@ def _run() -> tuple[bool, list[str]]:
 
     check("登录失败后不反复 Release+Init（融航段错误）", _hub_fail_cooldown)
 
+    def _login_wait_diag() -> str:
+        """登录等待可配置 + 超时报错带阶段诊断（2026-11-27 用户截图）。
+
+        现场：同样账户快期能登、ChanQuant 报「登录超时」，而 last_error 是空的
+        （柜台一个错误回包都没给，卡在前置/认证/登录某步）。两处改：
+        ① 等待写死 15 → 可配置，默认按用户最终定的 20 秒（并发撞前置的真根因
+        由 `_CONNECT_GATE` 解决，不必靠加长时间瞎等）；
+        ② 超时报错必须显示「前置/登录/结算」各自到位没有，否则只能干猜。
+        """
+        import inspect
+        import os
+        import threading
+
+        from ttrade import ctp_live as CL
+
+        hub = CL.CtpHub
+        if abs(hub.LOGIN_WAIT_SEC - 20.0) > 1e-9:
+            raise RuntimeError(
+                f"登录等待该是用户定的 20 秒（并发撞前置已由闸门解决，不用瞎等），"
+                f"现在是 {hub.LOGIN_WAIT_SEC}")
+        # 源码里不许再写死 15 秒（`+ 15.0` 这种），必须走可配置入口
+        src = inspect.getsource(CL.CtpHub._start_locked)
+        if "login_wait_sec()" not in src:
+            raise RuntimeError("超时循环没走 login_wait_sec()，环境变量调不动")
+
+        # 默认值 / 环境变量覆盖 / 坏值回退
+        knob = "CHANQUANT_CTP_LOGIN_WAIT"
+        old = os.environ.get(knob)
+        try:
+            os.environ.pop(knob, None)
+            if abs(hub.login_wait_sec() - hub.LOGIN_WAIT_SEC) > 1e-9:
+                raise RuntimeError("没设环境变量时该用默认等待秒数")
+            os.environ[knob] = "90"
+            if abs(hub.login_wait_sec() - 90.0) > 1e-9:
+                raise RuntimeError(f"环境变量没生效：{hub.login_wait_sec()}")
+            os.environ[knob] = "999"
+            if abs(hub.login_wait_sec() - hub.LOGIN_WAIT_SEC) > 1e-9:
+                raise RuntimeError("超范围的值该退回默认，不能真等 999 秒")
+            os.environ[knob] = "abc"
+            if abs(hub.login_wait_sec() - hub.LOGIN_WAIT_SEC) > 1e-9:
+                raise RuntimeError("坏值该退回默认，不能抛异常把界面带崩")
+        finally:
+            if old is None:
+                os.environ.pop(knob, None)
+            else:
+                os.environ[knob] = old
+
+        # 阶段诊断：三个 Event 各自到位没，必须都能看出来
+        class _Ev:
+            def __init__(self, on):
+                self.on = on
+
+            def is_set(self):
+                return self.on
+
+        class _Trader:
+            connected = _Ev(True)
+            logged_in = _Ev(False)
+            settled = _Ev(False)
+
+        diag = hub._login_stage(_Trader())
+        for kw in ("前置", "登录", "结算"):
+            if kw not in diag:
+                raise RuntimeError(f"阶段诊断漏了「{kw}」：{diag}")
+        if diag.count("✓") != 1 or diag.count("✗") != 2:
+            raise RuntimeError(f"阶段状态画错了（应 1✓2✗）：{diag}")
+        if "login_wait_sec" not in inspect.getsource(hub._start_locked):
+            raise RuntimeError("报错串没用可配置的等待秒数")
+        return (f"默认等 {hub.LOGIN_WAIT_SEC:.0f} 秒（环境变量可调 5~180）；"
+                "超时报错带前置/登录/结算三态，不再只说『超时』")
+
+    check("登录等待放宽 + 超时报错带阶段诊断", _login_wait_diag)
+
+    def _connect_gate_serial() -> str:
+        """多账户「登录全部」必须串行建连（2026-11-27 用户实测）。
+
+        现场：勾 2 CTP + 融航 + 天勤共 4 户一起登，CTP 全报「前置=✗ 登录=✗
+        结算=✗」（前置没连上）；单独登两个 CTP 都成功。`LiveCtl.start()` 给每
+        户各起一条线程，三层 CTP 系会话（2 标准 + 1 融航）各自拿实例锁同时
+        `Init()` ⇒ 前置瞬时并发受限。修法是类级闸门把建连串行。钉三件事：
+        ① 闸门是类属性、CTP 与融航拿到同一把；② `start()` 里用它；
+        ③ 天勤（LiveHub）不继承它，仍可并行。
+        """
+        import inspect
+        import threading
+
+        from ttrade import ctp_live as CL
+
+        gate = getattr(CL.CtpHub, "_CONNECT_GATE", None)
+        if gate is None:
+            raise RuntimeError("没有进程级建连闸门 —— 多账户并发 Init 会撞前置")
+        # 融航继承 CtpHub，必须拿到同一把（否则 CTP + 融航仍能并发）
+        if CL.RohonHub._CONNECT_GATE is not gate:
+            raise RuntimeError("融航和 CTP 不是同一把闸门 —— 混连时照样撞")
+        # start() 里必须真的用它锁住 _start_locked
+        src = inspect.getsource(CL.CtpHub.start)
+        if "_CONNECT_GATE" not in src or "_start_locked()" not in src:
+            raise RuntimeError("start() 没用闸门锁住建连")
+        # 天勤那条路不受影响：LiveHub 不继承 CtpHub
+        from ttrade.tqlive import LiveHub
+
+        if hasattr(LiveHub, "_CONNECT_GATE"):
+            raise RuntimeError("天勤也被闸门串行了 —— 它和柜台是两套 API，不该互相等")
+        # 闸门要能真的互斥（不是摆设）
+        got = []
+
+        def grab():
+            with gate:
+                got.append(1)
+
+        t = threading.Thread(target=grab)
+        t.start()
+        t.join(2)
+        if got != [1]:
+            raise RuntimeError("闸门不是可用的锁")
+        return ("CTP / 融航共享类级建连闸门，登录全部时 Init 串行；"
+                "失败冷却在闸门外、天勤不受影响")
+
+    check("登录全部：CTP/融航建连串行（前置并发受限）", _connect_gate_serial)
+
     def _stale_session_retry() -> str:
         """失败几次后必须还能重新登录（2026-11-26 用户反馈）。
 
@@ -17372,6 +17492,236 @@ def _run() -> tuple[bool, list[str]]:
                 "pooled 在波动不对称时净敞口会跑偏 —— 复现严格中性策略必须切 legs")
 
     check("HL point 复现：新因子 + 资金分配范围（多空各半仓 / 合并）", _hl_point)
+
+    def _start_workspace_scope():
+        """「启动工作区」只跑当前分页：别的工作区的策略停掉、账户连接不动。
+
+        用户 2026-11-27 在「启动全部」要等十几二十分钟之后要求加这个按钮。
+        判据不是「少启动几条」这么笼统：必须真的**停掉**其他分页正在跑的
+        槽位（否则当前工作区只是增量补充，一点没省），又不能关账户连接
+        （否则等于「停止全部」，切回来还得重连柜台）。
+        """
+        import inspect
+        from types import SimpleNamespace
+
+        import gui.portfolio_page as PP
+        from ttrade import strategy_store as SStore
+        from ttrade import workspace_store as WS
+
+        cls = PP.PortfolioPage
+        src = inspect.getsource(cls._build_top)
+        assert 'QPushButton("启动工作区")' in src, "顶部没有「启动工作区」按钮"
+        assert "btn_start_ws.clicked.connect(self._start_workspace)" in src
+        assert "only_current" in inspect.getsource(cls._live_plan), \
+            "计划还是全工作区合并的，按钮等于没用"
+        body = inspect.getsource(cls._start_workspace)
+        assert "enable(acct, sid, False)" in body, \
+            "没按策略停掉别的工作区的槽位"
+        assert "self.ctl.stop()" not in body, \
+            "别把账户连接一起停了 —— 那不是「只启动工作区」"
+
+        def cfg(sid):
+            c = SStore.StrategyConfig(sid=sid, name=sid, symbol="RB", period="1d",
+                                      rule_key="ma_cross", principal=100_000.0)
+            c.enabled = True
+            c.account = "sim"
+            c.accounts = ["sim"]
+            return c
+
+        pool = [cfg("a"), cfg("b")]
+        w1, w2 = WS.new_workspace("A"), WS.new_workspace("B")
+        w1.add("a", 100_000.0)
+        w2.add("b", 100_000.0)
+
+        calls = []
+
+        class Ctl:
+            def is_running(self, key):
+                return True
+
+            def enable(self, key, sid, on):
+                calls.append(("enable", key, sid, on))
+                return True
+
+            def add_or_update(self, key, c):
+                calls.append(("add_or_update", key, c.sid))
+                return True
+
+            def start(self, spec, *a):
+                calls.append(("start", getattr(spec, "name", "")))
+                return True
+
+            def stop(self, *a):
+                raise AssertionError("启动工作区不该停账户连接")
+
+        # 🔴 不能用 object.__new__(PortfolioPage)：它是 QWidget，直接 new 会抛
+        # `object.__new__(...) is not safe`。这三个方法只碰普通属性，把桩对象当
+        # self 传给未绑定方法即可，不必真的建 Qt 控件（也就不用 QApplication）。
+        p = SimpleNamespace()
+        p._pool = pool
+        p._ws, p._wss = w1, [w1, w2]
+        p.cb_acct = SimpleNamespace(currentData=lambda: "")
+        p.ctl = Ctl()
+        p._slot_multi = {"a": {"sim": {"sid": "a", "group": ""}},
+                         "b": {"sim": {"sid": "b", "group": ""}}}
+        p._slot_view = {"a": {"sid": "a"}, "b": {"sid": "b"}}
+        p._chase = p._monitor = None
+        p._spec = lambda name: SimpleNamespace(name=name, backend="tq")
+        p._live_plan = lambda only_current=False: cls._live_plan(p, only_current)
+        p._check_plan = lambda g, w, note: cls._check_plan(p, g, w, note)
+        p._apply_plan = lambda g: cls._apply_plan(p, g)
+
+        def fail(msg):
+            raise AssertionError(msg)
+
+        p._on_failed = fail
+        p._on_log = lambda msg: None
+        p._refresh_conn_label = lambda: None
+        cls._start_workspace(p)
+
+        assert ("enable", "sim", "b", False) in calls, \
+            f"别的工作区的策略没停：{calls}"
+        assert ("enable", "sim", "a", True) in calls, \
+            f"当前工作区的策略没启：{calls}"
+        assert not any(c[0] == "start" for c in calls), \
+            f"账户连接不该重建：{calls}"
+        return ("「启动工作区」只跑当前分页：A 启动 / B 停止，"
+                "账户连接不动（不重建、不停止）")
+
+    check("启动工作区：只跑当前分页，其他分页停策略不停账户", _start_workspace_scope)
+
+    def _stop_workspace_scope():
+        """「停止工作区」只停当前分页：别页继续跑、账户连接不动。
+
+        和「启动工作区」是一对；判据同样两条：① 只对本工作区的 sid 发
+        enable(False)，别的工作区一条都不碰；② 绝不 `ctl.stop()`（那会断
+        账户连接、连别的工作区一起停）。子槽位用 `group`（父 sid）归属。
+        """
+        import inspect
+        from types import SimpleNamespace
+
+        import gui.portfolio_page as PP
+        from ttrade import strategy_store as SStore
+        from ttrade import workspace_store as WS
+
+        cls = PP.PortfolioPage
+        src = inspect.getsource(cls._build_top)
+        assert 'QPushButton("停止工作区")' in src, "顶部没有「停止工作区」按钮"
+        assert "btn_stop_ws.clicked.connect(self._stop_workspace)" in src
+        body = inspect.getsource(cls._stop_workspace)
+        assert "WS.resolve(self._ws" in body, "停的还得是当前工作区解析出的成员"
+        assert "self.ctl.stop()" not in body, "别把账户连接一起停了"
+
+        def cfg(sid):
+            c = SStore.StrategyConfig(sid=sid, name=sid, symbol="RB", period="1d",
+                                      rule_key="ma_cross", principal=100_000.0)
+            c.enabled = True
+            c.account = "sim"
+            c.accounts = ["sim"]
+            return c
+
+        pool = [cfg("a"), cfg("b")]
+        w1, w2 = WS.new_workspace("A"), WS.new_workspace("B")
+        w1.add("a", 100_000.0)
+        w2.add("b", 100_000.0)
+
+        calls = []
+
+        class Ctl:
+            def enable(self, key, sid, on):
+                calls.append(("enable", key, sid, on))
+                return True
+
+            def stop(self, *a):
+                raise AssertionError("停止工作区不该停账户连接")
+
+        p = SimpleNamespace()
+        p._pool = pool
+        p._ws, p._wss = w1, [w1, w2]
+        p.cb_acct = SimpleNamespace(currentData=lambda: "")
+        p.ctl = Ctl()
+        # a、b 都在跑；b 的父 sid 用 group 字段（模拟多品种拆腿）
+        p._slot_multi = {"a": {"sim": {"sid": "a", "group": ""}},
+                         "b#RB": {"sim": {"sid": "b#RB", "group": "b"}}}
+        refreshed = []
+        p._on_failed = lambda m: (_ for _ in ()).throw(AssertionError(m))
+        p._on_log = lambda m: None
+        p._refresh_conn_label = lambda: refreshed.append(1)
+        cls._stop_workspace(p)
+
+        assert ("enable", "sim", "a", False) in calls, \
+            f"当前工作区的策略没停：{calls}"
+        assert not any(c[2] == "b" for c in calls), \
+            f"别的工作区的策略被误停：{calls}"
+        assert refreshed, "停止后没刷新连接状态标签"
+        return ("「停止工作区」只停当前分页：A 停、B 不动，"
+                "账户连接不重建不停止")
+
+    check("停止工作区：只停当前分页，其他分页继续跑", _stop_workspace_scope)
+
+    def _signal_time_budget():
+        """信号重算按**时间**配额，不再按条数：快策略多跑、慢策略不叠加。
+
+        用户 2026-11-27 报「启动全部要十几二十分钟」：114 条策略里截面一篮子
+        一次 2.4 秒、sbbox 逐腿回放一次几秒，旧的「每轮 2 条」既可能一轮卡 8
+        秒，也可能让一堆秒回的策略白排队。这里用 sleep 桩证明预算真会截断，
+        并且截断后的槽位**仍然订阅**（不订阅的话后面的品种永远不回填）。
+        """
+        import inspect
+        import time
+        from types import SimpleNamespace
+
+        import ttrade.strategy_runner as SR
+
+        src = inspect.getsource(SR.PortfolioRunner.tick)
+        assert "spent >= SIG_BUDGET_SEC" in src, \
+            "tick 没有按时间预算截断 —— 还是条数配额"
+        assert "done >= SIG_BUDGET_MAX" in src, "缺条数硬上限"
+        assert 'diag("SIG"' in src, "慢策略没有耗时埋点"
+        assert 0 < SR.SIG_BUDGET_SEC <= 5.0 and SR.SIG_BUDGET_MAX > 1
+        assert SR.SLOW_SIGNAL_SEC > 0
+
+        class St:
+            def __init__(self, i):
+                self.running = True
+                self.last_bar = 0
+                self.pending = []
+                self.last_action = ""
+                self.i = i
+
+            def title(self):
+                return f"桩{self.i}"
+
+        slots = {f"s{i}": St(i) for i in range(12)}
+        refreshed, subscribed = [], []
+
+        def refresh(st):
+            refreshed.append(st.i)
+            time.sleep(0.08)          # 每条 80ms，预算 0.5s ⇒ 约 6~7 条
+            st.last_bar += 1          # 只有换了 bar 才算真重算
+
+        p = SimpleNamespace()
+        p.feed = object()             # tick 开头只判 None
+        p._cross = False
+        p.api = None                  # 只算信号、不走下单链路
+        p._slots = slots
+        p._align_slot = SimpleNamespace(pending=[])
+        p._refresh_signal = refresh
+        p._subscribe = lambda st: subscribed.append(st.i)
+        SR.PortfolioRunner.tick(p)
+
+        # 预算必须真截断：12 条不能全算；也不能一条都不算
+        assert 2 <= len(refreshed) < len(slots), \
+            f"时间预算没生效：{len(refreshed)}/{len(slots)} 条都算了"
+        # 被截断的槽位仍要订阅 —— 这是首屏回填的关键
+        assert len(subscribed) >= len(slots) - len(refreshed), \
+            f"预算用完后的槽位没订阅：{subscribed}"
+        assert len(set(subscribed)) == len(subscribed), "同一槽位被重复订阅"
+        return (f"12 条桩策略（80ms/条）按 {SR.SIG_BUDGET_SEC:g}s 预算只重算 "
+                f"{len(refreshed)} 条，其余 {len(subscribed)} 条照常订阅；"
+                "慢策略耗时埋点在位")
+
+    check("信号重算按时间预算（不是每轮固定 2 条）+ 耗时埋点", _signal_time_budget)
 
     # 跑完就把进度文件收掉：留着会让下一轮的诊断以为"上次崩过"。
     # 崩溃时走不到这里，文件正好留下最后一项的名字。
