@@ -231,7 +231,21 @@ class BrokerApi:
             self.hub = hubreg.acquire(self.feed, [self.spec],
                                       lambda: cls([self.spec]))
             self._shared = hubreg.refs(self.hub) > 1
-        self.hub.start()
+        try:
+            self.hub.start()
+        except Exception:
+            # 🔴 登录失败必须把刚借的会话还回去。否则注册表里残留一条
+            # 「从没登上过」的僵尸会话：交易页再连只会借到它、日志误报
+            # 「复用组合页已连的会话」、start() 撞失败冷却，从此连不上
+            # （2026-11-26 用户反馈「限制了后面怎么也无法登录」）。
+            # 最后一手使用者才真的 close；别人还在用则不牵连。
+            hub, self.hub = self.hub, None
+            try:
+                if hubreg.release(hub):
+                    hub.close()
+            except Exception:                             # noqa: BLE001
+                pass
+            raise
         if getattr(self, "_shared", False):
             self._log(f"{BACKEND_LABELS.get(self.feed, self.feed)}：复用交易页"
                       "已连的会话（一个账户只留一条连接，回报和持仓是同一份）")

@@ -87,6 +87,22 @@ def make_hub(backend: str, specs: list):
     return hubreg.acquire("tq", specs, lambda: LiveHub(specs))
 
 
+def _hub_online(hub) -> bool:
+    """这条借到的会话是不是**真的连着** —— 只用于日志措辞，不参与连接决策。
+
+    借用数 >1 只说明「别人也持有一条引用」，不等于「别人已经登录成功」：
+    登录失败的会话残留时，`refs` 照样 >1。日志必须据实说，否则用户对着
+    「复用已连会话」却怎么也连不上（2026-11-26 的反馈）。
+    """
+    try:
+        probe = getattr(hub, "_alive", None)
+        if callable(probe):
+            return bool(probe())
+    except Exception:                                    # noqa: BLE001
+        return False
+    return bool(getattr(hub, "_started", False))
+
+
 class HubSet:
     """多条柜台连接的门面。
 
@@ -320,10 +336,16 @@ class LiveWorker(QObject):
             hub = None
             try:
                 hub = make_hub(name, specs)
-                if hubreg.refs(hub) > 1:
-                    # 组合页已经为这个账户连过了：拿的是同一条连接。直说，省得
-                    # 用户以为这里又登了一次（账户表上的「已连接」也不会重复）
+                if hubreg.refs(hub) > 1 and _hub_online(hub):
+                    # 组合页已为这个账户登录成功：拿的是同一条连接。直说，省得
+                    # 用户以为这里又登了一次（账户表上的「已连接」也不会重复）。
+                    # 🔴 必须真的 _alive 才这么说 —— 借用数 >1 也可能是一条
+                    # 登录失败的僵尸会话，那样只会误导用户（11-26 反馈）。
                     self.log.emit(f"{label} 复用组合页已连的会话，不再重复登录")
+                elif hubreg.refs(hub) > 1:
+                    # 同一账户被另一页借过，但那条会话没登上：这次 start() 会
+                    # 真正去连（或撞失败冷却后给出「N 秒后可再试」）。
+                    self.log.emit(f"{label} 已有引用但未登录，这次重新登录")
                 else:
                     self.log.emit(f"正在连接{label}…")
                 hub.start()          # 幂等：复用已有会话时立刻返回

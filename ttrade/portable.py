@@ -1,7 +1,9 @@
-"""可携带文件：自定义策略 `.cqs`、自定义因子 `.cqf`、工作区 `.cqw`。
+"""可携带文件：自定义策略 `.cqs`、自定义因子 `.cqf`、工作区 `.cqw`、账户 `.cqa`。
 
-三种文件都是带版本号的 JSON，扩展名只用来区分内容类型 —— 换一台机器导入时
+四种文件都是带版本号的 JSON，扩展名只用来区分内容类型 —— 换一台机器导入时
 **不需要联网、不需要原项目目录**，因为自定义策略 / 因子的源码就在包里。
+
+`.cqa` 是账户列表（含明文密码），只做同名合并，不碰本机账户定时。
 
 ## 为什么工作区要连策略一起打包
 
@@ -40,12 +42,14 @@ from ttrade import workspace_store as WS
 FMT_STRATEGY = "chanquant-strategies"
 FMT_FACTOR = "chanquant-factors"
 FMT_WORKSPACE = "chanquant-workspace"
+FMT_ACCOUNT = "chanquant-accounts"
 VERSION = 1
 
 LABELS = {
     FMT_STRATEGY: "策略包（.cqs）",
     FMT_FACTOR: "因子包（.cqf）",
     FMT_WORKSPACE: "工作区包（.cqw）",
+    FMT_ACCOUNT: "账户包（.cqa）",
 }
 
 
@@ -429,4 +433,74 @@ def import_workspaces(path: str, *, overwrite: bool = True) -> Report:
     _import_configs(_items(d, "library"), rep, overwrite, kind="library")
     _import_configs(_items(d, "portfolio"), rep, overwrite, kind="portfolio")
     _import_workspaces(_items(d, "workspaces"), rep, overwrite)
+    return rep
+
+
+# ---------------------------------------------------------------- 账户 .cqa
+
+
+def export_accounts(items: list, path: str) -> int:
+    """把账户列表存成 `.cqa`（按账户名去重，空名不导）。
+
+    字段和 `%LOCALAPPDATA%\\ChanQuant\\accounts.json` 里的 `AccountSpec` 完全同构：
+    少一个字段（比如 CTP 的 `td_front`）换台机器就连不上，所以整条 asdict 原样
+    带走。**密码是明文的**，界面在保存前会先提醒，这里不替用户做「脱敏」——
+    脱敏后的包导入进去连不上，用户会以为功能坏了。
+    """
+    from dataclasses import asdict
+
+    from ttrade import tqlive as TQ
+
+    fields = set(TQ.AccountSpec.__dataclass_fields__)
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for spec in items or []:
+        raw = asdict(spec) if hasattr(spec, "__dataclass_fields__") else dict(spec)
+        one = {k: str(raw.get(k) or "") for k in fields}
+        name = one.get("name", "").strip()
+        if not name or name in seen:
+            continue
+        one["name"] = name
+        seen.add(name)
+        rows.append(one)
+    _write(path, _wrap(FMT_ACCOUNT, accounts=rows))
+    return len(rows)
+
+
+def import_accounts(path: str, *, overwrite: bool = True) -> Report:
+    """导入 `.cqa`：按账户名合并，同名覆盖，新名追加在后面。
+
+    只动账户列表，不碰账户定时（`account_timer.json`）—— 定时是本机排班，
+    拷到另一台机器上按点自动登出别人的账户只会添乱。
+    """
+    from ttrade import tqlive as TQ
+
+    d = _read(path, FMT_ACCOUNT)
+    rep = Report()
+    current = TQ.load_accounts()
+    order = [s.name for s in current]
+    by_name = {s.name: s for s in current}
+    for raw in _items(d, "accounts"):
+        try:
+            spec = TQ.AccountSpec(**{
+                k: str(raw.get(k) or "") for k in TQ.AccountSpec.__dataclass_fields__
+            })
+        except Exception as exc:  # noqa: BLE001 - 一条坏的不该挡住整包
+            rep.error("账户（坏条目）", str(exc))
+            continue
+        spec.name = spec.name.strip()
+        if not spec.name:
+            rep.error("未命名账户", "没有名称")
+            continue
+        if spec.name in by_name and not overwrite:
+            rep.skip(spec.name, "本地已有同名账户，本次选择不覆盖")
+            continue
+        if spec.name in by_name:
+            by_name[spec.name] = spec
+        else:
+            order.append(spec.name)
+            by_name[spec.name] = spec
+        rep.ok += 1
+    if rep.ok:
+        TQ.save_accounts([by_name[n] for n in order])
     return rep

@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -807,28 +808,27 @@ class TradePage(QWidget):
             head.addWidget(btn)
         elif with_btn == "账户":
             for text, tip, slot in (
-                ("＋", "新增账户", self._add_account),
-                ("－", "删除选中账户", self._del_account),
-                ("✎", "编辑选中账户", self._edit_account),
+                ("新增", "新增账户", self._add_account),
+                ("删除", "删除选中账户", self._del_account),
+                ("编辑", "编辑选中账户", self._edit_account),
                 ("全选", "全部勾选", lambda: self._check_all(True)),
                 ("全不选", "全部取消勾选", lambda: self._check_all(False)),
+                ("导入", "从 .cqa 文件导入账户配置", self._import_accounts),
+                ("导出", "把账户配置导出为 .cqa 文件", self._export_accounts),
             ):
                 b = QPushButton(text)
                 b.setObjectName("Ghost")
                 b.setToolTip(tip)
-                if text in ("＋", "－", "✎"):
-                    b.setFixedWidth(32)
                 b.clicked.connect(slot)
                 head.addWidget(b)
         elif with_btn == "报价":
             for text, tip, slot in (
-                ("＋", "把下单框里的合约加进报价框", self._watch_add),
-                ("－", "从报价框删掉选中行（持仓里的合约会自己回来）", self._watch_del),
+                ("添加", "把下单框里的合约加进报价框", self._watch_add),
+                ("删除", "从报价框删掉选中行（持仓里的合约会自己回来）", self._watch_del),
             ):
                 b = QPushButton(text)
                 b.setObjectName("Ghost")
                 b.setToolTip(tip)
-                b.setFixedWidth(32)
                 b.clicked.connect(slot)
                 head.addWidget(b)
         lay.addLayout(head)
@@ -1538,6 +1538,67 @@ class TradePage(QWidget):
                         "点「登出」再「登录」才生效")
         else:
             self.on_log(f"已保存账户「{new.name}」")
+
+    # ---- 账户配置导入 / 导出（.cqa） ----
+
+    def _export_accounts(self) -> None:
+        """把整张账户表存成 .cqa。密码明文随包走，先确认再保存。"""
+        if not self._accounts:
+            QMessageBox.information(self, "导出账户配置", "本地还没有账户，先点「＋」添加。")
+            return
+        ans = QMessageBox.warning(
+            self, "导出账户配置",
+            "导出的 .cqa 文件会原样包含资金账号和密码（明文）。\n"
+            "请只保存在自己可控的位置，不要随意外发或提交到代码仓库。\n\n"
+            "继续导出吗？",
+            QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel)
+        if ans != QMessageBox.Ok:
+            return
+        from ttrade import portable as PORT
+        from ttrade.paths import user_dir
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出账户配置", os.path.join(user_dir(), "交易账户.cqa"),
+            "账户包 (*.cqa)")
+        if not path:
+            return
+        if not path.lower().endswith(".cqa"):
+            path += ".cqa"
+        try:
+            n = PORT.export_accounts(self._accounts, path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        msg = f"已导出 {n} 个账户到 {path}"
+        QMessageBox.information(self, "导出账户配置", msg)
+        self.on_log(msg)
+
+    def _import_accounts(self) -> None:
+        """合并 .cqa：同名覆盖、新名追加；定时配置是本机排班，不跟着导。"""
+        from ttrade import portable as PORT
+        from ttrade.paths import user_dir
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入账户配置", user_dir(), "账户包 (*.cqa)")
+        if not path:
+            return
+        before = {s.name for s in tqlive.load_accounts()}
+        try:
+            rep = PORT.import_accounts(path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        self._accounts = tqlive.load_accounts()
+        added = [s.name for s in self._accounts if s.name not in before]
+        self._checked.update(added)
+        self._reload_accounts()
+        msg = "导入账户配置：" + rep.summary()
+        if added:
+            msg += "\n新增账户：" + "、".join(added)
+        if rep.ok:
+            msg += "\n\n已连接的账户仍在用旧配置，改过参数的账户请「登出」再「登录」。"
+        QMessageBox.information(self, "导入账户配置", msg)
+        self.on_log(msg)
 
     # ---- 逐个账户登录 / 登出 ----
 

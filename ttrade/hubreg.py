@@ -84,12 +84,29 @@ def _first(specs):
     return specs
 
 
+def _reusable(hub) -> bool:
+    """这条在册会话能不能借给别人。
+
+    默认能。hub 可以自己实现 `reusable()` 否决复用 —— CTP/融航用它在
+    「登录失败、冷却已过、从没真正登上过」时作废僵尸会话（2026-11-26：
+    失败几次之后界面一直报「复用组合页已连的会话」却永远连不上，见
+    `CtpHub.reusable()`）。没有这个方法的 hub（假柜台、天勤）行为不变。
+    """
+    probe = getattr(hub, "reusable", None)
+    return True if not callable(probe) else bool(probe())
+
+
 def acquire(kind: str, specs, factory):
-    """借一条会话。表里已有就 **加一次引用** 直接返回，没有才 `factory()` 造。
+    """借一条会话。表里已有可复用的就 **加一次引用** 直接返回，没有才造。
 
     注意返回值可能是**别人已经 `start()` 过**的连接 —— 所以 `CtpHub.start()`
     必须是幂等的（现在是：`_start_lock` 串行 + `_started` 短路）。不幂等的话
     后到的一方会把已经登录好的 `trader` 换掉，前一方手里的引用就成了野指针。
+
+    🔴 会话自报不可复用时（`reusable()` 为假）**丢弃重建**：借到一条登录失败
+    的僵尸会话，只会让 `start()` 撞失败冷却、界面误报「复用已连会话」，而且
+    下一次 `release()` 又把它留在表里 —— 从此再也连不上。老持有者放手时
+    `release()` 对已摘掉的会话返回 True，它自己 close，不会误伤别人。
     """
     spec = _first(specs)
     if spec is None or str(kind or "") not in SHARED:
@@ -97,9 +114,11 @@ def acquire(kind: str, specs, factory):
     key = hub_key(kind, spec)
     with _LOCK:
         slot = _REG.get(key)
-        if slot is not None:
+        if slot is not None and _reusable(slot["hub"]):
             slot["refs"] += 1
             return slot["hub"]
+        if slot is not None:
+            _REG.pop(key, None)
         hub = factory()
         _REG[key] = {"hub": hub, "refs": 1}
         return hub

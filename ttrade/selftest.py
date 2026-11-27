@@ -3954,7 +3954,7 @@ def _run() -> tuple[bool, list[str]]:
     check("组合工作区解析（本金/sid/多账户）", _workspace_resolve)
 
     def _portable_bundles():
-        """.cqs / .cqf / .cqw 三种可携带包的导出 → 清空 → 导入往返。
+        """.cqs / .cqf / .cqw 三种可携带包的导出 → 清空 → 导入往返（.cqa 单独验）。
 
         三个坑必须一起验：
           ① 工作区包里的策略配置要**保留 sid**，用 `add_to_portfolio()` 会
@@ -4131,6 +4131,96 @@ def _run() -> tuple[bool, list[str]]:
 
     check("可携带文件 .cqs / .cqf / .cqw 往返", _portable_bundles)
 
+    def _account_bundle():
+        """.cqa 账户包往返：整条 AccountSpec 原样带过去，同名覆盖、新名追加。
+
+        密码必须原样带（脱敏后的包连不上柜台），所以这里同时钉住 CTP 的
+        `td_front` / `app_id` / 密码都逐字段一致；真正的 accounts.json 全程
+        被重定向到临时目录，自检绝不碰用户已配好的账户。
+        """
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        from ttrade import portable as P
+        from ttrade import tqlive as TQ
+
+        td = tempfile.mkdtemp(prefix="cq_account_")
+        old_path = TQ.accounts_path
+        try:
+            TQ.accounts_path = lambda: os.path.join(td, "accounts.json")
+            mine = TQ.AccountSpec(name="本机原有", kind="kq", user="u0")
+            other = TQ.AccountSpec(
+                name="待导入CTP", kind="ctp", user="ctp_u", password="pw",
+                broker_id="9999", account_id="123456", account_password="pw2",
+                ctp_preset="simnow_7x24", md_front="tcp://md", td_front="tcp://td",
+                app_id="cq_app", auth_code="cq_auth")
+            TQ.save_accounts([mine, other])
+
+            p = os.path.join(td, "bundle.cqa")
+            if P.export_accounts([other], p) != 1:
+                raise RuntimeError(".cqa 导出条数不对")
+            with open(p, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if raw.get("format") != P.FMT_ACCOUNT:
+                raise RuntimeError(".cqa format 不对")
+            row = (raw.get("accounts") or [{}])[0]
+            if (row.get("td_front") != "tcp://td" or row.get("app_id") != "cq_app"
+                    or row.get("account_password") != "pw2"):
+                raise RuntimeError(".cqa 丢了 CTP 字段或密码，换台机器连不上")
+
+            # 另一台机器：本地只有自己的账户，导入后应当追加在后面
+            TQ.save_accounts([mine])
+            rep = P.import_accounts(p)
+            got = TQ.load_accounts()
+            if rep.ok != 1 or rep.errors or [s.name for s in got] != ["本机原有", "待导入CTP"]:
+                raise RuntimeError(f".cqa 追加失败：{rep.summary()} / {[s.name for s in got]}")
+            if (got[1].td_front != "tcp://td" or got[1].auth_code != "cq_auth"
+                    or got[1].account_id != "123456"):
+                raise RuntimeError(".cqa 导入后字段没对齐")
+
+            # 同名覆盖：改密码再导一次；overwrite=False 则跳过
+            row["password"] = "newpw"
+            with open(p, "w", encoding="utf-8") as fh:
+                json.dump(raw, fh)
+            rep = P.import_accounts(p)
+            if rep.ok != 1 or TQ.load_accounts()[1].password != "newpw":
+                raise RuntimeError(f".cqa 同名没覆盖：{rep.summary()}")
+            rep = P.import_accounts(p, overwrite=False)
+            if rep.ok or not rep.skipped:
+                raise RuntimeError(f"overwrite=False 时同名还是被覆盖了：{rep.summary()}")
+
+            # 空名 / 坏包都不能静默成功
+            row_bad = dict(row)
+            row_bad["name"] = ""
+            p_bad = os.path.join(td, "empty.cqa")
+            with open(p_bad, "w", encoding="utf-8") as fh:
+                json.dump({"format": P.FMT_ACCOUNT, "version": 1,
+                           "accounts": [row_bad]}, fh)
+            if P.import_accounts(p_bad).ok:
+                raise RuntimeError("没名字的账户也被导进来了")
+            p_other = os.path.join(td, "other.json")
+            with open(p_other, "w", encoding="utf-8") as fh:
+                json.dump({"format": "something-else", "version": 1}, fh)
+            try:
+                P.import_accounts(p_other)
+            except P.BadPackage:
+                pass
+            else:
+                raise RuntimeError("别的文件格式被当成账户包静默接收了")
+
+            from gui.trade_page import TradePage
+            for name in ("_export_accounts", "_import_accounts"):
+                if not callable(getattr(TradePage, name, None)):
+                    raise RuntimeError(f"交易页少了账户导入导出入口：{name}")
+        finally:
+            TQ.accounts_path = old_path
+            shutil.rmtree(td, ignore_errors=True)
+        return "整条 AccountSpec 保真 / 同名覆盖 / 新名追加 / 无名单条拦截"
+
+    check("账户配置 .cqa 往返", _account_bundle)
+
     def _theory_realized_persist():
         """当日已落袋走**理论口径**并落盘，不再依赖账本成本。
 
@@ -4139,7 +4229,9 @@ def _run() -> tuple[bool, list[str]]:
           ① 原来 `real_day` 由账本 `_book_cost()` 记，账本均价缺（对齐补仓、
              老版本升级）时 `cost = 成交价` ⇒ 平仓盈亏恒 0；
           ② 原来 `real_day` 不落盘，进程一重启当天的落袋就清零。
-        现在改成理论仓减少时按 `theo_px` 记，并写进 positionbook 的 `_realized`。
+        现在改成理论仓减少时记，并写进 positionbook 的 `_realized`。
+        11-27 改口径：平仓基准从 `theo_px`（开仓价 1100）改成昨收（1000），
+        这里两者故意设成不同的数，用期望值直接把口径钉死。
         """
         from ttrade import daylimit
         from ttrade import strategy_runner as R
@@ -4198,11 +4290,13 @@ def _run() -> tuple[bool, list[str]]:
                 return run, run._slots["__theory_a"]
 
             run, st = make()
+            st.underlying = "SHFE.rb2701"       # 让昨收走 _Q.pre_close=1000
             mult = run._volume_multiple(st)
             if mult <= 0:
                 raise RuntimeError("RB 乘数读不到")
 
             # 今天开 2 手多 @1100，再一把全平 @1200 —— 账本均价故意是空的
+            # 昨收 1000 ≠ 开仓 1100 ⇒ 期望值按昨收算，退回开仓价就会被这条抓到
             st.cost.clear()
             st.held.clear()
             st.target = 2
@@ -4213,11 +4307,11 @@ def _run() -> tuple[bool, list[str]]:
                 raise RuntimeError(f"开仓就记了已落袋：{st.real_day}")
 
             st.target = 0
-            run._slot_pnl(st)               # 全平 ⇒ 按理论价记一笔
-            want = (1200.0 - 1100.0) * 2 * mult
+            run._slot_pnl(st)               # 全平 ⇒ 按昨收记一笔
+            want = (1200.0 - 1000.0) * 2 * mult
             if abs(st.real_day - want) > 1e-6:
                 raise RuntimeError(
-                    f"理论平仓盈亏没记上（账本均价是空的）：{st.real_day} ≠ {want}")
+                    f"平仓盈亏要按昨收记（不是开仓价）：{st.real_day} ≠ {want}")
             if st.cost:
                 raise RuntimeError("读账本均价了 —— 已落袋必须是理论口径")
 
@@ -4235,6 +4329,21 @@ def _run() -> tuple[bool, list[str]]:
             st2.real_day_of = "2000-01-01"
             if abs(run2._realized_today(st2)) > 1e-9:
                 raise RuntimeError("跨交易日没清零")
+
+            # 兜底：刚加载、underlying 还没推来时取不到昨收，退回开仓价，
+            # 绝不能记成 0（11-26 那三条「平仓盈亏为 0」的坑）
+            R.positionbook.data.clear()      # 内存账本按 sid 共享，先清掉上一场景
+            run3, st3 = make()
+            st3.underlying = ""
+            st3.target = 2
+            st3.theo_px, st3.theo_sig = 1100.0, 1
+            st3.theo_day = daylimit.trading_day()
+            run3._slot_pnl(st3)
+            st3.target = 0
+            run3._slot_pnl(st3)
+            fallback = (1200.0 - 1100.0) * 2 * mult
+            if abs(st3.real_day - fallback) > 1e-6:
+                raise RuntimeError(f"没昨收时的兜底丢了：{st3.real_day} ≠ {fallback}")
         finally:
             R.positionbook = old_pb
 
@@ -14093,7 +14202,7 @@ def _run() -> tuple[bool, list[str]]:
                      "def _sync_conn_buttons"):
             if must not in src_tp:
                 raise RuntimeError(f"交易页少了 {must}")
-        if "✎" not in inspect.getsource(TradePage._wrap):
+        if "编辑" not in inspect.getsource(TradePage._wrap):
             raise RuntimeError("账户表的「编辑」按钮不见了")
         if "[spec]" not in inspect.getsource(TradePage._toggle_account):
             raise RuntimeError("单点登录没有只发一个 spec（会连带别的户一起登）")
@@ -14696,11 +14805,11 @@ def _run() -> tuple[bool, list[str]]:
             raise RuntimeError(f"隔夜仓的当日盈亏要按昨结算 + 已落袋：{day3} ≠ {day3_want}")
         # 理论空仓：持仓盈亏写 0，**当日盈亏仍保留当天已平仓那一半**
         # （用户 11-26：原油策略当天平掉全部仓位，这道格不能变回 0）
-        # 平仓盈亏按**理论建仓价 1180**算，不是账本均价 1060 —— 这正是用户
-        # 说的「从回测获得，不从账本获得」
+        # 🔴 11-27 改口径：平仓盈亏按**昨收 1000**算，不是开仓价 1180、更不是
+        # 账本均价 1060 —— 用户要的是「平仓价相对昨收」的当日盈亏
         st.target = 0
         _px4, day4, pos4, _n4 = run._slot_pnl(st)
-        real = pos_want          # = (1200 − 1180) × 3 × 乘数
+        real = (1200.0 - 1000.0) * 3 * mult   # = (平仓价 − 昨收) × 3 × 乘数
         if pos4 != 0.0 or abs(day4 - real) > 1e-6:
             raise RuntimeError(f"空仓时持仓写 0、当日盈亏留平仓：day {day4} pos {pos4}")
         # 反手：均价必须重设成新方向的价（这是下单用的账本，仍在维护）
@@ -15810,6 +15919,99 @@ def _run() -> tuple[bool, list[str]]:
                 "收尾只调 Release()，绝不 RegisterSpi(None)")
 
     check("登录失败后不反复 Release+Init（融航段错误）", _hub_fail_cooldown)
+
+    def _stale_session_retry() -> str:
+        """失败几次后必须还能重新登录（2026-11-26 用户反馈）。
+
+        现场：CTP 有时登不上，用户连点几次后即使柜台恢复也永远连不上，日志
+        一直是「复用组合页已连的会话，不再重复登录」。两个坑叠在一起：
+        1. 组合页 `BrokerApi.start()` 登录失败没 release ⇒ 注册表残留一条
+           「从没登上过」的僵尸会话；
+        2. `hubreg.acquire()` 无条件复用它，`refs>1` 就误报「已连」，
+           `start()` 撞失败冷却 ⇒ 按钮像被焊死。
+        修好后：冷却期内不重建（防 dll 拆建崩溃），冷却过了作废重建；
+        日志据实说；失败的一方自己放手。
+        """
+        import inspect
+        import time
+
+        from ttrade import broker_api as BA, ctp_live as CL, hubreg
+        from ttrade.tqlive import AccountSpec
+
+        # --- 1. CtpHub.reusable()：冷却期内留着，过期作废 ---
+        h = CL.CtpHub.__new__(CL.CtpHub)
+        h._started = False
+        h._fail_msg = "[-1] 交易核心未初始化"
+        h.trader = None
+        h._fail_at = time.monotonic()
+        if not h.reusable():
+            raise RuntimeError("失败冷却期内就作废会话 —— 连点会反复 Release+Init，dll 会崩")
+        h._fail_at = 0.0
+        if h.reusable():
+            raise RuntimeError("冷却过期后会话还占着注册表 —— 重试永远拿到僵尸会话")
+        h._fail_msg = ""
+        if not h.reusable():
+            raise RuntimeError("从没失败的会话不该被作废")
+
+        # --- 2. hubreg.acquire() 丢弃不可复用的会话，可复用的照旧复用 ---
+        hubreg.clear()
+        sp = AccountSpec(name="坏会话户", kind="ctp", user="u9", td_front="t9")
+
+        class _Dead:
+            def __init__(self):
+                self.closed = 0
+
+            def reusable(self):
+                return False
+
+            def close(self):
+                self.closed += 1
+
+        class _Alive:
+            pass
+
+        dead = hubreg.acquire("ctp", [sp], lambda: _Dead())
+        fresh = hubreg.acquire("ctp", [sp], lambda: _Alive())
+        if fresh is dead or not isinstance(fresh, _Alive):
+            raise RuntimeError("借到了登录失败的僵尸会话 —— start() 只会撞冷却")
+        if hubreg.refs(dead) != 0:
+            raise RuntimeError("被作废的会话还赖在注册表里")
+        if not hubreg.release(dead):
+            raise RuntimeError("旧持有者没法收尾（该 return True 让它自己 close）")
+        dead.close()
+        hubreg.release(fresh)               # fresh 自己占的那一引用先放手
+        a = hubreg.acquire("ctp", [sp], lambda: _Alive())
+        b = hubreg.acquire("ctp", [sp], lambda: _Alive())
+        if a is not b or hubreg.refs(a) != 2:
+            raise RuntimeError(f"正常会话没被复用 —— 同一账户又登出两条连接：{hubreg.describe()}")
+        hubreg.release(a)
+        hubreg.release(b)
+        hubreg.clear()
+
+        # --- 3. 日志据实：refs>1 不等于「已经连上」 ---
+        from gui.live import LiveWorker, _hub_online
+
+        class _Online:
+            def _alive(self):
+                return True
+
+        class _Offline:
+            def _alive(self):
+                return False
+
+        if not _hub_online(_Online()) or _hub_online(_Offline()):
+            raise RuntimeError("在线判据错 —— 又要把没登录说成『复用已连会话』")
+        if "_hub_online" not in inspect.getsource(LiveWorker.run):
+            raise RuntimeError("交易页还在只看 refs>1 就报『复用已连会话』")
+
+        # --- 4. 组合页失败必须放手（源码级） ---
+        src = inspect.getsource(BA.BrokerApi.start)
+        if "hubreg.release" not in src or "self.hub, None" not in src:
+            raise RuntimeError("BrokerApi.start() 登录失败没放手 —— 僵尸会话的源头还在")
+        return ("失败会话冷却期内不拆 dll、过期作废重建；注册表不再残留僵尸；"
+                "日志区分『真复用』与『未登录重连』；组合页失败放手")
+
+    check("登录失败后能重新连上（不复用僵尸会话）", _stale_session_retry)
 
     def _no_dangling_api() -> str:
         """会话收掉之后，任何 `Req*` 都不许再碰 C++（2026-11-23 两次 0xc0000005）。

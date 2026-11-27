@@ -541,6 +541,24 @@ class CtpHub:
         ev = getattr(t, "logged_in", None)
         return True if ev is None else bool(ev.is_set())
 
+    def reusable(self) -> bool:
+        """这条会话能不能让 `hubreg.acquire()` 借给别人（2026-11-26）。
+
+        现场：CTP 有时登不上，用户连点几次后即使柜台恢复了也永远连不上，
+        日志一直是「复用组合页已连的会话，不再重复登录」。根因是有一条
+        **从没登上过**的会话残留在注册表里：借到它只会撞 `start()` 的失败
+        冷却，界面还以为「已连」；而它又没被 release，下一个人接着借到。
+
+        判据（既治「借到僵尸」，又不能把按钮变成 DLL 拆建器）：
+        - 还活着 / 从没失败过 → 可复用；
+        - 失败记录在**冷却期内** → 留着（`start()` 会抛出「N 秒后可再试」，
+          此时重建等于又走一轮 Release+Init，正是融航 0xc0000005 的成因）；
+        - 失败记录**已过冷却** → 作废，让重试拿到一条干净的连接。
+        """
+        if self._alive() or not self._fail_msg:
+            return True
+        return (time.monotonic() - self._fail_at) < self.FAIL_COOLDOWN
+
     def _start_locked(self) -> None:
         self.check_deps()
         if not self.specs:
